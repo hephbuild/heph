@@ -133,7 +133,7 @@ pub fn build_spec(
 
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: "sh".to_string(),
         config,
         labels: vec![],
         transitive: Default::default(),
@@ -206,7 +206,7 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(spec.driver, "bash");
+        assert_eq!(spec.driver, "sh");
     }
 
     #[test]

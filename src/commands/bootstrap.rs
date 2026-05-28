@@ -130,6 +130,9 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_managed_driver_factory("bash", |opts| {
         Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
     })?;
+    e.register_managed_driver_factory("sh", |opts| {
+        Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
+    })?;
     e.register_managed_driver_factory("go_golist", |opts| {
         config_file::deny_unknown("go_golist driver", opts, &[])?;
         Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))

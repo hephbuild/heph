@@ -654,7 +654,11 @@ mod tests {
     #[test]
     fn test_local_cache_sqlite() -> Result<()> {
         let dir = tempdir()?;
-        let cache = LocalCacheSQLite::with_pipe_limit(dir.path().join("cache.db"), 16 * 1024, DEFAULT_MAX_CONCURRENT_PIPES)?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
 
         let addr = make_addr("test_pkg", "test_target");
         let hashin = "abc123hash";
@@ -685,7 +689,11 @@ mod tests {
     fn test_seekable_reader_pread_in_middle() -> Result<()> {
         use io::{Read, Seek, SeekFrom};
         let dir = tempdir()?;
-        let cache = LocalCacheSQLite::with_pipe_limit(dir.path().join("cache.db"), 16 * 1024, DEFAULT_MAX_CONCURRENT_PIPES)?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
 
         let addr = make_addr("pkg", "t");
         let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
@@ -711,7 +719,12 @@ mod tests {
     #[test]
     fn test_seekable_reader_missing_returns_not_found() {
         let dir = tempdir().expect("tempdir");
-        let cache = LocalCacheSQLite::with_pipe_limit(dir.path().join("cache.db"), 16 * 1024, DEFAULT_MAX_CONCURRENT_PIPES).expect("cache");
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )
+        .expect("cache");
         let addr = make_addr("pkg", "t");
         let err = match cache.seekable_reader(&addr, "missing", "blob") {
             Ok(_) => panic!("must error"),

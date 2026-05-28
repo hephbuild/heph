@@ -24,7 +24,7 @@ pub fn build_spec(
     let cfg_json =
         compute_embed_cfg_json(embed_patterns, embed_files).context("compute embed cfg json")?;
 
-    // Escape single quotes so the JSON can be embedded in a bash single-quoted string.
+    // Escape single quotes so the JSON can be embedded in a shell single-quoted string.
     let escaped_json = cfg_json.replace('\'', "'\\''");
     let run = format!("printf '%s\\n' '{escaped_json}' > embedcfg\n");
 
@@ -39,7 +39,7 @@ pub fn build_spec(
     );
     Ok(TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: "sh".to_string(),
         config,
         labels: vec![],
         transitive: Default::default(),
@@ -138,7 +138,7 @@ mod tests {
             &["static/index.html".to_string()],
         )
         .unwrap();
-        assert_eq!(spec.driver, "bash");
+        assert_eq!(spec.driver, "sh");
     }
 
     #[test]

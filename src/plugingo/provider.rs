@@ -2311,7 +2311,7 @@ mod tests {
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
     }
 
     #[tokio::test]
@@ -2428,7 +2428,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("lib", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
     }
 
     #[tokio::test]
@@ -2457,7 +2457,7 @@ mod tests {
         let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "build")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
@@ -2479,7 +2479,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("@heph/go/std/fmt", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
     }
 
     #[tokio::test]
@@ -2501,7 +2501,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("pkg", "build_test"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
@@ -2720,7 +2720,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("server", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
@@ -2890,7 +2890,9 @@ mod tests {
         e.register_driver(Box::new(crate::pluginhostbin::Driver))
             .unwrap();
 
-        e.register_managed_driver(Box::new(crate::pluginexec::Driver::new_bash()))
+        e.register_managed_driver(Box::new(crate::pluginexec::Driver::new_sh()))
+            .unwrap();
+        e.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))
             .unwrap();
 
         e.register_provider(|root| Box::new(Provider::new(root.to_path_buf()).unwrap()))
@@ -3070,7 +3072,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
@@ -3143,7 +3145,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("pkg", "build_test_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
     }
 
     #[tokio::test]
@@ -3302,7 +3304,7 @@ mod tests {
         let sandbox = copy_fixture("mod-asm");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "sh");
     }
 
     #[tokio::test]

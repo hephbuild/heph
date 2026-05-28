@@ -153,6 +153,44 @@ pub fn bash_args_public(
     Ok(args)
 }
 
+/// Mirrors `BASH_C_INLINE_MAX` — same inline-vs-spill cutoff so the two
+/// drivers behave consistently for sandbox script materialization.
+const SH_C_INLINE_MAX: usize = 500;
+
+pub fn sh_args_public(
+    sandbox_dir: &std::path::Path,
+    cmd: &str,
+    termargs: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    // POSIX sh: no `--noprofile`/`--norc` (bash-only) and no `-o pipefail`
+    // (not in POSIX, varies across sh implementations). Plugingo scripts are
+    // pipe-free, so `set -u -e` is enough.
+    let mut args = if cmd.len() > SH_C_INLINE_MAX {
+        let script_path = sandbox_dir.join("cmd.sh");
+        std::fs::write(&script_path, cmd).context("write cmd.sh")?;
+        vec![
+            "sh".to_string(),
+            "-u".to_string(),
+            "-e".to_string(),
+            script_path.to_string_lossy().into_owned(),
+        ]
+    } else {
+        vec![
+            "sh".to_string(),
+            "-u".to_string(),
+            "-e".to_string(),
+            "-c".to_string(),
+            cmd.to_string(),
+        ]
+    };
+
+    if !termargs.is_empty() {
+        args.push("sh".to_string());
+        args.extend(termargs);
+    }
+    Ok(args)
+}
+
 impl Driver {
     pub fn new_exec() -> Self {
         Self {
@@ -180,6 +218,19 @@ impl Driver {
         }
     }
 
+    pub fn new_sh() -> Self {
+        Self {
+            name: "sh".to_string(),
+            search_path: vec![],
+            wrap_run: |sandbox_dir, run| {
+                sh_args_public(sandbox_dir, run.join("\n").as_str(), vec![])
+            },
+            // Interactive --shell debug UX (rcfile templates, history) is
+            // bash-only; recreating it for sh isn't worth the duplication.
+            wrap_run_shell: bash_args_shell,
+        }
+    }
+
     pub fn from_options_exec(opts: &crate::engine::config_file::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
@@ -191,6 +242,13 @@ impl Driver {
         Ok(Self {
             search_path: decode_path(opts)?,
             ..Self::new_bash()
+        })
+    }
+
+    pub fn from_options_sh(opts: &crate::engine::config_file::Options) -> anyhow::Result<Self> {
+        Ok(Self {
+            search_path: decode_path(opts)?,
+            ..Self::new_sh()
         })
     }
 }
@@ -216,9 +274,9 @@ fn spec_path_to_target_path(raw: &str, pkg: &crate::htpkg::PkgBuf, codegen: &Cod
 }
 
 fn decode_path(opts: &crate::engine::config_file::Options) -> anyhow::Result<Vec<String>> {
-    crate::engine::config_file::deny_unknown("exec/bash driver", opts, &["path"])?;
+    crate::engine::config_file::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
     Ok(
-        crate::engine::config_file::decode_opt(opts, "exec/bash driver", "path")?
+        crate::engine::config_file::decode_opt(opts, "exec/bash/sh driver", "path")?
             .unwrap_or_default(),
     )
 }
@@ -1244,6 +1302,40 @@ mod tests {
                 .iter()
                 .any(|a| a == script.to_string_lossy().as_ref())
         );
+    }
+
+    #[test]
+    fn sh_args_public_spills_long_cmd_to_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let short = "echo hi";
+        let short_args = sh_args_public(dir.path(), short, vec![]).expect("short");
+        assert_eq!(short_args.first().map(String::as_str), Some("sh"));
+        assert!(short_args.iter().any(|a| a == "-c"));
+        assert!(short_args.iter().any(|a| a == short));
+        assert!(!short_args.iter().any(|a| a == "--noprofile"));
+        assert!(!short_args.iter().any(|a| a == "--norc"));
+        assert!(!short_args.iter().any(|a| a == "pipefail"));
+        assert!(!dir.path().join("cmd.sh").exists());
+
+        let long = "x".repeat(SH_C_INLINE_MAX + 1);
+        let long_args = sh_args_public(dir.path(), &long, vec![]).expect("long");
+        assert!(!long_args.iter().any(|a| a == "-c"));
+        let script = dir.path().join("cmd.sh");
+        assert!(script.exists());
+        assert_eq!(std::fs::read_to_string(&script).expect("read"), long);
+        assert!(
+            long_args
+                .iter()
+                .any(|a| a == script.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn from_options_sh_no_path() {
+        let opts = crate::engine::config_file::Options::new();
+        let d = Driver::from_options_sh(&opts).expect("from_options");
+        assert_eq!(d.name, "sh");
+        assert!(d.search_path.is_empty());
     }
 
     #[test]

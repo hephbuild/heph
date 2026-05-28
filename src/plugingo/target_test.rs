@@ -230,7 +230,7 @@ pub fn build_test_spec(
 
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: "sh".to_string(),
         config,
         labels: vec![],
         transitive: Default::default(),
@@ -243,7 +243,16 @@ pub fn build_test_spec(
 /// `go_test_data`. The engine expands the query lazily, so this provider does
 /// not need to scan the package itself.
 pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> TargetSpec {
-    let run = "\"$SRC_BIN\" -test.v".to_string();
+    // exec driver passes argv literally — no shell expansion. The engine
+    // stages dep outputs at <pkg>/<file> under ws_dir, and the process cwd
+    // is the target's package dir (engine/driver_managed_os.rs:78). The
+    // `test` target is a sibling of `build_test` in the same package, so
+    // its `test_binary` output lands next to us and `./test_binary`
+    // resolves regardless of package depth.
+    let run = vec![
+        TargetSpecValue::String("./test_binary".to_string()),
+        TargetSpecValue::String("-test.v".to_string()),
+    ];
 
     let deps_map: HashMap<String, TargetSpecValue> = HashMap::from([
         (
@@ -257,12 +266,12 @@ pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> T
     ]);
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
+    config.insert("run".to_string(), TargetSpecValue::List(run));
     config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
     config.insert("out".to_string(), TargetSpecValue::Map(HashMap::new()));
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: "exec".to_string(),
         config,
         labels: vec!["test".to_string(), "go-test".to_string()],
         transitive: Default::default(),
@@ -397,7 +406,7 @@ fn build_lib_spec_inner(
 
     TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: "sh".to_string(),
         config,
         labels: vec![],
         transitive: Default::default(),
@@ -452,7 +461,7 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(spec.driver, "bash");
+        assert_eq!(spec.driver, "sh");
     }
 
     #[test]
@@ -645,7 +654,7 @@ mod tests {
             &testmain_lib,
             &[],
         );
-        assert_eq!(spec.driver, "bash");
+        assert_eq!(spec.driver, "sh");
     }
 
     #[test]
@@ -816,6 +825,31 @@ mod tests {
             _ => panic!(),
         };
         assert!(matches!(&bin_dep[0], TargetSpecValue::String(s) if s.contains("build_test")));
+    }
+
+    #[test]
+    fn test_test_spec_driver_is_exec() {
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+        );
+        assert_eq!(spec.driver, "exec");
+        let run = match spec.config.get("run").expect("run present") {
+            TargetSpecValue::List(v) => v.clone(),
+            other => panic!("run must be a list for exec driver: {other:?}"),
+        };
+        let argv: Vec<String> = run
+            .into_iter()
+            .map(|v| match v {
+                TargetSpecValue::String(s) => s,
+                other => panic!("argv element must be string: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            argv,
+            vec!["./test_binary".to_string(), "-test.v".to_string()]
+        );
     }
 
     #[test]

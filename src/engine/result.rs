@@ -176,6 +176,10 @@ impl fmt::Debug for dyn Content {
 pub struct ExtendedTargetDef {
     pub target_def: Arc<TargetDef>,
     pub applied_transitive: Option<Sandbox>,
+    /// Registry name of the driver that produced `target_def`. Folded into
+    /// `hashin` so swapping drivers under the same addr invalidates cache —
+    /// even if the produced `TargetDef` bytes happen to match.
+    pub driver: String,
 }
 
 #[derive(Clone)]
@@ -682,6 +686,7 @@ impl Engine {
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),
             applied_transitive: all_transitive,
+            driver: spec.driver.clone(),
         }))
     }
 

@@ -1,6 +1,6 @@
 use crate::debug_hash::DebugHasher;
-use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::request_state::RequestState;
+use crate::engine::result::ExtendedTargetDef;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr::Addr;
@@ -55,7 +55,7 @@ impl Engine {
             .collect();
 
         let hashin = self
-            .hashin(&def.target_def, Box::new(hashouts.into_iter()))
+            .hashin(&def, Box::new(hashouts.into_iter()))
             .with_context(|| "hashin")?;
 
         Ok(ResultMeta { hashin })
@@ -63,15 +63,22 @@ impl Engine {
 
     fn hashin(
         &self,
-        def: &TargetDef,
+        def: &ExtendedTargetDef,
         results: Box<dyn Iterator<Item = String>>,
     ) -> anyhow::Result<String> {
         let mut h = DebugHasher::new(
             Xxh3Default::new(),
-            format!("hashin_{}", def.addr.format()).as_str(),
+            format!("hashin_{}", def.target_def.addr.format()).as_str(),
         );
 
-        Hasher::write(&mut h, &def.hash);
+        // Driver name is part of the cache key: swapping drivers under the
+        // same addr (e.g. `bash` → `sh`, or a custom driver re-registration)
+        // must invalidate cached artifacts even when the produced
+        // `TargetDef` bytes happen to match.
+        Hasher::write(&mut h, def.driver.as_bytes());
+        Hasher::write(&mut h, &[0]);
+
+        Hasher::write(&mut h, &def.target_def.hash);
 
         for hashout in results {
             Hasher::write(&mut h, hashout.as_bytes());
