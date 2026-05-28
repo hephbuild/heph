@@ -109,7 +109,7 @@ pub fn build_spec(
         addr,
         driver: "sh".to_string(),
         config,
-        labels: vec![],
+        labels: vec!["go-build".to_string()],
         transitive: Default::default(),
     }
 }
@@ -245,6 +245,22 @@ mod tests {
             matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
             "CGO_ENABLED must be pinned to 0 in the hashed `env` map: {:?}",
             env.get("CGO_ENABLED")
+        );
+    }
+
+    #[test]
+    fn test_build_spec_has_go_build_label() {
+        let spec = build_spec(
+            test_addr(),
+            "fmt",
+            &test_factors(),
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        assert!(
+            spec.labels.contains(&"go-build".to_string()),
+            "std lib build spec must carry go-build label: {:?}",
+            spec.labels
         );
     }
 }

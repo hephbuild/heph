@@ -135,7 +135,7 @@ pub fn build_spec(
         addr,
         driver: "sh".to_string(),
         config,
-        labels: vec![],
+        labels: vec!["go-build".to_string()],
         transitive: Default::default(),
     }
 }
@@ -673,6 +673,28 @@ mod tests {
         assert!(
             run.contains("$SRC_EMBED"),
             "run script must reference $SRC_EMBED: {run}"
+        );
+    }
+
+    #[test]
+    fn test_spec_has_go_build_label() {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/mylib",
+            "mylib",
+            &test_factors(),
+            &[],
+            &src_addrs(),
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+            None,
+            &[],
+        );
+        assert!(
+            spec.labels.contains(&"go-build".to_string()),
+            "lib build spec must carry go-build label: {:?}",
+            spec.labels
         );
     }
 

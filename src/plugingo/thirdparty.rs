@@ -282,7 +282,7 @@ pub fn build_lib_spec(
         addr,
         driver: "sh".to_string(),
         config,
-        labels: vec![],
+        labels: vec!["go-build".to_string()],
         transitive: Default::default(),
     }
 }
@@ -591,6 +591,29 @@ mod tests {
             "/tmp/gocache",
         );
         assert_eq!(spec.driver, "sh");
+    }
+
+    #[test]
+    fn test_build_lib_has_go_build_label() {
+        let spec = build_lib_spec(
+            test_addr(),
+            &test_pkg(vec!["logr.go".to_string()]),
+            &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            &[],
+            None,
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+        );
+        assert!(
+            spec.labels.contains(&"go-build".to_string()),
+            "thirdparty build_lib spec must carry go-build label: {:?}",
+            spec.labels
+        );
     }
 
     #[test]

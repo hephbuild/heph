@@ -408,7 +408,7 @@ fn build_lib_spec_inner(
         addr,
         driver: "sh".to_string(),
         config,
-        labels: vec![],
+        labels: vec!["go-build".to_string()],
         transitive: Default::default(),
     }
 }
@@ -849,6 +849,69 @@ mod tests {
         assert_eq!(
             argv,
             vec!["./test_binary".to_string(), "-test.v".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_test_lib_spec_has_go_build_label() {
+        let spec = build_test_lib_spec(
+            mk_addr("pkg", "build_lib"),
+            "example.com/pkg",
+            "mypkg",
+            &test_factors(),
+            &[],
+            &src_addrs("pkg"),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+            None,
+            &[],
+        );
+        assert!(
+            spec.labels.contains(&"go-build".to_string()),
+            "build_test_lib spec must carry go-build label: {:?}",
+            spec.labels
+        );
+    }
+
+    #[test]
+    fn test_build_xtest_lib_spec_has_go_build_label() {
+        let spec = build_xtest_lib_spec(
+            mk_addr("pkg", "build_xtest_lib"),
+            "example.com/pkg",
+            "mypkg",
+            &test_factors(),
+            &[],
+            &src_addrs("pkg"),
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+            None,
+            &[],
+        );
+        assert!(
+            spec.labels.contains(&"go-build".to_string()),
+            "build_xtest_lib spec must carry go-build label: {:?}",
+            spec.labels
+        );
+    }
+
+    #[test]
+    fn test_build_testmain_lib_spec_has_go_build_label() {
+        let spec = build_testmain_lib_spec(
+            mk_addr("pkg", "build_testmain_lib"),
+            &test_factors(),
+            &mk_addr("pkg", "_testmain_src"),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+        );
+        assert!(
+            spec.labels.contains(&"go-build".to_string()),
+            "build_testmain_lib spec must carry go-build label: {:?}",
+            spec.labels
         );
     }
 
