@@ -9,6 +9,34 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+/// Close `file` (a freshly-written, writable handle to `path`) in a way that
+/// guarantees no writable descriptor for the file survives, then return.
+///
+/// Works around <https://github.com/rust-lang/rust/issues/114554>: if another
+/// thread `fork`s between our `File::create` and a later `exec` of the unpacked
+/// binary, the child inherits our writable fd and the `exec` fails with
+/// `ETXTBSY`. `flock` locks are tied to the open file description and shared
+/// with any forked child, so:
+///
+/// 1. take an exclusive lock on the writable fd,
+/// 2. close it (the lock lives on in any inherited copy),
+/// 3. reopen read-only and take a shared lock — this blocks until every
+///    writable fd (ours and any forked child's) is gone.
+///
+/// Only meaningful for files that will be executed, so callers gate on `+x`.
+#[cfg(unix)]
+fn close_ensure_ro_fd(file: fs::File, path: &Path) -> anyhow::Result<()> {
+    file.lock()
+        .with_context(|| format!("flock(exclusive) writable fd {:?}", path))?;
+    drop(file);
+
+    let ro = fs::File::open(path).with_context(|| format!("reopen {:?} read-only", path))?;
+    ro.lock_shared()
+        .with_context(|| format!("flock(shared) read-only fd {:?}", path))?;
+    drop(ro);
+    Ok(())
+}
+
 /// Describe what currently exists at `path` for error messages. Returns a
 /// short tag like "file", "dir", "symlink->/foo", or "<none>". Never errors.
 fn describe_existing(path: &Path) -> String {
@@ -125,14 +153,20 @@ pub fn unpack(
                     dest_file
                         .flush()
                         .with_context(|| format!("flush {:?} before chmod", dest))?;
-                    let file = dest_file.get_ref();
+                    let file = dest_file
+                        .into_inner()
+                        .with_context(|| format!("unwrap writer for {:?}", dest))?;
                     let mut perms = file
                         .metadata()
                         .with_context(|| format!("stat {:?} for chmod", dest))?
                         .permissions();
                     perms.set_mode(perms.mode() | 0o111);
-                    fs::set_permissions(&dest, perms)
+                    file.set_permissions(perms)
                         .with_context(|| format!("chmod +x {:?}", dest))?;
+                    // Executables may be exec'd immediately after unpack; ensure no
+                    // writable fd survives to avoid ETXTBSY (rust-lang/rust#114554).
+                    close_ensure_ro_fd(file, &dest)
+                        .with_context(|| format!("ensure read-only fd for {:?}", dest))?;
                 }
             }
         }
@@ -208,6 +242,31 @@ mod tests {
         // Symlink resolves to file with the expected content.
         let resolved = std::fs::read(&link_path).unwrap();
         assert_eq!(resolved, b"hello");
+    }
+
+    #[test]
+    fn unpack_executable_is_runnable() {
+        // A +x entry must come out executable, fully closed (no lingering
+        // writable fd), and immediately exec'able — see close_ensure_ro_fd /
+        // rust-lang/rust#114554.
+        let mut packer = TarPacker::new();
+        packer.create_raw(b"#!/bin/sh\necho ok\n".to_vec(), "script.sh", true);
+        let mut buf = Vec::new();
+        packer.pack(&mut buf).unwrap();
+        let content = TarBytes(buf);
+
+        let out = tempfile::tempdir().expect("out tempdir");
+        unpack(&content, out.path(), None, None).expect("unpack");
+
+        let script = out.path().join("script.sh");
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "script must be executable, mode={mode:o}");
+
+        let output = std::process::Command::new(&script)
+            .output()
+            .expect("exec unpacked script");
+        assert!(output.status.success(), "script exited non-zero: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
     }
 
     #[test]
