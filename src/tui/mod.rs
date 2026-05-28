@@ -3,6 +3,7 @@ mod backend;
 pub mod log_sink;
 pub mod panic;
 pub mod paused;
+pub mod stderr_backend;
 pub mod stdout_buffer;
 pub mod tty;
 

@@ -6,7 +6,6 @@ use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::prelude::Widget;
 use ratatui::text::Text;
@@ -17,11 +16,12 @@ use tokio::sync::mpsc;
 use crate::commands::bootstrap::ShutdownTrigger;
 use crate::tui::app::{App, AppContext, Control};
 use crate::tui::log_sink::LogSink;
+use crate::tui::stderr_backend::StderrBackend;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(80);
 
-type StderrTerminal = Terminal<CrosstermBackend<io::Stderr>>;
+type StderrTerminal = Terminal<StderrBackend>;
 
 pub async fn run<A: App + 'static>(
     app: A,
@@ -33,8 +33,12 @@ pub async fn run<A: App + 'static>(
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
     enable_raw_mode().context("enabling raw mode")?;
+    // StderrBackend wraps CrosstermBackend<Stderr> and overrides
+    // get_cursor_position so the DSR query goes to stderr instead of
+    // crossterm's hardcoded `io::stdout()`. Otherwise `cmd | wc -l`
+    // sees the `\x1b[6n` bytes in its pipe and miscounts.
     let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stderr()),
+        StderrBackend::new(io::stderr()),
         TerminalOptions {
             viewport: Viewport::Inline(1),
         },
@@ -103,7 +107,7 @@ pub async fn run<A: App + 'static>(
                         // re-queries the cursor and positions the viewport below
                         // the printed output instead of clobbering it.
                         if let Ok(new_term) = Terminal::with_options(
-                            CrosstermBackend::new(io::stderr()),
+                            StderrBackend::new(io::stderr()),
                             TerminalOptions {
                                 viewport: Viewport::Inline(1),
                             },
