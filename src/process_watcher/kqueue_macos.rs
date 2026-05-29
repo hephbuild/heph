@@ -131,7 +131,7 @@ fn poll_pending(pending: &mut HashMap<i32, mpsc::Sender<io::Result<ExitStatus>>>
         // SAFETY: WNOHANG waitpid is non-blocking; pid is one we registered.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r > 0 {
-            tracing::warn!(
+            tracing::debug!(
                 pid,
                 "process_watcher: backstop poll caught exited pid (kqueue dropped NOTE_EXIT)"
             );
@@ -141,7 +141,7 @@ fn poll_pending(pending: &mut HashMap<i32, mpsc::Sender<io::Result<ExitStatus>>>
             if err.raw_os_error() == Some(libc::ECHILD) {
                 // Status lost — surface as error rather than fabricating
                 // success. Pid stays in `pending` until removed below.
-                tracing::warn!(
+                tracing::debug!(
                     pid,
                     "process_watcher: backstop poll hit ECHILD; another reaper got it — status lost"
                 );
@@ -155,7 +155,7 @@ fn poll_pending(pending: &mut HashMap<i32, mpsc::Sender<io::Result<ExitStatus>>>
         }
     }
     if !resolved.is_empty() {
-        tracing::warn!(
+        tracing::debug!(
             recovered = resolved.len(),
             pending_total = total,
             "process_watcher: backstop recovered missed exits"

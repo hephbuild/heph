@@ -1,5 +1,8 @@
+use tokio::sync::mpsc;
+
 use crate::commands::bootstrap::ShutdownTrigger;
-use crate::tui::app::{App, AppContext};
+use crate::engine::event::EventReceiver;
+use crate::tui::app::{App, AppContext, CIAppView};
 use crate::tui::log_sink::LogSink;
 
 pub async fn run<A: App>(
@@ -7,7 +10,48 @@ pub async fn run<A: App>(
     sink: LogSink,
     _shutdown: ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
-    tracing::info!("{}", app.label());
-    let ctx = AppContext::direct(sink);
-    app.run(ctx).await
+    // The app owns its non-TUI rendering too: the backend only drives the
+    // event stream and hands each event to the view.
+    let mut view = app.ci_view();
+    view.begin();
+
+    // We own the build-event channel: sender to the app via AppContext, we keep
+    // the receiver.
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut events: Option<EventReceiver> = Some(event_rx);
+    let ctx = AppContext::direct(sink, Some(event_tx));
+    let app_fut = app.run(ctx);
+    tokio::pin!(app_fut);
+
+    let result = loop {
+        tokio::select! {
+            // Bias toward draining events so the final summary reflects the
+            // full stream, but the app future is what terminates the loop.
+            out = &mut app_fut => break out,
+            maybe_evt = async {
+                match events.as_mut() {
+                    Some(r) => r.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match maybe_evt {
+                    Some(ev) => view.apply(&ev),
+                    // Sender dropped — stop polling, keep awaiting the app.
+                    None => events = None,
+                }
+            }
+        }
+    };
+
+    // Drain any events buffered before the sender dropped so the final
+    // summary is accurate even if the app future completed first.
+    if let Some(r) = events.as_mut() {
+        while let Ok(ev) = r.try_recv() {
+            view.apply(&ev);
+        }
+    }
+
+    view.finish();
+
+    result
 }

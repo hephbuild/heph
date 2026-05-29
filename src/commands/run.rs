@@ -46,15 +46,27 @@ struct RunApp {
     matcher: Matcher,
 }
 
-#[async_trait]
-impl App for RunApp {
-    type Output = ();
-
-    fn label(&self) -> String {
+impl RunApp {
+    fn progress_label(&self) -> String {
         match &self.matcher {
             Matcher::Addr(a) => format!("Running {}", a.format()),
             other => format!("Running {other:?}"),
         }
+    }
+}
+
+#[async_trait]
+impl App for RunApp {
+    type Output = ();
+    type TuiView = tui::TuiProgressView;
+    type CiView = tui::CiProgressView;
+
+    fn tui_view(&self) -> Self::TuiView {
+        tui::TuiProgressView::new(self.progress_label())
+    }
+
+    fn ci_view(&self) -> Self::CiView {
+        tui::CiProgressView::new(self.progress_label())
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
@@ -95,10 +107,16 @@ impl App for RunApp {
         };
         let rs = self
             .engine
-            .new_state_with_fail_fast(!self.args.no_fail_fast);
+            .new_state_with_events(!self.args.no_fail_fast, ctx.event_sender());
 
         let (result, failures) = match self.matcher {
             Matcher::Addr(addr) => {
+                // Single top-level target: the matched set of one is known
+                // immediately, so emit it as already-complete (no `~`).
+                rs.emit(crate::engine::event::BuildEventKind::Matched {
+                    addrs: vec![addr.format()],
+                    complete: true,
+                });
                 let r = self
                     .engine
                     .clone()
@@ -134,14 +152,6 @@ impl App for RunApp {
                             println!("{}", e?.path.display());
                         }
                     }
-                }
-            } else {
-                println!("{} matched", result.len());
-            }
-            if !failures.is_empty() {
-                eprintln!("{} target(s) failed:", failures.len());
-                for (addr, err) in &failures {
-                    eprintln!("  {}: {:#}", addr.format(), err);
                 }
             }
         });

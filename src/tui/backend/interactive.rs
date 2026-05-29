@@ -14,7 +14,8 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use crate::commands::bootstrap::ShutdownTrigger;
-use crate::tui::app::{App, AppContext, Control};
+use crate::engine::event::{EventReceiver, now_unix_ms};
+use crate::tui::app::{App, AppContext, Control, TUIAppView};
 use crate::tui::log_sink::LogSink;
 use crate::tui::stderr_backend::StderrBackend;
 
@@ -28,9 +29,17 @@ pub async fn run<A: App + 'static>(
     sink: LogSink,
     shutdown: ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
-    let label = app.label();
+    // The app owns its view: aggregation + rendering. It lives on the loop
+    // stack so it survives pause/resume (only the terminal is rebuilt across a
+    // pause cycle, not the view's aggregated state).
+    let mut view = app.tui_view();
+    let rows = view.rows();
     let mut rx = sink.switch_to_buffered();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    // We own the build-event channel: the sender goes to the app via
+    // AppContext (and into its request state); we keep the receiver.
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut build_events: Option<EventReceiver> = Some(event_rx);
 
     enable_raw_mode().context("enabling raw mode")?;
     // StderrBackend wraps CrosstermBackend<Stderr> and overrides
@@ -40,7 +49,7 @@ pub async fn run<A: App + 'static>(
     let mut terminal = Terminal::with_options(
         StderrBackend::new(io::stderr()),
         TerminalOptions {
-            viewport: Viewport::Inline(1),
+            viewport: Viewport::Inline(rows),
         },
     )
     .context("building inline terminal")?;
@@ -49,7 +58,7 @@ pub async fn run<A: App + 'static>(
     let mut events: Option<EventStream> = Some(EventStream::new());
     let suppression = shutdown.suppression();
 
-    let ctx = AppContext::with_control(sink.clone(), control_tx);
+    let ctx = AppContext::with_control(sink.clone(), control_tx, Some(event_tx));
     // App runs on its own task so heavy sync work inside the app
     // (e.g. `block_in_place` for filesystem scans, Starlark eval) does
     // not block this task's ticker — the renderer task is re-polled
@@ -109,7 +118,7 @@ pub async fn run<A: App + 'static>(
                         if let Ok(new_term) = Terminal::with_options(
                             StderrBackend::new(io::stderr()),
                             TerminalOptions {
-                                viewport: Viewport::Inline(1),
+                                viewport: Viewport::Inline(rows),
                             },
                         ) {
                             terminal = new_term;
@@ -145,14 +154,28 @@ pub async fn run<A: App + 'static>(
                     _ => {}
                 }
             }
+            maybe_build_evt = async {
+                match build_events.as_mut() {
+                    Some(r) => r.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if !paused => {
+                match maybe_build_evt {
+                    // No per-event redraw: fold into the view here, the 80ms
+                    // ticker repaints the pinned progress block.
+                    Some(e) => view.apply(&e),
+                    // Sender dropped (request finished) — stop polling.
+                    None => build_events = None,
+                }
+            }
             _ = ticker.tick(), if !paused => {
                 drain_logs_to_terminal(&mut terminal, &mut rx, cols);
                 spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
                 let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
-                let line = format!("{frame} {label}");
+                let lines = view.render(frame, now_unix_ms());
                 drop(terminal.draw(|f| {
                     let area = f.area();
-                    f.render_widget(Paragraph::new(line), area);
+                    f.render_widget(Paragraph::new(Text::from(lines)), area);
                 }));
             }
         }
@@ -166,6 +189,20 @@ pub async fn run<A: App + 'static>(
     }
     sink.switch_to_direct();
     drain_logs_to_stderr(&mut rx);
+
+    // The app completing breaks the loop, but build events emitted just before
+    // it returned may still be buffered (the sender closes only once the
+    // request state drops). Drain them so the final summary reflects the full
+    // stream rather than the snapshot at the last tick.
+    if let Some(r) = build_events.as_mut() {
+        while let Ok(e) = r.try_recv() {
+            view.apply(&e);
+        }
+    }
+
+    // Persistent final summary, printed straight to stderr below the
+    // torn-down inline viewport (interactive mode only).
+    view.last_render();
 
     result
 }

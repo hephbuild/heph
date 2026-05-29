@@ -35,13 +35,19 @@ struct DefApp {
 #[async_trait]
 impl App for DefApp {
     type Output = ();
+    type TuiView = crate::tui::TuiProgressView;
+    type CiView = crate::tui::CiProgressView;
 
-    fn label(&self) -> String {
-        format!("Def {}", self.addr.format())
+    fn tui_view(&self) -> Self::TuiView {
+        crate::tui::TuiProgressView::new(format!("Def {}", self.addr.format()))
+    }
+
+    fn ci_view(&self) -> Self::CiView {
+        crate::tui::CiProgressView::new(format!("Def {}", self.addr.format()))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self.engine.new_state();
+        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
         let res = if self.no_transitive {
             self.engine.clone().get_direct_def(rs, &self.addr).await?
         } else {

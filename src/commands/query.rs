@@ -31,13 +31,19 @@ struct QueryApp {
 #[async_trait]
 impl App for QueryApp {
     type Output = ();
+    type TuiView = crate::tui::TuiProgressView;
+    type CiView = crate::tui::CiProgressView;
 
-    fn label(&self) -> String {
-        format!("Querying {:?}", self.matcher)
+    fn tui_view(&self) -> Self::TuiView {
+        crate::tui::TuiProgressView::new(format!("Querying {:?}", self.matcher))
+    }
+
+    fn ci_view(&self) -> Self::CiView {
+        crate::tui::CiProgressView::new(format!("Querying {:?}", self.matcher))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self.engine.new_state();
+        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
         let stream = self.engine.query(rs, &self.matcher);
         tokio::pin!(stream);
 

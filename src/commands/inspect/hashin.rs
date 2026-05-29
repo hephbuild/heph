@@ -22,17 +22,20 @@ struct HashinApp {
 #[async_trait]
 impl App for HashinApp {
     type Output = ();
+    type TuiView = crate::tui::TuiProgressView;
+    type CiView = crate::tui::CiProgressView;
 
-    fn label(&self) -> String {
-        format!("Hashin {}", self.addr.format())
+    fn tui_view(&self) -> Self::TuiView {
+        crate::tui::TuiProgressView::new(format!("Hashin {}", self.addr.format()))
+    }
+
+    fn ci_view(&self) -> Self::CiView {
+        crate::tui::CiProgressView::new(format!("Hashin {}", self.addr.format()))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let res = self
-            .engine
-            .clone()
-            .meta(self.engine.new_state(), &self.addr)
-            .await?;
+        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        let res = self.engine.clone().meta(rs, &self.addr).await?;
 
         tui::paused!(ctx, {
             println!("{}", res.hashin);

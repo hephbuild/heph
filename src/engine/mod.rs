@@ -17,6 +17,7 @@ mod root;
 pub use root::get_root;
 pub mod driver;
 pub mod error;
+pub mod event;
 mod local_cache;
 #[cfg(test)]
 mod local_cache_fs;

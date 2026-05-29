@@ -39,102 +39,114 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
 
-        crate::hmemoizer::set_phase("execute:inputs_result_exec");
-        let deps_result = self
-            .clone()
-            .inputs_result_exec(rs.clone(), &def.inputs)
-            .await?;
+        let addr_str = addr.format();
+        crate::engine::event::emit_scope(
+            &rs,
+            crate::engine::event::BuildEventKind::ExecuteStart {
+                addr: addr_str.clone(),
+                driver: driver.name.clone(),
+                cache: def.target.cache,
+            },
+            move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
+                addr: addr_str,
+                error,
+            },
+            async {
+                crate::hmemoizer::set_phase("execute:inputs_result_exec");
+                let deps_result = self
+                    .clone()
+                    .inputs_result_exec(rs.clone(), &def.inputs)
+                    .await?;
 
-        // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
-        // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
-        // waiting for a leaf that also needs a permit.
-        crate::hmemoizer::set_phase("execute:semaphore_acquire");
-        let semaphore = Arc::clone(&self.result_semaphore);
-        let _permit = semaphore
-            .acquire()
-            .await
-            .context("result semaphore closed")?;
+                // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
+                // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
+                // waiting for a leaf that also needs a permit.
+                crate::hmemoizer::set_phase("execute:semaphore_acquire");
+                let semaphore = Arc::clone(&self.result_semaphore);
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .context("result semaphore closed")?;
 
-        let sandbox_dir = {
-            let mut dir = self.home.join("sandbox");
-            for c in addr.package.components() {
-                dir = dir.join(c);
-            }
-            if addr.args.is_empty() {
-                dir.join(format!("__target_{}", addr.name))
-            } else {
-                dir.join(format!("__target_{}_{}", addr.name, addr.hash_str()))
-            }
-        };
-        // Stale cleanup only — the driver bridge owns the create step
-        // because it may redirect this path into a FUSE mount (v2 single-
-        // mount mode). Creating here would waste an inode + leave an
-        // orphan empty dir when the bridge picks the FUSE side.
-        crate::hmemoizer::set_phase("execute:sandbox_remove");
-        sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
-            match std::fs::remove_dir_all(&sandbox_dir) {
-                Ok(_) => Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(err),
-            }
-        }))
-        .await
-        .with_context(|| format!("remove stale sandbox dir {}", sandbox_dir.display()))?;
-
-        if def.target.cache {
-            tracing::info!(driver = %driver.name, %addr, "run");
-        }
-
-        let exec_wrapper: InteractiveWrapper = exec_wrapper.unwrap_or_else(|| {
-            Arc::new(|inner: InteractiveInner| {
-                Box::pin(async move { inner(None, None, None).await })
-            })
-        });
-
-        let (tx, rx) = tokio::sync::oneshot::channel::<RunResponse>();
-
-        let hashin = hashin.to_owned();
-
-        let inner: InteractiveInner = Box::new(enclose!(
-            (driver, def, rs, self => engine, sandbox_dir)
-            move |stdin, stdout, stderr| {
-                Box::pin(async move {
-                    let req = RunRequest {
-                        request_id: rs.request_id(),
-                        target: &def.target,
-                        tree_root_path: engine.cfg.root.clone(),
-                        inputs: deps_result,
-                        hashin: &hashin,
-                        stdin,
-                        stdout,
-                        stderr,
-                        sandbox_dir,
-                    };
-                    let res = if shell {
-                        driver.driver.run_shell(req, rs.ctoken()).await?
+                let sandbox_dir = {
+                    let mut dir = self.home.join("sandbox");
+                    for c in addr.package.components() {
+                        dir = dir.join(c);
+                    }
+                    if addr.args.is_empty() {
+                        dir.join(format!("__target_{}", addr.name))
                     } else {
-                        driver.driver.run(req, rs.ctoken()).await?
-                    };
-                    drop(tx.send(res));
-                    Ok(())
-                })
-            }
-        ));
+                        dir.join(format!("__target_{}_{}", addr.name, addr.hash_str()))
+                    }
+                };
+                // Stale cleanup only — the driver bridge owns the create step
+                // because it may redirect this path into a FUSE mount (v2 single-
+                // mount mode). Creating here would waste an inode + leave an
+                // orphan empty dir when the bridge picks the FUSE side.
+                crate::hmemoizer::set_phase("execute:sandbox_remove");
+                sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
+                    match std::fs::remove_dir_all(&sandbox_dir) {
+                        Ok(_) => Ok(()),
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                        Err(err) => Err(err),
+                    }
+                }))
+                .await
+                .with_context(|| format!("remove stale sandbox dir {}", sandbox_dir.display()))?;
 
-        crate::hmemoizer::set_phase("execute:driver_run");
-        exec_wrapper(inner).await.with_context(|| "run")?;
+                let exec_wrapper: InteractiveWrapper = exec_wrapper.unwrap_or_else(|| {
+                    Arc::new(|inner: InteractiveInner| {
+                        Box::pin(async move { inner(None, None, None).await })
+                    })
+                });
 
-        crate::hmemoizer::set_phase("execute:oneshot_rx");
-        let res = rx
-            .await
-            .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))?;
+                let (tx, rx) = tokio::sync::oneshot::channel::<RunResponse>();
 
-        // Bridge owns the cleanup closure (knows whether the sandbox
-        // lives in the plain `<home>/sandbox/...` tree or under the
-        // FUSE upper-side dir). Slot guards travel with the response
-        // so result.rs can drop them in the same defer that fires
-        // sandbox cleanup.
-        Ok((res.artifacts, res.sandbox_cleanup, res.fuse_slot_guards))
+                let hashin = hashin.to_owned();
+
+                let inner: InteractiveInner = Box::new(enclose!(
+                    (driver, def, rs, self => engine, sandbox_dir)
+                    move |stdin, stdout, stderr| {
+                        Box::pin(async move {
+                            let req = RunRequest {
+                                request_id: rs.request_id(),
+                                target: &def.target,
+                                tree_root_path: engine.cfg.root.clone(),
+                                inputs: deps_result,
+                                hashin: &hashin,
+                                stdin,
+                                stdout,
+                                stderr,
+                                sandbox_dir,
+                            };
+                            let res = if shell {
+                                driver.driver.run_shell(req, rs.ctoken()).await?
+                            } else {
+                                driver.driver.run(req, rs.ctoken()).await?
+                            };
+                            drop(tx.send(res));
+                            Ok(())
+                        })
+                    }
+                ));
+
+                crate::hmemoizer::set_phase("execute:driver_run");
+                exec_wrapper(inner).await.with_context(|| "run")?;
+
+                crate::hmemoizer::set_phase("execute:oneshot_rx");
+                let res = rx
+                    .await
+                    .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))?;
+
+                // Bridge owns the cleanup closure (knows whether the sandbox
+                // lives in the plain `<home>/sandbox/...` tree or under the
+                // FUSE upper-side dir). Slot guards travel with the response
+                // so result.rs can drop them in the same defer that fires
+                // sandbox cleanup.
+                Ok((res.artifacts, res.sandbox_cleanup, res.fuse_slot_guards))
+            },
+        )
+        .await
     }
 
     async fn inputs_result_exec(

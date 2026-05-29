@@ -22,17 +22,20 @@ struct SpecApp {
 #[async_trait]
 impl App for SpecApp {
     type Output = ();
+    type TuiView = crate::tui::TuiProgressView;
+    type CiView = crate::tui::CiProgressView;
 
-    fn label(&self) -> String {
-        format!("Spec {}", self.addr.format())
+    fn tui_view(&self) -> Self::TuiView {
+        crate::tui::TuiProgressView::new(format!("Spec {}", self.addr.format()))
+    }
+
+    fn ci_view(&self) -> Self::CiView {
+        crate::tui::CiProgressView::new(format!("Spec {}", self.addr.format()))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let res = self
-            .engine
-            .clone()
-            .get_spec(self.engine.new_state(), &self.addr)
-            .await?;
+        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        let res = self.engine.clone().get_spec(rs, &self.addr).await?;
 
         let json = serde_json::to_string_pretty(&*res).context("serialize spec")?;
 

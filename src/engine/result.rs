@@ -342,6 +342,12 @@ impl Engine {
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
+            // Announce each match as it resolves so the client can render a
+            // provisional "done X / ~N" that grows while the matcher streams.
+            rs.emit(crate::engine::event::BuildEventKind::Matched {
+                addrs: vec![addr.format()],
+                complete: false,
+            });
             crate::hmemoizer::join_set_spawn(
                 &mut set,
                 enclose!((self => engine, rs, opts, addr) async move {
@@ -350,6 +356,11 @@ impl Engine {
                 }),
             );
         }
+        // Matcher fully resolved: mark the matched set final (drops the `~`).
+        rs.emit(crate::engine::event::BuildEventKind::Matched {
+            addrs: Vec::new(),
+            complete: true,
+        });
 
         let mut ok: Vec<Arc<EResult>> = vec![];
         let mut errors: Vec<(Addr, anyhow::Error)> = vec![];
@@ -372,51 +383,65 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<EResult> {
-        // Use _no_track: result_addr set parent=addr before entering the memoizer,
-        // so tracked variants would record addr→addr.
-        let spec = Arc::clone(&self)
-            .get_spec_no_track(rs.clone(), addr)
-            .await?;
-        let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
+        let addr_str = addr.format();
+        crate::engine::event::emit_scope(
+            &rs,
+            crate::engine::event::BuildEventKind::ResultStart {
+                addr: addr_str.clone(),
+            },
+            move |error| crate::engine::event::BuildEventKind::ResultEnd {
+                addr: addr_str,
+                error,
+            },
+            async {
+                // Use _no_track: result_addr set parent=addr before entering the memoizer,
+                // so tracked variants would record addr→addr.
+                let spec = Arc::clone(&self)
+                    .get_spec_no_track(rs.clone(), addr)
+                    .await?;
+                let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
 
-        // `link` and `meta` operate on disjoint data once `def` is known: link
-        // resolves output names + filter checks across the input list; meta
-        // recursively walks inputs to compute hashin. Run them concurrently
-        // via `tokio::join!` so the shorter one isn't gated on the longer.
-        // Uses `join!` (stack-pinned futures, no per-branch boxing) rather
-        // than `try_join_all` — overhead is negligible on the hot path.
-        let link_fut = Arc::clone(&self).link(rs.clone(), def.target_def.clone());
-        let meta_fut = Arc::clone(&self).meta(rs.clone(), addr);
-        let (link_res, meta_res) = tokio::join!(link_fut, meta_fut);
-        let def = link_res.with_context(|| "link")?;
-        let meta = meta_res.with_context(|| "meta")?;
+                // `link` and `meta` operate on disjoint data once `def` is known: link
+                // resolves output names + filter checks across the input list; meta
+                // recursively walks inputs to compute hashin. Run them concurrently
+                // via `tokio::join!` so the shorter one isn't gated on the longer.
+                // Uses `join!` (stack-pinned futures, no per-branch boxing) rather
+                // than `try_join_all` — overhead is negligible on the hot path.
+                let link_fut = Arc::clone(&self).link(rs.clone(), def.target_def.clone());
+                let meta_fut = Arc::clone(&self).meta(rs.clone(), addr);
+                let (link_res, meta_res) = tokio::join!(link_fut, meta_fut);
+                let def = link_res.with_context(|| "link")?;
+                let meta = meta_res.with_context(|| "meta")?;
 
-        let output_names = match outputs {
-            OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
-            OutputMatcher::All => Ok(def.target.output_names()),
-            OutputMatcher::Exact(names) => {
-                let all_output_names = def.target.output_names();
-                for name in &names {
-                    if !all_output_names.contains(name) {
-                        anyhow::bail!("output not found: {}", name);
+                let output_names = match outputs {
+                    OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
+                    OutputMatcher::All => Ok(def.target.output_names()),
+                    OutputMatcher::Exact(names) => {
+                        let all_output_names = def.target.output_names();
+                        for name in &names {
+                            if !all_output_names.contains(name) {
+                                anyhow::bail!("output not found: {}", name);
+                            }
+                        }
+
+                        Ok(names)
                     }
-                }
+                }?;
 
-                Ok(names)
-            }
-        }?;
-
-        self.execute_and_cache(
-            rs,
-            &def,
-            output_names,
-            &ExecuteOptions {
-                hashin: &meta.hashin,
-                spec: &spec,
-                def: &def,
-                force: opts.force,
-                interactive: opts.interactive.clone(),
-                shell: opts.shell,
+                self.execute_and_cache(
+                    rs.clone(),
+                    &def,
+                    output_names,
+                    &ExecuteOptions {
+                        hashin: &meta.hashin,
+                        spec: &spec,
+                        def: &def,
+                        force: opts.force,
+                        interactive: opts.interactive.clone(),
+                        shell: opts.shell,
+                    },
+                )
+                .await
             },
         )
         .await
@@ -541,8 +566,19 @@ impl Engine {
             .artifacts_from_local_cache(rs.ctoken(), def, opts.hashin.as_str(), outputs)
             .await?
         {
-            Some(res) => res,
-            None => return Ok(None),
+            // TODO(remote-cache): emit RemoteCache* here
+            Some(res) => {
+                rs.emit(crate::engine::event::BuildEventKind::LocalCacheHit {
+                    addr: def.target.addr.format(),
+                });
+                res
+            }
+            None => {
+                rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
+                    addr: def.target.addr.format(),
+                });
+                return Ok(None);
+            }
         };
 
         let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
@@ -1660,6 +1696,221 @@ mod tests {
             err.downcast_ref::<CycleError>().is_some(),
             "expected CycleError, got: {err:#}"
         );
+        Ok(())
+    }
+
+    use crate::engine::event::{BuildEvent, BuildEventKind};
+
+    fn static_target_run(addr: &str, run: &str) -> pluginstatictarget::Target {
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            run: Some(run.to_string()),
+            out: HashMap::new(),
+            codegen: None,
+            deps: HashMap::new(),
+            labels: vec![],
+        }
+    }
+
+    /// Engine + the `TempDir` backing its `home`/cache. The caller must hold the
+    /// returned `TempDir` alive for the duration of the test so the on-disk cache
+    /// survives across resolves (warm-cache assertions read it back).
+    fn engine_with_home(
+        targets: Vec<pluginstatictarget::Target>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
+        let provider = pluginstatictarget::Provider::new(targets)?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
+    }
+
+    /// Resolve `addr` with a fresh event-collecting `RequestState`, then drop the
+    /// state (closing the sender) and drain every emitted event.
+    async fn resolve_collecting_events(
+        engine: &Arc<Engine>,
+        addr: &Addr,
+    ) -> (anyhow::Result<Arc<EResult>>, Vec<BuildEvent>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        let res = engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await;
+        drop(rs);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        (res, events)
+    }
+
+    #[tokio::test]
+    async fn emits_result_execute_and_cache_miss_for_fresh_target() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("fresh target must resolve");
+
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ResultStart { addr } if addr == "//pkg:a")
+            ),
+            "expected ResultStart, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::ExecuteStart { addr, driver, cache }
+                    if addr == "//pkg:a" && driver == "exec" && *cache
+            )),
+            "expected ExecuteStart{{driver:exec, cache:true}}, got {events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::LocalCacheMiss { addr } if addr == "//pkg:a")
+            ),
+            "expected LocalCacheMiss, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::ExecuteEnd { addr, error: None } if addr == "//pkg:a"
+            )),
+            "expected ExecuteEnd{{error:None}}, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::ResultEnd { addr, error: None } if addr == "//pkg:a"
+            )),
+            "expected ResultEnd{{error:None}}, got {events:?}"
+        );
+
+        // Server-stamped: every event carries a non-zero wall-clock timestamp.
+        for e in &events {
+            assert!(e.at_unix_ms > 0, "event missing at_unix_ms stamp: {e:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warm_cache_emits_local_cache_hit_and_no_execute() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+
+        // First resolve populates the cache (same engine ⇒ same home/cache).
+        let (first, _) = resolve_collecting_events(&engine, &addr).await;
+        first.expect("first resolve must succeed");
+
+        // Second resolve on the same engine must hit the local cache.
+        let (second, events) = resolve_collecting_events(&engine, &addr).await;
+        second.expect("second resolve must succeed");
+
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::LocalCacheHit { addr } if addr == "//pkg:a")
+            ),
+            "warm resolve must emit LocalCacheHit, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, BuildEventKind::ExecuteStart { .. })),
+            "warm resolve must not re-execute (no ExecuteStart), got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, BuildEventKind::ExecuteEnd { .. })),
+            "warm resolve must not re-execute (no ExecuteEnd), got {events:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failing_target_carries_error_in_execute_and_result_end() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "false")])?;
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        assert!(res.is_err(), "run:false target must fail");
+
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::ExecuteEnd { addr, error: Some(_) } if addr == "//pkg:a"
+            )),
+            "ExecuteEnd must carry the error (drop-guard on ? path), got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::ResultEnd { addr, error: Some(_) } if addr == "//pkg:a"
+            )),
+            "ResultEnd must carry the error, got {events:?}"
+        );
+        for e in &events {
+            assert!(e.at_unix_ms > 0, "event missing at_unix_ms stamp: {e:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn result_emits_matched_with_resolved_set() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![
+            static_target_run("//pkg:a", "true"),
+            static_target_run("//pkg:b", "true"),
+        ])?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        let batch = engine
+            .clone()
+            .result(
+                rs.clone(),
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await?;
+        assert_eq!(batch.ok.len(), 2);
+        drop(rs);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // The matched set streams incrementally (one event per match) and is
+        // followed by a final `complete` marker.
+        let mut matched: Vec<String> = Vec::new();
+        let mut saw_complete = false;
+        for e in &events {
+            if let BuildEventKind::Matched { addrs, complete } = &e.kind {
+                matched.extend(addrs.iter().cloned());
+                saw_complete |= *complete;
+            }
+        }
+        assert!(
+            saw_complete,
+            "result must emit a final complete Matched event"
+        );
+        assert_eq!(matched.len(), 2, "matched set: {matched:?}");
+        assert!(matched.contains(&"//pkg:a".to_string()), "{matched:?}");
+        assert!(matched.contains(&"//pkg:b".to_string()), "{matched:?}");
         Ok(())
     }
 }

@@ -185,6 +185,10 @@ pub struct RequestStateData {
     /// short-circuiting on the first error; errors are aggregated into a
     /// `MultiError`. Defaults to true (current behavior).
     pub fail_fast: bool,
+    /// Optional one-way build-progress event stream. Lives in the shared
+    /// `Arc<RequestStateData>`, so `with_parent` / `with_skip_provider` children
+    /// inherit it for free.
+    pub events: Option<crate::engine::event::EventSender>,
 }
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
@@ -207,6 +211,23 @@ impl RequestState {
 
     pub fn fail_fast(&self) -> bool {
         self.data.fail_fast
+    }
+
+    /// Stamp the server timestamp on `kind` and emit it on the event stream, if any.
+    pub fn emit(&self, kind: crate::engine::event::BuildEventKind) {
+        if let Some(tx) = &self.data.events {
+            // A closed receiver (consumer gone) is expected; events are
+            // best-effort, so dropping the send result is intentional.
+            drop(tx.send(crate::engine::event::BuildEvent {
+                at_unix_ms: crate::engine::event::now_unix_ms(),
+                kind,
+            }));
+        }
+    }
+
+    /// Hands a cloned sender to `emit_scope`'s drop-guard.
+    pub(crate) fn events_sender(&self) -> Option<crate::engine::event::EventSender> {
+        self.data.events.clone()
     }
 
     /// Returns a child RequestState sharing the same data but with a new parent.
@@ -247,6 +268,14 @@ impl Engine {
     }
 
     pub fn new_state_with_fail_fast(self: &Arc<Self>, fail_fast: bool) -> Arc<RequestState> {
+        self.new_state_with_events(fail_fast, None)
+    }
+
+    pub fn new_state_with_events(
+        self: &Arc<Self>,
+        fail_fast: bool,
+        events: Option<crate::engine::event::EventSender>,
+    ) -> Arc<RequestState> {
         let request_id = "".to_string();
         let data = Arc::new(RequestStateData {
             engine: Arc::downgrade(self),
@@ -263,6 +292,7 @@ impl Engine {
             mem_probe: Memoizer::with_tag("probe"),
             mem_probe_inner: Memoizer::with_tag("probe_inner"),
             fail_fast,
+            events,
         });
 
         let state = Arc::new(RequestState {

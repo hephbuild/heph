@@ -22,17 +22,24 @@ struct HashoutApp {
 #[async_trait]
 impl App for HashoutApp {
     type Output = ();
+    type TuiView = crate::tui::TuiProgressView;
+    type CiView = crate::tui::CiProgressView;
 
-    fn label(&self) -> String {
-        format!("Hashout {}", self.addr.format())
+    fn tui_view(&self) -> Self::TuiView {
+        crate::tui::TuiProgressView::new(format!("Hashout {}", self.addr.format()))
+    }
+
+    fn ci_view(&self) -> Self::CiView {
+        crate::tui::CiProgressView::new(format!("Hashout {}", self.addr.format()))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
+        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
         let res = self
             .engine
             .clone()
             .result_addr(
-                self.engine.new_state(),
+                rs,
                 &self.addr,
                 OutputMatcher::None,
                 &ResultOptions::default(),
