@@ -37,7 +37,7 @@ const WORKERS_PER_CELL: usize = 8;
 /// Glyph for a cell with N busy workers, indexed by N (0..=8). Index 0 is the
 /// empty/idle cell (the caller paints it grey); the lit progression follows the
 /// pinned UI rule `⠁ ⠃ ⠇ ⠧ ⠷ ⠿ … ⣿` with the 7-dot step filled in.
-const BRAILLE_FILL: [char; WORKERS_PER_CELL + 1] = ['⣿', '⠁', '⠃', '⠇', '⠧', '⠷', '⠿', '⡿', '⣿'];
+const BRAILLE_FILL: [char; WORKERS_PER_CELL + 1] = ['⣿', '⠁', '⠃', '⠇', '⡇', '⣇', '⣧', '⣷', '⣿'];
 
 /// Banner scroll cadence: advance one column every this many milliseconds.
 const SCROLL_MS: u64 = 150;
@@ -64,13 +64,22 @@ fn worker_spans(max_workers: usize, busy: usize) -> Vec<Span<'static>> {
         let cell_start = c * WORKERS_PER_CELL;
         let cap = (max_workers - cell_start).min(WORKERS_PER_CELL);
         let busy_here = busy.saturating_sub(cell_start).min(cap);
-        let glyph = BRAILLE_FILL.get(busy_here).copied().unwrap_or('⣿');
-        let style = if busy_here == 0 {
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM)
+        let (glyph, style) = if busy_here == 0 {
+            // Idle cell: grey outline of the *available* slots in this cell, so a
+            // partial trailing cell (e.g. 2 of 8) shows only its real worker count
+            // (⠃) instead of a full ⣿ that overstates capacity. A full cell uses
+            // cap == 8 ⇒ ⣿, unchanged.
+            (
+                BRAILLE_FILL.get(cap).copied().unwrap_or('⣿'),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )
         } else {
-            Style::default().fg(Color::Blue)
+            (
+                BRAILLE_FILL.get(busy_here).copied().unwrap_or('⣿'),
+                Style::default().fg(Color::Blue),
+            )
         };
         spans.push(Span::styled(glyph.to_string(), style));
     }
@@ -1038,7 +1047,7 @@ mod tests {
         };
         assert_eq!(glyph(0), "⣿"); // idle (painted grey by caller)
         assert_eq!(glyph(1), "⠁");
-        assert_eq!(glyph(6), "⠿");
+        assert_eq!(glyph(6), "⣧");
         assert_eq!(glyph(8), "⣿");
 
         // Idle cell is dim dark grey, busy cell is blue.
@@ -1051,11 +1060,31 @@ mod tests {
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].content, "⣿");
         assert_eq!(cells[1].content, "⠃");
-        // With only 8 busy, the first cell is full and the second is idle.
+        // With only 8 busy, the first cell is full (blue) and the second is idle.
+        // The idle trailing cell shows only its real capacity (2 → ⠃ grey), not a
+        // full ⣿ that would misread as 8 more workers.
         let partial = worker_spans(10, 8);
         assert_eq!(partial[0].content, "⣿");
-        assert_eq!(partial[1].content, "⣿");
+        assert_eq!(partial[1].content, "⠃");
         assert_eq!(partial[1].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn worker_spans_render_full_capacity_when_all_idle() {
+        // 10 workers, none busy: two grey cells totalling 10 slots (8 + 2), not
+        // two full ⣿ cells (which would read as 16).
+        let idle = worker_spans(10, 0);
+        assert_eq!(idle.len(), 2);
+        assert_eq!(idle[0].content, "⣿"); // full cell: 8 slots
+        assert_eq!(idle[1].content, "⠃"); // partial cell: 2 slots
+        assert!(idle.iter().all(|c| c.style.fg == Some(Color::DarkGray)));
+
+        // 3 busy: first cell shows 3 blue dots, trailing cell stays 2 grey.
+        let active = worker_spans(10, 3);
+        assert_eq!(active[0].content, "⠇");
+        assert_eq!(active[0].style.fg, Some(Color::Blue));
+        assert_eq!(active[1].content, "⠃");
+        assert_eq!(active[1].style.fg, Some(Color::DarkGray));
     }
 
     #[test]
