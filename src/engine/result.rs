@@ -272,6 +272,18 @@ impl Engine {
         // makes the dep recursion below a no-op.
         rs.announce_max_workers(self.max_workers);
 
+        // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
+        // claim the matched stream and emit the set-of-one as already-complete
+        // (no `~`). The once-guard keeps this silent for dep recursion and for
+        // result_addr calls under a batch `result` (which already claimed) — only
+        // a genuine top-level single addr wins the claim here.
+        if rs.claim_matched_stream() {
+            rs.emit(crate::engine::event::BuildEventKind::Matched {
+                addrs: vec![addr.format()],
+                complete: true,
+            });
+        }
+
         // Cycle check: fires for every caller (including those awaiting an in-flight future)
         // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
         if let Some(ref parent) = rs.parent {
@@ -357,6 +369,11 @@ impl Engine {
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
 
+        // Only the first/top-level `result` streams the matched set. Inner
+        // invocations sharing this request's data stay silent — re-emitting
+        // would inflate the client's matched count and trip `complete` early.
+        let owns_matched = rs.claim_matched_stream();
+
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
@@ -367,10 +384,12 @@ impl Engine {
             }
             // Announce each match as it resolves so the client can render a
             // provisional "done X / ~N" that grows while the matcher streams.
-            rs.emit(crate::engine::event::BuildEventKind::Matched {
-                addrs: vec![addr.format()],
-                complete: false,
-            });
+            if owns_matched {
+                rs.emit(crate::engine::event::BuildEventKind::Matched {
+                    addrs: vec![addr.format()],
+                    complete: false,
+                });
+            }
             crate::hmemoizer::join_set_spawn(
                 &mut set,
                 enclose!((self => engine, rs, opts, addr) async move {
@@ -380,10 +399,12 @@ impl Engine {
             );
         }
         // Matcher fully resolved: mark the matched set final (drops the `~`).
-        rs.emit(crate::engine::event::BuildEventKind::Matched {
-            addrs: Vec::new(),
-            complete: true,
-        });
+        if owns_matched {
+            rs.emit(crate::engine::event::BuildEventKind::Matched {
+                addrs: Vec::new(),
+                complete: true,
+            });
+        }
 
         let mut ok: Vec<Arc<EResult>> = vec![];
         let mut errors: Vec<(Addr, anyhow::Error)> = vec![];
@@ -2086,6 +2107,84 @@ mod tests {
         assert_eq!(matched.len(), 2, "matched set: {matched:?}");
         assert!(matched.contains(&"//pkg:a".to_string()), "{matched:?}");
         assert!(matched.contains(&"//pkg:b".to_string()), "{matched:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_addr_result_addr_emits_matched_complete() -> anyhow::Result<()> {
+        // The single-addr entry (run of one addr) goes straight to
+        // `result_addr`, which must announce the set-of-one as complete.
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        engine
+            .clone()
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &ResultOptions::default())
+            .await?;
+        drop(rs);
+
+        let mut matched: Vec<String> = Vec::new();
+        let mut saw_complete = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let BuildEventKind::Matched { addrs, complete } = &ev.kind {
+                matched.extend(addrs.iter().cloned());
+                saw_complete |= *complete;
+            }
+        }
+        assert!(saw_complete, "single-addr must emit complete Matched");
+        assert_eq!(matched, vec!["//pkg:a".to_string()], "matched: {matched:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inner_result_does_not_re_emit_matched() -> anyhow::Result<()> {
+        // Only the first/top-level `result` owns the matched stream. A second
+        // `result` sharing the same request data (the "inner" case) must stay
+        // silent so it can't inflate the matched count or trip `complete`.
+        let (engine, _home) = engine_with_home(vec![
+            static_target_run("//pkg:a", "true"),
+            static_target_run("//pkg:b", "true"),
+        ])?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+
+        // First call claims the stream and emits Matched.
+        engine
+            .clone()
+            .result(
+                rs.clone(),
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await?;
+
+        // Drain everything the first call emitted.
+        while rx.try_recv().is_ok() {}
+
+        // Second call on the same request data must not emit any Matched event.
+        engine
+            .clone()
+            .result(
+                rs.clone(),
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await?;
+        drop(rs);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, BuildEventKind::Matched { .. })),
+            "inner result must not emit Matched, got {events:?}"
+        );
         Ok(())
     }
 }

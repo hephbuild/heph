@@ -192,6 +192,12 @@ pub struct RequestStateData {
     /// Guards the one-shot `MaxWorkers` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
+    /// Guards the `Matched` stream so only the first/top-level `result` (or the
+    /// single-addr entry in `run`) announces the matched set. Inner `result`
+    /// invocations sharing this request's data must stay silent — re-emitting
+    /// would inflate the client's matched denominator and prematurely flip its
+    /// `complete` marker.
+    pub matched_announced: std::sync::atomic::AtomicBool,
     /// Fire-and-forget sandbox cleanups enqueued by this request but not yet
     /// finished (queued + in-flight on the global cleaner thread). Carried into
     /// each cleanup job so the cleaner decrements it on completion; the shutdown
@@ -250,6 +256,17 @@ impl RequestState {
         {
             self.emit(crate::engine::event::BuildEventKind::MaxWorkers { count });
         }
+    }
+
+    /// Claims ownership of the `Matched` stream for the calling `result`
+    /// invocation. Returns `true` exactly once per request (for the first/
+    /// top-level call); every later call — including inner `result`s sharing
+    /// this request's data — gets `false` and must not emit `Matched`.
+    pub fn claim_matched_stream(&self) -> bool {
+        !self
+            .data
+            .matched_announced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hands a cloned sender to `emit_scope`'s drop-guard.
@@ -333,6 +350,7 @@ impl Engine {
             fail_fast,
             events,
             workers_announced: std::sync::atomic::AtomicBool::new(false),
+            matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending,
         });
 

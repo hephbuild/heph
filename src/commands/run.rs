@@ -113,12 +113,6 @@ impl App for RunApp {
 
         let (result, failures) = match self.matcher {
             Matcher::Addr(addr) => {
-                // Single top-level target: the matched set of one is known
-                // immediately, so emit it as already-complete (no `~`).
-                rs.emit(crate::engine::event::BuildEventKind::Matched {
-                    addrs: vec![addr.format()],
-                    complete: true,
-                });
                 let r = self
                     .engine
                     .clone()
