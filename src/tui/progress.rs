@@ -105,6 +105,16 @@ fn human_elapsed(ms: u64) -> String {
     format!("{s:>ELAPSED_MIN_WIDTH$}")
 }
 
+/// Like [`human_elapsed`] but the sub-minute band keeps millisecond precision
+/// (`12.345s`). Used by the final report where the live flicker concern that
+/// drives [`human_elapsed`]'s coarse seconds band does not apply.
+fn human_elapsed_ms(ms: u64) -> String {
+    if ms / 1000 < 60 {
+        return format!("{}.{:03}s", ms / 1000, ms % 1000);
+    }
+    human_elapsed(ms)
+}
+
 /// A `window`-wide view of `label` scrolled like a banner: the text plus a
 /// 3-space gap, cycled, sampled at a time-derived offset. Wraps seamlessly.
 fn banner_slice(label: &str, window: usize, now_ms: u64) -> String {
@@ -581,7 +591,7 @@ impl TUIAppView for TuiProgressView {
         if !self.core.state.has_activity() {
             return;
         }
-        let elapsed = human_elapsed(
+        let elapsed = human_elapsed_ms(
             self.core
                 .state
                 .elapsed_ms(crate::engine::event::now_unix_ms()),
@@ -1012,6 +1022,15 @@ mod tests {
         assert!(human_elapsed(65_000).contains("1m05s"));
         assert!(human_elapsed(3_725_000).contains("1h02m"));
         assert!(human_elapsed(90_000_000).contains("1d01h"));
+    }
+
+    #[test]
+    fn human_elapsed_ms_keeps_millis_under_a_minute() {
+        assert_eq!(human_elapsed_ms(9_123), "9.123s");
+        assert_eq!(human_elapsed_ms(59_007), "59.007s");
+        assert_eq!(human_elapsed_ms(500), "0.500s");
+        // Past a minute it falls back to the coarse seconds band.
+        assert_eq!(human_elapsed_ms(65_000), human_elapsed(65_000));
     }
 
     #[test]
