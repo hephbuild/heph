@@ -60,6 +60,11 @@ pub struct Engine {
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
     pub home: PathBuf,
     pub(crate) result_semaphore: Arc<Semaphore>,
+    /// Maximum concurrent executes (the `result_semaphore` permit count). Cached
+    /// here so it can be announced to clients via a `MaxWorkers` build event
+    /// without reaching into the semaphore (whose live `available_permits` only
+    /// reflects the *free* count, not the configured max).
+    pub(crate) max_workers: usize,
 
     pub(crate) provider_factories: HashMap<String, ProviderFactory>,
     pub(crate) driver_factories: HashMap<String, DriverFactory>,
@@ -291,6 +296,8 @@ impl Engine {
 
         let fuse = Arc::new(EngineFuse::new(cfg.fuse, &home)?);
 
+        let max_workers = 2 * parallelism;
+
         let mut engine = Engine {
             cfg: cfg.clone(),
             home: home.clone(),
@@ -300,7 +307,8 @@ impl Engine {
             drivers: vec![],
             drivers_by_name: HashMap::new(),
             requests: Mutex::new(HashMap::new()),
-            result_semaphore: Arc::new(Semaphore::new(2 * parallelism)),
+            result_semaphore: Arc::new(Semaphore::new(max_workers)),
+            max_workers,
             provider_factories: HashMap::new(),
             driver_factories: HashMap::new(),
             managed_driver_factories: HashMap::new(),

@@ -189,6 +189,9 @@ pub struct RequestStateData {
     /// `Arc<RequestStateData>`, so `with_parent` / `with_skip_provider` children
     /// inherit it for free.
     pub events: Option<crate::engine::event::EventSender>,
+    /// Guards the one-shot `MaxWorkers` announcement so it fires once per request
+    /// regardless of which entry point (`result` / `result_addr`) is hit first.
+    pub workers_announced: std::sync::atomic::AtomicBool,
 }
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
@@ -222,6 +225,19 @@ impl RequestState {
                 at_unix_ms: crate::engine::event::now_unix_ms(),
                 kind,
             }));
+        }
+    }
+
+    /// Emit the `MaxWorkers` capacity event at most once per request. Safe to
+    /// call from every top-level entry point (`result`, `result_addr`); only the
+    /// first call emits, so dep recursion never re-announces.
+    pub fn announce_max_workers(&self, count: usize) {
+        if !self
+            .data
+            .workers_announced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.emit(crate::engine::event::BuildEventKind::MaxWorkers { count });
         }
     }
 
@@ -293,6 +309,7 @@ impl Engine {
             mem_probe_inner: Memoizer::with_tag("probe_inner"),
             fail_fast,
             events,
+            workers_announced: std::sync::atomic::AtomicBool::new(false),
         });
 
         let state = Arc::new(RequestState {

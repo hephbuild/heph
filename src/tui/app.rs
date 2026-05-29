@@ -136,8 +136,9 @@ pub trait TUIAppView: Send {
     fn rows(&self) -> u16;
 
     /// The lines for the pinned viewport, including the spinner row built from
-    /// `spinner`. Called every render tick.
-    fn render(&self, spinner: &str, now_ms: u64) -> Vec<Line<'static>>;
+    /// `spinner`. Called every render tick. `width` is the current terminal
+    /// column count, so the view can size borders and scroll long labels.
+    fn render(&self, spinner: &str, now_ms: u64, width: u16) -> Vec<Line<'static>>;
 
     /// After the live viewport is torn down, render a final build summary
     /// directly to the terminal (stderr) so it persists in scrollback. NOT

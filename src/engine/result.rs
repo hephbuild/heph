@@ -258,6 +258,11 @@ impl Engine {
             anyhow::bail!("cannot use --shell in non-interactive mode");
         }
 
+        // Announce worker capacity once per request. Covers the single-target
+        // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
+        // makes the dep recursion below a no-op.
+        rs.announce_max_workers(self.max_workers);
+
         // Cycle check: fires for every caller (including those awaiting an in-flight future)
         // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
         if let Some(ref parent) = rs.parent {
@@ -335,6 +340,10 @@ impl Engine {
         if !matches!(matcher, Matcher::Addr(_)) {
             opts.interactive = None;
         }
+
+        // Announce worker capacity up front so the client can paint a fixed
+        // worker-slot indicator before any execute lands.
+        rs.announce_max_workers(self.max_workers);
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -1804,6 +1813,33 @@ mod tests {
         for e in &events {
             assert!(e.at_unix_ms > 0, "event missing at_unix_ms stamp: {e:?}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_target_result_addr_announces_max_workers_once() -> anyhow::Result<()> {
+        // Regression: `run` of a single addr calls `result_addr` directly,
+        // bypassing `Engine::result`. The MaxWorkers announcement must still fire
+        // (so the TUI paints the worker indicator), and exactly once.
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("fresh target must resolve");
+
+        let max_workers: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                BuildEventKind::MaxWorkers { count } => Some(*count),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            max_workers.len(),
+            1,
+            "expected exactly one MaxWorkers event, got {events:?}"
+        );
+        assert!(max_workers[0] >= 1, "worker count must be positive");
         Ok(())
     }
 

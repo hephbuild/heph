@@ -8,13 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
 
 use crate::engine::event::{BuildEvent, BuildEventKind};
 use crate::tui::app::{CIAppView, TUIAppView};
 
-/// Total number of pinned viewport rows the progress block renders into.
-/// 1 spinner line + 1 summary line + up to [`MAX_LONG_RUNNING`] rows.
+/// Total number of pinned viewport rows the progress block renders into:
+/// 1 top border + [`MAX_LONG_RUNNING`] body rows + 1 bottom border.
 pub const PROGRESS_ROWS: u16 = 8;
 
 /// Maximum number of long-running target rows shown before collapsing the
@@ -23,6 +24,88 @@ pub const MAX_LONG_RUNNING: usize = 6;
 
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
+
+/// Display width the elapsed clock pads to once it leaves the seconds band.
+/// The seconds band renders natural (2–3 chars) so a fresh run starts compact;
+/// from a minute on it pads to this so the field only ever grows, never shrinks
+/// (e.g. `59m59s` → `1h00m` would otherwise lose a column and jitter the counts).
+const ELAPSED_MIN_WIDTH: usize = 6;
+
+/// One braille cell holds up to this many worker dots (8-dot braille).
+const WORKERS_PER_CELL: usize = 8;
+
+/// Glyph for a cell with N busy workers, indexed by N (0..=8). Index 0 is the
+/// empty/idle cell (the caller paints it grey); the lit progression follows the
+/// pinned UI rule `⠁ ⠃ ⠇ ⠧ ⠷ ⠿ … ⣿` with the 7-dot step filled in.
+const BRAILLE_FILL: [char; WORKERS_PER_CELL + 1] = ['⣿', '⠁', '⠃', '⠇', '⠧', '⠷', '⠿', '⡿', '⣿'];
+
+/// Banner scroll cadence: advance one column every this many milliseconds.
+const SCROLL_MS: u64 = 150;
+
+/// Below this width the box-drawing math has no room; we clamp up to it.
+const MIN_BOX_WIDTH: usize = 16;
+
+/// Visible column count of a span run. Every glyph we emit (box-drawing,
+/// braille, ASCII, `·`) is single-width, so a char count is exact.
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// One braille cell per group of [`WORKERS_PER_CELL`] worker slots. Busy slots
+/// fill left-to-right across cells; an all-idle cell is dim grey, any-busy cell
+/// is blue at the glyph matching its busy count.
+fn worker_spans(max_workers: usize, busy: usize) -> Vec<Span<'static>> {
+    if max_workers == 0 {
+        return Vec::new();
+    }
+    let cells = max_workers.div_ceil(WORKERS_PER_CELL);
+    let mut spans = Vec::with_capacity(cells);
+    for c in 0..cells {
+        let cell_start = c * WORKERS_PER_CELL;
+        let cap = (max_workers - cell_start).min(WORKERS_PER_CELL);
+        let busy_here = busy.saturating_sub(cell_start).min(cap);
+        let glyph = BRAILLE_FILL.get(busy_here).copied().unwrap_or('⣿');
+        let style = if busy_here == 0 {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::Blue)
+        };
+        spans.push(Span::styled(glyph.to_string(), style));
+    }
+    spans
+}
+
+/// Compact, human-friendly elapsed time. Precision is indicative only — the
+/// coarsest two units are shown: `12s`, `1m05s`, `1h05m`, `2d03h`. The seconds
+/// band is natural width (compact start); everything past a minute is padded to
+/// [`ELAPSED_MIN_WIDTH`] so the field grows monotonically and never flickers.
+fn human_elapsed(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let s = if secs < 3_600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else if secs < 86_400 {
+        format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60)
+    } else {
+        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3_600)
+    };
+    format!("{s:>ELAPSED_MIN_WIDTH$}")
+}
+
+/// A `window`-wide view of `label` scrolled like a banner: the text plus a
+/// 3-space gap, cycled, sampled at a time-derived offset. Wraps seamlessly.
+fn banner_slice(label: &str, window: usize, now_ms: u64) -> String {
+    let cycle: Vec<char> = label.chars().chain("   ".chars()).collect();
+    let cyc_len = cycle.len().max(1);
+    let offset = (now_ms / SCROLL_MS) as usize % cyc_len;
+    (0..window)
+        .map(|i| cycle.get((offset + i) % cyc_len).copied().unwrap_or(' '))
+        .collect()
+}
 
 /// Folds the engine's build-progress event stream into renderable state.
 #[derive(Debug, Default)]
@@ -44,10 +127,19 @@ pub struct BuildState {
     finished: HashSet<String>,
     completed: usize,
     errored: usize,
+    /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
+    /// Distinct from `completed`, which includes cache hits that never executed.
+    built: usize,
     local_hits: usize,
     local_misses: usize,
     remote_hits: usize,
     remote_misses: usize,
+    /// Worker capacity announced by the engine via `MaxWorkers`. `None` until
+    /// the event lands (no worker indicator rendered before then).
+    max_workers: Option<usize>,
+    /// Server timestamp of the first event seen — the run's start anchor for the
+    /// header's elapsed clock. `None` until any event lands.
+    started_at_ms: Option<u64>,
 }
 
 impl BuildState {
@@ -61,7 +153,15 @@ impl BuildState {
     /// double-fire: `ResultStart` inserts only if absent, and a second
     /// `ResultEnd` for an already-removed addr is a no-op.
     pub fn apply(&mut self, ev: &BuildEvent) {
+        // Anchor the elapsed clock to the earliest event observed.
+        self.started_at_ms = Some(match self.started_at_ms {
+            Some(t) => t.min(ev.at_unix_ms),
+            None => ev.at_unix_ms,
+        });
         match &ev.kind {
+            BuildEventKind::MaxWorkers { count } => {
+                self.max_workers = Some(*count);
+            }
             BuildEventKind::Matched { addrs, complete } => {
                 self.matched_seen = true;
                 self.matched.extend(addrs.iter().cloned());
@@ -88,8 +188,11 @@ impl BuildState {
             BuildEventKind::ExecuteStart { addr, .. } => {
                 self.executing.insert(addr.clone(), ev.at_unix_ms);
             }
-            BuildEventKind::ExecuteEnd { addr, .. } => {
+            BuildEventKind::ExecuteEnd { addr, error } => {
                 self.executing.remove(addr);
+                if error.is_none() {
+                    self.built += 1;
+                }
             }
             BuildEventKind::LocalCacheHit { .. } => self.local_hits += 1,
             BuildEventKind::LocalCacheMiss { .. } => self.local_misses += 1,
@@ -119,6 +222,55 @@ impl BuildState {
     /// matcher fully resolves). `None` if no `Matched` event has arrived.
     pub fn matched_total(&self) -> Option<usize> {
         self.matched_seen.then_some(self.matched.len())
+    }
+
+    /// Matched-target progress as `(done, total, complete)`: how many matched
+    /// top-level targets have finished, the total matched so far, and whether the
+    /// matcher fully resolved (`false` ⇒ the total is provisional). `None` until
+    /// a `Matched` event arrives (e.g. a single-target `result_addr` entry).
+    pub fn matched_progress(&self) -> Option<(usize, usize, bool)> {
+        if !self.matched_seen {
+            return None;
+        }
+        let done = self
+            .matched
+            .iter()
+            .filter(|a| self.finished.contains(*a))
+            .count();
+        Some((done, self.matched.len(), self.matched_complete))
+    }
+
+    /// Header counts, in render order: `(built, cached, running, failed)`.
+    /// `built` is targets whose driver actually ran; `cached` is cache hits
+    /// (local + remote); `running` is in-flight results; `failed` is errors.
+    pub fn header_counts(&self) -> (usize, usize, usize, usize) {
+        let cached = self.local_hits + self.remote_hits;
+        (
+            self.built,
+            cached,
+            self.in_flight_results.len(),
+            self.errored,
+        )
+    }
+
+    /// Workers currently holding an execute slot (targets mid-`Execute`). This is
+    /// the semaphore-bound busy count, not `running` (which includes targets
+    /// blocked on deps without a permit).
+    pub fn busy_workers(&self) -> usize {
+        self.executing.len()
+    }
+
+    /// Announced worker capacity, or `None` before the `MaxWorkers` event.
+    pub fn max_workers(&self) -> Option<usize> {
+        self.max_workers
+    }
+
+    /// Milliseconds since the first observed event, given the caller's wall
+    /// clock. `0` before any event has been seen.
+    pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
+        self.started_at_ms
+            .map(|start| now_ms.saturating_sub(start))
+            .unwrap_or(0)
     }
 
     /// Whether any build activity was observed. Used to suppress an all-zero
@@ -233,6 +385,78 @@ impl TuiProgressView {
             core: ProgressCore::new(label),
         }
     }
+
+    /// The rounded top border:
+    /// `╭─ 1m05s · D / N done · N cached · N failed · <workers> ──────╮`.
+    /// The leading field is the elapsed-time clock. "done" shows matched progress
+    /// `done / total` (total prefixed `~` while the matcher is still resolving),
+    /// falling back to the executed count before any match streams. The "running"
+    /// count is omitted — the worker braille (flush right) conveys concurrency.
+    fn header_line(&self, now_ms: u64, width: u16) -> Line<'static> {
+        let width = usize::from(width).max(MIN_BOX_WIDTH);
+        let (built, cached, _running, failed) = self.core.state.header_counts();
+        let busy = self.core.state.busy_workers();
+        let max_workers = self.core.state.max_workers().unwrap_or(0);
+        let elapsed = human_elapsed(self.core.state.elapsed_ms(now_ms));
+
+        let done = match self.core.state.matched_progress() {
+            Some((done, total, complete)) => {
+                let tilde = if complete { "" } else { "~" };
+                format!("{done} / {tilde}{total} done")
+            }
+            None => format!("{built} done"),
+        };
+
+        let mut left: Vec<Span<'static>> = Vec::with_capacity(5);
+        left.push(Span::raw("╭─ "));
+        left.push(Span::from(elapsed).bold());
+        left.push(Span::raw(format!(
+            " · {done} · {cached} cached · {failed} failed"
+        )));
+        // Worker braille sits after the failed count, separated by " · ".
+        let workers = worker_spans(max_workers, busy);
+        if !workers.is_empty() {
+            left.push(Span::raw(" · "));
+            left.extend(workers);
+        }
+        // Space between the counts and the dash fill.
+        left.push(Span::raw(" "));
+
+        let left_w = spans_width(&left);
+        // Trailing "─╮" closes the border.
+        let fill = width.saturating_sub(left_w + 2);
+
+        let mut spans = left;
+        spans.push(Span::raw("─".repeat(fill)));
+        spans.push(Span::raw("─╮"));
+        Line::from(spans)
+    }
+
+    /// The rounded bottom border: `╰─── <label> ────…────╯`. The label is left
+    /// after a `─── ` lead-in; if it overruns the available span it scrolls like
+    /// a banner. Total visible width always equals `width`.
+    fn bottom_line(&self, now_ms: u64, width: u16) -> Line<'static> {
+        let width = usize::from(width).max(MIN_BOX_WIDTH);
+        // "╰─── " (5) + window + "─╯" (2) == width  ⇒  window = width - 7.
+        let window = width.saturating_sub(7);
+        let label = &self.core.label;
+        let label_len = label.chars().count();
+
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+        spans.push(Span::raw("╰─── "));
+        if label_len <= window {
+            spans.push(Span::raw(label.clone()));
+            let pad = window - label_len;
+            if pad >= 1 {
+                spans.push(Span::raw(" "));
+                spans.push(Span::raw("─".repeat(pad - 1)));
+            }
+        } else if window > 0 {
+            spans.push(Span::raw(banner_slice(label, window, now_ms)));
+        }
+        spans.push(Span::raw("─╯"));
+        Line::from(spans)
+    }
 }
 
 impl TUIAppView for TuiProgressView {
@@ -244,20 +468,32 @@ impl TUIAppView for TuiProgressView {
         PROGRESS_ROWS
     }
 
-    /// Layout (top to bottom):
+    /// Layout (top to bottom), a rounded box pinned to [`PROGRESS_ROWS`]:
     /// ```text
-    /// <spinner> <summary>
-    /// <slow rows...>
-    /// <label>
+    /// ╭─ rheph · N built · N cached · N running · N failed ──── <workers> ─╮
+    ///   <slow rows...>            (padded to keep the box a fixed height)
+    /// ╰─── <label> ───────────────────────────────────────────────────────╯
     /// ```
-    fn render(&self, spinner: &str, now_ms: u64) -> Vec<Line<'static>> {
+    /// The `spinner` is unused — liveness is conveyed by the worker braille and
+    /// the scrolling label.
+    fn render(&self, _spinner: &str, now_ms: u64, width: u16) -> Vec<Line<'static>> {
+        let body_rows = usize::from(PROGRESS_ROWS) - 2;
         let mut lines = Vec::with_capacity(usize::from(PROGRESS_ROWS));
-        lines.push(Line::from(format!(
-            "{spinner} {}",
-            self.core.state.summary()
-        )));
-        lines.extend(self.core.state.long_running_lines(now_ms));
-        lines.push(Line::from(self.core.label.clone()));
+        lines.push(self.header_line(now_ms, width));
+        for line in self
+            .core
+            .state
+            .long_running_lines(now_ms)
+            .into_iter()
+            .take(body_rows)
+        {
+            lines.push(line);
+        }
+        // Pad the body so the bottom border always pins to the last row.
+        while lines.len() < body_rows + 1 {
+            lines.push(Line::from(""));
+        }
+        lines.push(self.bottom_line(now_ms, width));
         lines
     }
 
@@ -450,34 +686,121 @@ mod tests {
         assert!(s.long_running(10_000, 5_000).is_empty());
     }
 
+    fn max_workers(count: usize) -> BuildEventKind {
+        BuildEventKind::MaxWorkers { count }
+    }
+
     #[test]
-    fn tui_view_layout_spinner_summary_slow_label() {
+    fn tui_view_box_layout_header_body_label() {
         let mut v = TuiProgressView::new("Running //a:b");
         v.apply(&ev(0, execute_start("//slow:x")));
-        let lines = v.render("⠋", 10_000);
+        let lines = v.render("⠋", 10_000, 80);
 
-        // Row 1: spinner + summary (not the label).
+        // Always a fixed-height box.
+        assert_eq!(lines.len(), usize::from(PROGRESS_ROWS));
+
+        // Top border: rounded corners + title, not the label.
         let header = format!("{}", lines.first().expect("header line"));
-        assert!(header.contains("⠋"), "header: {header}");
-        assert!(
-            header.contains("done 0"),
-            "summary expected in header: {header}"
-        );
-        assert!(
-            !header.contains("Running //a:b"),
-            "label must not be in the header: {header}"
-        );
+        assert!(header.starts_with("╭─"), "header: {header}");
+        assert!(header.ends_with('╮'), "header: {header}");
+        // Leading field is the elapsed clock (10s after the start anchor at t=0).
+        assert!(header.contains("10s"), "header: {header}");
+        assert!(!header.contains("Running //a:b"), "header: {header}");
 
-        // Last row: the label.
-        let last = format!("{}", lines.last().expect("label line"));
-        assert_eq!(last, "Running //a:b");
+        // Bottom border: rounded corners + the label.
+        let footer = format!("{}", lines.last().expect("footer line"));
+        assert!(footer.starts_with("╰─"), "footer: {footer}");
+        assert!(footer.ends_with('╯'), "footer: {footer}");
+        assert!(footer.contains("Running //a:b"), "footer: {footer}");
 
-        // The slow block sits in between.
+        // The slow row sits in the body between the borders.
         assert!(
-            lines.iter().any(|l| format!("{l}").contains("//slow:x")),
-            "expected slow row, got {lines:?}"
+            lines[1..lines.len() - 1]
+                .iter()
+                .any(|l| format!("{l}").contains("//slow:x")),
+            "expected slow row in body, got {lines:?}"
         );
-        assert!(usize::from(v.rows()) >= lines.len());
+    }
+
+    #[test]
+    fn header_shows_built_cached_failed_counts_no_running() {
+        let mut v = TuiProgressView::new("L");
+        // One real build (execute end ok), one cache hit, one running, one failed.
+        v.apply(&ev(0, execute_start("//a:built")));
+        v.apply(&ev(1, execute_end("//a:built")));
+        v.apply(&ev(
+            2,
+            BuildEventKind::LocalCacheHit {
+                addr: "//a:cached".into(),
+            },
+        ));
+        v.apply(&ev(3, result_start("//a:running")));
+        v.apply(&ev(4, result_start("//a:failed")));
+        v.apply(&ev(5, result_end("//a:failed", Some("boom".into()))));
+
+        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        assert!(header.contains("1 done"), "{header}");
+        assert!(header.contains("1 cached"), "{header}");
+        assert!(header.contains("1 failed"), "{header}");
+        // The "running" count was dropped in favour of the worker braille.
+        assert!(!header.contains("running"), "{header}");
+        // A space separates the counts from the dash fill.
+        assert!(header.contains("failed "), "{header}");
+    }
+
+    #[test]
+    fn header_done_shows_matched_progress_with_provisional_marker() {
+        let mut v = TuiProgressView::new("L");
+        // Matcher still streaming: total is provisional (`~`).
+        v.apply(&ev(0, matched(&["//a:x", "//a:y", "//a:z"], false)));
+        v.apply(&ev(1, result_start("//a:x")));
+        v.apply(&ev(2, result_end("//a:x", None)));
+        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        assert!(header.contains("1 / ~3 done"), "{header}");
+
+        // Matcher resolves: the `~` drops.
+        v.apply(&ev(3, matched(&[], true)));
+        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        assert!(header.contains("1 / 3 done"), "{header}");
+        assert!(!header.contains('~'), "{header}");
+    }
+
+    #[test]
+    fn header_braille_sits_after_failed_count() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, max_workers(8)));
+        v.apply(&ev(1, execute_start("//a:b")));
+        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        // " · ⠁" appears after "failed".
+        let failed_at = header.find("failed").expect("failed in header");
+        let braille_at = header.find('⠁').expect("braille in header");
+        assert!(
+            braille_at > failed_at,
+            "braille must follow failed: {header}"
+        );
+        assert!(
+            header.contains("failed · "),
+            "separator before braille: {header}"
+        );
+    }
+
+    #[test]
+    fn max_workers_event_drives_worker_braille() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, max_workers(8)));
+        // One busy worker → first cell shows the 1-dot glyph, in the header.
+        v.apply(&ev(1, execute_start("//a:b")));
+        let header = format!("{}", v.render("⠋", 120, 120).first().expect("header"));
+        assert!(header.contains('⠁'), "expected 1-busy braille: {header}");
+    }
+
+    #[test]
+    fn no_worker_braille_before_max_workers_event() {
+        let v = TuiProgressView::new("L");
+        let header = format!("{}", v.render("⠋", 0, 120).first().expect("header"));
+        for g in ['⠁', '⠃', '⠇', '⠧', '⠷', '⠿', '⡿', '⣿'] {
+            assert!(!header.contains(g), "no braille expected: {header}");
+        }
     }
 
     #[test]
@@ -573,20 +896,106 @@ mod tests {
         for i in 0..20 {
             v.apply(&ev(0, execute_start(&format!("//pkg:t{i}"))));
         }
-        let lines = v.render("⠋", 10_000);
-        // Header + slow block (≤ MAX_LONG_RUNNING) + label ≤ PROGRESS_ROWS.
+        let lines = v.render("⠋", 10_000, 100);
+        // Fixed-height box: header + body + footer.
+        assert_eq!(lines.len(), usize::from(PROGRESS_ROWS));
+        // The footer carries the label.
+        let footer = format!("{}", lines.last().expect("footer line"));
+        assert!(footer.contains("Running //x:y"), "{footer}");
+        // The slow block overflowed, so a "+N more" collapse appears in the body.
         assert!(
-            lines.len() <= usize::from(PROGRESS_ROWS),
-            "render produced {} lines",
-            lines.len()
+            lines[1..lines.len() - 1]
+                .iter()
+                .any(|l| format!("{l}").contains("more")),
+            "expected collapse line in body, got {lines:?}"
         );
-        // The slow block overflowed, so a "+N more" collapse precedes the label.
-        let label = format!("{}", lines.last().expect("label line"));
-        assert_eq!(label, "Running //x:y");
-        let collapse = format!("{}", lines[lines.len() - 2]);
-        assert!(
-            collapse.contains("more"),
-            "expected collapse line, got {collapse}"
-        );
+    }
+
+    #[test]
+    fn human_elapsed_starts_compact_then_grows_monotonically() {
+        // Seconds band is natural width (compact start).
+        assert_eq!(human_elapsed(9_000), "9s");
+        assert_eq!(human_elapsed(59_000), "59s");
+        // Past a minute, width is padded so the field never shrinks.
+        for ms in [65_000, 3_600_000, 90_000_000] {
+            assert!(human_elapsed(ms).chars().count() >= ELAPSED_MIN_WIDTH);
+        }
+        // Width is non-decreasing as time advances across band boundaries.
+        let mut prev = 0usize;
+        for secs in [0u64, 30, 59, 60, 600, 3_599, 3_600, 86_399, 86_400] {
+            let w = human_elapsed(secs * 1_000).chars().count();
+            assert!(w >= prev, "width shrank at {secs}s: {prev} → {w}");
+            prev = w;
+        }
+        assert!(human_elapsed(65_000).contains("1m05s"));
+        assert!(human_elapsed(3_725_000).contains("1h02m"));
+        assert!(human_elapsed(90_000_000).contains("1d01h"));
+    }
+
+    #[test]
+    fn elapsed_anchors_to_first_event() {
+        let mut s = BuildState::new();
+        assert_eq!(s.elapsed_ms(5_000), 0, "no anchor before any event");
+        s.apply(&ev(2_000, result_start("//a:b")));
+        // Later events do not move the anchor backward or forward.
+        s.apply(&ev(4_000, result_end("//a:b", None)));
+        assert_eq!(s.elapsed_ms(9_000), 7_000);
+    }
+
+    #[test]
+    fn worker_spans_map_busy_count_to_braille() {
+        // 8 workers = one cell; busy count selects the glyph.
+        let glyph = |busy: usize| -> String {
+            worker_spans(8, busy)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(glyph(0), "⣿"); // idle (painted grey by caller)
+        assert_eq!(glyph(1), "⠁");
+        assert_eq!(glyph(6), "⠿");
+        assert_eq!(glyph(8), "⣿");
+
+        // Idle cell is dim dark grey, busy cell is blue.
+        assert_eq!(worker_spans(8, 0)[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(worker_spans(8, 3)[0].style.fg, Some(Color::Blue));
+
+        // 10 workers spread over two cells; busy fills left-to-right, so 10 busy
+        // fills the first cell (8) and the second (2 → ⠃).
+        let cells = worker_spans(10, 10);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].content, "⣿");
+        assert_eq!(cells[1].content, "⠃");
+        // With only 8 busy, the first cell is full and the second is idle.
+        let partial = worker_spans(10, 8);
+        assert_eq!(partial[0].content, "⣿");
+        assert_eq!(partial[1].content, "⣿");
+        assert_eq!(partial[1].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn banner_scrolls_when_label_overflows_window() {
+        let label = "a-really-long-label-that-will-not-fit-in-a-narrow-window";
+        // Narrow box forces scrolling; window = width - 7.
+        let window = 80usize - 7;
+        let a = banner_slice(label, window, 0);
+        let b = banner_slice(label, window, SCROLL_MS); // one column later
+        assert_eq!(a.chars().count(), window);
+        assert_eq!(b.chars().count(), window);
+        assert_ne!(a, b, "banner must advance over time");
+    }
+
+    #[test]
+    fn bottom_line_total_width_matches_terminal_width() {
+        // Short label (padded with dashes) and long label (scrolled) both fill W.
+        let short = TuiProgressView::new("ok");
+        let long =
+            TuiProgressView::new("a-really-long-label-that-overflows-the-available-window-area");
+        for w in [40u16, 80, 120] {
+            let s = format!("{}", short.bottom_line(0, w));
+            let l = format!("{}", long.bottom_line(0, w));
+            assert_eq!(s.chars().count(), usize::from(w), "short @ {w}: {s}");
+            assert_eq!(l.chars().count(), usize::from(w), "long @ {w}: {l}");
+        }
     }
 }

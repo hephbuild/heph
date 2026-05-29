@@ -20,6 +20,13 @@ pub struct BuildEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum BuildEventKind {
+    /// Declares the engine's worker capacity (the `result` semaphore size) for
+    /// this request. Emitted once at the start of a `result` batch so the client
+    /// can render a fixed worker-slot indicator. `count` is the maximum number of
+    /// targets that can execute concurrently.
+    MaxWorkers {
+        count: usize,
+    },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the
     /// matcher is still resolving (client renders a provisional `X / ~N`) and

@@ -172,7 +172,7 @@ pub async fn run<A: App + 'static>(
                 drain_logs_to_terminal(&mut terminal, &mut rx, cols);
                 spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
                 let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
-                let lines = view.render(frame, now_unix_ms());
+                let lines = view.render(frame, now_unix_ms(), cols);
                 drop(terminal.draw(|f| {
                     let area = f.area();
                     f.render_widget(Paragraph::new(Text::from(lines)), area);
