@@ -19,7 +19,11 @@ pub async fn run<A: App>(
     // the receiver.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let mut events: Option<EventReceiver> = Some(event_rx);
-    let ctx = AppContext::direct(sink, Some(event_tx));
+    // Shared with the app's request state so we can wait for fire-and-forget
+    // sandbox cleanups to drain before returning (and tearing down the runtime /
+    // exiting the process out from under the cleaner thread).
+    let bg_pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ctx = AppContext::direct(sink, Some(event_tx), std::sync::Arc::clone(&bg_pending));
     let app_fut = app.run(ctx);
     tokio::pin!(app_fut);
 
@@ -52,6 +56,13 @@ pub async fn run<A: App>(
     }
 
     view.finish();
+
+    // Block return until background sandbox cleanups have drained. No TUI to
+    // keep alive here, but the process must not exit out from under the cleaner
+    // thread mid-rmdir. Poll cheaply — cleanups are short rmdirs.
+    while bg_pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     result
 }

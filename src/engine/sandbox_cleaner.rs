@@ -18,6 +18,8 @@
 use crossbeam_channel::{Sender, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::{io, thread};
 
 /// One cleanup unit. Returning an `io::Result` lets the cleaner thread
@@ -25,19 +27,35 @@ use std::{io, thread};
 /// is common when retries collide).
 pub type SandboxCleanupJob = Box<dyn FnOnce() -> io::Result<()> + Send + 'static>;
 
-static CLEANER: OnceLock<Sender<(String, SandboxCleanupJob)>> = OnceLock::new();
+/// Per-request count of cleanup jobs enqueued but not yet finished (queued +
+/// in-flight). Lives in the request state (see `RequestStateData::bg_pending`)
+/// and is carried alongside each job so the global cleaner thread can decrement
+/// the right request's counter once the job has run. The shutdown path keeps
+/// the TUI open — and the process alive — until this drains to zero, so we never
+/// exit out from under an in-progress rmdir.
+pub type PendingCounter = Arc<AtomicUsize>;
 
-fn sender() -> &'static Sender<(String, SandboxCleanupJob)> {
+/// Queue entry: a failure `label`, the job, and the request counter to
+/// decrement when it completes.
+type Job = (String, SandboxCleanupJob, PendingCounter);
+
+static CLEANER: OnceLock<Sender<Job>> = OnceLock::new();
+
+fn sender() -> &'static Sender<Job> {
     CLEANER.get_or_init(|| {
-        let (tx, rx) = unbounded::<(String, SandboxCleanupJob)>();
+        let (tx, rx) = unbounded::<Job>();
         thread::Builder::new()
             .name("rheph-sandbox-cleaner".into())
             .spawn(move || {
-                for (label, job) in rx.iter() {
+                for (label, job, pending) in rx.iter() {
                     // catch_unwind so a panicking job doesn't kill the
                     // long-lived cleaner thread and silently drop every
                     // subsequent cleanup for the process lifetime.
-                    match catch_unwind(AssertUnwindSafe(job)) {
+                    let outcome = catch_unwind(AssertUnwindSafe(job));
+                    // Decrement after the job runs (not on dequeue) so the
+                    // counter only hits zero once the work is genuinely done.
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                    match outcome {
                         Ok(Ok(())) => (),
                         Ok(Err(err)) if err.kind() == io::ErrorKind::NotFound => (),
                         Ok(Err(err)) => {
@@ -61,10 +79,16 @@ fn sender() -> &'static Sender<(String, SandboxCleanupJob)> {
     })
 }
 
-/// Enqueue a cleanup job for asynchronous execution. `label` is used
-/// only for log lines emitted if the job fails. Non-blocking.
-pub fn enqueue(label: String, job: SandboxCleanupJob) {
-    if let Err(err) = sender().send((label, job)) {
+/// Enqueue a cleanup job for asynchronous execution. `label` is used only for
+/// log lines emitted if the job fails. `pending` is the request's in-flight
+/// counter, bumped here and dropped back by the cleaner once the job has run.
+/// Non-blocking.
+pub fn enqueue(label: String, job: SandboxCleanupJob, pending: PendingCounter) {
+    // Count before sending so the counter can never observe an enqueued job as
+    // already drained. The worker decrements once the job has run.
+    pending.fetch_add(1, Ordering::AcqRel);
+    if let Err(err) = sender().send((label, job, Arc::clone(&pending))) {
+        pending.fetch_sub(1, Ordering::AcqRel);
         tracing::error!(error = %err, "sandbox cleaner channel closed");
     }
 }
@@ -87,6 +111,10 @@ mod tests {
         true
     }
 
+    fn counter() -> PendingCounter {
+        Arc::new(AtomicUsize::new(0))
+    }
+
     #[test]
     fn enqueue_runs_job_on_cleaner_thread() {
         let ran = Arc::new(AtomicBool::new(false));
@@ -97,6 +125,7 @@ mod tests {
                 ran_clone.store(true, Ordering::SeqCst);
                 Ok(())
             }),
+            counter(),
         );
         assert!(
             wait_for(&ran, Duration::from_secs(2)),
@@ -121,6 +150,7 @@ mod tests {
                 done_clone.store(true, Ordering::SeqCst);
                 res
             }),
+            counter(),
         );
         assert!(
             wait_for(&done, Duration::from_secs(2)),
@@ -138,6 +168,7 @@ mod tests {
         enqueue(
             "enqueue_swallows_notfound_first".to_string(),
             Box::new(|| Err(io::Error::from(io::ErrorKind::NotFound))),
+            counter(),
         );
         let ran = Arc::new(AtomicBool::new(false));
         let ran_clone = Arc::clone(&ran);
@@ -147,6 +178,7 @@ mod tests {
                 ran_clone.store(true, Ordering::SeqCst);
                 Ok(())
             }),
+            counter(),
         );
         assert!(
             wait_for(&ran, Duration::from_secs(2)),
@@ -155,12 +187,50 @@ mod tests {
     }
 
     #[test]
+    fn pending_counter_drains_to_zero_after_job_runs() {
+        // A blocked job holds the request counter at 1 until released, then drops
+        // it back to 0 once the cleaner finishes it. This is the signal the
+        // shutdown path waits on to keep the TUI/process alive during drain.
+        let pending = counter();
+        let gate = Arc::new(AtomicBool::new(false));
+        let gate_job = Arc::clone(&gate);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_job = Arc::clone(&done);
+        enqueue(
+            "pending_counter_drains_to_zero_after_job_runs".to_string(),
+            Box::new(move || {
+                while !gate_job.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                done_job.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+            Arc::clone(&pending),
+        );
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            1,
+            "counter must rise while job is in flight"
+        );
+        gate.store(true, Ordering::SeqCst);
+        assert!(wait_for(&done, Duration::from_secs(2)), "job did not run");
+        // Spin until the worker's post-job decrement lands.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pending.load(Ordering::Acquire) > 0 {
+            assert!(Instant::now() < deadline, "counter did not drain to zero");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
     fn enqueue_survives_panicking_job() {
         // Same shape as the NotFound case: panic shouldn't kill the
         // thread; subsequent jobs still run.
+        let pending = counter();
         enqueue(
             "enqueue_survives_panicking_job_panicker".to_string(),
             Box::new(|| panic!("boom")),
+            Arc::clone(&pending),
         );
         let ran = Arc::new(AtomicBool::new(false));
         let ran_clone = Arc::clone(&ran);
@@ -170,10 +240,17 @@ mod tests {
                 ran_clone.store(true, Ordering::SeqCst);
                 Ok(())
             }),
+            Arc::clone(&pending),
         );
         assert!(
             wait_for(&ran, Duration::from_secs(2)),
             "cleaner thread stopped processing after panic"
         );
+        // A panicking job must still decrement the counter (catch_unwind path).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pending.load(Ordering::Acquire) > 0 {
+            assert!(Instant::now() < deadline, "counter leaked after panic");
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }

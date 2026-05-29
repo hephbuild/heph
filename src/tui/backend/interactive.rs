@@ -58,7 +58,18 @@ pub async fn run<A: App + 'static>(
     let mut events: Option<EventStream> = Some(EventStream::new());
     let suppression = shutdown.suppression();
 
-    let ctx = AppContext::with_control(sink.clone(), control_tx, Some(event_tx));
+    // Shared with the app's request state: the engine registers fire-and-forget
+    // sandbox cleanups against this counter. We keep rendering until the app
+    // future resolves AND this drains, so the run visibly stays up while
+    // background cleanups finish during exit (and the process doesn't tear the
+    // cleaner thread out mid-rmdir).
+    let bg_pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ctx = AppContext::with_control(
+        sink.clone(),
+        control_tx,
+        Some(event_tx),
+        std::sync::Arc::clone(&bg_pending),
+    );
     // App runs on its own task so heavy sync work inside the app
     // (e.g. `block_in_place` for filesystem scans, Starlark eval) does
     // not block this task's ticker — the renderer task is re-polled
@@ -71,16 +82,27 @@ pub async fn run<A: App + 'static>(
     let mut paused = false;
     let mut cols = terminal_cols(&terminal);
 
+    // Holds the app's result once its future resolves. We don't break the loop
+    // here: the TUI stays up, rendering, until background cleanups drain too.
+    let mut app_result: Option<anyhow::Result<A::Output>> = None;
     let result: anyhow::Result<A::Output> = loop {
+        // App finished and the background queue is empty — nothing left to show.
+        if let Some(r) = app_result.take() {
+            if bg_pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                break r;
+            }
+            // Background cleanups still draining — keep the result, keep rendering.
+            app_result = Some(r);
+        }
         tokio::select! {
-            res = &mut app_handle => {
-                break match res {
+            res = &mut app_handle, if app_result.is_none() => {
+                app_result = Some(match res {
                     Ok(inner) => inner,
                     Err(join_err) if join_err.is_panic() => {
                         std::panic::resume_unwind(join_err.into_panic())
                     }
                     Err(join_err) => Err(anyhow::Error::new(join_err).context("app task")),
-                };
+                });
             }
             ctrl = control_rx.recv() => {
                 match ctrl {
@@ -295,6 +317,59 @@ mod tests {
         assert!(
             observed >= 3,
             "renderer must keep ticking while app is in block_in_place; got {observed} ticks during {BLOCK_MS} ms"
+        );
+    }
+
+    /// The exit loop must not break the moment the app future resolves: it keeps
+    /// rendering until the shared background-cleanup counter drains to zero. This
+    /// mirrors the break condition in `run` (app done AND bg_pending == 0) without
+    /// a real terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loop_stays_open_until_bg_pending_drains() {
+        use std::sync::atomic::AtomicUsize;
+        // App finishes immediately, but leaves 1 unit of background work that a
+        // separate task clears after a delay.
+        let bg_pending = Arc::new(AtomicUsize::new(1));
+        let app = tokio::spawn(async { 7u8 });
+        tokio::pin!(app);
+
+        let drainer = {
+            let bg = Arc::clone(&bg_pending);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                bg.store(0, Ordering::Release);
+            })
+        };
+
+        let mut app_result: Option<u8> = None;
+        let mut ticks_after_app = 0usize;
+        let mut interval = tokio::time::interval(TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let result = loop {
+            if let Some(r) = app_result.take() {
+                if bg_pending.load(Ordering::Acquire) == 0 {
+                    break r;
+                }
+                app_result = Some(r);
+            }
+            tokio::select! {
+                res = &mut app, if app_result.is_none() => {
+                    app_result = Some(res.expect("app task"));
+                }
+                _ = interval.tick() => {
+                    if app_result.is_some() {
+                        ticks_after_app += 1;
+                    }
+                }
+            }
+        };
+
+        drainer.await.expect("drainer");
+        assert_eq!(result, 7, "must return the app's value");
+        assert!(
+            ticks_after_app >= 1,
+            "loop must keep rendering after the app finished while bg work drains; got {ticks_after_app} ticks"
         );
     }
 

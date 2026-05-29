@@ -105,9 +105,11 @@ impl App for RunApp {
             shell: self.args.shell.is_some(),
             interactive,
         };
-        let rs = self
-            .engine
-            .new_state_with_events(!self.args.no_fail_fast, ctx.event_sender());
+        let rs = self.engine.new_state_full(
+            !self.args.no_fail_fast,
+            ctx.event_sender(),
+            ctx.bg_pending(),
+        );
 
         let (result, failures) = match self.matcher {
             Matcher::Addr(addr) => {
@@ -175,7 +177,19 @@ impl App for RunApp {
 
 pub fn execute(args: &RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let rt = bootstrap::build_runtime().context("build tokio runtime")?;
-    rt.block_on(execute_async(args.clone(), sink, no_tui))
+    let res = rt.block_on(execute_async(args.clone(), sink, no_tui));
+    // Every piece of critical teardown — FUSE unmount, SQLite flush, sandbox
+    // rmdir (all in `Engine::drop`), plus the sandbox-cleanup queue the renderer
+    // waits on — has already run *inside* `block_on`: the last `Arc<Engine>`
+    // lives in the app task, so its drop completes before that future resolves.
+    // What's left is the implicit runtime drop, which *joins* the blocking pool
+    // (the signal driver, detached proc-output drain readers, any parked
+    // `spawn_blocking`). Those can't be aborted, so the join is what hangs the
+    // CLI after the TUI has already torn down. Shut the runtime down in the
+    // background instead and return immediately — the OS reaps the idle threads
+    // on process exit.
+    rt.shutdown_background();
+    res
 }
 
 async fn execute_async(args: RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {

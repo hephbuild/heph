@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use ratatui::text::Line;
 use tokio::sync::{mpsc, oneshot};
 
 use super::log_sink::LogSink;
 use crate::engine::event::{BuildEvent, EventSender};
+use crate::engine::sandbox_cleaner::PendingCounter;
 
 pub(crate) enum Control {
     Pause(oneshot::Sender<()>),
@@ -17,14 +20,23 @@ pub struct AppContext {
     /// engine's progress events reach the renderer's view. The backend owns the
     /// receiving end. `None` only in contexts with no renderer.
     events: Option<EventSender>,
+    /// Background-work (sandbox cleanup) counter shared with the request state
+    /// the app builds. The backend owns the other clone and polls it on exit so
+    /// the renderer stays up until fire-and-forget cleanups have drained.
+    bg_pending: PendingCounter,
 }
 
 impl AppContext {
-    pub(crate) fn direct(sink: LogSink, events: Option<EventSender>) -> Self {
+    pub(crate) fn direct(
+        sink: LogSink,
+        events: Option<EventSender>,
+        bg_pending: PendingCounter,
+    ) -> Self {
         Self {
             sink,
             control: None,
             events,
+            bg_pending,
         }
     }
 
@@ -32,11 +44,13 @@ impl AppContext {
         sink: LogSink,
         control: mpsc::UnboundedSender<Control>,
         events: Option<EventSender>,
+        bg_pending: PendingCounter,
     ) -> Self {
         Self {
             sink,
             control: Some(control),
             events,
+            bg_pending,
         }
     }
 
@@ -45,9 +59,16 @@ impl AppContext {
     }
 
     /// The build-event sender to plumb into the request state, e.g.
-    /// `engine.new_state_with_events(fail_fast, ctx.event_sender())`.
+    /// `engine.new_state_full(fail_fast, ctx.event_sender(), ctx.bg_pending())`.
     pub fn event_sender(&self) -> Option<EventSender> {
         self.events.clone()
+    }
+
+    /// The background-work counter to plumb into the request state alongside
+    /// `event_sender`, so the engine's sandbox cleanups register against the
+    /// counter the renderer watches on exit.
+    pub fn bg_pending(&self) -> PendingCounter {
+        Arc::clone(&self.bg_pending)
     }
 
     pub fn interactive(&self) -> bool {

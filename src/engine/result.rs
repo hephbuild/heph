@@ -600,10 +600,11 @@ impl Engine {
                     // by the bridge that built the sandbox; it knows
                     // whether to rm the plain dir or the FUSE upper.
                     let cleanup_label = format!("{addr}");
+                    let bg_pending = rs.bg_pending();
                     defer! {
                         drop(fuse_slot_guards);
                         if let Some(job) = sandbox_cleanup {
-                            crate::engine::sandbox_cleaner::enqueue(cleanup_label, job);
+                            crate::engine::sandbox_cleaner::enqueue(cleanup_label, job, bg_pending);
                         }
                     }
 

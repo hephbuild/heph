@@ -192,6 +192,11 @@ pub struct RequestStateData {
     /// Guards the one-shot `MaxWorkers` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
+    /// Fire-and-forget sandbox cleanups enqueued by this request but not yet
+    /// finished (queued + in-flight on the global cleaner thread). Carried into
+    /// each cleanup job so the cleaner decrements it on completion; the shutdown
+    /// path keeps the TUI open — and the process alive — until it drains to zero.
+    pub bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
 }
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
@@ -214,6 +219,12 @@ impl RequestState {
 
     pub fn fail_fast(&self) -> bool {
         self.data.fail_fast
+    }
+
+    /// The request's in-flight sandbox-cleanup counter. Clone to hand to
+    /// `sandbox_cleaner::enqueue`, or to the renderer so it can poll for drain.
+    pub fn bg_pending(&self) -> crate::engine::sandbox_cleaner::PendingCounter {
+        Arc::clone(&self.data.bg_pending)
     }
 
     /// Stamp the server timestamp on `kind` and emit it on the event stream, if any.
@@ -292,6 +303,18 @@ impl Engine {
         fail_fast: bool,
         events: Option<crate::engine::event::EventSender>,
     ) -> Arc<RequestState> {
+        self.new_state_full(fail_fast, events, Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+    }
+
+    /// Like [`new_state_with_events`] but with a caller-supplied background-work
+    /// counter, so the renderer that owns the other clone can watch this
+    /// request's sandbox cleanups drain during shutdown.
+    pub fn new_state_full(
+        self: &Arc<Self>,
+        fail_fast: bool,
+        events: Option<crate::engine::event::EventSender>,
+        bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+    ) -> Arc<RequestState> {
         let request_id = "".to_string();
         let data = Arc::new(RequestStateData {
             engine: Arc::downgrade(self),
@@ -310,6 +333,7 @@ impl Engine {
             fail_fast,
             events,
             workers_announced: std::sync::atomic::AtomicBool::new(false),
+            bg_pending,
         });
 
         let state = Arc::new(RequestState {
