@@ -320,7 +320,11 @@ impl Engine {
         fail_fast: bool,
         events: Option<crate::engine::event::EventSender>,
     ) -> Arc<RequestState> {
-        self.new_state_full(fail_fast, events, Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        self.new_state_full(
+            fail_fast,
+            events,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
     }
 
     /// Like [`new_state_with_events`] but with a caller-supplied background-work

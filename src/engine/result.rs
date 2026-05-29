@@ -423,9 +423,7 @@ impl Engine {
                 // which would drop the JoinSet.
                 Err(join_err) => {
                     if fatal.is_none() {
-                        fatal = Some(
-                            anyhow::Error::new(join_err).context("result task panicked"),
-                        );
+                        fatal = Some(anyhow::Error::new(join_err).context("result task panicked"));
                         rs.ctoken().cancel();
                     }
                     continue;
@@ -2121,7 +2119,12 @@ mod tests {
         let rs = engine.new_state_with_events(true, Some(tx));
         engine
             .clone()
-            .result_addr(rs.clone(), &addr, OutputMatcher::All, &ResultOptions::default())
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
             .await?;
         drop(rs);
 

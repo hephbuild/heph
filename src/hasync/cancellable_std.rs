@@ -2,9 +2,9 @@ use crate::hasync::Cancellable;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 /// A manual, std-only implementation of a cancellation signal.

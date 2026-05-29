@@ -1,12 +1,8 @@
 use clap::{Args, Parser};
-use humantime::format_duration;
 use rheph::commands;
-use rheph::defer;
 use rheph::log;
-use rheph::version::VERSION;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
 use tracing::{error, info, warn};
 
 #[derive(Args)]
@@ -55,13 +51,8 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
     }
 
-    let start = Instant::now();
     let sink = log::init();
     rheph::tui::panic::install(sink.clone());
-    info!(version = VERSION, "Application starting");
-    defer! {
-        info!(duration = %format_duration(start.elapsed()), "Application finished");
-    }
 
     // Fork the supervisor sidecar that will SIGKILL every tracked child
     // process group when this binary exits — including hard-kill scenarios.

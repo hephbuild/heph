@@ -17,9 +17,9 @@
 //! the queue, jobs are processed in FIFO order on one thread.
 use crossbeam_channel::{Sender, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::{io, thread};
 
 /// One cleanup unit. Returning an `io::Result` lets the cleaner thread
