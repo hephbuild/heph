@@ -156,8 +156,18 @@ impl App for RunApp {
             }
         });
 
-        if !failures.is_empty() {
-            anyhow::bail!("{} target(s) failed", failures.len());
+        // Cancellation (Ctrl-C) is not a target failure — separate it from the
+        // tally so a cancelled run doesn't report every in-flight target as
+        // "failed", but still exits with an error (the build was aborted).
+        let (cancelled, real): (Vec<_>, Vec<_>) = failures.iter().partition(|(_, e)| {
+            crate::hmemoizer::downcast_chain_ref::<crate::engine::error::CancelledError>(e)
+                .is_some()
+        });
+        if !real.is_empty() {
+            anyhow::bail!("{} target(s) failed", real.len());
+        }
+        if !cancelled.is_empty() {
+            anyhow::bail!("cancelled");
         }
         Ok(())
     }

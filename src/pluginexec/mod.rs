@@ -1159,8 +1159,17 @@ impl Driver {
             IoFutures::Pty { stdin, stdout } => {
                 tokio::select! {
                     _ = ctoken.cancelled() => {
-                        process_supervisor::kill_child(child_pid);
-                        _ = (&mut wait_handle).await;
+                        // Graceful Ctrl-C: SIGINT the child's process group,
+                        // give it the grace window to exit, then SIGKILL if it
+                        // ignores the interrupt.
+                        process_supervisor::interrupt_child(child_pid);
+                        if tokio::time::timeout(proc_exec::CANCEL_GRACE, &mut wait_handle)
+                            .await
+                            .is_err()
+                        {
+                            process_supervisor::kill_child(child_pid);
+                            _ = (&mut wait_handle).await;
+                        }
                         anyhow::bail!("cancelled")
                     },
                     res = async {
@@ -1199,8 +1208,17 @@ impl Driver {
             } => {
                 tokio::select! {
                     _ = ctoken.cancelled() => {
-                        process_supervisor::kill_child(child_pid);
-                        _ = (&mut wait_handle).await;
+                        // Graceful Ctrl-C: SIGINT the child's process group,
+                        // give it the grace window to exit, then SIGKILL if it
+                        // ignores the interrupt.
+                        process_supervisor::interrupt_child(child_pid);
+                        if tokio::time::timeout(proc_exec::CANCEL_GRACE, &mut wait_handle)
+                            .await
+                            .is_err()
+                        {
+                            process_supervisor::kill_child(child_pid);
+                            _ = (&mut wait_handle).await;
+                        }
                         anyhow::bail!("cancelled")
                     },
                     res = async {

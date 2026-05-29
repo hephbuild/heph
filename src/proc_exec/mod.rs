@@ -38,6 +38,13 @@ use imp_linux as imp;
 /// previous `tee_stream` buffer size for byte-for-byte compatibility.
 pub const CHUNK_SIZE: usize = 8192;
 
+/// Grace window granted to a child after a cancellation `SIGINT` before we
+/// escalate to `SIGKILL`. Mirrors a terminal Ctrl-C: well-behaved children
+/// (and their descendants) get a chance to unwind and exit cleanly; anything
+/// still alive after this is hard-killed so the runtime can't be parked
+/// waiting on a child that ignores the interrupt.
+pub const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Stdio configuration variants supported by [`Spec`]. Mirrors
 /// `std::process::Stdio` but is `Clone` so a `Spec` can be inspected /
 /// retried without consuming inherited fds.

@@ -1,7 +1,7 @@
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
-use crate::engine::error::{CycleError, TargetNotFoundError};
+use crate::engine::error::{CancelledError, CycleError, TargetNotFoundError};
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
     TargetSpec,
@@ -258,6 +258,15 @@ impl Engine {
             anyhow::bail!("cannot use --shell in non-interactive mode");
         }
 
+        // Stop the moment the request is cancelled (Ctrl-C). Every queued
+        // target in a batch enters here; bailing before spec/def resolution
+        // and execution means a cancelled build doesn't start new work — it
+        // just unwinds. In-flight targets that are already past this point are
+        // aborted by their driver's cancellation handling.
+        if rs.ctoken().is_cancelled() {
+            return Err(CancelledError.into());
+        }
+
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
@@ -351,6 +360,11 @@ impl Engine {
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
+            // Stop enqueuing new targets once cancelled — don't keep draining
+            // the matcher and spawning work that would immediately bail.
+            if rs.ctoken().is_cancelled() {
+                break;
+            }
             // Announce each match as it resolves so the client can render a
             // provisional "done X / ~N" that grows while the matcher streams.
             rs.emit(crate::engine::event::BuildEventKind::Matched {
@@ -373,13 +387,56 @@ impl Engine {
 
         let mut ok: Vec<Arc<EResult>> = vec![];
         let mut errors: Vec<(Addr, anyhow::Error)> = vec![];
+        // First genuine (non-cancellation) failure under fail_fast. We never
+        // break out of the JoinSet — doing so would drop it and tear down
+        // in-flight tasks mid-execution. Instead, the first failure *signals*
+        // every other target to stop (cancelling the request token broadcasts
+        // SIGINT to running children) and we keep draining until they have all
+        // stopped by themselves, then return this error.
+        let mut fatal: Option<anyhow::Error> = None;
         while let Some(joined) = set.join_next().await {
-            let (addr, res) = joined?;
+            let (addr, res) = match joined {
+                Ok(pair) => pair,
+                // A task panicked (we never abort tasks). Capture it, signal
+                // stop, and keep draining the rest — don't propagate via `?`,
+                // which would drop the JoinSet.
+                Err(join_err) => {
+                    if fatal.is_none() {
+                        fatal = Some(
+                            anyhow::Error::new(join_err).context("result task panicked"),
+                        );
+                        rs.ctoken().cancel();
+                    }
+                    continue;
+                }
+            };
             match res {
                 Ok(v) => ok.push(v),
-                Err(e) if !fail_fast => errors.push((addr, e)),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let is_cancelled = downcast_chain_ref::<CancelledError>(&e).is_some();
+                    if !fail_fast {
+                        errors.push((addr, e));
+                    } else if !is_cancelled && fatal.is_none() {
+                        // Fail-fast: tell everything to stop, then wait for it.
+                        fatal = Some(e);
+                        rs.ctoken().cancel();
+                    }
+                    // Under fail_fast, cancellation errors (and any failures
+                    // that land after we signalled stop) are the expected
+                    // fallout of the stop — they don't override the cause.
+                }
             }
+        }
+
+        if let Some(e) = fatal {
+            return Err(e);
+        }
+        // Fail-fast with no genuine failure but a cancelled token = Ctrl-C.
+        // Surface it as an error so the build aborts rather than reporting
+        // success. (`--no-fail-fast` instead carries cancellations in
+        // `errors` for the caller to classify.)
+        if fail_fast && rs.ctoken().is_cancelled() {
+            return Err(CancelledError.into());
         }
 
         Ok(BatchResult { ok, errors })
@@ -1351,6 +1408,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_request_bails_before_executing() -> anyhow::Result<()> {
+        // A request whose token is already cancelled must not resolve or
+        // execute the target — it returns CancelledError immediately so a
+        // ctrl-c'd build stops starting new work.
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let rs = engine.new_state();
+        rs.ctoken().cancel();
+
+        let err = engine
+            .clone()
+            .result_addr(rs, &addr_a, OutputMatcher::All, &ResultOptions::default())
+            .await
+            .err()
+            .expect("cancelled request must error");
+        assert!(
+            err.downcast_ref::<CancelledError>().is_some(),
+            "expected CancelledError, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_input_annotated_with_origin_hash() -> anyhow::Result<()> {
         let engine = engine_with(vec![static_target(
             "//pkg:a",
@@ -1613,6 +1693,64 @@ mod tests {
             )
             .await;
         assert!(res.is_err(), "fail_fast=true must surface Err");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_returns_cancelled_not_success() -> anyhow::Result<()> {
+        // A cancelled fail-fast batch must abort with CancelledError, not
+        // silently report success. The matcher loop stops enqueuing, the
+        // JoinSet drains, and the post-drain token check surfaces the abort.
+        let engine = engine_with(vec![
+            static_target("//pkg:a", &[], &[]),
+            static_target("//pkg:b", &[], &[]),
+        ])?;
+        let rs = engine.new_state();
+        rs.ctoken().cancel();
+        let err = engine
+            .clone()
+            .result(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await
+            .err()
+            .expect("cancelled fail-fast build must return Err");
+        assert!(
+            downcast_chain_ref::<CancelledError>(&err).is_some(),
+            "expected CancelledError, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_fast_failure_signals_cancellation_to_siblings() -> anyhow::Result<()> {
+        // The user contract: a fail-fast failure does not short-circuit the
+        // JoinSet. It signals every other in-flight target to stop (cancels
+        // the request token → broadcasts SIGINT) and drains, then surfaces the
+        // error. We assert the signal was sent (token cancelled) and the build
+        // still returned the failure.
+        let engine = engine_with(vec![
+            static_target("//pkg:a", &[], &["//missing:x"]),
+            static_target("//pkg:b", &[], &[]),
+            static_target("//pkg:c", &[], &[]),
+        ])?;
+        let rs = engine.new_state();
+        let token = rs.ctoken().clone();
+        let res = engine
+            .clone()
+            .result(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await;
+        assert!(res.is_err(), "fail_fast must surface the failure");
+        assert!(
+            token.is_cancelled(),
+            "fail_fast failure must signal stop to in-flight siblings"
+        );
         Ok(())
     }
 

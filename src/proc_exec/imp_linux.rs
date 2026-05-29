@@ -96,8 +96,16 @@ impl Handle {
         tokio::select! {
             res = self.child.wait() => res,
             _ = cancel.cancelled() => {
-                process_supervisor::kill_child(self.pid);
-                drop(self.child.wait().await);
+                // Graceful: SIGINT the child (and its pgid) first, then give
+                // it a grace window to exit before escalating to SIGKILL.
+                process_supervisor::interrupt_child(self.pid);
+                if tokio::time::timeout(super::CANCEL_GRACE, self.child.wait())
+                    .await
+                    .is_err()
+                {
+                    process_supervisor::kill_child(self.pid);
+                    drop(self.child.wait().await);
+                }
                 Err(io::Error::other("cancelled"))
             }
         }

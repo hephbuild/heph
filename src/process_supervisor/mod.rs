@@ -161,23 +161,38 @@ where
     f()
 }
 
-/// Send `SIGKILL` to a child by id. Always issues both `killpg` and `kill`:
-///   - `killpg` reaps the whole tree if the child is a session leader
+/// Send `signal` to a child by id. Always issues both `killpg` and `kill`:
+///   - `killpg` reaches the whole tree if the child is a session leader
 ///     (i.e. it called `setsid` in `pre_exec` — e.g. pluginexec shell mode).
 ///   - `kill` covers drivers that did not `setsid` (plugingo, pluginnix).
 ///
 /// PIDs are unique system-wide, so `killpg(pid)` is a safe no-op when `pid`
 /// is not a group leader. `ESRCH` from either call is ignored.
-pub fn kill_child(pid: i32) {
+fn signal_child(pid: i32, signal: libc::c_int) {
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
-        reason = "killpg + kill are paired best-effort reap of the same pid"
+        reason = "killpg + kill are paired best-effort delivery to the same pid"
     )]
-    // SAFETY: SIGKILL via killpg/kill on a pid we spawned and own.
+    // SAFETY: signal via killpg/kill on a pid we spawned and own.
     unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
+        libc::killpg(pid, signal);
+        libc::kill(pid, signal);
     }
+}
+
+/// Hard-kill a child (and its process group) with `SIGKILL`. Used for the
+/// non-graceful paths: Handle drop, drain-thread escalation, supervisor
+/// parent-death reap.
+pub fn kill_child(pid: i32) {
+    signal_child(pid, libc::SIGKILL);
+}
+
+/// Politely ask a child (and its process group) to stop with `SIGINT` —
+/// the same signal a terminal Ctrl-C delivers. Used by the cancellation
+/// path so well-behaved children can clean up before we escalate to
+/// `kill_child` (`SIGKILL`) if they ignore it.
+pub fn interrupt_child(pid: i32) {
+    signal_child(pid, libc::SIGINT);
 }
 
 /// Register a freshly-spawned child's pgid with the supervisor, returning a

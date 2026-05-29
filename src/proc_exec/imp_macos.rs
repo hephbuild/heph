@@ -324,15 +324,28 @@ impl Handle {
         let status = if is_multi_thread() {
             let cancel_ref = cancel;
             tokio::task::block_in_place(move || -> io::Result<ExitStatus> {
+                // Cancellation escalates: SIGINT first, then SIGKILL if the
+                // child outlives the grace window. `interrupted_at` records
+                // when we sent SIGINT so the same poll loop can time the grace.
+                let mut interrupted_at: Option<Instant> = None;
                 let mut killed = false;
                 loop {
                     match rx.recv_timeout(CANCEL_POLL_INTERVAL) {
                         Ok(Ok(s)) => return Ok(s),
                         Ok(Err(e)) => return Err(e),
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if !killed && cancel_ref.is_cancelled() {
-                                process_supervisor::kill_child(pid);
-                                killed = true;
+                            if cancel_ref.is_cancelled() {
+                                match interrupted_at {
+                                    None => {
+                                        process_supervisor::interrupt_child(pid);
+                                        interrupted_at = Some(Instant::now());
+                                    }
+                                    Some(at) if !killed && at.elapsed() >= super::CANCEL_GRACE => {
+                                        process_supervisor::kill_child(pid);
+                                        killed = true;
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -342,15 +355,25 @@ impl Handle {
                 }
             })?
         } else {
+            let mut interrupted_at: Option<Instant> = None;
             let mut killed = false;
             loop {
                 match rx.try_recv() {
                     Ok(Ok(s)) => break s,
                     Ok(Err(e)) => return Err(e),
                     Err(mpsc::TryRecvError::Empty) => {
-                        if !killed && cancel.is_cancelled() {
-                            process_supervisor::kill_child(pid);
-                            killed = true;
+                        if cancel.is_cancelled() {
+                            match interrupted_at {
+                                None => {
+                                    process_supervisor::interrupt_child(pid);
+                                    interrupted_at = Some(Instant::now());
+                                }
+                                Some(at) if !killed && at.elapsed() >= super::CANCEL_GRACE => {
+                                    process_supervisor::kill_child(pid);
+                                    killed = true;
+                                }
+                                _ => {}
+                            }
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }

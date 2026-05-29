@@ -14,6 +14,21 @@ impl fmt::Display for TargetNotFoundError {
 
 impl std::error::Error for TargetNotFoundError {}
 
+/// Returned the instant a request's cancellation token is observed set, so a
+/// cancelled build stops resolving and executing new targets immediately
+/// rather than draining the entire matched set. Callers match on this to
+/// suppress it from the "N targets failed" tally.
+#[derive(Debug, Clone)]
+pub struct CancelledError;
+
+impl fmt::Display for CancelledError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cancelled")
+    }
+}
+
+impl std::error::Error for CancelledError {}
+
 #[derive(Debug, Clone)]
 pub struct CycleError {
     pub from: Addr,
