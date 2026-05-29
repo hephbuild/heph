@@ -107,6 +107,46 @@ fn banner_slice(label: &str, window: usize, now_ms: u64) -> String {
         .collect()
 }
 
+/// Wall-clock → animation phase divisor (ms). Larger = slower drift.
+const ART_PERIOD_MS: f64 = 1400.0;
+
+/// Plasma density ramp, low → high. Classic ASCII-plasma glyphs; rendered dim so
+/// the whole field stays discreet despite full coverage.
+const ART_RAMP: [char; 8] = ['.', ':', '-', '=', '+', '*', '#', '%'];
+
+/// `rows` body lines of a dim, slowly-drifting plasma field: overlaid sine waves
+/// (including a radial term) sampled into [`ART_RAMP`]. Pure function of `now_ms`
+/// + cell position; one uniform dim style per line keeps spans cheap.
+fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let t = now_ms as f64 / ART_PERIOD_MS;
+    let cx = width as f64 / 2.0;
+    let cy = rows as f64 / 2.0;
+    let n = ART_RAMP.len();
+    let mut lines = Vec::with_capacity(rows);
+    for y in 0..rows {
+        let fy = y as f64;
+        let mut s = String::with_capacity(width);
+        for x in 0..width {
+            let fx = x as f64;
+            let dx = fx - cx;
+            let dy = (fy - cy) * 2.0; // cells are ~2× taller than wide
+            let v = (fx * 0.16 + t).sin()
+                + (fy * 0.55 - t * 0.7).sin()
+                + ((fx + fy) * 0.11 + t * 0.5).sin()
+                + (dx.hypot(dy) * 0.14 - t).sin();
+            // v ∈ [-4, 4] → [0, n] via threshold count (avoids a float→int cast).
+            let level = (v + 4.0) / 8.0 * n as f64;
+            let idx = (1..n).filter(|&i| level >= i as f64).count();
+            s.push(ART_RAMP.get(idx).copied().unwrap_or(' '));
+        }
+        lines.push(Line::from(Span::styled(s, style)));
+    }
+    lines
+}
+
 /// Folds the engine's build-progress event stream into renderable state.
 #[derive(Debug, Default)]
 pub struct BuildState {
@@ -134,6 +174,10 @@ pub struct BuildState {
     local_misses: usize,
     remote_hits: usize,
     remote_misses: usize,
+    /// Addrs that had a cache hit (local or remote). The header's "cached" count
+    /// is `matched ∩ cache_hit` so it tracks matched targets only, not the
+    /// transitive deps that also hit cache.
+    cache_hit: HashSet<String>,
     /// Worker capacity announced by the engine via `MaxWorkers`. `None` until
     /// the event lands (no worker indicator rendered before then).
     max_workers: Option<usize>,
@@ -194,9 +238,15 @@ impl BuildState {
                     self.built += 1;
                 }
             }
-            BuildEventKind::LocalCacheHit { .. } => self.local_hits += 1,
+            BuildEventKind::LocalCacheHit { addr } => {
+                self.local_hits += 1;
+                self.cache_hit.insert(addr.clone());
+            }
             BuildEventKind::LocalCacheMiss { .. } => self.local_misses += 1,
-            BuildEventKind::RemoteCacheHit { .. } => self.remote_hits += 1,
+            BuildEventKind::RemoteCacheHit { addr } => {
+                self.remote_hits += 1;
+                self.cache_hit.insert(addr.clone());
+            }
             BuildEventKind::RemoteCacheMiss { .. } => self.remote_misses += 1,
             // Read/Write markers are not aggregated into counters.
             BuildEventKind::RemoteCacheRead { .. } | BuildEventKind::RemoteCacheWrite { .. } => {}
@@ -240,11 +290,35 @@ impl BuildState {
         Some((done, self.matched.len(), self.matched_complete))
     }
 
+    /// The textual count segment shared by the live header and the final
+    /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
+    /// braille — callers prepend the elapsed field themselves.
+    pub fn counts_segment(&self) -> String {
+        let (built, cached, _running, failed) = self.header_counts();
+        let done = match self.matched_progress() {
+            Some((done, total, complete)) => {
+                let tilde = if complete { "" } else { "~" };
+                format!("{done} / {tilde}{total} done")
+            }
+            None => format!("{built} done"),
+        };
+        format!("{done} · {cached} cached · {failed} failed")
+    }
+
     /// Header counts, in render order: `(built, cached, running, failed)`.
-    /// `built` is targets whose driver actually ran; `cached` is cache hits
-    /// (local + remote); `running` is in-flight results; `failed` is errors.
+    /// `built` is targets whose driver actually ran; `cached` counts matched
+    /// targets that hit cache (`matched ∩ cache_hit`), falling back to all cache
+    /// hits before any `Matched` event arrives; `running` is in-flight results;
+    /// `failed` is errors.
     pub fn header_counts(&self) -> (usize, usize, usize, usize) {
-        let cached = self.local_hits + self.remote_hits;
+        let cached = if self.matched_seen {
+            self.matched
+                .iter()
+                .filter(|a| self.cache_hit.contains(*a))
+                .count()
+        } else {
+            self.local_hits + self.remote_hits
+        };
         (
             self.built,
             cached,
@@ -394,24 +468,16 @@ impl TuiProgressView {
     /// count is omitted — the worker braille (flush right) conveys concurrency.
     fn header_line(&self, now_ms: u64, width: u16) -> Line<'static> {
         let width = usize::from(width).max(MIN_BOX_WIDTH);
-        let (built, cached, _running, failed) = self.core.state.header_counts();
         let busy = self.core.state.busy_workers();
         let max_workers = self.core.state.max_workers().unwrap_or(0);
         let elapsed = human_elapsed(self.core.state.elapsed_ms(now_ms));
-
-        let done = match self.core.state.matched_progress() {
-            Some((done, total, complete)) => {
-                let tilde = if complete { "" } else { "~" };
-                format!("{done} / {tilde}{total} done")
-            }
-            None => format!("{built} done"),
-        };
 
         let mut left: Vec<Span<'static>> = Vec::with_capacity(5);
         left.push(Span::raw("╭─ "));
         left.push(Span::from(elapsed).bold());
         left.push(Span::raw(format!(
-            " · {done} · {cached} cached · {failed} failed"
+            " · {}",
+            self.core.state.counts_segment()
         )));
         // Worker braille sits after the failed count, separated by " · ".
         let workers = worker_spans(max_workers, busy);
@@ -474,20 +540,20 @@ impl TUIAppView for TuiProgressView {
     ///   <slow rows...>            (padded to keep the box a fixed height)
     /// ╰─── <label> ───────────────────────────────────────────────────────╯
     /// ```
-    /// The `spinner` is unused — liveness is conveyed by the worker braille and
-    /// the scrolling label.
+    /// When nothing is slow the body shows a dim, slowly-drifting abstract field
+    /// instead of blank rows. The `spinner` is unused — liveness is conveyed by
+    /// the worker braille, the scrolling label, and the idle art.
     fn render(&self, _spinner: &str, now_ms: u64, width: u16) -> Vec<Line<'static>> {
         let body_rows = usize::from(PROGRESS_ROWS) - 2;
         let mut lines = Vec::with_capacity(usize::from(PROGRESS_ROWS));
         lines.push(self.header_line(now_ms, width));
-        for line in self
-            .core
-            .state
-            .long_running_lines(now_ms)
-            .into_iter()
-            .take(body_rows)
-        {
-            lines.push(line);
+        let slow = self.core.state.long_running_lines(now_ms);
+        if slow.is_empty() {
+            lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows));
+        } else {
+            for line in slow.into_iter().take(body_rows) {
+                lines.push(line);
+            }
         }
         // Pad the body so the bottom border always pins to the last row.
         while lines.len() < body_rows + 1 {
@@ -497,7 +563,8 @@ impl TUIAppView for TuiProgressView {
         lines
     }
 
-    /// Final build report. The summary goes straight to stderr (not the log
+    /// Final build report — the same fields as the live header (elapsed clock +
+    /// counts) minus the worker braille, printed straight to stderr (not the log
     /// sink) so it survives the torn-down inline viewport; per-target errors go
     /// through the error logger. Skipped when no build activity was seen (e.g.
     /// inspect/query commands), to avoid all-zero noise.
@@ -505,11 +572,17 @@ impl TUIAppView for TuiProgressView {
         if !self.core.state.has_activity() {
             return;
         }
+        let elapsed = human_elapsed(
+            self.core
+                .state
+                .elapsed_ms(crate::engine::event::now_unix_ms()),
+        );
+        let elapsed = elapsed.trim_start();
         use std::io::Write;
         drop(writeln!(
             std::io::stderr().lock(),
-            "{}",
-            self.core.state.summary()
+            "{elapsed} · {}",
+            self.core.state.counts_segment()
         ));
         for (addr, msg) in &self.core.errors {
             tracing::error!("{addr}: {msg}");
@@ -940,6 +1013,18 @@ mod tests {
         // Later events do not move the anchor backward or forward.
         s.apply(&ev(4_000, result_end("//a:b", None)));
         assert_eq!(s.elapsed_ms(9_000), 7_000);
+    }
+
+    #[test]
+    fn slow_targets_replace_idle_field_in_body() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, execute_start("//slow:x")));
+        let lines = v.render("⠋", 10_000, 80);
+        let body: String = lines[1..lines.len() - 1]
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("//slow:x"), "{body}");
     }
 
     #[test]
