@@ -135,7 +135,7 @@ const ART_RAMP: [char; 8] = ['.', ':', '-', '=', '+', '*', '#', '%'];
 
 /// `rows` body lines of a dim, slowly-drifting plasma field: overlaid sine waves
 /// (including a radial term) sampled into [`ART_RAMP`]. Pure function of `now_ms`
-/// + cell position; one uniform dim style per line keeps spans cheap. A 1-space
+/// and cell position; one uniform dim style per line keeps spans cheap. A 1-space
 /// gutter is kept on the left and right so the field never touches the box edges.
 fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
     let style = Style::default()

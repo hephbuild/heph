@@ -79,7 +79,9 @@ impl ExecuteLock {
                 let guard = lock.lock(addr.clone(), ctoken).await?;
                 // Stamp our pid through the already-open lock fd (no second
                 // open). Best-effort: a write failure never fails the acquire.
-                let _ = guard.write_contents(std::process::id().to_string().as_bytes());
+                if let Err(err) = guard.write_contents(std::process::id().to_string().as_bytes()) {
+                    tracing::debug!(error = %err, "stamping pid into lock file");
+                }
                 Ok(Box::new(guard))
             }
             ExecuteLock::Mem(kl) => Ok(Box::new(kl.lock(addr.clone(), ctoken).await?)),
