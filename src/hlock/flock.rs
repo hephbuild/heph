@@ -13,6 +13,26 @@
 //! `LOCK_NB` and an exponential async backoff (1ms → [`MAX_BACKOFF`]), checking
 //! the cancellation token each iteration. The trade-off is up to `MAX_BACKOFF`
 //! of wakeup latency — acceptable for coarse cross-process build locks.
+//!
+//! ## Delete on unlock
+//!
+//! Releasing an *exclusive* lock unlinks the lock file so it does not linger on
+//! disk. `flock`-plus-unlink is racy on its own: a waiter blocked on the
+//! about-to-be-removed inode can win the lock on a now-unlinked file while a
+//! fresh process locks a newly created file at the same path — two holders. Two
+//! invariants close the race:
+//!
+//! 1. The unlink happens *while the lock is still held* (before `LOCK_UN`), so
+//!    the removed inode is exactly the one being released.
+//! 2. Every fresh acquire re-`stat`s the path after taking the lock and bails
+//!    (releases + retries) if the locked fd's inode no longer matches the path
+//!    — i.e. it locked a stale, unlinked file.
+//!
+//! Only the exclusive-release path deletes; read release never does. A
+//! cross-process shared reader holds its lock on the inode, and deleting it
+//! would let a new writer lock a fresh file at the same path while that reader
+//! still believes it holds a shared lock. A writer only deletes after every
+//! reader has drained, so no live holder ever sits on a removed inode.
 
 use crate::engine::error::CancelledError;
 use crate::hasync::Cancellable;
@@ -24,11 +44,18 @@ use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Bound on re-open attempts when a fresh acquire keeps locking stale (unlinked)
+/// inodes. Each iteration corresponds to a releaser having deleted the file in
+/// the tiny window between our open and lock; a handful suffices in practice,
+/// and exceeding it simply defers to the caller's backoff retry.
+const STALE_RETRIES: usize = 16;
 
 #[derive(Debug)]
 struct FdState {
@@ -75,13 +102,57 @@ impl FLockState {
     /// Drop the fd when no guard is held, releasing the OS lock.
     fn maybe_close(&self, st: &mut FdState) {
         if st.readers == 0 && !st.writer {
-            if let Some(f) = &st.file {
-                // Explicit unlock for clarity; close() below also releases.
-                // SAFETY: `f` owns a valid open fd for the duration of this call.
-                unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
-            }
-            st.file = None;
+            self.discard_fd(st);
         }
+    }
+
+    /// Unconditionally release the OS lock and close the fd. Used both to drop
+    /// the fd when no guard remains and to abandon a stale (unlinked) fd before
+    /// re-opening.
+    fn discard_fd(&self, st: &mut FdState) {
+        if let Some(f) = &st.file {
+            // Explicit unlock for clarity; close() below also releases.
+            // SAFETY: `f` owns a valid open fd for the duration of this call.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+        st.file = None;
+    }
+
+    /// Whether the currently open fd still names the inode at `path`. A `false`
+    /// means a releaser unlinked the file out from under us between our open and
+    /// our lock, so we hold a lock on a dead inode and must re-open.
+    fn fd_matches_path(&self, st: &FdState) -> Result<bool> {
+        let f = st.file.as_ref().context("fd must be open to validate")?;
+        let fd_meta = f.metadata().context("fstat-ing held lock fd")?;
+        match std::fs::metadata(&self.path) {
+            Ok(path_meta) => {
+                Ok(path_meta.dev() == fd_meta.dev() && path_meta.ino() == fd_meta.ino())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow::Error::new(e))
+                .with_context(|| format!("stat-ing lock file {}", self.path.display())),
+        }
+    }
+
+    /// Fresh open + non-blocking `flock(op)` + inode validation, retrying past
+    /// stale (unlinked) inodes. Only valid when no in-process guard is held.
+    /// `Ok(true)` leaves the fd open and locked; `Ok(false)` means would-block
+    /// (or repeated staleness) with the fd closed.
+    fn try_lock_fresh(&self, st: &mut FdState, op: c_int) -> Result<bool> {
+        for _ in 0..STALE_RETRIES {
+            let fd = self.ensure_open(st)?;
+            if !flock_nb(fd, op)? {
+                self.discard_fd(st);
+                return Ok(false);
+            }
+            if self.fd_matches_path(st)? {
+                return Ok(true);
+            }
+            // Locked a file that a releaser already unlinked; drop it and retry
+            // a fresh open (which re-creates the path).
+            self.discard_fd(st);
+        }
+        Ok(false)
     }
 
     /// Non-blocking shared-lock attempt. `Ok(true)` on acquire (readers
@@ -95,16 +166,11 @@ impl FLockState {
             st.readers += 1;
             return Ok(true);
         }
-        let fd = self.ensure_open(&mut st)?;
-        match flock_nb(fd, libc::LOCK_SH)? {
-            true => {
-                st.readers = 1;
-                Ok(true)
-            }
-            false => {
-                self.maybe_close(&mut st);
-                Ok(false)
-            }
+        if self.try_lock_fresh(&mut st, libc::LOCK_SH)? {
+            st.readers = 1;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -114,16 +180,11 @@ impl FLockState {
         if st.writer || st.readers > 0 {
             return Ok(false);
         }
-        let fd = self.ensure_open(&mut st)?;
-        match flock_nb(fd, libc::LOCK_EX)? {
-            true => {
-                st.writer = true;
-                Ok(true)
-            }
-            false => {
-                self.maybe_close(&mut st);
-                Ok(false)
-            }
+        if self.try_lock_fresh(&mut st, libc::LOCK_EX)? {
+            st.writer = true;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -154,6 +215,17 @@ impl FLockState {
     fn release_write(&self) {
         let mut st = self.fd.lock();
         st.writer = false;
+        // Delete the lock file *while still holding the exclusive lock*, so any
+        // waiter that grabbed this inode fails its post-lock inode check and
+        // re-opens, and any fresh acquire creates a new file. Best-effort: a
+        // missing file (someone raced us, or it was never created) is fine.
+        if st.file.is_some() {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::debug!(error = %e, path = %self.path.display(), "removing lock file on unlock"),
+            }
+        }
         self.maybe_close(&mut st);
     }
 
@@ -394,6 +466,76 @@ mod tests {
         // A shorter payload truncates the trailing bytes of the longer one.
         g.write_contents(b"42").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"42");
+        drop(g);
+    }
+
+    #[tokio::test]
+    async fn write_unlock_deletes_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let l = FLock::new(&path);
+
+        let g = l.lock(&ct()).await.unwrap();
+        assert!(path.exists(), "lock file present while held");
+        drop(g);
+        assert!(!path.exists(), "lock file removed on unlock");
+    }
+
+    #[tokio::test]
+    async fn read_unlock_keeps_lock_file() {
+        // Read release must NOT delete: a cross-process shared reader could
+        // still hold the inode, and removing it would let a new writer lock a
+        // fresh file at the same path concurrently.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let l = FRWLock::new(&path);
+
+        let r = l.read(&ct()).await.unwrap();
+        assert!(path.exists());
+        drop(r);
+        assert!(path.exists(), "read release leaves the lock file in place");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serializes_across_instances_after_delete() {
+        // After a holder deletes the file on release, an independent instance
+        // (modeling another process) re-creates and locks it cleanly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let a = FLock::new(&path);
+        let b = FLock::new(&path);
+
+        {
+            let _g = a.lock(&ct()).await.unwrap();
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "deleted on release");
+
+        let g = b.lock(&ct()).await.unwrap();
+        assert!(path.exists(), "re-created by fresh acquire");
+        let (readers, writer, fd_open) = b.state.counts();
+        assert_eq!((readers, writer, fd_open), (0, true, true));
+        drop(g);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_inode_is_rejected_and_reopened() {
+        // Simulate the race tail: a lock file is unlinked and a *different*
+        // inode now sits at the path. A fresh acquire must not be fooled by the
+        // post-lock inode check — it re-opens the live file and succeeds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let l = FLock::new(&path);
+
+        // Create then remove the original file, leaving a new inode behind.
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"fresh").unwrap();
+
+        let g = l.lock(&ct()).await.unwrap();
+        let (_, writer, fd_open) = l.state.counts();
+        assert!(writer && fd_open, "acquired the live file");
         drop(g);
     }
 
