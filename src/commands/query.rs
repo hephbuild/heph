@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 
+use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
 use crate::engine::{Engine, get_cwp};
@@ -26,6 +27,7 @@ pub struct Args {
 struct QueryApp {
     engine: Arc<Engine>,
     matcher: Matcher,
+    fail_fast: bool,
 }
 
 #[async_trait]
@@ -43,7 +45,9 @@ impl App for QueryApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        let rs = self
+            .engine
+            .new_state_with_events(self.fail_fast, ctx.event_sender());
         let stream = self.engine.query(rs.clone(), &self.matcher);
         tokio::pin!(stream);
 
@@ -64,16 +68,20 @@ impl App for QueryApp {
     }
 }
 
-pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
-    execute_async(args.clone(), sink, no_tui)
+pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    execute_async(args.clone(), sink, global.clone())
 }
 
 #[tokio::main]
-async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &cwp, true)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
-    let app = QueryApp { engine, matcher: m };
-    let interactive = tui::should_use_tui(no_tui);
+    let app = QueryApp {
+        engine,
+        matcher: m,
+        fail_fast: global.fail_fast,
+    };
+    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
 }

@@ -4,6 +4,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::engine::Engine;
 use crate::engine::driver::sandbox::Sandbox;
@@ -30,6 +31,7 @@ struct DefApp {
     engine: Arc<Engine>,
     addr: Addr,
     no_transitive: bool,
+    fail_fast: bool,
 }
 
 #[async_trait]
@@ -47,7 +49,9 @@ impl App for DefApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        let rs = self
+            .engine
+            .new_state_with_events(self.fail_fast, ctx.event_sender());
         // `get_def` may run provider targets, recording rich failures in `rs`;
         // `finalize` prefers those over the returned error and prints on success.
         let res = if self.no_transitive {
@@ -70,12 +74,12 @@ impl App for DefApp {
     }
 }
 
-pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
-    execute_async(args.clone(), sink, no_tui)
+pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    execute_async(args.clone(), sink, global.clone())
 }
 
 #[tokio::main]
-async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let addr =
         htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
     let (engine, shutdown) = bootstrap::new_engine()?;
@@ -83,7 +87,8 @@ async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Resul
         engine,
         addr,
         no_transitive: args.no_transitive,
+        fail_fast: global.fail_fast,
     };
-    let interactive = tui::should_use_tui(no_tui);
+    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
 }

@@ -1,26 +1,16 @@
-use clap::{Args, Parser};
+use clap::Parser;
 use rheph::commands;
+use rheph::commands::GlobalOptions;
 use rheph::log;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing::{error, info, warn};
-
-#[derive(Args)]
-struct GlobalArgs {
-    /// Write CPU pprof on exit
-    #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
-    pprof_cpu: Option<PathBuf>,
-    /// Disable the interactive TUI (force CI/log-only output)
-    #[arg(long = "no-tui", global = true)]
-    no_tui: bool,
-}
 
 #[derive(Parser)]
 #[command(name = "rheph")]
 #[command(about = "An efficient build system", long_about = None)]
 struct Cli {
     #[command(flatten)]
-    global: GlobalArgs,
+    global: GlobalOptions,
     #[command(subcommand)]
     command: commands::Commands,
 }
@@ -78,7 +68,7 @@ fn main() -> ExitCode {
         None
     };
 
-    let result = match cli.command.execute(sink, cli.global.no_tui) {
+    let result = match cli.command.execute(sink, &cli.global) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one

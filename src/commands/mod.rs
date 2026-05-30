@@ -1,10 +1,13 @@
 pub mod bootstrap;
 pub mod errors;
+mod global;
 pub mod inspect;
 pub mod query;
 pub mod run;
 mod utils;
 pub mod version;
+
+pub use global::GlobalOptions;
 
 use clap::Subcommand;
 
@@ -26,11 +29,11 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match self {
-            Commands::Run(args) => run::execute(args, sink, no_tui),
-            Commands::Inspect(args) => args.execute(sink, no_tui),
-            Commands::Query(args) => query::execute(args, sink, no_tui),
+            Commands::Run(args) => run::execute(args, sink, global),
+            Commands::Inspect(args) => args.execute(sink, global),
+            Commands::Query(args) => query::execute(args, sink, global),
             Commands::Version(args) => version::execute(args),
         }
     }

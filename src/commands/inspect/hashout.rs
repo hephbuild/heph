@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 
+use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::engine::{Engine, OutputMatcher, ResultOptions};
 use crate::htaddr::{self, Addr};
@@ -17,6 +18,7 @@ pub struct Args {
 struct HashoutApp {
     engine: Arc<Engine>,
     addr: Addr,
+    fail_fast: bool,
 }
 
 #[async_trait]
@@ -34,7 +36,9 @@ impl App for HashoutApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        let rs = self
+            .engine
+            .new_state_with_events(self.fail_fast, ctx.event_sender());
         // `result_addr` runs the target; rich failures land in `rs`. `finalize`
         // prefers those over the returned marker and prints the hashes on success.
         let res = self
@@ -56,16 +60,20 @@ impl App for HashoutApp {
     }
 }
 
-pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
-    execute_async(args.clone(), sink, no_tui)
+pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    execute_async(args.clone(), sink, global.clone())
 }
 
 #[tokio::main]
-async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let addr =
         htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
     let (engine, shutdown) = bootstrap::new_engine()?;
-    let app = HashoutApp { engine, addr };
-    let interactive = tui::should_use_tui(no_tui);
+    let app = HashoutApp {
+        engine,
+        addr,
+        fail_fast: global.fail_fast,
+    };
+    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
 }

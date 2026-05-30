@@ -7,6 +7,7 @@ mod spec;
 
 use clap::{Args, Subcommand};
 
+use crate::commands::GlobalOptions;
 use crate::tui::LogSink;
 
 #[derive(Args)]
@@ -33,9 +34,9 @@ pub enum InspectCommands {
 }
 
 impl InspectArgs {
-    pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         if let Some(cmd) = &self.command {
-            return cmd.execute(sink, no_tui);
+            return cmd.execute(sink, global);
         }
 
         Ok(())
@@ -43,14 +44,14 @@ impl InspectArgs {
 }
 
 impl InspectCommands {
-    pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match self {
-            InspectCommands::Packages(args) => packages::execute(args, sink, no_tui),
-            InspectCommands::Hashin(args) => hashin::execute(args, sink, no_tui),
-            InspectCommands::Hashout(args) => hashout::execute(args, sink, no_tui),
-            InspectCommands::Spec(args) => spec::execute(args, sink, no_tui),
-            InspectCommands::Def(args) => def::execute(args, sink, no_tui),
-            InspectCommands::Deps(args) => deps::execute(args, sink, no_tui),
+            InspectCommands::Packages(args) => packages::execute(args, sink, global),
+            InspectCommands::Hashin(args) => hashin::execute(args, sink, global),
+            InspectCommands::Hashout(args) => hashout::execute(args, sink, global),
+            InspectCommands::Spec(args) => spec::execute(args, sink, global),
+            InspectCommands::Def(args) => def::execute(args, sink, global),
+            InspectCommands::Deps(args) => deps::execute(args, sink, global),
         }
     }
 }

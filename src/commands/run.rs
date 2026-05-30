@@ -5,6 +5,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use clap::Args;
 
+use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
 use crate::engine::{Engine, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp};
@@ -35,15 +36,13 @@ pub struct RunArgs {
     /// Exclude target address (repeatable, e.g. -e //pkg:target)
     #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS")]
     pub exclude: Vec<String>,
-    /// Disable fail-fast: run every matched target and report all failures at the end
-    #[arg(long = "no-fail-fast", action = clap::ArgAction::SetTrue)]
-    pub no_fail_fast: bool,
 }
 
 struct RunApp {
     args: RunArgs,
     engine: Arc<Engine>,
     matcher: Matcher,
+    fail_fast: bool,
 }
 
 impl RunApp {
@@ -105,16 +104,14 @@ impl App for RunApp {
             shell: self.args.shell.is_some(),
             interactive,
         };
-        let rs = self.engine.new_state_full(
-            !self.args.no_fail_fast,
-            ctx.event_sender(),
-            ctx.bg_pending(),
-        );
+        let rs =
+            self.engine
+                .new_state_full(self.fail_fast, ctx.event_sender(), ctx.bg_pending());
 
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
         // `finalize!` paved road handles rendering and exit uniformly. The engine
         // already returns `Err` for cancellation and genuine top-level failures;
-        // per-addr `--no-fail-fast` failures live in the request's failure registry.
+        // per-addr failures (default, fail-fast off) live in the request's failure registry.
         let res = match self.matcher {
             Matcher::Addr(addr) => self
                 .engine
@@ -160,9 +157,9 @@ impl App for RunApp {
     }
 }
 
-pub fn execute(args: &RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
     let rt = bootstrap::build_runtime().context("build tokio runtime")?;
-    let res = rt.block_on(execute_async(args.clone(), sink, no_tui));
+    let res = rt.block_on(execute_async(args.clone(), sink, global.clone()));
     // Every piece of critical teardown — FUSE unmount, SQLite flush, sandbox
     // rmdir (all in `Engine::drop`), plus the sandbox-cleanup queue the renderer
     // waits on — has already run *inside* `block_on`: the last `Arc<Engine>`
@@ -177,7 +174,7 @@ pub fn execute(args: &RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()
     res
 }
 
-async fn execute_async(args: RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
@@ -185,7 +182,8 @@ async fn execute_async(args: RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Re
         args,
         engine,
         matcher: m,
+        fail_fast: global.fail_fast,
     };
-    let interactive = tui::should_use_tui(no_tui);
+    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
 }

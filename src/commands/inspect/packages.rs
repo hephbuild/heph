@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::engine::Engine;
 use crate::htmatcher::{self, Matcher};
@@ -17,6 +18,7 @@ pub struct Args {
 struct PackagesApp {
     engine: Arc<Engine>,
     matcher: Matcher,
+    fail_fast: bool,
 }
 
 #[async_trait]
@@ -34,7 +36,9 @@ impl App for PackagesApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        let rs = self
+            .engine
+            .new_state_with_events(self.fail_fast, ctx.event_sender());
 
         // Output is incremental; listing may run provider targets, recording rich
         // failures in `rs`, which `finalize` prefers over the returned error.
@@ -52,18 +56,22 @@ impl App for PackagesApp {
     }
 }
 
-pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
-    execute_async(args.clone(), sink, no_tui)
+pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    execute_async(args.clone(), sink, global.clone())
 }
 
 #[tokio::main]
-async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let matcher = match &args.matcher {
         Some(s) => htmatcher::parse(s.as_str())?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
     let (engine, shutdown) = bootstrap::new_engine()?;
-    let app = PackagesApp { engine, matcher };
-    let interactive = tui::should_use_tui(no_tui);
+    let app = PackagesApp {
+        engine,
+        matcher,
+        fail_fast: global.fail_fast,
+    };
+    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
 }
