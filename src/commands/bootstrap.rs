@@ -109,12 +109,22 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
 
     let fuse = file.fuse.unwrap_or_default();
 
+    let lock_backend = file
+        .lock
+        .and_then(|l| l.backend)
+        .map(|b| match b {
+            config_file::LockBackendConfig::Fs => engine::LockBackend::Fs,
+            config_file::LockBackendConfig::Mem => engine::LockBackend::Mem,
+        })
+        .unwrap_or_default();
+
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
         home_dir: home_dir.clone(),
         parallelism: None,
         mem_cache,
         fuse,
+        lock_backend,
     })?;
 
     // Auto-registered built-ins (no options).

@@ -1,6 +1,7 @@
 use crate::engine::config_file::{FuseConfig, Options, PluginEntry};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
+use crate::engine::execute_lock::{ExecuteLock, LockBackend};
 use crate::engine::local_cache::LocalCache;
 use crate::engine::local_cache_mem::LocalCacheMem;
 use crate::engine::local_cache_sqlite::LocalCacheSQLite;
@@ -23,6 +24,8 @@ pub struct Config {
     pub parallelism: Option<usize>,
     pub mem_cache: MemCacheOptions,
     pub fuse: FuseConfig,
+    /// Backend serializing the execute phase per addr. Defaults to `Fs`.
+    pub lock_backend: LockBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,10 @@ pub struct Engine {
     /// `Engine::new` so the bridge gets a ready `LayeredFs` at
     /// construction (or `None` when unsupported in Auto mode).
     pub(crate) fuse: Arc<EngineFuse>,
+
+    /// Guards the execute phase so at most one execute runs per target addr at
+    /// a time (cross-process with the filesystem backend, in-process with mem).
+    pub(crate) execute_lock: ExecuteLock,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -296,6 +303,11 @@ impl Engine {
 
         let fuse = Arc::new(EngineFuse::new(cfg.fuse, &home)?);
 
+        let lock_dir = home.join("lock");
+        std::fs::create_dir_all(&lock_dir)
+            .with_context(|| format!("create lock dir {lock_dir:?}"))?;
+        let execute_lock = ExecuteLock::new(cfg.lock_backend, lock_dir);
+
         let max_workers = 2 * parallelism;
 
         let mut engine = Engine {
@@ -313,6 +325,7 @@ impl Engine {
             driver_factories: HashMap::new(),
             managed_driver_factories: HashMap::new(),
             fuse,
+            execute_lock,
         };
         engine.register_driver(Box::new(crate::plugingroup::Driver))?;
         engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;
@@ -330,6 +343,11 @@ impl Engine {
                 rs.ctoken().cancel();
             }
         }
+    }
+
+    /// The per-addr execute-phase lock.
+    pub fn execute_lock(&self) -> &ExecuteLock {
+        &self.execute_lock
     }
 
     pub fn register_managed_driver(

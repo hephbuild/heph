@@ -99,12 +99,21 @@ impl Handle {
                 // Graceful: SIGINT the child (and its pgid) first, then give
                 // it a grace window to exit before escalating to SIGKILL.
                 process_supervisor::interrupt_child(self.pid);
-                if tokio::time::timeout(super::CANCEL_GRACE, self.child.wait())
-                    .await
-                    .is_err()
-                {
-                    process_supervisor::kill_child(self.pid);
-                    drop(self.child.wait().await);
+                // The grace deadline is a blocking-pool `thread::sleep`, NOT
+                // `tokio::time` — `child.wait()` rides the pidfd/epoll IO
+                // driver, so nothing here touches the time driver. A Ctrl-C
+                // that races runtime teardown therefore can't poll a timer on a
+                // shutting-down runtime (the "context found, but it is being
+                // shutdown" panic).
+                let grace = tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(super::CANCEL_GRACE);
+                });
+                tokio::select! {
+                    res = self.child.wait() => drop(res),
+                    _ = grace => {
+                        process_supervisor::kill_child(self.pid);
+                        drop(self.child.wait().await);
+                    }
                 }
                 Err(io::Error::other("cancelled"))
             }

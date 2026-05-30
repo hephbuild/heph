@@ -30,6 +30,11 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 use tokio::task::JoinSet;
 
+/// How long to block on the per-addr execute lock before surfacing a "waiting on
+/// lock" notice (with the holder's pid) to the progress stream. The notice is
+/// purely informational; the wait itself continues until acquired or cancelled.
+const EXECUTE_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
 /// does not need to store it separately.
 struct EngineProviderExecutor {
@@ -706,9 +711,52 @@ impl Engine {
         outputs: Vec<String>,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<EResult> {
-        if !opts.force
-            && opts.def.target.cache
-            && !opts.shell
+        let can_cache = !opts.force && opts.def.target.cache && !opts.shell;
+
+        if can_cache
+            && let Some(res) = self
+                .result_from_cache(rs.clone(), def, opts, outputs.clone())
+                .await?
+        {
+            return Ok(res);
+        }
+
+        // Serialize the execute phase per addr: at most one run for a given
+        // target addr at a time — across requests with the in-memory backend,
+        // across processes with the filesystem backend. Held across the execute +
+        // cache cycle below; released on scope exit. If the wait outlasts
+        // EXECUTE_LOCK_NOTICE, surface who holds the lock and keep waiting; the
+        // notice clears the moment the wait resolves (acquired or cancelled).
+        let _execute_guard = {
+            let lock_fut = self.execute_lock().lock(&def.target.addr, rs.ctoken());
+            tokio::pin!(lock_fut);
+            match tokio::time::timeout(EXECUTE_LOCK_NOTICE, &mut lock_fut).await {
+                Ok(res) => {
+                    res.with_context(|| format!("acquiring execute lock for {}", def.target.addr))?
+                }
+                Err(_elapsed) => {
+                    let addr_str = def.target.addr.format();
+                    let holder_pid = self.execute_lock().holder_pid(&def.target.addr);
+                    crate::engine::event::emit_scope(
+                        &rs,
+                        crate::engine::event::BuildEventKind::ExecuteLockWaitStart {
+                            addr: addr_str.clone(),
+                            holder_pid,
+                        },
+                        move |_| crate::engine::event::BuildEventKind::ExecuteLockWaitEnd {
+                            addr: addr_str,
+                        },
+                        async { (&mut lock_fut).await },
+                    )
+                    .await
+                    .with_context(|| format!("acquiring execute lock for {}", def.target.addr))?
+                }
+            }
+        };
+
+        // Re-check the cache now that we hold the lock: a concurrent run for the
+        // same addr may have produced the artifacts while we were waiting.
+        if can_cache
             && let Some(res) = self
                 .result_from_cache(rs.clone(), def, opts, outputs.clone())
                 .await?

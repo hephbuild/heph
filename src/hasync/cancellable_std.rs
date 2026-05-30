@@ -131,6 +131,10 @@ impl Cancellable for StdCancellationToken {
             id: None,
         })
     }
+
+    fn clone_arc(&self) -> Arc<dyn Cancellable + Send + Sync> {
+        Arc::new(self.clone())
+    }
 }
 
 #[cfg(test)]

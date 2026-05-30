@@ -39,6 +39,8 @@ pub mod driver_managed;
 pub mod driver_managed_fuse;
 pub mod driver_managed_os;
 mod execute;
+mod execute_lock;
+pub use execute_lock::{ExecuteLock, LockBackend};
 mod expand;
 pub mod fanout;
 mod link;

@@ -14,7 +14,6 @@ use crate::engine::driver::{
 use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 use crate::proc_exec;
-use crate::process_supervisor;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -1052,7 +1051,6 @@ impl Driver {
 
         crate::hmemoizer::set_phase("pluginexec:spawn");
         let mut handle = proc_exec::spawn(spec).with_context(|| "spawn child process")?;
-        let child_pid = handle.pid();
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -1137,71 +1135,47 @@ impl Driver {
         // with the IO pumps (which would deadlock when the child's pipe
         // buffer fills behind a parked worker).
         //
-        // Awaiting the spawned task's JoinHandle is the single residual
-        // exposure to the macOS waker bug (`RCA_MACOS_WAKER.md`): the wake
-        // fires post-exit and tokio's work-stealing re-polls eventually, so
-        // a dropped wake produces at most a small scheduling delay, not a
-        // deadlock. Same shape as the previously-verified design.
+        // Cancellation lives INSIDE this task via `wait_or_cancel`: it runs the
+        // SIGINT → grace → SIGKILL escalation with no `tokio::time` timer, so a
+        // Ctrl-C that races runtime teardown can't poll a timer on a
+        // shutting-down runtime (the "context found, but it is being shutdown"
+        // panic this design avoids). `ctoken` is a borrowed trait object, so we
+        // move an owned `clone_arc` handle into the task; the original borrow
+        // stays usable below for the post-wait cancellation check.
+        let cancel = ctoken.clone_arc();
         let wait_handle: tokio::task::JoinHandle<anyhow::Result<std::process::ExitStatus>> =
             tokio::spawn(async move {
-                // Take ownership of `ctoken` indirectly: we observe its state
-                // from this task via a freshly cloned `cancellable_token`
-                // already captured by closure. ctoken itself is a trait
-                // object outside, which is not Send-friendly to move here —
-                // route cancellation through the outer select! below instead.
-                let status = handle.wait().await.context("wait for child process")?;
+                let status = handle
+                    .wait_or_cancel(&*cancel)
+                    .await
+                    .context("wait for child process")?;
                 _ = stdin_cancel_tx.send(());
                 Ok(status)
             });
         tokio::pin!(wait_handle);
 
-        match io_futures {
+        // Drive the IO pumps alongside the wait. On a clean exit we briefly
+        // drain residual IO before checking status; on cancellation
+        // `wait_or_cancel` has already reaped the child, so we skip the drain
+        // (the runtime may be tearing down) and surface `cancelled` below.
+        let wait_res = match io_futures {
             IoFutures::Pty { stdin, stdout } => {
+                let io = async { tokio::join!(stdin, stdout) };
+                tokio::pin!(io);
                 tokio::select! {
-                    _ = ctoken.cancelled() => {
-                        // Graceful Ctrl-C: SIGINT the child's process group,
-                        // give it the grace window to exit, then SIGKILL if it
-                        // ignores the interrupt.
-                        process_supervisor::interrupt_child(child_pid);
-                        if tokio::time::timeout(proc_exec::CANCEL_GRACE, &mut wait_handle)
-                            .await
-                            .is_err()
-                        {
-                            process_supervisor::kill_child(child_pid);
-                            _ = (&mut wait_handle).await;
+                    wait_res = &mut wait_handle => {
+                        if !ctoken.is_cancelled() {
+                            crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
+                            _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                &mut io,
+                            ).await;
                         }
-                        anyhow::bail!("cancelled")
-                    },
-                    res = async {
-                        let io = async { tokio::join!(stdin, stdout) };
-                        tokio::pin!(io);
-                        tokio::select! {
-                            wait_res = &mut wait_handle => {
-                                crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
-                                _ = tokio::time::timeout(
-                                    std::time::Duration::from_millis(50),
-                                    &mut io,
-                                ).await;
-                                wait_res
-                            }
-                            _ = &mut io => {
-                                crate::hmemoizer::set_phase("pluginexec:post_io_wait");
-                                (&mut wait_handle).await
-                            },
-                        }
-                    } => {
-                        crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
-                        let status = res
-                            .context("wait task panicked")?
-                            .context("wait for child process")?;
-                        if !status.success() {
-                            let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
-                            return Err(crate::engine::error::ProcessFailed {
-                                status: status.to_string(),
-                                log_tail: crate::engine::error::last_n_lines(&log, 10),
-                            }
-                            .into());
-                        }
+                        wait_res
+                    }
+                    _ = &mut io => {
+                        crate::hmemoizer::set_phase("pluginexec:post_io_wait");
+                        (&mut wait_handle).await
                     }
                 }
             }
@@ -1210,54 +1184,44 @@ impl Driver {
                 stdout,
                 stderr,
             } => {
+                let io = async { tokio::join!(stdin, stdout, stderr) };
+                tokio::pin!(io);
                 tokio::select! {
-                    _ = ctoken.cancelled() => {
-                        // Graceful Ctrl-C: SIGINT the child's process group,
-                        // give it the grace window to exit, then SIGKILL if it
-                        // ignores the interrupt.
-                        process_supervisor::interrupt_child(child_pid);
-                        if tokio::time::timeout(proc_exec::CANCEL_GRACE, &mut wait_handle)
-                            .await
-                            .is_err()
-                        {
-                            process_supervisor::kill_child(child_pid);
-                            _ = (&mut wait_handle).await;
+                    wait_res = &mut wait_handle => {
+                        if !ctoken.is_cancelled() {
+                            crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
+                            _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                &mut io,
+                            ).await;
                         }
-                        anyhow::bail!("cancelled")
-                    },
-                    res = async {
-                        let io = async { tokio::join!(stdin, stdout, stderr) };
-                        tokio::pin!(io);
-                        tokio::select! {
-                            wait_res = &mut wait_handle => {
-                                crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
-                                _ = tokio::time::timeout(
-                                    std::time::Duration::from_millis(50),
-                                    &mut io,
-                                ).await;
-                                wait_res
-                            }
-                            _ = &mut io => {
-                                crate::hmemoizer::set_phase("pluginexec:post_io_wait");
-                                (&mut wait_handle).await
-                            },
-                        }
-                    } => {
-                        crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
-                        let status = res
-                            .context("wait task panicked")?
-                            .context("wait for child process")?;
-                        if !status.success() {
-                            let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
-                            return Err(crate::engine::error::ProcessFailed {
-                                status: status.to_string(),
-                                log_tail: crate::engine::error::last_n_lines(&log, 10),
-                            }
-                            .into());
-                        }
+                        wait_res
+                    }
+                    _ = &mut io => {
+                        crate::hmemoizer::set_phase("pluginexec:post_io_wait");
+                        (&mut wait_handle).await
                     }
                 }
             }
+        };
+
+        crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
+        // Cancellation takes precedence over whatever the wait task returned
+        // (`wait_or_cancel` surfaces an io error on cancel) so we preserve the
+        // `Err("cancelled")` contract callers and tests rely on.
+        if ctoken.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        let status = wait_res
+            .context("wait task panicked")?
+            .context("wait for child process")?;
+        if !status.success() {
+            let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
+            return Err(crate::engine::error::ProcessFailed {
+                status: status.to_string(),
+                log_tail: crate::engine::error::last_n_lines(&log, 10),
+            }
+            .into());
         }
         crate::hmemoizer::set_phase("pluginexec:post_wait_done");
 
@@ -1570,6 +1534,71 @@ mod tests {
         let res = run_fut.await;
         assert!(res.is_err());
         let err = res.err().unwrap();
+        assert_eq!(err.to_string(), "cancelled");
+
+        Ok(())
+    }
+
+    /// Cancelling a child that ignores SIGINT must escalate through the grace
+    /// window to SIGKILL and return `Err("cancelled")` — without ever arming a
+    /// `tokio::time` timer in the cancel path. The escalation now lives inside
+    /// `proc_exec::Handle::wait_or_cancel` (timer-free), so a Ctrl-C racing
+    /// runtime teardown can't poll a timer on a shutting-down runtime (the
+    /// "A Tokio 1.x context was found, but it is being shutdown" panic).
+    /// Runs on the `multi_thread` flavor — the runtime shape that panicked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_grace_escalates_without_panicking_timer() -> anyhow::Result<()> {
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                // Ignore SIGINT and hang, forcing the grace → SIGKILL path.
+                run: vec!["trap '' INT; sleep 30".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        let run_fut = driver.run(make_req(req), &ctoken);
+
+        tokio::spawn(enclose!((ctoken) async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            ctoken.cancel();
+        }));
+
+        let res = run_fut.await;
+        let err = res.err().expect("cancelled run must error");
         assert_eq!(err.to_string(), "cancelled");
 
         Ok(())

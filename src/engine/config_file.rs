@@ -20,6 +20,8 @@ pub struct ConfigFile {
     pub mem_cache: Option<MemCacheConfig>,
     #[serde(default)]
     pub fuse: Option<FuseConfig>,
+    #[serde(default)]
+    pub lock: Option<LockConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -103,6 +105,23 @@ impl FuseConfig {
     pub fn is_on(&self) -> bool {
         matches!(self.mode(), FuseMode::On)
     }
+}
+
+/// Execute-phase lock backend. `lock: { backend: fs | mem }`. Omit the block (or
+/// `backend`) to default to the filesystem backend.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LockConfig {
+    #[serde(default)]
+    pub backend: Option<LockBackendConfig>,
+}
+
+/// YAML spelling of the lock backend. Maps to `engine::LockBackend`.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LockBackendConfig {
+    Fs,
+    Mem,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,5 +306,44 @@ drivers:
         let f = FuseConfig::default();
         assert_eq!(f.mode(), FuseMode::Off);
         assert!(f.is_off());
+    }
+
+    #[test]
+    fn lock_config_backend_mem() {
+        let yaml = "lock:\n  backend: mem\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let l = cfg.lock.expect("lock present");
+        assert_eq!(l.backend, Some(LockBackendConfig::Mem));
+    }
+
+    #[test]
+    fn lock_config_backend_fs() {
+        let yaml = "lock:\n  backend: fs\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(
+            cfg.lock.expect("lock present").backend,
+            Some(LockBackendConfig::Fs)
+        );
+    }
+
+    #[test]
+    fn lock_config_omitted_is_none() {
+        let yaml = "providers: []\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        assert!(cfg.lock.is_none());
+    }
+
+    #[test]
+    fn lock_config_rejects_unknown_backend() {
+        let yaml = "lock:\n  backend: sqlite\n";
+        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("sqlite"), "{err}");
+    }
+
+    #[test]
+    fn lock_config_rejects_unknown_field() {
+        let yaml = "lock:\n  bogus: 1\n";
+        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 }

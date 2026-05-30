@@ -207,6 +207,10 @@ pub struct BuildState {
     /// Server timestamp of the first event seen — the run's start anchor for the
     /// header's elapsed clock. `None` until any event lands.
     started_at_ms: Option<u64>,
+    /// Addrs blocked on the execute lock past the notice threshold, mapped to the
+    /// holder's pid (`None` if unknown). Added on `ExecuteLockWaitStart`, removed
+    /// on `ExecuteLockWaitEnd`, so it reflects only currently-blocked waits.
+    lock_waits: HashMap<String, Option<u32>>,
 }
 
 impl BuildState {
@@ -271,6 +275,12 @@ impl BuildState {
                 self.cache_hit.insert(addr.clone());
             }
             BuildEventKind::RemoteCacheMiss { .. } => self.remote_misses += 1,
+            BuildEventKind::ExecuteLockWaitStart { addr, holder_pid } => {
+                self.lock_waits.insert(addr.clone(), *holder_pid);
+            }
+            BuildEventKind::ExecuteLockWaitEnd { addr } => {
+                self.lock_waits.remove(addr);
+            }
             // Read/Write markers are not aggregated into counters.
             BuildEventKind::RemoteCacheRead { .. } | BuildEventKind::RemoteCacheWrite { .. } => {}
         }
@@ -435,6 +445,28 @@ impl BuildState {
         }
         lines
     }
+
+    /// Rows for addrs currently blocked on the execute lock past the notice
+    /// threshold: `⏳ waiting on lock <addr> (held by pid N)`, or
+    /// `(holder unknown)` when the pid could not be determined. Sorted by addr so
+    /// the order is stable across frames. Empty when nothing is blocked.
+    pub fn lock_wait_lines(&self) -> Vec<Line<'static>> {
+        let mut waits: Vec<(&String, &Option<u32>)> = self.lock_waits.iter().collect();
+        waits.sort_by(|a, b| a.0.cmp(b.0));
+        waits
+            .into_iter()
+            .map(|(addr, pid)| {
+                let holder = match pid {
+                    Some(pid) => format!("held by pid {pid}"),
+                    None => "holder unknown".to_string(),
+                };
+                Line::from(Span::styled(
+                    format!("  ⏳ waiting on lock {addr} ({holder})"),
+                    Style::default().fg(Color::Yellow),
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Shared aggregation backing both paved-road views: a label plus the folded
@@ -562,11 +594,13 @@ impl TUIAppView for TuiProgressView {
         let body_rows = usize::from(PROGRESS_ROWS) - 2;
         let mut lines = Vec::with_capacity(usize::from(PROGRESS_ROWS));
         lines.push(self.header_line(now_ms, width));
-        let slow = self.core.state.long_running_lines(now_ms);
-        if slow.is_empty() {
+        // Lock-wait notices take priority in the body, followed by slow rows.
+        let mut body = self.core.state.lock_wait_lines();
+        body.extend(self.core.state.long_running_lines(now_ms));
+        if body.is_empty() {
             lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows));
         } else {
-            for line in slow.into_iter().take(body_rows) {
+            for line in body.into_iter().take(body_rows) {
                 lines.push(line);
             }
         }
@@ -627,13 +661,22 @@ impl CIAppView for CiProgressView {
     /// replacement for the old `tracing::info!(… "run")` — cache hits
     /// short-circuit before execute, so they stay silent).
     fn apply(&mut self, ev: &BuildEvent) {
-        if let BuildEventKind::ExecuteStart {
-            addr,
-            driver,
-            cache: true,
-        } = &ev.kind
-        {
-            tracing::info!("running {addr} [{driver}]");
+        match &ev.kind {
+            BuildEventKind::ExecuteStart {
+                addr,
+                driver,
+                cache: true,
+            } => {
+                tracing::info!("running {addr} [{driver}]");
+            }
+            BuildEventKind::ExecuteLockWaitStart { addr, holder_pid } => {
+                let holder = match holder_pid {
+                    Some(pid) => format!("held by pid {pid}"),
+                    None => "holder unknown".to_string(),
+                };
+                tracing::info!("waiting on execute lock for {addr} ({holder})");
+            }
+            _ => {}
         }
         self.core.fold(ev);
     }
@@ -652,6 +695,54 @@ mod tests {
 
     fn ev(at_unix_ms: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent { at_unix_ms, kind }
+    }
+
+    #[test]
+    fn lock_wait_shown_with_holder_pid_then_cleared_on_end() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::ExecuteLockWaitStart {
+                addr: "//pkg:a".into(),
+                holder_pid: Some(4242),
+            },
+        ));
+        let lines = s.lock_wait_lines();
+        assert_eq!(lines.len(), 1);
+        let text = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("//pkg:a"), "{text}");
+        assert!(text.contains("pid 4242"), "{text}");
+
+        // The notice disappears when the wait ends.
+        s.apply(&ev(
+            1,
+            BuildEventKind::ExecuteLockWaitEnd {
+                addr: "//pkg:a".into(),
+            },
+        ));
+        assert!(s.lock_wait_lines().is_empty());
+    }
+
+    #[test]
+    fn lock_wait_unknown_holder_renders_unknown() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::ExecuteLockWaitStart {
+                addr: "//pkg:a".into(),
+                holder_pid: None,
+            },
+        ));
+        let text = s.lock_wait_lines()[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("holder unknown"), "{text}");
     }
 
     fn result_start(addr: &str) -> BuildEventKind {
