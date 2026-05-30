@@ -6,6 +6,7 @@ pub mod defer;
 pub mod engine;
 pub mod hartifactcontent;
 pub mod hasync;
+pub mod hlock;
 pub mod hmemoizer;
 pub mod htaddr;
 pub mod htmatcher;

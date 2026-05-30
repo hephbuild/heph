@@ -103,9 +103,9 @@ impl App for RunApp {
             shell: self.args.shell.is_some(),
             interactive,
         };
-        let rs =
-            self.engine
-                .new_state_full(self.fail_fast, ctx.event_sender(), ctx.bg_pending());
+        let rs = self
+            .engine
+            .new_state_full(self.fail_fast, ctx.event_sender(), ctx.bg_pending());
 
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
         // `finalize!` paved road handles rendering and exit uniformly. The engine
