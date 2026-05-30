@@ -54,7 +54,7 @@ in
     go run . -seed 42 -out $DEVENV_ROOT/example/go/large -module example.com/large -pkgs 500 -max-depth 7
     cd $DEVENV_ROOT/example/go/large && go mod tidy
   '';
-  scripts.lint.exec = "echo '> clippy' && cargo clippy --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
+  scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
   scripts.tst.exec = "cargo test --locked --all";
 

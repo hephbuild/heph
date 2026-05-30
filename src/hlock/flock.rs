@@ -223,7 +223,9 @@ impl FLockState {
             match std::fs::remove_file(&self.path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::debug!(error = %e, path = %self.path.display(), "removing lock file on unlock"),
+                Err(e) => {
+                    tracing::debug!(error = %e, path = %self.path.display(), "removing lock file on unlock")
+                }
             }
         }
         self.maybe_close(&mut st);
