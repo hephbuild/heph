@@ -107,8 +107,36 @@ impl Workspace {
     pub async fn run_addr(&self, addr: Addr) -> anyhow::Result<Arc<EResult>> {
         let e = self.engine.clone();
         let rs = e.new_state();
-        e.result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+        match e
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
             .await
+        {
+            Ok(r) => Ok(r),
+            // result_addr returns a lightweight `UpstreamFailed` marker; the rich
+            // root-cause diagnostics live in the request's failure registry (the
+            // CLI drains and renders them at end-of-run). Mirror that here so
+            // direct engine consumers get the actual cause, not "dependency failed".
+            Err(err) => {
+                let failures = rs.take_failures();
+                if failures.is_empty() {
+                    return Err(err);
+                }
+                let mut msg = String::new();
+                for f in &failures {
+                    msg.push_str(&format!("{}: {:#}", f.addr.format(), f.source));
+                    if let Some(tail) = &f.log_tail {
+                        msg.push_str(&format!("\nlast log lines:\n{tail}"));
+                    }
+                    msg.push('\n');
+                }
+                Err(anyhow::anyhow!("{}", msg.trim_end()))
+            }
+        }
     }
 
     pub async fn get_spec(&self, addr_str: &str) -> anyhow::Result<Arc<EngineTargetSpec>> {

@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use crate::engine::error::CycleError;
+use crate::engine::error::{CycleError, TargetFailure};
 use crate::engine::local_cache::CacheArtifact;
 use crate::engine::meta::ResultMeta;
 use crate::engine::provider::State;
@@ -203,6 +203,11 @@ pub struct RequestStateData {
     /// each cleanup job so the cleaner decrements it on completion; the shutdown
     /// path keeps the TUI open — and the process alive — until it drains to zero.
     pub bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+    /// Per-request registry of genuinely-failing targets, keyed by addr. Populated
+    /// by the `result_addr` classifier (first-writer-wins dedup) and drained once
+    /// at the end of execution for rendering. Shared via `Arc<RequestStateData>`,
+    /// so `with_parent` / `with_skip_provider` children record into the same map.
+    pub failures: Mutex<indexmap::IndexMap<Addr, Arc<TargetFailure>>>,
 }
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
@@ -231,6 +236,40 @@ impl RequestState {
     /// `sandbox_cleaner::enqueue`, or to the renderer so it can poll for drain.
     pub fn bg_pending(&self) -> crate::engine::sandbox_cleaner::PendingCounter {
         Arc::clone(&self.data.bg_pending)
+    }
+
+    /// Records a genuinely-failing target's rich diagnostic. First-writer-wins:
+    /// if `addr` already has an entry (e.g. shared via the memoizer to multiple
+    /// waiters), the existing one is kept.
+    pub fn record_failure(&self, addr: Addr, failure: Arc<TargetFailure>) {
+        self.data.failures.lock().entry(addr).or_insert(failure);
+    }
+
+    /// Drains and returns all recorded failures in insertion order, leaving the
+    /// registry empty. Called once at the end of execution to render.
+    pub fn take_failures(&self) -> Vec<Arc<TargetFailure>> {
+        std::mem::take(&mut *self.data.failures.lock())
+            .into_values()
+            .collect()
+    }
+
+    /// Non-draining lookup of a single recorded failure by addr. Used by the
+    /// outermost `result_addr` frame to surface the rich root-cause diagnostic
+    /// to its direct caller in place of the `UpstreamFailed` marker.
+    pub fn get_failure(&self, addr: &Addr) -> Option<Arc<TargetFailure>> {
+        self.data.failures.lock().get(addr).cloned()
+    }
+
+    /// The first recorded failure in insertion order, if any. Fallback for
+    /// boundary surfacing when the marker's named root wasn't itself recorded
+    /// (e.g. a link-time resolution aggregation whose causes were recorded
+    /// against the individual deps instead).
+    pub fn first_failure(&self) -> Option<Arc<TargetFailure>> {
+        self.data
+            .failures
+            .lock()
+            .first()
+            .map(|(_, v)| Arc::clone(v))
     }
 
     /// Stamp the server timestamp on `kind` and emit it on the event stream, if any.
@@ -356,6 +395,7 @@ impl Engine {
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending,
+            failures: Mutex::new(indexmap::IndexMap::new()),
         });
 
         let state = Arc::new(RequestState {

@@ -81,7 +81,13 @@ fn main() -> ExitCode {
     let result = match cli.command.execute(sink, cli.global.no_tui) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
-            error!(error = %format!("{:#}", e), "Failed");
+            // Render a graphical diagnostic if the error chain carries one
+            // (Starlark/Go diagnostics from single-error commands). The TUI is
+            // already torn down here, so plain stderr output is safe. Fall back
+            // to the one-line log when nothing renderable is found.
+            if !rheph::commands::errors::render_anyhow(&e) {
+                error!(error = %format!("{:#}", e), "Failed");
+            }
             ExitCode::FAILURE
         }
     };

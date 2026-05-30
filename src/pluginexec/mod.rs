@@ -1196,7 +1196,11 @@ impl Driver {
                             .context("wait for child process")?;
                         if !status.success() {
                             let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
-                            anyhow::bail!("process exited with status: {}\n{}", status, log)
+                            return Err(crate::engine::error::ProcessFailed {
+                                status: status.to_string(),
+                                log_tail: crate::engine::error::last_n_lines(&log, 10),
+                            }
+                            .into());
                         }
                     }
                 }
@@ -1245,7 +1249,11 @@ impl Driver {
                             .context("wait for child process")?;
                         if !status.success() {
                             let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
-                            anyhow::bail!("process exited with status: {}\n{}", status, log)
+                            return Err(crate::engine::error::ProcessFailed {
+                                status: status.to_string(),
+                                log_tail: crate::engine::error::last_n_lines(&log, 10),
+                            }
+                            .into());
                         }
                     }
                 }

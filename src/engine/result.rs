@@ -1,7 +1,10 @@
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
-use crate::engine::error::{CancelledError, CycleError, TargetNotFoundError};
+use crate::engine::error::{
+    CancelledError, CycleError, MultiError, ProcessFailed, TargetFailure, TargetNotFoundError,
+    UpstreamFailed,
+};
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
     TargetSpec,
@@ -245,6 +248,119 @@ struct ExecuteOptions<'a> {
     shell: bool,
 }
 
+/// Single classifier chokepoint for any target error.
+///
+/// Decides whether an error is this target's **own** failure (record it once in
+/// the per-request registry, return a fresh `UpstreamFailed{root: addr}`) or
+/// merely collateral from a failing dependency (propagate a fresh
+/// `UpstreamFailed{root}` without recording). Cancellation is propagated as-is.
+///
+/// Every collateral hop replaces (never wraps) its incoming error with a fresh
+/// `UpstreamFailed`, so chain depth stays O(1) on any graph.
+fn classify_failure(
+    rs: &RequestState,
+    addr: &Addr,
+    interactive: bool,
+    e: anyhow::Error,
+) -> anyhow::Error {
+    // Cancellation: propagate unchanged, never record.
+    if downcast_chain_ref::<CancelledError>(&e).is_some() {
+        return e;
+    }
+
+    // Cyclic dependency: a structural error detected at potentially many nodes
+    // of the cycle, not a single target's own work failing. Propagate unchanged
+    // so the cycle surfaces directly to the caller (and never gets masked behind
+    // an `UpstreamFailed` marker or duplicated into the failure registry).
+    if downcast_chain_ref::<CycleError>(&e).is_some() {
+        return e;
+    }
+
+    // Already a collateral marker: reuse the existing root, do not record.
+    if let Some(uf) = downcast_chain_ref::<UpstreamFailed>(&e) {
+        return UpstreamFailed {
+            root: uf.root.clone(),
+        }
+        .into();
+    }
+
+    // Aggregation of child failures. If *every* child is already a recorded
+    // collateral marker (or a cancellation), the real root causes live in the
+    // registry downstream — this target has no own work to blame, so collapse to
+    // a cheap marker without recording. But if any child is a genuine,
+    // unrecorded cause (e.g. a `TargetNotFound` raised while resolving an input's
+    // def in `link`/`meta`, which never passes through `result_addr`), fall
+    // through and record the whole aggregation against this target so the detail
+    // (every broken input) isn't lost.
+    if let Some(multi) = downcast_chain_ref::<MultiError>(&e) {
+        let all_collateral = multi.0.iter().all(|inner| {
+            downcast_chain_ref::<UpstreamFailed>(inner).is_some()
+                || downcast_chain_ref::<CancelledError>(inner).is_some()
+        });
+        if all_collateral {
+            let root = multi
+                .0
+                .iter()
+                .find_map(|inner| {
+                    downcast_chain_ref::<UpstreamFailed>(inner).map(|u| u.root.clone())
+                })
+                .unwrap_or_else(|| addr.clone());
+            return UpstreamFailed { root }.into();
+        }
+    }
+
+    // This target's own failure (or an aggregation of unrecorded causes): record
+    // the rich diagnostic once (first-writer-wins) and propagate a cheap marker.
+    // Interactive targets stream their output straight to the user's terminal as
+    // they run, so the captured log tail is redundant — drop it from the box.
+    let log_tail = if interactive {
+        None
+    } else {
+        extract_log_tail(&e)
+    };
+    rs.record_failure(
+        addr.clone(),
+        Arc::new(TargetFailure::new(addr.clone(), log_tail, e)),
+    );
+    UpstreamFailed { root: addr.clone() }.into()
+}
+
+/// Pull the captured log tail out of a `ProcessFailed` anywhere in the chain so
+/// the recorded `TargetFailure` can surface it in its diagnostic.
+fn extract_log_tail(e: &anyhow::Error) -> Option<String> {
+    downcast_chain_ref::<ProcessFailed>(e).map(|pf| pf.log_tail.clone())
+}
+
+/// At the outermost `result_addr` frame (the directly-requested target, with no
+/// parent), replace the lightweight `UpstreamFailed` marker with a clone of the
+/// rich recorded `TargetFailure` so direct API/library consumers get the real
+/// root cause rather than "dependency failed". The CLI renders from the registry
+/// instead, so this is purely about the value returned to direct callers. No-op
+/// for inner frames and for non-marker errors (cancellation, cycles, …).
+fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Error {
+    if !is_top {
+        return e;
+    }
+    let is_marker = downcast_chain_ref::<UpstreamFailed>(&e).is_some()
+        || downcast_chain_ref::<MultiError>(&e).is_some();
+    if !is_marker {
+        return e;
+    }
+    // Prefer the rich failure for the marker's named root.
+    if let Some(tf) =
+        downcast_chain_ref::<UpstreamFailed>(&e).and_then(|uf| rs.get_failure(&uf.root))
+    {
+        return anyhow::Error::new((*tf).clone());
+    }
+    // Named root wasn't recorded (e.g. a link-time resolution aggregation whose
+    // causes were recorded against the individual deps). Surface the first
+    // recorded root cause — there is always at least one for a real failure.
+    if let Some(tf) = rs.first_failure() {
+        return anyhow::Error::new((*tf).clone());
+    }
+    e
+}
+
 impl Engine {
     #[async_recursion]
     pub async fn result_addr(
@@ -284,6 +400,11 @@ impl Engine {
             });
         }
 
+        // Directly-requested target (no parent) — the outermost frame. Used below
+        // to surface the rich recorded failure to the caller instead of the
+        // internal `UpstreamFailed` marker.
+        let is_top = rs.parent.is_none();
+
         // Cycle check: fires for every caller (including those awaiting an in-flight future)
         // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
         if let Some(ref parent) = rs.parent {
@@ -302,7 +423,16 @@ impl Engine {
         //
         // Use _no_track: result_addr just updated `parent → addr` above and set parent=addr;
         // calling tracked get_def would try to record addr→addr (spurious self-cycle).
-        let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
+        let def = match Arc::clone(&self).get_def_no_track(rs.clone(), addr).await {
+            Ok(def) => def,
+            Err(e) => {
+                return Err(surface_top(
+                    is_top,
+                    &rs,
+                    classify_failure(&rs, addr, opts.interactive.is_some(), e),
+                ));
+            }
+        };
         if def.target_def.transparent {
             let mut opts = opts.clone();
             if opts.shell {
@@ -322,7 +452,17 @@ impl Engine {
                     })
                 })
                 .collect();
-            let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await?;
+            let results =
+                match crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await {
+                    Ok(results) => results,
+                    Err(e) => {
+                        return Err(surface_top(
+                            is_top,
+                            &rs,
+                            classify_failure(&rs, addr, opts.interactive.is_some(), e),
+                        ));
+                    }
+                };
             let mut merged = EResult::default();
             for r in results {
                 merged.artifacts.extend(r.artifacts.iter().cloned());
@@ -344,11 +484,26 @@ impl Engine {
         }
         let key = (addr.clone(), key_outputs);
         let opts = opts.clone();
-        let res = rs.data.mem_result.once(key, enclose!((self => engine, rs, addr, outputs) move || async move {
-            engine.inner_result_addr(rs, &addr, outputs, &opts).await.map(Arc::new).with_context(|| format!("result: {}", addr))
-        })).await.map_err(unwrap_arc_err)?;
+        let interactive = opts.interactive.is_some();
+        let res = rs
+            .data
+            .mem_result
+            .once(
+                key,
+                enclose!((self => engine, rs, addr, outputs) move || async move {
+                    match engine.inner_result_addr(rs.clone(), &addr, outputs, &opts).await {
+                        Ok(v) => Ok(Arc::new(v)),
+                        Err(e) => Err(classify_failure(&rs, &addr, interactive, e)),
+                    }
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err);
 
-        Ok(res)
+        match res {
+            Ok(v) => Ok(v),
+            Err(e) => Err(surface_top(is_top, &rs, e)),
+        }
     }
 
     pub async fn result(
@@ -431,18 +586,20 @@ impl Engine {
             };
             match res {
                 Ok(v) => ok.push(v),
+                Err(e) if downcast_chain_ref::<CancelledError>(&e).is_some() => {
+                    // Cancellation is stop-fallout, not a genuine failure: the
+                    // token is cancelled, so we surface a single `CancelledError`
+                    // after draining rather than recording it per-addr.
+                }
                 Err(e) => {
-                    let is_cancelled = downcast_chain_ref::<CancelledError>(&e).is_some();
                     if !fail_fast {
                         errors.push((addr, e));
-                    } else if !is_cancelled && fatal.is_none() {
+                    } else if fatal.is_none() {
                         // Fail-fast: tell everything to stop, then wait for it.
+                        // Failures that land after we signalled don't override it.
                         fatal = Some(e);
                         rs.ctoken().cancel();
                     }
-                    // Under fail_fast, cancellation errors (and any failures
-                    // that land after we signalled stop) are the expected
-                    // fallout of the stop — they don't override the cause.
                 }
             }
         }
@@ -450,11 +607,11 @@ impl Engine {
         if let Some(e) = fatal {
             return Err(e);
         }
-        // Fail-fast with no genuine failure but a cancelled token = Ctrl-C.
-        // Surface it as an error so the build aborts rather than reporting
-        // success. (`--no-fail-fast` instead carries cancellations in
-        // `errors` for the caller to classify.)
-        if fail_fast && rs.ctoken().is_cancelled() {
+        // A cancelled token (Ctrl-C, or a signalled stop) aborts the whole build
+        // regardless of `fail_fast`: surface it so the caller reports an abort, not
+        // success. Genuine failures collected before the stop remain in the
+        // request's failure registry for rich rendering.
+        if rs.ctoken().is_cancelled() {
             return Err(CancelledError.into());
         }
 
@@ -1328,6 +1485,24 @@ mod tests {
         }
     }
 
+    /// Exec target with a custom `run` command (e.g. `"exit 1"` to fail, or a
+    /// script that emits log lines). Used by the error-handling tests.
+    fn run_target(addr: &str, deps: &[&str], run: &str) -> pluginstatictarget::Target {
+        let mut deps_map = HashMap::new();
+        if !deps.is_empty() {
+            deps_map.insert("".to_string(), deps.iter().map(|s| s.to_string()).collect());
+        }
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            run: Some(run.to_string()),
+            out: HashMap::new(),
+            codegen: None,
+            deps: deps_map,
+            labels: vec![],
+        }
+    }
+
     /// Target with a named codegen-tree output. Used to exercise matchers
     /// (like `TreeOutputTo`) that only resolve at def level — those force the
     /// executor's query to call `get_def(candidate)`, which is the path the
@@ -1804,13 +1979,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_fail_fast_off_aggregates_input_errors() -> anyhow::Result<()> {
+    async fn nested_fail_fast_off_records_aggregated_input_failures() -> anyhow::Result<()> {
         // A parent target with multiple bad inputs (each referencing a missing
-        // target). The nested fanout sites (link / inputs_result_meta /
-        // collect_transitive_deps) must aggregate all input failures into a
-        // single MultiError instead of short-circuiting on the first one — so
-        // the user sees every broken dep in one go.
-        use crate::engine::error::MultiError;
+        // target). Input *def* resolution happens in link/meta via get_def — not
+        // result_addr — so the missing targets never get per-dep registry
+        // entries. With fail_fast=false the fanout drives every input to
+        // completion and aggregates into a MultiError of unrecorded causes; that
+        // aggregation is recorded once against the parent (whose input-resolution
+        // work failed), preserving every broken input. The direct caller gets the
+        // rich diagnostic via boundary surfacing, never the bare marker.
+        use crate::engine::error::{TargetFailure, UpstreamFailed};
 
         let engine = engine_with(vec![static_target(
             "//pkg:parent",
@@ -1821,19 +1999,238 @@ mod tests {
         let rs = engine.new_state_with_fail_fast(false);
         let res = engine
             .clone()
-            .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
             .await;
         let err = res.err().expect("parent must fail");
-        // Memoizer routing wraps errors in SharedAnyhow; use downcast_chain_ref
-        // (the helper that traverses past SharedAnyhow nodes) to recover the
-        // concrete MultiError type.
-        let multi =
-            downcast_chain_ref::<MultiError>(&err).expect("expected MultiError in error chain");
-        let rendered = format!("{:#}", err);
-        assert!(multi.0.len() >= 2, "expected >=2 aggregated errors");
+        assert!(
+            downcast_chain_ref::<UpstreamFailed>(&err).is_none(),
+            "top-level error must be surfaced as the rich cause, not the marker: {err:#}"
+        );
+        downcast_chain_ref::<TargetFailure>(&err)
+            .expect("expected a surfaced TargetFailure at the boundary");
+        let rendered = format!("{err:#}");
         assert!(
             rendered.contains("missing:a") && rendered.contains("missing:b"),
-            "MultiError must surface both input failures, got: {rendered}"
+            "the surfaced failure must list every broken input, got: {rendered}"
+        );
+
+        let failures = rs.take_failures();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the aggregation is recorded once (against the parent), not duplicated per dep"
+        );
+        assert_eq!(failures[0].addr.format(), "//pkg:parent");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diamond_failure_recorded_once_at_root() -> anyhow::Result<()> {
+        // top → leaf1, leaf2 → base; base fails (its own work errors). Both
+        // leaves and top are collateral (they failed only because base did) and
+        // must NOT be recorded — only the root cause `base`, exactly once.
+        // (The lib harness can't spawn subprocesses, so base fails at exec spawn;
+        // the dedup contract is what this exercises — see the e2e suite for real
+        // process failures.)
+        use crate::engine::error::{TargetFailure, UpstreamFailed};
+
+        let engine = engine_with(vec![
+            run_target("//d:base", &[], "exit 1"),
+            run_target("//d:leaf1", &["//d:base"], "true"),
+            run_target("//d:leaf2", &["//d:base"], "true"),
+            run_target("//d:top", &["//d:leaf1", "//d:leaf2"], "true"),
+        ])?;
+        let addr = crate::htaddr::parse_addr("//d:top")?;
+        let rs = engine.new_state();
+        let err = engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .err()
+            .expect("top must fail");
+
+        let failures = rs.take_failures();
+        assert_eq!(
+            failures.len(),
+            1,
+            "only the root cause is recorded, not the collateral leaves/top"
+        );
+        assert_eq!(failures[0].addr.format(), "//d:base");
+        // base is recorded as its OWN failure (a genuine cause, not a marker).
+        assert!(
+            downcast_chain_ref::<UpstreamFailed>(&failures[0].source).is_none(),
+            "root cause must be a genuine failure, not an UpstreamFailed marker"
+        );
+        // The boundary surfaces a rich diagnostic to the direct caller.
+        assert!(downcast_chain_ref::<TargetFailure>(&err).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn deep_chain_failure_has_bounded_error_depth() {
+        // A linear chain a0→a1→…→aN where only the tail fails. The error
+        // propagated to the caller must NOT accumulate one frame per hop — each
+        // collateral hop replaces (never wraps) its incoming error with a fresh
+        // marker, so the chain stays O(1). Proven by comparing two very different
+        // chain lengths: the surfaced error's depth must be identical, and only
+        // the tail is recorded.
+        //
+        // Run on a large-stack thread with its own runtime: the engine's `meta`
+        // walk recurses once per hop and overflows the 2MB default test stack
+        // well before the depths exercised here.
+        use crate::engine::error::TargetFailure;
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async {
+                    async fn run_chain(n: usize) -> (usize, usize, String) {
+                        let addrs: Vec<String> =
+                            (0..n).map(|i| format!("//chain:a{i}")).collect();
+                        let mut targets = Vec::with_capacity(n);
+                        for i in 0..n {
+                            if i + 1 < n {
+                                targets
+                                    .push(run_target(&addrs[i], &[addrs[i + 1].as_str()], "true"));
+                            } else {
+                                targets.push(run_target(&addrs[i], &[], "exit 1"));
+                            }
+                        }
+                        let engine = engine_with(targets).expect("engine");
+                        let head = crate::htaddr::parse_addr(&addrs[0]).expect("addr");
+                        let rs = engine.new_state();
+                        let err = engine
+                            .clone()
+                            .result_addr(
+                                rs.clone(),
+                                &head,
+                                OutputMatcher::All,
+                                &ResultOptions::default(),
+                            )
+                            .await
+                            .err()
+                            .expect("head must fail");
+                        assert!(downcast_chain_ref::<TargetFailure>(&err).is_some());
+                        let failures = rs.take_failures();
+                        (
+                            failures.len(),
+                            err.chain().count(),
+                            failures.first().map(|f| f.addr.format()).unwrap_or_default(),
+                        )
+                    }
+
+                    let (rec_short, depth_short, root_short) = run_chain(10).await;
+                    let (rec_long, depth_long, root_long) = run_chain(200).await;
+
+                    assert_eq!(rec_short, 1, "one recorded root cause regardless of length");
+                    assert_eq!(rec_long, 1, "one recorded root cause regardless of length");
+                    assert_eq!(root_short, "//chain:a9");
+                    assert_eq!(root_long, "//chain:a199");
+                    assert_eq!(
+                        depth_short, depth_long,
+                        "error chain depth must be O(1) — independent of graph depth ({depth_short} vs {depth_long})"
+                    );
+                    assert!(
+                        depth_long < 10,
+                        "surfaced error must be a shallow chain, got {depth_long}"
+                    );
+                });
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[tokio::test]
+    async fn classify_attaches_process_log_tail_to_recorded_failure() -> anyhow::Result<()> {
+        // When a target's own failure carries a `ProcessFailed` (anywhere in the
+        // chain), the recorded `TargetFailure` must surface its log tail. Driven
+        // directly through `classify_failure` so it's deterministic and doesn't
+        // depend on spawning a real subprocess (the lib harness can't; the e2e
+        // suite covers the live path). `last_n_lines` itself is unit-tested in
+        // `engine::error`.
+        use crate::engine::error::{ProcessFailed, UpstreamFailed};
+
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+
+        let tail = "line6\nline7\nline8\nline9\nline10";
+        let e = anyhow::Error::new(ProcessFailed {
+            status: "exit status: 1".to_string(),
+            log_tail: tail.to_string(),
+        })
+        .context("driver run")
+        .context("execute //pkg:a");
+
+        let out = classify_failure(&rs, &addr, false, e);
+        // Own failure → cheap marker propagated upward.
+        assert!(downcast_chain_ref::<UpstreamFailed>(&out).is_some());
+        // …and the rich record carries the log tail pulled from ProcessFailed.
+        let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+        assert_eq!(recorded.log_tail.as_deref(), Some(tail));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classify_drops_log_tail_for_interactive_targets() -> anyhow::Result<()> {
+        // Interactive targets stream their output live to the user's terminal, so
+        // the captured log tail must NOT be re-rendered in the failure box.
+        use crate::engine::error::ProcessFailed;
+
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+
+        let e = anyhow::Error::new(ProcessFailed {
+            status: "exit status: 1".to_string(),
+            log_tail: "line9\nline10".to_string(),
+        })
+        .context("execute //pkg:a");
+
+        let _ = classify_failure(&rs, &addr, true, e);
+        let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+        assert_eq!(recorded.log_tail, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_not_recorded_as_failure() -> anyhow::Result<()> {
+        // A pre-cancelled request bails with CancelledError before doing work;
+        // cancellation is not a target failure and must not be recorded.
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let addr = crate::htaddr::parse_addr("//pkg:a")?;
+        let rs = engine.new_state();
+        rs.ctoken().cancel();
+        let err = engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .err()
+            .expect("cancelled request must fail");
+        assert!(downcast_chain_ref::<CancelledError>(&err).is_some());
+        assert!(
+            rs.take_failures().is_empty(),
+            "cancellation must not be recorded as a failure"
         );
         Ok(())
     }

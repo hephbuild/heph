@@ -35,13 +35,13 @@ impl App for HashinApp {
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let rs = self.engine.new_state_with_events(true, ctx.event_sender());
-        let res = self.engine.clone().meta(rs, &self.addr).await?;
-
-        tui::paused!(ctx, {
-            println!("{}", res.hashin);
-        });
-
-        Ok(())
+        // `meta` may run provider targets, recording rich failures in `rs`;
+        // `finalize` prefers those over the returned error and prints on success.
+        let res = self.engine.clone().meta(rs.clone(), &self.addr).await;
+        crate::commands::errors::finalize!(ctx, rs, res, meta => {
+            println!("{}", meta.hashin);
+            Ok(())
+        })
     }
 }
 

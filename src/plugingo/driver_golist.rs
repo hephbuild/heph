@@ -326,7 +326,11 @@ impl ManagedDriver for GoGolistDriver {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("go list failed for {}: {}", def.import_path, stderr);
+            return Err(crate::plugingo::errors::GoListError {
+                import_path: def.import_path.clone(),
+                stderr_tail: crate::engine::error::last_n_lines(&stderr, 10),
+            }
+            .into());
         }
 
         // Parse once, normalize Dir on the struct, then serialize package.bin and

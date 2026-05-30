@@ -48,23 +48,25 @@ impl App for DefApp {
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        // `get_def` may run provider targets, recording rich failures in `rs`;
+        // `finalize` prefers those over the returned error and prints on success.
         let res = if self.no_transitive {
-            self.engine.clone().get_direct_def(rs, &self.addr).await?
+            self.engine
+                .clone()
+                .get_direct_def(rs.clone(), &self.addr)
+                .await
         } else {
-            self.engine.clone().get_def(rs, &self.addr).await?
+            self.engine.clone().get_def(rs.clone(), &self.addr).await
         };
-
-        let view = DefView {
-            target_def: &res.target_def,
-            applied_transitive: res.applied_transitive.as_ref(),
-        };
-        let json = serde_json::to_string_pretty(&view).context("serialize def")?;
-
-        tui::paused!(ctx, {
+        crate::commands::errors::finalize!(ctx, rs, res, def => {
+            let view = DefView {
+                target_def: &def.target_def,
+                applied_transitive: def.applied_transitive.as_ref(),
+            };
+            let json = serde_json::to_string_pretty(&view).context("serialize def")?;
             println!("{json}");
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 

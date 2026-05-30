@@ -35,15 +35,15 @@ impl App for DepsApp {
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let rs = self.engine.new_state_with_events(true, ctx.event_sender());
-        let def = self.engine.clone().get_def(rs, &self.addr).await?;
-
-        tui::paused!(ctx, {
+        // `get_def` may run provider targets, recording rich failures in `rs`;
+        // `finalize` prefers those over the returned error and prints on success.
+        let res = self.engine.clone().get_def(rs.clone(), &self.addr).await;
+        crate::commands::errors::finalize!(ctx, rs, res, def => {
             for input in &def.target_def.inputs {
                 println!("{}", input.r#ref);
             }
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 

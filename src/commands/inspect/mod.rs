@@ -45,7 +45,7 @@ impl InspectArgs {
 impl InspectCommands {
     pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
         match self {
-            InspectCommands::Packages(args) => packages::execute(args),
+            InspectCommands::Packages(args) => packages::execute(args, sink, no_tui),
             InspectCommands::Hashin(args) => hashin::execute(args, sink, no_tui),
             InspectCommands::Hashout(args) => hashout::execute(args, sink, no_tui),
             InspectCommands::Spec(args) => spec::execute(args, sink, no_tui),

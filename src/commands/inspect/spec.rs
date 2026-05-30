@@ -35,15 +35,14 @@ impl App for SpecApp {
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let rs = self.engine.new_state_with_events(true, ctx.event_sender());
-        let res = self.engine.clone().get_spec(rs, &self.addr).await?;
-
-        let json = serde_json::to_string_pretty(&*res).context("serialize spec")?;
-
-        tui::paused!(ctx, {
+        // `get_spec` may run provider targets, recording rich failures in `rs`;
+        // `finalize` prefers those over the returned error and prints on success.
+        let res = self.engine.clone().get_spec(rs.clone(), &self.addr).await;
+        crate::commands::errors::finalize!(ctx, rs, res, spec => {
+            let json = serde_json::to_string_pretty(&*spec).context("serialize spec")?;
             println!("{json}");
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 

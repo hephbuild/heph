@@ -1,8 +1,42 @@
 mod common;
 
 use common::Workspace;
+use rheph::engine::ResultOptions;
+use rheph::htmatcher::Matcher;
+use rheph::htpkg::PkgBuf;
 use rheph::loosespecparser::TargetSpecValue;
 // ── Discovery ────────────────────────────────────────────────────────────────
+
+// Regression: a matcher-phase BUILD eval error surfaces from `engine.result` as
+// a raw `Err` that is NOT recorded in the per-request failure registry. The run
+// command must propagate it — a previous version trusted the registry alone and
+// swallowed the error, exiting 0.
+#[tokio::test]
+async fn test_result_matcher_eval_error_not_in_registry() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("broken", "this is not valid starlark @#$");
+
+    let e = ws.engine.clone();
+    let rs = e.new_state();
+    let matcher = Matcher::Package(PkgBuf::from("broken"));
+    let res = e
+        .result(rs.clone(), &matcher, &ResultOptions::default())
+        .await;
+
+    // The eval error surfaces as a returned `Err`...
+    let err = res.err().expect("expected matcher eval error");
+    assert!(
+        format!("{err:#}").contains("broken"),
+        "error should mention the broken package: {err:#}"
+    );
+    // ...and crucially is NOT in the failure registry, so a command that only
+    // drains the registry (and drops the returned `Err`) would swallow it.
+    assert!(
+        rs.take_failures().is_empty(),
+        "matcher-phase eval error must not be recorded as a TargetFailure"
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_nested_package_discovered() -> anyhow::Result<()> {

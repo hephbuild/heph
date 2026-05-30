@@ -806,7 +806,7 @@ fn find_build_files(dir: &Path, patterns: &[glob::Pattern]) -> anyhow::Result<Ve
 
 fn eval_file(path: &Path, pkg: &str, loader: &BuildFileLoader) -> anyhow::Result<RunResult> {
     let ast: AstModule =
-        AstModule::parse_file(path, &Dialect::Extended).map_err(|e| anyhow::anyhow!(e))?;
+        AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)?;
 
     let globals = get_globals();
 
@@ -994,6 +994,25 @@ target(
             .first()
             .map(|t| t.transitive.clone())
             .unwrap_or_default())
+    }
+
+    #[test]
+    fn starlark_eval_error_surfaces_location_and_cause() {
+        // A Starlark evaluation error must convert (via into_anyhow) into an
+        // error whose chain names the offending symbol and the BUILD file.
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        // Reference to an undefined symbol → eval error.
+        fs::write(pkg.join("BUILD"), "X = undefined_symbol\n").unwrap();
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "p").unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("undefined_symbol"),
+            "eval error must name the offending symbol: {chain}"
+        );
     }
 
     #[test]

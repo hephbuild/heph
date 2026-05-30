@@ -35,24 +35,24 @@ impl App for HashoutApp {
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let rs = self.engine.new_state_with_events(true, ctx.event_sender());
+        // `result_addr` runs the target; rich failures land in `rs`. `finalize`
+        // prefers those over the returned marker and prints the hashes on success.
         let res = self
             .engine
             .clone()
             .result_addr(
-                rs,
+                rs.clone(),
                 &self.addr,
                 OutputMatcher::None,
                 &ResultOptions::default(),
             )
-            .await?;
-
-        tui::paused!(ctx, {
-            for art in &res.artifacts_meta {
+            .await;
+        crate::commands::errors::finalize!(ctx, rs, res, result => {
+            for art in &result.artifacts_meta {
                 println!("{}", art.hashout);
             }
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 

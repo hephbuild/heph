@@ -333,7 +333,11 @@ pub(crate) async fn run_go_list(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("go list failed: {}", stderr);
+        return Err(crate::plugingo::errors::GoListError {
+            import_path: import_path.to_string(),
+            stderr_tail: crate::engine::error::last_n_lines(&stderr, 10),
+        }
+        .into());
     }
 
     parse_go_list_reader(output.stdout.as_slice())

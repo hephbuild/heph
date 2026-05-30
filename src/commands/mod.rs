@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod errors;
 pub mod inspect;
 pub mod query;
 pub mod run;

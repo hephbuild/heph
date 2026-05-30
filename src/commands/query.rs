@@ -44,16 +44,23 @@ impl App for QueryApp {
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let rs = self.engine.new_state_with_events(true, ctx.event_sender());
-        let stream = self.engine.query(rs, &self.matcher);
+        let stream = self.engine.query(rs.clone(), &self.matcher);
         tokio::pin!(stream);
 
+        // Output is incremental, so addrs are printed before `finalize` runs; a
+        // provider running a target mid-stream records rich failures in `rs`, which
+        // `finalize` renders after the addrs already flushed.
         let out = BufferedStdout::new(&ctx);
-        while let Some(addr) = stream.try_next().await? {
-            out.println(addr.format());
+        let res: anyhow::Result<()> = async {
+            while let Some(addr) = stream.try_next().await? {
+                out.println(addr.format());
+            }
+            Ok(())
         }
+        .await;
         out.close().await;
 
-        Ok(())
+        crate::commands::errors::finalize!(ctx, rs, res)
     }
 }
 

@@ -439,8 +439,6 @@ impl BuildState {
 struct ProgressCore {
     label: String,
     state: BuildState,
-    /// Errored `(addr, message)` collected from `ResultEnd`.
-    errors: Vec<(String, String)>,
 }
 
 impl ProgressCore {
@@ -448,19 +446,13 @@ impl ProgressCore {
         Self {
             label: label.into(),
             state: BuildState::new(),
-            errors: Vec::new(),
         }
     }
 
-    /// Fold one event: collect errors, then update the aggregate counters.
+    /// Fold one event into the aggregate counters. Per-target failures are not
+    /// collected here — they're rendered richly from the request's failure
+    /// registry (see `commands::errors::render_failures`).
     fn fold(&mut self, ev: &BuildEvent) {
-        if let BuildEventKind::ResultEnd {
-            addr,
-            error: Some(err),
-        } = &ev.kind
-        {
-            self.errors.push((addr.clone(), err.clone()));
-        }
         self.state.apply(ev);
     }
 }
@@ -584,9 +576,10 @@ impl TUIAppView for TuiProgressView {
 
     /// Final build report — the same fields as the live header (elapsed clock +
     /// counts) minus the worker braille, printed straight to stderr (not the log
-    /// sink) so it survives the torn-down inline viewport; per-target errors go
-    /// through the error logger. Skipped when no build activity was seen (e.g.
-    /// inspect/query commands), to avoid all-zero noise.
+    /// sink) so it survives the torn-down inline viewport. Per-target failures
+    /// are rendered separately (rich diagnostics from the failure registry).
+    /// Skipped when no build activity was seen (e.g. inspect/query commands), to
+    /// avoid all-zero noise.
     fn last_render(&self) {
         if !self.core.state.has_activity() {
             return;
@@ -603,9 +596,6 @@ impl TUIAppView for TuiProgressView {
             "{elapsed} · {}",
             self.core.state.counts_segment()
         ));
-        for (addr, msg) in &self.core.errors {
-            tracing::error!("{addr}: {msg}");
-        }
     }
 }
 
@@ -649,9 +639,6 @@ impl CIAppView for CiProgressView {
             tracing::info!("matched {n} targets");
         }
         tracing::info!("{}", self.core.state.summary());
-        for (addr, err) in &self.core.errors {
-            tracing::error!("{addr}: {err}");
-        }
     }
 }
 
@@ -896,15 +883,12 @@ mod tests {
     }
 
     #[test]
-    fn ci_view_event_folds_and_collects_errors() {
+    fn ci_view_event_folds_error_count() {
         let mut v = CiProgressView::new("Running //a:b");
         v.apply(&ev(1, result_start("//a:b")));
         v.apply(&ev(2, result_end("//a:b", Some("boom".into()))));
-        // ResultEnd errors are retained for the final ci_finish report.
-        assert_eq!(
-            v.core.errors,
-            vec![("//a:b".to_string(), "boom".to_string())]
-        );
+        // The failing ResultEnd bumps the errored counter; the message itself is
+        // not retained — rich diagnostics come from the failure registry.
         assert_eq!(v.core.state.errored, 1);
     }
 

@@ -111,30 +111,35 @@ impl App for RunApp {
             ctx.bg_pending(),
         );
 
-        let (result, failures) = match self.matcher {
-            Matcher::Addr(addr) => {
-                let r = self
-                    .engine
-                    .clone()
-                    .result_addr(rs, &addr, OutputMatcher::All, &opts)
-                    .await?;
-                (vec![r], Vec::new())
-            }
-            m => {
-                let batch = self.engine.clone().result(rs, &m, &opts).await?;
-                (batch.ok, batch.errors)
-            }
+        // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
+        // `finalize!` paved road handles rendering and exit uniformly. The engine
+        // already returns `Err` for cancellation and genuine top-level failures;
+        // per-addr `--no-fail-fast` failures live in the request's failure registry.
+        let res = match self.matcher {
+            Matcher::Addr(addr) => self
+                .engine
+                .clone()
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .map(|r| vec![r]),
+            m => self
+                .engine
+                .clone()
+                .result(rs.clone(), &m, &opts)
+                .await
+                .map(|batch| batch.ok),
         };
 
-        tui::paused!(ctx, {
+        // On success print `--cat-out` / `--list-out`; failures/cancellation are
+        // rendered and turned into the right exit by the macro.
+        crate::commands::errors::finalize!(ctx, rs, res, result => {
             if self.args.cat_out {
                 for r in &result {
                     for a in &r.artifacts {
                         for e in a.walk()? {
                             let e = e?;
-                            if let crate::hartifactcontent::WalkEntryKind::File {
-                                mut data, ..
-                            } = e.kind
+                            if let crate::hartifactcontent::WalkEntryKind::File { mut data, .. } =
+                                e.kind
                             {
                                 io::copy(&mut data, &mut io::stdout())?;
                             }
@@ -150,22 +155,8 @@ impl App for RunApp {
                     }
                 }
             }
-        });
-
-        // Cancellation (Ctrl-C) is not a target failure — separate it from the
-        // tally so a cancelled run doesn't report every in-flight target as
-        // "failed", but still exits with an error (the build was aborted).
-        let (cancelled, real): (Vec<_>, Vec<_>) = failures.iter().partition(|(_, e)| {
-            crate::hmemoizer::downcast_chain_ref::<crate::engine::error::CancelledError>(e)
-                .is_some()
-        });
-        if !real.is_empty() {
-            anyhow::bail!("{} target(s) failed", real.len());
-        }
-        if !cancelled.is_empty() {
-            anyhow::bail!("cancelled");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
