@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::available_parallelism;
 
+use anyhow::Context;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
@@ -26,6 +27,22 @@ pub fn build_runtime() -> std::io::Result<Runtime> {
         .max_blocking_threads(8 * n + 64)
         .enable_all()
         .build()
+}
+
+/// Every command entry point funnels through here so the blocking-pool sizing
+/// in `build_runtime` applies uniformly (the plain `#[tokio::main]` attribute
+/// can't express `max_blocking_threads`). Builds the tuned runtime, drives
+/// `fut` to completion, and lets the runtime drop normally at end of scope.
+///
+/// Critical teardown — FUSE unmount, SQLite flush, sandbox rmdir (all in
+/// `Engine::drop`), plus the sandbox-cleanup queue the renderer waits on — has
+/// already run *inside* `fut`: the last `Arc<Engine>` lives in the app task, so
+/// its drop completes before `fut` resolves. The runtime drop only joins idle
+/// worker/blocking threads after that.
+pub fn block_on<F: Future>(fut: F) -> anyhow::Result<F::Output> {
+    Ok(build_runtime()
+        .context("build tokio runtime")?
+        .block_on(fut))
 }
 
 /// Producer-side handle for the in-process shutdown signal. Both the SIGINT
@@ -182,8 +199,8 @@ fn spawn_sigint_producer(trigger: ShutdownTrigger) {
 ///
 /// Engine is held as a `Weak` so the spawned task can't keep the engine
 /// alive past the command's natural lifetime. Must be called from inside a
-/// tokio runtime; `bootstrap::new_engine` is only invoked from
-/// `#[tokio::main]` command entry points.
+/// tokio runtime; `bootstrap::new_engine` is only invoked from command entry
+/// points already running on a `bootstrap::block_on` runtime.
 fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedReceiver<()>) {
     tokio::spawn(async move {
         if rx.recv().await.is_none() {

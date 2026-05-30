@@ -50,10 +50,9 @@ impl App for HashinApp {
 }
 
 pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    execute_async(args.clone(), sink, global.clone())
+    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
-#[tokio::main]
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let addr =
         htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;

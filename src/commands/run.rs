@@ -1,7 +1,6 @@
 use std::io;
 use std::sync::Arc;
 
-use anyhow::Context;
 use async_trait::async_trait;
 use clap::Args;
 
@@ -158,20 +157,7 @@ impl App for RunApp {
 }
 
 pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    let rt = bootstrap::build_runtime().context("build tokio runtime")?;
-    let res = rt.block_on(execute_async(args.clone(), sink, global.clone()));
-    // Every piece of critical teardown — FUSE unmount, SQLite flush, sandbox
-    // rmdir (all in `Engine::drop`), plus the sandbox-cleanup queue the renderer
-    // waits on — has already run *inside* `block_on`: the last `Arc<Engine>`
-    // lives in the app task, so its drop completes before that future resolves.
-    // What's left is the implicit runtime drop, which *joins* the blocking pool
-    // (the signal driver, detached proc-output drain readers, any parked
-    // `spawn_blocking`). Those can't be aborted, so the join is what hangs the
-    // CLI after the TUI has already torn down. Shut the runtime down in the
-    // background instead and return immediately — the OS reaps the idle threads
-    // on process exit.
-    rt.shutdown_background();
-    res
+    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {

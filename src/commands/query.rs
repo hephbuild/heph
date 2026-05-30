@@ -69,10 +69,9 @@ impl App for QueryApp {
 }
 
 pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    execute_async(args.clone(), sink, global.clone())
+    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
-#[tokio::main]
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &cwp, true)?;
