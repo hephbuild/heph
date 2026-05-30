@@ -135,20 +135,23 @@ const ART_RAMP: [char; 8] = ['.', ':', '-', '=', '+', '*', '#', '%'];
 
 /// `rows` body lines of a dim, slowly-drifting plasma field: overlaid sine waves
 /// (including a radial term) sampled into [`ART_RAMP`]. Pure function of `now_ms`
-/// + cell position; one uniform dim style per line keeps spans cheap.
+/// + cell position; one uniform dim style per line keeps spans cheap. A 1-space
+/// gutter is kept on the left and right so the field never touches the box edges.
 fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
     let style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::DIM);
     let t = now_ms as f64 / ART_PERIOD_MS;
-    let cx = width as f64 / 2.0;
+    let inner = width.saturating_sub(2);
+    let cx = inner as f64 / 2.0;
     let cy = rows as f64 / 2.0;
     let n = ART_RAMP.len();
     let mut lines = Vec::with_capacity(rows);
     for y in 0..rows {
         let fy = y as f64;
         let mut s = String::with_capacity(width);
-        for x in 0..width {
+        s.push(' ');
+        for x in 0..inner {
             let fx = x as f64;
             let dx = fx - cx;
             let dy = (fy - cy) * 2.0; // cells are ~2× taller than wide
@@ -161,6 +164,7 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
             let idx = (1..n).filter(|&i| level >= i as f64).count();
             s.push(ART_RAMP.get(idx).copied().unwrap_or(' '));
         }
+        s.push(' ');
         lines.push(Line::from(Span::styled(s, style)));
     }
     lines

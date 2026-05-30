@@ -529,6 +529,16 @@ impl Engine {
         // would inflate the client's matched count and trip `complete` early.
         let owns_matched = rs.claim_matched_stream();
 
+        // Advertise the matched line up front (provisional, empty set) so the
+        // client paints "~0" the instant the query starts, instead of waiting
+        // for the first match to stream — the matcher walk can take a while.
+        if owns_matched {
+            rs.emit(crate::engine::event::BuildEventKind::Matched {
+                addrs: Vec::new(),
+                complete: false,
+            });
+        }
+
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
@@ -2502,6 +2512,47 @@ mod tests {
         assert_eq!(matched.len(), 2, "matched set: {matched:?}");
         assert!(matched.contains(&"//pkg:a".to_string()), "{matched:?}");
         assert!(matched.contains(&"//pkg:b".to_string()), "{matched:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn result_emits_provisional_zero_matched_up_front() -> anyhow::Result<()> {
+        // The matched line is advertised the instant the query starts: the first
+        // Matched event carries an empty set with complete=false (provisional
+        // "~0"), before any match has streamed.
+        let (engine, _home) = engine_with_home(vec![
+            static_target_run("//pkg:a", "true"),
+            static_target_run("//pkg:b", "true"),
+        ])?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        engine
+            .clone()
+            .result(
+                rs.clone(),
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await?;
+        drop(rs);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let first = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                BuildEventKind::Matched { addrs, complete } => Some((addrs.clone(), *complete)),
+                _ => None,
+            })
+            .expect("a Matched event must be emitted");
+        assert_eq!(
+            first,
+            (Vec::new(), false),
+            "first Matched event must advertise an empty, provisional set"
+        );
         Ok(())
     }
 
