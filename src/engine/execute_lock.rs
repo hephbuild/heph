@@ -11,7 +11,6 @@ use crate::hlock::{FLock, KeyedLock, MemLock};
 use crate::htaddr::Addr;
 use anyhow::Result;
 use std::io::Read as _;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Which lock backend guards the execute phase.
@@ -76,9 +75,11 @@ impl ExecuteLock {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> Result<ExecuteLockGuard> {
         match self {
-            ExecuteLock::Fs { dir, lock } => {
+            ExecuteLock::Fs { lock, .. } => {
                 let guard = lock.lock(addr.clone(), ctoken).await?;
-                write_pid(&lock_file_path(dir, addr));
+                // Stamp our pid through the already-open lock fd (no second
+                // open). Best-effort: a write failure never fails the acquire.
+                let _ = guard.write_contents(std::process::id().to_string().as_bytes());
                 Ok(Box::new(guard))
             }
             ExecuteLock::Mem(kl) => Ok(Box::new(kl.lock(addr.clone(), ctoken).await?)),
@@ -103,20 +104,7 @@ fn lock_file_path(dir: &Path, addr: &Addr) -> PathBuf {
     dir.join(format!("{}.lock", addr.hash_str()))
 }
 
-/// Stamp the current pid into the lock file. Best-effort — errors are swallowed
-/// because failing to advertise the holder must never fail the lock itself.
-/// Written through a fresh handle; the `flock(2)` held by the backend is
-/// advisory and does not block this write.
-fn write_pid(path: &Path) {
-    let _ = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .and_then(|mut f| f.write_all(std::process::id().to_string().as_bytes()));
-}
-
-/// Read a pid previously written by [`write_pid`]. `None` on any read/parse
+/// Read a pid previously stamped by the lock holder. `None` on any read/parse
 /// failure (missing file, empty, non-numeric).
 fn read_pid(path: &Path) -> Option<u32> {
     let mut s = String::new();

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use libc::c_int;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
+use std::io::{Seek, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,6 +125,23 @@ impl FLockState {
                 Ok(false)
             }
         }
+    }
+
+    /// Overwrite the lock file's contents through the already-open lock fd
+    /// (no second `open`). Only valid while a guard is held — the fd is open
+    /// exactly then. Truncates to `bytes.len()` so stale trailing bytes from a
+    /// prior, longer payload do not linger.
+    fn write_contents(&self, bytes: &[u8]) -> Result<()> {
+        let st = self.fd.lock();
+        let mut f = st
+            .file
+            .as_ref()
+            .context("write_contents requires a held lock (fd open)")?;
+        f.rewind().context("seeking lock file to start")?;
+        f.write_all(bytes).context("writing lock file contents")?;
+        f.set_len(bytes.len() as u64)
+            .context("truncating lock file to payload length")?;
+        Ok(())
     }
 
     fn release_read(&self) {
@@ -234,6 +252,15 @@ impl Drop for FReadGuard {
 #[derive(Debug)]
 pub struct FWriteGuard {
     state: Arc<FLockState>,
+}
+
+impl FWriteGuard {
+    /// Overwrite the lock file's contents through the held lock fd, reusing the
+    /// open file description rather than opening the path again. Holding the
+    /// exclusive guard guarantees no other writer races this.
+    pub fn write_contents(&self, bytes: &[u8]) -> Result<()> {
+        self.state.write_contents(bytes)
+    }
 }
 
 impl Drop for FWriteGuard {
@@ -352,6 +379,22 @@ mod tests {
 
         drop(held);
         assert!(b.try_write().unwrap().is_some(), "EX ok after SH released");
+    }
+
+    #[tokio::test]
+    async fn write_contents_persists_and_truncates_through_held_fd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let l = FLock::new(&path);
+
+        let g = l.lock(&ct()).await.unwrap();
+        g.write_contents(b"123456").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"123456");
+
+        // A shorter payload truncates the trailing bytes of the longer one.
+        g.write_contents(b"42").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"42");
+        drop(g);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
