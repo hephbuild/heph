@@ -5,7 +5,9 @@
 //! flight. When the last one drops, the cell removes its own (now-dead) entry
 //! from the registry. A live guard keeps its key resident.
 
-use crate::hlock::traits::{Ctoken, Lock, RWLock, TLock, TReadGuard, TWriteGuard};
+use crate::hlock::traits::{
+    Ctoken, Lock, RWLock, TLock, TReadGuard, TUpgradableReadGuard, TWriteGuard,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -108,16 +110,27 @@ impl<K: Eq + Hash, L, G: std::fmt::Debug> std::fmt::Debug for KeyedGuard<K, L, G
     }
 }
 
-#[async_trait]
+// Plain read guard: marker only (the cell keeps the key resident via `_cell`).
 impl<K, L, G> TReadGuard for KeyedGuard<K, L, G>
 where
     K: Eq + Hash + Send + Sync + 'static,
     L: Send + Sync + 'static,
     G: TReadGuard,
 {
+}
+
+#[async_trait]
+impl<K, L, G> TUpgradableReadGuard for KeyedGuard<K, L, G>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    L: Send + Sync + 'static,
+    G: TUpgradableReadGuard,
+{
     type WriteGuard = KeyedGuard<K, L, G::WriteGuard>;
 
     async fn upgrade(self, ctoken: Ctoken<'_>) -> Result<Self::WriteGuard> {
+        // On inner error the bridge releases the lock; `self._cell` drops here,
+        // releasing the keyed cell ref (no leak).
         let inner = self.inner.upgrade(ctoken).await?;
         Ok(KeyedGuard {
             _cell: self._cell,
@@ -133,9 +146,9 @@ where
     L: Send + Sync + 'static,
     G: TWriteGuard,
 {
-    type ReadGuard = KeyedGuard<K, L, G::ReadGuard>;
+    type UpgradableGuard = KeyedGuard<K, L, G::UpgradableGuard>;
 
-    async fn downgrade(self, ctoken: Ctoken<'_>) -> Result<Self::ReadGuard> {
+    async fn downgrade(self, ctoken: Ctoken<'_>) -> Result<Self::UpgradableGuard> {
         let inner = self.inner.downgrade(ctoken).await?;
         Ok(KeyedGuard {
             _cell: self._cell,
@@ -242,8 +255,9 @@ where
     }
 }
 
-/// Keyed transformable lock. Read/write guards can be upgraded/downgraded via
-/// the [`TReadGuard`]/[`TWriteGuard`] impls on [`KeyedGuard`].
+/// Keyed transformable lock. Upgradable-read guards can be upgraded and write
+/// guards downgraded via the [`TUpgradableReadGuard`]/[`TWriteGuard`] impls on
+/// [`KeyedGuard`].
 pub struct KeyedTLock<K: Eq + Hash, L> {
     reg: Registry<K, L>,
 }
@@ -260,10 +274,21 @@ where
         }
     }
 
-    /// Acquire a read guard for `key`.
+    /// Acquire a plain shared read guard for `key`.
     pub async fn read(&self, key: K, ctoken: Ctoken<'_>) -> Result<KeyedGuard<K, L, L::ReadGuard>> {
         let cell = self.reg.cell(key);
         let inner = cell.lock.read(ctoken).await?;
+        Ok(KeyedGuard { _cell: cell, inner })
+    }
+
+    /// Acquire an upgradable read guard for `key`.
+    pub async fn upgradable_read(
+        &self,
+        key: K,
+        ctoken: Ctoken<'_>,
+    ) -> Result<KeyedGuard<K, L, L::UpgradableGuard>> {
+        let cell = self.reg.cell(key);
+        let inner = cell.lock.upgradable_read(ctoken).await?;
         Ok(KeyedGuard { _cell: cell, inner })
     }
 
@@ -278,12 +303,24 @@ where
         Ok(KeyedGuard { _cell: cell, inner })
     }
 
-    /// Try to acquire a read guard for `key`.
+    /// Try to acquire a plain shared read guard for `key`.
     pub fn try_read(&self, key: K) -> Result<Option<KeyedGuard<K, L, L::ReadGuard>>> {
         let cell = self.reg.cell(key);
         Ok(cell
             .lock
             .try_read()?
+            .map(|inner| KeyedGuard { _cell: cell, inner }))
+    }
+
+    /// Try to acquire an upgradable read guard for `key`.
+    pub fn try_upgradable_read(
+        &self,
+        key: K,
+    ) -> Result<Option<KeyedGuard<K, L, L::UpgradableGuard>>> {
+        let cell = self.reg.cell(key);
+        Ok(cell
+            .lock
+            .try_upgradable_read()?
             .map(|inner| KeyedGuard { _cell: cell, inner }))
     }
 
@@ -408,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn keyed_transformable_upgrade_carries_cell() {
         let kl: KeyedTLock<String, TBridge<MemLock, MemRWLock>> = KeyedTLock::new(|_| mem_tlock());
-        let r = kl.read("a".to_string(), &ct()).await.unwrap();
+        let r = kl.upgradable_read("a".to_string(), &ct()).await.unwrap();
         assert_eq!(kl.len(), 1);
         let w = r.upgrade(&ct()).await.unwrap();
         assert_eq!(kl.len(), 1, "cell preserved across upgrade");

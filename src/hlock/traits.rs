@@ -5,8 +5,9 @@
 //!
 //! - [`Lock`] — exclusive lock.
 //! - [`RWLock`] — reader/writer lock (shared reads, exclusive write).
-//! - [`TLock`] — transformable lock: a held guard can be atomically
-//!   upgraded read→write or downgraded write→read.
+//! - [`TLock`] — transformable lock: an *upgradable* read guard can be
+//!   atomically upgraded read→write, and a write guard downgraded back to an
+//!   upgradable read guard.
 //! - [`TRWLock`] — transformable reader/writer lock (marker super-trait of
 //!   [`TLock`]; the inner lock permits concurrent readers).
 //!
@@ -54,23 +55,39 @@ pub trait RWLock: Send + Sync {
     fn try_write(&self) -> Result<Option<Self::WriteGuard>>;
 }
 
-/// A transformable lock whose guards can switch between shared "read" and
-/// exclusive "write" modes via the consuming transforms on [`TReadGuard`] /
-/// [`TWriteGuard`].
+/// A transformable lock whose guards can switch between an upgradable "read"
+/// mode and an exclusive "write" mode via the consuming transforms on
+/// [`TUpgradableReadGuard`] / [`TWriteGuard`].
+///
+/// Three guard flavours: a *plain* read guard ([`Self::ReadGuard`], shared, no
+/// transform), an *upgradable* read guard ([`Self::UpgradableGuard`], at most
+/// one outstanding, transformable to write), and a write guard
+/// ([`Self::WriteGuard`], exclusive, downgradable back to upgradable). Only the
+/// upgradable guard can become a writer; this is what makes upgrade/downgrade
+/// deadlock-free — the gateway to the write lock is held continuously across
+/// every transition, never acquired while another inner guard is in hand.
 #[async_trait]
 pub trait TLock: Send + Sync {
-    /// Read guard; can be upgraded to [`Self::WriteGuard`].
-    type ReadGuard: TReadGuard<WriteGuard = Self::WriteGuard> + Send;
-    /// Write guard; can be downgraded to [`Self::ReadGuard`].
-    type WriteGuard: TWriteGuard<ReadGuard = Self::ReadGuard> + Send;
+    /// Plain shared read guard. Cannot be upgraded; acquire an
+    /// [`Self::UpgradableGuard`] instead when an upgrade may be needed.
+    type ReadGuard: TReadGuard + Send;
+    /// Upgradable read guard; can be upgraded to [`Self::WriteGuard`]. At most
+    /// one is outstanding at a time (it coexists with plain readers).
+    type UpgradableGuard: TUpgradableReadGuard<WriteGuard = Self::WriteGuard> + Send;
+    /// Write guard; can be downgraded to [`Self::UpgradableGuard`].
+    type WriteGuard: TWriteGuard<UpgradableGuard = Self::UpgradableGuard> + Send;
 
-    /// Acquire a read guard, waiting until available or cancelled.
+    /// Acquire a plain shared read guard, waiting until available or cancelled.
     async fn read(&self, ctoken: Ctoken<'_>) -> Result<Self::ReadGuard>;
+    /// Acquire an upgradable read guard, waiting until available or cancelled.
+    async fn upgradable_read(&self, ctoken: Ctoken<'_>) -> Result<Self::UpgradableGuard>;
     /// Acquire a write guard, waiting until available or cancelled.
     async fn write(&self, ctoken: Ctoken<'_>) -> Result<Self::WriteGuard>;
 
-    /// Try to acquire a read guard without waiting.
+    /// Try to acquire a plain shared read guard without waiting.
     fn try_read(&self) -> Result<Option<Self::ReadGuard>>;
+    /// Try to acquire an upgradable read guard without waiting.
+    fn try_upgradable_read(&self) -> Result<Option<Self::UpgradableGuard>>;
     /// Try to acquire a write guard without waiting.
     fn try_write(&self) -> Result<Option<Self::WriteGuard>>;
 }
@@ -79,26 +96,32 @@ pub trait TLock: Send + Sync {
 /// distinction is that read guards are *shared* (many concurrent readers).
 pub trait TRWLock: TLock {}
 
-/// A read guard that can be atomically upgraded to a write guard.
+/// A plain shared read guard. Marker only — it carries no transform; to upgrade,
+/// acquire a [`TUpgradableReadGuard`] up front.
+pub trait TReadGuard: Sized + Send {}
+
+/// An upgradable read guard that can be atomically upgraded to a write guard.
 #[async_trait]
-pub trait TReadGuard: Sized + Send {
+pub trait TUpgradableReadGuard: Sized + Send {
     /// The write guard produced by [`Self::upgrade`].
     type WriteGuard: Send;
 
-    /// Atomically upgrade read→write, consuming the read guard.
+    /// Atomically upgrade read→write, consuming the upgradable guard.
     ///
-    /// Waits until all other readers drain. On error (including cancellation)
-    /// the lock is released — the caller must re-acquire.
+    /// Waits until all other readers drain — but never blocks on the upgrade
+    /// gateway, which this guard already holds, so it cannot deadlock against a
+    /// concurrent upgrade/downgrade. On error (including cancellation) the lock
+    /// is released — the caller must re-acquire.
     async fn upgrade(self, ctoken: Ctoken<'_>) -> Result<Self::WriteGuard>;
 }
 
-/// A write guard that can be atomically downgraded to a read guard.
+/// A write guard that can be atomically downgraded to an upgradable read guard.
 #[async_trait]
 pub trait TWriteGuard: Sized + Send {
-    /// The read guard produced by [`Self::downgrade`].
-    type ReadGuard: Send;
+    /// The upgradable read guard produced by [`Self::downgrade`].
+    type UpgradableGuard: Send;
 
-    /// Atomically downgrade write→read, consuming the write guard. No other
-    /// writer can acquire during the transition.
-    async fn downgrade(self, ctoken: Ctoken<'_>) -> Result<Self::ReadGuard>;
+    /// Atomically downgrade write→upgradable-read, consuming the write guard. No
+    /// other writer can acquire during the transition.
+    async fn downgrade(self, ctoken: Ctoken<'_>) -> Result<Self::UpgradableGuard>;
 }
