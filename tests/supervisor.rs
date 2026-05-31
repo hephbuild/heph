@@ -19,6 +19,13 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long to wait for the supervisor subprocess to observe socket EOF and
+/// SIGKILL its tracked targets. Generous because under a loaded CI runner
+/// (`cargo nextest` spawns one process per test, saturating cores) the
+/// supervisor can take seconds just to get scheduled. Locally this is hit in
+/// milliseconds — the headroom only matters under contention.
+const REAP_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn rheph_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rheph"))
 }
@@ -167,7 +174,7 @@ fn supervisor_reaps_tracked_pgid_on_eof() {
     drop(parent);
 
     assert!(
-        await_child_exit(&mut sleep_child, Duration::from_secs(3)),
+        await_child_exit(&mut sleep_child, REAP_TIMEOUT),
         "supervisor should have SIGKILLed pid {sleep_pid} after socket EOF"
     );
 
@@ -216,7 +223,7 @@ fn supervisor_reaps_non_setsid_child_via_direct_kill() {
     drop(parent);
 
     assert!(
-        await_child_exit(&mut sleep_child, Duration::from_secs(3)),
+        await_child_exit(&mut sleep_child, REAP_TIMEOUT),
         "supervisor must kill non-setsid pid {sleep_pid}"
     );
     drop(supervisor.wait());
@@ -257,7 +264,7 @@ fn supervisor_reaps_grandchildren_via_pgid_kill() {
     let sh_pid = sh.id();
 
     // Poll for the pid file to appear.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + REAP_TIMEOUT;
     let gc_pid: u32 = loop {
         if let Ok(contents) = std::fs::read_to_string(&pid_file)
             && let Ok(pid) = contents.trim().parse::<u32>()
@@ -280,13 +287,13 @@ fn supervisor_reaps_grandchildren_via_pgid_kill() {
     // sh is our direct child; reap it via try_wait so we don't trip on the
     // zombie still being present in the kernel process table.
     assert!(
-        await_child_exit(&mut sh, Duration::from_secs(3)),
+        await_child_exit(&mut sh, REAP_TIMEOUT),
         "sh leader {sh_pid} must die"
     );
     // The grandchild was re-parented to init when the bash leader exited;
     // it's not our child, so kill-probe semantics work cleanly.
     assert!(
-        await_pid_gone(gc_pid, Duration::from_secs(3)),
+        await_pid_gone(gc_pid, REAP_TIMEOUT),
         "grandchild {gc_pid} must die"
     );
     drop(supervisor.wait());
