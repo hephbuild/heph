@@ -278,6 +278,23 @@ fn exclude_any_cache() -> &'static RwLock<ExcludeCache> {
     CACHE.get_or_init(|| RwLock::new(ExcludeCache::default()))
 }
 
+/// Per-request cache of glob walk results.
+///
+/// fs-glob targets are `CacheConfig::off()`, so without this `run` re-walks the
+/// tree (walkdir + per-entry stat) on every call. Within one request the on-disk
+/// tree is immutable, so the artifact set for a given `(root, pattern, excludes)`
+/// is stable — memoize it and skip the walk on repeat calls. Keyed by
+/// `request_id` (outer) and `(root, pattern, excludes)` (inner) so it never
+/// reuses a stale tree across requests.
+type GlobResultBucket = FxHashMap<String, Arc<Vec<OutputArtifact>>>;
+/// request_id → its [`GlobResultBucket`].
+type GlobResultCache = FxHashMap<String, GlobResultBucket>;
+
+fn glob_result_cache() -> &'static RwLock<GlobResultCache> {
+    static CACHE: OnceLock<RwLock<GlobResultCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(GlobResultCache::default()))
+}
+
 /// Returns the compiled exclude `Any` (built-ins + user `exclude`) for
 /// `request_id`, memoizing across calls within that request. `exclude` must be
 /// non-empty; the no-exclude case uses the cheaper [`builtin_excludes`] path.
@@ -350,6 +367,133 @@ fn compile_glob(
         not,
         prefix: literal_prefix(pattern).to_owned(),
     })
+}
+
+/// Walks `root` for files matching `compiled`, returning their artifacts.
+///
+/// Starts at the pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans
+/// only `<root>/a/b`, not the whole tree. Matching uses the cached glob/exclude
+/// NFAs directly — no per-run regex compilation.
+fn walk_glob(
+    root: &std::path::Path,
+    compiled: &CompiledGlob,
+) -> anyhow::Result<Vec<OutputArtifact>> {
+    let walk_root = if compiled.prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&compiled.prefix)
+    };
+
+    let mut artifacts = vec![];
+
+    let walker = walkdir::WalkDir::new(&walk_root)
+        .into_iter()
+        .filter_entry(|entry| {
+            // Never descend into always-excluded subtrees (.git, …).
+            !(entry.file_type().is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| BUILT_IN_PRUNE_DIRS.contains(&n)))
+        });
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // A missing walk root (or a path that vanished mid-walk) is an
+                // empty match, not an error.
+                if e.io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                {
+                    continue;
+                }
+                return Err(anyhow::Error::from(e)).context("walking glob entries");
+            }
+        };
+
+        if entry.file_type().is_dir() {
+            continue;
+        }
+
+        let abs_path = entry.path();
+        let rel = abs_path
+            .strip_prefix(root)
+            .with_context(|| "strip root prefix from glob entry")?;
+
+        // Include on a pattern match, drop on an exclude match.
+        use wax::Program as _;
+        if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
+            continue;
+        }
+
+        let rel_str = rel.to_str().ok_or_else(|| {
+            anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
+        })?;
+
+        let meta = entry
+            .metadata()
+            .with_context(|| format!("stat glob entry '{}'", abs_path.display()))?;
+
+        let x = is_exec(&meta);
+        let hashout = file_hashout(&meta);
+
+        let source_path = abs_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("glob entry path is not valid UTF-8"))?
+            .to_string();
+
+        let name = rel_str.replace('/', "_");
+
+        artifacts.push(OutputArtifact {
+            group: "".to_string(),
+            name,
+            r#type: Type::Output,
+            content: Content::File(ContentFile {
+                source_path,
+                out_path: rel_str.to_string(),
+                x,
+            }),
+            hashout,
+        });
+    }
+
+    Ok(artifacts)
+}
+
+/// Returns the glob walk artifacts for `(root, pattern, exclude)`, memoizing
+/// across calls within `request_id`. The first call walks; repeats reuse the
+/// cached `Arc`.
+fn cached_glob_walk(
+    request_id: &str,
+    root: &std::path::Path,
+    pattern: &str,
+    exclude: &[String],
+    compiled: &CompiledGlob,
+) -> anyhow::Result<Arc<Vec<OutputArtifact>>> {
+    let mut sorted: Vec<&str> = exclude.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    // `root` is part of the key: the same pattern walked under a different tree
+    // root yields different artifacts (and source paths).
+    let key = format!("{}\0{}\0{}", root.display(), pattern, sorted.join("\u{1}"));
+
+    if let Some(a) = glob_result_cache()
+        .read()
+        .get(request_id)
+        .and_then(|m| m.get(&key))
+    {
+        return Ok(a.clone());
+    }
+
+    let artifacts = Arc::new(walk_glob(root, compiled)?);
+
+    Ok(glob_result_cache()
+        .write()
+        .entry(request_id.to_owned())
+        .or_default()
+        .entry(key)
+        .or_insert(artifacts)
+        .clone())
 }
 
 pub struct Driver;
@@ -536,94 +680,18 @@ impl crate::engine::driver::Driver for Driver {
                 })
             }
 
-            FsDef::Glob { compiled, .. } => {
-                // Start the walk at the pattern's literal prefix so a rooted
-                // pattern (`a/b/**/*`) scans only `<root>/a/b`, not the whole
-                // tree. Matching uses the cached glob/exclude NFAs directly —
-                // no per-run regex (WalkProgram / exclude `Any`) compilation.
-                let walk_root = if compiled.prefix.is_empty() {
-                    root.clone()
-                } else {
-                    root.join(&compiled.prefix)
-                };
-
-                let mut artifacts = vec![];
-
-                let walker = walkdir::WalkDir::new(&walk_root)
-                    .into_iter()
-                    .filter_entry(|entry| {
-                        // Never descend into always-excluded subtrees (.git, …).
-                        !(entry.file_type().is_dir()
-                            && entry
-                                .file_name()
-                                .to_str()
-                                .is_some_and(|n| BUILT_IN_PRUNE_DIRS.contains(&n)))
-                    });
-
-                for entry in walker {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(e) => {
-                            // A missing walk root (or a path that vanished
-                            // mid-walk) is an empty match, not an error.
-                            if e.io_error()
-                                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-                            {
-                                continue;
-                            }
-                            return Err(anyhow::Error::from(e))
-                                .context("walking glob entries");
-                        }
-                    };
-
-                    if entry.file_type().is_dir() {
-                        continue;
-                    }
-
-                    let abs_path = entry.path();
-                    let rel = abs_path
-                        .strip_prefix(root)
-                        .with_context(|| "strip root prefix from glob entry")?;
-
-                    // Include on a pattern match, drop on an exclude match.
-                    use wax::Program as _;
-                    if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
-                        continue;
-                    }
-
-                    let rel_str = rel.to_str().ok_or_else(|| {
-                        anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
-                    })?;
-
-                    let meta = entry
-                        .metadata()
-                        .with_context(|| format!("stat glob entry '{}'", abs_path.display()))?;
-
-                    let x = is_exec(&meta);
-                    let hashout = file_hashout(&meta);
-
-                    let source_path = abs_path
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("glob entry path is not valid UTF-8"))?
-                        .to_string();
-
-                    let name = rel_str.replace('/', "_");
-
-                    artifacts.push(OutputArtifact {
-                        group: "".to_string(),
-                        name,
-                        r#type: Type::Output,
-                        content: Content::File(ContentFile {
-                            source_path,
-                            out_path: rel_str.to_string(),
-                            x,
-                        }),
-                        hashout,
-                    });
-                }
+            FsDef::Glob {
+                pattern,
+                exclude,
+                compiled,
+            } => {
+                // Within a request the tree is immutable, so the walk result for
+                // this `(root, pattern, excludes)` is memoized — repeat calls
+                // skip walkdir + per-entry stat entirely.
+                let artifacts = cached_glob_walk(req.request_id, root, pattern, exclude, compiled)?;
 
                 Ok(RunResponse {
-                    artifacts,
+                    artifacts: (*artifacts).clone(),
                     ..Default::default()
                 })
             }
@@ -1510,11 +1578,125 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_driver_run_glob_memoized_per_request_skips_rewalk() {
+        // Within one request the walk result is memoized: a file created after
+        // the first run must NOT appear in a second run with the same id.
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), b"").unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("*.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        // Unique request id so this test does not collide with the shared cache.
+        let request_id = "test-memo-rewalk".to_string();
+        let hashin = String::new();
+
+        let res1 = driver
+            .run(
+                make_run_req(
+                    &parse_res.target_def,
+                    &request_id,
+                    tmp.path().to_path_buf(),
+                    &hashin,
+                ),
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res1.artifacts.len(), 1);
+
+        // New file on disk; a fresh walk would see it, the memoized result won't.
+        fs::write(tmp.path().join("b.rs"), b"").unwrap();
+
+        let res2 = driver
+            .run(
+                make_run_req(
+                    &parse_res.target_def,
+                    &request_id,
+                    tmp.path().to_path_buf(),
+                    &hashin,
+                ),
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res2.artifacts.len(),
+            1,
+            "second run in same request must reuse memoized walk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_distinct_requests_rewalk() {
+        // A different request id must not see the first request's memoized walk.
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), b"").unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("*.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let hashin = String::new();
+        let req_a = "test-memo-iso-a".to_string();
+        let res1 = driver
+            .run(
+                make_run_req(
+                    &parse_res.target_def,
+                    &req_a,
+                    tmp.path().to_path_buf(),
+                    &hashin,
+                ),
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res1.artifacts.len(), 1);
+
+        fs::write(tmp.path().join("b.rs"), b"").unwrap();
+
+        let req_b = "test-memo-iso-b".to_string();
+        let res2 = driver
+            .run(
+                make_run_req(
+                    &parse_res.target_def,
+                    &req_b,
+                    tmp.path().to_path_buf(),
+                    &hashin,
+                ),
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res2.artifacts.len(),
+            2,
+            "distinct request must walk fresh and see the new file"
+        );
+    }
+
     #[test]
     fn test_literal_prefix() {
         assert_eq!(literal_prefix("mgmt/protos/x/**/*"), "mgmt/protos/x");
         // Fully-literal pattern returns itself (walk visits just that path).
-        assert_eq!(literal_prefix("mgmt/protos/x/go.mod"), "mgmt/protos/x/go.mod");
+        assert_eq!(
+            literal_prefix("mgmt/protos/x/go.mod"),
+            "mgmt/protos/x/go.mod"
+        );
         assert_eq!(literal_prefix("*.rs"), "");
         assert_eq!(literal_prefix("**/*.rs"), "");
         assert_eq!(literal_prefix("dir/ogen.{yml,yaml}"), "dir");
