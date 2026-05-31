@@ -124,10 +124,15 @@ impl PendingTracker {
         slot
     }
 
-    fn wait_if_pending(&self, key: &Key) {
+    fn wait_if_pending(&self, addr: &str, hashin: &str, name: &str) {
         let slot_opt = {
             let m = self.map.lock().expect("pending tracker poisoned");
-            m.get(key).cloned()
+            // Map holds only in-flight writers/deletes (typically empty on the
+            // read hot path), so a borrowed scan beats allocating an owned Key
+            // tuple purely to call `get`.
+            m.iter()
+                .find(|(k, _)| k.0 == addr && k.1 == hashin && k.2 == name)
+                .map(|(_, slot)| slot.clone())
         };
         if let Some(slot) = slot_opt {
             slot.wait();
@@ -363,8 +368,8 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
 
 impl LocalCache for LocalCacheSQLite {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<SizedReader> {
-        let key = (Self::key(addr), hashin.to_string(), name.to_string());
-        self.pending.wait_if_pending(&key);
+        let addr_key = Self::key(addr);
+        self.pending.wait_if_pending(&addr_key, hashin, name);
 
         let conn = self
             .read_pool
@@ -377,7 +382,7 @@ impl LocalCache for LocalCacheSQLite {
             )
             .context("preparing reader lookup")?;
         let (row_id, blob_len): (i64, usize) = match stmt.query_row(
-            rusqlite::params![key.0, key.1, key.2],
+            rusqlite::params![addr_key, hashin, name],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ) {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
@@ -466,8 +471,8 @@ impl LocalCache for LocalCacheSQLite {
     }
 
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
-        let key = (Self::key(addr), hashin.to_string(), name.to_string());
-        self.pending.wait_if_pending(&key);
+        let addr_key = Self::key(addr);
+        self.pending.wait_if_pending(&addr_key, hashin, name);
 
         let conn = self
             .read_pool
@@ -479,7 +484,7 @@ impl LocalCache for LocalCacheSQLite {
                 "SELECT 1 FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3 LIMIT 1",
             )
             .context("preparing exists lookup")?;
-        let found = match stmt.query_row(rusqlite::params![key.0, key.1, key.2], |_| Ok(())) {
+        let found = match stmt.query_row(rusqlite::params![addr_key, hashin, name], |_| Ok(())) {
             Ok(()) => true,
             Err(rusqlite::Error::QueryReturnedNoRows) => false,
             Err(e) => {
@@ -566,8 +571,8 @@ impl LocalCache for LocalCacheSQLite {
         hashin: &str,
         name: &str,
     ) -> Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
-        let key = (Self::key(addr), hashin.to_string(), name.to_string());
-        self.pending.wait_if_pending(&key);
+        let addr_key = Self::key(addr);
+        self.pending.wait_if_pending(&addr_key, hashin, name);
 
         let conn = self
             .read_pool
@@ -577,7 +582,7 @@ impl LocalCache for LocalCacheSQLite {
         let mut stmt = conn
             .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
             .context("preparing seekable_reader lookup")?;
-        let row_id: i64 = match stmt.query_row(rusqlite::params![key.0, key.1, key.2], |row| {
+        let row_id: i64 = match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| {
             row.get(0)
         }) {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
