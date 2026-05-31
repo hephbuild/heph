@@ -1,4 +1,4 @@
-use crate::engine::local_cache::{LocalCache, SizedReader};
+use crate::engine::local_cache::{LocalCache, SizedReader, TargetStream};
 use crate::hartifactcontent;
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
@@ -105,6 +105,16 @@ impl LocalCache for LocalCacheMem {
         let key = Self::key(addr, hashin, name);
         self.cache.remove(&key);
         self.inner.delete(addr, hashin, name)
+    }
+
+    fn list_targets(&self) -> Result<TargetStream> {
+        // Enumeration is authoritative at the durable backend; the mem layer
+        // only fronts reads, so delegate.
+        self.inner.list_targets()
+    }
+
+    fn list_target_entries(&self, addr: &Addr) -> Result<Vec<String>> {
+        self.inner.list_target_entries(addr)
     }
 
     fn seekable_reader(

@@ -45,7 +45,7 @@ impl Engine {
             crate::engine::event::BuildEventKind::ExecuteStart {
                 addr: addr_str.clone(),
                 driver: driver.name.clone(),
-                cache: def.target.cache,
+                cache: def.target.cache.enabled,
             },
             move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
                 addr: addr_str,

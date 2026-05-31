@@ -2,7 +2,7 @@ use crate::engine::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, outputartifact,
     targetdef::{
-        Output, TargetDef,
+        CacheConfig, Output, TargetDef,
         path::{CodegenMode, Content, Path},
     },
 };
@@ -144,8 +144,7 @@ impl crate::engine::driver::Driver for Driver {
                     }],
                 }],
                 support_files: vec![],
-                cache: false,
-                disable_remote_cache: true,
+                cache: CacheConfig::off(),
                 pty: false,
                 hash,
                 transparent: false,

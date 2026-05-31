@@ -43,6 +43,8 @@ mod result_lock;
 pub use result_lock::{LockBackend, ResultLock};
 mod expand;
 pub mod fanout;
+mod gc;
+pub use gc::GcStats;
 mod link;
 mod matcher_spec;
 mod meta;

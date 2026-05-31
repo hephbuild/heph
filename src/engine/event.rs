@@ -83,6 +83,15 @@ pub enum BuildEventKind {
     RemoteCacheMiss {
         addr: String,
     },
+    /// One target finished garbage collection: how many cache revisions it
+    /// dropped and how many bytes those revisions freed (summed from manifest
+    /// artifact sizes). Emitted once per target the `heph gc` sweep visits —
+    /// including targets that dropped nothing — so a consumer can show both the
+    /// count of targets explored and the total data reclaimed.
+    GcTargetSwept {
+        revisions_removed: usize,
+        bytes_removed: u64,
+    },
 }
 
 pub type EventSender = tokio::sync::mpsc::UnboundedSender<BuildEvent>;

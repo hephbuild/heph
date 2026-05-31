@@ -13,7 +13,10 @@ use std::io::{self, IsTerminal};
 pub use app::{App, AppContext, CIAppView, PauseGuard, TUIAppView};
 pub use log_sink::LogSink;
 pub use paused::paused;
-pub use progress::{BuildState, CiProgressView, MAX_LONG_RUNNING, PROGRESS_ROWS, TuiProgressView};
+pub use progress::{
+    BuildHeader, BuildState, CiProgressView, GcCiView, GcHeader, MAX_LONG_RUNNING, PROGRESS_ROWS,
+    ProgressHeader, TuiProgressView,
+};
 pub use stdout_buffer::BufferedStdout;
 
 pub fn should_use_tui(force_off: bool) -> bool {

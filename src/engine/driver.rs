@@ -418,6 +418,41 @@ pub mod targetdef {
         erased_serde::serialize(&**d, s)
     }
 
+    /// Per-target cache configuration.
+    ///
+    /// `enabled` gates local caching; `remote_enabled` gates the remote cache
+    /// (only meaningful when `enabled`). `history` is how many cache revisions
+    /// (distinct input hashes) to retain for this target — GC trims older ones.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub struct CacheConfig {
+        pub enabled: bool,
+        pub remote_enabled: bool,
+        pub history: u32,
+    }
+
+    impl CacheConfig {
+        /// Default number of cache revisions kept per target.
+        pub const DEFAULT_HISTORY: u32 = 1;
+
+        /// Caching enabled, with the given remote-cache toggle and default history.
+        pub fn on(remote_enabled: bool) -> Self {
+            Self {
+                enabled: true,
+                remote_enabled,
+                history: Self::DEFAULT_HISTORY,
+            }
+        }
+
+        /// Caching fully disabled (local and remote).
+        pub fn off() -> Self {
+            Self {
+                enabled: false,
+                remote_enabled: false,
+                history: 0,
+            }
+        }
+    }
+
     #[derive(Clone, Serialize)]
     pub struct TargetDef {
         pub addr: Addr,
@@ -427,8 +462,7 @@ pub mod targetdef {
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
         pub support_files: Vec<path::Path>,
-        pub cache: bool,
-        pub disable_remote_cache: bool,
+        pub cache: CacheConfig,
         pub pty: bool,
         #[serde(serialize_with = "serialize_hash")]
         pub hash: Vec<u8>,

@@ -195,6 +195,23 @@ impl ResultLock {
         }
     }
 
+    /// Non-blocking exclusive write acquire for `addr`. Returns `Ok(None)` when
+    /// the addr is currently contended (any reader/writer holds it) instead of
+    /// waiting. Used by the post-write GC trim, which must never block the hot
+    /// path. Stamps pid on success like [`write`](ResultLock::write).
+    pub fn try_write(&self, addr: &Addr) -> Result<Option<ResultWriteGuard>> {
+        match self {
+            ResultLock::Fs { dir, lock } => match lock.try_write(addr.clone())? {
+                Some(guard) => {
+                    stamp_pid(&outer_lock_path(dir, addr));
+                    Ok(Some(ResultWriteGuard::Fs(guard)))
+                }
+                None => Ok(None),
+            },
+            ResultLock::Mem(kl) => Ok(kl.try_write(addr.clone())?.map(ResultWriteGuard::Mem)),
+        }
+    }
+
     /// Best-effort pid of the process currently holding (or last to hold) the
     /// gateway for `addr`. For the filesystem backend this reads the pid the
     /// holder stamped into the gateway lock file; for the in-memory backend the
@@ -380,6 +397,43 @@ mod tests {
         lock.write(&addr("a"), &ct())
             .await
             .expect("writer after read drains");
+    }
+
+    #[tokio::test]
+    async fn try_write_none_while_held_then_some_after_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+
+        // Free → acquires.
+        let g = lock
+            .try_write(&addr("a"))
+            .expect("try_write ok")
+            .expect("free addr acquires");
+
+        // Held → non-blocking, returns None rather than waiting.
+        assert!(
+            lock.try_write(&addr("a")).expect("try_write ok").is_none(),
+            "must not acquire while a write guard is held"
+        );
+
+        drop(g);
+
+        // Released → acquires again.
+        assert!(
+            lock.try_write(&addr("a")).expect("try_write ok").is_some(),
+            "must acquire once the prior guard drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_write_none_while_plain_read_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+        let _r = lock.read(&addr("a"), &ct()).await.expect("read");
+        assert!(
+            lock.try_write(&addr("a")).expect("try_write ok").is_none(),
+            "writer must not acquire while a shared read is held"
+        );
     }
 
     #[tokio::test]

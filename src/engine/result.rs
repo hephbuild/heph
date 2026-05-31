@@ -774,7 +774,7 @@ impl Engine {
     /// Acquire a lock guard, surfacing a "waiting on lock" notice (with the
     /// holder's pid) if the wait outlasts [`RESULT_LOCK_NOTICE`]. The notice is
     /// purely informational; the wait continues until acquired or cancelled.
-    async fn acquire_with_notice<G>(
+    pub(crate) async fn acquire_with_notice<G>(
         &self,
         rs: &Arc<RequestState>,
         addr: &Addr,
@@ -810,7 +810,7 @@ impl Engine {
         outputs: Vec<String>,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<EResult> {
-        let can_cache = !opts.force && opts.def.target.cache && !opts.shell;
+        let can_cache = !opts.force && opts.def.target.cache.enabled && !opts.shell;
         let addr = &def.target.addr;
         let ctoken = rs.ctoken();
 
@@ -891,7 +891,7 @@ impl Engine {
         let hashin = opts.hashin.clone();
         let spec = opts.spec.clone();
         let def = opts.def.clone();
-        let use_tmp_cache = !opts.def.target.cache || opts.shell;
+        let use_tmp_cache = !opts.def.target.cache.enabled || opts.shell;
         let interactive = opts.interactive.clone();
         let shell = opts.shell;
         let key = (addr.clone(), hashin.clone());
@@ -939,6 +939,24 @@ impl Engine {
                         .await
                         .map(|cached| (cached, artifacts_meta))
                         .with_context(|| format!("cache_locally {addr}"));
+
+                    // Post-write GC: trim this target's stale revisions in the
+                    // background (same lane as sandbox cleanup), skipping
+                    // uncacheable/tmp entries which are ephemeral and would be
+                    // dropped anyway. Fire-and-forget; the trim runs only if the
+                    // addr's lock is free, so it never blocks the hot path.
+                    if out.is_ok() && !use_tmp_cache {
+                        let keep = def.target.cache.history;
+                        crate::engine::sandbox_cleaner::enqueue(
+                            format!("gc {addr}"),
+                            Box::new(enclose!((engine, addr, hashin) move || {
+                                engine.try_trim_after_write(&addr, keep, &hashin);
+                                Ok(())
+                            })),
+                            rs.bg_pending(),
+                        );
+                    }
+
                     crate::hmemoizer::clear_phase();
                     out
                 }),

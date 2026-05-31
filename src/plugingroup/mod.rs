@@ -2,7 +2,7 @@ use crate::engine::driver::TargetAddr;
 use crate::engine::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
-    targetdef::{Input, InputMode, TargetDef},
+    targetdef::{CacheConfig, Input, InputMode, TargetDef},
 };
 use crate::hasync::Cancellable;
 use crate::loosespecparser::parse_strings;
@@ -83,8 +83,7 @@ impl crate::engine::driver::Driver for Driver {
                 inputs,
                 outputs: vec![],
                 support_files: vec![],
-                cache: false,
-                disable_remote_cache: true,
+                cache: CacheConfig::off(),
                 pty: false,
                 hash,
                 transparent: true,
@@ -157,7 +156,7 @@ mod tests {
             .unwrap();
         assert!(res.target_def.inputs.is_empty());
         assert!(res.target_def.transparent);
-        assert!(!res.target_def.cache);
+        assert!(!res.target_def.cache.enabled);
     }
 
     #[tokio::test]

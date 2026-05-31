@@ -25,6 +25,55 @@ pub(crate) struct TargetSpec {
 pub(crate) struct TargetSpecCache {
     pub local: bool,
     pub remote: bool,
+    /// How many cache revisions to retain for this target. Default 1.
+    pub history: u32,
+}
+
+/// Parse the `cache` attribute, which accepts either a bare bool (legacy:
+/// `cache = True/False` toggles both local and remote, history 1) or a dict
+/// `cache = {"enabled": bool, "remote": bool, "history": int}` where any unset
+/// key falls back to its default (enabled/remote true, history 1).
+fn parse_cache(v: &TargetSpecValue) -> anyhow::Result<TargetSpecCache> {
+    match v {
+        TargetSpecValue::Bool(b) => Ok(TargetSpecCache {
+            local: *b,
+            remote: *b,
+            history: 1,
+        }),
+        TargetSpecValue::Map(m) => {
+            let mut c = TargetSpecCache {
+                local: true,
+                remote: true,
+                history: 1,
+            };
+            for (k, val) in m {
+                match k.as_str() {
+                    "enabled" => {
+                        c.local = parse_bool(val).with_context(|| "parse `cache.enabled`")?
+                    }
+                    "remote" => {
+                        c.remote = parse_bool(val).with_context(|| "parse `cache.remote`")?
+                    }
+                    "history" => c.history = parse_cache_history(val)?,
+                    other => anyhow::bail!("unknown `cache` entry: {other:?}"),
+                }
+            }
+            Ok(c)
+        }
+        _ => anyhow::bail!("`cache` must be a bool or a dict"),
+    }
+}
+
+fn parse_cache_history(v: &TargetSpecValue) -> anyhow::Result<u32> {
+    let n: i64 = match v {
+        TargetSpecValue::Int(i) => *i,
+        TargetSpecValue::Uint(u) => i64::try_from(*u).context("`cache.history` too large")?,
+        _ => anyhow::bail!("`cache.history` must be an integer"),
+    };
+    if n < 1 {
+        anyhow::bail!("`cache.history` must be >= 1, got {n}");
+    }
+    u32::try_from(n).context("`cache.history` too large")
 }
 
 impl TargetSpec {
@@ -37,6 +86,7 @@ impl TargetSpec {
             cache: TargetSpecCache {
                 local: true,
                 remote: true,
+                history: 1,
             },
             outputs: HashMap::new(),
             support_files: vec![],
@@ -55,13 +105,8 @@ impl TargetSpec {
             spec.run = parse_strings(v).with_context(|| "parse `run`")?;
         };
 
-        if let Some(v) = m.remove("cache")
-            && !parse_bool(v).with_context(|| "parse `cache`")?
-        {
-            spec.cache = TargetSpecCache {
-                local: false,
-                remote: false,
-            };
+        if let Some(v) = m.remove("cache") {
+            spec.cache = parse_cache(v).with_context(|| "parse `cache`")?;
         }
 
         if let Some(v) = m.remove("out") {
@@ -140,6 +185,94 @@ mod tests {
         )]);
         m.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
         TargetSpec::from(m)
+    }
+
+    #[test]
+    fn test_cache_bool_true() {
+        let spec = make_spec([("cache", TargetSpecValue::Bool(true))]).unwrap();
+        assert!(spec.cache.local);
+        assert!(spec.cache.remote);
+        assert_eq!(spec.cache.history, 1);
+    }
+
+    #[test]
+    fn test_cache_bool_false_disables_both() {
+        let spec = make_spec([("cache", TargetSpecValue::Bool(false))]).unwrap();
+        assert!(!spec.cache.local);
+        assert!(!spec.cache.remote);
+        assert_eq!(spec.cache.history, 1);
+    }
+
+    #[test]
+    fn test_cache_default_when_absent() {
+        let spec = make_spec([]).unwrap();
+        assert!(spec.cache.local);
+        assert!(spec.cache.remote);
+        assert_eq!(spec.cache.history, 1);
+    }
+
+    #[test]
+    fn test_cache_dict_partial_keys_use_defaults() {
+        // Only `remote` set — `enabled` and `history` fall back to defaults.
+        let spec = make_spec([(
+            "cache",
+            TargetSpecValue::Map(HashMap::from([(
+                "remote".to_string(),
+                TargetSpecValue::Bool(false),
+            )])),
+        )])
+        .unwrap();
+        assert!(spec.cache.local, "enabled defaults to true");
+        assert!(!spec.cache.remote);
+        assert_eq!(spec.cache.history, 1);
+    }
+
+    #[test]
+    fn test_cache_dict_history_honored() {
+        let spec = make_spec([(
+            "cache",
+            TargetSpecValue::Map(HashMap::from([(
+                "history".to_string(),
+                TargetSpecValue::Int(5),
+            )])),
+        )])
+        .unwrap();
+        assert_eq!(spec.cache.history, 5);
+        assert!(spec.cache.local);
+        assert!(spec.cache.remote);
+    }
+
+    #[test]
+    fn test_cache_dict_unknown_key_errors() {
+        let err = match make_spec([(
+            "cache",
+            TargetSpecValue::Map(HashMap::from([(
+                "bogus".to_string(),
+                TargetSpecValue::Bool(true),
+            )])),
+        )]) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("unknown `cache` entry"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn test_cache_dict_zero_history_errors() {
+        let err = match make_spec([(
+            "cache",
+            TargetSpecValue::Map(HashMap::from([(
+                "history".to_string(),
+                TargetSpecValue::Int(0),
+            )])),
+        )]) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains(">= 1"), "{err:#}");
     }
 
     #[test]

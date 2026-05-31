@@ -1,4 +1,4 @@
-use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader};
+use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader, TargetStream};
 use crate::hartifactcontent;
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
@@ -484,6 +484,63 @@ impl LocalCache for LocalCacheSQLite {
         Ok(found)
     }
 
+    fn list_targets(&self) -> Result<TargetStream> {
+        // Stream distinct addrs over a bounded channel: the producer holds one
+        // pooled connection and a `SELECT DISTINCT addr` cursor on a dedicated
+        // thread, the consumer pulls one addr at a time. Bounded so a slow
+        // consumer (GC locking/resolving each target) applies backpressure
+        // instead of buffering every target in memory.
+        let conn = self
+            .read_pool
+            .get()
+            .context("acquiring read connection from pool")?;
+        let (tx, rx) = mpsc::sync_channel::<Result<String>>(256);
+        // Dedicated thread (not rayon) so a saturated rayon pool can't starve
+        // this long-lived producer and deadlock the consumer on `recv`.
+        std::thread::Builder::new()
+            .name("rheph-gc-list-targets".to_string())
+            .spawn(move || {
+                let mut stmt = match conn.prepare("SELECT DISTINCT addr FROM artifacts") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        drop(tx.send(Err(anyhow::Error::from(e).context("prepare list_targets"))));
+                        return;
+                    }
+                };
+                match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    Ok(rows) => {
+                        for row in rows {
+                            let item = row.context("read target addr row");
+                            if tx.send(item).is_err() {
+                                break; // consumer dropped
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        drop(tx.send(Err(anyhow::Error::from(e).context("query list_targets"))));
+                    }
+                }
+            })
+            .context("spawning gc list-targets thread")?;
+        Ok(Box::new(rx.into_iter()))
+    }
+
+    fn list_target_entries(&self, addr: &Addr) -> Result<Vec<String>> {
+        let key = Self::key(addr);
+        let conn = self
+            .read_pool
+            .get()
+            .context("acquiring read connection from pool")?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT hashin FROM artifacts WHERE addr=?1")
+            .context("preparing list_target_entries query")?;
+        let rows = stmt
+            .query_map([&key], |row| row.get::<_, String>(0))
+            .with_context(|| format!("listing entries for {addr}"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| format!("collecting entries for {addr}"))
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let key = (Self::key(addr), hashin.to_string(), name.to_string());
         let slot = self.pending.register(key.clone());
@@ -769,6 +826,34 @@ mod tests {
             h.join().expect("thread panicked");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_targets_and_entries() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let a = make_addr("pkg", "t");
+        let b = make_addr("pkg", "u");
+        for (addr, h) in [(&a, "h1"), (&a, "h2"), (&b, "h9")] {
+            let mut w = cache.writer(addr, h, "out.tar")?;
+            w.write_all(b"x")?;
+            drop(w);
+            assert!(cache.exists(addr, h, "out.tar")?); // barrier
+        }
+
+        let mut targets = cache.list_targets()?.collect::<Result<Vec<_>>>()?;
+        targets.sort();
+        assert_eq!(targets, vec![a.format(), b.format()]);
+
+        let mut a_entries = cache.list_target_entries(&a)?;
+        a_entries.sort();
+        assert_eq!(a_entries, vec!["h1".to_string(), "h2".to_string()]);
+        assert_eq!(cache.list_target_entries(&b)?, vec!["h9".to_string()]);
         Ok(())
     }
 

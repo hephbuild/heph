@@ -1,5 +1,5 @@
 use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
-use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef};
+use crate::engine::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use crate::engine::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -323,10 +323,9 @@ impl ManagedDriver for Driver {
                 inputs: vec![nix_tool],
                 outputs,
                 support_files: vec![],
-                cache: true,
                 // The wrapper points at host-local /nix/store paths; remote
                 // consumers would not have those paths realized.
-                disable_remote_cache: true,
+                cache: CacheConfig::on(false),
                 pty: false,
                 hash,
                 transparent: false,
@@ -669,9 +668,9 @@ mod tests {
             .parse(make_parse_req("//pkg:t", basic_config()), &ctoken())
             .await
             .unwrap();
-        assert!(res.target_def.cache);
+        assert!(res.target_def.cache.enabled);
         assert!(
-            res.target_def.disable_remote_cache,
+            !res.target_def.cache.remote_enabled,
             "wrappers point at host-local /nix/store; remote cache must stay disabled"
         );
     }

@@ -1,8 +1,10 @@
-use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader};
+use crate::engine::local_cache::{
+    LocalCache, MANIFEST_V1, Manifest, NotFoundError, SizedReader, TargetStream,
+};
 use crate::hartifactcontent;
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 pub struct LocalCacheFS {
@@ -14,7 +16,9 @@ impl LocalCacheFS {
         Ok(Self { root })
     }
 
-    fn get_path(&self, addr: &Addr, hashin: &str, name: &str) -> PathBuf {
+    /// Directory holding all of a target's revisions:
+    /// `<root>/<package>/__target_<name>[_<addr_hash>]/`.
+    fn target_dir(&self, addr: &Addr) -> PathBuf {
         let mut path = self.root.clone();
         path.push(addr.package.as_str());
         if addr.args.is_empty() {
@@ -22,6 +26,11 @@ impl LocalCacheFS {
         } else {
             path.push(format!("__target_{}_{}", addr.name, addr.hash_str()));
         }
+        path
+    }
+
+    fn get_path(&self, addr: &Addr, hashin: &str, name: &str) -> PathBuf {
+        let mut path = self.target_dir(addr);
         path.push(hashin);
         path.push(name);
         path
@@ -75,6 +84,34 @@ impl LocalCache for LocalCacheFS {
         Ok(())
     }
 
+    fn list_targets(&self) -> Result<TargetStream> {
+        let mut out = Vec::new();
+        collect_targets(&self.root, &mut out)?;
+        Ok(Box::new(out.into_iter().map(Ok)))
+    }
+
+    fn list_target_entries(&self, addr: &Addr) -> Result<Vec<String>> {
+        let dir = self.target_dir(addr);
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("read target dir {dir:?}")),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read dir entry under {dir:?}"))?;
+            if entry
+                .file_type()
+                .with_context(|| format!("stat {:?}", entry.path()))?
+                .is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                out.push(name.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     fn seekable_reader(
         &self,
         addr: &Addr,
@@ -90,6 +127,67 @@ impl LocalCache for LocalCacheFS {
             }
         }
     }
+}
+
+/// Recursively walk `dir`; for each `__target_*` directory (one per target),
+/// read any one revision's `MANIFEST_V1` to recover the addr (`manifest.target`
+/// is authoritative — the on-disk path hashes arg'd addrs irreversibly) and push
+/// it once. Does not descend into a target dir. Targets whose manifests are all
+/// missing/corrupt are skipped (best-effort; GC tolerates noise).
+fn collect_targets(dir: &Path, out: &mut Vec<String>) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read cache dir {dir:?}")),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read dir entry under {dir:?}"))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .with_context(|| format!("stat {path:?}"))?
+            .is_dir()
+        {
+            continue;
+        }
+        let is_target = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("__target_"));
+        if is_target {
+            if let Some(addr) = read_any_target_addr(&path)? {
+                out.push(addr);
+            }
+        } else {
+            collect_targets(&path, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read `manifest.target` from the first revision under a target dir that has a
+/// readable `MANIFEST_V1`. `None` if none do.
+fn read_any_target_addr(target_dir: &Path) -> Result<Option<String>> {
+    for entry in fs::read_dir(target_dir).with_context(|| format!("read {target_dir:?}"))? {
+        let entry = entry.with_context(|| format!("read dir entry under {target_dir:?}"))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("stat {:?}", entry.path()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let manifest_path = entry.path().join(MANIFEST_V1);
+        let buf = match fs::read(&manifest_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("read {manifest_path:?}")),
+        };
+        if let Ok(manifest) = borsh::from_slice::<Manifest>(&buf) {
+            return Ok(Some(manifest.target));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -134,6 +232,38 @@ mod tests {
         cache.delete(&addr, hashin, name)?;
         assert!(!cache.exists(&addr, hashin, name)?);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_targets_and_entries_fs() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheFS::new(PathBuf::from(dir.path()))?;
+        let addr = crate::htaddr::Addr::new(
+            crate::htpkg::PkgBuf::from("pkg"),
+            "t".to_string(),
+            Default::default(),
+        );
+        for h in ["h1", "h2"] {
+            let manifest = Manifest {
+                version: "1.0.0".to_string(),
+                target: addr.format(),
+                created_at_nanos: 0,
+                hashin: h.to_string(),
+                artifacts: vec![],
+            };
+            let mut w = cache.writer(&addr, h, MANIFEST_V1)?;
+            borsh::to_writer(&mut w, &manifest)?;
+            drop(w);
+        }
+
+        // One distinct target, recovered from the manifest's `target` field.
+        let targets = cache.list_targets()?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(targets, vec![addr.format()]);
+
+        let mut entries = cache.list_target_entries(&addr)?;
+        entries.sort();
+        assert_eq!(entries, vec!["h1".to_string(), "h2".to_string()]);
         Ok(())
     }
 

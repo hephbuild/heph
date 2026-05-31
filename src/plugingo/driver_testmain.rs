@@ -1,6 +1,6 @@
 use crate::debug_hash::DebugHasher;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
-use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef};
+use crate::engine::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use crate::engine::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -174,8 +174,7 @@ impl ManagedDriver for GoTestmainDriver {
                 inputs,
                 outputs,
                 support_files: vec![],
-                cache: true,
-                disable_remote_cache: false,
+                cache: CacheConfig::on(true),
                 pty: false,
                 hash,
                 transparent: false,

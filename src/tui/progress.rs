@@ -283,6 +283,10 @@ impl BuildState {
             }
             // Read/Write markers are not aggregated into counters.
             BuildEventKind::RemoteCacheRead { .. } | BuildEventKind::RemoteCacheWrite { .. } => {}
+            // GC progress is tracked by GcHeader, not the build counters. The
+            // elapsed-clock anchor at the top of `apply` still runs, so the
+            // clock works during a gc sweep.
+            BuildEventKind::GcTargetSwept { .. } => {}
         }
     }
 
@@ -447,9 +451,10 @@ impl BuildState {
     }
 
     /// Rows for addrs currently blocked on the result lock past the notice
-    /// threshold: `⏳ waiting on lock <addr> (held by pid N)`, or
-    /// `(holder unknown)` when the pid could not be determined. Sorted by addr so
-    /// the order is stable across frames. Empty when nothing is blocked.
+    /// threshold, rendered like the slow-target rows but flagged locked:
+    /// `🔒 <addr> (locked by pid N)`, or `(locked, holder unknown)` when the pid
+    /// could not be determined. Sorted by addr so the order is stable across
+    /// frames. Empty when nothing is blocked.
     pub fn lock_wait_lines(&self) -> Vec<Line<'static>> {
         let mut waits: Vec<(&String, &Option<u32>)> = self.lock_waits.iter().collect();
         waits.sort_by(|a, b| a.0.cmp(b.0));
@@ -457,11 +462,11 @@ impl BuildState {
             .into_iter()
             .map(|(addr, pid)| {
                 let holder = match pid {
-                    Some(pid) => format!("held by pid {pid}"),
-                    None => "holder unknown".to_string(),
+                    Some(pid) => format!("locked by pid {pid}"),
+                    None => "locked, holder unknown".to_string(),
                 };
                 Line::from(Span::styled(
-                    format!("  ⏳ waiting on lock {addr} ({holder})"),
+                    format!("  🔒 {addr} ({holder})"),
                     Style::default().fg(Color::Yellow),
                 ))
             })
@@ -493,17 +498,160 @@ impl ProgressCore {
     }
 }
 
-/// The paved-road [`TUIAppView`]: a spinner+label header over the aggregated
-/// [`BuildState`], rendering the long-running block and a persistent final
-/// summary. Used by every command's `tui_view`.
+/// Format a byte count as a compact human-readable size (`512 B`, `3.4 KiB`,
+/// `1.2 GiB`). Binary units; one decimal past the bytes band.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", UNITS.get(unit).copied().unwrap_or("B"))
+}
+
+/// Per-command header content for [`TuiProgressView`]. The view owns the box
+/// chrome, the elapsed clock, and the body (slow rows / lock waits / idle art);
+/// the header supplies only the status segment after the clock (and the bottom
+/// label + final summary). `run`/`query`/`inspect` use [`BuildHeader`]; `gc`
+/// uses [`GcHeader`].
+pub trait ProgressHeader: Send {
+    /// Fold an event into header-private state. The build header reads the
+    /// view's shared [`BuildState`] instead, so its impl is a no-op.
+    fn apply(&mut self, _ev: &BuildEvent) {}
+    /// Status segment shown after the elapsed clock, including the worker
+    /// braille. Spans (not a plain string) so the braille keeps its styling.
+    /// `core` is the view's shared build state; headers that track their own
+    /// state ignore it.
+    fn header(&self, core: &BuildState) -> Vec<Span<'static>>;
+    /// The bottom-border label.
+    fn label(&self) -> String;
+    /// Final summary segment printed after the run (after the elapsed clock).
+    /// Empty ⇒ nothing is printed.
+    fn last_render(&self, core: &BuildState) -> String;
+}
+
+/// Build/query/inspect header: the elapsed-clock counts segment plus worker
+/// braille, all read from the shared [`BuildState`].
+pub struct BuildHeader {
+    label: String,
+}
+
+impl BuildHeader {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+        }
+    }
+}
+
+impl ProgressHeader for BuildHeader {
+    fn header(&self, core: &BuildState) -> Vec<Span<'static>> {
+        let mut spans = vec![Span::raw(core.counts_segment())];
+        let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_workers());
+        if !workers.is_empty() {
+            spans.push(Span::raw(" · "));
+            spans.extend(workers);
+        }
+        spans
+    }
+
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn last_render(&self, core: &BuildState) -> String {
+        if core.has_activity() {
+            core.counts_segment()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// GC sweep header: targets explored, revisions dropped, and bytes freed,
+/// folded from [`BuildEventKind::GcTargetSwept`].
+pub struct GcHeader {
+    label: String,
+    targets: usize,
+    revisions_removed: usize,
+    bytes_removed: u64,
+}
+
+impl GcHeader {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            targets: 0,
+            revisions_removed: 0,
+            bytes_removed: 0,
+        }
+    }
+
+    fn segment(&self) -> String {
+        format!(
+            "{} targets · {} freed",
+            self.targets,
+            human_bytes(self.bytes_removed),
+        )
+    }
+}
+
+impl ProgressHeader for GcHeader {
+    fn apply(&mut self, ev: &BuildEvent) {
+        if let BuildEventKind::GcTargetSwept {
+            revisions_removed,
+            bytes_removed,
+        } = &ev.kind
+        {
+            self.targets += 1;
+            self.revisions_removed += revisions_removed;
+            self.bytes_removed = self.bytes_removed.saturating_add(*bytes_removed);
+        }
+    }
+
+    fn header(&self, _core: &BuildState) -> Vec<Span<'static>> {
+        vec![Span::raw(self.segment())]
+    }
+
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn last_render(&self, _core: &BuildState) -> String {
+        if self.targets > 0 {
+            self.segment()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// The paved-road [`TUIAppView`]: an elapsed-clock header (its status segment
+/// supplied by a [`ProgressHeader`]) over a shared [`BuildState`] that drives the
+/// long-running/lock-wait body, plus a persistent final summary.
 pub struct TuiProgressView {
-    core: ProgressCore,
+    /// Shared build state: elapsed-clock anchor + body rows. Folds every event.
+    state: BuildState,
+    /// Per-command header content (build counts vs gc sweep stats).
+    model: Box<dyn ProgressHeader>,
 }
 
 impl TuiProgressView {
+    /// Build-counts header (run/query/inspect). The label rides the bottom border.
     pub fn new(label: impl Into<String>) -> Self {
+        Self::with_header(Box::new(BuildHeader::new(label)))
+    }
+
+    /// A view with a custom header model (e.g. [`GcHeader`] for `heph gc`).
+    pub fn with_header(model: Box<dyn ProgressHeader>) -> Self {
         Self {
-            core: ProgressCore::new(label),
+            state: BuildState::new(),
+            model,
         }
     }
 
@@ -515,24 +663,16 @@ impl TuiProgressView {
     /// count is omitted — the worker braille (flush right) conveys concurrency.
     fn header_line(&self, now_ms: u64, width: u16) -> Line<'static> {
         let width = usize::from(width).max(MIN_BOX_WIDTH);
-        let busy = self.core.state.busy_workers();
-        let max_workers = self.core.state.max_workers().unwrap_or(0);
-        let elapsed = human_elapsed(self.core.state.elapsed_ms(now_ms));
+        let elapsed = human_elapsed(self.state.elapsed_ms(now_ms));
 
         let mut left: Vec<Span<'static>> = Vec::with_capacity(5);
         left.push(Span::raw("╭─ "));
         left.push(Span::from(elapsed).bold());
-        left.push(Span::raw(format!(
-            " · {}",
-            self.core.state.counts_segment()
-        )));
-        // Worker braille sits after the failed count, separated by " · ".
-        let workers = worker_spans(max_workers, busy);
-        if !workers.is_empty() {
-            left.push(Span::raw(" · "));
-            left.extend(workers);
-        }
-        // Space between the counts and the dash fill.
+        // The status segment (counts + worker braille, or gc sweep stats) is
+        // supplied by the header model; the view owns only the leading clock.
+        left.push(Span::raw(" · "));
+        left.extend(self.model.header(&self.state));
+        // Space between the segment and the dash fill.
         left.push(Span::raw(" "));
 
         let left_w = spans_width(&left);
@@ -552,7 +692,7 @@ impl TuiProgressView {
         let width = usize::from(width).max(MIN_BOX_WIDTH);
         // "╰─── " (5) + window + "─╯" (2) == width  ⇒  window = width - 7.
         let window = width.saturating_sub(7);
-        let label = &self.core.label;
+        let label = self.model.label();
         let label_len = label.chars().count();
 
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
@@ -565,7 +705,7 @@ impl TuiProgressView {
                 spans.push(Span::raw("─".repeat(pad - 1)));
             }
         } else if window > 0 {
-            spans.push(Span::raw(banner_slice(label, window, now_ms)));
+            spans.push(Span::raw(banner_slice(&label, window, now_ms)));
         }
         spans.push(Span::raw("─╯"));
         Line::from(spans)
@@ -574,7 +714,8 @@ impl TuiProgressView {
 
 impl TUIAppView for TuiProgressView {
     fn apply(&mut self, ev: &BuildEvent) {
-        self.core.fold(ev);
+        self.state.apply(ev);
+        self.model.apply(ev);
     }
 
     fn rows(&self) -> u16 {
@@ -595,8 +736,8 @@ impl TUIAppView for TuiProgressView {
         let mut lines = Vec::with_capacity(usize::from(PROGRESS_ROWS));
         lines.push(self.header_line(now_ms, width));
         // Lock-wait notices take priority in the body, followed by slow rows.
-        let mut body = self.core.state.lock_wait_lines();
-        body.extend(self.core.state.long_running_lines(now_ms));
+        let mut body = self.state.lock_wait_lines();
+        body.extend(self.state.long_running_lines(now_ms));
         if body.is_empty() {
             lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows));
         } else {
@@ -612,28 +753,21 @@ impl TUIAppView for TuiProgressView {
         lines
     }
 
-    /// Final build report — the same fields as the live header (elapsed clock +
-    /// counts) minus the worker braille, printed straight to stderr (not the log
-    /// sink) so it survives the torn-down inline viewport. Per-target failures
-    /// are rendered separately (rich diagnostics from the failure registry).
-    /// Skipped when no build activity was seen (e.g. inspect/query commands), to
-    /// avoid all-zero noise.
+    /// Final report — the elapsed clock plus the header model's summary segment,
+    /// printed straight to stderr (not the log sink) so it survives the torn-down
+    /// inline viewport. Per-target failures are rendered separately (rich
+    /// diagnostics from the failure registry). The model returns an empty segment
+    /// when there was nothing to report (e.g. inspect/query, or a no-op gc), in
+    /// which case nothing is printed.
     fn last_render(&self) {
-        if !self.core.state.has_activity() {
+        let segment = self.model.last_render(&self.state);
+        if segment.is_empty() {
             return;
         }
-        let elapsed = human_elapsed_ms(
-            self.core
-                .state
-                .elapsed_ms(crate::engine::event::now_unix_ms()),
-        );
+        let elapsed = human_elapsed_ms(self.state.elapsed_ms(crate::engine::event::now_unix_ms()));
         let elapsed = elapsed.trim_start();
         use std::io::Write;
-        drop(writeln!(
-            std::io::stderr().lock(),
-            "{elapsed} · {}",
-            self.core.state.counts_segment()
-        ));
+        drop(writeln!(std::io::stderr().lock(), "{elapsed} · {segment}"));
     }
 }
 
@@ -686,6 +820,35 @@ impl CIAppView for CiProgressView {
             tracing::info!("matched {n} targets");
         }
         tracing::info!("{}", self.core.state.summary());
+    }
+}
+
+/// CI (non-TUI) view for `heph gc`: folds the gc sweep into a [`GcHeader`] and
+/// logs a single summary line at the end. Per-target progress is silent (the
+/// command also prints its `GcStats` on completion).
+pub struct GcCiView {
+    header: GcHeader,
+}
+
+impl GcCiView {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            header: GcHeader::new(label),
+        }
+    }
+}
+
+impl CIAppView for GcCiView {
+    fn begin(&self) {
+        tracing::info!("{}", self.header.label());
+    }
+
+    fn apply(&mut self, ev: &BuildEvent) {
+        self.header.apply(ev);
+    }
+
+    fn finish(&self) {
+        tracing::info!("gc: {}", self.header.segment());
     }
 }
 
@@ -988,16 +1151,70 @@ mod tests {
     }
 
     #[test]
+    fn human_bytes_formats_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024u64), "3.0 GiB");
+    }
+
+    fn gc_swept(revisions_removed: usize, bytes_removed: u64) -> BuildEventKind {
+        BuildEventKind::GcTargetSwept {
+            revisions_removed,
+            bytes_removed,
+        }
+    }
+
+    #[test]
+    fn gc_header_folds_targets_revisions_bytes() {
+        let core = BuildState::new();
+        let mut h = GcHeader::new("GC");
+
+        h.apply(&ev(0, gc_swept(2, 1024)));
+        h.apply(&ev(1, gc_swept(0, 0))); // zero-removal target still counts as explored
+
+        let seg: String = h
+            .header(&core)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(seg.contains("2 targets"), "{seg}");
+        assert!(seg.contains("1.0 KiB"), "{seg}");
+        assert_eq!(h.label(), "GC");
+        assert!(!h.last_render(&core).is_empty());
+    }
+
+    #[test]
+    fn build_header_segment_has_counts_and_braille_and_ignores_gc() {
+        let mut core = BuildState::new();
+        core.apply(&ev(0, max_workers(8)));
+        core.apply(&ev(1, execute_start("//a:b")));
+        // A gc event must not perturb the build counters.
+        core.apply(&ev(2, gc_swept(9, 9)));
+
+        let h = BuildHeader::new("L");
+        let text: String = h
+            .header(&core)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.contains("done"), "{text}");
+        assert!(text.contains('⠁'), "expected worker braille: {text}");
+    }
+
+    #[test]
     fn has_activity_gates_final_summary() {
         // Empty view (e.g. an inspect/query run): no summary should print.
         let empty = TuiProgressView::new("Spec //a:b");
-        assert!(!empty.core.state.has_activity());
+        assert!(!empty.state.has_activity());
 
         // Any observed event flips it on.
         let mut active = TuiProgressView::new("Running //a:b");
         active.apply(&ev(1, result_start("//a:b")));
         active.apply(&ev(2, result_end("//a:b", None)));
-        assert!(active.core.state.has_activity());
+        assert!(active.state.has_activity());
     }
 
     fn matched(addrs: &[&str], complete: bool) -> BuildEventKind {

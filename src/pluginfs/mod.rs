@@ -3,7 +3,7 @@ use crate::engine::driver::{
     ParseResponse, RunRequest, RunResponse,
     outputartifact::{Content, ContentFile, OutputArtifact, Type},
     targetdef::{
-        Output, TargetDef,
+        CacheConfig, Output, TargetDef,
         path::{CodegenMode, Content as PathContent, Path},
     },
 };
@@ -334,8 +334,7 @@ impl crate::engine::driver::Driver for Driver {
                 inputs: vec![],
                 outputs,
                 support_files: vec![],
-                cache: false,
-                disable_remote_cache: true,
+                cache: CacheConfig::off(),
                 pty: false,
                 hash,
                 transparent: false,
@@ -680,8 +679,8 @@ mod tests {
             .unwrap();
         let def = res.target_def.def::<FsDef>();
         assert!(matches!(def, FsDef::File { path } if path == "src/main.rs"));
-        assert!(!res.target_def.cache);
-        assert!(res.target_def.disable_remote_cache);
+        assert!(!res.target_def.cache.enabled);
+        assert!(!res.target_def.cache.remote_enabled);
     }
 
     #[tokio::test]

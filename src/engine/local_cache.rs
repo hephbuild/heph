@@ -89,11 +89,29 @@ pub struct SizedReader {
     pub bytes: Option<Arc<[u8]>>,
 }
 
+/// Streaming iterator of target address keys. Boxed and `Send` so it can be held
+/// across `.await` points by GC; `'static` because backends stream from an owned
+/// connection/snapshot, not a borrow of the cache.
+pub type TargetStream = Box<dyn Iterator<Item = anyhow::Result<String>> + Send>;
+
 pub trait LocalCache: Send + Sync {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader>;
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Write>>;
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool>;
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
+    /// Stream the distinct target address keys (`Addr::format()`, parseable via
+    /// `htaddr::parse_addr`) present in the cache. Streamed rather than collected
+    /// because the target count can be very large; GC processes one at a time so
+    /// the full set never has to live in memory. Defaults to empty so
+    /// lightweight/test backends need not implement it.
+    fn list_targets(&self) -> anyhow::Result<TargetStream> {
+        Ok(Box::new(std::iter::empty()))
+    }
+    /// The distinct cache revisions (input hashes) for a single target. Bounded
+    /// per target, so returning a `Vec` is fine. Defaults to empty.
+    fn list_target_entries(&self, _addr: &Addr) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// Returns a seekable reader when the cache backend supports `O(1)`
     /// pread (sqlite blob, on-disk file). Defaults to `Ok(None)` so backends
     /// can opt in. Used by the FUSE sandbox path to index and read tar
@@ -112,7 +130,7 @@ pub trait LocalCache: Send + Sync {
 #[error("not found")]
 pub struct NotFoundError;
 
-const MANIFEST_V1: &str = "manifest-v1.borsh";
+pub(crate) const MANIFEST_V1: &str = "manifest-v1.borsh";
 
 #[derive(Clone)]
 pub struct CacheArtifact {
