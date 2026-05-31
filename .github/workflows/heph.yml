@@ -234,6 +234,8 @@ jobs:
       # pure-Rust FUSE path.
       - name: Test
         shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
         run: tst
 
   release:
