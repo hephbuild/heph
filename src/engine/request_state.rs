@@ -375,7 +375,13 @@ impl Engine {
         events: Option<crate::engine::event::EventSender>,
         bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
     ) -> Arc<RequestState> {
-        let request_id = "".to_string();
+        // Unique per top-level request. `with_parent`/`with_skip_provider`
+        // children share this `RequestStateData` (and thus this id), so a request
+        // subtree keys into one bucket of any per-request cache (e.g. pluginfs's
+        // exclude-`Any` cache, pruned in `Drop`).
+        static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request_id = format!("req-{n}");
         let data = Arc::new(RequestStateData {
             engine: Arc::downgrade(self),
             request_id: request_id.clone(),

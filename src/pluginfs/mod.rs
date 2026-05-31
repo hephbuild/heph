@@ -261,6 +261,63 @@ fn builtin_excludes() -> anyhow::Result<Arc<wax::Any<'static>>> {
     Ok(BUILTIN.get_or_init(|| any).clone())
 }
 
+/// Per-request cache of compiled exclude `Any` unions.
+///
+/// Outer key is the `request_id`; inner key is the sorted user-exclude set.
+/// Within a request, targets sharing the same excludes (common when a rule
+/// template fans out across packages) reuse one `wax::any` regex union. Built-in
+/// excludes are constant and prepended on build, so the user set alone keys the
+/// inner entry.
+/// One request's excludes: sorted-exclude-set key → compiled `Any`.
+type ExcludeBucket = FxHashMap<String, Arc<wax::Any<'static>>>;
+/// request_id → its [`ExcludeBucket`].
+type ExcludeCache = FxHashMap<String, ExcludeBucket>;
+
+fn exclude_any_cache() -> &'static RwLock<ExcludeCache> {
+    static CACHE: OnceLock<RwLock<ExcludeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(ExcludeCache::default()))
+}
+
+/// Returns the compiled exclude `Any` (built-ins + user `exclude`) for
+/// `request_id`, memoizing across calls within that request. `exclude` must be
+/// non-empty; the no-exclude case uses the cheaper [`builtin_excludes`] path.
+fn cached_exclude_any(
+    request_id: &str,
+    exclude: &[String],
+) -> anyhow::Result<Arc<wax::Any<'static>>> {
+    let mut sorted: Vec<&str> = exclude.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let key = sorted.join("\0");
+
+    if let Some(a) = exclude_any_cache()
+        .read()
+        .get(request_id)
+        .and_then(|m| m.get(&key))
+    {
+        return Ok(a.clone());
+    }
+
+    let exclude_globs: Vec<wax::Glob<'static>> = BUILT_IN_GLOB_EXCLUDES
+        .iter()
+        .copied()
+        .chain(exclude.iter().map(String::as_str))
+        .map(|s| {
+            cached_glob(s)
+                .map(|g| (*g).clone())
+                .with_context(|| format!("invalid exclude pattern '{s}'"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let any = Arc::new(wax::any(exclude_globs).context("compiling exclude patterns")?);
+
+    Ok(exclude_any_cache()
+        .write()
+        .entry(request_id.to_owned())
+        .or_default()
+        .entry(key)
+        .or_insert(any)
+        .clone())
+}
+
 #[derive(serde::Serialize)]
 enum FsDef {
     File {
@@ -274,24 +331,18 @@ enum FsDef {
     },
 }
 
-fn compile_glob(pattern: &str, exclude: &[String]) -> anyhow::Result<CompiledGlob> {
+fn compile_glob(
+    request_id: &str,
+    pattern: &str,
+    exclude: &[String],
+) -> anyhow::Result<CompiledGlob> {
     let glob = cached_glob(pattern).with_context(|| format!("invalid glob pattern '{pattern}'"))?;
 
     // No user excludes: reuse the cached built-in `Any` directly.
     let not = if exclude.is_empty() {
         builtin_excludes()?
     } else {
-        let exclude_globs: Vec<wax::Glob<'static>> = BUILT_IN_GLOB_EXCLUDES
-            .iter()
-            .copied()
-            .chain(exclude.iter().map(String::as_str))
-            .map(|s| {
-                cached_glob(s)
-                    .map(|g| (*g).clone())
-                    .with_context(|| format!("invalid exclude pattern '{s}'"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Arc::new(wax::any(exclude_globs).context("compiling exclude patterns")?)
+        cached_exclude_any(request_id, exclude)?
     };
 
     Ok(CompiledGlob {
@@ -393,7 +444,7 @@ impl crate::engine::driver::Driver for Driver {
                 }
                 let hash = format!("{:x}", h.digest()).into_bytes();
 
-                let compiled = Arc::new(compile_glob(&pattern, &exclude)?);
+                let compiled = Arc::new(compile_glob(&req.request_id, &pattern, &exclude)?);
                 let def = FsDef::Glob {
                     pattern: pattern.clone(),
                     exclude,
@@ -1420,10 +1471,42 @@ mod tests {
     #[test]
     fn test_compile_glob_no_exclude_reuses_builtin() {
         let builtin = builtin_excludes().unwrap();
-        let compiled = compile_glob("**/*.rs", &[]).unwrap();
+        let compiled = compile_glob("req-test", "**/*.rs", &[]).unwrap();
         assert!(
             Arc::ptr_eq(&compiled.not, &builtin),
             "empty-exclude path must reuse the cached built-in Any"
+        );
+    }
+
+    #[test]
+    fn test_compile_glob_user_exclude_shares_any() {
+        // Within one request, the same exclude set (any order) reuses one
+        // compiled `Any`; a different set does not.
+        let req = "req-share";
+        let a = compile_glob(req, "**/*.go", &["vendor/**".into(), "out/**".into()]).unwrap();
+        let b = compile_glob(req, "src/**/*.go", &["out/**".into(), "vendor/**".into()]).unwrap();
+        assert!(
+            Arc::ptr_eq(&a.not, &b.not),
+            "identical exclude sets must share one Any regardless of order"
+        );
+
+        let c = compile_glob(req, "**/*.go", &["other/**".into()]).unwrap();
+        assert!(
+            !Arc::ptr_eq(&a.not, &c.not),
+            "distinct exclude sets must not share an Any"
+        );
+    }
+
+    #[test]
+    fn test_compile_glob_exclude_cache_is_per_request() {
+        // Different request ids do not share exclude `Any`s, even for the same
+        // set — buckets are keyed by request.
+        let exclude = ["vendor/**".to_string()];
+        let a = compile_glob("req-iso-a", "**/*.go", &exclude).unwrap();
+        let b = compile_glob("req-iso-b", "**/*.go", &exclude).unwrap();
+        assert!(
+            !Arc::ptr_eq(&a.not, &b.not),
+            "distinct requests must not share an exclude Any"
         );
     }
 
