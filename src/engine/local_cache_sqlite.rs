@@ -381,10 +381,10 @@ impl LocalCache for LocalCacheSQLite {
                 "SELECT rowid, length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
             )
             .context("preparing reader lookup")?;
-        let (row_id, blob_len): (i64, usize) = match stmt.query_row(
-            rusqlite::params![addr_key, hashin, name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ) {
+        let (row_id, blob_len): (i64, usize) = match stmt
+            .query_row(rusqlite::params![addr_key, hashin, name], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            }) {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(anyhow::anyhow!(NotFoundError));
             }
@@ -582,19 +582,18 @@ impl LocalCache for LocalCacheSQLite {
         let mut stmt = conn
             .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
             .context("preparing seekable_reader lookup")?;
-        let row_id: i64 = match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| {
-            row.get(0)
-        }) {
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(anyhow::anyhow!(NotFoundError));
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("looking up {name} hashin={hashin} for seekable read")
-                });
-            }
-            Ok(v) => v,
-        };
+        let row_id: i64 =
+            match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| row.get(0)) {
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(anyhow::anyhow!(NotFoundError));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("looking up {name} hashin={hashin} for seekable read")
+                    });
+                }
+                Ok(v) => v,
+            };
         drop(stmt);
 
         Ok(Some(Box::new(OwnedBlob::new(conn, row_id)?)))
