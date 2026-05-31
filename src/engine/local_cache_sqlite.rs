@@ -371,8 +371,12 @@ impl LocalCache for LocalCacheSQLite {
             .get()
             .context("acquiring read connection from pool")?;
 
-        let (row_id, blob_len): (i64, usize) = match conn.query_row(
-            "SELECT rowid, length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT rowid, length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
+            )
+            .context("preparing reader lookup")?;
+        let (row_id, blob_len): (i64, usize) = match stmt.query_row(
             rusqlite::params![key.0, key.1, key.2],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ) {
@@ -410,6 +414,7 @@ impl LocalCache for LocalCacheSQLite {
         }
 
         // Release the SELECT connection before acquiring semaphore + a fresh pipe connection.
+        drop(stmt);
         drop(conn);
 
         // Semaphore acquired before pool to bound concurrent open pipes (= open FDs).
@@ -469,11 +474,12 @@ impl LocalCache for LocalCacheSQLite {
             .get()
             .context("acquiring read connection from pool")?;
 
-        let found = match conn.query_row(
-            "SELECT 1 FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3 LIMIT 1",
-            rusqlite::params![key.0, key.1, key.2],
-            |_| Ok(()),
-        ) {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT 1 FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3 LIMIT 1",
+            )
+            .context("preparing exists lookup")?;
+        let found = match stmt.query_row(rusqlite::params![key.0, key.1, key.2], |_| Ok(())) {
             Ok(()) => true,
             Err(rusqlite::Error::QueryReturnedNoRows) => false,
             Err(e) => {
@@ -532,7 +538,7 @@ impl LocalCache for LocalCacheSQLite {
             .get()
             .context("acquiring read connection from pool")?;
         let mut stmt = conn
-            .prepare("SELECT DISTINCT hashin FROM artifacts WHERE addr=?1")
+            .prepare_cached("SELECT DISTINCT hashin FROM artifacts WHERE addr=?1")
             .context("preparing list_target_entries query")?;
         let rows = stmt
             .query_map([&key], |row| row.get::<_, String>(0))
@@ -568,11 +574,12 @@ impl LocalCache for LocalCacheSQLite {
             .get()
             .context("acquiring read connection from pool")?;
 
-        let row_id: i64 = match conn.query_row(
-            "SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
-            rusqlite::params![key.0, key.1, key.2],
-            |row| row.get(0),
-        ) {
+        let mut stmt = conn
+            .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
+            .context("preparing seekable_reader lookup")?;
+        let row_id: i64 = match stmt.query_row(rusqlite::params![key.0, key.1, key.2], |row| {
+            row.get(0)
+        }) {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(anyhow::anyhow!(NotFoundError));
             }
@@ -583,6 +590,7 @@ impl LocalCache for LocalCacheSQLite {
             }
             Ok(v) => v,
         };
+        drop(stmt);
 
         Ok(Some(Box::new(OwnedBlob::new(conn, row_id)?)))
     }
