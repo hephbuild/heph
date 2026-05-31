@@ -170,13 +170,89 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// A target-scoped operation, as the client groups it for display. This is a
+/// purely client-side (rendering) concept: the engine emits individually typed
+/// events (`ExecuteStart/End`, `LocalCacheWriteStart/End`, …) and
+/// [`event_op_boundary`] collapses those into this timeline. Add a variant here
+/// (plus a mapping arm) when a new typed span event should appear in the
+/// breakdown — e.g. remote read/write once their events land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Op {
+    Execute,
+    LocalCacheWrite,
+}
+
+impl Op {
+    /// Single glyph shown before the op's elapsed time. Must stay **BMP
+    /// single-width** (plain-text rows; a double-width glyph would clip). Future
+    /// remote ops use `↓`/`↑` (U+2193/2191), never the emoji `⬇`/`⬆`.
+    fn icon(self) -> char {
+        match self {
+            Op::Execute => '▶',
+            Op::LocalCacheWrite => '⊕',
+        }
+    }
+
+    /// Pipeline ordinal for stable left-to-right ordering of the breakdown.
+    fn order(self) -> u8 {
+        match self {
+            Op::Execute => 0,
+            Op::LocalCacheWrite => 1,
+        }
+    }
+}
+
+/// A slow target as surfaced by [`BuildState::long_running`]: its address, the
+/// elapsed of its currently-active op, and the per-op breakdown `(op, elapsed_ms)`
+/// ordered by [`Op::order`].
+type SlowTarget = (String, u64, Vec<(Op, u64)>);
+
+/// Which edge of an [`Op`] span an event represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    Start,
+    End,
+}
+
+/// The per-target operation timeline: how long each [`Op`] has taken (completed
+/// runs summed) plus the currently-open op and its start timestamp. This is the
+/// paved road — every op a target passes through folds in here, and the slow-row
+/// renderer reads the breakdown straight off it.
+#[derive(Debug, Default)]
+struct OpTimeline {
+    /// op → summed elapsed (ms) of its finished runs on this target.
+    completed: HashMap<Op, u64>,
+    /// the currently-open op and its server start timestamp, if any.
+    active: Option<(Op, u64)>,
+}
+
+/// Map an individually-typed engine event to the op-timeline boundary it
+/// represents, if any. This is where the well-defined engine events are collapsed
+/// into the shared per-target timeline; a new op needs one arm here.
+fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
+    match kind {
+        BuildEventKind::ExecuteStart { addr, .. } => Some((addr, Op::Execute, Boundary::Start)),
+        BuildEventKind::ExecuteEnd { addr, .. } => Some((addr, Op::Execute, Boundary::End)),
+        BuildEventKind::LocalCacheWriteStart { addr } => {
+            Some((addr, Op::LocalCacheWrite, Boundary::Start))
+        }
+        BuildEventKind::LocalCacheWriteEnd { addr, .. } => {
+            Some((addr, Op::LocalCacheWrite, Boundary::End))
+        }
+        _ => None,
+    }
+}
+
 /// Folds the engine's build-progress event stream into renderable state.
 #[derive(Debug, Default)]
 pub struct BuildState {
     /// Addrs between `ResultStart` and `ResultEnd` — the "running" set.
     in_flight_results: HashSet<String>,
-    /// addr → server `ExecuteStart` timestamp; used for long-running detection.
-    executing: HashMap<String, u64>,
+    /// addr → per-target operation timeline. Drives the worker braille (count of
+    /// targets whose active op is `Execute`) and the slow-target breakdown rows.
+    /// Entries persist for the request (completed durations are kept so a finished
+    /// op still shows in the breakdown while a later op is active).
+    ops: HashMap<String, OpTimeline>,
     /// The matched top-level target set, accumulated as the matcher streams.
     matched: HashSet<String>,
     /// Whether any `Matched` event has been seen (gates display of the line).
@@ -229,6 +305,33 @@ impl BuildState {
             Some(t) => t.min(ev.at_unix_ms),
             None => ev.at_unix_ms,
         });
+        // Generic op timeline: any event that is an op boundary folds here,
+        // independent of the counter side effects handled in the match below.
+        if let Some((addr, op, boundary)) = event_op_boundary(&ev.kind) {
+            let tl = self.ops.entry(addr.to_string()).or_default();
+            match boundary {
+                Boundary::Start => {
+                    // Overlap guard: if an op is somehow still open (a missing or
+                    // reordered end), fold it into completed before opening the new
+                    // one so durations stay bounded and `active` reflects reality.
+                    if let Some((prev_op, prev_start)) = tl.active.take() {
+                        *tl.completed.entry(prev_op).or_insert(0) +=
+                            ev.at_unix_ms.saturating_sub(prev_start);
+                    }
+                    tl.active = Some((op, ev.at_unix_ms));
+                }
+                Boundary::End => {
+                    // Ignore a mismatched/duplicate close: only the currently-open
+                    // op can end.
+                    if let Some((active_op, start)) = tl.active
+                        && active_op == op
+                    {
+                        *tl.completed.entry(op).or_insert(0) += ev.at_unix_ms.saturating_sub(start);
+                        tl.active = None;
+                    }
+                }
+            }
+        }
         match &ev.kind {
             BuildEventKind::MaxWorkers { count } => {
                 self.max_workers = Some(*count);
@@ -256,11 +359,10 @@ impl BuildState {
                 // `Matched` event arrived before or after this result.
                 self.finished.insert(addr.clone());
             }
-            BuildEventKind::ExecuteStart { addr, .. } => {
-                self.executing.insert(addr.clone(), ev.at_unix_ms);
-            }
-            BuildEventKind::ExecuteEnd { addr, error } => {
-                self.executing.remove(addr);
+            // The op timeline (folded above) tracks Execute's duration; here we
+            // keep only the `built` counter side effect on a successful end.
+            BuildEventKind::ExecuteStart { .. } => {}
+            BuildEventKind::ExecuteEnd { error, .. } => {
                 if error.is_none() {
                     self.built += 1;
                 }
@@ -281,8 +383,13 @@ impl BuildState {
             BuildEventKind::ResultLockWaitEnd { addr } => {
                 self.lock_waits.remove(addr);
             }
-            // Read/Write markers are not aggregated into counters.
-            BuildEventKind::RemoteCacheRead { .. } | BuildEventKind::RemoteCacheWrite { .. } => {}
+            // Read/Write markers are not aggregated into counters. The local
+            // cache-write span is folded into the op timeline above, so the
+            // counter match ignores it here.
+            BuildEventKind::RemoteCacheRead { .. }
+            | BuildEventKind::RemoteCacheWrite { .. }
+            | BuildEventKind::LocalCacheWriteStart { .. }
+            | BuildEventKind::LocalCacheWriteEnd { .. } => {}
             // GC progress is tracked by GcHeader, not the build counters. The
             // elapsed-clock anchor at the top of `apply` still runs, so the
             // clock works during a gc sweep.
@@ -290,15 +397,30 @@ impl BuildState {
         }
     }
 
-    /// Targets executing longer than `threshold_ms`, as `(addr, elapsed_ms)`
-    /// sorted by elapsed descending (longest first).
-    pub fn long_running(&self, now_ms: u64, threshold_ms: u64) -> Vec<(String, u64)> {
-        let mut out: Vec<(String, u64)> = self
-            .executing
+    /// Targets whose *currently-active* op has run longer than `threshold_ms`,
+    /// with the per-op breakdown for that target. Returns
+    /// `(addr, active_elapsed_ms, breakdown)` sorted by active elapsed descending
+    /// (then addr). The breakdown is the target's completed ops plus the live
+    /// active op, each at least one second, ordered by [`Op::order`]. A target
+    /// with no active op is never slow (it dropped off when its last op ended).
+    fn long_running(&self, now_ms: u64, threshold_ms: u64) -> Vec<SlowTarget> {
+        let mut out: Vec<SlowTarget> = self
+            .ops
             .iter()
-            .filter_map(|(addr, &start)| {
-                let elapsed = now_ms.saturating_sub(start);
-                (elapsed > threshold_ms).then(|| (addr.clone(), elapsed))
+            .filter_map(|(addr, tl)| {
+                let (active_op, active_start) = tl.active?;
+                let active_elapsed = now_ms.saturating_sub(active_start);
+                if active_elapsed <= threshold_ms {
+                    return None;
+                }
+                // Merge completed durations with the live active op, drop sub-second
+                // ops, and order the breakdown by pipeline position.
+                let mut durs = tl.completed.clone();
+                *durs.entry(active_op).or_insert(0) += active_elapsed;
+                let mut breakdown: Vec<(Op, u64)> =
+                    durs.into_iter().filter(|&(_, ms)| ms >= 1000).collect();
+                breakdown.sort_by_key(|&(op, _)| op.order());
+                Some((addr.clone(), active_elapsed, breakdown))
             })
             .collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -364,11 +486,14 @@ impl BuildState {
         )
     }
 
-    /// Workers currently holding an execute slot (targets mid-`Execute`). This is
-    /// the semaphore-bound busy count, not `running` (which includes targets
-    /// blocked on deps without a permit).
+    /// Workers currently holding an execute slot (targets whose active op is
+    /// `Execute`). This is the semaphore-bound busy count, not `running` (which
+    /// includes targets blocked on deps without a permit).
     pub fn busy_workers(&self) -> usize {
-        self.executing.len()
+        self.ops
+            .values()
+            .filter(|tl| matches!(tl.active, Some((Op::Execute, _))))
+            .count()
     }
 
     /// Announced worker capacity, or `None` before the `MaxWorkers` event.
@@ -426,8 +551,9 @@ impl BuildState {
     }
 
     /// The long-running ("slow") target rows: up to [`MAX_LONG_RUNNING`] rows of
-    /// `addr (Ns)`, with a trailing "+N more" line when the list overflows. At
-    /// most [`MAX_LONG_RUNNING`] lines total (the collapse line consumes a slot).
+    /// `addr (icon Ns)…` — one `(icon Ns)` group per op the target passed through
+    /// or is in — with a trailing "+N more" line when the list overflows. At most
+    /// [`MAX_LONG_RUNNING`] lines total (the collapse line consumes a slot).
     pub fn long_running_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
         let long = self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS);
         let overflow = long.len() > MAX_LONG_RUNNING;
@@ -439,9 +565,12 @@ impl BuildState {
             MAX_LONG_RUNNING
         };
         let mut lines = Vec::with_capacity(MAX_LONG_RUNNING);
-        for (addr, elapsed_ms) in long.iter().take(shown) {
-            let secs = *elapsed_ms / 1000;
-            lines.push(Line::from(format!("  {addr} ({secs}s)")));
+        for (addr, _active_elapsed, breakdown) in long.iter().take(shown) {
+            let groups: String = breakdown
+                .iter()
+                .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
+                .collect();
+            lines.push(Line::from(format!("  {addr}{groups}")));
         }
         if overflow {
             let extra = long.len() - shown;
@@ -930,6 +1059,94 @@ mod tests {
             error: None,
         }
     }
+    fn local_write_start(addr: &str) -> BuildEventKind {
+        BuildEventKind::LocalCacheWriteStart { addr: addr.into() }
+    }
+    fn local_write_end(addr: &str) -> BuildEventKind {
+        BuildEventKind::LocalCacheWriteEnd {
+            addr: addr.into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn op_timeline_records_execute_then_local_cache_write_breakdown() {
+        // Execute runs 0→3s (completed), then LocalCacheWrite opens at 3s and is
+        // still live at now=9s (6s active, over the 5s trigger). The breakdown
+        // carries both, ordered by pipeline.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:b")));
+        s.apply(&ev(3_000, execute_end("//a:b")));
+        s.apply(&ev(3_000, local_write_start("//a:b")));
+
+        let long = s.long_running(9_000, 5_000);
+        assert_eq!(long.len(), 1);
+        assert_eq!(long[0].0, "//a:b");
+        assert_eq!(long[0].1, 6_000); // active LocalCacheWrite elapsed
+        assert_eq!(
+            long[0].2,
+            vec![(Op::Execute, 3_000), (Op::LocalCacheWrite, 6_000)]
+        );
+    }
+
+    #[test]
+    fn op_timeline_omits_sub_second_ops() {
+        // A 500ms Execute is below the 1s breakdown floor and is dropped; only the
+        // live 6s LocalCacheWrite shows.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:b")));
+        s.apply(&ev(500, execute_end("//a:b")));
+        s.apply(&ev(500, local_write_start("//a:b")));
+
+        let long = s.long_running(6_500, 5_000);
+        assert_eq!(long[0].2, vec![(Op::LocalCacheWrite, 6_000)]);
+    }
+
+    #[test]
+    fn op_timeline_overlap_folds_dangling_active() {
+        // A new op opening while one is still active folds the dangling one into
+        // completed (defensive against a missing/reordered end).
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:b")));
+        s.apply(&ev(3_000, local_write_start("//a:b")));
+
+        let tl = s.ops.get("//a:b").expect("timeline");
+        assert_eq!(tl.completed.get(&Op::Execute).copied(), Some(3_000));
+        assert_eq!(tl.active, Some((Op::LocalCacheWrite, 3_000)));
+    }
+
+    #[test]
+    fn op_timeline_mismatched_end_ignored() {
+        // An end for an op that is not the active one is a no-op.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:b")));
+        s.apply(&ev(1_000, local_write_end("//a:b")));
+
+        let tl = s.ops.get("//a:b").expect("timeline");
+        assert_eq!(tl.active, Some((Op::Execute, 0)));
+        assert!(tl.completed.is_empty());
+    }
+
+    #[test]
+    fn busy_workers_counts_only_active_execute() {
+        // One target mid-Execute, one mid-LocalCacheWrite: only Execute counts as
+        // a busy worker (the semaphore-bound slot).
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:exec")));
+        s.apply(&ev(0, local_write_start("//a:write")));
+        assert_eq!(s.busy_workers(), 1);
+    }
+
+    #[test]
+    fn op_timeline_non_execute_op_alone_surfaces_target() {
+        // A non-Execute op (cache write) with no Execute event still surfaces the
+        // target as slow, proving the timeline is not Execute-specific.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, local_write_start("//a:b")));
+        let long = s.long_running(6_000, 5_000);
+        assert_eq!(long.len(), 1);
+        assert_eq!(long[0].2, vec![(Op::LocalCacheWrite, 6_000)]);
+    }
 
     #[test]
     fn result_start_then_ok_end_completes_and_clears_in_flight() {
@@ -1008,11 +1225,13 @@ mod tests {
         //   //fresh:c  elapsed 3000         ✗
         let long = s.long_running(7_000, 5_000);
         assert_eq!(long.len(), 2);
-        // Sorted descending by elapsed: slow (7000) before mid (6000).
+        // Sorted descending by active elapsed: slow (7000) before mid (6000).
         assert_eq!(long[0].0, "//slow:a");
         assert_eq!(long[0].1, 7_000);
+        assert_eq!(long[0].2, vec![(Op::Execute, 7_000)]);
         assert_eq!(long[1].0, "//mid:b");
         assert_eq!(long[1].1, 6_000);
+        assert_eq!(long[1].2, vec![(Op::Execute, 6_000)]);
     }
 
     #[test]
@@ -1021,6 +1240,27 @@ mod tests {
         s.apply(&ev(0, execute_start("//slow:a")));
         s.apply(&ev(100, execute_end("//slow:a")));
         assert!(s.long_running(10_000, 5_000).is_empty());
+    }
+
+    #[test]
+    fn long_running_lines_render_icons_per_op() {
+        // A slow target with a finished Execute and a live LocalCacheWrite renders
+        // one `(icon Ns)` group per op.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//slow:x")));
+        s.apply(&ev(3_000, execute_end("//slow:x")));
+        s.apply(&ev(3_000, local_write_start("//slow:x")));
+
+        let line = format!("{}", s.long_running_lines(9_000)[0]);
+        assert!(line.contains("//slow:x"), "{line}");
+        assert!(
+            line.contains(&format!("({} ", Op::Execute.icon())),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("({} ", Op::LocalCacheWrite.icon())),
+            "{line}"
+        );
     }
 
     fn max_workers(count: usize) -> BuildEventKind {

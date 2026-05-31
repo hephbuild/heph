@@ -57,6 +57,17 @@ pub enum BuildEventKind {
     LocalCacheMiss {
         addr: String,
     },
+    /// Start of writing a target's artifacts to the local cache. Paired with
+    /// `LocalCacheWriteEnd` via [`emit_scope`] (fires on completion, `?`, or
+    /// cancellation). The client groups this span under the target alongside
+    /// `Execute*` as one entry in the per-target operation timeline.
+    LocalCacheWriteStart {
+        addr: String,
+    },
+    LocalCacheWriteEnd {
+        addr: String,
+        error: Option<String>,
+    },
     /// Acquiring the per-addr result lock has been blocked past the notice
     /// threshold. `holder_pid` is the process believed to hold the lock
     /// (best-effort; `None` if unknown). Paired one-to-one with

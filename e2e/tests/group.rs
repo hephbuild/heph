@@ -162,7 +162,7 @@ target(name = "g", driver = "group", deps = ["//nocache:t"])
         .clone()
         .get_def(rs, &rheph::htaddr::parse_addr("//nocache:g")?)
         .await?;
-    assert!(!def.target_def.cache, "group must not be cached");
+    assert!(!def.target_def.cache.enabled, "group must not be cached");
     assert!(def.target_def.transparent, "group must be transparent");
     drop(spec);
     Ok(())

@@ -934,11 +934,23 @@ impl Engine {
                     }
 
                     crate::hmemoizer::set_phase("execute_cache:cache_locally");
-                    let out = engine
-                        .cache_locally(rs.ctoken(), &addr, &hashin, artifacts, use_tmp_cache)
-                        .await
-                        .map(|cached| (cached, artifacts_meta))
-                        .with_context(|| format!("cache_locally {addr}"));
+                    let write_addr = addr.format();
+                    let out = crate::engine::event::emit_scope(
+                        &rs,
+                        crate::engine::event::BuildEventKind::LocalCacheWriteStart {
+                            addr: write_addr.clone(),
+                        },
+                        move |error| crate::engine::event::BuildEventKind::LocalCacheWriteEnd {
+                            addr: write_addr,
+                            error,
+                        },
+                        engine.cache_locally(rs.ctoken(), &addr, &hashin, artifacts, use_tmp_cache),
+                    )
+                    .await
+                    .map(|cached| (cached, artifacts_meta))
+                    .with_context(|| format!("cache_locally {addr}"));
+                    // TODO(remote-cache): bracket the remote push with its own
+                    // RemoteCacheWrite{Start,End} events here once it lands.
 
                     // Post-write GC: trim this target's stale revisions in the
                     // background (same lane as sandbox cleanup), skipping
@@ -980,7 +992,9 @@ impl Engine {
             .artifacts_from_local_cache(rs.ctoken(), def, opts.hashin.as_str(), outputs)
             .await?
         {
-            // TODO(remote-cache): emit RemoteCache* here
+            // TODO(remote-cache): emit RemoteCache* here; bracket the remote
+            // lookup with its own RemoteCacheRead{Start,End} events so it shows in
+            // the per-target op breakdown.
             Some(res) => {
                 rs.emit(crate::engine::event::BuildEventKind::LocalCacheHit {
                     addr: def.target.addr.format(),
