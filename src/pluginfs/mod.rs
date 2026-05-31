@@ -19,8 +19,10 @@ use crate::loosespecparser::TargetSpecValue;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use xxhash_rust::xxh3::Xxh3;
 
 const PKG: &str = "@heph/fs";
@@ -175,8 +177,54 @@ fn normalize_path(path: &str) -> anyhow::Result<String> {
 }
 
 struct CompiledGlob {
-    glob: wax::Glob<'static>,
-    not: wax::Any<'static>,
+    glob: Arc<wax::Glob<'static>>,
+    not: Arc<wax::Any<'static>>,
+}
+
+/// Process-global cache of compiled globs keyed by pattern string.
+///
+/// Identical patterns (`**/*.go`, etc.) repeat across hundreds of packages in
+/// the go-test pipeline; each `wax::Glob::new` builds a regex NFA. Patterns are
+/// already normalized before reaching here, so the key set is small and stable.
+/// Read-mostly: the lock is contended only on first sight of each pattern.
+fn glob_cache() -> &'static RwLock<FxHashMap<String, Arc<wax::Glob<'static>>>> {
+    static CACHE: OnceLock<RwLock<FxHashMap<String, Arc<wax::Glob<'static>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
+/// Returns the compiled `Glob` for `pattern`, memoizing across calls.
+fn cached_glob(pattern: &str) -> Result<Arc<wax::Glob<'static>>, wax::BuildError> {
+    if let Some(g) = glob_cache().read().get(pattern) {
+        return Ok(g.clone());
+    }
+    let glob = Arc::new(wax::Glob::new(pattern).map(wax::Glob::into_owned)?);
+    glob_cache()
+        .write()
+        .entry(pattern.to_owned())
+        .or_insert_with(|| glob.clone());
+    Ok(glob)
+}
+
+/// Returns the compiled built-in exclude `Any`, built once per process.
+///
+/// The common case is a glob target with no user excludes, so reusing this Arc
+/// avoids rebuilding the 3-pattern regex union (`**/.git/**`, …) on every parse.
+fn builtin_excludes() -> anyhow::Result<Arc<wax::Any<'static>>> {
+    static BUILTIN: OnceLock<Arc<wax::Any<'static>>> = OnceLock::new();
+    if let Some(a) = BUILTIN.get() {
+        return Ok(a.clone());
+    }
+    let globs = BUILT_IN_GLOB_EXCLUDES
+        .iter()
+        .map(|s| {
+            cached_glob(s)
+                .map(|g| (*g).clone())
+                .with_context(|| format!("invalid built-in exclude pattern '{s}'"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let any = Arc::new(wax::any(globs).context("compiling built-in exclude patterns")?);
+    // Lost a race? Keep whichever value won; both are equivalent.
+    Ok(BUILTIN.get_or_init(|| any).clone())
 }
 
 #[derive(serde::Serialize)]
@@ -193,22 +241,24 @@ enum FsDef {
 }
 
 fn compile_glob(pattern: &str, exclude: &[String]) -> anyhow::Result<CompiledGlob> {
-    let glob = wax::Glob::new(pattern)
-        .map(wax::Glob::into_owned)
-        .with_context(|| format!("invalid glob pattern '{pattern}'"))?;
+    let glob = cached_glob(pattern).with_context(|| format!("invalid glob pattern '{pattern}'"))?;
 
-    let exclude_globs: Vec<wax::Glob<'static>> = BUILT_IN_GLOB_EXCLUDES
-        .iter()
-        .copied()
-        .chain(exclude.iter().map(String::as_str))
-        .map(|s| {
-            wax::Glob::new(s)
-                .map(wax::Glob::into_owned)
-                .with_context(|| format!("invalid exclude pattern '{s}'"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let not = wax::any(exclude_globs).context("compiling exclude patterns")?;
+    // No user excludes: reuse the cached built-in `Any` directly.
+    let not = if exclude.is_empty() {
+        builtin_excludes()?
+    } else {
+        let exclude_globs: Vec<wax::Glob<'static>> = BUILT_IN_GLOB_EXCLUDES
+            .iter()
+            .copied()
+            .chain(exclude.iter().map(String::as_str))
+            .map(|s| {
+                cached_glob(s)
+                    .map(|g| (*g).clone())
+                    .with_context(|| format!("invalid exclude pattern '{s}'"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Arc::new(wax::any(exclude_globs).context("compiling exclude patterns")?)
+    };
 
     Ok(CompiledGlob { glob, not })
 }
@@ -403,7 +453,7 @@ impl crate::engine::driver::Driver for Driver {
                 let walker = compiled
                     .glob
                     .walk(root.clone())
-                    .not(compiled.not.clone())
+                    .not(wax::Any::clone(&compiled.not))
                     .context("applying exclude filter")?;
 
                 let mut artifacts = vec![];
@@ -1291,6 +1341,30 @@ mod tests {
         assert_eq!(
             out_paths,
             vec!["dir/ogen.yaml".to_string(), "dir/ogen.yml".to_string(),]
+        );
+    }
+
+    #[test]
+    fn test_cached_glob_returns_same_arc() {
+        let a = cached_glob("test_cache/**/*.unique-ext").unwrap();
+        let b = cached_glob("test_cache/**/*.unique-ext").unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "identical patterns must share one Arc");
+    }
+
+    #[test]
+    fn test_builtin_excludes_shared() {
+        let a = builtin_excludes().unwrap();
+        let b = builtin_excludes().unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "built-in Any built once per process");
+    }
+
+    #[test]
+    fn test_compile_glob_no_exclude_reuses_builtin() {
+        let builtin = builtin_excludes().unwrap();
+        let compiled = compile_glob("**/*.rs", &[]).unwrap();
+        assert!(
+            Arc::ptr_eq(&compiled.not, &builtin),
+            "empty-exclude path must reuse the cached built-in Any"
         );
     }
 
