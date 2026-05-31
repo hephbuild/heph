@@ -150,6 +150,38 @@ impl EProvider for Provider {
 
 const BUILT_IN_GLOB_EXCLUDES: &[&str] = &["**/.git/**", "**/.heph3/**", "**/.heph/**"];
 
+/// Directory basenames whose subtree is always excluded — pruned during the
+/// walk so we never descend into them. Kept in sync with the recursive
+/// `**/<name>/**` entries in `BUILT_IN_GLOB_EXCLUDES`: matching the basename at
+/// any depth is equivalent to those patterns, and every descendant is excluded,
+/// so pruning is a pure optimization with identical results.
+const BUILT_IN_PRUNE_DIRS: &[&str] = &[".git", ".heph3", ".heph"];
+
+/// Returns the leading literal path prefix of `pattern` — the run of complete
+/// components that contain no glob metacharacters.
+///
+/// Used as the walk root so a pattern like `mgmt/protos/x/**/*` scans only
+/// `<root>/mgmt/protos/x` instead of the whole workspace. A fully-literal
+/// pattern returns itself, letting `walkdir` visit just that one path.
+///
+/// `pattern` must already be normalized (no empty, `.`, or `..` components).
+fn literal_prefix(pattern: &str) -> &str {
+    // wax glob metacharacters (plus `\` escape and `,` which is only meaningful
+    // inside `{…}` but signals a non-literal component).
+    const META: &[char] = &['*', '?', '[', ']', '{', '}', '<', '>', '\\', ','];
+    let mut end = 0usize;
+    let mut pos = 0usize;
+    for comp in pattern.split('/') {
+        if comp.contains(META) {
+            break;
+        }
+        pos += comp.len();
+        end = pos; // include this component in the prefix
+        pos += 1; // skip the '/' separator
+    }
+    &pattern[..end]
+}
+
 /// Collapses `.`, empty, and `..` components in a forward-slash path.
 ///
 /// `wax` accepts patterns like `a/./b` or `a/b/../c` at parse time but its
@@ -179,6 +211,8 @@ fn normalize_path(path: &str) -> anyhow::Result<String> {
 struct CompiledGlob {
     glob: Arc<wax::Glob<'static>>,
     not: Arc<wax::Any<'static>>,
+    /// Literal directory prefix of the pattern, used as the walk root.
+    prefix: String,
 }
 
 /// Process-global cache of compiled globs keyed by pattern string.
@@ -260,7 +294,11 @@ fn compile_glob(pattern: &str, exclude: &[String]) -> anyhow::Result<CompiledGlo
         Arc::new(wax::any(exclude_globs).context("compiling exclude patterns")?)
     };
 
-    Ok(CompiledGlob { glob, not })
+    Ok(CompiledGlob {
+        glob,
+        not,
+        prefix: literal_prefix(pattern).to_owned(),
+    })
 }
 
 pub struct Driver;
@@ -448,26 +486,41 @@ impl crate::engine::driver::Driver for Driver {
             }
 
             FsDef::Glob { compiled, .. } => {
-                use wax::walk::{Entry as _, FileIterator as _};
-
-                let walker = compiled
-                    .glob
-                    .walk(root.clone())
-                    .not(wax::Any::clone(&compiled.not))
-                    .context("applying exclude filter")?;
+                // Start the walk at the pattern's literal prefix so a rooted
+                // pattern (`a/b/**/*`) scans only `<root>/a/b`, not the whole
+                // tree. Matching uses the cached glob/exclude NFAs directly —
+                // no per-run regex (WalkProgram / exclude `Any`) compilation.
+                let walk_root = if compiled.prefix.is_empty() {
+                    root.clone()
+                } else {
+                    root.join(&compiled.prefix)
+                };
 
                 let mut artifacts = vec![];
+
+                let walker = walkdir::WalkDir::new(&walk_root)
+                    .into_iter()
+                    .filter_entry(|entry| {
+                        // Never descend into always-excluded subtrees (.git, …).
+                        !(entry.file_type().is_dir()
+                            && entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|n| BUILT_IN_PRUNE_DIRS.contains(&n)))
+                    });
 
                 for entry in walker {
                     let entry = match entry {
                         Ok(e) => e,
                         Err(e) => {
-                            // Treat missing paths as empty matches rather than errors.
-                            let io_err: std::io::Error = e.into();
-                            if io_err.kind() == std::io::ErrorKind::NotFound {
+                            // A missing walk root (or a path that vanished
+                            // mid-walk) is an empty match, not an error.
+                            if e.io_error()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                            {
                                 continue;
                             }
-                            return Err(anyhow::Error::from(io_err))
+                            return Err(anyhow::Error::from(e))
                                 .context("walking glob entries");
                         }
                     };
@@ -480,6 +533,12 @@ impl crate::engine::driver::Driver for Driver {
                     let rel = abs_path
                         .strip_prefix(root)
                         .with_context(|| "strip root prefix from glob entry")?;
+
+                    // Include on a pattern match, drop on an exclude match.
+                    use wax::Program as _;
+                    if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
+                        continue;
+                    }
 
                     let rel_str = rel.to_str().ok_or_else(|| {
                         anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
@@ -1366,6 +1425,53 @@ mod tests {
             Arc::ptr_eq(&compiled.not, &builtin),
             "empty-exclude path must reuse the cached built-in Any"
         );
+    }
+
+    #[test]
+    fn test_literal_prefix() {
+        assert_eq!(literal_prefix("mgmt/protos/x/**/*"), "mgmt/protos/x");
+        // Fully-literal pattern returns itself (walk visits just that path).
+        assert_eq!(literal_prefix("mgmt/protos/x/go.mod"), "mgmt/protos/x/go.mod");
+        assert_eq!(literal_prefix("*.rs"), "");
+        assert_eq!(literal_prefix("**/*.rs"), "");
+        assert_eq!(literal_prefix("dir/ogen.{yml,yaml}"), "dir");
+        assert_eq!(literal_prefix("a/b?c/d"), "a");
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_rooted_prefix_ignores_siblings() {
+        // A rooted pattern walks only its literal-prefix subtree; sibling
+        // directories with matching-looking files must not appear.
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg/sub")).unwrap();
+        fs::write(tmp.path().join("pkg/keep.rs"), b"").unwrap();
+        fs::write(tmp.path().join("pkg/sub/deep.rs"), b"").unwrap();
+        fs::create_dir_all(tmp.path().join("other")).unwrap();
+        fs::write(tmp.path().join("other/nope.rs"), b"").unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("pkg/**/*.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let mut names: Vec<_> = res.artifacts.iter().map(|a| a.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["pkg_keep.rs", "pkg_sub_deep.rs"]);
     }
 
     #[tokio::test]
