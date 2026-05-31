@@ -179,7 +179,9 @@ fn literal_prefix(pattern: &str) -> &str {
         end = pos; // include this component in the prefix
         pos += 1; // skip the '/' separator
     }
-    &pattern[..end]
+    // `end` always lands on a `/` separator (ASCII) or 0/len, so it is a valid
+    // char boundary; `get` keeps that guarantee explicit and panic-free.
+    pattern.get(..end).unwrap_or(pattern)
 }
 
 /// Collapses `.`, empty, and `..` components in a forward-slash path.
