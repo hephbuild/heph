@@ -818,9 +818,20 @@ impl Engine {
         // serializing per addr across requests/processes — and return ephemeral
         // artifacts with no long-lived read lock.
         if !can_cache {
-            let _w = self
-                .acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
-                .await?;
+            // pluginfs targets are pure, ephemeral filesystem reads (cache off):
+            // no cross-process state to serialize and GC never touches them, so
+            // the per-addr write lock is pure overhead. Skip it.
+            // TODO(targetdef): expose this as an explicit flag on TargetDef
+            // (e.g. `needs_lock`) instead of hardcoding the fs driver name here.
+            let skip_lock = opts.spec.driver == crate::pluginfs::DRIVER_NAME;
+            let _w = if skip_lock {
+                None
+            } else {
+                Some(
+                    self.acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
+                        .await?,
+                )
+            };
             let (cached, meta) = self
                 .clone()
                 .execute_and_cache_inner(rs.clone(), opts)

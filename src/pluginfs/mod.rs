@@ -24,7 +24,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
 const PKG: &str = "@heph/fs";
-const DRIVER_NAME: &str = "fs";
+pub const DRIVER_NAME: &str = "fs";
 
 /// Returns the `Addr` for a single-file fs target.
 /// Consumers use this to reference a file without knowing the internal address format.
