@@ -22,18 +22,20 @@ use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::{CacheArtifact, ManifestArtifactType};
-use crate::hartifactcontent::Content;
+use crate::engine::result_lock::ResultReadGuard;
+use crate::hartifactcontent::{Content, ReadSeek, WalkEntry};
 use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Weak};
 use tokio::task::JoinSet;
 
-/// How long to block on the per-addr execute lock before surfacing a "waiting on
+/// How long to block on the per-addr result lock before surfacing a "waiting on
 /// lock" notice (with the holder's pid) to the progress stream. The notice is
 /// purely informational; the wait itself continues until acquired or cancelled.
-const EXECUTE_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
 /// does not need to store it separately.
@@ -213,6 +215,71 @@ pub struct EResult {
     /// target's `support_files` declaration; never filtered by output group.
     pub support_artifacts: Vec<Arc<dyn Content>>,
     pub artifacts_meta: Vec<ArtifactMeta>,
+}
+
+/// A cache-backed artifact paired with the read lock guarding its cache entry.
+/// Delegates every [`Content`] method to the inner artifact; the guard is held
+/// purely for RAII, so the cache entry cannot be overwritten/deleted while any
+/// handle to it (here, or cloned into a dependent's sandbox input) is alive. The
+/// lock releases when the last `Arc<dyn Content>` for the entry drops.
+struct GuardedArtifact {
+    inner: Arc<dyn Content>,
+    _lock: Arc<ResultReadGuard>,
+}
+
+impl Content for GuardedArtifact {
+    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+        self.inner.reader()
+    }
+    fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+        self.inner.walk()
+    }
+    fn hashout(&self) -> anyhow::Result<String> {
+        self.inner.hashout()
+    }
+    fn seekable_reader(&self) -> anyhow::Result<Option<Box<dyn ReadSeek + Send>>> {
+        self.inner.seekable_reader()
+    }
+    fn byte_size(&self) -> Option<u64> {
+        self.inner.byte_size()
+    }
+}
+
+/// Build an [`EResult`] from cached artifacts, filtering by output group and
+/// type, and attaching `guard` (the read lock for this target's cache entry) to
+/// each kept artifact. `guard` is `None` only for the non-cacheable (force/shell)
+/// path, whose artifacts are ephemeral and need no long-lived lock.
+fn build_eresult(
+    cached: Vec<CacheArtifact>,
+    artifacts_meta: Vec<ArtifactMeta>,
+    outputs: &[String],
+    guard: Option<Arc<ResultReadGuard>>,
+) -> EResult {
+    let wrap = |a: CacheArtifact| -> Arc<dyn Content> {
+        let inner: Arc<dyn Content> = Arc::new(a);
+        match &guard {
+            Some(lock) => Arc::new(GuardedArtifact {
+                inner,
+                _lock: Arc::clone(lock),
+            }),
+            None => inner,
+        }
+    };
+
+    let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
+    let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
+    for a in cached {
+        match a.r#type {
+            ManifestArtifactType::Output if outputs.contains(&a.group) => artifacts.push(wrap(a)),
+            ManifestArtifactType::SupportFile => support_artifacts.push(wrap(a)),
+            _ => {}
+        }
+    }
+    EResult {
+        artifacts,
+        support_artifacts,
+        artifacts_meta,
+    }
 }
 
 pub type InteractiveInner = Box<
@@ -704,6 +771,38 @@ impl Engine {
         .await
     }
 
+    /// Acquire a lock guard, surfacing a "waiting on lock" notice (with the
+    /// holder's pid) if the wait outlasts [`RESULT_LOCK_NOTICE`]. The notice is
+    /// purely informational; the wait continues until acquired or cancelled.
+    async fn acquire_with_notice<G>(
+        &self,
+        rs: &Arc<RequestState>,
+        addr: &Addr,
+        lock_fut: impl Future<Output = anyhow::Result<G>>,
+    ) -> anyhow::Result<G> {
+        tokio::pin!(lock_fut);
+        match tokio::time::timeout(RESULT_LOCK_NOTICE, &mut lock_fut).await {
+            Ok(res) => res.with_context(|| format!("acquiring result lock for {addr}")),
+            Err(_elapsed) => {
+                let addr_str = addr.format();
+                let holder_pid = self.result_lock().holder_pid(addr);
+                crate::engine::event::emit_scope(
+                    rs,
+                    crate::engine::event::BuildEventKind::ResultLockWaitStart {
+                        addr: addr_str.clone(),
+                        holder_pid,
+                    },
+                    move |_| crate::engine::event::BuildEventKind::ResultLockWaitEnd {
+                        addr: addr_str,
+                    },
+                    async { (&mut lock_fut).await },
+                )
+                .await
+                .with_context(|| format!("acquiring result lock for {addr}"))
+            }
+        }
+    }
+
     async fn execute_and_cache(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -712,81 +811,73 @@ impl Engine {
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<EResult> {
         let can_cache = !opts.force && opts.def.target.cache && !opts.shell;
+        let addr = &def.target.addr;
+        let ctoken = rs.ctoken();
 
-        if can_cache
-            && let Some(res) = self
-                .result_from_cache(rs.clone(), def, opts, outputs.clone())
-                .await?
-        {
-            return Ok(res);
+        // Non-cacheable (force/shell): execute under an exclusive write lock —
+        // serializing per addr across requests/processes — and return ephemeral
+        // artifacts with no long-lived read lock.
+        if !can_cache {
+            let _w = self
+                .acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
+                .await?;
+            let (cached, meta) = self
+                .clone()
+                .execute_and_cache_inner(rs.clone(), opts)
+                .await?;
+            return Ok(build_eresult(cached, meta, &outputs, None));
         }
 
-        // Serialize the execute phase per addr: at most one run for a given
-        // target addr at a time — across requests with the in-memory backend,
-        // across processes with the filesystem backend. Held across the execute +
-        // cache cycle below; released on scope exit. If the wait outlasts
-        // EXECUTE_LOCK_NOTICE, surface who holds the lock and keep waiting; the
-        // notice clears the moment the wait resolves (acquired or cancelled).
-        let _execute_guard = {
-            let lock_fut = self.execute_lock().lock(&def.target.addr, rs.ctoken());
-            tokio::pin!(lock_fut);
-            match tokio::time::timeout(EXECUTE_LOCK_NOTICE, &mut lock_fut).await {
-                Ok(res) => {
-                    res.with_context(|| format!("acquiring execute lock for {}", def.target.addr))?
-                }
-                Err(_elapsed) => {
-                    let addr_str = def.target.addr.format();
-                    let holder_pid = self.execute_lock().holder_pid(&def.target.addr);
-                    crate::engine::event::emit_scope(
-                        &rs,
-                        crate::engine::event::BuildEventKind::ExecuteLockWaitStart {
-                            addr: addr_str.clone(),
-                            holder_pid,
-                        },
-                        move |_| crate::engine::event::BuildEventKind::ExecuteLockWaitEnd {
-                            addr: addr_str,
-                        },
-                        async { (&mut lock_fut).await },
-                    )
-                    .await
-                    .with_context(|| format!("acquiring execute lock for {}", def.target.addr))?
-                }
+        // 1. Optimistically take a plain shared read lock and look in the cache.
+        //    The read lock rides with the returned artifacts (attached per
+        //    artifact in build_eresult), protecting the cache entry while in use.
+        let read = self
+            .acquire_with_notice(&rs, addr, self.result_lock().read(addr, ctoken))
+            .await?;
+        if let Some((cached, meta)) = self
+            .result_from_cache(rs.clone(), def, opts, outputs.clone())
+            .await?
+        {
+            // A. Cache hit — attach this read lock and return.
+            return Ok(build_eresult(cached, meta, &outputs, Some(Arc::new(read))));
+        }
+
+        // B. Miss: a plain read cannot upgrade. Drop it and take the exclusive
+        //    write lock directly — after a miss we'll almost certainly execute,
+        //    so this skips the upgradable→upgrade two-step. It also serializes
+        //    the execute phase per addr, replacing the old exclusive result lock.
+        drop(read);
+        let write = self
+            .acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
+            .await?;
+
+        // Re-check under the write lock: covers the drop window above and any
+        // writer that produced the artifacts while we waited. The write lock
+        // excludes all others, so one re-check suffices. On the rare hit (another
+        // worker raced us) we skip execution; otherwise we execute + cache.
+        let (cached, meta) = match self
+            .result_from_cache(rs.clone(), def, opts, outputs.clone())
+            .await?
+        {
+            Some(res) => res,
+            None => {
+                self.clone()
+                    .execute_and_cache_inner(rs.clone(), opts)
+                    .await?
             }
         };
 
-        // Re-check the cache now that we hold the lock: a concurrent run for the
-        // same addr may have produced the artifacts while we were waiting.
-        if can_cache
-            && let Some(res) = self
-                .result_from_cache(rs.clone(), def, opts, outputs.clone())
-                .await?
-        {
-            return Ok(res);
-        }
-
-        let (cached_artifacts, artifacts_meta) = self
-            .clone()
-            .execute_and_cache_inner(rs.clone(), opts)
-            .await?;
-
-        let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
-        let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
-        for a in cached_artifacts {
-            match a.r#type {
-                ManifestArtifactType::Output if outputs.contains(&a.group) => {
-                    artifacts.push(Arc::new(a) as Arc<dyn Content>);
-                }
-                ManifestArtifactType::SupportFile => {
-                    support_artifacts.push(Arc::new(a) as Arc<dyn Content>);
-                }
-                _ => {}
-            }
-        }
-        Ok(EResult {
-            artifacts,
-            support_artifacts,
-            artifacts_meta,
-        })
+        // Downgrade to an upgradable read, then take a plain read while still
+        // holding the gateway (gap-free — no writer can delete what we just
+        // confirmed/wrote), and release the gateway. The plain read rides with
+        // the artifacts.
+        let up = write
+            .downgrade(ctoken)
+            .await
+            .with_context(|| format!("downgrading result lock for {addr}"))?;
+        let read = self.result_lock().read(addr, ctoken).await?;
+        drop(up);
+        Ok(build_eresult(cached, meta, &outputs, Some(Arc::new(read))))
     }
 
     // Memoized by addr:hashin — at most one execute+cache cycle runs per target per request,
@@ -856,14 +947,18 @@ impl Engine {
             .map_err(unwrap_arc_err)
     }
 
+    /// Look up `def`'s artifacts in the local cache, emitting the hit/miss event.
+    /// Returns the raw cached artifacts (already filtered to `outputs` by
+    /// [`artifacts_from_local_cache`](Self::artifacts_from_local_cache)); the
+    /// caller wraps them via [`build_eresult`], attaching the read lock it holds.
     async fn result_from_cache(
         &self,
         rs: Arc<RequestState>,
         def: &LinkedTargetDef,
         opts: &ExecuteOptions<'_>,
         outputs: Vec<String>,
-    ) -> anyhow::Result<Option<EResult>> {
-        let (cached_artifacts, artifacts_meta) = match self
+    ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
+        match self
             .artifacts_from_local_cache(rs.ctoken(), def, opts.hashin.as_str(), outputs)
             .await?
         {
@@ -872,34 +967,15 @@ impl Engine {
                 rs.emit(crate::engine::event::BuildEventKind::LocalCacheHit {
                     addr: def.target.addr.format(),
                 });
-                res
+                Ok(Some(res))
             }
             None => {
                 rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
                     addr: def.target.addr.format(),
                 });
-                return Ok(None);
-            }
-        };
-
-        let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
-        let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
-        for a in cached_artifacts {
-            match a.r#type {
-                ManifestArtifactType::Output => {
-                    artifacts.push(Arc::new(a) as Arc<dyn Content>);
-                }
-                ManifestArtifactType::SupportFile => {
-                    support_artifacts.push(Arc::new(a) as Arc<dyn Content>);
-                }
-                ManifestArtifactType::Log => {}
+                Ok(None)
             }
         }
-        Ok(Some(EResult {
-            artifacts,
-            support_artifacts,
-            artifacts_meta,
-        }))
     }
 
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
@@ -1272,13 +1348,78 @@ mod tests {
         ConfigRequest, ConfigResponse, ListPackageResponse, ListPackagesRequest, ListResponse,
         ProbeRequest, ProbeResponse,
     };
-    use crate::hasync::Cancellable;
+    use crate::engine::result_lock::{LockBackend, ResultLock};
+    use crate::hasync::{Cancellable, StdCancellationToken};
     use crate::htmatcher::Matcher;
     use crate::htpkg::PkgBuf;
     use futures::future::BoxFuture;
+    use std::collections::BTreeMap;
     use std::sync::Arc as SArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    /// Minimal [`Content`] for guard-lifetime tests; carries no real bytes.
+    struct DummyContent;
+    impl Content for DummyContent {
+        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok("dummy".to_string())
+        }
+    }
+
+    /// The read lock travels with the artifact, not the `EResult`: it stays held
+    /// as long as *any* handle to the artifact is alive — including a handle
+    /// cloned into a dependent's sandbox input (or a group target's merged
+    /// result) after the producing `EResult` has dropped — and releases only when
+    /// the last handle drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_artifact_holds_read_lock_until_all_handles_drop() {
+        let dir = tempdir().expect("tempdir");
+        let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
+        let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
+
+        let read = lock
+            .read(&addr, &StdCancellationToken::new())
+            .await
+            .expect("read");
+        let guarded: Arc<dyn Content> = Arc::new(GuardedArtifact {
+            inner: Arc::new(DummyContent),
+            _lock: Arc::new(read),
+        });
+        // A dependent clones the artifact handle into its own structures.
+        let cloned = Arc::clone(&guarded);
+
+        // A writer for the same addr blocks while any handle is alive.
+        let lock2 = SArc::clone(&lock);
+        let addr2 = addr.clone();
+        let writer = tokio::spawn(async move {
+            let tok = StdCancellationToken::new();
+            lock2.write(&addr2, &tok).await.map(|_| ())
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!writer.is_finished(), "writer blocked while artifact alive");
+
+        // Producer's EResult drops, but the dependent still holds `cloned`.
+        drop(guarded);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !writer.is_finished(),
+            "still blocked: the cloned handle keeps the read lock alive"
+        );
+
+        drop(cloned);
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("did not hang")
+            .expect("join")
+            .expect("writer acquires once the last artifact handle drops");
+    }
 
     struct CountingProvider {
         name: String,

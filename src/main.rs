@@ -41,6 +41,11 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
     }
 
+    // Raise the open-file limit before any build work: rheph holds an flock fd
+    // per in-use cached artifact, and the default macOS soft limit (256) is
+    // exhausted almost immediately on a wide build.
+    rheph::fdlimit::raise_open_file_limit();
+
     let sink = log::init();
     rheph::tui::panic::install(sink.clone());
 

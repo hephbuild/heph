@@ -30,6 +30,7 @@ pub mod commands;
 pub mod debug_hash;
 pub mod defer;
 pub mod engine;
+pub mod fdlimit;
 pub mod hartifactcontent;
 pub mod hasync;
 pub mod hlock;

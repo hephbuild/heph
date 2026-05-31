@@ -57,17 +57,17 @@ pub enum BuildEventKind {
     LocalCacheMiss {
         addr: String,
     },
-    /// Acquiring the per-addr execute lock has been blocked past the notice
+    /// Acquiring the per-addr result lock has been blocked past the notice
     /// threshold. `holder_pid` is the process believed to hold the lock
     /// (best-effort; `None` if unknown). Paired one-to-one with
-    /// `ExecuteLockWaitEnd` (which fires on acquire **or** cancellation), so a
+    /// `ResultLockWaitEnd` (which fires on acquire **or** cancellation), so a
     /// consumer can show the notice for exactly the duration of the wait.
-    ExecuteLockWaitStart {
+    ResultLockWaitStart {
         addr: String,
         holder_pid: Option<u32>,
     },
     /// The execute-lock wait ended (lock acquired or the wait was cancelled).
-    ExecuteLockWaitEnd {
+    ResultLockWaitEnd {
         addr: String,
     },
     // Defined for the future process-split / remote cache work; NOT emitted yet.

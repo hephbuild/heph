@@ -207,9 +207,9 @@ pub struct BuildState {
     /// Server timestamp of the first event seen — the run's start anchor for the
     /// header's elapsed clock. `None` until any event lands.
     started_at_ms: Option<u64>,
-    /// Addrs blocked on the execute lock past the notice threshold, mapped to the
-    /// holder's pid (`None` if unknown). Added on `ExecuteLockWaitStart`, removed
-    /// on `ExecuteLockWaitEnd`, so it reflects only currently-blocked waits.
+    /// Addrs blocked on the result lock past the notice threshold, mapped to the
+    /// holder's pid (`None` if unknown). Added on `ResultLockWaitStart`, removed
+    /// on `ResultLockWaitEnd`, so it reflects only currently-blocked waits.
     lock_waits: HashMap<String, Option<u32>>,
 }
 
@@ -275,10 +275,10 @@ impl BuildState {
                 self.cache_hit.insert(addr.clone());
             }
             BuildEventKind::RemoteCacheMiss { .. } => self.remote_misses += 1,
-            BuildEventKind::ExecuteLockWaitStart { addr, holder_pid } => {
+            BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
                 self.lock_waits.insert(addr.clone(), *holder_pid);
             }
-            BuildEventKind::ExecuteLockWaitEnd { addr } => {
+            BuildEventKind::ResultLockWaitEnd { addr } => {
                 self.lock_waits.remove(addr);
             }
             // Read/Write markers are not aggregated into counters.
@@ -446,7 +446,7 @@ impl BuildState {
         lines
     }
 
-    /// Rows for addrs currently blocked on the execute lock past the notice
+    /// Rows for addrs currently blocked on the result lock past the notice
     /// threshold: `⏳ waiting on lock <addr> (held by pid N)`, or
     /// `(holder unknown)` when the pid could not be determined. Sorted by addr so
     /// the order is stable across frames. Empty when nothing is blocked.
@@ -669,12 +669,12 @@ impl CIAppView for CiProgressView {
             } => {
                 tracing::info!("running {addr} [{driver}]");
             }
-            BuildEventKind::ExecuteLockWaitStart { addr, holder_pid } => {
+            BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
                 let holder = match holder_pid {
                     Some(pid) => format!("held by pid {pid}"),
                     None => "holder unknown".to_string(),
                 };
-                tracing::info!("waiting on execute lock for {addr} ({holder})");
+                tracing::info!("waiting on result lock for {addr} ({holder})");
             }
             _ => {}
         }
@@ -702,7 +702,7 @@ mod tests {
         let mut s = BuildState::new();
         s.apply(&ev(
             0,
-            BuildEventKind::ExecuteLockWaitStart {
+            BuildEventKind::ResultLockWaitStart {
                 addr: "//pkg:a".into(),
                 holder_pid: Some(4242),
             },
@@ -720,7 +720,7 @@ mod tests {
         // The notice disappears when the wait ends.
         s.apply(&ev(
             1,
-            BuildEventKind::ExecuteLockWaitEnd {
+            BuildEventKind::ResultLockWaitEnd {
                 addr: "//pkg:a".into(),
             },
         ));
@@ -732,7 +732,7 @@ mod tests {
         let mut s = BuildState::new();
         s.apply(&ev(
             0,
-            BuildEventKind::ExecuteLockWaitStart {
+            BuildEventKind::ResultLockWaitStart {
                 addr: "//pkg:a".into(),
                 holder_pid: None,
             },
