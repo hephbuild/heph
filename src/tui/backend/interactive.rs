@@ -373,6 +373,94 @@ mod tests {
         );
     }
 
+    /// Regression: resizing the terminal broke inline-viewport rendering. The
+    /// `Event::Resize` arm only updated the local width; the viewport itself was
+    /// never re-anchored in a window where the DSR cursor query could run safely,
+    /// so the next `draw()` raced crossterm's EventStream on /dev/tty and the box
+    /// rendered garbled / at the stale width.
+    ///
+    /// The real /dev/tty race needs a PTY and injected timing to reproduce and is
+    /// not honestly unit-testable here. This freezes the observable contract the
+    /// fix restores: after `reanchor_terminal`, the inline viewport tracks the new
+    /// backend size and the next frame lays out at the new width — using a
+    /// `TestBackend` whose deterministic cursor lets `compute_inline_size` run
+    /// without a tty.
+    #[test]
+    fn resize_reanchors_inline_viewport_and_reflows() {
+        use super::reanchor_terminal;
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::{PROGRESS_ROWS, TuiProgressView};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Position;
+        use ratatui::text::Text;
+        use ratatui::widgets::Paragraph;
+        use ratatui::{TerminalOptions, Viewport};
+
+        fn row_string(buf: &Buffer, y: u16) -> String {
+            (buf.area.left()..buf.area.right())
+                .filter_map(|x| buf.cell(Position::new(x, y)))
+                .map(|c| c.symbol())
+                .collect()
+        }
+
+        fn draw_view(terminal: &mut Terminal<TestBackend>, view: &TuiProgressView) {
+            let cols = terminal.size().expect("size").width;
+            let lines = view.render("⠋", 10_000, cols);
+            terminal
+                .draw(|f| {
+                    f.render_widget(Paragraph::new(Text::from(lines)), f.area());
+                })
+                .expect("draw");
+        }
+
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(PROGRESS_ROWS),
+            },
+        )
+        .expect("terminal");
+
+        let view = TuiProgressView::new("Running //a:b");
+        draw_view(&mut terminal, &view);
+
+        // Shrink the terminal, then re-anchor (the load-bearing call the fix runs
+        // inside the EventStream-down window).
+        terminal.backend_mut().resize(40, 24);
+        reanchor_terminal(&mut terminal);
+        draw_view(&mut terminal, &view);
+
+        let buf = terminal.backend().buffer();
+        // Buffers re-anchored to the new width, not stale 80.
+        assert_eq!(buf.area.width, 40, "viewport width should track resize");
+
+        // The box reflowed to the new width: the rounded corners pin to the
+        // last column of the header (top-right) and footer (bottom-right) rows.
+        let last_col = buf.area.right() - 1;
+        let header_y = (buf.area.top()..buf.area.bottom())
+            .find(|&y| row_string(buf, y).trim_start().starts_with('╭'))
+            .expect("header row");
+        let footer_y = (buf.area.top()..buf.area.bottom())
+            .find(|&y| row_string(buf, y).trim_start().starts_with('╰'))
+            .expect("footer row");
+        assert_eq!(
+            buf.cell(Position::new(last_col, header_y))
+                .map(|c| c.symbol()),
+            Some("╮"),
+            "header should close at the new last column: {:?}",
+            row_string(buf, header_y)
+        );
+        assert_eq!(
+            buf.cell(Position::new(last_col, footer_y))
+                .map(|c| c.symbol()),
+            Some("╯"),
+            "footer should close at the new last column: {:?}",
+            row_string(buf, footer_y)
+        );
+    }
+
     #[test]
     fn rows_needed_handles_boundaries() {
         assert_eq!(rows_needed(0, 80), 1);
