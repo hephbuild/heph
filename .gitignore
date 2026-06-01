@@ -33,3 +33,5 @@ devenv.local.yaml
 
 gen
 example/go/large
+
+ai-docs
