@@ -280,6 +280,21 @@ jobs:
           prerelease: false
           make_latest: true
 
+      - name: Trigger Deploy on hephbuild.github.io
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: 'hephbuild',
+              repo: 'hephbuild.github.io',
+              workflow_id: 'deploy.yml',
+              ref: 'main',
+              inputs: {
+                version: '${{ needs.gen.outputs.version }}',
+              },
+            });
+
   summary:
     name: Summary
     needs: [gen, upload_artifacts]
