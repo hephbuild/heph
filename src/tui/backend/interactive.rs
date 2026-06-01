@@ -81,6 +81,10 @@ pub async fn run<A: App + 'static>(
     let mut spinner_idx: usize = 0;
     let mut paused = false;
     let mut cols = terminal_cols(&terminal);
+    // Set when a resize event arrives; handled (coalesced) at the next tick so a
+    // drag-resize burst triggers at most one re-anchor per tick instead of a
+    // blocking DSR query per event.
+    let mut needs_resize = false;
 
     // Holds the app's result once its future resolves. We don't break the loop
     // here: the TUI stays up, rendering, until background cleanups drain too.
@@ -171,7 +175,11 @@ pub async fn run<A: App + 'static>(
                         shutdown.trigger();
                     }
                     Some(Ok(Event::Resize(w, _))) => {
+                        // Cheap: just record. The terminal re-anchor (which does a
+                        // DSR cursor query that must not race the EventStream) is
+                        // deferred to the tick arm below.
                         cols = w.max(1);
+                        needs_resize = true;
                     }
                     _ => {}
                 }
@@ -191,6 +199,14 @@ pub async fn run<A: App + 'static>(
                 }
             }
             _ = ticker.tick(), if !paused => {
+                if needs_resize {
+                    // Re-anchor the inline viewport at the new size before drawing.
+                    // The tick is a synchronous draw-owning point, so the
+                    // EventStream teardown/restore inside has no `.await` between
+                    // them — the no-race invariant holds (see stderr_backend.rs).
+                    reanchor_after_resize(&mut terminal, &mut events, &mut cols);
+                    needs_resize = false;
+                }
                 drain_logs_to_terminal(&mut terminal, &mut rx, cols);
                 spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
                 let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
@@ -231,6 +247,31 @@ pub async fn run<A: App + 'static>(
 
 fn terminal_cols(terminal: &StderrTerminal) -> u16 {
     terminal.size().map(|r| r.width).unwrap_or(80).max(1)
+}
+
+/// Re-anchor an inline viewport to the backend's current size. `autoresize()`
+/// re-runs `compute_inline_size`, which issues a DSR cursor query via the
+/// backend. Kept generic and free of the EventStream choreography so it can be
+/// exercised with a `TestBackend`.
+fn reanchor_terminal<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) {
+    drop(terminal.autoresize());
+}
+
+/// Re-anchor after a terminal resize. The DSR query inside `autoresize` reads
+/// the reply off `/dev/tty`; crossterm's `EventStream` reader consumes the same
+/// tty, so it must be torn down across the query (see `stderr_backend.rs`
+/// invariant). There must be no `.await` between the two `events` writes —
+/// callers run this from the synchronous tick arm.
+fn reanchor_after_resize(
+    terminal: &mut StderrTerminal,
+    events: &mut Option<EventStream>,
+    cols: &mut u16,
+) {
+    *events = None;
+    reanchor_terminal(terminal);
+    *events = Some(EventStream::new());
+    // The backend size ratatui actually re-anchored to is the source of truth.
+    *cols = terminal_cols(terminal);
 }
 
 fn drain_logs_to_terminal(
