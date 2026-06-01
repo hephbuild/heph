@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod errors;
 pub mod gc;
+pub mod gendocs;
 mod global;
 pub mod inspect;
 pub mod query;
@@ -29,6 +30,9 @@ pub enum Commands {
     Version(version::Args),
     /// Garbage collect the local cache
     Gc(gc::GcArgs),
+    /// Generate markdown CLI reference
+    #[command(name = "gen-docs", hide = true)]
+    GenDocs(gendocs::GenDocsArgs),
 }
 
 impl Commands {
@@ -39,6 +43,7 @@ impl Commands {
             Commands::Query(args) => query::execute(args, sink, global),
             Commands::Version(args) => version::execute(args),
             Commands::Gc(args) => gc::execute(args, sink, global),
+            Commands::GenDocs(args) => gendocs::execute(args),
         }
     }
 }

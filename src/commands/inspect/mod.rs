@@ -29,7 +29,7 @@ pub enum InspectCommands {
     Spec(spec::Args),
     /// Prints target def
     Def(def::Args),
-    /// Prints target spec
+    /// Prints target deps
     Deps(deps::Args),
 }
 
