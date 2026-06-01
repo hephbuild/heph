@@ -148,12 +148,12 @@ mod tests {
         let md = render_markdown(&cli_command());
 
         // Top-level commands appear.
-        assert!(md.contains("## `rheph run`"), "missing run heading:\n{md}");
-        assert!(md.contains("## `rheph query`"), "missing query heading");
+        assert!(md.contains("## `heph run`"), "missing run heading:\n{md}");
+        assert!(md.contains("## `heph query`"), "missing query heading");
 
         // Nested inspect subcommands flatten with the full path.
         assert!(
-            md.contains("## `rheph inspect packages`"),
+            md.contains("## `heph inspect packages`"),
             "missing nested inspect packages heading:\n{md}"
         );
 

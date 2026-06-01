@@ -429,6 +429,20 @@ mod tests {
         Addr::new(PkgBuf::from("pkg"), name.to_string(), Default::default())
     }
 
+    /// Build an `Engine` rooted at a unique temp dir so the sqlite cache db
+    /// never collides across parallel tests (a shared path locks the db).
+    /// The returned `TempDir` must be held alive for the test's duration.
+    fn test_engine() -> anyhow::Result<(tempfile::TempDir, Arc<Engine>)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Arc::new(Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?);
+        Ok((dir, engine))
+    }
+
     #[test]
     fn test_dep_dag_acyclic() {
         let mut dag = DepDag::new();
@@ -548,12 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_state_tracking() -> anyhow::Result<()> {
-        let engine = Arc::new(Engine::new(Config {
-            root: PathBuf::from("/tmp"),
-            home_dir: std::path::PathBuf::new(),
-            parallelism: None,
-            ..Default::default()
-        })?);
+        let (_tmp, engine) = test_engine()?;
 
         let rs = engine.new_state();
         let request_id = rs.request_id().to_string();
@@ -577,12 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_all_requests_cancels_live_tokens() -> anyhow::Result<()> {
-        let engine = Arc::new(Engine::new(Config {
-            root: PathBuf::from("/tmp"),
-            home_dir: std::path::PathBuf::new(),
-            parallelism: None,
-            ..Default::default()
-        })?);
+        let (_tmp, engine) = test_engine()?;
 
         let rs = engine.new_state();
         assert!(!rs.ctoken().is_cancelled());
@@ -599,12 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn fail_fast_defaults_true_overridable() -> anyhow::Result<()> {
-        let engine = Arc::new(Engine::new(Config {
-            root: PathBuf::from("/tmp"),
-            home_dir: std::path::PathBuf::new(),
-            parallelism: None,
-            ..Default::default()
-        })?);
+        let (_tmp, engine) = test_engine()?;
 
         assert!(engine.new_state().fail_fast());
         assert!(engine.new_state_with_fail_fast(true).fail_fast());
@@ -614,12 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_skip_provider_child_does_not_cancel_token() -> anyhow::Result<()> {
-        let engine = Arc::new(Engine::new(Config {
-            root: PathBuf::from("/tmp"),
-            home_dir: std::path::PathBuf::new(),
-            parallelism: None,
-            ..Default::default()
-        })?);
+        let (_tmp, engine) = test_engine()?;
 
         let rs = engine.new_state();
         assert!(!rs.ctoken().is_cancelled());
