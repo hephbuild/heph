@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["master", "rv1", "v1"]
+    branches: ["master"]
   pull_request:
-    branches: ["master", "rv1", "v1"]
+    branches: ["master"]
 
 jobs:
   gen:
@@ -267,7 +267,7 @@ jobs:
   release:
     name: Release
     needs: [gen, upload_artifacts, lint, test]
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/rv1' || github.ref == 'refs/heads/v1'
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

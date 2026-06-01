@@ -436,7 +436,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = Arc::new(Engine::new(Config {
             root: dir.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
+            home_dir: PathBuf::new(),
             parallelism: None,
             ..Default::default()
         })?);
