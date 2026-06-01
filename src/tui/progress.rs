@@ -853,7 +853,7 @@ impl TUIAppView for TuiProgressView {
 
     /// Layout (top to bottom), a rounded box pinned to [`PROGRESS_ROWS`]:
     /// ```text
-    /// ╭─ rheph · N built · N cached · N running · N failed ──── <workers> ─╮
+    /// ╭─ heph · N built · N cached · N running · N failed ──── <workers> ─╮
     ///   <slow rows...>            (padded to keep the box a fixed height)
     /// ╰─── <label> ───────────────────────────────────────────────────────╯
     /// ```

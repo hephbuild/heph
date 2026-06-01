@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-use rheph::proc_exec;
+use heph::proc_exec;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

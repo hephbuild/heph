@@ -1,9 +1,9 @@
 use anyhow::Context as _;
-use rheph::engine::driver::Driver as SDKDriver;
-use rheph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
-use rheph::engine::provider::Provider as SDKProvider;
-use rheph::engine::{Config, EResult, Engine, EngineTargetSpec, OutputMatcher, ResultOptions};
-use rheph::htaddr::{Addr, parse_addr};
+use heph::engine::driver::Driver as SDKDriver;
+use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
+use heph::engine::provider::Provider as SDKProvider;
+use heph::engine::{Config, EResult, Engine, EngineTargetSpec, OutputMatcher, ResultOptions};
+use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -147,7 +147,7 @@ impl Workspace {
 }
 
 pub fn artifact_bytes(result: &EResult) -> Vec<u8> {
-    use rheph::hartifactcontent::WalkEntryKind;
+    use heph::hartifactcontent::WalkEntryKind;
     use std::io::Read as _;
     let mut out = Vec::new();
     for artifact in &result.artifacts {

@@ -1,5 +1,5 @@
 [package]
-name = "rheph"
+name = "heph"
 version = "0.1.0"
 edition = "2024"
 
@@ -91,7 +91,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
-rheph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
+heph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
 memoize = "0.6.0"

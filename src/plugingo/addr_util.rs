@@ -39,7 +39,7 @@ fn decode_cache() -> &'static DecodeCache {
     DECODE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Decode a rheph package address into its Go package kind.
+/// Decode a heph package address into its Go package kind.
 /// Returns None if the address doesn't correspond to a Go package.
 ///
 /// Results are memoized in a process-wide cache keyed by `(pkg, workspace_root)`
@@ -196,7 +196,7 @@ fn parse_thirdparty(rest: &str, module_root: PathBuf) -> Option<GoPackageKind> {
     })
 }
 
-/// Encode a stdlib import path as a rheph Addr for build_lib.
+/// Encode a stdlib import path as a heph Addr for build_lib.
 pub fn encode_stdlib(import_path: &str, factors: &Factors) -> Addr {
     Addr::new(
         PkgBuf::from(format!("{}{}", STD_PREFIX, import_path)),
@@ -205,7 +205,7 @@ pub fn encode_stdlib(import_path: &str, factors: &Factors) -> Addr {
     )
 }
 
-/// Encode a third-party package as a rheph Addr for build_lib.
+/// Encode a third-party package as a heph Addr for build_lib.
 /// `base_pkg` is the module-root path relative to the workspace root
 /// (e.g. "" for a root go.mod, "go" for go/go.mod).
 pub fn encode_thirdparty(
@@ -250,7 +250,7 @@ pub fn encode_thirdparty_download(module: &str, version: &str, base_pkg: &str) -
     Addr::new(PkgBuf::from(pkg), "download".to_string(), BTreeMap::new())
 }
 
-/// Encode a first-party package (relative to workspace root) as a rheph Addr for build_lib.
+/// Encode a first-party package (relative to workspace root) as a heph Addr for build_lib.
 pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, factors: &Factors) -> Addr {
     let rel = src_dir.strip_prefix(workspace_root).unwrap_or(src_dir);
     Addr::new(

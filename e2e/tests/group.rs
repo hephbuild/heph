@@ -160,7 +160,7 @@ target(name = "g", driver = "group", deps = ["//nocache:t"])
     let def = ws
         .engine
         .clone()
-        .get_def(rs, &rheph::htaddr::parse_addr("//nocache:g")?)
+        .get_def(rs, &heph::htaddr::parse_addr("//nocache:g")?)
         .await?;
     assert!(!def.target_def.cache.enabled, "group must not be cached");
     assert!(def.target_def.transparent, "group must be transparent");

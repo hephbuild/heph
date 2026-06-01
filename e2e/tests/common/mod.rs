@@ -1,17 +1,17 @@
 #![allow(dead_code, unused_imports)]
 
 use anyhow::Result;
-use rheph::pluginbuildfile;
-use rheph::pluginexec;
-use rheph::pluginstatictarget;
-use rheph_testkit::WorkspaceBuilder;
+use heph::pluginbuildfile;
+use heph::pluginexec;
+use heph::pluginstatictarget;
+use heph_testkit::WorkspaceBuilder;
 
-pub use rheph_testkit::{artifact_bytes, artifact_paths, artifact_string, root};
+pub use heph_testkit::{artifact_bytes, artifact_paths, artifact_string, root};
 
-pub struct Workspace(rheph_testkit::Workspace);
+pub struct Workspace(heph_testkit::Workspace);
 
 impl std::ops::Deref for Workspace {
-    type Target = rheph_testkit::Workspace;
+    type Target = heph_testkit::Workspace;
     fn deref(&self) -> &Self::Target {
         &self.0
     }

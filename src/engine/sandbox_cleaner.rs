@@ -45,7 +45,7 @@ fn sender() -> &'static Sender<Job> {
     CLEANER.get_or_init(|| {
         let (tx, rx) = unbounded::<Job>();
         thread::Builder::new()
-            .name("rheph-sandbox-cleaner".into())
+            .name("heph-sandbox-cleaner".into())
             .spawn(move || {
                 for (label, job, pending) in rx.iter() {
                     // catch_unwind so a panicking job doesn't kill the

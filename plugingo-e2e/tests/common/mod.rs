@@ -1,14 +1,14 @@
 use anyhow::Context as _;
-use rheph::pluginbuildfile;
-use rheph::pluginexec;
-use rheph::pluginfs;
-use rheph::plugingo;
-use rheph::pluginstatictarget;
-use rheph_testkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
+use heph::pluginbuildfile;
+use heph::pluginexec;
+use heph::pluginfs;
+use heph::plugingo;
+use heph::pluginstatictarget;
+use heph_testkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-pub use rheph_testkit::{artifact_paths, artifact_string};
+pub use heph_testkit::{artifact_paths, artifact_string};
 
 macro_rules! require_go {
     () => {

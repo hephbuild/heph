@@ -1750,12 +1750,12 @@ mod tests {
     #[tokio::test]
     async fn test_run_runtime_pass_env_injected() -> anyhow::Result<()> {
         unsafe {
-            std::env::set_var("RHEPH_TEST_RUNTIME_PASS", "runtime_pass_value");
+            std::env::set_var("heph_TEST_RUNTIME_PASS", "runtime_pass_value");
         }
         let out = run_bash_env(
-            "echo $RHEPH_TEST_RUNTIME_PASS",
+            "echo $heph_TEST_RUNTIME_PASS",
             BTreeMap::new(),
-            vec!["RHEPH_TEST_RUNTIME_PASS".to_string()],
+            vec!["heph_TEST_RUNTIME_PASS".to_string()],
             HashMap::new(),
         )
         .await?;
@@ -1766,10 +1766,10 @@ mod tests {
     #[tokio::test]
     async fn test_run_env_not_leaked_from_parent() -> anyhow::Result<()> {
         unsafe {
-            std::env::set_var("RHEPH_TEST_PARENT_ONLY", "should_not_see_this");
+            std::env::set_var("heph_TEST_PARENT_ONLY", "should_not_see_this");
         }
         let out = run_bash_env(
-            "echo ${RHEPH_TEST_PARENT_ONLY:-absent}",
+            "echo ${heph_TEST_PARENT_ONLY:-absent}",
             BTreeMap::new(),
             vec![],
             HashMap::new(),
@@ -1782,7 +1782,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_pass_env_resolves_value() -> anyhow::Result<()> {
         unsafe {
-            std::env::set_var("RHEPH_TEST_PARSE_PASS", "resolved_value");
+            std::env::set_var("heph_TEST_PARSE_PASS", "resolved_value");
         }
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
@@ -1795,7 +1795,7 @@ mod tests {
                 "pass_env".to_string(),
                 crate::loosespecparser::TargetSpecValue::List(vec![
                     crate::loosespecparser::TargetSpecValue::String(
-                        "RHEPH_TEST_PARSE_PASS".to_string(),
+                        "heph_TEST_PARSE_PASS".to_string(),
                     ),
                 ]),
             ),
@@ -1817,7 +1817,7 @@ mod tests {
             .await?;
         let def = res.target_def.def::<TargetDef>();
         assert_eq!(
-            def.pass_env.get("RHEPH_TEST_PARSE_PASS"),
+            def.pass_env.get("heph_TEST_PARSE_PASS"),
             Some(&"resolved_value".to_string())
         );
         Ok(())
@@ -1836,7 +1836,7 @@ mod tests {
                 "pass_env".to_string(),
                 crate::loosespecparser::TargetSpecValue::List(vec![
                     crate::loosespecparser::TargetSpecValue::String(
-                        "RHEPH_TEST_DEFINITELY_UNSET_99999".to_string(),
+                        "heph_TEST_DEFINITELY_UNSET_99999".to_string(),
                     ),
                 ]),
             ),

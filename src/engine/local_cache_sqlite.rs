@@ -240,7 +240,7 @@ impl LocalCacheSQLite {
         let (writer_tx, writer_rx) = mpsc::channel::<WriterCmd>();
         let pending_bg = pending.clone();
         let writer_handle = std::thread::Builder::new()
-            .name("rheph-sqlite-writer".to_string())
+            .name("heph-sqlite-writer".to_string())
             .spawn(move || writer_loop(&mut write_conn, &writer_rx, &pending_bg))
             .context("spawning sqlite writer thread")?;
 
@@ -509,7 +509,7 @@ impl LocalCache for LocalCacheSQLite {
         // Dedicated thread (not rayon) so a saturated rayon pool can't starve
         // this long-lived producer and deadlock the consumer on `recv`.
         std::thread::Builder::new()
-            .name("rheph-gc-list-targets".to_string())
+            .name("heph-gc-list-targets".to_string())
             .spawn(move || {
                 let mut stmt = match conn.prepare("SELECT DISTINCT addr FROM artifacts") {
                     Ok(s) => s,

@@ -78,7 +78,7 @@ pub fn build_download_spec(
     // CGO pin lives in `env` (hashed; pluginexec/mod.rs:70 excludes runtime_env
     // from the def hash). `go mod download` itself does not invoke the C
     // toolchain, but pinning here keeps the global rule simple: no Go process
-    // in rheph ever autodetects CGO.
+    // in heph ever autodetects CGO.
     config.insert(
         "env".to_string(),
         TargetSpecValue::Map(HashMap::from([(

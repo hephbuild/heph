@@ -90,8 +90,8 @@ async fn test_cached_run() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_force_run() -> anyhow::Result<()> {
-    use rheph::engine::{OutputMatcher, ResultOptions};
-    use rheph::htaddr::parse_addr;
+    use heph::engine::{OutputMatcher, ResultOptions};
+    use heph::htaddr::parse_addr;
 
     let ws = Workspace::new();
     ws.write_build_file(

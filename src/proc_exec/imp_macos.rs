@@ -489,7 +489,7 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
     // drops the Handle without calling `wait*` (e.g. an error path between
     // spawn and wait in pluginexec). Without this registration, Drop's
     // `kill_child` would SIGKILL the pid but nobody would reap it → permanent
-    // zombie observed under PPID of main rheph.
+    // zombie observed under PPID of main heph.
     let exit_rx = process_watcher::register(pid);
 
     Ok(Handle {
@@ -546,7 +546,7 @@ fn spawn_drain_thread<R: io::Read + Send + 'static>(
     let done = Arc::new(AtomicBool::new(false));
     let done_for_thread = Arc::clone(&done);
     let jh = std::thread::Builder::new()
-        .name("rheph-proc-drain".into())
+        .name("heph-proc-drain".into())
         .spawn(move || {
             let mut buf = vec![0u8; CHUNK_SIZE];
             // Single exit point so `done` is always flipped to true on
@@ -573,13 +573,13 @@ fn spawn_drain_thread<R: io::Read + Send + 'static>(
             }
             done_for_thread.store(true, Ordering::Release);
         })
-        .expect("spawn rheph-proc-drain thread");
+        .expect("spawn heph-proc-drain thread");
     (rx, DrainHandle { join: jh, done })
 }
 
 fn collect_chunks(reader: Option<ChunkReader>) -> JoinHandle<io::Result<Vec<u8>>> {
     std::thread::Builder::new()
-        .name("rheph-proc-collect".into())
+        .name("heph-proc-collect".into())
         .spawn(move || -> io::Result<Vec<u8>> {
             let Some(reader) = reader else {
                 return Ok(Vec::new());
@@ -595,7 +595,7 @@ fn collect_chunks(reader: Option<ChunkReader>) -> JoinHandle<io::Result<Vec<u8>>
                 }
             }
         })
-        .expect("spawn rheph-proc-collect thread")
+        .expect("spawn heph-proc-collect thread")
 }
 
 #[cfg(test)]

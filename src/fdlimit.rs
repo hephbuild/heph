@@ -1,6 +1,6 @@
 //! Raise the process's open-file (`RLIMIT_NOFILE`) soft limit at startup.
 //!
-//! rheph holds an advisory `flock(2)` fd per in-use cached artifact (the read
+//! heph holds an advisory `flock(2)` fd per in-use cached artifact (the read
 //! lock guarding the cache entry while a consumer reads it — see
 //! [`crate::engine::result_lock`]). A wide build keeps many cache entries live
 //! at once, so the default soft limit (just **256** on macOS) is exhausted

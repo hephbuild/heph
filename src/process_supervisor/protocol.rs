@@ -1,7 +1,7 @@
 use anyhow::Context;
 use std::path::PathBuf;
 
-/// Wire protocol between the rheph main process and its supervisor child.
+/// Wire protocol between the heph main process and its supervisor child.
 ///
 /// One ASCII line per message:
 ///   * `TRACK <pgid>\n`     — register child pgid for SIGKILL on EOF

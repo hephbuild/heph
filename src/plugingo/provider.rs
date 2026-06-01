@@ -1890,7 +1890,7 @@ impl ProviderInner {
         Ok((import_path.to_string(), Some(dep_addr), sub_imports))
     }
 
-    /// Resolve an import path to a rheph `build_lib` Addr.
+    /// Resolve an import path to a heph `build_lib` Addr.
     fn resolve_import_to_addr(
         &self,
         import_path: &str,

@@ -114,11 +114,11 @@ jobs:
           # syslibroot and fails to find `-lfuse`, so the (native arm64) macOS
           # runner uses plain `cargo build` — no cross needed there.
           if [ "${{ matrix.os }}" = "darwin" ]; then
-            cargo build --release --locked --target ${{ matrix.target }} --bin rheph
+            cargo build --release --locked --target ${{ matrix.target }} --bin heph
           else
-            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rheph
+            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin heph
           fi
-          cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/rheph $BIN_NAME
+          cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/heph $BIN_NAME
 
       # macFUSE is NOT installed on this runner. libfuse is weak-linked, so the
       # binary must still launch — this proves the shipped macOS artifact runs

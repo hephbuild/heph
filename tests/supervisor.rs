@@ -1,7 +1,7 @@
 //! Integration tests for the process supervisor sidecar.
 //!
-//! These spawn the actual `rheph __supervisor` subprocess (path resolved via
-//! `CARGO_BIN_EXE_rheph`) with a socketpair, then verify that:
+//! These spawn the actual `heph __supervisor` subprocess (path resolved via
+//! `CARGO_BIN_EXE_heph`) with a socketpair, then verify that:
 //!   1. Tracked process-groups are reaped when the parent's socket end closes.
 //!   2. Untracked groups are *not* killed on EOF.
 //!   3. Grandchildren are reaped via the process-group kill (setsid → killpg).
@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 /// milliseconds — the headroom only matters under contention.
 const REAP_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn rheph_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_rheph"))
+fn heph_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_heph"))
 }
 
 fn set_cloexec(fd: i32, on: bool) {
@@ -73,7 +73,7 @@ fn spawn_sleep_session_leader(secs: u64) -> std::process::Child {
     cmd.spawn().expect("spawn sleep")
 }
 
-/// Spawn the rheph supervisor with one end of a fresh socketpair. Returns the
+/// Spawn the heph supervisor with one end of a fresh socketpair. Returns the
 /// parent's end and the supervisor's `Child` handle. The parent end has
 /// CLOEXEC set; the supervisor's end has CLOEXEC cleared.
 fn spawn_supervisor() -> (UnixStream, std::process::Child) {
@@ -82,7 +82,7 @@ fn spawn_supervisor() -> (UnixStream, std::process::Child) {
     let child_fd = child.into_raw_fd();
     set_cloexec(child_fd, false);
 
-    let mut cmd = Command::new(rheph_bin());
+    let mut cmd = Command::new(heph_bin());
     cmd.arg("__supervisor")
         .arg("--ipc-fd")
         .arg(child_fd.to_string())

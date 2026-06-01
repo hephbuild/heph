@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p rheph -p e2e -p rheph-testkit -p plugingo-e2e";
+  qualityCrates = "-p heph -p e2e -p heph-testkit -p plugingo-e2e";
 in
 {
   # https://devenv.sh/basics/
@@ -59,11 +59,11 @@ in
   scripts.tst.exec = "cargo test --locked --all";
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
-  scripts.run-profile.exec = ''$DEVENV_ROOT/target/profiling/rheph "''${@}"'';
-  scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $DEVENV_ROOT/target/profiling/rheph "''${@}"'';
+  scripts.run-profile.exec = ''$DEVENV_ROOT/target/profiling/heph "''${@}"'';
+  scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $DEVENV_ROOT/target/profiling/heph "''${@}"'';
 
   scripts.build-release.exec = ''cargo build --profile release'';
-  scripts.run-release.exec = ''$DEVENV_ROOT/target/release/rheph "''${@}"'';
+  scripts.run-release.exec = ''$DEVENV_ROOT/target/release/heph "''${@}"'';
 
   scripts.rheph.exec = ''cargo run -q --profile release -- "''${@}"'';
   scripts.pheph.exec = ''cargo run -q --profile profiling -- "''${@}"'';
@@ -81,13 +81,13 @@ in
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")
-    cp $DEVENV_ROOT/target/debug/rheph "${binLocation}"
+    cp $DEVENV_ROOT/target/debug/heph "${binLocation}"
   '';
 
   scripts.install-release-build.exec = ''
     cargo build --release
     mkdir -p $(dirname "${binLocation}")
-    cp $DEVENV_ROOT/target/release/rheph "${binLocation}"
+    cp $DEVENV_ROOT/target/release/heph "${binLocation}"
   '';
 
 

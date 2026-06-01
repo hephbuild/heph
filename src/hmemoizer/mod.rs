@@ -175,12 +175,12 @@ fn format_frame_stack(top: &Arc<Frame>) -> Vec<String> {
 // where each stuck invocation is parked when the hang is on a non-memoizer
 // await (semaphore acquire, fs op, subprocess wait, cache_locally, …).
 //
-// Opt in via `RHEPH_PHASE_TRACE=1`. Disabled by default — `set_phase` and
+// Opt in via `heph_PHASE_TRACE=1`. Disabled by default — `set_phase` and
 // `clear_phase` are O(1) early-returns when the flag is off.
 
 fn phase_trace_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| matches!(std::env::var("RHEPH_PHASE_TRACE").as_deref(), Ok("1")))
+    *FLAG.get_or_init(|| matches!(std::env::var("heph_PHASE_TRACE").as_deref(), Ok("1")))
 }
 
 static PHASES: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
@@ -190,7 +190,7 @@ fn phases() -> &'static Mutex<HashMap<u64, &'static str>> {
 }
 
 /// Tag the calling invocation with its next-await `phase`. No-op when
-/// `RHEPH_PHASE_TRACE` is unset or when invoked outside any `once()` scope.
+/// `heph_PHASE_TRACE` is unset or when invoked outside any `once()` scope.
 pub fn set_phase(phase: &'static str) {
     if !phase_trace_enabled() {
         return;
@@ -218,7 +218,7 @@ pub fn clear_phase() {
 
 fn dump_phases() -> String {
     if !phase_trace_enabled() {
-        return "  (phase trace disabled — set RHEPH_PHASE_TRACE=1)".to_string();
+        return "  (phase trace disabled — set heph_PHASE_TRACE=1)".to_string();
     }
     let map = phases().lock().expect("phases mutex poisoned");
     if map.is_empty() {

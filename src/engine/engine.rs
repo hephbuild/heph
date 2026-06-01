@@ -180,7 +180,7 @@ impl Drop for EngineFuse {
         if let Some(mount) = self.mount.take() {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::Builder::new()
-                .name("rheph-fuse-unmount".into())
+                .name("heph-fuse-unmount".into())
                 .spawn(move || {
                     drop(mount);
                     _ = tx.send(());

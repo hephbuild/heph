@@ -206,7 +206,7 @@ fn build_nix_expr(
 /// Sanitize an Addr's format into a string usable as a derivation `name` attr.
 fn sanitize_env_name(addr_str: &str) -> String {
     let mut out = String::with_capacity(addr_str.len() + 6);
-    out.push_str("rheph-");
+    out.push_str("heph-");
     for c in addr_str.chars() {
         if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
             out.push(c);
@@ -803,7 +803,7 @@ mod tests {
         require_nix!();
         let locked = "github:NixOS/nixpkgs/abc1234?narHash=sha256-xxx";
         let packages = vec!["pkgs.ripgrep".to_string(), "pkgs.fd".to_string()];
-        let expr = build_nix_expr(locked, "x86_64-linux", &packages, "rheph-test");
+        let expr = build_nix_expr(locked, "x86_64-linux", &packages, "heph-test");
         assert!(expr.contains(locked), "{expr}");
         assert!(expr.contains("legacyPackages.\"x86_64-linux\""), "{expr}");
         assert!(expr.contains("pkgs.ripgrep"), "{expr}");
@@ -814,7 +814,7 @@ mod tests {
     #[test]
     fn sanitize_env_name_replaces_unsafe_chars() {
         require_nix!();
-        assert_eq!(sanitize_env_name("//pkg/sub:tool"), "rheph-__pkg_sub_tool");
-        assert_eq!(sanitize_env_name("a-b_c.d"), "rheph-a-b_c.d");
+        assert_eq!(sanitize_env_name("//pkg/sub:tool"), "heph-__pkg_sub_tool");
+        assert_eq!(sanitize_env_name("a-b_c.d"), "heph-a-b_c.d");
     }
 }

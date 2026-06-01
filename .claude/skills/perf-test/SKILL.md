@@ -1,16 +1,16 @@
 ---
 name: perf-test
 description: >
-  Profile the rheph binary with samply and produce performance recommendations.
+  Profile the heph binary with samply and produce performance recommendations.
   Builds the profiling target, runs samply twice (first run is warmup, second is the captured profile),
   analyzes the resulting profile.json.gz + profile.json.syms.json (plus /tmp/cpu.prof if present),
   and writes findings + suggestions to PERFORMANCE.md at the repo root.
-  Trigger when user says "perf test", "profile rheph", "run a perf run", "performance test", or invokes /perf-test.
+  Trigger when user says "perf test", "profile heph", "run a perf run", "performance test", or invokes /perf-test.
 ---
 
 # Performance Testing
 
-Goal: measure rheph hot paths, surface concrete bottlenecks, propose actionable fixes.
+Goal: measure heph hot paths, surface concrete bottlenecks, propose actionable fixes.
 
 ## Steps
 
@@ -25,7 +25,7 @@ Goal: measure rheph hot paths, surface concrete bottlenecks, propose actionable 
 2. **Warmup run** — prime caches, FS, allocator. Discard output. `heph r test` must run from `example/`:
 
    ```bash
-   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $DEVENV_ROOT/target/profiling/rheph r test
+   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $DEVENV_ROOT/target/profiling/heph r test
    ```
 
    `-s` = save-only (no web server). Output: `profile.json.gz` + `profile.json.syms.json` in cwd (`example/`).
@@ -33,7 +33,7 @@ Goal: measure rheph hot paths, surface concrete bottlenecks, propose actionable 
 3. **Measured run** — same command, second invocation, plus pprof output:
 
    ```bash
-   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $DEVENV_ROOT/target/profiling/rheph --pprof-cpu=/tmp/cpu.prof r test
+   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $DEVENV_ROOT/target/profiling/heph --pprof-cpu=/tmp/cpu.prof r test
    ```
 
    Artifacts land in `example/profile.json.gz` + `example/profile.json.syms.json` directly. pprof at `/tmp/cpu.prof`.
@@ -43,7 +43,7 @@ Goal: measure rheph hot paths, surface concrete bottlenecks, propose actionable 
 4. **Analyze** the artifacts:
    - `example/profile.json.gz` — gzipped samply profile (Firefox Profiler format). Decompress with `gunzip -c` and inspect with `jq`.
    - `example/profile.json.syms.json` — symbol table keyed by lib + address.
-   - `/tmp/cpu.prof` — optional pprof-format CPU profile, if rheph wrote one. Inspect with `go tool pprof -top /tmp/cpu.prof` or `pprof -top` if available; skip if file missing.
+   - `/tmp/cpu.prof` — optional pprof-format CPU profile, if heph wrote one. Inspect with `go tool pprof -top /tmp/cpu.prof` or `pprof -top` if available; skip if file missing.
 
    For samply JSON, focus on:
    - `threads[].samples` weights → time per stack frame
@@ -68,7 +68,7 @@ Goal: measure rheph hot paths, surface concrete bottlenecks, propose actionable 
    ```markdown
    # Performance Report
 
-   _Profile captured: <date> · binary: target/profiling/rheph · profiler: samply_
+   _Profile captured: <date> · binary: target/profiling/heph · profiler: samply_
 
    ## Top hot functions (self time)
    | Rank | Function | Crate / file | Self % | Notes |

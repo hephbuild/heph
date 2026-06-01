@@ -393,8 +393,8 @@ mod tests {
             _ => panic!(),
         };
         assert!(
-            !run.contains("RHEPH_PKG_SRC_DIR"),
-            "run script must not reference RHEPH_PKG_SRC_DIR: {}",
+            !run.contains("heph_PKG_SRC_DIR"),
+            "run script must not reference heph_PKG_SRC_DIR: {}",
             run
         );
         assert!(

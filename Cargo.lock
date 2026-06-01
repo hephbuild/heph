@@ -842,8 +842,8 @@ name = "e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "rheph",
- "rheph-testkit",
+ "heph",
+ "heph-testkit",
  "tempfile",
  "tokio",
 ]
@@ -1243,6 +1243,83 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "heph"
+version = "0.1.0"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "async-recursion",
+ "async-stream",
+ "async-trait",
+ "borsh",
+ "chrono",
+ "clap",
+ "crossbeam-channel",
+ "crossterm",
+ "derivative",
+ "enclose",
+ "erased-serde 0.4.10",
+ "fuser",
+ "futures",
+ "glob",
+ "heph-proto-gen",
+ "humantime",
+ "indexmap",
+ "itertools 0.13.0",
+ "libc",
+ "memoize",
+ "nom 7.1.3",
+ "parking_lot",
+ "pprof",
+ "quick_cache",
+ "r2d2",
+ "r2d2_sqlite",
+ "ratatui",
+ "rayon",
+ "rusqlite",
+ "rustc-hash",
+ "serde",
+ "serde-jsonlines",
+ "serde_json",
+ "serde_yaml",
+ "smart-default",
+ "starlark",
+ "tar",
+ "tempfile",
+ "templi",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+ "unicode-width 0.2.0",
+ "walkdir",
+ "wax",
+ "which",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "heph-proto-gen"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "serde",
+]
+
+[[package]]
+name = "heph-testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "heph",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -2063,8 +2140,8 @@ name = "plugingo-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "rheph",
- "rheph-testkit",
+ "heph",
+ "heph-testkit",
  "tempfile",
  "tokio",
 ]
@@ -2501,83 +2578,6 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "rheph"
-version = "0.1.0"
-dependencies = [
- "ansi-to-tui",
- "anyhow",
- "async-recursion",
- "async-stream",
- "async-trait",
- "borsh",
- "chrono",
- "clap",
- "crossbeam-channel",
- "crossterm",
- "derivative",
- "enclose",
- "erased-serde 0.4.10",
- "fuser",
- "futures",
- "glob",
- "humantime",
- "indexmap",
- "itertools 0.13.0",
- "libc",
- "memoize",
- "nom 7.1.3",
- "parking_lot",
- "pprof",
- "quick_cache",
- "r2d2",
- "r2d2_sqlite",
- "ratatui",
- "rayon",
- "rheph-proto-gen",
- "rusqlite",
- "rustc-hash",
- "serde",
- "serde-jsonlines",
- "serde_json",
- "serde_yaml",
- "smart-default",
- "starlark",
- "tar",
- "tempfile",
- "templi",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
- "unicode-width 0.2.0",
- "walkdir",
- "wax",
- "which",
- "xxhash-rust",
-]
-
-[[package]]
-name = "rheph-proto-gen"
-version = "0.1.0"
-dependencies = [
- "prost 0.13.5",
- "prost-types 0.13.5",
- "serde",
-]
-
-[[package]]
-name = "rheph-testkit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rheph",
- "tempfile",
- "tokio",
-]
 
 [[package]]
 name = "rusqlite"

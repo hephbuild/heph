@@ -45,7 +45,7 @@ fn render_command(cmd: &clap::Command, parent_path: &str, out: &mut String) {
     }
 
     // clap's usage starts with the command's own leaf name; prefix the parent path
-    // so it reads `rheph <path> <args…>`. Multi-line override_usage forms pass
+    // so it reads `heph <path> <args…>`. Multi-line override_usage forms pass
     // through verbatim, matching how `--help` renders them.
     let usage = cmd
         .clone()
