@@ -2,7 +2,7 @@ use clap::{Args, Subcommand};
 
 use crate::commands::{Commands, GlobalOptions};
 
-const BIN: &str = "rheph";
+const BIN: &str = "heph";
 
 #[derive(clap::Args)]
 pub struct GenDocsArgs {}
