@@ -15,7 +15,7 @@ use crate::engine::provider::{
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -122,7 +122,7 @@ impl EProvider for Provider {
                 .addr
                 .args
                 .iter()
-                .map(|(k, v)| (k.clone(), TargetSpecValue::String(v.clone())))
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
                 .collect();
 
             Ok(GetResponse {
@@ -541,7 +541,7 @@ impl crate::engine::driver::Driver for Driver {
         let get_str = |key: &str| -> anyhow::Result<Option<String>> {
             match req.target_spec.config.get(key) {
                 None => Ok(None),
-                Some(TargetSpecValue::String(s)) => Ok(Some(s.clone())),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
                 Some(v) => anyhow::bail!("fs driver: '{}' must be a string, got {:?}", key, v),
             }
         };
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(result.target_spec.addr.name, "file");
         assert_eq!(
             result.target_spec.config.get("f"),
-            Some(&TargetSpecValue::String("foo.txt".to_string()))
+            Some(&Value::String("foo.txt".to_string()))
         );
     }
 
@@ -802,13 +802,13 @@ mod tests {
         assert_eq!(result.target_spec.addr.name, "glob");
         assert_eq!(
             result.target_spec.config.get("p"),
-            Some(&TargetSpecValue::String("src/*.rs".to_string()))
+            Some(&Value::String("src/*.rs".to_string()))
         );
     }
 
     // ─── Driver tests ──────────────────────────────────────────────────────
 
-    fn make_parse_req(config: std::collections::HashMap<String, TargetSpecValue>) -> ParseRequest {
+    fn make_parse_req(config: std::collections::HashMap<String, Value>) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
@@ -862,7 +862,7 @@ mod tests {
         // Unmatched alternation — wax rejects at parse time.
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("ogen.{yml,yaml".to_string()),
+            Value::String("ogen.{yml,yaml".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         let Err(err) = result else {
@@ -879,10 +879,10 @@ mod tests {
     async fn test_driver_parse_invalid_exclude_fails() {
         let driver = Driver;
         let config = std::collections::HashMap::from([
-            ("p".to_string(), TargetSpecValue::String("*.rs".to_string())),
+            ("p".to_string(), Value::String("*.rs".to_string())),
             (
                 "e".to_string(),
-                TargetSpecValue::String("good/**,bad.{yml".to_string()),
+                Value::String("good/**,bad.{yml".to_string()),
             ),
         ]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
@@ -901,7 +901,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("src/main.rs".to_string()),
+            Value::String("src/main.rs".to_string()),
         )]);
         let res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -918,7 +918,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("src/*.rs".to_string()),
+            Value::String("src/*.rs".to_string()),
         )]);
         let res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -934,11 +934,11 @@ mod tests {
         let config = std::collections::HashMap::from([
             (
                 "p".to_string(),
-                TargetSpecValue::String("**/*.rs".to_string()),
+                Value::String("**/*.rs".to_string()),
             ),
             (
                 "e".to_string(),
-                TargetSpecValue::String("vendor/**,generated/**".to_string()),
+                Value::String("vendor/**,generated/**".to_string()),
             ),
         ]);
         let res = driver
@@ -963,7 +963,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("hello.txt".to_string()),
+            Value::String("hello.txt".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1000,7 +1000,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("nonexistent.txt".to_string()),
+            Value::String("nonexistent.txt".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1028,7 +1028,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("*.rs".to_string()),
+            Value::String("*.rs".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1062,7 +1062,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("**/*".to_string()),
+            Value::String("**/*".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1097,10 +1097,10 @@ mod tests {
         fs::write(tmp.path().join("skip.rs"), b"").unwrap();
 
         let config = std::collections::HashMap::from([
-            ("p".to_string(), TargetSpecValue::String("*.rs".to_string())),
+            ("p".to_string(), Value::String("*.rs".to_string())),
             (
                 "e".to_string(),
-                TargetSpecValue::String("skip.rs".to_string()),
+                Value::String("skip.rs".to_string()),
             ),
         ]);
         let parse_res = driver
@@ -1132,7 +1132,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("**/*.rs".to_string()),
+            Value::String("**/*.rs".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1260,7 +1260,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("mgmt/protos/x/bsdiff/./**/*".to_string()),
+            Value::String("mgmt/protos/x/bsdiff/./**/*".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1307,7 +1307,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("mgmt/protos/x/bsdiff/../go.mod".to_string()),
+            Value::String("mgmt/protos/x/bsdiff/../go.mod".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1333,7 +1333,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("some/../../file".to_string()),
+            Value::String("some/../../file".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         let Err(err) = result else {
@@ -1351,7 +1351,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("../escape/**".to_string()),
+            Value::String("../escape/**".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         assert!(result.is_err());
@@ -1362,7 +1362,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("a/../../file.txt".to_string()),
+            Value::String("a/../../file.txt".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         let Err(err) = result else {
@@ -1380,11 +1380,11 @@ mod tests {
         let driver = Driver;
         let with_parent = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/b/../c/**/*.rs".to_string()),
+            Value::String("a/b/../c/**/*.rs".to_string()),
         )]);
         let collapsed = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/c/**/*.rs".to_string()),
+            Value::String("a/c/**/*.rs".to_string()),
         )]);
         let h1 = driver
             .parse(make_parse_req(with_parent), &ctoken())
@@ -1408,11 +1408,11 @@ mod tests {
         let driver = Driver;
         let with_dot = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/./b/**/*.rs".to_string()),
+            Value::String("a/./b/**/*.rs".to_string()),
         )]);
         let without_dot = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/b/**/*.rs".to_string()),
+            Value::String("a/b/**/*.rs".to_string()),
         )]);
         let h1 = driver
             .parse(make_parse_req(with_dot), &ctoken())
@@ -1437,7 +1437,7 @@ mod tests {
         let pattern = "does/not/exist/*.rs";
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String(pattern.to_string()),
+            Value::String(pattern.to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1465,7 +1465,7 @@ mod tests {
         let pattern = "*.rs";
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String(pattern.to_string()),
+            Value::String(pattern.to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1492,7 +1492,7 @@ mod tests {
         let pattern = "dir/ogen.{yml,yaml}";
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String(pattern.to_string()),
+            Value::String(pattern.to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1590,7 +1590,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("*.rs".to_string()),
+            Value::String("*.rs".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1646,7 +1646,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("*.rs".to_string()),
+            Value::String("*.rs".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1719,7 +1719,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("pkg/**/*.rs".to_string()),
+            Value::String("pkg/**/*.rs".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())

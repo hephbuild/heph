@@ -1,6 +1,6 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 
@@ -64,7 +64,7 @@ pub fn build_spec_thirdparty(
     // dep — `go list` still queries metadata via the host GOMODCACHE.
     spec.config.insert(
         "thirdparty_download_addr".to_string(),
-        TargetSpecValue::String(download_addr.format()),
+        Value::String(download_addr.format()),
     );
     Ok(spec)
 }
@@ -76,63 +76,50 @@ fn build_spec_inner(
     goroot: &str,
     extra_deps: &[(&str, &[String])],
 ) -> anyhow::Result<TargetSpec> {
-    let mut deps: HashMap<String, TargetSpecValue> = HashMap::new();
+    let mut deps: HashMap<String, Value> = HashMap::new();
     for (group, dep_addrs) in extra_deps {
         deps.insert(
             group.to_string(),
-            TargetSpecValue::List(
-                dep_addrs
-                    .iter()
-                    .map(|a| TargetSpecValue::String(a.clone()))
-                    .collect(),
-            ),
+            Value::List(dep_addrs.iter().map(|a| Value::String(a.clone())).collect()),
         );
     }
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+    let mut config: HashMap<String, Value> = HashMap::new();
     config.insert(
         "import_path".to_string(),
-        TargetSpecValue::String(import_path.to_string()),
+        Value::String(import_path.to_string()),
     );
-    config.insert(
-        "goos".to_string(),
-        TargetSpecValue::String(factors.goos.to_string()),
-    );
+    config.insert("goos".to_string(), Value::String(factors.goos.to_string()));
     config.insert(
         "goarch".to_string(),
-        TargetSpecValue::String(factors.goarch.to_string()),
+        Value::String(factors.goarch.to_string()),
     );
-    config.insert(
-        "goroot".to_string(),
-        TargetSpecValue::String(goroot.to_string()),
-    );
+    config.insert("goroot".to_string(), Value::String(goroot.to_string()));
     if !factors.build_tags.is_empty() {
         config.insert(
             "build_tags".to_string(),
-            TargetSpecValue::List(
+            Value::List(
                 factors
                     .build_tags
                     .iter()
-                    .map(|t| TargetSpecValue::String(t.clone()))
+                    .map(|t| Value::String(t.clone()))
                     .collect(),
             ),
         );
     }
     if !deps.is_empty() {
-        config.insert("deps".to_string(), TargetSpecValue::Map(deps));
+        config.insert("deps".to_string(), Value::Map(deps));
     }
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([
+        Value::Map(HashMap::from([
             (
                 "pkg".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("package.bin".to_string())]),
+                Value::List(vec![Value::String("package.bin".to_string())]),
             ),
             (
                 "addrs".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String(
-                    "package_addrs.bin".to_string(),
-                )]),
+                Value::List(vec![Value::String("package_addrs.bin".to_string())]),
             ),
         ])),
     );
@@ -209,7 +196,7 @@ mod tests {
         )
         .unwrap();
         let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(out.contains_key("pkg"), "out should have 'pkg' group");
@@ -232,7 +219,7 @@ mod tests {
         assert!(
             matches!(
                 spec.config.get("import_path"),
-                Some(TargetSpecValue::String(s)) if s == "example.com/mylib"
+                Some(Value::String(s)) if s == "example.com/mylib"
             ),
             "config must have import_path"
         );
@@ -253,15 +240,15 @@ mod tests {
         .unwrap();
         assert!(matches!(
             spec.config.get("goos"),
-            Some(TargetSpecValue::String(s)) if s == "linux"
+            Some(Value::String(s)) if s == "linux"
         ));
         assert!(matches!(
             spec.config.get("goarch"),
-            Some(TargetSpecValue::String(s)) if s == "amd64"
+            Some(Value::String(s)) if s == "amd64"
         ));
         assert!(matches!(
             spec.config.get("goroot"),
-            Some(TargetSpecValue::String(s)) if s == "/usr/local/go"
+            Some(Value::String(s)) if s == "/usr/local/go"
         ));
     }
 
@@ -302,7 +289,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        if let Some(TargetSpecValue::Map(deps)) = spec.config.get("deps") {
+        if let Some(Value::Map(deps)) = spec.config.get("deps") {
             assert!(!deps.contains_key("go_bin"), "deps must not contain go_bin");
         }
     }
@@ -321,7 +308,7 @@ mod tests {
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
@@ -354,7 +341,7 @@ mod tests {
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
@@ -367,7 +354,7 @@ mod tests {
         );
         assert_eq!(spec.driver, "go_golist");
         let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(out.contains_key("pkg"));
@@ -385,7 +372,7 @@ mod tests {
         )
         .unwrap();
         let addr_str = match spec.config.get("thirdparty_download_addr").unwrap() {
-            TargetSpecValue::String(s) => s.as_str(),
+            Value::String(s) => s.as_str(),
             _ => panic!("expected string"),
         };
         assert!(
@@ -409,7 +396,7 @@ mod tests {
         assert!(
             matches!(
                 spec.config.get("build_tags"),
-                Some(TargetSpecValue::List(tags)) if tags.len() == 1
+                Some(Value::List(tags)) if tags.len() == 1
             ),
             "build_tags must be in config when non-empty"
         );

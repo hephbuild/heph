@@ -3,8 +3,8 @@ use crate::engine::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::{
-    TargetSpecValue, parse_map_string_string, parse_map_string_strings, parse_strings,
+use crate::htvalue::{
+    self, parse_map_string_string, parse_map_string_strings, parse_strings,
 };
 use crate::pluginbuildfile::provider::Provider;
 use anyhow::Context;
@@ -41,20 +41,20 @@ pub(crate) struct OnTargetPayload {
     pub driver: String,
     pub labels: Vec<String>,
     pub transitive: Sandbox,
-    pub config: HashMap<String, TargetSpecValue>,
+    pub config: HashMap<String, htvalue::Value>,
 }
 
 impl Sandbox {
-    fn from(m: TargetSpecValue, pkg: &PkgBuf) -> anyhow::Result<Self> {
+    fn from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Self> {
         let m = match m {
-            TargetSpecValue::Map(m) => m,
-            TargetSpecValue::Null() => {
+            htvalue::Value::Map(m) => m,
+            htvalue::Value::Null() => {
                 return Ok(Default::default());
             }
             _ => anyhow::bail!("Expected map, got {:?}", m),
         };
 
-        let mut m: HashMap<&str, &TargetSpecValue> =
+        let mut m: HashMap<&str, &htvalue::Value> =
             m.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
         let mut sandbox = Self::default();
@@ -147,7 +147,7 @@ impl Sandbox {
 #[derive(Debug, Clone)]
 pub(crate) struct OnStatePayload {
     pub provider: String,
-    pub args: HashMap<String, TargetSpecValue>,
+    pub args: HashMap<String, htvalue::Value>,
 }
 
 #[derive(Debug)]
@@ -212,29 +212,29 @@ pub(crate) struct Extra<'a> {
     clippy::panic,
     reason = "caller must only pass supported starlark value types; any other type is a programming error"
 )]
-fn starlark_to_rust(v: &Value) -> TargetSpecValue {
+fn starlark_to_rust(v: &Value) -> htvalue::Value {
     if v.is_none() {
-        return TargetSpecValue::Null();
+        return htvalue::Value::Null();
     }
 
     if let Some(s) = v.unpack_str() {
-        return TargetSpecValue::String(s.to_string());
+        return htvalue::Value::String(s.to_string());
     }
 
     if let Some(b) = v.unpack_bool() {
-        return TargetSpecValue::Bool(b);
+        return htvalue::Value::Bool(b);
     }
 
     if let Some(i) = v.unpack_i32() {
-        return TargetSpecValue::Int(i as i64);
+        return htvalue::Value::Int(i as i64);
     }
 
     if let Ok(Some(UnpackFloat(f))) = UnpackFloat::unpack_value(*v) {
-        return TargetSpecValue::Float(f);
+        return htvalue::Value::Float(f);
     }
 
     if let Ok(Some(l)) = UnpackList::<Value>::unpack_value(*v) {
-        return TargetSpecValue::List(l.items.iter().map(starlark_to_rust).collect());
+        return htvalue::Value::List(l.items.iter().map(starlark_to_rust).collect());
     }
 
     if let Some(d) = DictRef::from_value(*v) {
@@ -245,7 +245,7 @@ fn starlark_to_rust(v: &Value) -> TargetSpecValue {
                     .map(|s| (s.to_string(), starlark_to_rust(&val)))
             })
             .collect();
-        return TargetSpecValue::Map(map);
+        return htvalue::Value::Map(map);
     }
 
     panic!(
@@ -294,7 +294,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         let mut transitive: Sandbox = Default::default();
         let config = m
             .iter()
-            .map(|e| -> anyhow::Result<Option<(String, TargetSpecValue)>> {
+            .map(|e| -> anyhow::Result<Option<(String, htvalue::Value)>> {
                 match e.0.as_str() {
                     "name" => {
                         if let Some(s) = e.1.unpack_str() {
@@ -329,7 +329,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             .collect::<anyhow::Result<Vec<_>>>()?
             .into_iter()
             .flatten()
-            .collect::<HashMap<String, TargetSpecValue>>();
+            .collect::<HashMap<String, htvalue::Value>>();
 
         if name.is_empty() {
             return Err(starlark::Error::new_other(anyhow::anyhow!(
@@ -422,7 +422,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                 }
                 _ => Some((e.0.as_str().to_string(), starlark_to_rust(e.1))),
             })
-            .collect::<HashMap<String, TargetSpecValue>>();
+            .collect::<HashMap<String, htvalue::Value>>();
 
         if provider.is_empty() {
             return Err(starlark::Error::new_other(anyhow::anyhow!(
@@ -921,7 +921,7 @@ target(
             vec!["label1".to_string(), "label2".to_string()]
         );
 
-        if let Some(TargetSpecValue::String(s)) = target.config.get("config_str") {
+        if let Some(htvalue::Value::String(s)) = target.config.get("config_str") {
             assert_eq!(s, "hello");
         } else {
             panic!(
@@ -930,7 +930,7 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::Int(i)) = target.config.get("config_int") {
+        if let Some(htvalue::Value::Int(i)) = target.config.get("config_int") {
             assert_eq!(*i, 42);
         } else {
             panic!(
@@ -939,7 +939,7 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::Bool(b)) = target.config.get("config_bool") {
+        if let Some(htvalue::Value::Bool(b)) = target.config.get("config_bool") {
             assert!(*b);
         } else {
             panic!(
@@ -948,7 +948,7 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::Float(f)) = target.config.get("config_float") {
+        if let Some(htvalue::Value::Float(f)) = target.config.get("config_float") {
             assert_eq!(*f, 1.5);
         } else {
             panic!(
@@ -957,14 +957,14 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::List(l)) = target.config.get("config_list") {
+        if let Some(htvalue::Value::List(l)) = target.config.get("config_list") {
             assert_eq!(l.len(), 2);
-            if let TargetSpecValue::String(s) = &l[0] {
+            if let htvalue::Value::String(s) = &l[0] {
                 assert_eq!(s, "a");
             } else {
                 panic!("Expected string in list");
             }
-            if let TargetSpecValue::Int(i) = &l[1] {
+            if let htvalue::Value::Int(i) = &l[1] {
                 assert_eq!(*i, 1);
             } else {
                 panic!("Expected int in list");
@@ -1193,7 +1193,7 @@ target(
         assert_eq!(result.targets[0].name, "mytarget");
     }
 
-    fn run_target_config(build_content: &str) -> HashMap<String, TargetSpecValue> {
+    fn run_target_config(build_content: &str) -> HashMap<String, htvalue::Value> {
         let tmp_dir = tempdir().unwrap();
         let pkg_name = "mypkg";
         let pkg_path = tmp_dir.path().join(pkg_name);
@@ -1218,7 +1218,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::file_addr("mypkg/src/main.rs").format();
         match config.get("src") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected file addr string, got {:?}", other),
         }
     }
@@ -1235,7 +1235,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::file_addr("vendor/x.rs").format();
         match config.get("src") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected file addr string, got {:?}", other),
         }
     }
@@ -1252,7 +1252,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::glob_addr("mypkg/src/**/*.rs", &[]).format();
         match config.get("srcs") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
         }
     }
@@ -1270,7 +1270,7 @@ target(
         let expected =
             crate::pluginfs::glob_addr("mypkg/**/*.go", &["vendor/**", "gen/**"]).format();
         match config.get("srcs") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
         }
     }
@@ -1287,7 +1287,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::glob_addr("**/*.rs", &[]).format();
         match config.get("srcs") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
         }
     }
@@ -1568,11 +1568,11 @@ target(name = "t", driver = "d", deps_kind = deps_kind, str_kind = str_kind)
 "#;
         let config = run_target_config(content);
         match config.get("deps_kind") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "list"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "list"),
             other => panic!("expected list type string, got {other:?}"),
         }
         match config.get("str_kind") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "string"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "string"),
             other => panic!("expected string type string, got {other:?}"),
         }
     }
@@ -1589,10 +1589,10 @@ target(name = "t", driver = "d", deps = coerce("single"))
 "#;
         let config = run_target_config(content);
         match config.get("deps") {
-            Some(TargetSpecValue::List(l)) => {
+            Some(htvalue::Value::List(l)) => {
                 assert_eq!(l.len(), 1);
                 match &l[0] {
-                    TargetSpecValue::String(s) => assert_eq!(s, "single"),
+                    htvalue::Value::String(s) => assert_eq!(s, "single"),
                     other => panic!("expected string in list, got {other:?}"),
                 }
             }
@@ -1614,7 +1614,7 @@ target(name = "t", driver = "d", deps = coerce("single"))
         let result = run_pkg_blocking(&provider, "some/pkg").unwrap();
         assert_eq!(result.targets.len(), 1);
         match result.targets[0].config.get("here") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "some/pkg"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "some/pkg"),
             other => panic!("expected pkg string, got {other:?}"),
         }
     }
@@ -1642,11 +1642,11 @@ target(name = "t", driver = "d", loaded_from = WHERE, here = get_pkg())
         let result = run_pkg_blocking(&provider, "app").unwrap();
         let cfg = &result.targets[0].config;
         match cfg.get("loaded_from") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "lib"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "lib"),
             other => panic!("expected lib, got {other:?}"),
         }
         match cfg.get("here") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "app"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "app"),
             other => panic!("expected app, got {other:?}"),
         }
     }
@@ -1672,9 +1672,9 @@ target(name = "t", driver = "d")
         assert_eq!(s.provider, "go");
         assert_eq!(
             s.args.get("root"),
-            Some(&TargetSpecValue::String("src".to_string()))
+            Some(&htvalue::Value::String("src".to_string()))
         );
-        assert_eq!(s.args.get("strict"), Some(&TargetSpecValue::Bool(true)));
+        assert_eq!(s.args.get("strict"), Some(&htvalue::Value::Bool(true)));
         assert!(!s.args.contains_key("provider"));
     }
 
@@ -1701,17 +1701,17 @@ target(
 "#;
         let config = run_target_config(content);
         match config.get("cfg") {
-            Some(TargetSpecValue::Map(m)) => {
+            Some(htvalue::Value::Map(m)) => {
                 match m.get("name") {
-                    Some(TargetSpecValue::String(s)) => assert_eq!(s, "n"),
+                    Some(htvalue::Value::String(s)) => assert_eq!(s, "n"),
                     other => panic!("expected name string, got {other:?}"),
                 }
                 match m.get("driver") {
-                    Some(TargetSpecValue::String(s)) => assert_eq!(s, "d"),
+                    Some(htvalue::Value::String(s)) => assert_eq!(s, "d"),
                     other => panic!("expected driver string, got {other:?}"),
                 }
                 match m.get("count") {
-                    Some(TargetSpecValue::Int(i)) => assert_eq!(*i, 3),
+                    Some(htvalue::Value::Int(i)) => assert_eq!(*i, 3),
                     other => panic!("expected count int, got {other:?}"),
                 }
             }
@@ -1843,12 +1843,12 @@ target(name = "t_in_app", driver = SHARED)
         assert_eq!(lib_res.targets[0].name, "t_in_lib");
     }
 
-    fn expect_string_list(v: Option<&TargetSpecValue>) -> Vec<String> {
+    fn expect_string_list(v: Option<&htvalue::Value>) -> Vec<String> {
         match v {
-            Some(TargetSpecValue::List(l)) => l
+            Some(htvalue::Value::List(l)) => l
                 .iter()
                 .map(|e| match e {
-                    TargetSpecValue::String(s) => s.clone(),
+                    htvalue::Value::String(s) => s.clone(),
                     other => panic!("expected string in list, got {other:?}"),
                 })
                 .collect(),

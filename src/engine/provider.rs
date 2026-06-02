@@ -4,7 +4,7 @@ use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,14 +36,14 @@ pub struct ListPackageResponse {
 pub struct State {
     pub package: PkgBuf,
     pub provider: String,
-    pub state: HashMap<String, TargetSpecValue>,
+    pub state: HashMap<String, Value>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub addr: Addr,
     pub driver: String,
-    pub config: HashMap<String, TargetSpecValue>,
+    pub config: HashMap<String, Value>,
     pub labels: Vec<String>,
     pub transitive: Sandbox,
 }

@@ -7,7 +7,7 @@ use crate::engine::driver::{
 };
 use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
-use crate::loosespecparser::parse_map_string_strings;
+use crate::htvalue::parse_map_string_strings;
 use crate::plugingo::gen_testmain::{analyze_test_main, generate_testmain};
 use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
@@ -112,7 +112,7 @@ impl ManagedDriver for GoTestmainDriver {
         }
 
         let mode = match config.get("mode") {
-            Some(crate::loosespecparser::TargetSpecValue::String(s)) => match s.as_str() {
+            Some(crate::htvalue::Value::String(s)) => match s.as_str() {
                 "internal" => TestmainMode::Internal,
                 "xtest" => TestmainMode::Xtest,
                 "both" => TestmainMode::Both,
@@ -266,7 +266,7 @@ mod tests {
     use crate::engine::provider::TargetSpec;
     use crate::htaddr::Addr;
     use crate::htpkg::PkgBuf;
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
     use std::collections::HashMap;
 
     fn driver() -> GoTestmainDriver {
@@ -278,19 +278,19 @@ mod tests {
     }
 
     fn make_parse_request(pkg: &str, golist_addr: &str) -> ParseRequest {
-        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        let mut config: HashMap<String, Value> = HashMap::new();
         config.insert(
             "deps".to_string(),
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "golist".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String(golist_addr.to_string())]),
+                Value::List(vec![Value::String(golist_addr.to_string())]),
             )])),
         );
         config.insert(
             "out".to_string(),
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "go".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("testmain.go".to_string())]),
+                Value::List(vec![Value::String("testmain.go".to_string())]),
             )])),
         );
 
@@ -333,30 +333,24 @@ mod tests {
     #[tokio::test]
     async fn test_parse_includes_test_and_xtest_file_inputs() {
         let ct = noop_ctoken();
-        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        let mut config: HashMap<String, Value> = HashMap::new();
         config.insert(
             "deps".to_string(),
-            TargetSpecValue::Map(HashMap::from([
+            Value::Map(HashMap::from([
                 (
                     "golist".to_string(),
-                    TargetSpecValue::List(vec![TargetSpecValue::String(
-                        "//mypkg:_golist|pkg".to_string(),
-                    )]),
+                    Value::List(vec![Value::String("//mypkg:_golist|pkg".to_string())]),
                 ),
                 (
                     "test".to_string(),
-                    TargetSpecValue::List(vec![
-                        TargetSpecValue::String(
-                            "//@heph/fs:.read?path=mypkg/a_test.go".to_string(),
-                        ),
-                        TargetSpecValue::String(
-                            "//@heph/fs:.read?path=mypkg/b_test.go".to_string(),
-                        ),
+                    Value::List(vec![
+                        Value::String("//@heph/fs:.read?path=mypkg/a_test.go".to_string()),
+                        Value::String("//@heph/fs:.read?path=mypkg/b_test.go".to_string()),
                     ]),
                 ),
                 (
                     "xtest".to_string(),
-                    TargetSpecValue::List(vec![TargetSpecValue::String(
+                    Value::List(vec![Value::String(
                         "//@heph/fs:.read?path=mypkg/c_test.go".to_string(),
                     )]),
                 ),
@@ -364,9 +358,9 @@ mod tests {
         );
         config.insert(
             "out".to_string(),
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "go".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("testmain.go".to_string())]),
+                Value::List(vec![Value::String("testmain.go".to_string())]),
             )])),
         );
         let req = ParseRequest {
@@ -401,8 +395,8 @@ mod tests {
     #[tokio::test]
     async fn test_parse_missing_golist_errors() {
         let ct = noop_ctoken();
-        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-        config.insert("out".to_string(), TargetSpecValue::Map(HashMap::new()));
+        let mut config: HashMap<String, Value> = HashMap::new();
+        config.insert("out".to_string(), Value::Map(HashMap::new()));
         let req = ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {

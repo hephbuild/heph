@@ -1789,15 +1789,13 @@ mod tests {
         let config = HashMap::from([
             (
                 "run".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+                crate::htvalue::Value::String("echo".to_string()),
             ),
             (
                 "pass_env".to_string(),
-                crate::loosespecparser::TargetSpecValue::List(vec![
-                    crate::loosespecparser::TargetSpecValue::String(
-                        "heph_TEST_PARSE_PASS".to_string(),
-                    ),
-                ]),
+                crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                    "heph_TEST_PARSE_PASS".to_string(),
+                )]),
             ),
         ]);
         let res = driver
@@ -1830,15 +1828,13 @@ mod tests {
         let config = HashMap::from([
             (
                 "run".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+                crate::htvalue::Value::String("echo".to_string()),
             ),
             (
                 "pass_env".to_string(),
-                crate::loosespecparser::TargetSpecValue::List(vec![
-                    crate::loosespecparser::TargetSpecValue::String(
-                        "heph_TEST_DEFINITELY_UNSET_99999".to_string(),
-                    ),
-                ]),
+                crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                    "heph_TEST_DEFINITELY_UNSET_99999".to_string(),
+                )]),
             ),
         ]);
         let res = driver
@@ -1864,13 +1860,13 @@ mod tests {
     /// Drives `parse()` with the given `extra` config keys merged on top of a
     /// minimal exec spec (just `run`). Returns the resulting EngineTargetDef.
     async fn parse_with(
-        extra: HashMap<String, crate::loosespecparser::TargetSpecValue>,
+        extra: HashMap<String, crate::htvalue::Value>,
     ) -> anyhow::Result<crate::engine::driver::targetdef::TargetDef> {
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
         let mut config = HashMap::from([(
             "run".to_string(),
-            crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+            crate::htvalue::Value::String("echo".to_string()),
         )]);
         config.extend(extra);
         let res = driver
@@ -1895,9 +1891,9 @@ mod tests {
     async fn test_parse_hash_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
         let extra = HashMap::from([(
             "hash_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]);
         let td = parse_with(extra).await?;
         let def = td.def::<TargetDef>();
@@ -1922,9 +1918,9 @@ mod tests {
     async fn test_parse_runtime_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
         let extra = HashMap::from([(
             "runtime_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]);
         let td = parse_with(extra).await?;
         let def = td.def::<TargetDef>();
@@ -1949,9 +1945,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_runtime = parse_with(HashMap::from([(
             "runtime_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]))
         .await?;
         // Adding a `runtime_deps` entry must NOT change the per-target def
@@ -1969,9 +1965,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_hash = parse_with(HashMap::from([(
             "hash_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]))
         .await?;
         assert_eq!(base.hash, with_hash.hash);
@@ -1985,9 +1981,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_deps = parse_with(HashMap::from([(
             "deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]))
         .await?;
         assert_ne!(base.hash, with_deps.hash);
@@ -2000,17 +1996,17 @@ mod tests {
         // changing an env value is a semantic change to the target's input.
         let with_v1 = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v1".to_string()),
+                crate::htvalue::Value::String("v1".to_string()),
             )])),
         )]))
         .await?;
         let with_v2 = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v2".to_string()),
+                crate::htvalue::Value::String("v2".to_string()),
             )])),
         )]))
         .await?;
@@ -2024,17 +2020,17 @@ mod tests {
         // def hash.
         let with_foo = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+                crate::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;
         let with_bar = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "BAR".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+                crate::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;
@@ -2048,9 +2044,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_env = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+                crate::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;

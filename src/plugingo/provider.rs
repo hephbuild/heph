@@ -7,7 +7,7 @@ use crate::hasync::Cancellable;
 use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::{TargetSpecValue, parse_strings};
+use crate::htvalue::{Value, parse_strings};
 use crate::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
@@ -477,12 +477,7 @@ struct TransitiveDeps {
 fn pick_codegen_root(states: &[State]) -> Option<&State> {
     states
         .iter()
-        .filter(|s| {
-            matches!(
-                s.state.get("go_codegen_root"),
-                Some(TargetSpecValue::Bool(true))
-            )
-        })
+        .filter(|s| matches!(s.state.get("go_codegen_root"), Some(Value::Bool(true))))
         .max_by_key(|s| s.package.as_str().len())
 }
 
@@ -544,10 +539,10 @@ fn pick_test_skip(states: &[State]) -> bool {
     else {
         return false;
     };
-    let Some(TargetSpecValue::Map(test_map)) = state.state.get("test") else {
+    let Some(Value::Map(test_map)) = state.state.get("test") else {
         return false;
     };
-    matches!(test_map.get("skip"), Some(TargetSpecValue::Bool(true)))
+    matches!(test_map.get("skip"), Some(Value::Bool(true)))
 }
 
 /// Pick the closest (deepest) ancestor state carrying `go_codegen_deps`.
@@ -1948,27 +1943,24 @@ fn build_embed_spec(
     golist_addr: &Addr,
     variant: &str,
 ) -> crate::engine::provider::TargetSpec {
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
     use std::collections::HashMap;
 
     let golist_dep = format!("{}|pkg", golist_addr.format());
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert(
-        "variant".to_string(),
-        TargetSpecValue::String(variant.to_string()),
-    );
-    let mut deps_map: HashMap<String, TargetSpecValue> = HashMap::new();
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("variant".to_string(), Value::String(variant.to_string()));
+    let mut deps_map: HashMap<String, Value> = HashMap::new();
     deps_map.insert(
         "golist".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
+        Value::List(vec![Value::String(golist_dep)]),
     );
-    config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
+    config.insert("deps".to_string(), Value::Map(deps_map));
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "cfg".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("embedcfg".to_string())]),
+            Value::List(vec![Value::String("embedcfg".to_string())]),
         )])),
     );
 
@@ -2017,23 +2009,23 @@ fn build_testmain_spec(
     test_file_addrs: &[String],
     xtest_file_addrs: &[String],
 ) -> crate::engine::provider::TargetSpec {
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
     use std::collections::HashMap;
 
     let golist_dep = format!("{}|pkg", golist_addr.format());
 
-    let mut deps_map: HashMap<String, TargetSpecValue> = HashMap::new();
+    let mut deps_map: HashMap<String, Value> = HashMap::new();
     deps_map.insert(
         "golist".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
+        Value::List(vec![Value::String(golist_dep)]),
     );
     if !test_file_addrs.is_empty() {
         deps_map.insert(
             "test".to_string(),
-            TargetSpecValue::List(
+            Value::List(
                 test_file_addrs
                     .iter()
-                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .map(|s| Value::String(s.clone()))
                     .collect(),
             ),
         );
@@ -2041,10 +2033,10 @@ fn build_testmain_spec(
     if !xtest_file_addrs.is_empty() {
         deps_map.insert(
             "xtest".to_string(),
-            TargetSpecValue::List(
+            Value::List(
                 xtest_file_addrs
                     .iter()
-                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .map(|s| Value::String(s.clone()))
                     .collect(),
             ),
         );
@@ -2062,17 +2054,14 @@ fn build_testmain_spec(
         "internal"
     };
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
-    config.insert(
-        "mode".to_string(),
-        TargetSpecValue::String(mode.to_string()),
-    );
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("deps".to_string(), Value::Map(deps_map));
+    config.insert("mode".to_string(), Value::String(mode.to_string()));
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "go".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("testmain.go".to_string())]),
+            Value::List(vec![Value::String("testmain.go".to_string())]),
         )])),
     );
 
@@ -2095,7 +2084,7 @@ mod tests {
     use crate::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
     use crate::hasync::StdCancellationToken;
     use crate::htpkg::PkgBuf;
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
     use crate::plugingo::addr_util::decode_package;
     use crate::plugingo::factors::Factors;
     use crate::plugingo::pkg_analysis::run_go_list;
@@ -2321,7 +2310,7 @@ mod tests {
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         let out = resp.target_spec.config.get("out").unwrap();
-        assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
+        assert!(matches!(out, Value::Map(m) if m.contains_key("a")));
     }
 
     #[tokio::test]
@@ -2352,7 +2341,7 @@ mod tests {
         let resp = p.get(req, &ctoken).await.unwrap();
         assert_eq!(resp.target_spec.driver, "go_golist");
         let out = match resp.target_spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(out.contains_key("pkg"));
@@ -2440,7 +2429,7 @@ mod tests {
             .await
             .unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
         let has_lib_dep = deps.keys().any(|k| k.contains("lib"));
@@ -2459,7 +2448,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("cmd", "build")).await.unwrap();
         assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(
@@ -2503,7 +2492,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(out.contains_key("bin"));
@@ -2516,16 +2505,16 @@ mod tests {
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(deps.contains_key("bin"));
         let bin_dep = match deps.get("bin").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!(),
         };
         let dep_str = match &bin_dep[0] {
-            TargetSpecValue::String(s) => s,
+            Value::String(s) => s,
             _ => panic!(),
         };
         assert!(
@@ -2561,7 +2550,7 @@ mod tests {
             .await
             .unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         // Internal bin's importcfg entry for pkgb's import path must point at
@@ -2572,8 +2561,8 @@ mod tests {
             .map(|(_, v)| v)
             .expect("build_test deps must include pkgb's lib group");
         let pkgb_addr = match pkgb_group {
-            TargetSpecValue::List(v) => match &v[0] {
-                TargetSpecValue::String(s) => s.as_str(),
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.as_str(),
                 _ => panic!("expected string"),
             },
             _ => panic!("expected list"),
@@ -2594,7 +2583,7 @@ mod tests {
             .await
             .unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         // pkgb (P) must be NORMAL build_lib — xtest_lib was compiled against
@@ -2603,8 +2592,8 @@ mod tests {
             .get("lib_example_com_with_test_cycle_pkgb")
             .expect("xtest bin must include pkgb's lib group");
         let pkgb_addr = match pkgb_group {
-            TargetSpecValue::List(v) => match &v[0] {
-                TargetSpecValue::String(s) => s.as_str(),
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.as_str(),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -2625,8 +2614,8 @@ mod tests {
             .get("lib_example_com_with_test_cycle_pkgb_test")
             .expect("xtest bin must include pkgb_test (xtest_lib) group");
         let pkgb_test_addr = match pkgb_test_group {
-            TargetSpecValue::List(v) => match &v[0] {
-                TargetSpecValue::String(s) => s.as_str(),
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.as_str(),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -2644,8 +2633,8 @@ mod tests {
             .map(|(_, v)| v)
             .expect("xtest bin must include pkga");
         let pkga_addr = match pkga_group {
-            TargetSpecValue::List(v) => match &v[0] {
-                TargetSpecValue::String(s) => s.as_str(),
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.as_str(),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -2674,7 +2663,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.target_spec.driver, "go_embed");
         let out = match resp.target_spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(out.contains_key("cfg"));
@@ -2695,16 +2684,16 @@ mod tests {
         };
         let resp = provider_get(&p, addr).await.unwrap();
         let runtime_env = match resp.target_spec.config.get("runtime_env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
-            matches!(runtime_env.get("GOOS"), Some(TargetSpecValue::String(s)) if s == "linux"),
+            matches!(runtime_env.get("GOOS"), Some(Value::String(s)) if s == "linux"),
             "GOOS should be linux, got {:?}",
             runtime_env.get("GOOS")
         );
         assert!(
-            matches!(runtime_env.get("GOARCH"), Some(TargetSpecValue::String(s)) if s == "amd64"),
+            matches!(runtime_env.get("GOARCH"), Some(Value::String(s)) if s == "amd64"),
             "GOARCH should be amd64, got {:?}",
             runtime_env.get("GOARCH")
         );
@@ -2722,7 +2711,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(out.contains_key("a"));
@@ -2737,7 +2726,7 @@ mod tests {
             .await
             .unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
         assert!(
@@ -2756,7 +2745,7 @@ mod tests {
             .await
             .unwrap();
         let run = match resp.target_spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
         assert!(
@@ -2775,7 +2764,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.target_spec.driver, "go_embed");
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
         assert!(
@@ -2783,7 +2772,7 @@ mod tests {
             "embed spec must dep on golist output"
         );
         let variant = match resp.target_spec.config.get("variant").unwrap() {
-            TargetSpecValue::String(s) => s.as_str(),
+            Value::String(s) => s.as_str(),
             _ => panic!("expected string"),
         };
         assert_eq!(variant, "embed");
@@ -2796,7 +2785,7 @@ mod tests {
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
         assert!(
@@ -2804,7 +2793,7 @@ mod tests {
             "build_lib for non-embed package must not have 'embed' dep"
         );
         let run = match resp.target_spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
         assert!(
@@ -2820,11 +2809,11 @@ mod tests {
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
         let src_list = match deps.get("").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!("expected list"),
         };
         assert!(
@@ -2833,7 +2822,7 @@ mod tests {
         );
         for entry in src_list {
             let s = match entry {
-                TargetSpecValue::String(s) => s,
+                Value::String(s) => s,
                 _ => panic!("expected string"),
             };
             assert!(
@@ -3074,7 +3063,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(out.contains_key("bin"));
@@ -3109,7 +3098,7 @@ mod tests {
             .await
             .unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         let p_group =
@@ -3157,7 +3146,7 @@ mod tests {
             .await
             .unwrap();
         let out = match resp.target_spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         assert!(out.contains_key("bin"));
@@ -3241,7 +3230,7 @@ mod tests {
             .await
             .unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         let p_group =
@@ -3250,8 +3239,8 @@ mod tests {
             .get(&p_group)
             .expect("xtest bin must include P's lib group");
         let s = match entry {
-            TargetSpecValue::List(v) => match &v[0] {
-                TargetSpecValue::String(s) => s.clone(),
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.clone(),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -3275,7 +3264,7 @@ mod tests {
             .await
             .unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         let p_group =
@@ -3284,8 +3273,8 @@ mod tests {
             .get(&p_group)
             .expect("xtest_lib must include P in importcfg (xtest source imports P)");
         let s = match entry {
-            TargetSpecValue::List(v) => match &v[0] {
-                TargetSpecValue::String(s) => s.clone(),
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.clone(),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -3327,7 +3316,7 @@ mod tests {
         };
 
         let run = match resp.target_spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
 
@@ -3351,7 +3340,7 @@ mod tests {
 
     fn state_with_root(pkg: &str, root: bool) -> State {
         let mut m = HashMap::new();
-        m.insert("go_codegen_root".to_string(), TargetSpecValue::Bool(root));
+        m.insert("go_codegen_root".to_string(), Value::Bool(root));
         State {
             package: PkgBuf::from(pkg),
             provider: "go".to_string(),
@@ -3392,9 +3381,9 @@ mod tests {
 
     fn state_with_test_skip(pkg: &str, skip: bool) -> State {
         let mut test_map = HashMap::new();
-        test_map.insert("skip".to_string(), TargetSpecValue::Bool(skip));
+        test_map.insert("skip".to_string(), Value::Bool(skip));
         let mut m = HashMap::new();
-        m.insert("test".to_string(), TargetSpecValue::Map(test_map));
+        m.insert("test".to_string(), Value::Map(test_map));
         State {
             package: PkgBuf::from(pkg),
             provider: "go".to_string(),
@@ -3426,7 +3415,7 @@ mod tests {
     #[test]
     fn pick_test_skip_state_without_test_key_returns_false() {
         let mut m = HashMap::new();
-        m.insert("other".to_string(), TargetSpecValue::Bool(true));
+        m.insert("other".to_string(), Value::Bool(true));
         let states = vec![State {
             package: PkgBuf::from(""),
             provider: "go".to_string(),
@@ -3505,14 +3494,14 @@ mod tests {
 
     fn extract_srcfiles(resp: &GetResponse) -> Vec<String> {
         let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("deps not a map"),
         };
         match deps.get("srcfiles").unwrap() {
-            TargetSpecValue::List(l) => l
+            Value::List(l) => l
                 .iter()
                 .map(|v| match v {
-                    TargetSpecValue::String(s) => s.clone(),
+                    Value::String(s) => s.clone(),
                     _ => panic!("srcfiles entry not a string"),
                 })
                 .collect(),
@@ -3556,10 +3545,10 @@ mod tests {
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let mut state_map = HashMap::new();
-        state_map.insert("go_codegen_root".to_string(), TargetSpecValue::Bool(true));
+        state_map.insert("go_codegen_root".to_string(), Value::Bool(true));
         state_map.insert(
             "go_codegen_deps".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("//codegen:gen".to_string())]),
+            Value::List(vec![Value::String("//codegen:gen".to_string())]),
         );
         let state = State {
             package: PkgBuf::from(""),
@@ -3609,7 +3598,7 @@ mod tests {
         let mut state_map = HashMap::new();
         state_map.insert(
             "go_codegen_deps".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("//codegen:gen".to_string())]),
+            Value::List(vec![Value::String("//codegen:gen".to_string())]),
         );
         let state = State {
             package: PkgBuf::from(""),

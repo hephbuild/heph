@@ -2001,13 +2001,13 @@ mod tests {
             .clone();
         let q_spec = engine.clone().get_spec(engine.new_state(), &q_addr).await?;
         let deps = match q_spec.config.get("deps") {
-            Some(crate::loosespecparser::TargetSpecValue::List(l)) => l,
+            Some(crate::htvalue::Value::List(l)) => l,
             other => panic!("expected deps list, got {other:?}"),
         };
         let dep_strs: Vec<String> = deps
             .iter()
             .map(|v| match v {
-                crate::loosespecparser::TargetSpecValue::String(s) => s.clone(),
+                crate::htvalue::Value::String(s) => s.clone(),
                 other => panic!("expected string dep, got {other:?}"),
             })
             .collect();
@@ -2069,10 +2069,10 @@ mod tests {
 
         let extract_deps = |spec: &TargetSpec| -> Vec<String> {
             match spec.config.get("deps") {
-                Some(crate::loosespecparser::TargetSpecValue::List(l)) => l
+                Some(crate::htvalue::Value::List(l)) => l
                     .iter()
                     .map(|v| match v {
-                        crate::loosespecparser::TargetSpecValue::String(s) => s.clone(),
+                        crate::htvalue::Value::String(s) => s.clone(),
                         other => panic!("expected string, got {other:?}"),
                     })
                     .collect(),

@@ -8,7 +8,7 @@ use crate::engine::driver::{
 use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::{parse_map_string_strings, parse_string, parse_strings};
+use crate::htvalue::{parse_map_string_strings, parse_string, parse_strings};
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
@@ -414,57 +414,49 @@ mod tests {
     ) -> ParseRequest {
         use crate::engine::provider::TargetSpec;
         use crate::htaddr::Addr;
-        use crate::loosespecparser::TargetSpecValue;
+        use crate::htvalue::Value;
         use std::collections::HashMap;
 
-        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        let mut config: HashMap<String, Value> = HashMap::new();
         config.insert(
             "import_path".to_string(),
-            TargetSpecValue::String(import_path.to_string()),
+            Value::String(import_path.to_string()),
         );
-        config.insert(
-            "goos".to_string(),
-            TargetSpecValue::String("linux".to_string()),
-        );
-        config.insert(
-            "goarch".to_string(),
-            TargetSpecValue::String("amd64".to_string()),
-        );
+        config.insert("goos".to_string(), Value::String("linux".to_string()));
+        config.insert("goarch".to_string(), Value::String("amd64".to_string()));
         config.insert(
             "goroot".to_string(),
-            TargetSpecValue::String("/usr/local/go".to_string()),
+            Value::String("/usr/local/go".to_string()),
         );
         config.insert(
             "out".to_string(),
-            TargetSpecValue::Map(HashMap::from([
+            Value::Map(HashMap::from([
                 (
                     "pkg".to_string(),
-                    TargetSpecValue::List(vec![TargetSpecValue::String("package.bin".to_string())]),
+                    Value::List(vec![Value::String("package.bin".to_string())]),
                 ),
                 (
                     "addrs".to_string(),
-                    TargetSpecValue::List(vec![TargetSpecValue::String(
-                        "package_addrs.bin".to_string(),
-                    )]),
+                    Value::List(vec![Value::String("package_addrs.bin".to_string())]),
                 ),
             ])),
         );
 
         if !extra_deps.is_empty() {
-            let deps_map: HashMap<String, TargetSpecValue> = extra_deps
+            let deps_map: HashMap<String, Value> = extra_deps
                 .into_iter()
                 .map(|(k, vs)| {
                     (
                         k.to_string(),
-                        TargetSpecValue::List(
+                        Value::List(
                             vs.into_iter()
-                                .map(|v| TargetSpecValue::String(v.to_string()))
+                                .map(|v| Value::String(v.to_string()))
                                 .collect(),
                         ),
                     )
                 })
                 .collect();
-            config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
+            config.insert("deps".to_string(), Value::Map(deps_map));
         }
 
         ParseRequest {

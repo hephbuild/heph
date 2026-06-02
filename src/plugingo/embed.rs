@@ -3,7 +3,7 @@ use crate::engine::provider::TargetSpec;
 #[cfg(test)]
 use crate::htaddr::Addr;
 #[cfg(test)]
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 #[cfg(test)]
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -28,13 +28,13 @@ pub fn build_spec(
     let escaped_json = cfg_json.replace('\'', "'\\''");
     let run = format!("printf '%s\\n' '{escaped_json}' > embedcfg\n");
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("run".to_string(), Value::String(run));
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "cfg".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("embedcfg".to_string())]),
+            Value::List(vec![Value::String("embedcfg".to_string())]),
         )])),
     );
     Ok(TargetSpec {
@@ -150,7 +150,7 @@ mod tests {
         )
         .unwrap();
         let out = spec.config.get("out").unwrap();
-        assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("cfg")));
+        assert!(matches!(out, Value::Map(m) if m.contains_key("cfg")));
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!(),
         };
         assert!(
@@ -180,7 +180,7 @@ mod tests {
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!(),
         };
         assert!(

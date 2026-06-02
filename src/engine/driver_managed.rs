@@ -14,7 +14,7 @@ use crate::engine::driver_managed_os::ManagedDriverOs;
 use crate::engine::provider::TargetSpec;
 use crate::hartifactcontent;
 use crate::hasync::{self, Cancellable};
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -127,8 +127,8 @@ impl ShellFallback {
     /// the single `bash` command into an interactive bash session via
     /// `bash_args_shell` + `init.sh`.
     pub fn default_exec() -> Arc<Self> {
-        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-        config.insert("run".to_string(), TargetSpecValue::List(vec![]));
+        let mut config: HashMap<String, Value> = HashMap::new();
+        config.insert("run".to_string(), Value::List(vec![]));
         Arc::new(Self {
             driver: Arc::new(crate::pluginexec::Driver::new_exec()),
             spec_template: Arc::new(TargetSpec {

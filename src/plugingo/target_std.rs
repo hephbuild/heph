@@ -1,6 +1,6 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 
@@ -48,49 +48,43 @@ pub fn build_spec(
     run.push_str("if [ \"$(uname)\" = Darwin ]; then CP=\"cp -X\"; else CP=\"cp\"; fi\n");
     run.push_str(&format!("$CP \"$export_path\" \"{}\"\n", out_file));
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("run".to_string(), Value::String(run));
     config.insert(
         "deps".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "go_bin".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
+            Value::List(vec![Value::String(go_bin_addr.to_string())]),
         )])),
     );
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "a".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(out_file)]),
+            Value::List(vec![Value::String(out_file)]),
         )])),
     );
     config.insert(
         "pass_env".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
+        Value::List(vec![Value::String("GOROOT".to_string())]),
     );
     config.insert(
         "runtime_pass_env".to_string(),
-        TargetSpecValue::List(vec![
-            TargetSpecValue::String("HOME".to_string()),
-            TargetSpecValue::String("GOCACHE".to_string()),
+        Value::List(vec![
+            Value::String("HOME".to_string()),
+            Value::String("GOCACHE".to_string()),
         ]),
     );
     config.insert(
         "runtime_env".to_string(),
-        TargetSpecValue::Map(HashMap::from([
-            (
-                "GOOS".to_string(),
-                TargetSpecValue::String(factors.goos.clone()),
-            ),
-            (
-                "GOARCH".to_string(),
-                TargetSpecValue::String(factors.goarch.clone()),
-            ),
+        Value::Map(HashMap::from([
+            ("GOOS".to_string(), Value::String(factors.goos.clone())),
+            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
             (
                 // Set GOROOT explicitly so go can find its tools even from a copied binary.
                 // pass_env also captures GOROOT for cache invalidation if set in the host env.
                 "GOROOT".to_string(),
-                TargetSpecValue::String(goroot.to_string()),
+                Value::String(goroot.to_string()),
             ),
         ])),
     );
@@ -99,9 +93,9 @@ pub fn build_spec(
     // from the def hash (see pluginexec/mod.rs:70).
     config.insert(
         "env".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "CGO_ENABLED".to_string(),
-            TargetSpecValue::String("0".to_string()),
+            Value::String("0".to_string()),
         )])),
     );
 
@@ -158,7 +152,7 @@ mod tests {
             "/usr/local/go",
         );
         let out = spec.config.get("out").unwrap();
-        assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
+        assert!(matches!(out, Value::Map(m) if m.contains_key("a")));
     }
 
     #[test]
@@ -171,7 +165,7 @@ mod tests {
             "/usr/local/go",
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s,
+            Value::String(s) => s,
             _ => panic!(),
         };
         assert!(
@@ -201,7 +195,7 @@ mod tests {
             "/usr/local/go",
         );
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(deps.contains_key("go_bin"));
@@ -217,15 +211,11 @@ mod tests {
             "/usr/local/go",
         );
         let runtime_env = match spec.config.get("runtime_env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(
-            matches!(runtime_env.get("GOOS"), Some(TargetSpecValue::String(s)) if s == "linux")
-        );
-        assert!(
-            matches!(runtime_env.get("GOARCH"), Some(TargetSpecValue::String(s)) if s == "amd64")
-        );
+        assert!(matches!(runtime_env.get("GOOS"), Some(Value::String(s)) if s == "linux"));
+        assert!(matches!(runtime_env.get("GOARCH"), Some(Value::String(s)) if s == "amd64"));
     }
 
     #[test]
@@ -238,11 +228,11 @@ mod tests {
             "/usr/local/go",
         );
         let env = match spec.config.get("env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
-            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "0"),
             "CGO_ENABLED must be pinned to 0 in the hashed `env` map: {:?}",
             env.get("CGO_ENABLED")
         );

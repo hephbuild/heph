@@ -193,7 +193,7 @@ mod tests {
     };
     use crate::hasync::Cancellable;
     use crate::htpkg::PkgBuf;
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
     use futures::future::BoxFuture;
     use std::collections::HashMap;
 
@@ -265,10 +265,7 @@ mod tests {
 
     fn exec_spec(addr: &str) -> TargetSpec {
         let mut config = HashMap::new();
-        config.insert(
-            "run".to_string(),
-            TargetSpecValue::String("true".to_string()),
-        );
+        config.insert("run".to_string(), Value::String("true".to_string()));
         TargetSpec {
             addr: crate::htaddr::parse_addr(addr).expect("parse addr"),
             driver: "exec".to_string(),
@@ -280,11 +277,11 @@ mod tests {
 
     fn group_spec(addr: &str, deps: &[&str]) -> TargetSpec {
         let mut config = HashMap::new();
-        let deps_list: Vec<TargetSpecValue> = deps
+        let deps_list: Vec<Value> = deps
             .iter()
-            .map(|s| TargetSpecValue::String((*s).to_string()))
+            .map(|s| Value::String((*s).to_string()))
             .collect();
-        config.insert("deps".to_string(), TargetSpecValue::List(deps_list));
+        config.insert("deps".to_string(), Value::List(deps_list));
         TargetSpec {
             addr: crate::htaddr::parse_addr(addr).expect("parse addr"),
             driver: "group".to_string(),

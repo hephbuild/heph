@@ -1,6 +1,6 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
@@ -22,62 +22,50 @@ pub fn build_spec(
 
     let run = generate_link_script(import_path, &binary_name, transitive_libs);
 
-    let mut deps: BTreeMap<String, TargetSpecValue> = transitive_libs
+    let mut deps: BTreeMap<String, Value> = transitive_libs
         .iter()
         .map(|(dep_import_path, dep_addr)| {
             let group = import_path_to_dep_group(dep_import_path);
-            (
-                group,
-                TargetSpecValue::List(vec![TargetSpecValue::String(dep_addr.format())]),
-            )
+            (group, Value::List(vec![Value::String(dep_addr.format())]))
         })
         .collect();
     deps.insert(
         "go_bin".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
+        Value::List(vec![Value::String(go_bin_addr.to_string())]),
     );
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("run".to_string(), Value::String(run));
     config.insert(
         "deps".to_string(),
-        TargetSpecValue::Map(deps.into_iter().collect::<HashMap<_, _>>()),
+        Value::Map(deps.into_iter().collect::<HashMap<_, _>>()),
     );
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             String::new(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(binary_name)]),
+            Value::List(vec![Value::String(binary_name)]),
         )])),
     );
     config.insert(
         "pass_env".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
+        Value::List(vec![Value::String("GOROOT".to_string())]),
     );
     config.insert(
         "runtime_env".to_string(),
-        TargetSpecValue::Map(HashMap::from([
-            (
-                "GOOS".to_string(),
-                TargetSpecValue::String(factors.goos.clone()),
-            ),
-            (
-                "GOARCH".to_string(),
-                TargetSpecValue::String(factors.goarch.clone()),
-            ),
-            (
-                "GOROOT".to_string(),
-                TargetSpecValue::String(goroot.to_string()),
-            ),
+        Value::Map(HashMap::from([
+            ("GOOS".to_string(), Value::String(factors.goos.clone())),
+            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
+            ("GOROOT".to_string(), Value::String(goroot.to_string())),
         ])),
     );
     // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
     config.insert(
         "env".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "CGO_ENABLED".to_string(),
-            TargetSpecValue::String("0".to_string()),
+            Value::String("0".to_string()),
         )])),
     );
 
@@ -158,14 +146,14 @@ mod tests {
             "/usr/local/go",
         );
         let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!(),
         };
         let files = match out.get("").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!(),
         };
-        assert!(matches!(&files[0], TargetSpecValue::String(s) if s == "cmd"));
+        assert!(matches!(&files[0], Value::String(s) if s == "cmd"));
     }
 
     #[test]
@@ -183,7 +171,7 @@ mod tests {
             "/usr/local/go",
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!(),
         };
         assert!(run.contains("SRC_GO_BIN"));
@@ -202,7 +190,7 @@ mod tests {
             "/usr/local/go",
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!(),
         };
         assert!(
@@ -223,7 +211,7 @@ mod tests {
             "/usr/local/go",
         );
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
@@ -244,11 +232,11 @@ mod tests {
             "/usr/local/go",
         );
         let env = match spec.config.get("env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
-            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "0"),
             "env must pin CGO_ENABLED=0 in the hashed map: {:?}",
             env.get("CGO_ENABLED")
         );
@@ -265,7 +253,7 @@ mod tests {
             "/usr/local/go",
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!(),
         };
         assert!(
@@ -291,7 +279,7 @@ mod tests {
             "/usr/local/go",
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!(),
         };
         assert!(

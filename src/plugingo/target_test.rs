@@ -1,6 +1,6 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
@@ -155,58 +155,46 @@ pub fn build_test_spec(
         "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"\n",
     );
 
-    let mut deps: BTreeMap<String, TargetSpecValue> = BTreeMap::new();
+    let mut deps: BTreeMap<String, Value> = BTreeMap::new();
     deps.insert(
         "go_bin".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
+        Value::List(vec![Value::String(go_bin_addr.to_string())]),
     );
     deps.insert(
         "testmain".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(testmain_lib_addr.format())]),
+        Value::List(vec![Value::String(testmain_lib_addr.format())]),
     );
     for (import_path, lib_addr) in all_libs {
         let group = import_path_to_dep_group(import_path);
-        deps.insert(
-            group,
-            TargetSpecValue::List(vec![TargetSpecValue::String(lib_addr.format())]),
-        );
+        deps.insert(group, Value::List(vec![Value::String(lib_addr.format())]));
     }
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(script));
-    config.insert(
-        "deps".to_string(),
-        TargetSpecValue::Map(deps.into_iter().collect()),
-    );
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("run".to_string(), Value::String(script));
+    config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "bin".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("test_binary".to_string())]),
+            Value::List(vec![Value::String("test_binary".to_string())]),
         )])),
     );
     config.insert(
         "runtime_env".to_string(),
-        TargetSpecValue::Map(HashMap::from([
-            (
-                "GOOS".to_string(),
-                TargetSpecValue::String(factors.goos.clone()),
-            ),
-            (
-                "GOARCH".to_string(),
-                TargetSpecValue::String(factors.goarch.clone()),
-            ),
+        Value::Map(HashMap::from([
+            ("GOOS".to_string(), Value::String(factors.goos.clone())),
+            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
             (
                 "GOMODCACHE".to_string(),
-                TargetSpecValue::String(go_env.gomodcache.to_string()),
+                Value::String(go_env.gomodcache.to_string()),
             ),
             (
                 "GOPATH".to_string(),
-                TargetSpecValue::String(go_env.gopath.to_string()),
+                Value::String(go_env.gopath.to_string()),
             ),
             (
                 "GOCACHE".to_string(),
-                TargetSpecValue::String(go_env.gocache.to_string()),
+                Value::String(go_env.gocache.to_string()),
             ),
         ])),
     );
@@ -214,17 +202,17 @@ pub fn build_test_spec(
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
     config.insert(
         "env".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "CGO_ENABLED".to_string(),
-            TargetSpecValue::String("0".to_string()),
+            Value::String("0".to_string()),
         )])),
     );
     config.insert(
         "pass_env".to_string(),
-        TargetSpecValue::List(vec![
-            TargetSpecValue::String("GOROOT".to_string()),
-            TargetSpecValue::String("GOMODCACHE".to_string()),
-            TargetSpecValue::String("GOPATH".to_string()),
+        Value::List(vec![
+            Value::String("GOROOT".to_string()),
+            Value::String("GOMODCACHE".to_string()),
+            Value::String("GOPATH".to_string()),
         ]),
     );
 
@@ -250,25 +238,25 @@ pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> T
     // its `test_binary` output lands next to us and `./test_binary`
     // resolves regardless of package depth.
     let run = vec![
-        TargetSpecValue::String("./test_binary".to_string()),
-        TargetSpecValue::String("-test.v".to_string()),
+        Value::String("./test_binary".to_string()),
+        Value::String("-test.v".to_string()),
     ];
 
-    let deps_map: HashMap<String, TargetSpecValue> = HashMap::from([
+    let deps_map: HashMap<String, Value> = HashMap::from([
         (
             "bin".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(build_test_addr.format())]),
+            Value::List(vec![Value::String(build_test_addr.format())]),
         ),
         (
             "data".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(data_query_addr.format())]),
+            Value::List(vec![Value::String(data_query_addr.format())]),
         ),
     ]);
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::List(run));
-    config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
-    config.insert("out".to_string(), TargetSpecValue::Map(HashMap::new()));
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("run".to_string(), Value::List(run));
+    config.insert("deps".to_string(), Value::Map(deps_map));
+    config.insert("out".to_string(), Value::Map(HashMap::new()));
     TargetSpec {
         addr,
         driver: "exec".to_string(),
@@ -317,29 +305,26 @@ fn build_lib_spec_inner(
     run: String,
     out_file: String,
 ) -> TargetSpec {
-    let mut deps: BTreeMap<String, TargetSpecValue> = transitive_libs
+    let mut deps: BTreeMap<String, Value> = transitive_libs
         .iter()
         .map(|(import_path, dep_addr)| {
             let group = import_path_to_dep_group(import_path);
-            (
-                group,
-                TargetSpecValue::List(vec![TargetSpecValue::String(dep_addr.format())]),
-            )
+            (group, Value::List(vec![Value::String(dep_addr.format())]))
         })
         .collect();
 
     deps.insert(
         String::new(),
-        TargetSpecValue::List(src_addrs.map(TargetSpecValue::String).collect()),
+        Value::List(src_addrs.map(Value::String).collect()),
     );
     deps.insert(
         "go_bin".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
+        Value::List(vec![Value::String(go_bin_addr.to_string())]),
     );
     if let Some(e) = embed_addr {
         deps.insert(
             "embed".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(e.format())]),
+            Value::List(vec![Value::String(e.format())]),
         );
     }
     // Embed files travel as inputs so the engine stages them into the sandbox
@@ -347,61 +332,46 @@ fn build_lib_spec_inner(
     if !embed_file_addrs.is_empty() {
         deps.insert(
             "embed_files".to_string(),
-            TargetSpecValue::List(
+            Value::List(
                 embed_file_addrs
                     .iter()
-                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .map(|s| Value::String(s.clone()))
                     .collect(),
             ),
         );
     }
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
-    config.insert(
-        "deps".to_string(),
-        TargetSpecValue::Map(deps.into_iter().collect()),
-    );
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("run".to_string(), Value::String(run));
+    config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "a".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(out_file)]),
+            Value::List(vec![Value::String(out_file)]),
         )])),
     );
     config.insert(
         "runtime_env".to_string(),
-        TargetSpecValue::Map(HashMap::from([
-            (
-                "GOOS".to_string(),
-                TargetSpecValue::String(factors.goos.clone()),
-            ),
-            (
-                "GOARCH".to_string(),
-                TargetSpecValue::String(factors.goarch.clone()),
-            ),
-            (
-                "GOROOT".to_string(),
-                TargetSpecValue::String(goroot.to_string()),
-            ),
-            (
-                "GOCACHE".to_string(),
-                TargetSpecValue::String(gocache.to_string()),
-            ),
+        Value::Map(HashMap::from([
+            ("GOOS".to_string(), Value::String(factors.goos.clone())),
+            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
+            ("GOROOT".to_string(), Value::String(goroot.to_string())),
+            ("GOCACHE".to_string(), Value::String(gocache.to_string())),
         ])),
     );
     // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
     config.insert(
         "env".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "CGO_ENABLED".to_string(),
-            TargetSpecValue::String("0".to_string()),
+            Value::String("0".to_string()),
         )])),
     );
     config.insert(
         "pass_env".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
+        Value::List(vec![Value::String("GOROOT".to_string())]),
     );
 
     TargetSpec {
@@ -481,15 +451,15 @@ mod tests {
             &[],
         );
         let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         let files = match out.get("a").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!("expected list"),
         };
         let fname = match &files[0] {
-            TargetSpecValue::String(s) => s,
+            Value::String(s) => s,
             _ => panic!("expected string"),
         };
         assert!(
@@ -516,7 +486,7 @@ mod tests {
             &[],
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
         assert!(
@@ -547,15 +517,15 @@ mod tests {
             &[],
         );
         let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         let files = match out.get("a").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!("expected list"),
         };
         let fname = match &files[0] {
-            TargetSpecValue::String(s) => s,
+            Value::String(s) => s,
             _ => panic!("expected string"),
         };
         assert!(
@@ -581,7 +551,7 @@ mod tests {
             &[],
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
         assert!(
@@ -605,15 +575,15 @@ mod tests {
             "/tmp/gocache",
         );
         let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         let files = match out.get("a").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!("expected list"),
         };
         let fname = match &files[0] {
-            TargetSpecValue::String(s) => s,
+            Value::String(s) => s,
             _ => panic!("expected string"),
         };
         assert_eq!(fname, "testmain_main.a");
@@ -632,7 +602,7 @@ mod tests {
             "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
         assert!(
@@ -669,7 +639,7 @@ mod tests {
             &[],
         );
         let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
@@ -690,7 +660,7 @@ mod tests {
             &[],
         );
         let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
         assert!(
@@ -715,11 +685,11 @@ mod tests {
             &[],
         );
         let env = match spec.config.get("env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
-            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "0"),
             "link env must pin CGO_ENABLED=0 in the hashed map: {:?}",
             env.get("CGO_ENABLED")
         );
@@ -742,11 +712,11 @@ mod tests {
             &[],
         );
         let env = match spec.config.get("env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
-            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "0"),
             "compile env must pin CGO_ENABLED=0 in the hashed map: {:?}",
             env.get("CGO_ENABLED")
         );
@@ -764,7 +734,7 @@ mod tests {
             &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
         assert!(
@@ -786,7 +756,7 @@ mod tests {
             &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
         assert!(
@@ -816,15 +786,15 @@ mod tests {
             &query_addr("mypkg"),
         );
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m.clone(),
+            Value::Map(m) => m.clone(),
             _ => panic!(),
         };
         assert!(deps.contains_key("bin"));
         let bin_dep = match deps.get("bin").unwrap() {
-            TargetSpecValue::List(v) => v.clone(),
+            Value::List(v) => v.clone(),
             _ => panic!(),
         };
-        assert!(matches!(&bin_dep[0], TargetSpecValue::String(s) if s.contains("build_test")));
+        assert!(matches!(&bin_dep[0], Value::String(s) if s.contains("build_test")));
     }
 
     #[test]
@@ -836,13 +806,13 @@ mod tests {
         );
         assert_eq!(spec.driver, "exec");
         let run = match spec.config.get("run").expect("run present") {
-            TargetSpecValue::List(v) => v.clone(),
+            Value::List(v) => v.clone(),
             other => panic!("run must be a list for exec driver: {other:?}"),
         };
         let argv: Vec<String> = run
             .into_iter()
             .map(|v| match v {
-                TargetSpecValue::String(s) => s,
+                Value::String(s) => s,
                 other => panic!("argv element must be string: {other:?}"),
             })
             .collect();
@@ -935,16 +905,16 @@ mod tests {
             &qa,
         );
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m.clone(),
+            Value::Map(m) => m.clone(),
             _ => panic!(),
         };
         let data_dep = match deps.get("data").expect("data group present") {
-            TargetSpecValue::List(v) => v.clone(),
+            Value::List(v) => v.clone(),
             _ => panic!("data group must be a list"),
         };
         assert_eq!(data_dep.len(), 1);
         let s = match &data_dep[0] {
-            TargetSpecValue::String(s) => s.clone(),
+            Value::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
         assert!(

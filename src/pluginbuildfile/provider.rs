@@ -526,7 +526,7 @@ target(
 
     #[tokio::test]
     async fn probe_returns_provider_states_from_build_file() {
-        use crate::loosespecparser::TargetSpecValue;
+        use crate::htvalue::Value;
 
         let tmp_dir = tempdir().unwrap();
         let pkg_name = "p";
@@ -561,9 +561,9 @@ provider_state(provider = "go", root = "src", strict = True)
         assert_eq!(s.provider, "go");
         assert_eq!(
             s.state.get("root"),
-            Some(&TargetSpecValue::String("src".to_string()))
+            Some(&Value::String("src".to_string()))
         );
-        assert_eq!(s.state.get("strict"), Some(&TargetSpecValue::Bool(true)));
+        assert_eq!(s.state.get("strict"), Some(&Value::Bool(true)));
         assert!(!s.state.contains_key("provider"));
     }
 
