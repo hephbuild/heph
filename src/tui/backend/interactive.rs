@@ -17,6 +17,7 @@ use crate::commands::bootstrap::ShutdownTrigger;
 use crate::engine::event::{EventReceiver, now_unix_ms};
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
 use crate::tui::log_sink::LogSink;
+use crate::tui::progress::HSCROLL_STEP;
 use crate::tui::stderr_backend::StderrBackend;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -193,6 +194,26 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) => view.scroll(1),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Left,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.hscroll(-(HSCROLL_STEP as i32)),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Right,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.hscroll(HSCROLL_STEP as i32),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Tab,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.tab(true),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::BackTab,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.tab(false),
                     Some(Ok(Event::Resize(w, _))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is

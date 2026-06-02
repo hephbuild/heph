@@ -59,6 +59,35 @@ fn windowed(
     (window, scroll)
 }
 
+/// Columns shifted per Left/Right key press when panning a wide body.
+pub const HSCROLL_STEP: usize = 4;
+
+/// Drop the first `offset` visible columns from a line, preserving each span's
+/// styling. Every glyph this module emits is single-width, so a char count is an
+/// exact column count. `offset == 0` returns the line untouched.
+fn hscroll_line(line: Line<'static>, offset: usize) -> Line<'static> {
+    if offset == 0 {
+        return line;
+    }
+    let mut remaining = offset;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let chars = span.content.chars().count();
+        if remaining >= chars {
+            remaining -= chars;
+            continue;
+        }
+        if remaining > 0 {
+            let kept: String = span.content.chars().skip(remaining).collect();
+            spans.push(Span::styled(kept, span.style));
+            remaining = 0;
+        } else {
+            spans.push(span);
+        }
+    }
+    Line::from(spans)
+}
+
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
 
@@ -207,6 +236,56 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Which body the TUI viewport is showing. The default view is the live
+/// slow-target / lock-wait breakdown; the [`ViewMode::Failed`] view lists every
+/// errored target. `Tab` cycles through `[Default]` plus one entry per
+/// [`HeaderItem::Tab`] the header model exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The live breakdown: slow targets + lock waits (or idle art when empty).
+    Default,
+    /// The list of failed targets.
+    Failed,
+}
+
+/// One freestanding segment of the header status line. The view joins items with
+/// ` · ` itself — items must NOT bake in separators. A [`HeaderItem::Tab`] binds a
+/// segment to a body [`ViewMode`]; the view highlights it (background colour)
+/// while that mode is the active view.
+pub enum HeaderItem {
+    /// A plain segment that is always rendered as-is.
+    Text(Vec<Span<'static>>),
+    /// A segment bound to a body view. Selectable via `Tab`; highlighted while
+    /// its `mode` is active.
+    Tab {
+        mode: ViewMode,
+        spans: Vec<Span<'static>>,
+    },
+}
+
+impl HeaderItem {
+    /// A plain-text segment.
+    pub fn text(s: impl Into<String>) -> Self {
+        HeaderItem::Text(vec![Span::raw(s.into())])
+    }
+
+    /// A plain-text segment bound to a body view.
+    pub fn tab(mode: ViewMode, s: impl Into<String>) -> Self {
+        HeaderItem::Tab {
+            mode,
+            spans: vec![Span::raw(s.into())],
+        }
+    }
+
+    /// The item's spans, regardless of variant (used by tests).
+    #[cfg(test)]
+    fn spans(&self) -> &[Span<'static>] {
+        match self {
+            HeaderItem::Text(spans) | HeaderItem::Tab { spans, .. } => spans,
+        }
+    }
+}
+
 /// A target-scoped operation, as the client groups it for display. This is a
 /// purely client-side (rendering) concept: the engine emits individually typed
 /// events (`ExecuteStart/End`, `LocalCacheWriteStart/End`, …) and
@@ -303,6 +382,9 @@ pub struct BuildState {
     finished: HashSet<String>,
     completed: usize,
     errored: usize,
+    /// Failed targets in failure order, each with its error message (if the
+    /// `ResultEnd` carried one). Drives the [`ViewMode::Failed`] body.
+    failed: Vec<(String, Option<String>)>,
     /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
     /// Distinct from `completed`, which includes cache hits that never executed.
     built: usize,
@@ -385,8 +467,9 @@ impl BuildState {
             }
             BuildEventKind::ResultEnd { addr, error } => {
                 if self.in_flight_results.remove(addr) {
-                    if error.is_some() {
+                    if let Some(err) = error {
                         self.errored += 1;
+                        self.failed.push((addr.clone(), Some(err.clone())));
                     } else {
                         self.completed += 1;
                     }
@@ -486,10 +569,11 @@ impl BuildState {
         Some((done, self.matched.len(), self.matched_complete))
     }
 
-    /// The textual count segment shared by the live header and the final
-    /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
-    /// braille — callers prepend the elapsed field themselves.
-    pub fn counts_segment(&self) -> String {
+    /// The three freestanding count fields — `(done, cached, failed)` — each
+    /// without separators. The header model wraps these in [`HeaderItem`]s (so
+    /// the view owns the ` · ` joins); [`BuildState::counts_segment`] joins them
+    /// for the plain-text final summary.
+    pub fn count_fields(&self) -> (String, String, String) {
         let (built, cached, _running, failed) = self.header_counts();
         let done = match self.matched_progress() {
             Some((done, total, complete)) => {
@@ -498,7 +582,41 @@ impl BuildState {
             }
             None => format!("{built} done"),
         };
-        format!("{done} · {cached} cached · {failed} failed")
+        (done, format!("{cached} cached"), format!("{failed} failed"))
+    }
+
+    /// The textual count segment shared by the live header and the final
+    /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
+    /// braille — callers prepend the elapsed field themselves.
+    pub fn counts_segment(&self) -> String {
+        let (done, cached, failed) = self.count_fields();
+        format!("{done} · {cached} · {failed}")
+    }
+
+    /// Body rows for the [`ViewMode::Failed`] view: one line per failed target,
+    /// addr in red followed by its error message (when one was reported).
+    /// Empty when nothing has failed.
+    pub fn failed_lines(&self) -> Vec<Line<'static>> {
+        self.failed
+            .iter()
+            .map(|(addr, err)| {
+                let mut spans = vec![Span::styled(
+                    format!("  {addr}"),
+                    Style::default().fg(Color::Red),
+                )];
+                if let Some(err) = err {
+                    // Keep the message on one line; the viewport clips overflow.
+                    let msg = err.lines().next().unwrap_or(err);
+                    spans.push(Span::styled(
+                        format!("  {msg}"),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect()
     }
 
     /// Header counts, in render order: `(built, cached, running, failed)`.
@@ -687,11 +805,12 @@ pub trait ProgressHeader: Send {
     /// Fold an event into header-private state. The build header reads the
     /// view's shared [`BuildState`] instead, so its impl is a no-op.
     fn apply(&mut self, _ev: &BuildEvent) {}
-    /// Status segment shown after the elapsed clock, including the worker
-    /// braille. Spans (not a plain string) so the braille keeps its styling.
+    /// Status items shown after the elapsed clock. Each item is freestanding —
+    /// the view joins them with ` · ` and highlights any [`HeaderItem::Tab`]
+    /// whose mode is the active view — so a model must NOT bake in separators.
     /// `core` is the view's shared build state; headers that track their own
     /// state ignore it.
-    fn header(&self, core: &BuildState) -> Vec<Span<'static>>;
+    fn header(&self, core: &BuildState) -> Vec<HeaderItem>;
     /// The bottom-border label.
     fn label(&self) -> String;
     /// Final summary segment printed after the run (after the elapsed clock).
@@ -714,14 +833,19 @@ impl BuildHeader {
 }
 
 impl ProgressHeader for BuildHeader {
-    fn header(&self, core: &BuildState) -> Vec<Span<'static>> {
-        let mut spans = vec![Span::raw(core.counts_segment())];
+    fn header(&self, core: &BuildState) -> Vec<HeaderItem> {
+        let (done, cached, failed) = core.count_fields();
+        let mut items = vec![
+            HeaderItem::text(done),
+            HeaderItem::text(cached),
+            // The failed count is a tab into the failed-targets view.
+            HeaderItem::tab(ViewMode::Failed, failed),
+        ];
         let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_workers());
         if !workers.is_empty() {
-            spans.push(Span::raw(" · "));
-            spans.extend(workers);
+            items.push(HeaderItem::Text(workers));
         }
-        spans
+        items
     }
 
     fn label(&self) -> String {
@@ -778,8 +902,8 @@ impl ProgressHeader for GcHeader {
         }
     }
 
-    fn header(&self, _core: &BuildState) -> Vec<Span<'static>> {
-        vec![Span::raw(self.segment())]
+    fn header(&self, _core: &BuildState) -> Vec<HeaderItem> {
+        vec![HeaderItem::text(self.segment())]
     }
 
     fn label(&self) -> String {
@@ -807,6 +931,12 @@ pub struct TuiProgressView {
     /// a `Cell` so `render` can clamp it against the live row count while staying
     /// `&self`; `scroll()` mutates it from key events.
     scroll: Cell<usize>,
+    /// Body horizontal pan offset in columns, for lines wider than the viewport.
+    /// Clamped in `render` against the widest body line; `hscroll()` mutates it.
+    hscroll: Cell<usize>,
+    /// The active body view. `Tab` cycles it through [`ViewMode::Default`] plus
+    /// every tab the header model exposes.
+    view: Cell<ViewMode>,
 }
 
 impl TuiProgressView {
@@ -821,17 +951,62 @@ impl TuiProgressView {
             state: BuildState::new(),
             model,
             scroll: Cell::new(0),
+            hscroll: Cell::new(0),
+            view: Cell::new(ViewMode::Default),
         }
+    }
+
+    /// The selectable body views in cycle order: [`ViewMode::Default`] first,
+    /// then one entry per [`HeaderItem::Tab`] the header model exposes, in header
+    /// order. `Tab` walks this list.
+    fn view_modes(&self) -> Vec<ViewMode> {
+        let mut modes = vec![ViewMode::Default];
+        modes.extend(self.model.header(&self.state).iter().filter_map(|i| {
+            if let HeaderItem::Tab { mode, .. } = i {
+                Some(*mode)
+            } else {
+                None
+            }
+        }));
+        modes
     }
 
     /// The dim help row pinned under the box: the keys the viewport responds to.
     fn help_line(&self) -> Line<'static> {
         Line::from(Span::styled(
-            "  ↑/↓ scroll",
+            "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ))
+    }
+
+    /// Render the header model's items into a flat span run: items joined by
+    /// ` · `, with the [`HeaderItem::Tab`] matching the active view highlighted
+    /// (reversed background). This is the one place the ` · ` separator lives.
+    fn header_item_spans(&self) -> Vec<Span<'static>> {
+        let active = self.view.get();
+        let items = self.model.header(&self.state);
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 2);
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" · "));
+            }
+            match item {
+                HeaderItem::Text(item_spans) => spans.extend(item_spans.iter().cloned()),
+                HeaderItem::Tab { mode, spans: item_spans } if *mode == active => {
+                    // Active tab: paint a background so the selected view reads
+                    // as highlighted in the header.
+                    spans.extend(item_spans.iter().map(|s| {
+                        Span::styled(s.content.clone(), s.style.bg(Color::Blue).fg(Color::White))
+                    }));
+                }
+                HeaderItem::Tab { spans: item_spans, .. } => {
+                    spans.extend(item_spans.iter().cloned())
+                }
+            }
+        }
+        spans
     }
 
     /// The rounded top border:
@@ -850,7 +1025,7 @@ impl TuiProgressView {
         // The status segment (counts + worker braille, or gc sweep stats) is
         // supplied by the header model; the view owns only the leading clock.
         left.push(Span::raw(" · "));
-        left.extend(self.model.header(&self.state));
+        left.extend(self.header_item_spans());
         // Space between the segment and the dash fill.
         left.push(Span::raw(" "));
 
@@ -912,6 +1087,37 @@ impl TUIAppView for TuiProgressView {
         self.scroll.set(next);
     }
 
+    fn hscroll(&mut self, delta: i32) {
+        let cur = self.hscroll.get();
+        let mag = delta.unsigned_abs() as usize;
+        let next = if delta >= 0 {
+            cur.saturating_add(mag)
+        } else {
+            cur.saturating_sub(mag)
+        };
+        self.hscroll.set(next);
+    }
+
+    fn tab(&mut self, forward: bool) {
+        let modes = self.view_modes();
+        let len = modes.len().max(1);
+        let cur = self.view.get();
+        let idx = modes.iter().position(|&m| m == cur).unwrap_or(0);
+        // Step forward or backward with wrap. `modes` always holds at least
+        // `Default`, so the index is in-bounds; the `.get`/fallback keeps it
+        // panic-free regardless.
+        let step = if forward { 1 } else { len - 1 };
+        let next = modes
+            .get((idx + step) % len)
+            .copied()
+            .unwrap_or(ViewMode::Default);
+        self.view.set(next);
+        // Switching views resets the scroll so the new body starts at the
+        // top-left.
+        self.scroll.set(0);
+        self.hscroll.set(0);
+    }
+
     /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
     /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
     /// ```text
@@ -931,14 +1137,38 @@ impl TUIAppView for TuiProgressView {
         let body_rows = height - 3;
         let mut lines = Vec::with_capacity(height);
         lines.push(self.header_line(now_ms, width));
-        let body = self.state.body_lines(now_ms);
+        let view = self.view.get();
+        let body = match view {
+            ViewMode::Default => self.state.body_lines(now_ms),
+            ViewMode::Failed => self.state.failed_lines(),
+        };
         if body.is_empty() {
             self.scroll.set(0);
-            lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows));
+            self.hscroll.set(0);
+            match view {
+                // Default view: the dim drifting idle field.
+                ViewMode::Default => {
+                    lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows))
+                }
+                // Failed view with nothing failed: a single dim placeholder.
+                ViewMode::Failed => lines.push(Line::from(Span::styled(
+                    "  no failed targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+            }
         } else {
+            // Clamp the horizontal pan against the widest body line so panning
+            // stops once the longest line's tail reaches the right edge.
+            let avail = usize::from(width.max(1));
+            let max_w = body.iter().map(|l| spans_width(&l.spans)).max().unwrap_or(0);
+            let hscroll = self.hscroll.get().min(max_w.saturating_sub(avail));
+            self.hscroll.set(hscroll);
+
             let (window, scroll) = windowed(body, body_rows, self.scroll.get());
             self.scroll.set(scroll);
-            lines.extend(window);
+            lines.extend(window.into_iter().map(|l| hscroll_line(l, hscroll)));
         }
         // Pad the body so the bottom border always pins to the same row.
         while lines.len() < body_rows + 1 {
@@ -1054,6 +1284,15 @@ mod tests {
 
     fn ev(at_unix_ms: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent { at_unix_ms, kind }
+    }
+
+    /// Flatten a header model's items into their concatenated text.
+    fn header_text(items: &[HeaderItem]) -> String {
+        items
+            .iter()
+            .flat_map(|i| i.spans())
+            .map(|s| s.content.to_string())
+            .collect()
     }
 
     #[test]
@@ -1487,11 +1726,7 @@ mod tests {
         h.apply(&ev(0, gc_swept(2, 1024)));
         h.apply(&ev(1, gc_swept(0, 0))); // zero-removal target still counts as explored
 
-        let seg: String = h
-            .header(&core)
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
+        let seg = header_text(&h.header(&core));
         assert!(seg.contains("2 targets"), "{seg}");
         assert!(seg.contains("1.0 KiB"), "{seg}");
         assert_eq!(h.label(), "GC");
@@ -1507,11 +1742,7 @@ mod tests {
         core.apply(&ev(2, gc_swept(9, 9)));
 
         let h = BuildHeader::new("L");
-        let text: String = h
-            .header(&core)
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
+        let text = header_text(&h.header(&core));
         assert!(text.contains("done"), "{text}");
         assert!(text.contains('⠁'), "expected worker braille: {text}");
     }
@@ -1798,6 +2029,171 @@ mod tests {
             .find(|t| t.contains("more"))
             .expect("collapse line");
         assert!(collapse.contains("+3 more"), "{collapse}");
+    }
+
+    #[test]
+    fn failed_lines_list_failed_targets_with_error() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, result_start("//a:ok")));
+        s.apply(&ev(1, result_end("//a:ok", None)));
+        s.apply(&ev(2, result_start("//a:bad")));
+        s.apply(&ev(3, result_end("//a:bad", Some("boom".into()))));
+        s.apply(&ev(4, result_start("//a:bad2")));
+        s.apply(&ev(5, result_end("//a:bad2", Some("kaput".into()))));
+
+        let lines = s.failed_lines();
+        // Only the two errored targets appear, in failure order.
+        assert_eq!(lines.len(), 2);
+        let l0 = format!("{}", lines[0]);
+        assert!(l0.contains("//a:bad"), "{l0}");
+        assert!(l0.contains("boom"), "{l0}");
+        let l1 = format!("{}", lines[1]);
+        assert!(l1.contains("//a:bad2"), "{l1}");
+        assert!(!format!("{}{}", l0, l1).contains("//a:ok"));
+    }
+
+    #[test]
+    fn header_items_are_freestanding_without_separators() {
+        // Each header item must carry no ` · ` — the view owns the joins.
+        let mut core = BuildState::new();
+        core.apply(&ev(0, max_workers(8)));
+        core.apply(&ev(1, execute_start("//a:b")));
+        let h = BuildHeader::new("L");
+        for item in h.header(&core) {
+            let text: String = item.spans().iter().map(|s| s.content.to_string()).collect();
+            assert!(!text.contains('·'), "item baked in a separator: {text}");
+        }
+    }
+
+    #[test]
+    fn tab_cycles_default_failed_and_back() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, execute_start("//slow:x")));
+        v.apply(&ev(1, result_start("//a:bad")));
+        v.apply(&ev(2, result_end("//a:bad", Some("boom".into()))));
+
+        // Default view shows the slow row, not the failed target.
+        let body = |v: &TuiProgressView| -> String {
+            v.render("⠋", 10_000, 80, 8)
+                .iter()
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+        assert_eq!(v.view.get(), ViewMode::Default);
+        assert!(body(&v).contains("//slow:x"));
+
+        // Tab → failed view: shows the failed target.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Failed);
+        let failed_body = body(&v);
+        assert!(failed_body.contains("//a:bad"), "{failed_body}");
+        assert!(!failed_body.contains("//slow:x"), "{failed_body}");
+
+        // Tab again wraps back to default.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Default);
+        assert!(body(&v).contains("//slow:x"));
+    }
+
+    #[test]
+    fn hscroll_pans_wide_body_lines_and_clamps() {
+        let mut v = TuiProgressView::new("L");
+        // A slow target whose addr is far wider than the viewport.
+        let long = format!("//pkg:{}", "x".repeat(200));
+        v.apply(&ev(0, execute_start(&long)));
+
+        let body_at = |v: &TuiProgressView, w: u16| -> String {
+            v.render("⠋", 10_000, w, 8)[1..]
+                .iter()
+                .take(1)
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+
+        let width = 40u16;
+        // At pan 0 the row starts with the indent + addr head.
+        let row0 = body_at(&v, width);
+        assert!(row0.contains("//pkg:xxx"), "{row0}");
+
+        // Pan right: the head columns are dropped.
+        v.hscroll(20);
+        let row1 = body_at(&v, width);
+        assert!(!row1.contains("//pkg:xxx"), "{row1}");
+        assert!(row1.contains('x'), "{row1}");
+
+        // Pan back left to the origin restores the head.
+        v.hscroll(-1000);
+        assert!(body_at(&v, width).contains("//pkg:xxx"));
+
+        // Pan far right clamps so the tail never scrolls off the right edge:
+        // the rendered row stays non-empty (the addr's tail is still visible).
+        v.hscroll(100_000);
+        let clamped = body_at(&v, width);
+        // The row's tail is the op breakdown group, e.g. `(▶ 10s)`.
+        assert!(clamped.trim().ends_with(')'), "{clamped}");
+        assert!(!clamped.trim().is_empty(), "{clamped}");
+    }
+
+    #[test]
+    fn switching_view_resets_horizontal_pan() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
+        v.hscroll(50);
+        v.tab(true);
+        assert_eq!(v.hscroll.get(), 0);
+    }
+
+    #[test]
+    fn shift_tab_cycles_backwards() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
+
+        // Two modes (Default, Failed): backward from Default wraps to Failed.
+        assert_eq!(v.view.get(), ViewMode::Default);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Failed);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Default);
+    }
+
+    #[test]
+    fn failed_tab_is_highlighted_when_active() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
+
+        // Inactive: the "failed" segment carries no background.
+        let header = v.render("⠋", 100, 120, 8);
+        let plain = header[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed"))
+            .expect("failed span");
+        assert_eq!(plain.style.bg, None);
+
+        // Active (failed view): the segment is highlighted with a background.
+        v.tab(true);
+        let header = v.render("⠋", 100, 120, 8);
+        let hl = header[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed"))
+            .expect("failed span");
+        assert_eq!(hl.style.bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn failed_view_with_no_failures_shows_placeholder() {
+        let mut v = TuiProgressView::new("L");
+        v.tab(true); // → Failed, but nothing has failed
+        let body: String = v
+            .render("⠋", 10_000, 80, 8)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("no failed targets"), "{body}");
     }
 
     #[test]

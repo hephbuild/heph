@@ -14,8 +14,8 @@ pub use app::{App, AppContext, CIAppView, PauseGuard, TUIAppView};
 pub use log_sink::LogSink;
 pub use paused::paused;
 pub use progress::{
-    BuildHeader, BuildState, CiProgressView, GcCiView, GcHeader, MIN_PROGRESS_ROWS, ProgressHeader,
-    TuiProgressView, rows_for_height,
+    BuildHeader, BuildState, CiProgressView, GcCiView, GcHeader, HeaderItem, MIN_PROGRESS_ROWS,
+    ProgressHeader, TuiProgressView, ViewMode, rows_for_height,
 };
 pub use stdout_buffer::BufferedStdout;
 

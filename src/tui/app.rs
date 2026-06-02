@@ -162,6 +162,16 @@ pub trait TUIAppView: Send {
     /// tick. No-op by default for views without a scrollable body.
     fn scroll(&mut self, _delta: i32) {}
 
+    /// Pan the body horizontally by `delta` columns (negative = left, positive =
+    /// right) for content wider than the viewport. No-op by default.
+    fn hscroll(&mut self, _delta: i32) {}
+
+    /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
+    /// the next view, otherwise the previous. Called from the backend's key
+    /// handler; the repaint happens on the next render tick. No-op by default for
+    /// views with a single view.
+    fn tab(&mut self, _forward: bool) {}
+
     /// The lines for the pinned viewport, including the spinner row built from
     /// `spinner`. Called every render tick. `width` is the current terminal
     /// column count and `height` the reserved viewport row count, so the view can
