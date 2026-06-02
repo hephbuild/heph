@@ -2,7 +2,7 @@ use crate::engine::provider::GetError::NotFound;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
-    Provider as EProvider, State, TargetSpec,
+    Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
 use crate::hasync::Cancellable;
 use crate::hmemoizer::Memoizer;
@@ -12,9 +12,10 @@ use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use enclose::enclose;
 use futures::future::BoxFuture;
+use starlark::environment::Globals;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct RequestState {}
 
@@ -39,6 +40,13 @@ pub struct Provider {
     /// Sync cache: package directory → merged result across every matching BUILD file
     /// in that dir. Loaded once and reused by both `run_pkg` and `load("//pkg", ...)`.
     pub(crate) dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+    /// Aggregated provider functions, injected once by the engine. Drives the
+    /// `heph.<provider>.<fn>` Starlark namespace. Empty until injected (some unit
+    /// tests run the provider without an engine).
+    pub(crate) function_registry: OnceLock<Arc<ProviderFunctionRegistry>>,
+    /// Lazily-built Starlark globals (built from `function_registry` on first eval),
+    /// shared with every `BuildFileLoader` so the namespace is built at most once.
+    pub(crate) globals: Arc<OnceLock<Globals>>,
 }
 
 impl Default for Provider {
@@ -51,6 +59,8 @@ impl Default for Provider {
             packages_cache: Memoizer::with_tag("buildfile_packages"),
             file_cache: Arc::new(Mutex::new(HashMap::new())),
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
+            function_registry: OnceLock::new(),
+            globals: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -263,6 +273,14 @@ impl EProvider for Provider {
                     .collect(),
             })
         })
+    }
+
+    fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
+        // First injection wins; the engine wires exactly once, so a later set
+        // (already-injected) is a harmless no-op.
+        if self.function_registry.set(reg).is_err() {
+            // Registry was already injected; keep the first one.
+        }
     }
 }
 
@@ -559,10 +577,7 @@ provider_state(provider = "go", root = "src", strict = True)
         let s = &res.states[0];
         assert_eq!(s.package, PkgBuf::from(pkg_name));
         assert_eq!(s.provider, "go");
-        assert_eq!(
-            s.state.get("root"),
-            Some(&Value::String("src".to_string()))
-        );
+        assert_eq!(s.state.get("root"), Some(&Value::String("src".to_string())));
         assert_eq!(s.state.get("strict"), Some(&Value::Bool(true)));
         assert!(!s.state.contains_key("provider"));
     }

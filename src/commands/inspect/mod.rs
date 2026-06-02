@@ -1,5 +1,6 @@
 mod def;
 mod deps;
+mod functions;
 mod hashin;
 mod hashout;
 mod packages;
@@ -31,6 +32,8 @@ pub enum InspectCommands {
     Def(def::Args),
     /// Prints target deps
     Deps(deps::Args),
+    /// List provider-exposed functions (`heph.<provider>.<fn>`)
+    Functions(functions::Args),
 }
 
 impl InspectArgs {
@@ -52,6 +55,7 @@ impl InspectCommands {
             InspectCommands::Spec(args) => spec::execute(args, sink, global),
             InspectCommands::Def(args) => def::execute(args, sink, global),
             InspectCommands::Deps(args) => deps::execute(args, sink, global),
+            InspectCommands::Functions(args) => functions::execute(args, sink, global),
         }
     }
 }

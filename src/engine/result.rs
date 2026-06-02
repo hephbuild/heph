@@ -1257,6 +1257,9 @@ impl Engine {
         rs: &Arc<RequestState>,
         pkg: &PkgBuf,
     ) -> anyhow::Result<Arc<Vec<State>>> {
+        // Single chokepoint for every provider-dispatch path (get/probe/list all
+        // route through here), so provider functions are wired before any BUILD eval.
+        self.ensure_provider_functions_wired();
         rs.data
             .mem_probe
             .once(
@@ -1628,6 +1631,71 @@ mod tests {
             .map(|s| s.package.as_str().to_string())
             .collect();
         assert_eq!(recorded_pkgs, vec!["a/b/c", "a/b", "a", ""]);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_functions_lists_exposed_functions() {
+        let root = tempdir().unwrap();
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .register_provider(|_| Box::new(crate::pluginfs::Provider))
+            .unwrap();
+        let fns = engine.provider_functions();
+        assert!(
+            fns.contains(&("fs".to_string(), "glob".to_string())),
+            "{fns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_wires_provider_functions_into_buildfile() -> anyhow::Result<()> {
+        // End-to-end: the engine must aggregate `fs`'s exposed `glob` function and
+        // inject it into the buildfile provider, so a BUILD calling `heph.fs.glob`
+        // resolves at spec time.
+        let root = tempdir()?;
+        std::fs::write(root.path().join("a.txt"), "")?;
+        std::fs::write(root.path().join("b.txt"), "")?;
+        std::fs::write(root.path().join("c.md"), "")?;
+        std::fs::write(
+            root.path().join("BUILD"),
+            r#"target(name = "t", driver = "d", srcs = heph.fs.glob("*.txt"))"#,
+        )?;
+
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|_| Box::new(crate::pluginfs::Provider))?;
+        engine.register_provider(|root| {
+            Box::new(crate::pluginbuildfile::Provider::new(root.to_path_buf()))
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let addr = Addr::new(PkgBuf::from(""), "t".to_string(), Default::default());
+        let spec = SArc::clone(&engine).get_spec(rs, &addr).await?;
+
+        let mut srcs = match spec.spec.config.get("srcs") {
+            Some(crate::htvalue::Value::List(l)) => l
+                .iter()
+                .map(|e| match e {
+                    crate::htvalue::Value::String(s) => s.clone(),
+                    other => panic!("expected string, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("expected list, got {other:?}"),
+        };
+        srcs.sort();
+        assert_eq!(srcs, vec!["a.txt".to_string(), "b.txt".to_string()]);
         Ok(())
     }
 

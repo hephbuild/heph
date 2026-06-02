@@ -8,9 +8,10 @@ use crate::engine::driver::{
     },
 };
 use crate::engine::provider::{
-    ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, GetError,
-    GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
-    ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec,
+    ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, FnArgs,
+    FnCallContext, GetError, GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest,
+    ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, ProviderFn,
+    ProviderFunctionDef, TargetSpec,
 };
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
@@ -143,6 +144,71 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
+    }
+
+    fn functions(&self) -> Vec<ProviderFunctionDef> {
+        vec![ProviderFunctionDef {
+            name: "glob".to_string(),
+            func: Arc::new(GlobFn),
+        }]
+    }
+}
+
+// ─── Exposed functions ─────────────────────────────────────────────────────────
+
+/// `heph.fs.glob(pattern)` — expand `pattern` (resolved relative to the calling
+/// package) against the workspace filesystem and return matched file paths relative
+/// to that package. Uses the exact same `wax` walk as the `fs` driver
+/// ([`compile_glob`] + [`walk_glob`]), so BUILD-time expansion matches what the
+/// driver globs at execution time: brace alternation, `.`/`..` normalization, and
+/// the built-in `.git`/`.heph`/`.heph3` pruning. Result is sorted.
+struct GlobFn;
+
+#[async_trait]
+impl ProviderFn for GlobFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let pattern = match args.positional.first() {
+            Some(Value::String(s)) => s.as_str(),
+            Some(other) => anyhow::bail!("heph.fs.glob: pattern must be a string, got {:?}", other),
+            None => anyhow::bail!("heph.fs.glob: missing pattern argument"),
+        };
+
+        let resolved = if ctx.pkg.is_empty() {
+            pattern.to_string()
+        } else {
+            format!("{}/{}", ctx.pkg, pattern)
+        };
+        let resolved = normalize_path(&resolved).context("heph.fs.glob: normalizing pattern")?;
+
+        // No user excludes, so `request_id` is irrelevant (the built-in exclude
+        // path is taken). Reuses the driver's compiled glob + walk verbatim.
+        let compiled = compile_glob("heph.fs.glob", &resolved, &[])?;
+        let artifacts = walk_glob(ctx.root, &compiled)?;
+
+        let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
+
+        let mut paths: Vec<String> = Vec::new();
+        for artifact in &artifacts {
+            let Content::File(file) = &artifact.content else {
+                continue;
+            };
+            // `out_path` is root-relative; strip the package prefix to make it
+            // package-relative (a no-op at the workspace root).
+            let rel = std::path::Path::new(&file.out_path);
+            let pkg_rel = pkg_prefix
+                .and_then(|prefix| rel.strip_prefix(prefix).ok())
+                .unwrap_or(rel);
+            let s = pkg_rel.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "heph.fs.glob: entry path is not valid UTF-8: {}",
+                    pkg_rel.display()
+                )
+            })?;
+            paths.push(s.to_string());
+        }
+
+        paths.sort();
+        Ok(Value::List(paths.into_iter().map(Value::String).collect()))
     }
 }
 
@@ -753,6 +819,67 @@ mod tests {
         }
     }
 
+    // ─── Exposed-function (glob) tests ─────────────────────────────────────
+
+    fn call_glob(root: &std::path::Path, pkg: &str, pattern: &str) -> Vec<String> {
+        let ctx = FnCallContext { pkg, root };
+        let args = FnArgs {
+            positional: vec![Value::String(pattern.to_string())],
+            named: Default::default(),
+        };
+        let v = futures::executor::block_on(GlobFn.call(&ctx, args)).unwrap();
+        match v {
+            Value::List(l) => l
+                .into_iter()
+                .map(|e| match e {
+                    Value::String(s) => s,
+                    other => panic!("expected string, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_glob_fn_pkg_relative_and_skips_dirs() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("mypkg");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(pkg.join("src").join("a.yaml"), "").unwrap();
+        fs::write(pkg.join("src").join("b.yaml"), "").unwrap();
+        fs::write(pkg.join("src").join("c.txt"), "").unwrap();
+
+        let got = call_glob(tmp.path(), "mypkg", "src/*.yaml");
+        assert_eq!(
+            got,
+            vec!["src/a.yaml".to_string(), "src/b.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_glob_fn_excludes_builtin_dirs() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("mypkg");
+        let git = pkg.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("HEAD"), "").unwrap();
+        fs::write(pkg.join("main.rs"), "").unwrap();
+
+        let got = call_glob(tmp.path(), "mypkg", "**/*");
+        assert!(!got.iter().any(|s| s.starts_with(".git")), "{got:?}");
+        assert!(got.contains(&"main.rs".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn test_glob_fn_at_root_unprefixed() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.yaml"), "").unwrap();
+        fs::write(tmp.path().join("b.yaml"), "").unwrap();
+
+        let got = call_glob(tmp.path(), "", "*.yaml");
+        assert_eq!(got, vec!["a.yaml".to_string(), "b.yaml".to_string()]);
+    }
+
     // ─── Provider tests ────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -932,10 +1059,7 @@ mod tests {
     async fn test_driver_parse_glob_with_exclude() {
         let driver = Driver;
         let config = std::collections::HashMap::from([
-            (
-                "p".to_string(),
-                Value::String("**/*.rs".to_string()),
-            ),
+            ("p".to_string(), Value::String("**/*.rs".to_string())),
             (
                 "e".to_string(),
                 Value::String("vendor/**,generated/**".to_string()),
@@ -1026,10 +1150,8 @@ mod tests {
         fs::write(tmp.path().join("b.rs"), b"").unwrap();
         fs::write(tmp.path().join("c.txt"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            Value::String("*.rs".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await
@@ -1060,10 +1182,8 @@ mod tests {
         fs::write(git_dir.join("config"), b"").unwrap();
         fs::write(tmp.path().join("main.rs"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            Value::String("**/*".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await
@@ -1098,10 +1218,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([
             ("p".to_string(), Value::String("*.rs".to_string())),
-            (
-                "e".to_string(),
-                Value::String("skip.rs".to_string()),
-            ),
+            ("e".to_string(), Value::String("skip.rs".to_string())),
         ]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1588,10 +1705,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("a.rs"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            Value::String("*.rs".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await
@@ -1644,10 +1759,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("a.rs"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            Value::String("*.rs".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await

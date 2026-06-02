@@ -81,6 +81,11 @@ pub struct Engine {
     /// Guards the execute phase so at most one execute runs per target addr at
     /// a time (cross-process with the filesystem backend, in-process with mem).
     pub(crate) result_lock: ResultLock,
+
+    /// Aggregates every provider's exposed functions and injects the registry
+    /// into consumers (the buildfile provider) exactly once, lazily on the first
+    /// provider dispatch — by which point all registration has completed.
+    pub(crate) provider_functions_wired: std::sync::Once,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -326,6 +331,7 @@ impl Engine {
             managed_driver_factories: HashMap::new(),
             fuse,
             result_lock,
+            provider_functions_wired: std::sync::Once::new(),
         };
         engine.register_driver(Box::new(crate::plugingroup::Driver))?;
         engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;
@@ -348,6 +354,42 @@ impl Engine {
     /// The per-addr execute-phase lock.
     pub fn result_lock(&self) -> &ResultLock {
         &self.result_lock
+    }
+
+    /// Every `(provider name, function name)` pair exposed across all registered
+    /// providers, sorted. Surfaced via `heph inspect functions`.
+    pub fn provider_functions(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .providers
+            .iter()
+            .flat_map(|p| {
+                p.provider
+                    .functions()
+                    .into_iter()
+                    .map(move |def| (p.name.clone(), def.name))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Build the aggregate function registry from every registered provider and
+    /// inject it into each provider, exactly once. Idempotent and cheap after the
+    /// first call. Invoked at the top of provider-dispatch paths so the registry
+    /// is complete by the first BUILD evaluation.
+    pub(crate) fn ensure_provider_functions_wired(&self) {
+        self.provider_functions_wired.call_once(|| {
+            let mut registry = provider::ProviderFunctionRegistry::default();
+            for provider in &self.providers {
+                registry.insert_provider(&provider.name, provider.provider.functions());
+            }
+            let registry = Arc::new(registry);
+            for provider in &self.providers {
+                provider
+                    .provider
+                    .set_function_registry(Arc::clone(&registry));
+            }
+        });
     }
 
     pub fn register_managed_driver(
