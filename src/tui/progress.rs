@@ -937,6 +937,10 @@ pub struct TuiProgressView {
     /// The active body view. `Tab` cycles it through [`ViewMode::Default`] plus
     /// every tab the header model exposes.
     view: Cell<ViewMode>,
+    /// Server-wall timestamp captured when the run finished and the viewport was
+    /// held open (user navigated off the main view). `Some` drives the green
+    /// "press q to quit" notice and freezes the elapsed clock at this instant.
+    finished_at_ms: Option<u64>,
 }
 
 impl TuiProgressView {
@@ -953,6 +957,7 @@ impl TuiProgressView {
             scroll: Cell::new(0),
             hscroll: Cell::new(0),
             view: Cell::new(ViewMode::Default),
+            finished_at_ms: None,
         }
     }
 
@@ -971,8 +976,18 @@ impl TuiProgressView {
         modes
     }
 
-    /// The dim help row pinned under the box: the keys the viewport responds to.
+    /// The help row pinned under the box. While held open after the run finishes
+    /// it turns into a green "press q to quit" notice; otherwise it lists the keys
+    /// the viewport responds to.
     fn help_line(&self) -> Line<'static> {
+        if self.finished_at_ms.is_some() {
+            return Line::from(Span::styled(
+                "  ✓ run finished — press q or Ctrl-C to quit",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         Line::from(Span::styled(
             "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view",
             Style::default()
@@ -1017,7 +1032,10 @@ impl TuiProgressView {
     /// count is omitted — the worker braille (flush right) conveys concurrency.
     fn header_line(&self, now_ms: u64, width: u16) -> Line<'static> {
         let width = usize::from(width).max(MIN_BOX_WIDTH);
-        let elapsed = human_elapsed(self.state.elapsed_ms(now_ms));
+        // Once finished, the clock is frozen at the finish instant rather than
+        // advancing with the live render wall clock.
+        let clock = self.finished_at_ms.unwrap_or(now_ms);
+        let elapsed = human_elapsed(self.state.elapsed_ms(clock));
 
         let mut left: Vec<Span<'static>> = Vec::with_capacity(5);
         left.push(Span::raw("╭─ "));
@@ -1118,6 +1136,18 @@ impl TUIAppView for TuiProgressView {
         self.hscroll.set(0);
     }
 
+    fn hold_after_finish(&self) -> bool {
+        // Auto-exit only from the main view; if the user is reading another tab
+        // (e.g. the failed list), keep the viewport up until they quit.
+        self.view.get() != ViewMode::Default
+    }
+
+    fn set_finished(&mut self) {
+        // Freeze the elapsed clock at the finish instant; the viewport keeps
+        // rendering while held but the time must stop counting.
+        self.finished_at_ms = Some(crate::engine::event::now_unix_ms());
+    }
+
     /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
     /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
     /// ```text
@@ -1190,7 +1220,12 @@ impl TUIAppView for TuiProgressView {
         if segment.is_empty() {
             return;
         }
-        let elapsed = human_elapsed_ms(self.state.elapsed_ms(crate::engine::event::now_unix_ms()));
+        // Match the live header: a held/finished run freezes the clock at the
+        // finish instant rather than the teardown wall clock.
+        let clock = self
+            .finished_at_ms
+            .unwrap_or_else(crate::engine::event::now_unix_ms);
+        let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
         let elapsed = elapsed.trim_start();
         use std::io::Write;
         drop(writeln!(std::io::stderr().lock(), "{elapsed} · {segment}"));
@@ -2142,6 +2177,50 @@ mod tests {
         v.hscroll(50);
         v.tab(true);
         assert_eq!(v.hscroll.get(), 0);
+    }
+
+    #[test]
+    fn hold_after_finish_only_off_main_view() {
+        let mut v = TuiProgressView::new("L");
+        // On the default (main) view: auto-exit, no hold.
+        assert!(!v.hold_after_finish());
+        // On another tab: hold the viewport open.
+        v.tab(true);
+        assert!(v.hold_after_finish());
+    }
+
+    #[test]
+    fn finished_shows_green_quit_notice() {
+        use crate::tui::app::TUIAppView;
+        let mut v = TuiProgressView::new("L");
+        // Before finishing, the help row lists the key bindings.
+        let help = format!("{}", v.render("⠋", 0, 80, 8).last().expect("help"));
+        assert!(help.contains("scroll"), "{help}");
+        assert!(!help.contains("quit"), "{help}");
+
+        v.set_finished();
+        let lines = v.render("⠋", 0, 80, 8);
+        let help = lines.last().expect("help");
+        let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("finished"), "{text}");
+        assert!(text.contains('q'), "{text}");
+        // The notice is green so it stands out.
+        assert_eq!(help.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn elapsed_clock_freezes_after_finish() {
+        use crate::tui::app::TUIAppView;
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, execute_start("//a:b"))); // anchor the clock at t=0
+
+        // Live: two renders at different wall clocks show different elapsed.
+        let h = |v: &TuiProgressView, now: u64| format!("{}", v.render("⠋", now, 80, 8)[0]);
+        assert_ne!(h(&v, 5_000), h(&v, 9_000));
+
+        // Frozen: after finish the header is identical regardless of `now_ms`.
+        v.set_finished();
+        assert_eq!(h(&v, 100_000), h(&v, 999_000));
     }
 
     #[test]

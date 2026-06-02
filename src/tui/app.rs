@@ -178,6 +178,19 @@ pub trait TUIAppView: Send {
     /// size borders, scroll long labels, and grow its body to fill the rows.
     fn render(&self, spinner: &str, now_ms: u64, width: u16, height: u16) -> Vec<Line<'static>>;
 
+    /// Whether the viewport should stay open after the run finishes and wait for
+    /// an explicit quit (`q` / Ctrl-C) instead of auto-exiting — e.g. the user
+    /// navigated away from the main view and would lose what they are looking at
+    /// on auto-tear-down. Default `false` (auto-exit).
+    fn hold_after_finish(&self) -> bool {
+        false
+    }
+
+    /// Mark the run as finished so the view can surface a "done — press q to
+    /// quit" notice. Called once when the viewport is being held open. No-op by
+    /// default.
+    fn set_finished(&mut self) {}
+
     /// After the live viewport is torn down, render a final build summary
     /// directly to the terminal (stderr) so it persists in scrollback. NOT
     /// routed through the log sink. No-op by default.

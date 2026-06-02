@@ -99,14 +99,34 @@ pub async fn run<A: App + 'static>(
     // Holds the app's result once its future resolves. We don't break the loop
     // here: the TUI stays up, rendering, until background cleanups drain too.
     let mut app_result: Option<anyhow::Result<A::Output>> = None;
+    // Latched once the finished run is held open on a non-main view: the viewport
+    // keeps rendering until the user quits explicitly (`q` / Ctrl-C).
+    let mut held = false;
+    // Set by `q` / Ctrl-C to break out of a held viewport.
+    let mut quit = false;
     let result: anyhow::Result<A::Output> = loop {
-        // App finished and the background queue is empty — nothing left to show.
+        // App finished and the background queue is empty — decide whether to exit.
         if let Some(r) = app_result.take() {
             if bg_pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
-                break r;
+                if held {
+                    // Held open after finish — exit only on explicit quit.
+                    if quit {
+                        break r;
+                    }
+                    app_result = Some(r);
+                } else if view.hold_after_finish() {
+                    // User navigated off the main view: hold the viewport up and
+                    // surface a "press q to quit" notice instead of auto-exiting.
+                    held = true;
+                    view.set_finished();
+                    app_result = Some(r);
+                } else {
+                    break r;
+                }
+            } else {
+                // Background cleanups still draining — keep the result, keep rendering.
+                app_result = Some(r);
             }
-            // Background cleanups still draining — keep the result, keep rendering.
-            app_result = Some(r);
         }
         tokio::select! {
             res = &mut app_handle, if app_result.is_none() => {
@@ -183,6 +203,15 @@ pub async fn run<A: App + 'static>(
                         ..
                     }))) if modifiers.contains(KeyModifiers::CONTROL) => {
                         shutdown.trigger();
+                        // Also quits a viewport held open after the run finished.
+                        quit = true;
+                    }
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('q'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if held => {
+                        quit = true;
                     }
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Up,
@@ -473,6 +502,62 @@ mod tests {
         assert!(
             ticks_after_app >= 1,
             "loop must keep rendering after the app finished while bg work drains; got {ticks_after_app} ticks"
+        );
+    }
+
+    /// Mirrors the held-viewport logic in `interactive::run`: when the app
+    /// finishes on a non-main view (`hold_after_finish == true`), the loop must
+    /// keep rendering and only break once an explicit quit (`q` / Ctrl-C) is
+    /// observed — never auto-exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_viewport_waits_for_explicit_quit() {
+        let app = tokio::spawn(async { 7u8 });
+        tokio::pin!(app);
+
+        let mut app_result: Option<u8> = None;
+        let mut held = false;
+        let mut quit = false;
+        // Simulate the user being off the main view at finish time.
+        let hold_after_finish = true;
+        let mut ticks_after_finish = 0usize;
+        let mut interval = tokio::time::interval(TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let result = loop {
+            if let Some(r) = app_result.take() {
+                // Background queue drained (== 0) immediately in this model.
+                if held {
+                    if quit {
+                        break r;
+                    }
+                    app_result = Some(r);
+                } else if hold_after_finish {
+                    held = true;
+                    app_result = Some(r);
+                } else {
+                    break r;
+                }
+            }
+            tokio::select! {
+                res = &mut app, if app_result.is_none() => {
+                    app_result = Some(res.expect("app task"));
+                }
+                _ = interval.tick() => {
+                    if held {
+                        ticks_after_finish += 1;
+                        // After a few held frames, the user presses `q`.
+                        if ticks_after_finish == 3 {
+                            quit = true;
+                        }
+                    }
+                }
+            }
+        };
+
+        assert_eq!(result, 7, "must return the app's value");
+        assert!(
+            ticks_after_finish >= 3,
+            "held viewport must keep rendering until explicit quit; got {ticks_after_finish}"
         );
     }
 
