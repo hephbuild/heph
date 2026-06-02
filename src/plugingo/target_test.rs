@@ -250,7 +250,7 @@ pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> T
     // its `test_binary` output lands next to us and `./test_binary`
     // resolves regardless of package depth.
     let run = vec![
-        TargetSpecValue::String("./test_binary2".to_string()),
+        TargetSpecValue::String("./test_binary".to_string()),
         TargetSpecValue::String("-test.v".to_string()),
     ];
 
