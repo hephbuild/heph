@@ -248,6 +248,18 @@ pub enum ViewMode {
     Failed,
 }
 
+/// Which target set the header counters are scoped to. `Matched` (the default)
+/// counts only the matched top-level targets; `All` counts every target the view
+/// has observed, including transitive deps. The `a` key toggles between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CountScope {
+    /// Counters scoped to the matched top-level target set.
+    #[default]
+    Matched,
+    /// Counters across every target the view has seen (incl. transitive deps).
+    All,
+}
+
 /// One freestanding segment of the header status line. The view joins items with
 /// ` · ` itself — items must NOT bake in separators. A [`HeaderItem::Tab`] binds a
 /// segment to a body [`ViewMode`]; the view highlights it (background colour)
@@ -573,14 +585,24 @@ impl BuildState {
     /// without separators. The header model wraps these in [`HeaderItem`]s (so
     /// the view owns the ` · ` joins); [`BuildState::counts_segment`] joins them
     /// for the plain-text final summary.
-    pub fn count_fields(&self) -> (String, String, String) {
-        let (built, cached, _running, failed) = self.header_counts();
-        let done = match self.matched_progress() {
-            Some((done, total, complete)) => {
-                let tilde = if complete { "" } else { "~" };
-                format!("{done} / {tilde}{total} done")
+    pub fn count_fields(&self, scope: CountScope) -> (String, String, String) {
+        let (built, cached, _running, failed) = self.header_counts(scope);
+        let done = match scope {
+            // All-targets scope: every observed target (`finished ∪ in_flight`),
+            // with the finished count over that running total. No `~` — the total
+            // grows as deps stream rather than resolving to a fixed matched set.
+            CountScope::All => {
+                let done = self.finished.len();
+                let total = done + self.in_flight_results.len();
+                format!("{done} / {total} done")
             }
-            None => format!("{built} done"),
+            CountScope::Matched => match self.matched_progress() {
+                Some((done, total, complete)) => {
+                    let tilde = if complete { "" } else { "~" };
+                    format!("{done} / {tilde}{total} done")
+                }
+                None => format!("{built} done"),
+            },
         };
         (done, format!("{cached} cached"), format!("{failed} failed"))
     }
@@ -588,8 +610,8 @@ impl BuildState {
     /// The textual count segment shared by the live header and the final
     /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
     /// braille — callers prepend the elapsed field themselves.
-    pub fn counts_segment(&self) -> String {
-        let (done, cached, failed) = self.count_fields();
+    pub fn counts_segment(&self, scope: CountScope) -> String {
+        let (done, cached, failed) = self.count_fields(scope);
         format!("{done} · {cached} · {failed}")
     }
 
@@ -624,14 +646,16 @@ impl BuildState {
     /// targets that hit cache (`matched ∩ cache_hit`), falling back to all cache
     /// hits before any `Matched` event arrives; `running` is in-flight results;
     /// `failed` is errors.
-    pub fn header_counts(&self) -> (usize, usize, usize, usize) {
-        let cached = if self.matched_seen {
-            self.matched
+    pub fn header_counts(&self, scope: CountScope) -> (usize, usize, usize, usize) {
+        let cached = match scope {
+            // All-targets scope: every addr that hit cache (deduped), deps included.
+            CountScope::All => self.cache_hit.len(),
+            CountScope::Matched if self.matched_seen => self
+                .matched
                 .iter()
                 .filter(|a| self.cache_hit.contains(*a))
-                .count()
-        } else {
-            self.local_hits + self.remote_hits
+                .count(),
+            CountScope::Matched => self.local_hits + self.remote_hits,
         };
         (
             self.built,
@@ -809,8 +833,10 @@ pub trait ProgressHeader: Send {
     /// the view joins them with ` · ` and highlights any [`HeaderItem::Tab`]
     /// whose mode is the active view — so a model must NOT bake in separators.
     /// `core` is the view's shared build state; headers that track their own
-    /// state ignore it.
-    fn header(&self, core: &BuildState) -> Vec<HeaderItem>;
+    /// state ignore it. `scope` selects whether the counts cover the matched set
+    /// or every observed target (toggled by the `a` key); state-private headers
+    /// ignore it.
+    fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem>;
     /// The bottom-border label.
     fn label(&self) -> String;
     /// Final summary segment printed after the run (after the elapsed clock).
@@ -833,8 +859,8 @@ impl BuildHeader {
 }
 
 impl ProgressHeader for BuildHeader {
-    fn header(&self, core: &BuildState) -> Vec<HeaderItem> {
-        let (done, cached, failed) = core.count_fields();
+    fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
+        let (done, cached, failed) = core.count_fields(scope);
         let mut items = vec![
             HeaderItem::text(done),
             HeaderItem::text(cached),
@@ -854,7 +880,8 @@ impl ProgressHeader for BuildHeader {
 
     fn last_render(&self, core: &BuildState) -> String {
         if core.has_activity() {
-            core.counts_segment()
+            // The final summary always reports the matched set, the canonical view.
+            core.counts_segment(CountScope::Matched)
         } else {
             String::new()
         }
@@ -902,7 +929,7 @@ impl ProgressHeader for GcHeader {
         }
     }
 
-    fn header(&self, _core: &BuildState) -> Vec<HeaderItem> {
+    fn header(&self, _core: &BuildState, _scope: CountScope) -> Vec<HeaderItem> {
         vec![HeaderItem::text(self.segment())]
     }
 
@@ -937,6 +964,9 @@ pub struct TuiProgressView {
     /// The active body view. `Tab` cycles it through [`ViewMode::Default`] plus
     /// every tab the header model exposes.
     view: Cell<ViewMode>,
+    /// Which target set the header counters cover. `a` toggles matched ⇄ all.
+    /// Held in a `Cell` so `render`/`header_item_spans` read it through `&self`.
+    scope: Cell<CountScope>,
     /// Server-wall timestamp captured when the run finished and the viewport was
     /// held open (user navigated off the main view). `Some` drives the green
     /// "press q to quit" notice and freezes the elapsed clock at this instant.
@@ -957,6 +987,7 @@ impl TuiProgressView {
             scroll: Cell::new(0),
             hscroll: Cell::new(0),
             view: Cell::new(ViewMode::Default),
+            scope: Cell::new(CountScope::Matched),
             finished_at_ms: None,
         }
     }
@@ -966,13 +997,18 @@ impl TuiProgressView {
     /// order. `Tab` walks this list.
     fn view_modes(&self) -> Vec<ViewMode> {
         let mut modes = vec![ViewMode::Default];
-        modes.extend(self.model.header(&self.state).iter().filter_map(|i| {
-            if let HeaderItem::Tab { mode, .. } = i {
-                Some(*mode)
-            } else {
-                None
-            }
-        }));
+        modes.extend(
+            self.model
+                .header(&self.state, self.scope.get())
+                .iter()
+                .filter_map(|i| {
+                    if let HeaderItem::Tab { mode, .. } = i {
+                        Some(*mode)
+                    } else {
+                        None
+                    }
+                }),
+        );
         modes
     }
 
@@ -982,14 +1018,19 @@ impl TuiProgressView {
     fn help_line(&self) -> Line<'static> {
         if self.finished_at_ms.is_some() {
             return Line::from(Span::styled(
-                "  ✓ run finished — press q or Ctrl-C to quit",
+                "  ✓ finished — press q or Ctrl-C to quit",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // The `a` hint reads as the *action*: it names the scope you switch to.
+        let scope_key = match self.scope.get() {
+            CountScope::Matched => "a all",
+            CountScope::All => "a matched",
+        };
         Line::from(Span::styled(
-            "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view",
+            format!("  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}"),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -1001,7 +1042,7 @@ impl TuiProgressView {
     /// (reversed background). This is the one place the ` · ` separator lives.
     fn header_item_spans(&self) -> Vec<Span<'static>> {
         let active = self.view.get();
-        let items = self.model.header(&self.state);
+        let items = self.model.header(&self.state, self.scope.get());
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 2);
         for (i, item) in items.iter().enumerate() {
             if i > 0 {
@@ -1139,16 +1180,12 @@ impl TUIAppView for TuiProgressView {
         self.hscroll.set(0);
     }
 
-    fn hold_after_finish(&self) -> bool {
-        // Auto-exit only from the main view; if the user is reading another tab
-        // (e.g. the failed list), keep the viewport up until they quit.
-        self.view.get() != ViewMode::Default
-    }
-
-    fn set_finished(&mut self) {
-        // Freeze the elapsed clock at the finish instant; the viewport keeps
-        // rendering while held but the time must stop counting.
-        self.finished_at_ms = Some(crate::engine::event::now_unix_ms());
+    fn toggle_scope(&mut self) {
+        let next = match self.scope.get() {
+            CountScope::Matched => CountScope::All,
+            CountScope::All => CountScope::Matched,
+        };
+        self.scope.set(next);
     }
 
     /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
@@ -1214,6 +1251,18 @@ impl TUIAppView for TuiProgressView {
         lines.push(self.bottom_line(now_ms, width));
         lines.push(self.help_line());
         lines
+    }
+
+    fn hold_after_finish(&self) -> bool {
+        // Auto-exit only from the main view; if the user is reading another tab
+        // (e.g. the failed list), keep the viewport up until they quit.
+        self.view.get() != ViewMode::Default
+    }
+
+    fn set_finished(&mut self) {
+        // Freeze the elapsed clock at the finish instant; the viewport keeps
+        // rendering while held but the time must stop counting.
+        self.finished_at_ms = Some(crate::engine::event::now_unix_ms());
     }
 
     /// Final report — the elapsed clock plus the header model's summary segment,
@@ -1768,7 +1817,7 @@ mod tests {
         h.apply(&ev(0, gc_swept(2, 1024)));
         h.apply(&ev(1, gc_swept(0, 0))); // zero-removal target still counts as explored
 
-        let seg = header_text(&h.header(&core));
+        let seg = header_text(&h.header(&core, CountScope::Matched));
         assert!(seg.contains("2 targets"), "{seg}");
         assert!(seg.contains("1.0 KiB"), "{seg}");
         assert_eq!(h.label(), "GC");
@@ -1784,7 +1833,7 @@ mod tests {
         core.apply(&ev(2, gc_swept(9, 9)));
 
         let h = BuildHeader::new("L");
-        let text = header_text(&h.header(&core));
+        let text = header_text(&h.header(&core, CountScope::Matched));
         assert!(text.contains("done"), "{text}");
         assert!(text.contains('⠁'), "expected worker braille: {text}");
     }
@@ -1829,6 +1878,46 @@ mod tests {
         // A duplicate ResultEnd for the same matched addr is idempotent.
         s.apply(&ev(5, result_end("//a:b", None)));
         assert!(s.summary().contains("matched 1 / 2"), "{}", s.summary());
+    }
+
+    fn local_cache_hit(addr: &str) -> BuildEventKind {
+        BuildEventKind::LocalCacheHit { addr: addr.into() }
+    }
+
+    #[test]
+    fn count_scope_toggles_done_and_cached_between_matched_and_all() {
+        let mut s = BuildState::new();
+        // One matched target plus a transitive dep, both finishing with a cache
+        // hit, and a third target still in flight.
+        s.apply(&ev(0, matched(&["//a:b"], true)));
+        s.apply(&ev(1, result_start("//a:b")));
+        s.apply(&ev(2, local_cache_hit("//a:b")));
+        s.apply(&ev(3, result_end("//a:b", None)));
+        s.apply(&ev(4, result_start("//dep:x")));
+        s.apply(&ev(5, local_cache_hit("//dep:x")));
+        s.apply(&ev(6, result_end("//dep:x", None)));
+        s.apply(&ev(7, result_start("//run:y")));
+
+        // Matched scope: only the matched target is counted.
+        let (done, cached, _) = s.count_fields(CountScope::Matched);
+        assert_eq!(done, "1 / 1 done", "matched done");
+        assert_eq!(cached, "1 cached", "matched cached");
+
+        // All scope: every observed target — both finished deps over the running
+        // total (incl. the in-flight one), and both cache hits.
+        let (done, cached, _) = s.count_fields(CountScope::All);
+        assert_eq!(done, "2 / 3 done", "all done");
+        assert_eq!(cached, "2 cached", "all cached");
+    }
+
+    #[test]
+    fn toggle_scope_flips_view_count_scope() {
+        let mut v = TuiProgressView::new("L");
+        assert_eq!(v.scope.get(), CountScope::Matched);
+        v.toggle_scope();
+        assert_eq!(v.scope.get(), CountScope::All);
+        v.toggle_scope();
+        assert_eq!(v.scope.get(), CountScope::Matched);
     }
 
     #[test]
@@ -2101,7 +2190,7 @@ mod tests {
         core.apply(&ev(0, max_workers(8)));
         core.apply(&ev(1, execute_start("//a:b")));
         let h = BuildHeader::new("L");
-        for item in h.header(&core) {
+        for item in h.header(&core, CountScope::Matched) {
             let text: String = item.spans().iter().map(|s| s.content.to_string()).collect();
             assert!(!text.contains('·'), "item baked in a separator: {text}");
         }

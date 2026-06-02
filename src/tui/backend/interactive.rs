@@ -243,6 +243,11 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) => view.tab(false),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('a'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.toggle_scope(),
                     Some(Ok(Event::Resize(w, _))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is
