@@ -1009,16 +1009,19 @@ impl TuiProgressView {
             }
             match item {
                 HeaderItem::Text(item_spans) => spans.extend(item_spans.iter().cloned()),
-                HeaderItem::Tab { mode, spans: item_spans } if *mode == active => {
+                HeaderItem::Tab {
+                    mode,
+                    spans: item_spans,
+                } if *mode == active => {
                     // Active tab: paint a background so the selected view reads
                     // as highlighted in the header.
                     spans.extend(item_spans.iter().map(|s| {
                         Span::styled(s.content.clone(), s.style.bg(Color::Blue).fg(Color::White))
                     }));
                 }
-                HeaderItem::Tab { spans: item_spans, .. } => {
-                    spans.extend(item_spans.iter().cloned())
-                }
+                HeaderItem::Tab {
+                    spans: item_spans, ..
+                } => spans.extend(item_spans.iter().cloned()),
             }
         }
         spans
@@ -1192,7 +1195,11 @@ impl TUIAppView for TuiProgressView {
             // Clamp the horizontal pan against the widest body line so panning
             // stops once the longest line's tail reaches the right edge.
             let avail = usize::from(width.max(1));
-            let max_w = body.iter().map(|l| spans_width(&l.spans)).max().unwrap_or(0);
+            let max_w = body
+                .iter()
+                .map(|l| spans_width(&l.spans))
+                .max()
+                .unwrap_or(0);
             let hscroll = self.hscroll.get().min(max_w.saturating_sub(avail));
             self.hscroll.set(hscroll);
 
