@@ -283,8 +283,7 @@ mod tests {
         std::fs::write(inner.join("file"), b"x").expect("write file");
         // 0555 dir: kernel refuses to unlink children → plain remove_dir_all
         // fails with PermissionDenied.
-        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555))
-            .expect("chmod ro");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
 
         assert!(
             std::fs::remove_dir_all(&root).is_err(),
