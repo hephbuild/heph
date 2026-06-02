@@ -44,17 +44,28 @@ fn render_command(cmd: &clap::Command, parent_path: &str, out: &mut String) {
         out.push_str(&format!("{about}\n\n"));
     }
 
-    // clap's usage starts with the command's own leaf name; prefix the parent path
-    // so it reads `heph <path> <args…>`. Multi-line override_usage forms pass
-    // through verbatim, matching how `--help` renders them.
-    let usage = cmd
-        .clone()
-        .render_usage()
-        .to_string()
-        .trim_start_matches("Usage:")
-        .trim()
-        .to_string();
-    out.push_str(&format!("```bash\n{parent_path} {usage}\n```\n\n"));
+    // clap's auto usage starts with the command's own leaf name, so prefix the
+    // parent path to read `heph <path> <args…>`. An explicit override_usage already
+    // spells out the full `heph …` invocation, so it must NOT be re-prefixed — detect
+    // that by the line already leading with the bin name. Continuation lines are
+    // indented to align under clap's `Usage: ` column in `--help`; strip that
+    // alignment whitespace for clean markdown.
+    let bin_prefix = format!("{BIN} ");
+    let usage = cmd.clone().render_usage().to_string();
+    let usage = usage.trim_start_matches("Usage:").trim();
+    let usage = usage
+        .lines()
+        .map(|line| {
+            let line = line.trim_start();
+            if line == BIN || line.starts_with(&bin_prefix) {
+                line.to_string()
+            } else {
+                format!("{parent_path} {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push_str(&format!("```bash\n{usage}\n```\n\n"));
 
     if let Some(table) = flags_table(cmd) {
         out.push_str(&table);
@@ -171,6 +182,43 @@ mod tests {
         assert!(
             !md.contains("gen-docs"),
             "hidden gen-docs leaked into output:\n{md}"
+        );
+    }
+
+    #[test]
+    fn multiline_override_usage_not_reprefixed_and_dedented() {
+        let mut out = String::new();
+        // override_usage already spells the full `heph query` invocation; its
+        // continuation line aligns under clap's `Usage: ` column in --help.
+        let cmd = clap::Command::new("query").override_usage(
+            "heph query <TARGET_ADDRESS>\n       heph query <LABEL> <PACKAGE_MATCHER>",
+        );
+        render_command(&cmd, BIN, &mut out);
+
+        // No double `heph heph` prefix; alignment whitespace stripped in markdown.
+        assert!(
+            out.contains("heph query <TARGET_ADDRESS>\nheph query <LABEL> <PACKAGE_MATCHER>"),
+            "override usage mangled:\n{out}"
+        );
+        assert!(
+            !out.contains("heph heph"),
+            "override usage was double-prefixed:\n{out}"
+        );
+        assert!(
+            !out.contains("       heph"),
+            "stale alignment whitespace leaked:\n{out}"
+        );
+    }
+
+    #[test]
+    fn auto_usage_gets_parent_prefix() {
+        let mut out = String::new();
+        let cmd = clap::Command::new("run").arg(clap::Arg::new("addr"));
+        render_command(&cmd, BIN, &mut out);
+
+        assert!(
+            out.contains("heph run"),
+            "auto usage missing parent prefix:\n{out}"
         );
     }
 

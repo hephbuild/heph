@@ -12,7 +12,7 @@ use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(Args, Clone)]
-#[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
+#[command(override_usage = "heph run <TARGET_ADDRESS>\n       heph run <LABEL> <PACKAGE_MATCHER>")]
 pub struct RunArgs {
     /// Target address (e.g., //pkg:name) OR Label
     #[arg(value_name = "TARGET_ADDRESS/LABEL")]

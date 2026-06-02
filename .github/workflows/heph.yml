@@ -135,35 +135,9 @@ jobs:
           name: ${{steps.build.outputs.bin_name}}
           path: ${{steps.build.outputs.bin_name}}
 
-  docs:
-    name: Gen CLI docs
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: build
-    steps:
-      - name: Download linux amd64 binary
-        uses: actions/download-artifact@v7
-        with:
-          name: heph_linux_amd64
-          path: .
-
-      # gen-docs is pure clap introspection — no FUSE, no devenv, runs natively
-      # on the ubuntu runner. Emit md file so upload_artifacts sweeps it into the
-      # release via the heph_* pattern.
-      - name: Generate cli.md
-        run: |
-          chmod +x heph_linux_amd64
-          ./heph_linux_amd64 gen-docs > cli.md
-
-      - name: Upload cli.md
-        uses: actions/upload-artifact@v6
-        with:
-          name: heph_cli.md
-          path: cli.md
-
   upload_artifacts:
     name: Upload artifacts
-    needs: [gen, build, docs]
+    needs: [gen, build]
     if: always() && needs.gen.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
