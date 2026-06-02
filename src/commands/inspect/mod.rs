@@ -1,5 +1,6 @@
 mod def;
 mod deps;
+mod deps_explorer;
 mod functions;
 mod hashin;
 mod hashout;
