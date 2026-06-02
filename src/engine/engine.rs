@@ -195,7 +195,7 @@ impl Drop for EngineFuse {
             }
         }
         if self.root.exists() {
-            drop(std::fs::remove_dir_all(&self.root));
+            drop(crate::engine::sandbox_cleaner::remove_dir_all(&self.root));
         }
     }
 }
@@ -254,7 +254,7 @@ fn sweep_stale_sandboxfuse_dirs(home: &Path) {
         // still has refs (which is exactly why we're sweeping), so
         // force is required to make sweep idempotent + bounded.
         force_umount(&lower);
-        drop(std::fs::remove_dir_all(&dir));
+        drop(crate::engine::sandbox_cleaner::remove_dir_all(&dir));
     }
 }
 

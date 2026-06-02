@@ -153,13 +153,20 @@ pub trait TUIAppView: Send {
     /// the render tick, so this must not draw.
     fn apply(&mut self, ev: &BuildEvent);
 
-    /// Number of pinned inline viewport rows to reserve.
-    fn rows(&self) -> u16;
+    /// Number of pinned inline viewport rows to reserve, given the full terminal
+    /// height. The paved-road view targets one third of the terminal.
+    fn rows(&self, term_height: u16) -> u16;
+
+    /// Scroll the body by `delta` rows (negative = up, positive = down). Called
+    /// from the backend's key handler; the repaint happens on the next render
+    /// tick. No-op by default for views without a scrollable body.
+    fn scroll(&mut self, _delta: i32) {}
 
     /// The lines for the pinned viewport, including the spinner row built from
     /// `spinner`. Called every render tick. `width` is the current terminal
-    /// column count, so the view can size borders and scroll long labels.
-    fn render(&self, spinner: &str, now_ms: u64, width: u16) -> Vec<Line<'static>>;
+    /// column count and `height` the reserved viewport row count, so the view can
+    /// size borders, scroll long labels, and grow its body to fill the rows.
+    fn render(&self, spinner: &str, now_ms: u64, width: u16, height: u16) -> Vec<Line<'static>>;
 
     /// After the live viewport is torn down, render a final build summary
     /// directly to the terminal (stderr) so it persists in scrollback. NOT

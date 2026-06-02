@@ -85,7 +85,7 @@ impl Engine {
                 // orphan empty dir when the bridge picks the FUSE side.
                 crate::hmemoizer::set_phase("execute:sandbox_remove");
                 sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
-                    match std::fs::remove_dir_all(&sandbox_dir) {
+                    match crate::engine::sandbox_cleaner::remove_dir_all(&sandbox_dir) {
                         Ok(_) => Ok(()),
                         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
                         Err(err) => Err(err),

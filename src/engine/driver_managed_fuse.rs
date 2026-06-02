@@ -51,7 +51,7 @@ impl ManagedDriverFuse {
         let upper_cleanup_dir = self.fuse_upper.join(&rel);
         let mut sandbox_cleanup: Option<crate::engine::sandbox_cleaner::SandboxCleanupJob> =
             Some(Box::new(move || {
-                std::fs::remove_dir_all(&upper_cleanup_dir)
+                crate::engine::sandbox_cleaner::remove_dir_all(&upper_cleanup_dir)
             }));
 
         let ws_dir = sandbox_dir.join("ws");

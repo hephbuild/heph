@@ -17,10 +17,59 @@
 //! the queue, jobs are processed in FIFO order on one thread.
 use crossbeam_channel::{Sender, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{io, thread};
+use std::{fs, io, thread};
+
+/// `remove_dir_all` that recovers from `PermissionDenied`. The Go module
+/// cache (and other read-only tooling) leaves `0555` directories behind;
+/// the kernel refuses to unlink their children until the dir is writable.
+/// On the first permission failure we recursively `chmod 0777` every
+/// directory under `dir` and retry the removal once.
+///
+/// Borrowed from the Go toolchain's `modfetch.MakeDirsReadWrite`:
+/// https://github.com/golang/go/blob/3c72dd513c30df60c0624360e98a77c4ae7ca7c8/src/cmd/go/internal/modfetch/fetch.go
+pub fn remove_dir_all(dir: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            make_dirs_read_write(dir);
+            fs::remove_dir_all(dir)
+        }
+        other => other,
+    }
+}
+
+/// Recursively make every directory under `dir` writable (`0777`) so its
+/// contents can be removed. Errors walking the tree are ignored — this is
+/// a best-effort prelude to a removal retry, mirroring Go's helper.
+#[cfg(unix)]
+fn make_dirs_read_write(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn walk(path: &Path) {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if !meta.is_dir() {
+            return;
+        }
+        drop(fs::set_permissions(path, fs::Permissions::from_mode(0o777)));
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            walk(&entry.path());
+        }
+    }
+
+    walk(dir);
+}
+
+#[cfg(not(unix))]
+fn make_dirs_read_write(_dir: &Path) {}
 
 /// One cleanup unit. Returning an `io::Result` lets the cleaner thread
 /// emit a uniform log line on failure (filtering out `NotFound`, which
@@ -220,6 +269,30 @@ mod tests {
             assert!(Instant::now() < deadline, "counter did not drain to zero");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_dir_all_recovers_from_readonly_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("sandbox");
+        let inner = root.join("ro");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        std::fs::write(inner.join("file"), b"x").expect("write file");
+        // 0555 dir: kernel refuses to unlink children → plain remove_dir_all
+        // fails with PermissionDenied.
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod ro");
+
+        assert!(
+            std::fs::remove_dir_all(&root).is_err(),
+            "precondition: plain removal must fail on read-only dir"
+        );
+
+        remove_dir_all(&root).expect("chmod-retry removal must succeed");
+        assert!(!root.exists(), "directory should be gone");
     }
 
     #[test]

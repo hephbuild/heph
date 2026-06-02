@@ -6,6 +6,7 @@
 //! receipt clock — so elapsed times stay correct across a future client/server
 //! process split. Rendering callers pass their own `now_ms` wall clock.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -14,13 +15,49 @@ use ratatui::text::{Line, Span};
 use crate::engine::event::{BuildEvent, BuildEventKind};
 use crate::tui::app::{CIAppView, TUIAppView};
 
-/// Total number of pinned viewport rows the progress block renders into:
-/// 1 top border + [`MAX_LONG_RUNNING`] body rows + 1 bottom border.
-pub const PROGRESS_ROWS: u16 = 8;
+/// Floor on the pinned viewport row count. The viewport targets one third of the
+/// terminal height (see [`rows_for_height`]) but never shrinks below this, which
+/// is the minimum that fits the box: top border + 1 body row + bottom border +
+/// help row.
+pub const MIN_PROGRESS_ROWS: u16 = 4;
 
-/// Maximum number of long-running target rows shown before collapsing the
-/// remainder into a single "+N more" line.
-pub const MAX_LONG_RUNNING: usize = 6;
+/// Pinned viewport rows for a given terminal height: one third of the terminal,
+/// clamped up to [`MIN_PROGRESS_ROWS`]. The box grows the body (slow/lock rows)
+/// to fill whatever rows it is given.
+pub fn rows_for_height(term_height: u16) -> u16 {
+    (term_height / 3).max(MIN_PROGRESS_ROWS)
+}
+
+/// Slice `lines` to a `rows`-tall window starting at `scroll`, returning the
+/// window and the clamped scroll offset. When content extends past the window
+/// bottom, the last visible row is replaced by a combined `+N more` collapse
+/// that counts *every* hidden line below (slow targets and lock waits alike).
+/// Scroll is clamped so the window never runs off the end.
+fn windowed(
+    mut lines: Vec<Line<'static>>,
+    rows: usize,
+    scroll: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let total = lines.len();
+    if rows == 0 {
+        return (Vec::new(), 0);
+    }
+    if total <= rows {
+        return (lines, 0);
+    }
+    let max_scroll = total - rows;
+    let scroll = scroll.min(max_scroll);
+    let mut window: Vec<Line<'static>> = lines.drain(scroll..scroll + rows).collect();
+    // Rows still hidden below the window. The collapse line itself displaces one
+    // shown row, so the reported count is the hidden rows plus that displaced one.
+    let hidden_below = max_scroll - scroll;
+    if hidden_below > 0
+        && let Some(last) = window.last_mut()
+    {
+        *last = Line::from(format!("  +{} more", hidden_below + 1));
+    }
+    (window, scroll)
+}
 
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
@@ -550,33 +587,31 @@ impl BuildState {
         )
     }
 
-    /// The long-running ("slow") target rows: up to [`MAX_LONG_RUNNING`] rows of
+    /// The long-running ("slow") target rows, one per slow target and uncollapsed:
     /// `addr (icon Ns)…` — one `(icon Ns)` group per op the target passed through
-    /// or is in — with a trailing "+N more" line when the list overflows. At most
-    /// [`MAX_LONG_RUNNING`] lines total (the collapse line consumes a slot).
-    pub fn long_running_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
-        let long = self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS);
-        let overflow = long.len() > MAX_LONG_RUNNING;
-        // When the list overflows, the "+N more" collapse line consumes one
-        // slot, so we show one fewer detailed row.
-        let shown = if overflow {
-            MAX_LONG_RUNNING - 1
-        } else {
-            MAX_LONG_RUNNING
-        };
-        let mut lines = Vec::with_capacity(MAX_LONG_RUNNING);
-        for (addr, _active_elapsed, breakdown) in long.iter().take(shown) {
-            let groups: String = breakdown
-                .iter()
-                .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
-                .collect();
-            lines.push(Line::from(format!("  {addr}{groups}")));
-        }
-        if overflow {
-            let extra = long.len() - shown;
-            lines.push(Line::from(format!("  +{extra} more")));
-        }
-        lines
+    /// or is in. The collapse into a "+N more" line is applied later, over the
+    /// *combined* slow + lock-wait body (see [`BuildState::body_lines`]), so the
+    /// overflow count covers both kinds of rows together.
+    fn slow_rows(&self, now_ms: u64) -> Vec<Line<'static>> {
+        self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS)
+            .into_iter()
+            .map(|(addr, _active_elapsed, breakdown)| {
+                let groups: String = breakdown
+                    .iter()
+                    .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
+                    .collect();
+                Line::from(format!("  {addr}{groups}"))
+            })
+            .collect()
+    }
+
+    /// The full body: lock-wait notices first (they take priority), then every
+    /// slow-target row. Uncollapsed — the caller windows/collapses it to the
+    /// available rows, so a "+N more" count spans locks and slow rows alike.
+    pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
+        let mut body = self.lock_wait_lines();
+        body.extend(self.slow_rows(now_ms));
+        body
     }
 
     /// Rows for addrs currently blocked on the result lock past the notice
@@ -768,6 +803,10 @@ pub struct TuiProgressView {
     state: BuildState,
     /// Per-command header content (build counts vs gc sweep stats).
     model: Box<dyn ProgressHeader>,
+    /// Body scroll offset (rows from the top of the combined body list). Held in
+    /// a `Cell` so `render` can clamp it against the live row count while staying
+    /// `&self`; `scroll()` mutates it from key events.
+    scroll: Cell<usize>,
 }
 
 impl TuiProgressView {
@@ -781,7 +820,18 @@ impl TuiProgressView {
         Self {
             state: BuildState::new(),
             model,
+            scroll: Cell::new(0),
         }
+    }
+
+    /// The dim help row pinned under the box: the keys the viewport responds to.
+    fn help_line(&self) -> Line<'static> {
+        Line::from(Span::styled(
+            "  ↑/↓ scroll",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ))
     }
 
     /// The rounded top border:
@@ -847,38 +897,55 @@ impl TUIAppView for TuiProgressView {
         self.model.apply(ev);
     }
 
-    fn rows(&self) -> u16 {
-        PROGRESS_ROWS
+    fn rows(&self, term_height: u16) -> u16 {
+        rows_for_height(term_height)
     }
 
-    /// Layout (top to bottom), a rounded box pinned to [`PROGRESS_ROWS`]:
+    fn scroll(&mut self, delta: i32) {
+        let cur = self.scroll.get();
+        let mag = delta.unsigned_abs() as usize;
+        let next = if delta >= 0 {
+            cur.saturating_add(mag)
+        } else {
+            cur.saturating_sub(mag)
+        };
+        self.scroll.set(next);
+    }
+
+    /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
+    /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
     /// ```text
     /// ╭─ heph · N built · N cached · N running · N failed ──── <workers> ─╮
-    ///   <slow rows...>            (padded to keep the box a fixed height)
+    ///   <slow rows + lock waits, scrollable, collapsed to "+N more">
     /// ╰─── <label> ───────────────────────────────────────────────────────╯
+    ///   ↑/↓ scroll
     /// ```
-    /// When nothing is slow the body shows a dim, slowly-drifting abstract field
-    /// instead of blank rows. The `spinner` is unused — liveness is conveyed by
-    /// the worker braille, the scrolling label, and the idle art.
-    fn render(&self, _spinner: &str, now_ms: u64, width: u16) -> Vec<Line<'static>> {
-        let body_rows = usize::from(PROGRESS_ROWS) - 2;
-        let mut lines = Vec::with_capacity(usize::from(PROGRESS_ROWS));
+    /// The body grows to fill the available rows; when it overflows it scrolls and
+    /// the last visible row collapses the remainder. When nothing is slow the body
+    /// shows a dim, slowly-drifting abstract field instead of blank rows. The
+    /// `spinner` is unused — liveness is conveyed by the worker braille, the
+    /// scrolling label, and the idle art.
+    fn render(&self, _spinner: &str, now_ms: u64, width: u16, height: u16) -> Vec<Line<'static>> {
+        let height = usize::from(height.max(MIN_PROGRESS_ROWS));
+        // height = 1 header + body_rows + 1 bottom border + 1 help row.
+        let body_rows = height - 3;
+        let mut lines = Vec::with_capacity(height);
         lines.push(self.header_line(now_ms, width));
-        // Lock-wait notices take priority in the body, followed by slow rows.
-        let mut body = self.state.lock_wait_lines();
-        body.extend(self.state.long_running_lines(now_ms));
+        let body = self.state.body_lines(now_ms);
         if body.is_empty() {
+            self.scroll.set(0);
             lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows));
         } else {
-            for line in body.into_iter().take(body_rows) {
-                lines.push(line);
-            }
+            let (window, scroll) = windowed(body, body_rows, self.scroll.get());
+            self.scroll.set(scroll);
+            lines.extend(window);
         }
-        // Pad the body so the bottom border always pins to the last row.
+        // Pad the body so the bottom border always pins to the same row.
         while lines.len() < body_rows + 1 {
             lines.push(Line::from(""));
         }
         lines.push(self.bottom_line(now_ms, width));
+        lines.push(self.help_line());
         lines
     }
 
@@ -1251,7 +1318,7 @@ mod tests {
         s.apply(&ev(3_000, execute_end("//slow:x")));
         s.apply(&ev(3_000, local_write_start("//slow:x")));
 
-        let line = format!("{}", s.long_running_lines(9_000)[0]);
+        let line = format!("{}", s.slow_rows(9_000)[0]);
         assert!(line.contains("//slow:x"), "{line}");
         assert!(
             line.contains(&format!("({} ", Op::Execute.icon())),
@@ -1271,10 +1338,11 @@ mod tests {
     fn tui_view_box_layout_header_body_label() {
         let mut v = TuiProgressView::new("Running //a:b");
         v.apply(&ev(0, execute_start("//slow:x")));
-        let lines = v.render("⠋", 10_000, 80);
+        let height = 8u16;
+        let lines = v.render("⠋", 10_000, 80, height);
 
-        // Always a fixed-height box.
-        assert_eq!(lines.len(), usize::from(PROGRESS_ROWS));
+        // The box fills exactly the rows it was given.
+        assert_eq!(lines.len(), usize::from(height));
 
         // Top border: rounded corners + title, not the label.
         let header = format!("{}", lines.first().expect("header line"));
@@ -1284,15 +1352,19 @@ mod tests {
         assert!(header.contains("10s"), "header: {header}");
         assert!(!header.contains("Running //a:b"), "header: {header}");
 
-        // Bottom border: rounded corners + the label.
-        let footer = format!("{}", lines.last().expect("footer line"));
+        // Help row is pinned last, below the box.
+        let help = format!("{}", lines.last().expect("help line"));
+        assert!(help.contains("scroll"), "help: {help}");
+
+        // Bottom border (second-to-last row): rounded corners + the label.
+        let footer = format!("{}", lines[lines.len() - 2]);
         assert!(footer.starts_with("╰─"), "footer: {footer}");
         assert!(footer.ends_with('╯'), "footer: {footer}");
         assert!(footer.contains("Running //a:b"), "footer: {footer}");
 
-        // The slow row sits in the body between the borders.
+        // The slow row sits in the body between the header and the bottom border.
         assert!(
-            lines[1..lines.len() - 1]
+            lines[1..lines.len() - 2]
                 .iter()
                 .any(|l| format!("{l}").contains("//slow:x")),
             "expected slow row in body, got {lines:?}"
@@ -1315,7 +1387,7 @@ mod tests {
         v.apply(&ev(4, result_start("//a:failed")));
         v.apply(&ev(5, result_end("//a:failed", Some("boom".into()))));
 
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         assert!(header.contains("1 done"), "{header}");
         assert!(header.contains("1 cached"), "{header}");
         assert!(header.contains("1 failed"), "{header}");
@@ -1332,12 +1404,12 @@ mod tests {
         v.apply(&ev(0, matched(&["//a:x", "//a:y", "//a:z"], false)));
         v.apply(&ev(1, result_start("//a:x")));
         v.apply(&ev(2, result_end("//a:x", None)));
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         assert!(header.contains("1 / ~3 done"), "{header}");
 
         // Matcher resolves: the `~` drops.
         v.apply(&ev(3, matched(&[], true)));
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         assert!(header.contains("1 / 3 done"), "{header}");
         assert!(!header.contains('~'), "{header}");
     }
@@ -1347,7 +1419,7 @@ mod tests {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, max_workers(8)));
         v.apply(&ev(1, execute_start("//a:b")));
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         // " · ⠁" appears after "failed".
         let failed_at = header.find("failed").expect("failed in header");
         let braille_at = header.find('⠁').expect("braille in header");
@@ -1367,14 +1439,14 @@ mod tests {
         v.apply(&ev(0, max_workers(8)));
         // One busy worker → first cell shows the 1-dot glyph, in the header.
         v.apply(&ev(1, execute_start("//a:b")));
-        let header = format!("{}", v.render("⠋", 120, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 120, 120, 8).first().expect("header"));
         assert!(header.contains('⠁'), "expected 1-busy braille: {header}");
     }
 
     #[test]
     fn no_worker_braille_before_max_workers_event() {
         let v = TuiProgressView::new("L");
-        let header = format!("{}", v.render("⠋", 0, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 0, 120, 8).first().expect("header"));
         for g in ['⠁', '⠃', '⠇', '⠧', '⠷', '⠿', '⡿', '⣿'] {
             assert!(!header.contains(g), "no braille expected: {header}");
         }
@@ -1524,15 +1596,16 @@ mod tests {
         for i in 0..20 {
             v.apply(&ev(0, execute_start(&format!("//pkg:t{i}"))));
         }
-        let lines = v.render("⠋", 10_000, 100);
-        // Fixed-height box: header + body + footer.
-        assert_eq!(lines.len(), usize::from(PROGRESS_ROWS));
-        // The footer carries the label.
-        let footer = format!("{}", lines.last().expect("footer line"));
+        let height = 8u16;
+        let lines = v.render("⠋", 10_000, 100, height);
+        // The box fills exactly the rows it was given.
+        assert_eq!(lines.len(), usize::from(height));
+        // The bottom border (second-to-last row) carries the label.
+        let footer = format!("{}", lines[lines.len() - 2]);
         assert!(footer.contains("Running //x:y"), "{footer}");
-        // The slow block overflowed, so a "+N more" collapse appears in the body.
+        // 20 slow rows can't fit the small body, so a "+N more" collapse appears.
         assert!(
-            lines[1..lines.len() - 1]
+            lines[1..lines.len() - 2]
                 .iter()
                 .any(|l| format!("{l}").contains("more")),
             "expected collapse line in body, got {lines:?}"
@@ -1583,8 +1656,8 @@ mod tests {
     fn slow_targets_replace_idle_field_in_body() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, execute_start("//slow:x")));
-        let lines = v.render("⠋", 10_000, 80);
-        let body: String = lines[1..lines.len() - 1]
+        let lines = v.render("⠋", 10_000, 80, 8);
+        let body: String = lines[1..lines.len() - 2]
             .iter()
             .map(|l| format!("{l}"))
             .collect();
@@ -1666,5 +1739,89 @@ mod tests {
             assert_eq!(s.chars().count(), usize::from(w), "short @ {w}: {s}");
             assert_eq!(l.chars().count(), usize::from(w), "long @ {w}: {l}");
         }
+    }
+
+    #[test]
+    fn rows_for_height_is_one_third_clamped_to_min() {
+        assert_eq!(rows_for_height(30), 10);
+        assert_eq!(rows_for_height(24), 8);
+        // Tiny terminals clamp up to the minimum box height.
+        assert_eq!(rows_for_height(3), MIN_PROGRESS_ROWS);
+        assert_eq!(rows_for_height(0), MIN_PROGRESS_ROWS);
+    }
+
+    #[test]
+    fn render_fills_exactly_the_given_height() {
+        let v = TuiProgressView::new("L");
+        for h in [MIN_PROGRESS_ROWS, 8, 20] {
+            let lines = v.render("⠋", 0, 80, h);
+            assert_eq!(lines.len(), usize::from(h), "height {h}");
+        }
+        // Below the minimum the height is clamped up, never fewer rows.
+        let lines = v.render("⠋", 0, 80, 1);
+        assert_eq!(lines.len(), usize::from(MIN_PROGRESS_ROWS));
+    }
+
+    #[test]
+    fn help_row_is_pinned_last_and_dim() {
+        let v = TuiProgressView::new("L");
+        let lines = v.render("⠋", 0, 80, 8);
+        let help = lines.last().expect("help line");
+        let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("scroll"), "{text}");
+        assert_eq!(help.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    fn lock_wait_start(addr: &str, pid: u32) -> BuildEventKind {
+        BuildEventKind::ResultLockWaitStart {
+            addr: addr.into(),
+            holder_pid: Some(pid),
+        }
+    }
+
+    #[test]
+    fn body_collapse_counts_locks_and_slow_together() {
+        // 2 lock waits + 4 slow targets = 6 body rows. Regression: the old
+        // collapse counted only the slow overflow and ignored hidden lock rows.
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, lock_wait_start("//l:1", 1)));
+        v.apply(&ev(0, lock_wait_start("//l:2", 2)));
+        for i in 0..4 {
+            v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
+        }
+        // height 7 → body_rows = 4. 6 items > 4 ⇒ window shows 3 + a collapse.
+        // total=6, body_rows=4, max_scroll=2, scroll=0 ⇒ hidden_below=2 ⇒ +3 more.
+        let lines = v.render("⠋", 10_000, 80, 7);
+        let collapse = lines
+            .iter()
+            .map(|l| format!("{l}"))
+            .find(|t| t.contains("more"))
+            .expect("collapse line");
+        assert!(collapse.contains("+3 more"), "{collapse}");
+    }
+
+    #[test]
+    fn scroll_advances_the_body_window_and_clamps() {
+        let mut v = TuiProgressView::new("L");
+        for i in 0..6 {
+            v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
+        }
+        // body_rows = 4, 6 slow rows, max_scroll = 2.
+        // Scroll past the end; render clamps to the bottom ⇒ no collapse there.
+        v.scroll(10);
+        let body: String = v
+            .render("⠋", 10_000, 80, 7)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(!body.contains("more"), "no collapse at bottom: {body}");
+        // Back to the top: the collapse returns.
+        v.scroll(-10);
+        let body: String = v
+            .render("⠋", 10_000, 80, 7)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("more"), "collapse at top: {body}");
     }
 }

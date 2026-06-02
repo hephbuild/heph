@@ -33,7 +33,16 @@ pub async fn run<A: App + 'static>(
     // stack so it survives pause/resume (only the terminal is rebuilt across a
     // pause cycle, not the view's aggregated state).
     let mut view = app.tui_view();
-    let rows = view.rows();
+    // Size the inline viewport to ~1/3 of the terminal height. Queried before the
+    // viewport is built (so the first frame is already sized); the column count is
+    // re-derived from the backend below.
+    let term_height = crossterm::terminal::size()
+        .map(|(_, h)| h)
+        .unwrap_or(24)
+        .max(1);
+    // Mutable: recomputed (and the viewport rebuilt) on terminal resize so the
+    // box stays ~1/3 of the live terminal height.
+    let mut rows = view.rows(term_height);
     let mut rx = sink.switch_to_buffered();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     // We own the build-event channel: the sender goes to the app via
@@ -174,6 +183,16 @@ pub async fn run<A: App + 'static>(
                     }))) if modifiers.contains(KeyModifiers::CONTROL) => {
                         shutdown.trigger();
                     }
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Up,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.scroll(-1),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Down,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.scroll(1),
                     Some(Ok(Event::Resize(w, _))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is
@@ -204,13 +223,13 @@ pub async fn run<A: App + 'static>(
                     // The tick is a synchronous draw-owning point, so the
                     // EventStream teardown/restore inside has no `.await` between
                     // them — the no-race invariant holds (see stderr_backend.rs).
-                    reanchor_after_resize(&mut terminal, &mut events, &mut cols);
+                    reanchor_after_resize(&mut terminal, &mut events, &mut cols, &mut rows);
                     needs_resize = false;
                 }
                 drain_logs_to_terminal(&mut terminal, &mut rx, cols);
                 spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
                 let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
-                let lines = view.render(frame, now_unix_ms(), cols);
+                let lines = view.render(frame, now_unix_ms(), cols, rows);
                 drop(terminal.draw(|f| {
                     let area = f.area();
                     f.render_widget(Paragraph::new(Text::from(lines)), area);
@@ -257,18 +276,40 @@ fn reanchor_terminal<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) {
     drop(terminal.autoresize());
 }
 
-/// Re-anchor after a terminal resize. The DSR query inside `autoresize` reads
-/// the reply off `/dev/tty`; crossterm's `EventStream` reader consumes the same
-/// tty, so it must be torn down across the query (see `stderr_backend.rs`
-/// invariant). There must be no `.await` between the two `events` writes —
-/// callers run this from the synchronous tick arm.
+/// Re-anchor after a terminal resize, keeping the inline viewport at ~1/3 of the
+/// new terminal height. The DSR query (inside `autoresize`, and again when we
+/// rebuild the terminal for a new row count) reads its reply off `/dev/tty`;
+/// crossterm's `EventStream` reader consumes the same tty, so it must be torn
+/// down across the query (see `stderr_backend.rs` invariant). There must be no
+/// `.await` between the two `events` writes — callers run this from the
+/// synchronous tick arm.
 fn reanchor_after_resize(
     terminal: &mut StderrTerminal,
     events: &mut Option<EventStream>,
     cols: &mut u16,
+    rows: &mut u16,
 ) {
     *events = None;
-    reanchor_terminal(terminal);
+    let term_height = terminal.size().map(|r| r.height).unwrap_or(24).max(1);
+    let desired = crate::tui::progress::rows_for_height(term_height);
+    if desired != *rows {
+        // Row count changed: rebuild the inline terminal so the viewport reserves
+        // the new height. `with_options` re-queries the cursor and re-anchors the
+        // viewport, same as the pause/resume rebuild.
+        if let Ok(new_term) = Terminal::with_options(
+            StderrBackend::new(io::stderr()),
+            TerminalOptions {
+                viewport: Viewport::Inline(desired),
+            },
+        ) {
+            *terminal = new_term;
+            *rows = desired;
+        } else {
+            reanchor_terminal(terminal);
+        }
+    } else {
+        reanchor_terminal(terminal);
+    }
     *events = Some(EventStream::new());
     // The backend size ratatui actually re-anchored to is the source of truth.
     *cols = terminal_cols(terminal);
@@ -430,7 +471,7 @@ mod tests {
     fn resize_reanchors_inline_viewport_and_reflows() {
         use super::reanchor_terminal;
         use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{PROGRESS_ROWS, TuiProgressView};
+        use crate::tui::progress::{MIN_PROGRESS_ROWS, TuiProgressView};
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::buffer::Buffer;
@@ -448,7 +489,7 @@ mod tests {
 
         fn draw_view(terminal: &mut Terminal<TestBackend>, view: &TuiProgressView) {
             let cols = terminal.size().expect("size").width;
-            let lines = view.render("⠋", 10_000, cols);
+            let lines = view.render("⠋", 10_000, cols, MIN_PROGRESS_ROWS);
             terminal
                 .draw(|f| {
                     f.render_widget(Paragraph::new(Text::from(lines)), f.area());
@@ -459,7 +500,7 @@ mod tests {
         let mut terminal = Terminal::with_options(
             TestBackend::new(80, 24),
             TerminalOptions {
-                viewport: Viewport::Inline(PROGRESS_ROWS),
+                viewport: Viewport::Inline(MIN_PROGRESS_ROWS),
             },
         )
         .expect("terminal");

@@ -28,7 +28,9 @@ impl ManagedDriverOs {
         let sandbox_dir = req.sandbox_dir.clone();
         let cleanup_dir = sandbox_dir.clone();
         let mut sandbox_cleanup: Option<crate::engine::sandbox_cleaner::SandboxCleanupJob> =
-            Some(Box::new(move || std::fs::remove_dir_all(&cleanup_dir)));
+            Some(Box::new(move || {
+                crate::engine::sandbox_cleaner::remove_dir_all(&cleanup_dir)
+            }));
         let ws_dir = sandbox_dir.join("ws");
         fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
 
