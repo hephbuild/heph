@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
+use crate::plugingo::addr_util::{import_path_to_dep_group, to_run_value, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 
@@ -151,8 +151,8 @@ pub fn build_test_spec(
     all_libs: &[(String, Addr)],
 ) -> TargetSpec {
     let mut script = write_importcfg_script(all_libs, None);
-    script.push_str(
-        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"\n",
+    script.push(
+        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"".to_string(),
     );
 
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
@@ -170,7 +170,7 @@ pub fn build_test_spec(
     }
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(script));
+    config.insert("run".to_string(), to_run_value(script));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
@@ -273,19 +273,19 @@ fn compile_run_script(
     transitive_libs: &[(String, Addr)],
     out_file: &str,
     has_embed: bool,
-) -> String {
-    let mut script = write_importcfg_script(transitive_libs, None);
+) -> Vec<String> {
+    let mut lines = write_importcfg_script(transitive_libs, None);
     let embedcfg_flag = if has_embed {
         " -embedcfg \"$SRC_EMBED\""
     } else {
         ""
     };
 
-    script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
+    lines.push(format!(
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
     ));
 
-    script
+    lines
 }
 
 #[expect(
@@ -302,7 +302,7 @@ fn build_lib_spec_inner(
     gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
-    run: String,
+    run: Vec<String>,
     out_file: String,
 ) -> TargetSpec {
     let mut deps: BTreeMap<String, Value> = transitive_libs
@@ -342,7 +342,7 @@ fn build_lib_spec_inner(
     }
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
+    config.insert("run".to_string(), to_run_value(run));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
@@ -388,6 +388,21 @@ mod tests {
     use super::*;
     use crate::htpkg::PkgBuf;
     use crate::pluginfs;
+
+    fn run_str(spec: &TargetSpec) -> String {
+        match spec.config.get("run").unwrap() {
+            Value::String(s) => s.clone(),
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.as_str(),
+                    _ => panic!("run entry not a string"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("run not string or list"),
+        }
+    }
 
     fn mk_addr(pkg: &str, name: &str) -> Addr {
         Addr::new(PkgBuf::from(pkg), name.to_string(), Default::default())
@@ -485,10 +500,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("tool compile"),
             "run must use go tool compile: {run}"
@@ -550,10 +562,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("example.com/pkg_test"),
             "xtest compile must use _test import path: {run}"
@@ -601,10 +610,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("-p \"main\""),
             "testmain lib must use -p main: {run}"
@@ -659,10 +665,7 @@ mod tests {
             &testmain_lib,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("tool link"),
             "build_test run must use go tool link: {run}"

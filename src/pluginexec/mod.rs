@@ -85,15 +85,51 @@ fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
     args
 }
 
+#[derive(serde::Serialize)]
+struct InitLine {
+    /// 1-based line number.
+    n: usize,
+    /// Line number padded to the width of the largest number, for `show`.
+    label: String,
+    /// The command text.
+    text: String,
+    /// The command text wrapped as a single bash single-quoted token, safe to
+    /// drop into the `__heph_cmds` array even when `text` spans multiple lines
+    /// or contains single quotes.
+    quoted: String,
+}
+
+/// Wrap `s` in single quotes for bash, escaping embedded single quotes via the
+/// `'\''` idiom. Newlines inside `s` are preserved literally.
+fn bash_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
     let cmds = (!run.is_empty()).then(|| run.join("\n"));
+
+    // Width of the largest line number so the `|` column in `show` stays aligned.
+    let width = run.len().to_string().len();
+    let lines: Vec<InitLine> = run
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let n = i + 1;
+            InitLine {
+                n,
+                label: format!("{n:>width$}"),
+                quoted: bash_squote(text),
+                text: text.clone(),
+            }
+        })
+        .collect();
 
     let mut env = minijinja::Environment::new();
     env.add_template("init.sh", SHELL_INIT_SH)
         .context("compile init.sh template")?;
     env.get_template("init.sh")
         .context("load init.sh template")?
-        .render(minijinja::context! { cmds })
+        .render(minijinja::context! { cmds, lines })
         .context("render init.sh template")
 }
 
@@ -1362,6 +1398,60 @@ mod tests {
     }
 
     #[test]
+    fn test_render_shell_init_numbered_runs_and_show() {
+        let run = vec![
+            "echo one".to_string(),
+            "echo two".to_string(),
+            "echo three".to_string(),
+        ];
+        let out = render_shell_init(&run).expect("render");
+
+        // Per-line run/xrun functions exist for every line, each a tiny O(1)
+        // delegator to the shared helper (no per-line command duplication).
+        for n in 1..=3 {
+            assert!(
+                out.contains(&format!("run{n}() {{ __heph_run_upto {n}; }}")),
+                "missing run{n} delegator: {out}"
+            );
+            assert!(
+                out.contains(&format!("xrun{n}() {{ __heph_run_upto {n} x; }}")),
+                "missing xrun{n} delegator: {out}"
+            );
+        }
+
+        // Commands live once in the array; runN replays a prefix via the helper.
+        assert!(out.contains("__heph_cmds=("), "missing cmds array: {out}");
+        assert!(out.contains("'echo one'"), "array missing line 1: {out}");
+        assert!(out.contains("'echo three'"), "array missing line 3: {out}");
+        // Each command is materialized exactly once as a quoted array element —
+        // no per-line duplication (the old runN bodies were O(n^2)).
+        assert_eq!(
+            out.matches("'echo two'").count(),
+            1,
+            "command should appear once as a quoted array element: {out}"
+        );
+
+        // show prints raw commands, showl prints numbered "N | line" form.
+        assert!(out.contains("show()"), "missing show: {out}");
+        assert!(out.contains("showl()"), "missing showl: {out}");
+        assert!(out.contains("1 │ echo one"), "showl line 1: {out}");
+        assert!(out.contains("3 │ echo three"), "showl line 3: {out}");
+        assert!(
+            out.contains("echo one\necho two\necho three"),
+            "show raw cmds: {out}"
+        );
+    }
+
+    #[test]
+    fn test_render_shell_init_pads_line_numbers() {
+        // 10 lines -> numbers 1..10, width 2, so "1" is right-padded to " 1".
+        let run: Vec<String> = (1..=10).map(|i| format!("echo {i}")).collect();
+        let out = render_shell_init(&run).expect("render");
+        assert!(out.contains(" 1 │ echo 1"), "line 1 not padded: {out}");
+        assert!(out.contains("10 │ echo 10"), "line 10 misaligned: {out}");
+    }
+
+    #[test]
     fn test_render_shell_init_does_not_html_escape_cmds() {
         // The template renders a shell script, not HTML — special chars must pass
         // through verbatim, otherwise the generated bash is corrupted.
@@ -1371,6 +1461,65 @@ mod tests {
             out.contains("a && b < c > d \"e\" 'f'"),
             "shell chars were escaped: {out}"
         );
+    }
+
+    #[test]
+    fn test_bash_squote_escapes_single_quotes() {
+        // Commands like `awk -F'"' '/Dir/'` carry single quotes — the array
+        // element must use the `'\''` idiom so eval re-parses the original text.
+        assert_eq!(bash_squote("echo hi"), "'echo hi'");
+        assert_eq!(bash_squote("a'b"), "'a'\\''b'");
+        // Multi-line command stays one token (newline preserved inside quotes).
+        assert_eq!(bash_squote("if x; then\n  y\nfi"), "'if x; then\n  y\nfi'");
+    }
+
+    #[test]
+    fn test_render_shell_init_quotes_array_elements() {
+        // A command containing single quotes must be safely single-quoted in the
+        // __heph_cmds array (otherwise the generated bash fails to parse).
+        let run = vec!["awk -F'\"' '/Dir/'".to_string()];
+        let out = render_shell_init(&run).expect("render");
+        assert!(
+            out.contains("'awk -F'\\''\"'\\'' '\\''/Dir/'\\'''"),
+            "array element not safely single-quoted: {out}"
+        );
+    }
+
+    // Functionally validate that the generated bash parses and that `runN`
+    // replays exactly the first N commands — including a command with single
+    // quotes and a multi-line compound statement (the cases the array+eval
+    // design has to get right).
+    #[test]
+    fn test_render_shell_init_runn_executes_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init_path = dir.path().join("init.sh");
+        let run = vec![
+            "printf 'a\\n' >> out.txt".to_string(),
+            "if true; then\n  printf 'b\\n' >> out.txt\nfi".to_string(),
+            "printf 'c\\n' >> out.txt".to_string(),
+        ];
+        std::fs::write(&init_path, render_shell_init(&run).expect("render")).expect("write");
+
+        // Source the rcfile (defines the functions), then run a 2-line prefix.
+        let output = std::process::Command::new("bash")
+            .arg("--norc")
+            .arg("-c")
+            .arg(format!(
+                "source '{}' >/dev/null 2>&1; run2",
+                init_path.display()
+            ))
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn bash");
+        assert!(
+            output.status.success(),
+            "bash failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let produced = std::fs::read_to_string(dir.path().join("out.txt")).expect("read out.txt");
+        // run2 → lines 1 and 2 only; line 3 ("c") must not run.
+        assert_eq!(produced, "a\nb\n", "run2 should replay exactly lines 1-2");
     }
 
     #[test]

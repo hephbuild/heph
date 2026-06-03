@@ -1,6 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
+use crate::plugingo::addr_util::to_run_value;
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 
@@ -29,27 +30,30 @@ pub fn build_spec(
     goroot: &str,
 ) -> TargetSpec {
     let out_file = archive_filename(import_path);
-    let mut run = String::new();
-    run.push_str(&format!(
-        "export_path=$(\"$SRC_GO_BIN\" list -export -f '{{{{.Export}}}}' \"{}\")\n",
-        import_path
-    ));
-    run.push_str("if [ -z \"$export_path\" ]; then\n");
-    run.push_str(&format!(
-        "  echo \"go list -export returned empty path for {}\" >&2\n",
-        import_path
-    ));
-    run.push_str("  exit 1\nfi\n");
-    // BSD/macOS cp copies extended attributes by default
-    // (com.apple.quarantine from Go's build cache) and fails with EPERM
-    // on filesystems that reject xattr writes (e.g. our FUSE overlay).
-    // `cp -X` on macOS suppresses that; on GNU cp `-X` means
-    // `--one-file-system`, so branch on `uname`.
-    run.push_str("if [ \"$(uname)\" = Darwin ]; then CP=\"cp -X\"; else CP=\"cp\"; fi\n");
-    run.push_str(&format!("$CP \"$export_path\" \"{}\"\n", out_file));
+    let run = vec![
+        format!(
+            "export_path=$(\"$SRC_GO_BIN\" list -export -f '{{{{.Export}}}}' \"{}\")",
+            import_path
+        ),
+        // The if-block stays one element: it's a single compound statement that
+        // breaks if its lines are split across separate `run` entries.
+        format!(
+            "if [ -z \"$export_path\" ]; then\n  \
+               echo \"go list -export returned empty path for {}\" >&2\n  \
+               exit 1\nfi",
+            import_path
+        ),
+        // BSD/macOS cp copies extended attributes by default
+        // (com.apple.quarantine from Go's build cache) and fails with EPERM
+        // on filesystems that reject xattr writes (e.g. our FUSE overlay).
+        // `cp -X` on macOS suppresses that; on GNU cp `-X` means
+        // `--one-file-system`, so branch on `uname`.
+        "if [ \"$(uname)\" = Darwin ]; then CP=\"cp -X\"; else CP=\"cp\"; fi".to_string(),
+        format!("$CP \"$export_path\" \"{}\"", out_file),
+    ];
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
+    config.insert("run".to_string(), to_run_value(run));
     config.insert(
         "deps".to_string(),
         Value::Map(HashMap::from([(
@@ -114,6 +118,21 @@ mod tests {
     use crate::htaddr::Addr;
     use crate::htpkg::PkgBuf;
 
+    fn run_str(spec: &TargetSpec) -> String {
+        match spec.config.get("run").unwrap() {
+            Value::String(s) => s.clone(),
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.as_str(),
+                    _ => panic!("run entry not a string"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("run not string or list"),
+        }
+    }
+
     fn test_addr() -> Addr {
         Addr::new(
             PkgBuf::from("@heph/go/std/fmt"),
@@ -164,10 +183,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s,
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("list -export"),
             "run should use go list -export: {}",

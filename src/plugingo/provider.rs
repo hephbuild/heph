@@ -2095,6 +2095,21 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn run_str(spec: &crate::engine::provider::TargetSpec) -> String {
+        match spec.config.get("run").unwrap() {
+            Value::String(s) => s.clone(),
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.as_str(),
+                    _ => panic!("run entry not a string"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("run not string or list"),
+        }
+    }
+
     fn go_available() -> bool {
         std::process::Command::new("go")
             .arg("version")
@@ -2744,10 +2759,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("server", "build_lib"))
             .await
             .unwrap();
-        let run = match resp.target_spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&resp.target_spec);
         assert!(
             run.contains("-embedcfg"),
             "build_lib run script must contain -embedcfg for embed package: {run}"
@@ -2792,10 +2804,7 @@ mod tests {
             !deps.contains_key("embed"),
             "build_lib for non-embed package must not have 'embed' dep"
         );
-        let run = match resp.target_spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&resp.target_spec);
         assert!(
             !run.contains("-embedcfg"),
             "build_lib for non-embed package must not include -embedcfg: {run}"
@@ -3315,10 +3324,7 @@ mod tests {
             }
         };
 
-        let run = match resp.target_spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&resp.target_spec);
 
         // Only assert asm steps when the package actually has .s files on this platform.
         // If SFiles is empty for this arch, tool asm won't appear and that's correct.

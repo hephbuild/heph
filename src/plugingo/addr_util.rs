@@ -1,5 +1,6 @@
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::htvalue::Value;
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -292,31 +293,42 @@ pub fn dep_group_env_var(group: &str) -> String {
     format!("SRC_{}", group.to_uppercase())
 }
 
+/// Wrap a list of shell commands into the `run` config value. The exec driver
+/// joins list entries with newlines, so one command per element reads back as a
+/// single script.
+pub fn to_run_value(lines: Vec<String>) -> Value {
+    Value::List(lines.into_iter().map(Value::String).collect())
+}
+
 /// Build the importcfg shell fragment for a set of transitive libs.
 ///
 /// Emits `importcfg="$PWD/importcfg"`, clears the file, then appends one
 /// `packagefile` line per library, sorted by import path for determinism.
 /// An optional `skip` import path is excluded (used by the linker to omit
-/// the main package from importcfg).
-pub fn write_importcfg_script(transitive_libs: &[(String, Addr)], skip: Option<&str>) -> String {
+/// the main package from importcfg). Returns one shell command per element.
+pub fn write_importcfg_script(
+    transitive_libs: &[(String, Addr)],
+    skip: Option<&str>,
+) -> Vec<String> {
     let mut sorted: Vec<&(String, Addr)> = transitive_libs.iter().collect();
     sorted.sort_by_key(|(ip, _)| ip.as_str());
 
-    let mut script = String::new();
-    script.push_str("importcfg=\"$PWD/importcfg\"\n");
-    script.push_str("> \"$importcfg\"\n");
+    let mut lines = vec![
+        "importcfg=\"$PWD/importcfg\"".to_string(),
+        "> \"$importcfg\"".to_string(),
+    ];
     for (import_path, _) in &sorted {
         if skip.is_some_and(|s| *import_path == s) {
             continue;
         }
         let group = import_path_to_dep_group(import_path);
         let env_var = dep_group_env_var(&group);
-        script.push_str(&format!(
-            "printf \"packagefile {}=%s\\n\" \"${}\" >> \"$importcfg\"\n",
+        lines.push(format!(
+            "printf \"packagefile {}=%s\\n\" \"${}\" >> \"$importcfg\"",
             import_path, env_var
         ));
     }
-    script
+    lines
 }
 
 #[cfg(test)]

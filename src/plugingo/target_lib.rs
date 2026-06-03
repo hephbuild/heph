@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
+use crate::plugingo::addr_util::{import_path_to_dep_group, to_run_value, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use crate::plugingo::target_std::archive_filename;
 use std::collections::{BTreeMap, HashMap};
@@ -74,7 +74,7 @@ pub fn build_spec(
     }
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
+    config.insert("run".to_string(), to_run_value(run));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
@@ -122,8 +122,8 @@ fn generate_run_script(
     transitive_libs: &[(String, Addr)],
     out_file: &str,
     has_embed: bool,
-) -> String {
-    let mut script = write_importcfg_script(transitive_libs, None);
+) -> Vec<String> {
+    let mut lines = write_importcfg_script(transitive_libs, None);
     let embedcfg_flag = if has_embed {
         " -embedcfg \"$SRC_EMBED\""
     } else {
@@ -133,10 +133,10 @@ fn generate_run_script(
     // buildmode is PIE (darwin/arm64, recent linux/amd64). Without it, asm
     // helpers in transitive deps may fail to link with "relocation target X
     // not defined". Cheap to set unconditionally — Go's own build does so.
-    script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
+    lines.push(format!(
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
     ));
-    script
+    lines
 }
 
 #[cfg(test)]
@@ -144,6 +144,21 @@ mod tests {
     use super::*;
     use crate::htpkg::PkgBuf;
     use crate::pluginfs;
+
+    fn run_str(spec: &TargetSpec) -> String {
+        match spec.config.get("run").unwrap() {
+            Value::String(s) => s.clone(),
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.as_str(),
+                    _ => panic!("run entry not a string"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("run not string or list"),
+        }
+    }
 
     fn test_addr() -> Addr {
         Addr::new(
@@ -297,10 +312,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("@${LIST_SRC}"),
             "run script should use @${{LIST_SRC}} response file: {}",
@@ -334,10 +346,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("\"$SRC_GO_BIN\""),
             "run script must use \"$SRC_GO_BIN\" (quoted): {}",
@@ -365,10 +374,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             !run.contains("heph_PKG_SRC_DIR"),
             "run script must not reference heph_PKG_SRC_DIR: {}",
@@ -402,10 +408,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(run.contains("packagefile fmt="));
         assert!(run.contains("SRC_LIB_FMT"));
     }
@@ -487,14 +490,8 @@ mod tests {
             &[],
         );
 
-        let run1 = match s1.config.get("run").unwrap() {
-            Value::String(s) => s,
-            _ => panic!(),
-        };
-        let run2 = match s2.config.get("run").unwrap() {
-            Value::String(s) => s,
-            _ => panic!(),
-        };
+        let run1 = run_str(&s1);
+        let run2 = run_str(&s2);
         assert_eq!(run1, run2);
     }
 
@@ -539,10 +536,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("-p \"main\""),
             "main package must be compiled with -p \"main\": {}",
@@ -570,10 +564,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("-p \"example.com/mylib\""),
             "non-main package must use full import path as -p flag: {}",
@@ -639,10 +630,7 @@ mod tests {
             Some(&embed_addr()),
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("-embedcfg"),
             "run script must include -embedcfg when embed_addr is Some: {run}"
@@ -690,10 +678,7 @@ mod tests {
             None,
             &[],
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             !run.contains("-embedcfg"),
             "run script must not include -embedcfg when embed_addr is None: {run}"

@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
+use crate::plugingo::addr_util::{import_path_to_dep_group, to_run_value, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use crate::plugingo::pkg_analysis::GoPackage;
 use crate::plugingo::target_std::archive_filename;
@@ -34,24 +34,26 @@ pub fn build_download_spec(
     // overlays that reject xattr writes. `cp -X` on macOS suppresses
     // xattr copy; on GNU cp `-X` means `--one-file-system`, so branch
     // on `uname`.
-    let run = format!(
-        "printf 'module heph_ignore\\n' > go.mod\n\
-         \"$SRC_GO_BIN\" mod download -modcacherw -json '{mod_at_ver}' > mod.json\n\
-         rm go.mod\n\
-         MOD_DIR=$(awk -F'\"' '/\"Dir\": / {{ print $4 }}' mod.json)\n\
-         if [ -z \"$MOD_DIR\" ]; then\n\
+    let run = vec![
+        "printf 'module heph_ignore\\n' > go.mod".to_string(),
+        format!("\"$SRC_GO_BIN\" mod download -modcacherw -json '{mod_at_ver}' > mod.json"),
+        "rm go.mod".to_string(),
+        "MOD_DIR=$(awk -F'\"' '/\"Dir\": / { print $4 }' mod.json)".to_string(),
+        // One compound statement — keep its lines in a single entry.
+        "if [ -z \"$MOD_DIR\" ]; then\n\
            echo 'go mod download produced no Dir' >&2\n\
            cat mod.json >&2\n\
            exit 1\n\
-         fi\n\
-         if [ \"$(uname)\" = Darwin ]; then CP=\"cp -RX\"; else CP=\"cp -R\"; fi\n\
-         $CP \"$MOD_DIR/.\" .\n\
-         rm mod.json\n\
-         chmod -R u+w .\n",
-    );
+         fi"
+        .to_string(),
+        "if [ \"$(uname)\" = Darwin ]; then CP=\"cp -RX\"; else CP=\"cp -R\"; fi".to_string(),
+        "$CP \"$MOD_DIR/.\" .".to_string(),
+        "rm mod.json".to_string(),
+        "chmod -R u+w .".to_string(),
+    ];
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
+    config.insert("run".to_string(), to_run_value(run));
     config.insert(
         "deps".to_string(),
         Value::Map(HashMap::from([(
@@ -220,7 +222,7 @@ pub fn build_lib_spec(
     }
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
+    config.insert("run".to_string(), to_run_value(run));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
@@ -271,8 +273,8 @@ fn generate_compile_script(
     s_files: &[String],
     factors: &Factors,
     has_embed: bool,
-) -> String {
-    let mut script = write_importcfg_script(transitive_libs, None);
+) -> Vec<String> {
+    let mut lines = write_importcfg_script(transitive_libs, None);
 
     let has_asm = !s_files.is_empty();
     let asmhdr_flag = if has_asm { " -asmhdr \"go_asm.h\"" } else { "" };
@@ -304,7 +306,7 @@ fn generate_compile_script(
         // -gensymabis). Without this the asm parse silently emits an empty
         // symabis file → compiler uses ABIInternal for asm-defined funcs →
         // linker fails with "relocation target X not defined".
-        script.push_str("touch go_asm.h\n");
+        lines.push("touch go_asm.h".to_string());
 
         // Step 1: generate symabis from all .s files (one invocation).
         let s_files_list = s_files
@@ -312,8 +314,8 @@ fn generate_compile_script(
             .map(|f| format!("\"./{}\"", f))
             .collect::<Vec<_>>()
             .join(" ");
-        script.push_str(&format!(
-            "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -gensymabis -o \"symabis\" {s_files_list}\n"
+        lines.push(format!(
+            "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -gensymabis -o \"symabis\" {s_files_list}"
         ));
     }
 
@@ -322,16 +324,16 @@ fn generate_compile_script(
     // Sources are staged into the consumer's sandbox by the engine (via the
     // download target's filtered outputs). `@${LIST_SRC}` is a response file
     // listing every staged source — same convention as first-party.
-    script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{symabis_flag}{asmhdr_flag}{embedcfg_flag}{shared} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
+    lines.push(format!(
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{symabis_flag}{asmhdr_flag}{embedcfg_flag}{shared} -o \"{out_file}\" \"@${{LIST_SRC}}\"",
     ));
 
     if has_asm {
         // Step 3: assemble each .s file. -I . finds go_asm.h written above.
         for s_file in s_files {
             let obj_file = format!("{}.o", s_file.trim_end_matches(".s"));
-            script.push_str(&format!(
-                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -o \"{obj_file}\" \"./{s_file}\"\n"
+            lines.push(format!(
+                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -o \"{obj_file}\" \"./{s_file}\""
             ));
         }
         // Step 4: pack asm objs into the archive.
@@ -340,12 +342,12 @@ fn generate_compile_script(
             .map(|f| format!("\"{}.o\"", f.trim_end_matches(".s")))
             .collect::<Vec<_>>()
             .join(" ");
-        script.push_str(&format!(
-            "\"$SRC_GO_BIN\" tool pack r \"{out_file}\" {obj_args}\n"
+        lines.push(format!(
+            "\"$SRC_GO_BIN\" tool pack r \"{out_file}\" {obj_args}"
         ));
     }
 
-    script
+    lines
 }
 
 #[cfg(test)]
@@ -353,6 +355,21 @@ mod tests {
     use super::*;
     use crate::htpkg::PkgBuf;
     use crate::plugingo::pkg_analysis::{GoModule, GoPackage};
+
+    fn run_str(spec: &TargetSpec) -> String {
+        match spec.config.get("run").unwrap() {
+            Value::String(s) => s.clone(),
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.as_str(),
+                    _ => panic!("run entry not a string"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("run not string or list"),
+        }
+    }
 
     fn test_factors() -> Factors {
         Factors {
@@ -442,10 +459,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("go mod download"),
             "missing go mod download: {run}"
@@ -609,10 +623,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("@${LIST_SRC}"),
             "run must use @${{LIST_SRC}}: {run}"
@@ -639,10 +650,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         // Reject host GOMODCACHE leakage — sources must flow through sandbox staging.
         assert!(
             !run.contains("/go/pkg/mod/"),
@@ -724,10 +732,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("-p \"main\""),
             "main package must use -p \"main\": {run}"
@@ -750,10 +755,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("-p \"github.com/go-logr/logr\""),
             "non-main pkg must use -p <import>: {run}"
@@ -782,10 +784,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("packagefile fmt="),
             "importcfg dep missing: {run}"
@@ -838,10 +837,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(run.contains("tool asm"), "must invoke go tool asm: {run}");
         assert!(run.contains("tool pack r"), "must pack .o files: {run}");
         assert!(
@@ -901,10 +897,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(!run.contains("tool asm"), "no .s → no tool asm: {run}");
         assert!(!run.contains("tool pack"), "no .s → no tool pack: {run}");
         assert!(!run.contains("-asmhdr"), "no .s → no -asmhdr: {run}");
@@ -931,10 +924,7 @@ mod tests {
             "/usr/local/go",
             "/tmp/gocache",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
+        let run = run_str(&spec);
         assert!(run.contains("-embedcfg"), "must include -embedcfg: {run}");
         assert!(
             run.contains("$SRC_EMBED"),

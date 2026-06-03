@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
+use crate::plugingo::addr_util::{import_path_to_dep_group, to_run_value, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 
@@ -35,7 +35,7 @@ pub fn build_spec(
     );
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
+    config.insert("run".to_string(), to_run_value(run));
     config.insert(
         "deps".to_string(),
         Value::Map(deps.into_iter().collect::<HashMap<_, _>>()),
@@ -82,25 +82,40 @@ fn generate_link_script(
     self_import_path: &str,
     binary_name: &str,
     transitive_libs: &[(String, Addr)],
-) -> String {
+) -> Vec<String> {
     // The main package is passed as a positional arg to the linker, not via importcfg.
-    let mut script = write_importcfg_script(transitive_libs, Some(self_import_path));
+    let mut lines = write_importcfg_script(transitive_libs, Some(self_import_path));
     let self_group = import_path_to_dep_group(self_import_path);
     let self_env_var = format!("SRC_{}", self_group.to_uppercase());
     // -buildmode=pie matches Go's default on darwin/arm64 (and most modern
     // platforms). Libs were compiled with -shared, so the link must agree on
     // PIE — otherwise asm relocations from transitive deps fail to resolve.
-    script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"\n",
+    lines.push(format!(
+        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"",
         binary_name, self_env_var
     ));
-    script
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::htpkg::PkgBuf;
+
+    fn run_str(spec: &TargetSpec) -> String {
+        match spec.config.get("run").unwrap() {
+            Value::String(s) => s.clone(),
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.as_str(),
+                    _ => panic!("run entry not a string"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("run not string or list"),
+        }
+    }
 
     fn test_factors() -> Factors {
         Factors {
@@ -170,10 +185,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(run.contains("SRC_GO_BIN"));
         assert!(run.contains("tool link"));
         assert!(run.contains("importcfg"));
@@ -189,10 +201,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("\"$SRC_GO_BIN\""),
             "link script must use \"$SRC_GO_BIN\" (quoted): {}",
@@ -252,10 +261,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             !run.contains("src_hash"),
             "link script must not embed src_hash (dep chain handles invalidation): {}",
@@ -278,10 +284,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             !run.contains("packagefile example.com/cmd="),
             "link script must not add main package to importcfg: {}",
