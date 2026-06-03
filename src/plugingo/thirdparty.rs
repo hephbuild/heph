@@ -508,7 +508,7 @@ mod tests {
         assert!(tools.contains_key("go"));
         assert_eq!(tools.len(), 1, "download must only have go tool");
         assert!(
-            spec.config.get("deps").is_none(),
+            !spec.config.contains_key("deps"),
             "download must not declare any deps"
         );
     }

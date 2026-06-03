@@ -188,11 +188,7 @@ mod tests {
             "run should reference import path: {}",
             run
         );
-        assert!(
-            run.contains("$TOOL_GO"),
-            "run should use $TOOL_GO: {}",
-            run
-        );
+        assert!(run.contains("$TOOL_GO"), "run should use $TOOL_GO: {}", run);
     }
 
     #[test]
