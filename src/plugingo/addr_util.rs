@@ -293,6 +293,17 @@ pub fn dep_group_env_var(group: &str) -> String {
     format!("SRC_{}", group.to_uppercase())
 }
 
+/// Build the `tools` config value exposing the go binary as `tool={go: <addr>}`.
+///
+/// The exec driver symlinks the tool into `bin/` and sets `$TOOL_GO` to its
+/// path (group "go" → `TOOL_GO`), so run scripts invoke `"$TOOL_GO" tool ...`.
+pub fn go_bin_tools_config(go_bin_addr: &str) -> Value {
+    Value::Map(HashMap::from([(
+        "go".to_string(),
+        Value::List(vec![Value::String(go_bin_addr.to_string())]),
+    )]))
+}
+
 /// Wrap a list of shell commands into the `run` config value. The exec driver
 /// joins list entries with newlines, so one command per element reads back as a
 /// single script.

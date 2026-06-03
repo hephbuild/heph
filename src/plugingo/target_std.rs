@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::to_run_value;
+use crate::plugingo::addr_util::{go_bin_tools_config, to_run_value};
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 
@@ -32,7 +32,7 @@ pub fn build_spec(
     let out_file = archive_filename(import_path);
     let run = vec![
         format!(
-            "export_path=$(\"$SRC_GO_BIN\" list -export -f '{{{{.Export}}}}' \"{}\")",
+            "export_path=$(\"$TOOL_GO\" list -export -f '{{{{.Export}}}}' \"{}\")",
             import_path
         ),
         // The if-block stays one element: it's a single compound statement that
@@ -54,13 +54,7 @@ pub fn build_spec(
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
-    config.insert(
-        "deps".to_string(),
-        Value::Map(HashMap::from([(
-            "go_bin".to_string(),
-            Value::List(vec![Value::String(go_bin_addr.to_string())]),
-        )])),
-    );
+    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -195,14 +189,14 @@ mod tests {
             run
         );
         assert!(
-            run.contains("$SRC_GO_BIN"),
-            "run should use $SRC_GO_BIN: {}",
+            run.contains("$TOOL_GO"),
+            "run should use $TOOL_GO: {}",
             run
         );
     }
 
     #[test]
-    fn test_build_spec_has_go_bin_dep() {
+    fn test_build_spec_has_go_tool() {
         let spec = build_spec(
             test_addr(),
             "fmt",
@@ -210,11 +204,11 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let deps = match spec.config.get("deps").unwrap() {
+        let tools = match spec.config.get("tools").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(deps.contains_key("go_bin"));
+        assert!(tools.contains_key("go"));
     }
 
     #[test]

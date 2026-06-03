@@ -1,7 +1,9 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{import_path_to_dep_group, to_run_value, write_importcfg_script};
+use crate::plugingo::addr_util::{
+    go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
+};
 use crate::plugingo::factors::Factors;
 use crate::plugingo::target_std::archive_filename;
 use std::collections::{BTreeMap, HashMap};
@@ -47,10 +49,6 @@ pub fn build_spec(
         String::new(),
         Value::List(src_addrs.iter().map(|s| Value::String(s.clone())).collect()),
     );
-    deps.insert(
-        "go_bin".to_string(),
-        Value::List(vec![Value::String(go_bin_addr.to_string())]),
-    );
     if let Some(e) = embed_addr {
         deps.insert(
             "embed".to_string(),
@@ -75,6 +73,7 @@ pub fn build_spec(
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
+    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
@@ -134,7 +133,7 @@ fn generate_run_script(
     // helpers in transitive deps may fail to link with "relocation target X
     // not defined". Cheap to set unconditionally — Go's own build does so.
     lines.push(format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
+        "\"$TOOL_GO\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
     ));
     lines
 }
@@ -263,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deps_has_go_bin_group() {
+    fn test_tools_has_go_group() {
         let spec = build_spec(
             test_addr(),
             "example.com/mylib",
@@ -277,23 +276,18 @@ mod tests {
             None,
             &[],
         );
-        let deps = match spec.config.get("deps").unwrap() {
+        let tools = match spec.config.get("tools").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(
-            deps.contains_key("go_bin"),
-            "deps must have go_bin group: {:?}",
-            deps.keys().collect::<Vec<_>>()
-        );
-        let go_bin_entry = match deps.get("go_bin").unwrap() {
+        let go = match tools.get("go").expect("tools must have go group") {
             Value::List(v) => v,
             _ => panic!("expected list"),
         };
         assert!(
-            matches!(&go_bin_entry[0], Value::String(s) if s.contains("@heph/bin")),
-            "go_bin dep should reference go bin addr: {:?}",
-            go_bin_entry
+            matches!(&go[0], Value::String(s) if s.contains("@heph/bin")),
+            "go tool should reference go bin addr: {:?}",
+            go
         );
     }
 
@@ -319,8 +313,8 @@ mod tests {
             run
         );
         assert!(
-            run.contains("SRC_GO_BIN"),
-            "run script should use $SRC_GO_BIN: {}",
+            run.contains("TOOL_GO"),
+            "run script should use $TOOL_GO: {}",
             run
         );
         assert!(run.contains("tool compile"));
@@ -332,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_uses_src_go_bin() {
+    fn test_run_uses_tool_go() {
         let spec = build_spec(
             test_addr(),
             "example.com/mylib",
@@ -348,8 +342,8 @@ mod tests {
         );
         let run = run_str(&spec);
         assert!(
-            run.contains("\"$SRC_GO_BIN\""),
-            "run script must use \"$SRC_GO_BIN\" (quoted): {}",
+            run.contains("\"$TOOL_GO\""),
+            "run script must use \"$TOOL_GO\" (quoted): {}",
             run
         );
         assert!(

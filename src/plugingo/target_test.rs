@@ -1,7 +1,9 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{import_path_to_dep_group, to_run_value, write_importcfg_script};
+use crate::plugingo::addr_util::{
+    go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
+};
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 
@@ -152,14 +154,10 @@ pub fn build_test_spec(
 ) -> TargetSpec {
     let mut script = write_importcfg_script(all_libs, None);
     script.push(
-        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"".to_string(),
+        "\"$TOOL_GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"".to_string(),
     );
 
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
-    deps.insert(
-        "go_bin".to_string(),
-        Value::List(vec![Value::String(go_bin_addr.to_string())]),
-    );
     deps.insert(
         "testmain".to_string(),
         Value::List(vec![Value::String(testmain_lib_addr.format())]),
@@ -171,6 +169,7 @@ pub fn build_test_spec(
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(script));
+    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
@@ -282,7 +281,7 @@ fn compile_run_script(
     };
 
     lines.push(format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
+        "\"$TOOL_GO\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
     ));
 
     lines
@@ -317,10 +316,6 @@ fn build_lib_spec_inner(
         String::new(),
         Value::List(src_addrs.map(Value::String).collect()),
     );
-    deps.insert(
-        "go_bin".to_string(),
-        Value::List(vec![Value::String(go_bin_addr.to_string())]),
-    );
     if let Some(e) = embed_addr {
         deps.insert(
             "embed".to_string(),
@@ -343,6 +338,7 @@ fn build_lib_spec_inner(
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
+    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
         "out".to_string(),
@@ -748,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_test_spec_deps_has_go_bin() {
+    fn test_build_test_spec_tools_has_go() {
         let testmain_lib = mk_addr("pkg", "build_testmain_lib");
         let spec = build_test_spec(
             mk_addr("pkg", "build_test"),
@@ -758,14 +754,14 @@ mod tests {
             &testmain_lib,
             &[],
         );
-        let deps = match spec.config.get("deps").unwrap() {
+        let tools = match spec.config.get("tools").unwrap() {
             Value::Map(m) => m,
-            _ => panic!("expected deps map"),
+            _ => panic!("expected tools map"),
         };
         assert!(
-            deps.contains_key("go_bin"),
-            "deps must have go_bin group: {:?}",
-            deps.keys().collect::<Vec<_>>()
+            tools.contains_key("go"),
+            "tools must have go group: {:?}",
+            tools.keys().collect::<Vec<_>>()
         );
     }
 

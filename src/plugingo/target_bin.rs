@@ -1,7 +1,9 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{import_path_to_dep_group, to_run_value, write_importcfg_script};
+use crate::plugingo::addr_util::{
+    go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
+};
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 
@@ -22,20 +24,17 @@ pub fn build_spec(
 
     let run = generate_link_script(import_path, &binary_name, transitive_libs);
 
-    let mut deps: BTreeMap<String, Value> = transitive_libs
+    let deps: BTreeMap<String, Value> = transitive_libs
         .iter()
         .map(|(dep_import_path, dep_addr)| {
             let group = import_path_to_dep_group(dep_import_path);
             (group, Value::List(vec![Value::String(dep_addr.format())]))
         })
         .collect();
-    deps.insert(
-        "go_bin".to_string(),
-        Value::List(vec![Value::String(go_bin_addr.to_string())]),
-    );
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
+    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert(
         "deps".to_string(),
         Value::Map(deps.into_iter().collect::<HashMap<_, _>>()),
@@ -91,7 +90,7 @@ fn generate_link_script(
     // platforms). Libs were compiled with -shared, so the link must agree on
     // PIE — otherwise asm relocations from transitive deps fail to resolve.
     lines.push(format!(
-        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"",
+        "\"$TOOL_GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"",
         binary_name, self_env_var
     ));
     lines
@@ -186,13 +185,13 @@ mod tests {
             "/usr/local/go",
         );
         let run = run_str(&spec);
-        assert!(run.contains("SRC_GO_BIN"));
+        assert!(run.contains("TOOL_GO"));
         assert!(run.contains("tool link"));
         assert!(run.contains("importcfg"));
     }
 
     #[test]
-    fn test_run_uses_src_go_bin() {
+    fn test_run_uses_tool_go() {
         let spec = build_spec(
             test_addr(),
             "example.com/cmd",
@@ -203,14 +202,14 @@ mod tests {
         );
         let run = run_str(&spec);
         assert!(
-            run.contains("\"$SRC_GO_BIN\""),
-            "link script must use \"$SRC_GO_BIN\" (quoted): {}",
+            run.contains("\"$TOOL_GO\""),
+            "link script must use \"$TOOL_GO\" (quoted): {}",
             run
         );
     }
 
     #[test]
-    fn test_deps_has_go_bin_group() {
+    fn test_tools_has_go_group() {
         let spec = build_spec(
             test_addr(),
             "example.com/cmd",
@@ -219,14 +218,18 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let deps = match spec.config.get("deps").unwrap() {
+        let tools = match spec.config.get("tools").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
         };
+        let go = match tools.get("go").expect("tools must have go group") {
+            Value::List(v) => v,
+            _ => panic!("expected list"),
+        };
         assert!(
-            deps.contains_key("go_bin"),
-            "deps must have go_bin group: {:?}",
-            deps.keys().collect::<Vec<_>>()
+            matches!(&go[0], Value::String(s) if s.contains("@heph/bin")),
+            "go tool should reference go bin addr: {:?}",
+            go
         );
     }
 
