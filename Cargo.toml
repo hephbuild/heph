@@ -127,7 +127,7 @@ ansi-to-tui = "8"
 unicode-width = "0.2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 libc = "0.2"
-templi = "0.1.2"
+minijinja = "2"
 erased-serde = "0.4"
 crossbeam-channel = "0.5"
 quick_cache = "0.6"

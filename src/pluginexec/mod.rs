@@ -86,15 +86,14 @@ fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
 }
 
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
-    let mut ctx = serde_json::Map::new();
-    if !run.is_empty() {
-        ctx.insert(
-            "cmds".to_string(),
-            serde_json::Value::String(run.join("\n")),
-        );
-    }
-    templi::render(SHELL_INIT_SH, &serde_json::Value::Object(ctx))
-        .map_err(anyhow::Error::from)
+    let cmds = (!run.is_empty()).then(|| run.join("\n"));
+
+    let mut env = minijinja::Environment::new();
+    env.add_template("init.sh", SHELL_INIT_SH)
+        .context("compile init.sh template")?;
+    env.get_template("init.sh")
+        .context("load init.sh template")?
+        .render(minijinja::context! { cmds })
         .context("render init.sh template")
 }
 
@@ -1360,6 +1359,18 @@ mod tests {
         assert!(out.contains("xrun()"), "missing xrun() definition: {out}");
         assert!(out.contains("echo hi\nls -la"), "cmds not joined: {out}");
         assert!(!out.contains("{{"), "template tokens left: {out}");
+    }
+
+    #[test]
+    fn test_render_shell_init_does_not_html_escape_cmds() {
+        // The template renders a shell script, not HTML — special chars must pass
+        // through verbatim, otherwise the generated bash is corrupted.
+        let run = vec!["a && b < c > d \"e\" 'f'".to_string()];
+        let out = render_shell_init(&run).expect("render");
+        assert!(
+            out.contains("a && b < c > d \"e\" 'f'"),
+            "shell chars were escaped: {out}"
+        );
     }
 
     #[test]

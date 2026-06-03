@@ -1,7 +1,7 @@
 mod common;
 
 use common::Workspace;
-use heph::loosespecparser::TargetSpecValue;
+use heph::htvalue::Value as TargetSpecValue;
 use heph::pluginquery::PACKAGE;
 
 // Query by label resolves to group spec with all matching targets as deps

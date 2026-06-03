@@ -4,7 +4,7 @@ use common::Workspace;
 use heph::engine::ResultOptions;
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
-use heph::loosespecparser::TargetSpecValue;
+use heph::htvalue::Value as TargetSpecValue;
 // ── Discovery ────────────────────────────────────────────────────────────────
 
 // Regression: a matcher-phase BUILD eval error surfaces from `engine.result` as
