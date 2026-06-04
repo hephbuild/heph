@@ -238,12 +238,16 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
 
 /// Which body the TUI viewport is showing. The default view is the live
 /// slow-target / lock-wait breakdown; the [`ViewMode::Failed`] view lists every
-/// errored target. `Tab` cycles through `[Default]` plus one entry per
-/// [`HeaderItem::Tab`] the header model exposes.
+/// errored target and the [`ViewMode::Done`] view every completed one. `Tab`
+/// cycles through `[Default]` plus one entry per [`HeaderItem::Tab`] the header
+/// model exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     /// The live breakdown: slow targets + lock waits (or idle art when empty).
     Default,
+    /// The list of completed (successfully finished) targets, scoped by the
+    /// active [`CountScope`] (matched set vs every observed target).
+    Done,
     /// The list of failed targets.
     Failed,
 }
@@ -397,6 +401,10 @@ pub struct BuildState {
     /// Failed targets in failure order, each with its error message (if the
     /// `ResultEnd` carried one). Drives the [`ViewMode::Failed`] body.
     failed: Vec<(String, Option<String>)>,
+    /// Successfully completed targets in completion order (cache hits included —
+    /// any `ResultEnd` with no error). Drives the [`ViewMode::Done`] body; the
+    /// `Matched` scope filters this against `matched`.
+    done: Vec<String>,
     /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
     /// Distinct from `completed`, which includes cache hits that never executed.
     built: usize,
@@ -484,6 +492,7 @@ impl BuildState {
                         self.failed.push((addr.clone(), Some(err.clone())));
                     } else {
                         self.completed += 1;
+                        self.done.push(addr.clone());
                     }
                 }
                 // Record every terminal addr; matched progress is computed as
@@ -637,6 +646,26 @@ impl BuildState {
                     ));
                 }
                 Line::from(spans)
+            })
+            .collect()
+    }
+
+    /// Body rows for the [`ViewMode::Done`] view: one line per completed target,
+    /// addr in green, in completion order. Scoped by `scope`: `Matched` keeps only
+    /// addrs in the matched top-level set, `All` lists every completed target
+    /// (transitive deps included). Empty when nothing has finished.
+    pub fn done_lines(&self, scope: CountScope) -> Vec<Line<'static>> {
+        self.done
+            .iter()
+            .filter(|addr| match scope {
+                CountScope::All => true,
+                CountScope::Matched => self.matched.contains(*addr),
+            })
+            .map(|addr| {
+                Line::from(Span::styled(
+                    format!("  {addr}"),
+                    Style::default().fg(Color::Green),
+                ))
             })
             .collect()
     }
@@ -862,7 +891,8 @@ impl ProgressHeader for BuildHeader {
     fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
         let (done, cached, failed) = core.count_fields(scope);
         let mut items = vec![
-            HeaderItem::text(done),
+            // The done count is a tab into the completed-targets view.
+            HeaderItem::tab(ViewMode::Done, done),
             HeaderItem::text(cached),
             // The failed count is a tab into the failed-targets view.
             HeaderItem::tab(ViewMode::Failed, failed),
@@ -1210,6 +1240,7 @@ impl TUIAppView for TuiProgressView {
         let view = self.view.get();
         let body = match view {
             ViewMode::Default => self.state.body_lines(now_ms),
+            ViewMode::Done => self.state.done_lines(self.scope.get()),
             ViewMode::Failed => self.state.failed_lines(),
         };
         if body.is_empty() {
@@ -1220,6 +1251,13 @@ impl TUIAppView for TuiProgressView {
                 ViewMode::Default => {
                     lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows))
                 }
+                // Done view with nothing completed: a single dim placeholder.
+                ViewMode::Done => lines.push(Line::from(Span::styled(
+                    "  no completed targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
                 // Failed view with nothing failed: a single dim placeholder.
                 ViewMode::Failed => lines.push(Line::from(Span::styled(
                     "  no failed targets",
@@ -2197,13 +2235,16 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_default_failed_and_back() {
+    fn tab_cycles_default_done_failed_and_back() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, execute_start("//slow:x")));
-        v.apply(&ev(1, result_start("//a:bad")));
-        v.apply(&ev(2, result_end("//a:bad", Some("boom".into()))));
+        v.apply(&ev(1, matched(&["//a:ok"], true)));
+        v.apply(&ev(2, result_start("//a:ok")));
+        v.apply(&ev(3, result_end("//a:ok", None)));
+        v.apply(&ev(4, result_start("//a:bad")));
+        v.apply(&ev(5, result_end("//a:bad", Some("boom".into()))));
 
-        // Default view shows the slow row, not the failed target.
+        // Default view shows the slow row, not the done/failed targets.
         let body = |v: &TuiProgressView| -> String {
             v.render("⠋", 10_000, 80, 8)
                 .iter()
@@ -2212,6 +2253,13 @@ mod tests {
         };
         assert_eq!(v.view.get(), ViewMode::Default);
         assert!(body(&v).contains("//slow:x"));
+
+        // Tab → done view: shows the completed target.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        let done_body = body(&v);
+        assert!(done_body.contains("//a:ok"), "{done_body}");
+        assert!(!done_body.contains("//slow:x"), "{done_body}");
 
         // Tab → failed view: shows the failed target.
         v.tab(true);
@@ -2325,10 +2373,13 @@ mod tests {
         v.apply(&ev(0, result_start("//a:bad")));
         v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
 
-        // Two modes (Default, Failed): backward from Default wraps to Failed.
+        // Three modes (Default, Done, Failed): backward from Default wraps to
+        // the last (Failed), then steps back through Done to Default.
         assert_eq!(v.view.get(), ViewMode::Default);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Failed);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Done);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Default);
     }
@@ -2349,7 +2400,8 @@ mod tests {
         assert_eq!(plain.style.bg, None);
 
         // Active (failed view): the segment is highlighted with a background.
-        v.tab(true);
+        v.tab(true); // → Done
+        v.tab(true); // → Failed
         let header = v.render("⠋", 100, 120, 8);
         let hl = header[0]
             .spans
@@ -2362,6 +2414,7 @@ mod tests {
     #[test]
     fn failed_view_with_no_failures_shows_placeholder() {
         let mut v = TuiProgressView::new("L");
+        v.tab(true); // → Done
         v.tab(true); // → Failed, but nothing has failed
         let body: String = v
             .render("⠋", 10_000, 80, 8)
@@ -2369,6 +2422,53 @@ mod tests {
             .map(|l| format!("{l}"))
             .collect();
         assert!(body.contains("no failed targets"), "{body}");
+    }
+
+    #[test]
+    fn done_view_with_nothing_done_shows_placeholder() {
+        let mut v = TuiProgressView::new("L");
+        v.tab(true); // → Done, but nothing has completed
+        assert_eq!(v.view.get(), ViewMode::Done);
+        let body: String = v
+            .render("⠋", 10_000, 80, 8)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("no completed targets"), "{body}");
+    }
+
+    #[test]
+    fn done_lines_respect_matched_and_all_scope() {
+        let mut s = BuildState::new();
+        // Two matched top-level targets; one transitive dep finishes too.
+        s.apply(&ev(0, matched(&["//a:top"], false)));
+        s.apply(&ev(1, result_start("//a:top")));
+        s.apply(&ev(2, result_end("//a:top", None)));
+        s.apply(&ev(3, result_start("//dep:lib")));
+        s.apply(&ev(4, result_end("//dep:lib", None)));
+        // A failed target must never appear in the done list.
+        s.apply(&ev(5, result_start("//a:bad")));
+        s.apply(&ev(6, result_end("//a:bad", Some("boom".into()))));
+
+        // Matched scope: only the matched top-level target.
+        let matched_lines: String = s
+            .done_lines(CountScope::Matched)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(matched_lines.contains("//a:top"), "{matched_lines}");
+        assert!(!matched_lines.contains("//dep:lib"), "{matched_lines}");
+        assert!(!matched_lines.contains("//a:bad"), "{matched_lines}");
+
+        // All scope: every completed target, deps included, still no failures.
+        let all_lines: String = s
+            .done_lines(CountScope::All)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(all_lines.contains("//a:top"), "{all_lines}");
+        assert!(all_lines.contains("//dep:lib"), "{all_lines}");
+        assert!(!all_lines.contains("//a:bad"), "{all_lines}");
     }
 
     #[test]
