@@ -45,6 +45,7 @@ mod expand;
 pub mod fanout;
 mod gc;
 pub use gc::GcStats;
+mod grow_stack;
 mod link;
 mod matcher_spec;
 mod meta;

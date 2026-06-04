@@ -100,6 +100,7 @@ pprof = { version = "0.13", features = ["prost-codec"] }
 futures = "0.3.32"
 async-trait = "0.1.86"
 async-recursion = "1"
+stacker = "0.1"
 async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"

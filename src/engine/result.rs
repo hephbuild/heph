@@ -27,8 +27,10 @@ use crate::hartifactcontent::{Content, ReadSeek, WalkEntry};
 use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
+use crate::engine::grow_stack::{GrowStack, grow_stack};
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use tokio::task::JoinSet;
 
@@ -36,6 +38,11 @@ use tokio::task::JoinSet;
 /// lock" notice (with the holder's pid) to the progress stream. The notice is
 /// purely informational; the wait itself continues until acquired or cancelled.
 const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The boxed future produced by `#[async_recursion]` for `result_addr_impl`,
+/// wrapped per-poll by [`GrowStack`] in [`Engine::result_addr`].
+type BoxedResultFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<Arc<EResult>>> + Send + 'a>>;
 
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
 /// does not need to store it separately.
@@ -434,8 +441,26 @@ fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Err
 }
 
 impl Engine {
+    /// Resolve a target's result. Thin wrapper over [`Self::result_addr_impl`]
+    /// that grows the physical stack on demand.
+    ///
+    /// Every dependency-graph edge recurses through here, and a cache-warm
+    /// descent polls the whole subtree synchronously in one go (~100 KiB of
+    /// stack per level). Wrapping each level's poll in [`grow_stack`] keeps that
+    /// cascade from overflowing the 2 MiB tokio worker stack on deep graphs.
+    /// See `engine::grow_stack` for the full rationale.
+    pub fn result_addr<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &'a Addr,
+        outputs: OutputMatcher,
+        opts: &'a ResultOptions,
+    ) -> GrowStack<BoxedResultFuture<'a>> {
+        grow_stack(self.result_addr_impl(rs, addr, outputs, opts))
+    }
+
     #[async_recursion]
-    pub async fn result_addr(
+    async fn result_addr_impl(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
