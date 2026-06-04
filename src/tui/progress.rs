@@ -1113,8 +1113,14 @@ impl TuiProgressView {
             CountScope::Matched => "a all",
             CountScope::All => "a matched",
         };
+        // `/` only filters the list tabs, so only advertise it off the live view.
+        let search_hint = if self.view.get() == ViewMode::Default {
+            ""
+        } else {
+            " · / search"
+        };
         Line::from(Span::styled(
-            format!("  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}"),
+            format!("  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}"),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -2275,6 +2281,27 @@ mod tests {
         let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("scroll"), "{text}");
         assert_eq!(help.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn help_advertises_search_only_on_list_tabs() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//a:ok"], true)));
+        v.apply(&ev(1, result_start("//a:ok")));
+        v.apply(&ev(2, result_end("//a:ok", None)));
+
+        let help = |v: &TuiProgressView| -> String {
+            format!("{}", v.render("⠋", 10_000, 80, 8).last().expect("help"))
+        };
+
+        // Default (live) view: `/` has no list to filter, so it isn't advertised.
+        assert_eq!(v.view.get(), ViewMode::Default);
+        assert!(!help(&v).contains("/ search"), "{}", help(&v));
+
+        // Done tab: search is available, so the hint appears.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        assert!(help(&v).contains("/ search"), "{}", help(&v));
     }
 
     fn lock_wait_start(addr: &str, pid: u32) -> BuildEventKind {
