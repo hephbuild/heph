@@ -210,9 +210,30 @@ pub async fn run<A: App + 'static>(
                         code: KeyCode::Char('q'),
                         kind: KeyEventKind::Press,
                         ..
-                    }))) if held => {
+                    }))) if held && !view.is_searching() => {
                         quit = true;
                     }
+                    // While the `/` filter captures input, printable keys, Backspace
+                    // and Enter edit the query instead of firing the shortcuts
+                    // below. These arms must precede the char shortcuts.
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char(c),
+                        modifiers,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.is_searching() && !modifiers.contains(KeyModifiers::CONTROL) => {
+                        view.search_input(c)
+                    }
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Backspace,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.is_searching() => view.search_backspace(),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.is_searching() => view.search_confirm(),
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Up,
                         kind: KeyEventKind::Press,
@@ -248,6 +269,19 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) => view.toggle_scope(),
+                    // `/` opens the addr filter on the Done/Failed tabs (no-op on
+                    // the live view). While searching it is captured as input above.
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('/'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.search_start(),
+                    // Esc clears the filter whether mid-type or already confirmed.
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Esc,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) => view.search_cancel(),
                     Some(Ok(Event::Resize(w, _))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is

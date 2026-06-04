@@ -20,6 +20,7 @@ use enclose::enclose;
 
 use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
+use crate::engine::grow_stack::{GrowStack, grow_stack};
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::{CacheArtifact, ManifestArtifactType};
 use crate::engine::result_lock::ResultReadGuard;
@@ -27,7 +28,6 @@ use crate::hartifactcontent::{Content, ReadSeek, WalkEntry};
 use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
-use crate::engine::grow_stack::{GrowStack, grow_stack};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;

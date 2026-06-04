@@ -6,7 +6,7 @@
 //! receipt clock — so elapsed times stay correct across a future client/server
 //! process split. Rendering callers pass their own `now_ms` wall clock.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -250,6 +250,16 @@ pub enum ViewMode {
     Done,
     /// The list of failed targets.
     Failed,
+}
+
+/// Case-insensitive substring test for the `/` filter on the `Done`/`Failed`
+/// bodies. An empty filter matches everything (the unfiltered list).
+fn addr_matches(addr: &str, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    addr.to_ascii_lowercase()
+        .contains(&filter.to_ascii_lowercase())
 }
 
 /// Which target set the header counters are scoped to. `Matched` (the default)
@@ -627,9 +637,10 @@ impl BuildState {
     /// Body rows for the [`ViewMode::Failed`] view: one line per failed target,
     /// addr in red followed by its error message (when one was reported).
     /// Empty when nothing has failed.
-    pub fn failed_lines(&self) -> Vec<Line<'static>> {
+    pub fn failed_lines(&self, filter: &str) -> Vec<Line<'static>> {
         self.failed
             .iter()
+            .filter(|(addr, _)| addr_matches(addr, filter))
             .map(|(addr, err)| {
                 let mut spans = vec![Span::styled(
                     format!("  {addr}"),
@@ -654,13 +665,14 @@ impl BuildState {
     /// addr in green, in completion order. Scoped by `scope`: `Matched` keeps only
     /// addrs in the matched top-level set, `All` lists every completed target
     /// (transitive deps included). Empty when nothing has finished.
-    pub fn done_lines(&self, scope: CountScope) -> Vec<Line<'static>> {
+    pub fn done_lines(&self, scope: CountScope, filter: &str) -> Vec<Line<'static>> {
         self.done
             .iter()
             .filter(|addr| match scope {
                 CountScope::All => true,
                 CountScope::Matched => self.matched.contains(*addr),
             })
+            .filter(|addr| addr_matches(addr, filter))
             .map(|addr| {
                 Line::from(Span::styled(
                     format!("  {addr}"),
@@ -1001,6 +1013,14 @@ pub struct TuiProgressView {
     /// held open (user navigated off the main view). `Some` drives the green
     /// "press q to quit" notice and freezes the elapsed clock at this instant.
     finished_at_ms: Option<u64>,
+    /// Whether the `/` filter is capturing keystrokes. While `true` printable keys
+    /// edit [`Self::search_query`] instead of triggering the normal shortcuts.
+    /// Only meaningful on the `Done`/`Failed` tabs.
+    search_active: Cell<bool>,
+    /// The active filter for the `Done`/`Failed` bodies: a case-insensitive
+    /// substring matched against the target addr. Empty means no filtering.
+    /// Persists after `Enter` confirms so the filtered list stays scrollable.
+    search_query: RefCell<String>,
 }
 
 impl TuiProgressView {
@@ -1019,6 +1039,8 @@ impl TuiProgressView {
             view: Cell::new(ViewMode::Default),
             scope: Cell::new(CountScope::Matched),
             finished_at_ms: None,
+            search_active: Cell::new(false),
+            search_query: RefCell::new(String::new()),
         }
     }
 
@@ -1046,6 +1068,38 @@ impl TuiProgressView {
     /// it turns into a green "press q to quit" notice; otherwise it lists the keys
     /// the viewport responds to.
     fn help_line(&self) -> Line<'static> {
+        // While typing a filter the help row becomes the search prompt with a
+        // block cursor; Enter keeps it, Esc clears it.
+        if self.search_active.get() {
+            let query = self.search_query.borrow();
+            return Line::from(vec![
+                Span::styled(format!("  /{query}▏"), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "  enter keep · esc clear",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]);
+        }
+        // A confirmed (but still applied) filter: show it with the clear hint.
+        {
+            let query = self.search_query.borrow();
+            if !query.is_empty() {
+                return Line::from(vec![
+                    Span::styled(
+                        format!("  filter: {query}"),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        "  ↑/↓ scroll · / edit · esc clear",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                ]);
+            }
+        }
         if self.finished_at_ms.is_some() {
             return Line::from(Span::styled(
                 "  ✓ finished — press q or Ctrl-C to quit",
@@ -1205,9 +1259,11 @@ impl TUIAppView for TuiProgressView {
             .unwrap_or(ViewMode::Default);
         self.view.set(next);
         // Switching views resets the scroll so the new body starts at the
-        // top-left.
+        // top-left, and drops any active filter (it was scoped to the old tab).
         self.scroll.set(0);
         self.hscroll.set(0);
+        self.search_active.set(false);
+        self.search_query.borrow_mut().clear();
     }
 
     fn toggle_scope(&mut self) {
@@ -1216,6 +1272,44 @@ impl TUIAppView for TuiProgressView {
             CountScope::All => CountScope::Matched,
         };
         self.scope.set(next);
+    }
+
+    fn is_searching(&self) -> bool {
+        self.search_active.get()
+    }
+
+    fn search_start(&mut self) {
+        // Search only filters the list tabs; ignore `/` on the live Default view.
+        if self.view.get() == ViewMode::Default {
+            return;
+        }
+        // Re-entering search keeps any confirmed query so `/` resumes editing.
+        self.search_active.set(true);
+        self.scroll.set(0);
+        self.hscroll.set(0);
+    }
+
+    fn search_input(&mut self, c: char) {
+        self.search_query.borrow_mut().push(c);
+        // A changed filter reshapes the list; restart from the top.
+        self.scroll.set(0);
+    }
+
+    fn search_backspace(&mut self) {
+        self.search_query.borrow_mut().pop();
+        self.scroll.set(0);
+    }
+
+    fn search_cancel(&mut self) {
+        self.search_active.set(false);
+        self.search_query.borrow_mut().clear();
+        self.scroll.set(0);
+        self.hscroll.set(0);
+    }
+
+    fn search_confirm(&mut self) {
+        // Leave input mode but keep the filter so the list stays scrollable.
+        self.search_active.set(false);
     }
 
     /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
@@ -1238,11 +1332,15 @@ impl TUIAppView for TuiProgressView {
         let mut lines = Vec::with_capacity(height);
         lines.push(self.header_line(now_ms, width));
         let view = self.view.get();
+        // The `/` filter only applies to the list tabs; the Default body ignores it.
+        let query = self.search_query.borrow();
+        let filter: &str = query.as_str();
         let body = match view {
             ViewMode::Default => self.state.body_lines(now_ms),
-            ViewMode::Done => self.state.done_lines(self.scope.get()),
-            ViewMode::Failed => self.state.failed_lines(),
+            ViewMode::Done => self.state.done_lines(self.scope.get(), filter),
+            ViewMode::Failed => self.state.failed_lines(filter),
         };
+        let filtering = !filter.is_empty();
         if body.is_empty() {
             self.scroll.set(0);
             self.hscroll.set(0);
@@ -1251,6 +1349,13 @@ impl TUIAppView for TuiProgressView {
                 ViewMode::Default => {
                     lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows))
                 }
+                // List tabs with an active filter that matched nothing.
+                _ if filtering => lines.push(Line::from(Span::styled(
+                    format!("  no targets match \"{filter}\""),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
                 // Done view with nothing completed: a single dim placeholder.
                 ViewMode::Done => lines.push(Line::from(Span::styled(
                     "  no completed targets",
@@ -2210,7 +2315,7 @@ mod tests {
         s.apply(&ev(4, result_start("//a:bad2")));
         s.apply(&ev(5, result_end("//a:bad2", Some("kaput".into()))));
 
-        let lines = s.failed_lines();
+        let lines = s.failed_lines("");
         // Only the two errored targets appear, in failure order.
         assert_eq!(lines.len(), 2);
         let l0 = format!("{}", lines[0]);
@@ -2272,6 +2377,118 @@ mod tests {
         v.tab(true);
         assert_eq!(v.view.get(), ViewMode::Default);
         assert!(body(&v).contains("//slow:x"));
+    }
+
+    #[test]
+    fn done_and_failed_lines_filter_by_addr_substring() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, result_start("//web:server")));
+        s.apply(&ev(1, result_end("//web:server", None)));
+        s.apply(&ev(2, result_start("//api:server")));
+        s.apply(&ev(3, result_end("//api:server", None)));
+        s.apply(&ev(4, result_start("//web:bad")));
+        s.apply(&ev(5, result_end("//web:bad", Some("boom".into()))));
+        s.apply(&ev(6, result_start("//api:bad")));
+        s.apply(&ev(7, result_end("//api:bad", Some("kaput".into()))));
+
+        let join =
+            |ls: Vec<Line<'static>>| -> String { ls.iter().map(|l| format!("{l}")).collect() };
+
+        // Empty filter keeps everything.
+        assert_eq!(s.done_lines(CountScope::All, "").len(), 2);
+        assert_eq!(s.failed_lines("").len(), 2);
+
+        // Substring filter, case-insensitive, matches only the package prefix.
+        let done = join(s.done_lines(CountScope::All, "WEB"));
+        assert!(done.contains("//web:server"), "{done}");
+        assert!(!done.contains("//api:server"), "{done}");
+
+        let failed = join(s.failed_lines("api"));
+        assert!(failed.contains("//api:bad"), "{failed}");
+        assert!(!failed.contains("//web:bad"), "{failed}");
+    }
+
+    #[test]
+    fn slash_filters_done_tab_enter_keeps_esc_clears() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
+        v.apply(&ev(1, result_start("//web:server")));
+        v.apply(&ev(2, result_end("//web:server", None)));
+        v.apply(&ev(3, result_start("//api:server")));
+        v.apply(&ev(4, result_end("//api:server", None)));
+
+        let body = |v: &TuiProgressView| -> String {
+            v.render("⠋", 10_000, 80, 8)
+                .iter()
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+
+        // `/` on the Default view is a no-op (search has no list to filter).
+        v.search_start();
+        assert!(!v.is_searching());
+
+        // Move to Done, then open the filter and type "web".
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        v.search_start();
+        assert!(v.is_searching());
+        v.search_input('w');
+        v.search_input('e');
+        v.search_input('b');
+        let filtered = body(&v);
+        assert!(filtered.contains("//web:server"), "{filtered}");
+        assert!(!filtered.contains("//api:server"), "{filtered}");
+
+        // Enter confirms: input mode ends but the filter stays applied.
+        v.search_confirm();
+        assert!(!v.is_searching());
+        let still = body(&v);
+        assert!(still.contains("//web:server"), "{still}");
+        assert!(!still.contains("//api:server"), "{still}");
+
+        // Esc clears the filter; the full list returns.
+        v.search_cancel();
+        let cleared = body(&v);
+        assert!(cleared.contains("//web:server"), "{cleared}");
+        assert!(cleared.contains("//api:server"), "{cleared}");
+    }
+
+    #[test]
+    fn backspace_edits_query_and_tab_switch_drops_filter() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
+        v.apply(&ev(1, result_start("//web:server")));
+        v.apply(&ev(2, result_end("//web:server", None)));
+        v.apply(&ev(3, result_start("//api:server")));
+        v.apply(&ev(4, result_end("//api:server", None)));
+
+        let body = |v: &TuiProgressView| -> String {
+            v.render("⠋", 10_000, 80, 8)
+                .iter()
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+
+        v.tab(true); // Done
+        v.search_start();
+        v.search_input('a');
+        v.search_input('p');
+        v.search_input('z'); // typo: matches nothing
+        assert!(body(&v).contains("no targets match"));
+        v.search_backspace(); // drop the 'z' → "ap"
+        let fixed = body(&v);
+        assert!(fixed.contains("//api:server"), "{fixed}");
+        assert!(!fixed.contains("//web:server"), "{fixed}");
+
+        // Switching tabs drops the filter and exits search input.
+        v.tab(true); // Failed
+        assert!(!v.is_searching());
+        v.tab(true); // back to Default
+        v.tab(true); // Done again — full list, no filter
+        let full = body(&v);
+        assert!(full.contains("//web:server"), "{full}");
+        assert!(full.contains("//api:server"), "{full}");
     }
 
     #[test]
@@ -2452,7 +2669,7 @@ mod tests {
 
         // Matched scope: only the matched top-level target.
         let matched_lines: String = s
-            .done_lines(CountScope::Matched)
+            .done_lines(CountScope::Matched, "")
             .iter()
             .map(|l| format!("{l}"))
             .collect();
@@ -2462,7 +2679,7 @@ mod tests {
 
         // All scope: every completed target, deps included, still no failures.
         let all_lines: String = s
-            .done_lines(CountScope::All)
+            .done_lines(CountScope::All, "")
             .iter()
             .map(|l| format!("{l}"))
             .collect();

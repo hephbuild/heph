@@ -178,6 +178,31 @@ pub trait TUIAppView: Send {
     /// a scope toggle.
     fn toggle_scope(&mut self) {}
 
+    /// Whether the view is currently capturing keystrokes into a search query
+    /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
+    /// Enter and Esc to the search methods below instead of the normal shortcuts.
+    /// Default `false` for views without search.
+    fn is_searching(&self) -> bool {
+        false
+    }
+
+    /// Enter search-input mode (the `/` key). No-op by default.
+    fn search_start(&mut self) {}
+
+    /// Append a typed character to the active search query. No-op by default.
+    fn search_input(&mut self, _c: char) {}
+
+    /// Delete the last character of the active search query. No-op by default.
+    fn search_backspace(&mut self) {}
+
+    /// Cancel search: leave input mode and clear the filter (the `Esc` key).
+    /// No-op by default.
+    fn search_cancel(&mut self) {}
+
+    /// Confirm search: leave input mode but keep the filter applied so the body
+    /// can be scrolled (the `Enter` key). No-op by default.
+    fn search_confirm(&mut self) {}
+
     /// The lines for the pinned viewport, including the spinner row built from
     /// `spinner`. Called every render tick. `width` is the current terminal
     /// column count and `height` the reserved viewport row count, so the view can
