@@ -17,6 +17,7 @@ in
     pkgs.zig
     pkgs.cargo-zigbuild
     pkgs.tokio-console
+    pkgs.sccache
     # pkg-config + libfuse for the `fuse-sandbox` feature.
     # - Linux: `fuse3` ships headers/pc files fuser links against.
     # - macOS: `macfuse-stubs` provides the build-time `osxfuse.pc` per
@@ -29,6 +30,11 @@ in
   ] ++ lib.optionals pkgs.stdenv.isLinux [
     pkgs.fuse3
   ];
+
+  # Route every rustc invocation through sccache (local + CI, since CI runs
+  # inside this shell). SCCACHE_DIR is left at its platform default locally;
+  # CI overrides it to a workspace path so it can be cached across runs.
+  env.RUSTC_WRAPPER = "sccache";
 
   # https://devenv.sh/languages/
    languages.rust = {
