@@ -65,11 +65,11 @@ in
   scripts.tst.exec = "cargo test --locked --all";
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
-  scripts.run-profile.exec = ''$DEVENV_ROOT/target/profiling/heph "''${@}"'';
-  scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $DEVENV_ROOT/target/profiling/heph "''${@}"'';
+  scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';
+  scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $CARGO_TARGET_DIR/profiling/heph "''${@}"'';
 
   scripts.build-release.exec = ''cargo build --profile release'';
-  scripts.run-release.exec = ''$DEVENV_ROOT/target/release/heph "''${@}"'';
+  scripts.run-release.exec = ''$CARGO_TARGET_DIR/release/heph "''${@}"'';
 
   scripts.rheph.exec = ''cargo run -q --profile release -- "''${@}"'';
   scripts.pheph.exec = ''cargo run -q --profile profiling -- "''${@}"'';
@@ -87,21 +87,25 @@ in
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")
-    cp $DEVENV_ROOT/target/debug/heph "${binLocation}"
+    cp $CARGO_TARGET_DIR/debug/heph "${binLocation}"
   '';
 
   scripts.install-release-build.exec = ''
     cargo build --release
     mkdir -p $(dirname "${binLocation}")
-    cp $DEVENV_ROOT/target/release/heph "${binLocation}"
+    cp $CARGO_TARGET_DIR/release/heph "${binLocation}"
   '';
 
 
   # https://devenv.sh/basics/
-#  enterShell = ''
-#    hello         # Run scripts directly
-#    git --version # Use packages
-#  '';
+  enterShell = ''
+    # All git worktrees share one cargo target dir (deps stored once, not
+    # duplicated per worktree). The shell is rooted at the MAIN checkout, so
+    # $DEVENV_ROOT is stable across every worktree a tool call cd's into; the
+    # exported var is inherited by all subprocesses. Respect an externally-set
+    # value (CI pins ./target).
+    export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$DEVENV_ROOT/target}"
+  '';
 
   # https://devenv.sh/tests/
   enterTest = ''

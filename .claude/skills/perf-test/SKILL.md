@@ -25,7 +25,7 @@ Goal: measure heph hot paths, surface concrete bottlenecks, propose actionable f
 2. **Warmup run** — prime caches, FS, allocator. Discard output. `heph r test` must run from `example/`:
 
    ```bash
-   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $DEVENV_ROOT/target/profiling/heph r test
+   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $CARGO_TARGET_DIR/profiling/heph r test
    ```
 
    `-s` = save-only (no web server). Output: `profile.json.gz` + `profile.json.syms.json` in cwd (`example/`).
@@ -33,7 +33,7 @@ Goal: measure heph hot paths, surface concrete bottlenecks, propose actionable f
 3. **Measured run** — same command, second invocation, plus pprof output:
 
    ```bash
-   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $DEVENV_ROOT/target/profiling/heph --pprof-cpu=/tmp/cpu.prof r test
+   cd $DEVENV_ROOT/example && samply record --unstable-presymbolicate -s $CARGO_TARGET_DIR/profiling/heph --pprof-cpu=/tmp/cpu.prof r test
    ```
 
    Artifacts land in `example/profile.json.gz` + `example/profile.json.syms.json` directly. pprof at `/tmp/cpu.prof`.
