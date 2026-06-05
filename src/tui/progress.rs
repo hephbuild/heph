@@ -6,6 +6,7 @@
 //! receipt clock — so elapsed times stay correct across a future client/server
 //! process split. Rendering callers pass their own `now_ms` wall clock.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -14,13 +15,78 @@ use ratatui::text::{Line, Span};
 use crate::engine::event::{BuildEvent, BuildEventKind};
 use crate::tui::app::{CIAppView, TUIAppView};
 
-/// Total number of pinned viewport rows the progress block renders into:
-/// 1 top border + [`MAX_LONG_RUNNING`] body rows + 1 bottom border.
-pub const PROGRESS_ROWS: u16 = 8;
+/// Floor on the pinned viewport row count. The viewport targets one third of the
+/// terminal height (see [`rows_for_height`]) but never shrinks below this, which
+/// is the minimum that fits the box: top border + 1 body row + bottom border +
+/// help row.
+pub const MIN_PROGRESS_ROWS: u16 = 4;
 
-/// Maximum number of long-running target rows shown before collapsing the
-/// remainder into a single "+N more" line.
-pub const MAX_LONG_RUNNING: usize = 6;
+/// Pinned viewport rows for a given terminal height: one third of the terminal,
+/// clamped up to [`MIN_PROGRESS_ROWS`]. The box grows the body (slow/lock rows)
+/// to fill whatever rows it is given.
+pub fn rows_for_height(term_height: u16) -> u16 {
+    (term_height / 3).max(MIN_PROGRESS_ROWS)
+}
+
+/// Slice `lines` to a `rows`-tall window starting at `scroll`, returning the
+/// window and the clamped scroll offset. When content extends past the window
+/// bottom, the last visible row is replaced by a combined `+N more` collapse
+/// that counts *every* hidden line below (slow targets and lock waits alike).
+/// Scroll is clamped so the window never runs off the end.
+fn windowed(
+    mut lines: Vec<Line<'static>>,
+    rows: usize,
+    scroll: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let total = lines.len();
+    if rows == 0 {
+        return (Vec::new(), 0);
+    }
+    if total <= rows {
+        return (lines, 0);
+    }
+    let max_scroll = total - rows;
+    let scroll = scroll.min(max_scroll);
+    let mut window: Vec<Line<'static>> = lines.drain(scroll..scroll + rows).collect();
+    // Rows still hidden below the window. The collapse line itself displaces one
+    // shown row, so the reported count is the hidden rows plus that displaced one.
+    let hidden_below = max_scroll - scroll;
+    if hidden_below > 0
+        && let Some(last) = window.last_mut()
+    {
+        *last = Line::from(format!("  +{} more", hidden_below + 1));
+    }
+    (window, scroll)
+}
+
+/// Columns shifted per Left/Right key press when panning a wide body.
+pub const HSCROLL_STEP: usize = 4;
+
+/// Drop the first `offset` visible columns from a line, preserving each span's
+/// styling. Every glyph this module emits is single-width, so a char count is an
+/// exact column count. `offset == 0` returns the line untouched.
+fn hscroll_line(line: Line<'static>, offset: usize) -> Line<'static> {
+    if offset == 0 {
+        return line;
+    }
+    let mut remaining = offset;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let chars = span.content.chars().count();
+        if remaining >= chars {
+            remaining -= chars;
+            continue;
+        }
+        if remaining > 0 {
+            let kept: String = span.content.chars().skip(remaining).collect();
+            spans.push(Span::styled(kept, span.style));
+            remaining = 0;
+        } else {
+            spans.push(span);
+        }
+    }
+    Line::from(spans)
+}
 
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
@@ -170,6 +236,82 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Which body the TUI viewport is showing. The default view is the live
+/// slow-target / lock-wait breakdown; the [`ViewMode::Failed`] view lists every
+/// errored target and the [`ViewMode::Done`] view every completed one. `Tab`
+/// cycles through `[Default]` plus one entry per [`HeaderItem::Tab`] the header
+/// model exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The live breakdown: slow targets + lock waits (or idle art when empty).
+    Default,
+    /// The list of completed (successfully finished) targets, scoped by the
+    /// active [`CountScope`] (matched set vs every observed target).
+    Done,
+    /// The list of failed targets.
+    Failed,
+}
+
+/// Case-insensitive substring test for the `/` filter on the `Done`/`Failed`
+/// bodies. An empty filter matches everything (the unfiltered list).
+fn addr_matches(addr: &str, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    addr.to_ascii_lowercase()
+        .contains(&filter.to_ascii_lowercase())
+}
+
+/// Which target set the header counters are scoped to. `Matched` (the default)
+/// counts only the matched top-level targets; `All` counts every target the view
+/// has observed, including transitive deps. The `a` key toggles between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CountScope {
+    /// Counters scoped to the matched top-level target set.
+    #[default]
+    Matched,
+    /// Counters across every target the view has seen (incl. transitive deps).
+    All,
+}
+
+/// One freestanding segment of the header status line. The view joins items with
+/// ` · ` itself — items must NOT bake in separators. A [`HeaderItem::Tab`] binds a
+/// segment to a body [`ViewMode`]; the view highlights it (background colour)
+/// while that mode is the active view.
+pub enum HeaderItem {
+    /// A plain segment that is always rendered as-is.
+    Text(Vec<Span<'static>>),
+    /// A segment bound to a body view. Selectable via `Tab`; highlighted while
+    /// its `mode` is active.
+    Tab {
+        mode: ViewMode,
+        spans: Vec<Span<'static>>,
+    },
+}
+
+impl HeaderItem {
+    /// A plain-text segment.
+    pub fn text(s: impl Into<String>) -> Self {
+        HeaderItem::Text(vec![Span::raw(s.into())])
+    }
+
+    /// A plain-text segment bound to a body view.
+    pub fn tab(mode: ViewMode, s: impl Into<String>) -> Self {
+        HeaderItem::Tab {
+            mode,
+            spans: vec![Span::raw(s.into())],
+        }
+    }
+
+    /// The item's spans, regardless of variant (used by tests).
+    #[cfg(test)]
+    fn spans(&self) -> &[Span<'static>] {
+        match self {
+            HeaderItem::Text(spans) | HeaderItem::Tab { spans, .. } => spans,
+        }
+    }
+}
+
 /// A target-scoped operation, as the client groups it for display. This is a
 /// purely client-side (rendering) concept: the engine emits individually typed
 /// events (`ExecuteStart/End`, `LocalCacheWriteStart/End`, …) and
@@ -266,6 +408,13 @@ pub struct BuildState {
     finished: HashSet<String>,
     completed: usize,
     errored: usize,
+    /// Failed targets in failure order, each with its error message (if the
+    /// `ResultEnd` carried one). Drives the [`ViewMode::Failed`] body.
+    failed: Vec<(String, Option<String>)>,
+    /// Successfully completed targets in completion order (cache hits included —
+    /// any `ResultEnd` with no error). Drives the [`ViewMode::Done`] body; the
+    /// `Matched` scope filters this against `matched`.
+    done: Vec<String>,
     /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
     /// Distinct from `completed`, which includes cache hits that never executed.
     built: usize,
@@ -348,10 +497,12 @@ impl BuildState {
             }
             BuildEventKind::ResultEnd { addr, error } => {
                 if self.in_flight_results.remove(addr) {
-                    if error.is_some() {
+                    if let Some(err) = error {
                         self.errored += 1;
+                        self.failed.push((addr.clone(), Some(err.clone())));
                     } else {
                         self.completed += 1;
+                        self.done.push(addr.clone());
                     }
                 }
                 // Record every terminal addr; matched progress is computed as
@@ -449,19 +600,86 @@ impl BuildState {
         Some((done, self.matched.len(), self.matched_complete))
     }
 
+    /// The three freestanding count fields — `(done, cached, failed)` — each
+    /// without separators. The header model wraps these in [`HeaderItem`]s (so
+    /// the view owns the ` · ` joins); [`BuildState::counts_segment`] joins them
+    /// for the plain-text final summary.
+    pub fn count_fields(&self, scope: CountScope) -> (String, String, String) {
+        let (built, cached, _running, failed) = self.header_counts(scope);
+        let done = match scope {
+            // All-targets scope: every observed target (`finished ∪ in_flight`),
+            // with the finished count over that running total. No `~` — the total
+            // grows as deps stream rather than resolving to a fixed matched set.
+            CountScope::All => {
+                let done = self.finished.len();
+                let total = done + self.in_flight_results.len();
+                format!("{done} / {total} done")
+            }
+            CountScope::Matched => match self.matched_progress() {
+                Some((done, total, complete)) => {
+                    let tilde = if complete { "" } else { "~" };
+                    format!("{done} / {tilde}{total} done")
+                }
+                None => format!("{built} done"),
+            },
+        };
+        (done, format!("{cached} cached"), format!("{failed} failed"))
+    }
+
     /// The textual count segment shared by the live header and the final
     /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
     /// braille — callers prepend the elapsed field themselves.
-    pub fn counts_segment(&self) -> String {
-        let (built, cached, _running, failed) = self.header_counts();
-        let done = match self.matched_progress() {
-            Some((done, total, complete)) => {
-                let tilde = if complete { "" } else { "~" };
-                format!("{done} / {tilde}{total} done")
-            }
-            None => format!("{built} done"),
-        };
-        format!("{done} · {cached} cached · {failed} failed")
+    pub fn counts_segment(&self, scope: CountScope) -> String {
+        let (done, cached, failed) = self.count_fields(scope);
+        format!("{done} · {cached} · {failed}")
+    }
+
+    /// Body rows for the [`ViewMode::Failed`] view: one line per failed target,
+    /// addr in red followed by its error message (when one was reported).
+    /// Empty when nothing has failed.
+    pub fn failed_lines(&self, filter: &str) -> Vec<Line<'static>> {
+        self.failed
+            .iter()
+            .filter(|(addr, _)| addr_matches(addr, filter))
+            .map(|(addr, err)| {
+                let mut spans = vec![Span::styled(
+                    format!("  {addr}"),
+                    Style::default().fg(Color::Red),
+                )];
+                if let Some(err) = err {
+                    // Keep the message on one line; the viewport clips overflow.
+                    let msg = err.lines().next().unwrap_or(err);
+                    spans.push(Span::styled(
+                        format!("  {msg}"),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    /// Body rows for the [`ViewMode::Done`] view: one line per completed target,
+    /// addr in green, in completion order. Scoped by `scope`: `Matched` keeps only
+    /// addrs in the matched top-level set, `All` lists every completed target
+    /// (transitive deps included). Empty when nothing has finished.
+    pub fn done_lines(&self, scope: CountScope, filter: &str) -> Vec<Line<'static>> {
+        self.done
+            .iter()
+            .filter(|addr| match scope {
+                CountScope::All => true,
+                CountScope::Matched => self.matched.contains(*addr),
+            })
+            .filter(|addr| addr_matches(addr, filter))
+            .map(|addr| {
+                Line::from(Span::styled(
+                    format!("  {addr}"),
+                    Style::default().fg(Color::Green),
+                ))
+            })
+            .collect()
     }
 
     /// Header counts, in render order: `(built, cached, running, failed)`.
@@ -469,14 +687,16 @@ impl BuildState {
     /// targets that hit cache (`matched ∩ cache_hit`), falling back to all cache
     /// hits before any `Matched` event arrives; `running` is in-flight results;
     /// `failed` is errors.
-    pub fn header_counts(&self) -> (usize, usize, usize, usize) {
-        let cached = if self.matched_seen {
-            self.matched
+    pub fn header_counts(&self, scope: CountScope) -> (usize, usize, usize, usize) {
+        let cached = match scope {
+            // All-targets scope: every addr that hit cache (deduped), deps included.
+            CountScope::All => self.cache_hit.len(),
+            CountScope::Matched if self.matched_seen => self
+                .matched
                 .iter()
                 .filter(|a| self.cache_hit.contains(*a))
-                .count()
-        } else {
-            self.local_hits + self.remote_hits
+                .count(),
+            CountScope::Matched => self.local_hits + self.remote_hits,
         };
         (
             self.built,
@@ -550,33 +770,31 @@ impl BuildState {
         )
     }
 
-    /// The long-running ("slow") target rows: up to [`MAX_LONG_RUNNING`] rows of
+    /// The long-running ("slow") target rows, one per slow target and uncollapsed:
     /// `addr (icon Ns)…` — one `(icon Ns)` group per op the target passed through
-    /// or is in — with a trailing "+N more" line when the list overflows. At most
-    /// [`MAX_LONG_RUNNING`] lines total (the collapse line consumes a slot).
-    pub fn long_running_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
-        let long = self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS);
-        let overflow = long.len() > MAX_LONG_RUNNING;
-        // When the list overflows, the "+N more" collapse line consumes one
-        // slot, so we show one fewer detailed row.
-        let shown = if overflow {
-            MAX_LONG_RUNNING - 1
-        } else {
-            MAX_LONG_RUNNING
-        };
-        let mut lines = Vec::with_capacity(MAX_LONG_RUNNING);
-        for (addr, _active_elapsed, breakdown) in long.iter().take(shown) {
-            let groups: String = breakdown
-                .iter()
-                .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
-                .collect();
-            lines.push(Line::from(format!("  {addr}{groups}")));
-        }
-        if overflow {
-            let extra = long.len() - shown;
-            lines.push(Line::from(format!("  +{extra} more")));
-        }
-        lines
+    /// or is in. The collapse into a "+N more" line is applied later, over the
+    /// *combined* slow + lock-wait body (see [`BuildState::body_lines`]), so the
+    /// overflow count covers both kinds of rows together.
+    fn slow_rows(&self, now_ms: u64) -> Vec<Line<'static>> {
+        self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS)
+            .into_iter()
+            .map(|(addr, _active_elapsed, breakdown)| {
+                let groups: String = breakdown
+                    .iter()
+                    .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
+                    .collect();
+                Line::from(format!("  {addr}{groups}"))
+            })
+            .collect()
+    }
+
+    /// The full body: lock-wait notices first (they take priority), then every
+    /// slow-target row. Uncollapsed — the caller windows/collapses it to the
+    /// available rows, so a "+N more" count spans locks and slow rows alike.
+    pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
+        let mut body = self.lock_wait_lines();
+        body.extend(self.slow_rows(now_ms));
+        body
     }
 
     /// Rows for addrs currently blocked on the result lock past the notice
@@ -652,11 +870,14 @@ pub trait ProgressHeader: Send {
     /// Fold an event into header-private state. The build header reads the
     /// view's shared [`BuildState`] instead, so its impl is a no-op.
     fn apply(&mut self, _ev: &BuildEvent) {}
-    /// Status segment shown after the elapsed clock, including the worker
-    /// braille. Spans (not a plain string) so the braille keeps its styling.
+    /// Status items shown after the elapsed clock. Each item is freestanding —
+    /// the view joins them with ` · ` and highlights any [`HeaderItem::Tab`]
+    /// whose mode is the active view — so a model must NOT bake in separators.
     /// `core` is the view's shared build state; headers that track their own
-    /// state ignore it.
-    fn header(&self, core: &BuildState) -> Vec<Span<'static>>;
+    /// state ignore it. `scope` selects whether the counts cover the matched set
+    /// or every observed target (toggled by the `a` key); state-private headers
+    /// ignore it.
+    fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem>;
     /// The bottom-border label.
     fn label(&self) -> String;
     /// Final summary segment printed after the run (after the elapsed clock).
@@ -679,14 +900,20 @@ impl BuildHeader {
 }
 
 impl ProgressHeader for BuildHeader {
-    fn header(&self, core: &BuildState) -> Vec<Span<'static>> {
-        let mut spans = vec![Span::raw(core.counts_segment())];
+    fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
+        let (done, cached, failed) = core.count_fields(scope);
+        let mut items = vec![
+            // The done count is a tab into the completed-targets view.
+            HeaderItem::tab(ViewMode::Done, done),
+            HeaderItem::text(cached),
+            // The failed count is a tab into the failed-targets view.
+            HeaderItem::tab(ViewMode::Failed, failed),
+        ];
         let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_workers());
         if !workers.is_empty() {
-            spans.push(Span::raw(" · "));
-            spans.extend(workers);
+            items.push(HeaderItem::Text(workers));
         }
-        spans
+        items
     }
 
     fn label(&self) -> String {
@@ -695,7 +922,8 @@ impl ProgressHeader for BuildHeader {
 
     fn last_render(&self, core: &BuildState) -> String {
         if core.has_activity() {
-            core.counts_segment()
+            // The final summary always reports the matched set, the canonical view.
+            core.counts_segment(CountScope::Matched)
         } else {
             String::new()
         }
@@ -743,8 +971,8 @@ impl ProgressHeader for GcHeader {
         }
     }
 
-    fn header(&self, _core: &BuildState) -> Vec<Span<'static>> {
-        vec![Span::raw(self.segment())]
+    fn header(&self, _core: &BuildState, _scope: CountScope) -> Vec<HeaderItem> {
+        vec![HeaderItem::text(self.segment())]
     }
 
     fn label(&self) -> String {
@@ -768,6 +996,31 @@ pub struct TuiProgressView {
     state: BuildState,
     /// Per-command header content (build counts vs gc sweep stats).
     model: Box<dyn ProgressHeader>,
+    /// Body scroll offset (rows from the top of the combined body list). Held in
+    /// a `Cell` so `render` can clamp it against the live row count while staying
+    /// `&self`; `scroll()` mutates it from key events.
+    scroll: Cell<usize>,
+    /// Body horizontal pan offset in columns, for lines wider than the viewport.
+    /// Clamped in `render` against the widest body line; `hscroll()` mutates it.
+    hscroll: Cell<usize>,
+    /// The active body view. `Tab` cycles it through [`ViewMode::Default`] plus
+    /// every tab the header model exposes.
+    view: Cell<ViewMode>,
+    /// Which target set the header counters cover. `a` toggles matched ⇄ all.
+    /// Held in a `Cell` so `render`/`header_item_spans` read it through `&self`.
+    scope: Cell<CountScope>,
+    /// Server-wall timestamp captured when the run finished and the viewport was
+    /// held open (user navigated off the main view). `Some` drives the green
+    /// "press q to quit" notice and freezes the elapsed clock at this instant.
+    finished_at_ms: Option<u64>,
+    /// Whether the `/` filter is capturing keystrokes. While `true` printable keys
+    /// edit [`Self::search_query`] instead of triggering the normal shortcuts.
+    /// Only meaningful on the `Done`/`Failed` tabs.
+    search_active: Cell<bool>,
+    /// The active filter for the `Done`/`Failed` bodies: a case-insensitive
+    /// substring matched against the target addr. Empty means no filtering.
+    /// Persists after `Enter` confirms so the filtered list stays scrollable.
+    search_query: RefCell<String>,
 }
 
 impl TuiProgressView {
@@ -781,7 +1034,128 @@ impl TuiProgressView {
         Self {
             state: BuildState::new(),
             model,
+            scroll: Cell::new(0),
+            hscroll: Cell::new(0),
+            view: Cell::new(ViewMode::Default),
+            scope: Cell::new(CountScope::Matched),
+            finished_at_ms: None,
+            search_active: Cell::new(false),
+            search_query: RefCell::new(String::new()),
         }
+    }
+
+    /// The selectable body views in cycle order: [`ViewMode::Default`] first,
+    /// then one entry per [`HeaderItem::Tab`] the header model exposes, in header
+    /// order. `Tab` walks this list.
+    fn view_modes(&self) -> Vec<ViewMode> {
+        let mut modes = vec![ViewMode::Default];
+        modes.extend(
+            self.model
+                .header(&self.state, self.scope.get())
+                .iter()
+                .filter_map(|i| {
+                    if let HeaderItem::Tab { mode, .. } = i {
+                        Some(*mode)
+                    } else {
+                        None
+                    }
+                }),
+        );
+        modes
+    }
+
+    /// The help row pinned under the box. While held open after the run finishes
+    /// it turns into a green "press q to quit" notice; otherwise it lists the keys
+    /// the viewport responds to.
+    fn help_line(&self) -> Line<'static> {
+        // While typing a filter the help row becomes the search prompt with a
+        // block cursor; Enter keeps it, Esc clears it.
+        if self.search_active.get() {
+            let query = self.search_query.borrow();
+            return Line::from(vec![
+                Span::styled(format!("  /{query}▏"), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "  enter keep · esc clear",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]);
+        }
+        // A confirmed (but still applied) filter: show it with the clear hint.
+        {
+            let query = self.search_query.borrow();
+            if !query.is_empty() {
+                return Line::from(vec![
+                    Span::styled(
+                        format!("  filter: {query}"),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        "  ↑/↓ scroll · / edit · esc clear",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                ]);
+            }
+        }
+        if self.finished_at_ms.is_some() {
+            return Line::from(Span::styled(
+                "  ✓ finished — press q or Ctrl-C to quit",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // The `a` hint reads as the *action*: it names the scope you switch to.
+        let scope_key = match self.scope.get() {
+            CountScope::Matched => "a all",
+            CountScope::All => "a matched",
+        };
+        // `/` only filters the list tabs, so only advertise it off the live view.
+        let search_hint = if self.view.get() == ViewMode::Default {
+            ""
+        } else {
+            " · / search"
+        };
+        Line::from(Span::styled(
+            format!("  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ))
+    }
+
+    /// Render the header model's items into a flat span run: items joined by
+    /// ` · `, with the [`HeaderItem::Tab`] matching the active view highlighted
+    /// (reversed background). This is the one place the ` · ` separator lives.
+    fn header_item_spans(&self) -> Vec<Span<'static>> {
+        let active = self.view.get();
+        let items = self.model.header(&self.state, self.scope.get());
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 2);
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" · "));
+            }
+            match item {
+                HeaderItem::Text(item_spans) => spans.extend(item_spans.iter().cloned()),
+                HeaderItem::Tab {
+                    mode,
+                    spans: item_spans,
+                } if *mode == active => {
+                    // Active tab: paint a background so the selected view reads
+                    // as highlighted in the header.
+                    spans.extend(item_spans.iter().map(|s| {
+                        Span::styled(s.content.clone(), s.style.bg(Color::Blue).fg(Color::White))
+                    }));
+                }
+                HeaderItem::Tab {
+                    spans: item_spans, ..
+                } => spans.extend(item_spans.iter().cloned()),
+            }
+        }
+        spans
     }
 
     /// The rounded top border:
@@ -792,7 +1166,10 @@ impl TuiProgressView {
     /// count is omitted — the worker braille (flush right) conveys concurrency.
     fn header_line(&self, now_ms: u64, width: u16) -> Line<'static> {
         let width = usize::from(width).max(MIN_BOX_WIDTH);
-        let elapsed = human_elapsed(self.state.elapsed_ms(now_ms));
+        // Once finished, the clock is frozen at the finish instant rather than
+        // advancing with the live render wall clock.
+        let clock = self.finished_at_ms.unwrap_or(now_ms);
+        let elapsed = human_elapsed(self.state.elapsed_ms(clock));
 
         let mut left: Vec<Span<'static>> = Vec::with_capacity(5);
         left.push(Span::raw("╭─ "));
@@ -800,7 +1177,7 @@ impl TuiProgressView {
         // The status segment (counts + worker braille, or gc sweep stats) is
         // supplied by the header model; the view owns only the leading clock.
         left.push(Span::raw(" · "));
-        left.extend(self.model.header(&self.state));
+        left.extend(self.header_item_spans());
         // Space between the segment and the dash fill.
         left.push(Span::raw(" "));
 
@@ -847,39 +1224,194 @@ impl TUIAppView for TuiProgressView {
         self.model.apply(ev);
     }
 
-    fn rows(&self) -> u16 {
-        PROGRESS_ROWS
+    fn rows(&self, term_height: u16) -> u16 {
+        rows_for_height(term_height)
     }
 
-    /// Layout (top to bottom), a rounded box pinned to [`PROGRESS_ROWS`]:
-    /// ```text
-    /// ╭─ rheph · N built · N cached · N running · N failed ──── <workers> ─╮
-    ///   <slow rows...>            (padded to keep the box a fixed height)
-    /// ╰─── <label> ───────────────────────────────────────────────────────╯
-    /// ```
-    /// When nothing is slow the body shows a dim, slowly-drifting abstract field
-    /// instead of blank rows. The `spinner` is unused — liveness is conveyed by
-    /// the worker braille, the scrolling label, and the idle art.
-    fn render(&self, _spinner: &str, now_ms: u64, width: u16) -> Vec<Line<'static>> {
-        let body_rows = usize::from(PROGRESS_ROWS) - 2;
-        let mut lines = Vec::with_capacity(usize::from(PROGRESS_ROWS));
-        lines.push(self.header_line(now_ms, width));
-        // Lock-wait notices take priority in the body, followed by slow rows.
-        let mut body = self.state.lock_wait_lines();
-        body.extend(self.state.long_running_lines(now_ms));
-        if body.is_empty() {
-            lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows));
+    fn scroll(&mut self, delta: i32) {
+        let cur = self.scroll.get();
+        let mag = delta.unsigned_abs() as usize;
+        let next = if delta >= 0 {
+            cur.saturating_add(mag)
         } else {
-            for line in body.into_iter().take(body_rows) {
-                lines.push(line);
-            }
+            cur.saturating_sub(mag)
+        };
+        self.scroll.set(next);
+    }
+
+    fn hscroll(&mut self, delta: i32) {
+        let cur = self.hscroll.get();
+        let mag = delta.unsigned_abs() as usize;
+        let next = if delta >= 0 {
+            cur.saturating_add(mag)
+        } else {
+            cur.saturating_sub(mag)
+        };
+        self.hscroll.set(next);
+    }
+
+    fn tab(&mut self, forward: bool) {
+        let modes = self.view_modes();
+        let len = modes.len().max(1);
+        let cur = self.view.get();
+        let idx = modes.iter().position(|&m| m == cur).unwrap_or(0);
+        // Step forward or backward with wrap. `modes` always holds at least
+        // `Default`, so the index is in-bounds; the `.get`/fallback keeps it
+        // panic-free regardless.
+        let step = if forward { 1 } else { len - 1 };
+        let next = modes
+            .get((idx + step) % len)
+            .copied()
+            .unwrap_or(ViewMode::Default);
+        self.view.set(next);
+        // Switching views resets the scroll so the new body starts at the
+        // top-left, and drops any active filter (it was scoped to the old tab).
+        self.scroll.set(0);
+        self.hscroll.set(0);
+        self.search_active.set(false);
+        self.search_query.borrow_mut().clear();
+    }
+
+    fn toggle_scope(&mut self) {
+        let next = match self.scope.get() {
+            CountScope::Matched => CountScope::All,
+            CountScope::All => CountScope::Matched,
+        };
+        self.scope.set(next);
+    }
+
+    fn is_searching(&self) -> bool {
+        self.search_active.get()
+    }
+
+    fn search_start(&mut self) {
+        // Search only filters the list tabs; ignore `/` on the live Default view.
+        if self.view.get() == ViewMode::Default {
+            return;
         }
-        // Pad the body so the bottom border always pins to the last row.
+        // Re-entering search keeps any confirmed query so `/` resumes editing.
+        self.search_active.set(true);
+        self.scroll.set(0);
+        self.hscroll.set(0);
+    }
+
+    fn search_input(&mut self, c: char) {
+        self.search_query.borrow_mut().push(c);
+        // A changed filter reshapes the list; restart from the top.
+        self.scroll.set(0);
+    }
+
+    fn search_backspace(&mut self) {
+        self.search_query.borrow_mut().pop();
+        self.scroll.set(0);
+    }
+
+    fn search_cancel(&mut self) {
+        self.search_active.set(false);
+        self.search_query.borrow_mut().clear();
+        self.scroll.set(0);
+        self.hscroll.set(0);
+    }
+
+    fn search_confirm(&mut self) {
+        // Leave input mode but keep the filter so the list stays scrollable.
+        self.search_active.set(false);
+    }
+
+    /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
+    /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
+    /// ```text
+    /// ╭─ heph · N built · N cached · N running · N failed ──── <workers> ─╮
+    ///   <slow rows + lock waits, scrollable, collapsed to "+N more">
+    /// ╰─── <label> ───────────────────────────────────────────────────────╯
+    ///   ↑/↓ scroll
+    /// ```
+    /// The body grows to fill the available rows; when it overflows it scrolls and
+    /// the last visible row collapses the remainder. When nothing is slow the body
+    /// shows a dim, slowly-drifting abstract field instead of blank rows. The
+    /// `spinner` is unused — liveness is conveyed by the worker braille, the
+    /// scrolling label, and the idle art.
+    fn render(&self, _spinner: &str, now_ms: u64, width: u16, height: u16) -> Vec<Line<'static>> {
+        let height = usize::from(height.max(MIN_PROGRESS_ROWS));
+        // height = 1 header + body_rows + 1 bottom border + 1 help row.
+        let body_rows = height - 3;
+        let mut lines = Vec::with_capacity(height);
+        lines.push(self.header_line(now_ms, width));
+        let view = self.view.get();
+        // The `/` filter only applies to the list tabs; the Default body ignores it.
+        let query = self.search_query.borrow();
+        let filter: &str = query.as_str();
+        let body = match view {
+            ViewMode::Default => self.state.body_lines(now_ms),
+            ViewMode::Done => self.state.done_lines(self.scope.get(), filter),
+            ViewMode::Failed => self.state.failed_lines(filter),
+        };
+        let filtering = !filter.is_empty();
+        if body.is_empty() {
+            self.scroll.set(0);
+            self.hscroll.set(0);
+            match view {
+                // Default view: the dim drifting idle field.
+                ViewMode::Default => {
+                    lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows))
+                }
+                // List tabs with an active filter that matched nothing.
+                _ if filtering => lines.push(Line::from(Span::styled(
+                    format!("  no targets match \"{filter}\""),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+                // Done view with nothing completed: a single dim placeholder.
+                ViewMode::Done => lines.push(Line::from(Span::styled(
+                    "  no completed targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+                // Failed view with nothing failed: a single dim placeholder.
+                ViewMode::Failed => lines.push(Line::from(Span::styled(
+                    "  no failed targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+            }
+        } else {
+            // Clamp the horizontal pan against the widest body line so panning
+            // stops once the longest line's tail reaches the right edge.
+            let avail = usize::from(width.max(1));
+            let max_w = body
+                .iter()
+                .map(|l| spans_width(&l.spans))
+                .max()
+                .unwrap_or(0);
+            let hscroll = self.hscroll.get().min(max_w.saturating_sub(avail));
+            self.hscroll.set(hscroll);
+
+            let (window, scroll) = windowed(body, body_rows, self.scroll.get());
+            self.scroll.set(scroll);
+            lines.extend(window.into_iter().map(|l| hscroll_line(l, hscroll)));
+        }
+        // Pad the body so the bottom border always pins to the same row.
         while lines.len() < body_rows + 1 {
             lines.push(Line::from(""));
         }
         lines.push(self.bottom_line(now_ms, width));
+        lines.push(self.help_line());
         lines
+    }
+
+    fn hold_after_finish(&self) -> bool {
+        // Auto-exit only from the main view; if the user is reading another tab
+        // (e.g. the failed list), keep the viewport up until they quit.
+        self.view.get() != ViewMode::Default
+    }
+
+    fn set_finished(&mut self) {
+        // Freeze the elapsed clock at the finish instant; the viewport keeps
+        // rendering while held but the time must stop counting.
+        self.finished_at_ms = Some(crate::engine::event::now_unix_ms());
     }
 
     /// Final report — the elapsed clock plus the header model's summary segment,
@@ -893,7 +1425,12 @@ impl TUIAppView for TuiProgressView {
         if segment.is_empty() {
             return;
         }
-        let elapsed = human_elapsed_ms(self.state.elapsed_ms(crate::engine::event::now_unix_ms()));
+        // Match the live header: a held/finished run freezes the clock at the
+        // finish instant rather than the teardown wall clock.
+        let clock = self
+            .finished_at_ms
+            .unwrap_or_else(crate::engine::event::now_unix_ms);
+        let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
         let elapsed = elapsed.trim_start();
         use std::io::Write;
         drop(writeln!(std::io::stderr().lock(), "{elapsed} · {segment}"));
@@ -987,6 +1524,15 @@ mod tests {
 
     fn ev(at_unix_ms: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent { at_unix_ms, kind }
+    }
+
+    /// Flatten a header model's items into their concatenated text.
+    fn header_text(items: &[HeaderItem]) -> String {
+        items
+            .iter()
+            .flat_map(|i| i.spans())
+            .map(|s| s.content.to_string())
+            .collect()
     }
 
     #[test]
@@ -1251,7 +1797,7 @@ mod tests {
         s.apply(&ev(3_000, execute_end("//slow:x")));
         s.apply(&ev(3_000, local_write_start("//slow:x")));
 
-        let line = format!("{}", s.long_running_lines(9_000)[0]);
+        let line = format!("{}", s.slow_rows(9_000)[0]);
         assert!(line.contains("//slow:x"), "{line}");
         assert!(
             line.contains(&format!("({} ", Op::Execute.icon())),
@@ -1271,10 +1817,11 @@ mod tests {
     fn tui_view_box_layout_header_body_label() {
         let mut v = TuiProgressView::new("Running //a:b");
         v.apply(&ev(0, execute_start("//slow:x")));
-        let lines = v.render("⠋", 10_000, 80);
+        let height = 8u16;
+        let lines = v.render("⠋", 10_000, 80, height);
 
-        // Always a fixed-height box.
-        assert_eq!(lines.len(), usize::from(PROGRESS_ROWS));
+        // The box fills exactly the rows it was given.
+        assert_eq!(lines.len(), usize::from(height));
 
         // Top border: rounded corners + title, not the label.
         let header = format!("{}", lines.first().expect("header line"));
@@ -1284,15 +1831,19 @@ mod tests {
         assert!(header.contains("10s"), "header: {header}");
         assert!(!header.contains("Running //a:b"), "header: {header}");
 
-        // Bottom border: rounded corners + the label.
-        let footer = format!("{}", lines.last().expect("footer line"));
+        // Help row is pinned last, below the box.
+        let help = format!("{}", lines.last().expect("help line"));
+        assert!(help.contains("scroll"), "help: {help}");
+
+        // Bottom border (second-to-last row): rounded corners + the label.
+        let footer = format!("{}", lines[lines.len() - 2]);
         assert!(footer.starts_with("╰─"), "footer: {footer}");
         assert!(footer.ends_with('╯'), "footer: {footer}");
         assert!(footer.contains("Running //a:b"), "footer: {footer}");
 
-        // The slow row sits in the body between the borders.
+        // The slow row sits in the body between the header and the bottom border.
         assert!(
-            lines[1..lines.len() - 1]
+            lines[1..lines.len() - 2]
                 .iter()
                 .any(|l| format!("{l}").contains("//slow:x")),
             "expected slow row in body, got {lines:?}"
@@ -1315,7 +1866,7 @@ mod tests {
         v.apply(&ev(4, result_start("//a:failed")));
         v.apply(&ev(5, result_end("//a:failed", Some("boom".into()))));
 
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         assert!(header.contains("1 done"), "{header}");
         assert!(header.contains("1 cached"), "{header}");
         assert!(header.contains("1 failed"), "{header}");
@@ -1332,12 +1883,12 @@ mod tests {
         v.apply(&ev(0, matched(&["//a:x", "//a:y", "//a:z"], false)));
         v.apply(&ev(1, result_start("//a:x")));
         v.apply(&ev(2, result_end("//a:x", None)));
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         assert!(header.contains("1 / ~3 done"), "{header}");
 
         // Matcher resolves: the `~` drops.
         v.apply(&ev(3, matched(&[], true)));
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         assert!(header.contains("1 / 3 done"), "{header}");
         assert!(!header.contains('~'), "{header}");
     }
@@ -1347,7 +1898,7 @@ mod tests {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, max_workers(8)));
         v.apply(&ev(1, execute_start("//a:b")));
-        let header = format!("{}", v.render("⠋", 100, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
         // " · ⠁" appears after "failed".
         let failed_at = header.find("failed").expect("failed in header");
         let braille_at = header.find('⠁').expect("braille in header");
@@ -1367,14 +1918,14 @@ mod tests {
         v.apply(&ev(0, max_workers(8)));
         // One busy worker → first cell shows the 1-dot glyph, in the header.
         v.apply(&ev(1, execute_start("//a:b")));
-        let header = format!("{}", v.render("⠋", 120, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 120, 120, 8).first().expect("header"));
         assert!(header.contains('⠁'), "expected 1-busy braille: {header}");
     }
 
     #[test]
     fn no_worker_braille_before_max_workers_event() {
         let v = TuiProgressView::new("L");
-        let header = format!("{}", v.render("⠋", 0, 120).first().expect("header"));
+        let header = format!("{}", v.render("⠋", 0, 120, 8).first().expect("header"));
         for g in ['⠁', '⠃', '⠇', '⠧', '⠷', '⠿', '⡿', '⣿'] {
             assert!(!header.contains(g), "no braille expected: {header}");
         }
@@ -1415,11 +1966,7 @@ mod tests {
         h.apply(&ev(0, gc_swept(2, 1024)));
         h.apply(&ev(1, gc_swept(0, 0))); // zero-removal target still counts as explored
 
-        let seg: String = h
-            .header(&core)
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
+        let seg = header_text(&h.header(&core, CountScope::Matched));
         assert!(seg.contains("2 targets"), "{seg}");
         assert!(seg.contains("1.0 KiB"), "{seg}");
         assert_eq!(h.label(), "GC");
@@ -1435,11 +1982,7 @@ mod tests {
         core.apply(&ev(2, gc_swept(9, 9)));
 
         let h = BuildHeader::new("L");
-        let text: String = h
-            .header(&core)
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
+        let text = header_text(&h.header(&core, CountScope::Matched));
         assert!(text.contains("done"), "{text}");
         assert!(text.contains('⠁'), "expected worker braille: {text}");
     }
@@ -1486,6 +2029,46 @@ mod tests {
         assert!(s.summary().contains("matched 1 / 2"), "{}", s.summary());
     }
 
+    fn local_cache_hit(addr: &str) -> BuildEventKind {
+        BuildEventKind::LocalCacheHit { addr: addr.into() }
+    }
+
+    #[test]
+    fn count_scope_toggles_done_and_cached_between_matched_and_all() {
+        let mut s = BuildState::new();
+        // One matched target plus a transitive dep, both finishing with a cache
+        // hit, and a third target still in flight.
+        s.apply(&ev(0, matched(&["//a:b"], true)));
+        s.apply(&ev(1, result_start("//a:b")));
+        s.apply(&ev(2, local_cache_hit("//a:b")));
+        s.apply(&ev(3, result_end("//a:b", None)));
+        s.apply(&ev(4, result_start("//dep:x")));
+        s.apply(&ev(5, local_cache_hit("//dep:x")));
+        s.apply(&ev(6, result_end("//dep:x", None)));
+        s.apply(&ev(7, result_start("//run:y")));
+
+        // Matched scope: only the matched target is counted.
+        let (done, cached, _) = s.count_fields(CountScope::Matched);
+        assert_eq!(done, "1 / 1 done", "matched done");
+        assert_eq!(cached, "1 cached", "matched cached");
+
+        // All scope: every observed target — both finished deps over the running
+        // total (incl. the in-flight one), and both cache hits.
+        let (done, cached, _) = s.count_fields(CountScope::All);
+        assert_eq!(done, "2 / 3 done", "all done");
+        assert_eq!(cached, "2 cached", "all cached");
+    }
+
+    #[test]
+    fn toggle_scope_flips_view_count_scope() {
+        let mut v = TuiProgressView::new("L");
+        assert_eq!(v.scope.get(), CountScope::Matched);
+        v.toggle_scope();
+        assert_eq!(v.scope.get(), CountScope::All);
+        v.toggle_scope();
+        assert_eq!(v.scope.get(), CountScope::Matched);
+    }
+
     #[test]
     fn matched_progress_is_order_independent() {
         // Regression: in `Engine::result` the spawned target tasks emit their
@@ -1524,15 +2107,16 @@ mod tests {
         for i in 0..20 {
             v.apply(&ev(0, execute_start(&format!("//pkg:t{i}"))));
         }
-        let lines = v.render("⠋", 10_000, 100);
-        // Fixed-height box: header + body + footer.
-        assert_eq!(lines.len(), usize::from(PROGRESS_ROWS));
-        // The footer carries the label.
-        let footer = format!("{}", lines.last().expect("footer line"));
+        let height = 8u16;
+        let lines = v.render("⠋", 10_000, 100, height);
+        // The box fills exactly the rows it was given.
+        assert_eq!(lines.len(), usize::from(height));
+        // The bottom border (second-to-last row) carries the label.
+        let footer = format!("{}", lines[lines.len() - 2]);
         assert!(footer.contains("Running //x:y"), "{footer}");
-        // The slow block overflowed, so a "+N more" collapse appears in the body.
+        // 20 slow rows can't fit the small body, so a "+N more" collapse appears.
         assert!(
-            lines[1..lines.len() - 1]
+            lines[1..lines.len() - 2]
                 .iter()
                 .any(|l| format!("{l}").contains("more")),
             "expected collapse line in body, got {lines:?}"
@@ -1583,8 +2167,8 @@ mod tests {
     fn slow_targets_replace_idle_field_in_body() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, execute_start("//slow:x")));
-        let lines = v.render("⠋", 10_000, 80);
-        let body: String = lines[1..lines.len() - 1]
+        let lines = v.render("⠋", 10_000, 80, 8);
+        let body: String = lines[1..lines.len() - 2]
             .iter()
             .map(|l| format!("{l}"))
             .collect();
@@ -1666,5 +2250,493 @@ mod tests {
             assert_eq!(s.chars().count(), usize::from(w), "short @ {w}: {s}");
             assert_eq!(l.chars().count(), usize::from(w), "long @ {w}: {l}");
         }
+    }
+
+    #[test]
+    fn rows_for_height_is_one_third_clamped_to_min() {
+        assert_eq!(rows_for_height(30), 10);
+        assert_eq!(rows_for_height(24), 8);
+        // Tiny terminals clamp up to the minimum box height.
+        assert_eq!(rows_for_height(3), MIN_PROGRESS_ROWS);
+        assert_eq!(rows_for_height(0), MIN_PROGRESS_ROWS);
+    }
+
+    #[test]
+    fn render_fills_exactly_the_given_height() {
+        let v = TuiProgressView::new("L");
+        for h in [MIN_PROGRESS_ROWS, 8, 20] {
+            let lines = v.render("⠋", 0, 80, h);
+            assert_eq!(lines.len(), usize::from(h), "height {h}");
+        }
+        // Below the minimum the height is clamped up, never fewer rows.
+        let lines = v.render("⠋", 0, 80, 1);
+        assert_eq!(lines.len(), usize::from(MIN_PROGRESS_ROWS));
+    }
+
+    #[test]
+    fn help_row_is_pinned_last_and_dim() {
+        let v = TuiProgressView::new("L");
+        let lines = v.render("⠋", 0, 80, 8);
+        let help = lines.last().expect("help line");
+        let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("scroll"), "{text}");
+        assert_eq!(help.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn help_advertises_search_only_on_list_tabs() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//a:ok"], true)));
+        v.apply(&ev(1, result_start("//a:ok")));
+        v.apply(&ev(2, result_end("//a:ok", None)));
+
+        let help = |v: &TuiProgressView| -> String {
+            format!("{}", v.render("⠋", 10_000, 80, 8).last().expect("help"))
+        };
+
+        // Default (live) view: `/` has no list to filter, so it isn't advertised.
+        assert_eq!(v.view.get(), ViewMode::Default);
+        assert!(!help(&v).contains("/ search"), "{}", help(&v));
+
+        // Done tab: search is available, so the hint appears.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        assert!(help(&v).contains("/ search"), "{}", help(&v));
+    }
+
+    fn lock_wait_start(addr: &str, pid: u32) -> BuildEventKind {
+        BuildEventKind::ResultLockWaitStart {
+            addr: addr.into(),
+            holder_pid: Some(pid),
+        }
+    }
+
+    #[test]
+    fn body_collapse_counts_locks_and_slow_together() {
+        // 2 lock waits + 4 slow targets = 6 body rows. Regression: the old
+        // collapse counted only the slow overflow and ignored hidden lock rows.
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, lock_wait_start("//l:1", 1)));
+        v.apply(&ev(0, lock_wait_start("//l:2", 2)));
+        for i in 0..4 {
+            v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
+        }
+        // height 7 → body_rows = 4. 6 items > 4 ⇒ window shows 3 + a collapse.
+        // total=6, body_rows=4, max_scroll=2, scroll=0 ⇒ hidden_below=2 ⇒ +3 more.
+        let lines = v.render("⠋", 10_000, 80, 7);
+        let collapse = lines
+            .iter()
+            .map(|l| format!("{l}"))
+            .find(|t| t.contains("more"))
+            .expect("collapse line");
+        assert!(collapse.contains("+3 more"), "{collapse}");
+    }
+
+    #[test]
+    fn failed_lines_list_failed_targets_with_error() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, result_start("//a:ok")));
+        s.apply(&ev(1, result_end("//a:ok", None)));
+        s.apply(&ev(2, result_start("//a:bad")));
+        s.apply(&ev(3, result_end("//a:bad", Some("boom".into()))));
+        s.apply(&ev(4, result_start("//a:bad2")));
+        s.apply(&ev(5, result_end("//a:bad2", Some("kaput".into()))));
+
+        let lines = s.failed_lines("");
+        // Only the two errored targets appear, in failure order.
+        assert_eq!(lines.len(), 2);
+        let l0 = format!("{}", lines[0]);
+        assert!(l0.contains("//a:bad"), "{l0}");
+        assert!(l0.contains("boom"), "{l0}");
+        let l1 = format!("{}", lines[1]);
+        assert!(l1.contains("//a:bad2"), "{l1}");
+        assert!(!format!("{}{}", l0, l1).contains("//a:ok"));
+    }
+
+    #[test]
+    fn header_items_are_freestanding_without_separators() {
+        // Each header item must carry no ` · ` — the view owns the joins.
+        let mut core = BuildState::new();
+        core.apply(&ev(0, max_workers(8)));
+        core.apply(&ev(1, execute_start("//a:b")));
+        let h = BuildHeader::new("L");
+        for item in h.header(&core, CountScope::Matched) {
+            let text: String = item.spans().iter().map(|s| s.content.to_string()).collect();
+            assert!(!text.contains('·'), "item baked in a separator: {text}");
+        }
+    }
+
+    #[test]
+    fn tab_cycles_default_done_failed_and_back() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, execute_start("//slow:x")));
+        v.apply(&ev(1, matched(&["//a:ok"], true)));
+        v.apply(&ev(2, result_start("//a:ok")));
+        v.apply(&ev(3, result_end("//a:ok", None)));
+        v.apply(&ev(4, result_start("//a:bad")));
+        v.apply(&ev(5, result_end("//a:bad", Some("boom".into()))));
+
+        // Default view shows the slow row, not the done/failed targets.
+        let body = |v: &TuiProgressView| -> String {
+            v.render("⠋", 10_000, 80, 8)
+                .iter()
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+        assert_eq!(v.view.get(), ViewMode::Default);
+        assert!(body(&v).contains("//slow:x"));
+
+        // Tab → done view: shows the completed target.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        let done_body = body(&v);
+        assert!(done_body.contains("//a:ok"), "{done_body}");
+        assert!(!done_body.contains("//slow:x"), "{done_body}");
+
+        // Tab → failed view: shows the failed target.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Failed);
+        let failed_body = body(&v);
+        assert!(failed_body.contains("//a:bad"), "{failed_body}");
+        assert!(!failed_body.contains("//slow:x"), "{failed_body}");
+
+        // Tab again wraps back to default.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Default);
+        assert!(body(&v).contains("//slow:x"));
+    }
+
+    #[test]
+    fn done_and_failed_lines_filter_by_addr_substring() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, result_start("//web:server")));
+        s.apply(&ev(1, result_end("//web:server", None)));
+        s.apply(&ev(2, result_start("//api:server")));
+        s.apply(&ev(3, result_end("//api:server", None)));
+        s.apply(&ev(4, result_start("//web:bad")));
+        s.apply(&ev(5, result_end("//web:bad", Some("boom".into()))));
+        s.apply(&ev(6, result_start("//api:bad")));
+        s.apply(&ev(7, result_end("//api:bad", Some("kaput".into()))));
+
+        let join =
+            |ls: Vec<Line<'static>>| -> String { ls.iter().map(|l| format!("{l}")).collect() };
+
+        // Empty filter keeps everything.
+        assert_eq!(s.done_lines(CountScope::All, "").len(), 2);
+        assert_eq!(s.failed_lines("").len(), 2);
+
+        // Substring filter, case-insensitive, matches only the package prefix.
+        let done = join(s.done_lines(CountScope::All, "WEB"));
+        assert!(done.contains("//web:server"), "{done}");
+        assert!(!done.contains("//api:server"), "{done}");
+
+        let failed = join(s.failed_lines("api"));
+        assert!(failed.contains("//api:bad"), "{failed}");
+        assert!(!failed.contains("//web:bad"), "{failed}");
+    }
+
+    #[test]
+    fn slash_filters_done_tab_enter_keeps_esc_clears() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
+        v.apply(&ev(1, result_start("//web:server")));
+        v.apply(&ev(2, result_end("//web:server", None)));
+        v.apply(&ev(3, result_start("//api:server")));
+        v.apply(&ev(4, result_end("//api:server", None)));
+
+        let body = |v: &TuiProgressView| -> String {
+            v.render("⠋", 10_000, 80, 8)
+                .iter()
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+
+        // `/` on the Default view is a no-op (search has no list to filter).
+        v.search_start();
+        assert!(!v.is_searching());
+
+        // Move to Done, then open the filter and type "web".
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        v.search_start();
+        assert!(v.is_searching());
+        v.search_input('w');
+        v.search_input('e');
+        v.search_input('b');
+        let filtered = body(&v);
+        assert!(filtered.contains("//web:server"), "{filtered}");
+        assert!(!filtered.contains("//api:server"), "{filtered}");
+
+        // Enter confirms: input mode ends but the filter stays applied.
+        v.search_confirm();
+        assert!(!v.is_searching());
+        let still = body(&v);
+        assert!(still.contains("//web:server"), "{still}");
+        assert!(!still.contains("//api:server"), "{still}");
+
+        // Esc clears the filter; the full list returns.
+        v.search_cancel();
+        let cleared = body(&v);
+        assert!(cleared.contains("//web:server"), "{cleared}");
+        assert!(cleared.contains("//api:server"), "{cleared}");
+    }
+
+    #[test]
+    fn backspace_edits_query_and_tab_switch_drops_filter() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
+        v.apply(&ev(1, result_start("//web:server")));
+        v.apply(&ev(2, result_end("//web:server", None)));
+        v.apply(&ev(3, result_start("//api:server")));
+        v.apply(&ev(4, result_end("//api:server", None)));
+
+        let body = |v: &TuiProgressView| -> String {
+            v.render("⠋", 10_000, 80, 8)
+                .iter()
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+
+        v.tab(true); // Done
+        v.search_start();
+        v.search_input('a');
+        v.search_input('p');
+        v.search_input('z'); // typo: matches nothing
+        assert!(body(&v).contains("no targets match"));
+        v.search_backspace(); // drop the 'z' → "ap"
+        let fixed = body(&v);
+        assert!(fixed.contains("//api:server"), "{fixed}");
+        assert!(!fixed.contains("//web:server"), "{fixed}");
+
+        // Switching tabs drops the filter and exits search input.
+        v.tab(true); // Failed
+        assert!(!v.is_searching());
+        v.tab(true); // back to Default
+        v.tab(true); // Done again — full list, no filter
+        let full = body(&v);
+        assert!(full.contains("//web:server"), "{full}");
+        assert!(full.contains("//api:server"), "{full}");
+    }
+
+    #[test]
+    fn hscroll_pans_wide_body_lines_and_clamps() {
+        let mut v = TuiProgressView::new("L");
+        // A slow target whose addr is far wider than the viewport.
+        let long = format!("//pkg:{}", "x".repeat(200));
+        v.apply(&ev(0, execute_start(&long)));
+
+        let body_at = |v: &TuiProgressView, w: u16| -> String {
+            v.render("⠋", 10_000, w, 8)[1..]
+                .iter()
+                .take(1)
+                .map(|l| format!("{l}"))
+                .collect()
+        };
+
+        let width = 40u16;
+        // At pan 0 the row starts with the indent + addr head.
+        let row0 = body_at(&v, width);
+        assert!(row0.contains("//pkg:xxx"), "{row0}");
+
+        // Pan right: the head columns are dropped.
+        v.hscroll(20);
+        let row1 = body_at(&v, width);
+        assert!(!row1.contains("//pkg:xxx"), "{row1}");
+        assert!(row1.contains('x'), "{row1}");
+
+        // Pan back left to the origin restores the head.
+        v.hscroll(-1000);
+        assert!(body_at(&v, width).contains("//pkg:xxx"));
+
+        // Pan far right clamps so the tail never scrolls off the right edge:
+        // the rendered row stays non-empty (the addr's tail is still visible).
+        v.hscroll(100_000);
+        let clamped = body_at(&v, width);
+        // The row's tail is the op breakdown group, e.g. `(▶ 10s)`.
+        assert!(clamped.trim().ends_with(')'), "{clamped}");
+        assert!(!clamped.trim().is_empty(), "{clamped}");
+    }
+
+    #[test]
+    fn switching_view_resets_horizontal_pan() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
+        v.hscroll(50);
+        v.tab(true);
+        assert_eq!(v.hscroll.get(), 0);
+    }
+
+    #[test]
+    fn hold_after_finish_only_off_main_view() {
+        let mut v = TuiProgressView::new("L");
+        // On the default (main) view: auto-exit, no hold.
+        assert!(!v.hold_after_finish());
+        // On another tab: hold the viewport open.
+        v.tab(true);
+        assert!(v.hold_after_finish());
+    }
+
+    #[test]
+    fn finished_shows_green_quit_notice() {
+        use crate::tui::app::TUIAppView;
+        let mut v = TuiProgressView::new("L");
+        // Before finishing, the help row lists the key bindings.
+        let help = format!("{}", v.render("⠋", 0, 80, 8).last().expect("help"));
+        assert!(help.contains("scroll"), "{help}");
+        assert!(!help.contains("quit"), "{help}");
+
+        v.set_finished();
+        let lines = v.render("⠋", 0, 80, 8);
+        let help = lines.last().expect("help");
+        let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("finished"), "{text}");
+        assert!(text.contains('q'), "{text}");
+        // The notice is green so it stands out.
+        assert_eq!(help.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn elapsed_clock_freezes_after_finish() {
+        use crate::tui::app::TUIAppView;
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, execute_start("//a:b"))); // anchor the clock at t=0
+
+        // Live: two renders at different wall clocks show different elapsed.
+        let h = |v: &TuiProgressView, now: u64| format!("{}", v.render("⠋", now, 80, 8)[0]);
+        assert_ne!(h(&v, 5_000), h(&v, 9_000));
+
+        // Frozen: after finish the header is identical regardless of `now_ms`.
+        v.set_finished();
+        assert_eq!(h(&v, 100_000), h(&v, 999_000));
+    }
+
+    #[test]
+    fn shift_tab_cycles_backwards() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
+
+        // Three modes (Default, Done, Failed): backward from Default wraps to
+        // the last (Failed), then steps back through Done to Default.
+        assert_eq!(v.view.get(), ViewMode::Default);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Failed);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Default);
+    }
+
+    #[test]
+    fn failed_tab_is_highlighted_when_active() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
+
+        // Inactive: the "failed" segment carries no background.
+        let header = v.render("⠋", 100, 120, 8);
+        let plain = header[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed"))
+            .expect("failed span");
+        assert_eq!(plain.style.bg, None);
+
+        // Active (failed view): the segment is highlighted with a background.
+        v.tab(true); // → Done
+        v.tab(true); // → Failed
+        let header = v.render("⠋", 100, 120, 8);
+        let hl = header[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed"))
+            .expect("failed span");
+        assert_eq!(hl.style.bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn failed_view_with_no_failures_shows_placeholder() {
+        let mut v = TuiProgressView::new("L");
+        v.tab(true); // → Done
+        v.tab(true); // → Failed, but nothing has failed
+        let body: String = v
+            .render("⠋", 10_000, 80, 8)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("no failed targets"), "{body}");
+    }
+
+    #[test]
+    fn done_view_with_nothing_done_shows_placeholder() {
+        let mut v = TuiProgressView::new("L");
+        v.tab(true); // → Done, but nothing has completed
+        assert_eq!(v.view.get(), ViewMode::Done);
+        let body: String = v
+            .render("⠋", 10_000, 80, 8)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("no completed targets"), "{body}");
+    }
+
+    #[test]
+    fn done_lines_respect_matched_and_all_scope() {
+        let mut s = BuildState::new();
+        // Two matched top-level targets; one transitive dep finishes too.
+        s.apply(&ev(0, matched(&["//a:top"], false)));
+        s.apply(&ev(1, result_start("//a:top")));
+        s.apply(&ev(2, result_end("//a:top", None)));
+        s.apply(&ev(3, result_start("//dep:lib")));
+        s.apply(&ev(4, result_end("//dep:lib", None)));
+        // A failed target must never appear in the done list.
+        s.apply(&ev(5, result_start("//a:bad")));
+        s.apply(&ev(6, result_end("//a:bad", Some("boom".into()))));
+
+        // Matched scope: only the matched top-level target.
+        let matched_lines: String = s
+            .done_lines(CountScope::Matched, "")
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(matched_lines.contains("//a:top"), "{matched_lines}");
+        assert!(!matched_lines.contains("//dep:lib"), "{matched_lines}");
+        assert!(!matched_lines.contains("//a:bad"), "{matched_lines}");
+
+        // All scope: every completed target, deps included, still no failures.
+        let all_lines: String = s
+            .done_lines(CountScope::All, "")
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(all_lines.contains("//a:top"), "{all_lines}");
+        assert!(all_lines.contains("//dep:lib"), "{all_lines}");
+        assert!(!all_lines.contains("//a:bad"), "{all_lines}");
+    }
+
+    #[test]
+    fn scroll_advances_the_body_window_and_clamps() {
+        let mut v = TuiProgressView::new("L");
+        for i in 0..6 {
+            v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
+        }
+        // body_rows = 4, 6 slow rows, max_scroll = 2.
+        // Scroll past the end; render clamps to the bottom ⇒ no collapse there.
+        v.scroll(10);
+        let body: String = v
+            .render("⠋", 10_000, 80, 7)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(!body.contains("more"), "no collapse at bottom: {body}");
+        // Back to the top: the collapse returns.
+        v.scroll(-10);
+        let body: String = v
+            .render("⠋", 10_000, 80, 7)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("more"), "collapse at top: {body}");
     }
 }

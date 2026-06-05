@@ -2,7 +2,7 @@ use crate::engine::provider::GetError::NotFound;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
-    Provider as EProvider, State, TargetSpec,
+    Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
 use crate::hasync::Cancellable;
 use crate::hmemoizer::Memoizer;
@@ -12,15 +12,61 @@ use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use enclose::enclose;
 use futures::future::BoxFuture;
+use starlark::environment::Globals;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Prunes directories during the BUILD-file walk. Two prune sources:
+///  - `dirs`: absolute engine-owned paths (e.g. the heph home) the engine hands
+///    every provider; matched by exact path.
+///  - `globs`: user `skip` wax patterns, matched against the workspace-relative
+///    package path.
+#[derive(Debug, Default)]
+pub struct SkipMatcher {
+    dirs: Vec<PathBuf>,
+    globs: Option<wax::Any<'static>>,
+}
+
+impl SkipMatcher {
+    fn new(dirs: &[PathBuf], globs: &[String]) -> anyhow::Result<Self> {
+        let compiled = if globs.is_empty() {
+            None
+        } else {
+            let gs = globs
+                .iter()
+                .map(|s| {
+                    wax::Glob::new(s)
+                        .map(wax::Glob::into_owned)
+                        .with_context(|| format!("buildfile provider: invalid skip pattern `{s}`"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Some(wax::any(gs).context("compiling buildfile skip patterns")?)
+        };
+        Ok(Self {
+            dirs: dirs.to_vec(),
+            globs: compiled,
+        })
+    }
+
+    /// True if the dir at absolute `path` (workspace-relative `rel`) is pruned.
+    fn is_skipped(&self, path: &std::path::Path, rel: &std::path::Path) -> bool {
+        use wax::Program as _;
+        if self.dirs.iter().any(|d| d == path) {
+            return true;
+        }
+        self.globs.as_ref().is_some_and(|any| any.is_match(rel))
+    }
+}
 
 pub struct RequestState {}
 
 pub struct Provider {
     pub root: std::path::PathBuf,
     pub build_file_patterns: Vec<glob::Pattern>,
+    /// Directories to prune during the BUILD-file walk: engine-owned dirs
+    /// (e.g. the heph home) plus user `skip` globs. See [`SkipMatcher`].
+    pub skip: Arc<SkipMatcher>,
     pub requests: Mutex<HashMap<String, RequestState>>,
     /// Cache: pkg name → parsed BUILD file result. Avoids re-parsing the Starlark
     /// AST on every `list`/`get`/`probe` call for the same package (3+ calls per
@@ -39,6 +85,13 @@ pub struct Provider {
     /// Sync cache: package directory → merged result across every matching BUILD file
     /// in that dir. Loaded once and reused by both `run_pkg` and `load("//pkg", ...)`.
     pub(crate) dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+    /// Aggregated provider functions, injected once by the engine. Drives the
+    /// `heph.<provider>.<fn>` Starlark namespace. Empty until injected (some unit
+    /// tests run the provider without an engine).
+    pub(crate) function_registry: OnceLock<Arc<ProviderFunctionRegistry>>,
+    /// Lazily-built Starlark globals (built from `function_registry` on first eval),
+    /// shared with every `BuildFileLoader` so the namespace is built at most once.
+    pub(crate) globals: Arc<OnceLock<Globals>>,
 }
 
 impl Default for Provider {
@@ -46,11 +99,14 @@ impl Default for Provider {
         Self {
             root: std::path::PathBuf::from("/"),
             build_file_patterns: vec![glob::Pattern::new("BUILD").expect("BUILD literal")],
+            skip: Arc::new(SkipMatcher::default()),
             requests: Mutex::new(HashMap::new()),
             pkg_cache: Memoizer::with_tag("buildfile_pkg"),
             packages_cache: Memoizer::with_tag("buildfile_packages"),
             file_cache: Arc::new(Mutex::new(HashMap::new())),
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
+            function_registry: OnceLock::new(),
+            globals: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -65,9 +121,14 @@ impl Provider {
 
     pub fn from_options(
         root: std::path::PathBuf,
+        skip_dirs: &[std::path::PathBuf],
         opts: &crate::engine::config_file::Options,
     ) -> anyhow::Result<Self> {
-        crate::engine::config_file::deny_unknown("buildfile provider", opts, &["patterns"])?;
+        crate::engine::config_file::deny_unknown(
+            "buildfile provider",
+            opts,
+            &["patterns", "skip"],
+        )?;
         let patterns: Vec<String> =
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "patterns")?
                 .unwrap_or_else(|| vec!["BUILD".to_string()]);
@@ -77,9 +138,14 @@ impl Provider {
                 glob::Pattern::new(&p).with_context(|| format!("invalid buildfile pattern `{p}`"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let skip_globs: Vec<String> =
+            crate::engine::config_file::decode_opt(opts, "buildfile provider", "skip")?
+                .unwrap_or_default();
+        let skip = SkipMatcher::new(skip_dirs, &skip_globs)?;
         Ok(Self {
             root,
             build_file_patterns: compiled,
+            skip: Arc::new(skip),
             ..Self::default()
         })
     }
@@ -89,21 +155,12 @@ fn find_packages_sync(
     path: &std::path::Path,
     root: &std::path::Path,
     patterns: &[glob::Pattern],
+    skip: &SkipMatcher,
     packages: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let mut has_build_file = false;
     for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
         let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .unwrap_or("")
-            .starts_with(".heph")
-        {
-            // TODO: fix it better
-            continue;
-        }
-
         let Ok(ft) = entry.file_type() else { continue };
         let entry_path = entry.path();
 
@@ -117,7 +174,11 @@ fn find_packages_sync(
                 has_build_file = true;
             }
         } else if ft.is_dir() {
-            find_packages_sync(&entry_path, root, patterns, packages)?;
+            let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
+            if skip.is_skipped(&entry_path, rel) {
+                continue;
+            }
+            find_packages_sync(&entry_path, root, patterns, skip, packages)?;
         }
     }
 
@@ -186,10 +247,10 @@ impl EProvider for Provider {
                 .packages_cache
                 .once(
                     (),
-                    enclose!((self.root => root, self.build_file_patterns => patterns) move || async move {
+                    enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip) move || async move {
                         let packages = crate::process_supervisor::block_or_inline(move || {
                             let mut packages = std::collections::HashSet::new();
-                            find_packages_sync(&root, &root, &patterns, &mut packages)?;
+                            find_packages_sync(&root, &root, &patterns, &skip, &mut packages)?;
                             Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
                         })?;
                         Ok(Arc::new(packages))
@@ -264,6 +325,14 @@ impl EProvider for Provider {
             })
         })
     }
+
+    fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
+        // First injection wins; the engine wires exactly once, so a later set
+        // (already-injected) is a harmless no-op.
+        if self.function_registry.set(reg).is_err() {
+            // Registry was already injected; keep the first one.
+        }
+    }
 }
 
 #[cfg(test)]
@@ -277,7 +346,7 @@ mod tests {
     #[test]
     fn from_options_defaults_to_build() {
         let dir = tempdir().expect("tempdir");
-        let p = Provider::from_options(dir.path().to_path_buf(), &Options::new())
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &Options::new())
             .expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
         assert_eq!(names, vec!["BUILD"]);
@@ -291,7 +360,7 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::from_str("[BUILD2, \"*.BUILD2\"]").expect("yaml"),
         );
-        let p = Provider::from_options(dir.path().to_path_buf(), &opts).expect("from_options");
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &opts).expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
         assert_eq!(names, vec!["BUILD2", "*.BUILD2"]);
     }
@@ -304,7 +373,7 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::from_str("[\"[bad\"]").expect("yaml"),
         );
-        let err = Provider::from_options(dir.path().to_path_buf(), &opts)
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &opts)
             .err()
             .expect("must error");
         assert!(err.to_string().contains("[bad"), "{err}");
@@ -315,7 +384,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut opts = Options::new();
         opts.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
-        let err = Provider::from_options(dir.path().to_path_buf(), &opts)
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &opts)
             .err()
             .expect("must error");
         assert!(err.to_string().contains("bogus"), "{err}");
@@ -329,10 +398,57 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::Value::String("not a list".to_string()),
         );
-        let err = Provider::from_options(dir.path().to_path_buf(), &opts)
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &opts)
             .err()
             .expect("must error");
         assert!(err.to_string().contains("patterns"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_packages_skips_core_dirs_and_globs() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+
+        // root/BUILD, root/.heph3/BUILD (core skip), root/vendor/BUILD (glob skip),
+        // root/src/BUILD (kept).
+        fs::write(root.join("BUILD"), "").unwrap();
+        let heph = root.join(".heph3");
+        fs::create_dir_all(&heph).unwrap();
+        fs::write(heph.join("BUILD"), "").unwrap();
+        let vendor = root.join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("BUILD"), "").unwrap();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("BUILD"), "").unwrap();
+
+        let mut opts = Options::new();
+        opts.insert(
+            "skip".to_string(),
+            serde_yaml::from_str("[vendor]").expect("yaml"),
+        );
+        let provider =
+            Provider::from_options(root.to_path_buf(), &[heph.clone()], &opts).expect("provider");
+
+        let ctoken = StdCancellationToken::new();
+        let res = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
+
+        assert!(packages.contains(&"".to_string()));
+        assert!(packages.contains(&"src".to_string()));
+        assert!(
+            !packages.contains(&".heph3".to_string()),
+            "core dir not pruned"
+        );
+        assert!(!packages.contains(&"vendor".to_string()), "glob not pruned");
     }
 
     #[tokio::test]
@@ -526,7 +642,7 @@ target(
 
     #[tokio::test]
     async fn probe_returns_provider_states_from_build_file() {
-        use crate::loosespecparser::TargetSpecValue;
+        use crate::htvalue::Value;
 
         let tmp_dir = tempdir().unwrap();
         let pkg_name = "p";
@@ -559,11 +675,8 @@ provider_state(provider = "go", root = "src", strict = True)
         let s = &res.states[0];
         assert_eq!(s.package, PkgBuf::from(pkg_name));
         assert_eq!(s.provider, "go");
-        assert_eq!(
-            s.state.get("root"),
-            Some(&TargetSpecValue::String("src".to_string()))
-        );
-        assert_eq!(s.state.get("strict"), Some(&TargetSpecValue::Bool(true)));
+        assert_eq!(s.state.get("root"), Some(&Value::String("src".to_string())));
+        assert_eq!(s.state.get("strict"), Some(&Value::Bool(true)));
         assert!(!s.state.contains_key("provider"));
     }
 

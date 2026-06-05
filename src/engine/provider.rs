@@ -4,10 +4,12 @@ use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
+use async_trait::async_trait;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 pub struct ConfigRequest {}
@@ -36,14 +38,14 @@ pub struct ListPackageResponse {
 pub struct State {
     pub package: PkgBuf,
     pub provider: String,
-    pub state: HashMap<String, TargetSpecValue>,
+    pub state: HashMap<String, Value>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub addr: Addr,
     pub driver: String,
-    pub config: HashMap<String, TargetSpecValue>,
+    pub config: HashMap<String, Value>,
     pub labels: Vec<String>,
     pub transitive: Sandbox,
 }
@@ -101,6 +103,81 @@ pub enum GetError {
     Other(anyhow::Error),
 }
 
+/// A function a provider exposes to BUILD files, surfaced as the Starlark symbol
+/// `heph.<provider name>.<function name>`. Args and the return value are the loose
+/// dynamic [`Value`] type so calls can cross provider boundaries (in-process now,
+/// out-of-process plugins later).
+#[async_trait]
+pub trait ProviderFn: Send + Sync {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value>;
+}
+
+/// One exposed function: its bare name (no `heph.<provider>.` prefix) and handler.
+pub struct ProviderFunctionDef {
+    pub name: String,
+    pub func: Arc<dyn ProviderFn>,
+}
+
+/// Context handed to a [`ProviderFn`] at call time.
+///
+/// Intentionally minimal — `pkg` + `root` is what filesystem helpers like `glob`
+/// need. A `ProviderExecutor`/cancellation token is deliberately absent: a function
+/// that resolves targets through the engine would also need the buildfile provider's
+/// cross-request `pkg_cache` reworked (it caches BUILD eval per provider lifetime,
+/// not per request), so engine-calling functions are out of scope for now.
+pub struct FnCallContext<'a> {
+    /// Package the calling BUILD file lives in (e.g. `"foo/bar"`, empty at root).
+    pub pkg: &'a str,
+    /// Workspace root.
+    pub root: &'a Path,
+}
+
+/// Positional + named arguments passed from the Starlark call site.
+#[derive(Default)]
+pub struct FnArgs {
+    pub positional: Vec<Value>,
+    pub named: HashMap<String, Value>,
+}
+
+/// Aggregate of every provider's exposed functions: provider name → function name →
+/// handler. Built once by the engine and injected into providers that consume it
+/// (the buildfile provider) via [`Provider::set_function_registry`].
+#[derive(Default)]
+pub struct ProviderFunctionRegistry {
+    map: HashMap<String, HashMap<String, Arc<dyn ProviderFn>>>,
+}
+
+impl ProviderFunctionRegistry {
+    /// Insert all of `provider`'s exposed functions under its name.
+    pub fn insert_provider(&mut self, provider: &str, defs: Vec<ProviderFunctionDef>) {
+        if defs.is_empty() {
+            return;
+        }
+        let entry = self.map.entry(provider.to_string()).or_default();
+        for def in defs {
+            entry.insert(def.name, def.func);
+        }
+    }
+
+    /// Look up a single handler by provider + function name.
+    pub fn get(&self, provider: &str, func: &str) -> Option<&Arc<dyn ProviderFn>> {
+        self.map.get(provider).and_then(|m| m.get(func))
+    }
+
+    /// Iterate `(provider, function name, handler)` over every registered function.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &Arc<dyn ProviderFn>)> {
+        self.map.iter().flat_map(|(p, fns)| {
+            fns.iter()
+                .map(move |(name, func)| (p.as_str(), name.as_str(), func))
+        })
+    }
+
+    /// Iterate `(provider name, its functions)` — one entry per provider.
+    pub fn providers(&self) -> impl Iterator<Item = (&str, &HashMap<String, Arc<dyn ProviderFn>>)> {
+        self.map.iter().map(|(p, fns)| (p.as_str(), fns))
+    }
+}
+
 impl std::fmt::Debug for GetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -135,4 +212,15 @@ pub trait Provider: Send + Sync {
         req: ProbeRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>>;
+
+    /// Functions this provider exposes to BUILD files as `heph.<name>.<fn>`.
+    /// Default: none.
+    fn functions(&self) -> Vec<ProviderFunctionDef> {
+        vec![]
+    }
+
+    /// Hand this provider the aggregated registry of every provider's functions.
+    /// Called once by the engine before the first dispatch. Default: no-op —
+    /// only consumers (the buildfile provider) override it.
+    fn set_function_registry(&self, _reg: Arc<ProviderFunctionRegistry>) {}
 }

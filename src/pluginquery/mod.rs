@@ -6,7 +6,7 @@ use crate::engine::provider::{
 use crate::hasync::Cancellable;
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 
@@ -130,12 +130,12 @@ impl EProvider for Provider {
                 .await
                 .map_err(GetError::Other)?;
 
-            let deps: Vec<TargetSpecValue> = addrs
+            let deps: Vec<Value> = addrs
                 .into_iter()
-                .map(|addr| TargetSpecValue::String(addr.format()))
+                .map(|addr| Value::String(addr.format()))
                 .collect();
 
-            let config = HashMap::from([("deps".to_string(), TargetSpecValue::List(deps))]);
+            let config = HashMap::from([("deps".to_string(), Value::List(deps))]);
 
             Ok(GetResponse {
                 target_spec: TargetSpec {
@@ -206,14 +206,14 @@ mod tests {
 
         assert_eq!(spec.driver, crate::plugingroup::DRIVER_NAME);
         let deps = match spec.config.get("deps") {
-            Some(TargetSpecValue::List(l)) => l,
+            Some(Value::List(l)) => l,
             _ => panic!("expected deps list"),
         };
         assert_eq!(deps.len(), 2);
         let dep_strs: Vec<&str> = deps
             .iter()
             .map(|v| match v {
-                TargetSpecValue::String(s) => s.as_str(),
+                Value::String(s) => s.as_str(),
                 _ => panic!("expected string"),
             })
             .collect();
@@ -236,7 +236,7 @@ mod tests {
 
         assert_eq!(spec.driver, crate::plugingroup::DRIVER_NAME);
         let deps = match spec.config.get("deps") {
-            Some(TargetSpecValue::List(l)) => l,
+            Some(Value::List(l)) => l,
             _ => panic!("expected deps list"),
         };
         assert_eq!(deps.len(), 2);
@@ -257,7 +257,7 @@ mod tests {
 
         assert_eq!(spec.driver, crate::plugingroup::DRIVER_NAME);
         let deps = match spec.config.get("deps") {
-            Some(TargetSpecValue::List(l)) => l,
+            Some(Value::List(l)) => l,
             _ => panic!("expected deps list"),
         };
         assert_eq!(deps.len(), 2);
@@ -279,11 +279,11 @@ mod tests {
         let spec = engine.get_spec(rs, &addr).await?;
 
         let deps = match spec.config.get("deps") {
-            Some(TargetSpecValue::List(l)) => l,
+            Some(Value::List(l)) => l,
             _ => panic!("expected deps list"),
         };
         assert_eq!(deps.len(), 1);
-        assert!(matches!(&deps[0], TargetSpecValue::String(s) if s == "//src/foo:a"));
+        assert!(matches!(&deps[0], Value::String(s) if s == "//src/foo:a"));
         Ok(())
     }
 
@@ -382,7 +382,7 @@ mod tests {
         let spec = engine.get_spec(rs, &addr).await?;
 
         let deps = match spec.config.get("deps") {
-            Some(TargetSpecValue::List(l)) => l,
+            Some(Value::List(l)) => l,
             _ => panic!("expected deps list"),
         };
         assert_eq!(

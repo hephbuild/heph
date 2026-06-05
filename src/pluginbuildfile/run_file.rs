@@ -1,11 +1,10 @@
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+use crate::engine::provider::{FnArgs, FnCallContext, ProviderFn, ProviderFunctionRegistry};
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::{
-    TargetSpecValue, parse_map_string_string, parse_map_string_strings, parse_strings,
-};
+use crate::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use crate::pluginbuildfile::provider::Provider;
 use anyhow::Context;
 use enclose::enclose;
@@ -22,17 +21,108 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-static GLOBALS: OnceLock<Globals> = OnceLock::new();
-
-fn get_globals() -> &'static Globals {
-    GLOBALS.get_or_init(|| {
-        GlobalsBuilder::standard()
-            .with(starlark_module)
-            .with_namespace("heph", |b| {
-                b.namespace("fs", heph_fs_module);
-            })
-            .build()
+/// Build the Starlark globals: the static `starlark_module` builtins plus a
+/// dynamic `heph.<provider>.<fn>` namespace for every function the providers
+/// expose. Built once per buildfile-provider lifetime (the registry is fixed
+/// after the engine injects it).
+fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
+    let mut builder = GlobalsBuilder::standard();
+    builder = builder.with(starlark_module);
+    builder.with_namespace("heph", |hb| {
+        // One `heph.<provider>` namespace per provider; each function becomes a
+        // native callable bridging into its async `ProviderFn`.
+        for (provider, fns) in registry.providers() {
+            hb.namespace(provider, |nb| {
+                for (name, func) in fns {
+                    nb.set_function(
+                        name.as_str(),
+                        starlark::__derive_refs::components::NativeCallableComponents {
+                            speculative_exec_safe: false,
+                            rust_docstring: None,
+                            param_spec:
+                                starlark::__derive_refs::param_spec::NativeCallableParamSpec::for_arguments(
+                                ),
+                            return_type: starlark::typing::Ty::any(),
+                        },
+                        None,
+                        None,
+                        None,
+                        ProviderNativeFn {
+                            func: Arc::clone(func),
+                        },
+                    );
+                }
+            });
+        }
     })
+    .build()
+}
+
+/// Native Starlark function bridging a `heph.<provider>.<fn>` call to the
+/// provider's async [`ProviderFn`]. The Starlark eval is synchronous (it runs
+/// inside `block_or_inline`), so the async handler is driven with
+/// `futures::executor::block_on` — runtime-agnostic, works under `#[test]`,
+/// inline eval, and `block_in_place`.
+struct ProviderNativeFn {
+    func: Arc<dyn ProviderFn>,
+}
+
+impl starlark::values::function::NativeFunc for ProviderNativeFn {
+    fn invoke<'v>(
+        &self,
+        eval: &mut Evaluator<'v, '_, '_>,
+        args: &Arguments<'v, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let extra = eval
+            .extra
+            .expect("evaluator extra must be set before calling a provider function")
+            .downcast_ref::<Extra>()
+            .expect("evaluator extra must be of type Extra");
+
+        // No public accessor returns an arbitrary positional slice; read up to a
+        // fixed cap (errors past it) and keep the ones actually supplied. Eight is
+        // far beyond any current provider function (glob takes one).
+        let (_, optional) =
+            starlark::__derive_refs::parse_args::parse_positional::<0, 8>(args, eval.heap())?;
+        let positional: Vec<htvalue::Value> =
+            optional.iter().flatten().map(starlark_to_rust).collect();
+        let named: HashMap<String, htvalue::Value> = args
+            .names_map()?
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), starlark_to_rust(v)))
+            .collect();
+
+        let ctx = FnCallContext {
+            pkg: extra.pkg,
+            root: extra.root,
+        };
+        let fn_args = FnArgs { positional, named };
+
+        let result = futures::executor::block_on(self.func.call(&ctx, fn_args))
+            .map_err(starlark::Error::new_other)?;
+
+        Ok(rust_to_starlark(eval.heap(), &result))
+    }
+}
+
+/// Convert a [`htvalue::Value`] back into a Starlark value — the inverse of
+/// [`starlark_to_rust`].
+fn rust_to_starlark<'v>(heap: &'v starlark::values::Heap, v: &htvalue::Value) -> Value<'v> {
+    match v {
+        htvalue::Value::Null() => Value::new_none(),
+        htvalue::Value::String(s) => heap.alloc(s.as_str()),
+        htvalue::Value::Bool(b) => Value::new_bool(*b),
+        htvalue::Value::Int(i) => heap.alloc(*i),
+        htvalue::Value::Uint(u) => heap.alloc(*u),
+        htvalue::Value::Float(f) => heap.alloc(*f),
+        htvalue::Value::List(l) => {
+            heap.alloc(AllocList(l.iter().map(|e| rust_to_starlark(heap, e))))
+        }
+        htvalue::Value::Map(m) => heap
+            .alloc(starlark::values::dict::AllocDict(m.iter().map(
+                |(k, val)| (heap.alloc(k.as_str()), rust_to_starlark(heap, val)),
+            ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,20 +131,20 @@ pub(crate) struct OnTargetPayload {
     pub driver: String,
     pub labels: Vec<String>,
     pub transitive: Sandbox,
-    pub config: HashMap<String, TargetSpecValue>,
+    pub config: HashMap<String, htvalue::Value>,
 }
 
 impl Sandbox {
-    fn from(m: TargetSpecValue, pkg: &PkgBuf) -> anyhow::Result<Self> {
+    fn from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Self> {
         let m = match m {
-            TargetSpecValue::Map(m) => m,
-            TargetSpecValue::Null() => {
+            htvalue::Value::Map(m) => m,
+            htvalue::Value::Null() => {
                 return Ok(Default::default());
             }
             _ => anyhow::bail!("Expected map, got {:?}", m),
         };
 
-        let mut m: HashMap<&str, &TargetSpecValue> =
+        let mut m: HashMap<&str, &htvalue::Value> =
             m.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
         let mut sandbox = Self::default();
@@ -147,7 +237,7 @@ impl Sandbox {
 #[derive(Debug, Clone)]
 pub(crate) struct OnStatePayload {
     pub provider: String,
-    pub args: HashMap<String, TargetSpecValue>,
+    pub args: HashMap<String, htvalue::Value>,
 }
 
 #[derive(Debug)]
@@ -212,29 +302,29 @@ pub(crate) struct Extra<'a> {
     clippy::panic,
     reason = "caller must only pass supported starlark value types; any other type is a programming error"
 )]
-fn starlark_to_rust(v: &Value) -> TargetSpecValue {
+fn starlark_to_rust(v: &Value) -> htvalue::Value {
     if v.is_none() {
-        return TargetSpecValue::Null();
+        return htvalue::Value::Null();
     }
 
     if let Some(s) = v.unpack_str() {
-        return TargetSpecValue::String(s.to_string());
+        return htvalue::Value::String(s.to_string());
     }
 
     if let Some(b) = v.unpack_bool() {
-        return TargetSpecValue::Bool(b);
+        return htvalue::Value::Bool(b);
     }
 
     if let Some(i) = v.unpack_i32() {
-        return TargetSpecValue::Int(i as i64);
+        return htvalue::Value::Int(i as i64);
     }
 
     if let Ok(Some(UnpackFloat(f))) = UnpackFloat::unpack_value(*v) {
-        return TargetSpecValue::Float(f);
+        return htvalue::Value::Float(f);
     }
 
     if let Ok(Some(l)) = UnpackList::<Value>::unpack_value(*v) {
-        return TargetSpecValue::List(l.items.iter().map(starlark_to_rust).collect());
+        return htvalue::Value::List(l.items.iter().map(starlark_to_rust).collect());
     }
 
     if let Some(d) = DictRef::from_value(*v) {
@@ -245,7 +335,7 @@ fn starlark_to_rust(v: &Value) -> TargetSpecValue {
                     .map(|s| (s.to_string(), starlark_to_rust(&val)))
             })
             .collect();
-        return TargetSpecValue::Map(map);
+        return htvalue::Value::Map(map);
     }
 
     panic!(
@@ -294,7 +384,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         let mut transitive: Sandbox = Default::default();
         let config = m
             .iter()
-            .map(|e| -> anyhow::Result<Option<(String, TargetSpecValue)>> {
+            .map(|e| -> anyhow::Result<Option<(String, htvalue::Value)>> {
                 match e.0.as_str() {
                     "name" => {
                         if let Some(s) = e.1.unpack_str() {
@@ -329,7 +419,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             .collect::<anyhow::Result<Vec<_>>>()?
             .into_iter()
             .flatten()
-            .collect::<HashMap<String, TargetSpecValue>>();
+            .collect::<HashMap<String, htvalue::Value>>();
 
         if name.is_empty() {
             return Err(starlark::Error::new_other(anyhow::anyhow!(
@@ -422,7 +512,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                 }
                 _ => Some((e.0.as_str().to_string(), starlark_to_rust(e.1))),
             })
-            .collect::<HashMap<String, TargetSpecValue>>();
+            .collect::<HashMap<String, htvalue::Value>>();
 
         if provider.is_empty() {
             return Err(starlark::Error::new_other(anyhow::anyhow!(
@@ -448,88 +538,6 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
     }
 }
 
-/// Built-in exclude patterns for `heph.fs.glob` — matches `pluginfs` driver behavior so
-/// that BUILD-time glob expansion stays consistent with what the driver would see.
-const HEPH_FS_GLOB_BUILTIN_EXCLUDES: &[&str] = &[".git/**/*", ".heph3/**/*", ".heph/**/*"];
-
-#[starlark_module]
-fn heph_fs_module(builder: &mut GlobalsBuilder) {
-    /// Expand `pattern` (resolved relative to the current package) against the workspace
-    /// filesystem and return matched file paths relative to the current package. Skips
-    /// directories and built-in excludes (`.git`, `.heph`, `.heph3`).
-    fn glob<'v>(eval: &mut Evaluator<'v, '_, '_>, pattern: &str) -> starlark::Result<Value<'v>> {
-        let extra = eval
-            .extra
-            .expect("evaluator extra must be set before calling heph.fs.glob()")
-            .downcast_ref::<Extra>()
-            .expect("evaluator extra must be of type Extra");
-
-        let resolved = if extra.pkg.is_empty() {
-            pattern.to_string()
-        } else {
-            format!("{}/{}", extra.pkg, pattern)
-        };
-
-        let abs_pattern = extra.root.join(&resolved);
-        let abs_pattern_str = abs_pattern.to_str().ok_or_else(|| {
-            starlark::Error::new_other(anyhow::anyhow!(
-                "heph.fs.glob: pattern path is not valid UTF-8"
-            ))
-        })?;
-
-        let excludes: Vec<glob::Pattern> = HEPH_FS_GLOB_BUILTIN_EXCLUDES
-            .iter()
-            .map(|s| glob::Pattern::new(s).expect("built-in exclude pattern must compile"))
-            .collect();
-
-        let pkg_prefix = (!extra.pkg.is_empty()).then(|| Path::new(extra.pkg));
-
-        let entries = glob::glob(abs_pattern_str)
-            .map_err(|e| starlark::Error::new_other(anyhow::Error::from(e)))?;
-
-        let mut paths: Vec<String> = Vec::new();
-        for entry in entries {
-            let entry_path =
-                entry.map_err(|e| starlark::Error::new_other(anyhow::Error::from(e)))?;
-
-            if entry_path.is_dir() {
-                continue;
-            }
-
-            let rel = entry_path.strip_prefix(extra.root).map_err(|e| {
-                starlark::Error::new_other(anyhow::Error::from(e).context(format!(
-                    "heph.fs.glob: entry `{}` is outside workspace root `{}`",
-                    entry_path.display(),
-                    extra.root.display()
-                )))
-            })?;
-
-            let pkg_rel = pkg_prefix
-                .and_then(|prefix| rel.strip_prefix(prefix).ok())
-                .unwrap_or(rel);
-
-            // Excludes are matched against the pkg-relative path so that a `.git`
-            // directory inside the package is filtered out regardless of how deep
-            // the package itself sits under the workspace root.
-            if excludes.iter().any(|p| p.matches_path(pkg_rel)) {
-                continue;
-            }
-
-            let s = pkg_rel.to_str().ok_or_else(|| {
-                starlark::Error::new_other(anyhow::anyhow!(
-                    "heph.fs.glob: entry path is not valid UTF-8: {}",
-                    pkg_rel.display()
-                ))
-            })?;
-
-            paths.push(s.to_string());
-        }
-
-        paths.sort();
-        Ok(eval.heap().alloc(AllocList(paths)))
-    }
-}
-
 impl Provider {
     pub(crate) async fn run_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
         let key = pkg.to_string();
@@ -537,13 +545,15 @@ impl Provider {
         let patterns = self.build_file_patterns.clone();
         let file_cache = self.file_cache.clone();
         let dir_cache = self.dir_cache.clone();
+        let registry = self.function_registry.get().cloned().unwrap_or_default();
+        let globals = self.globals.clone();
         self.pkg_cache
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
                     crate::process_supervisor::block_or_inline(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
-                            BuildFileLoader::new(root, patterns, file_cache, dir_cache);
+                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
@@ -565,6 +575,11 @@ pub(crate) struct BuildFileLoader {
     dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
     /// Files/dirs currently being evaluated on this call chain — guards against `load()` cycles.
     in_flight: Mutex<HashSet<PathBuf>>,
+    /// Provider functions exposed as `heph.<provider>.<fn>`. Used to build `globals`.
+    registry: Arc<ProviderFunctionRegistry>,
+    /// Lazily-built, provider-lifetime Starlark globals (shared across loaders so
+    /// the registry-driven namespace is built at most once).
+    globals: Arc<OnceLock<Globals>>,
 }
 
 impl BuildFileLoader {
@@ -573,6 +588,8 @@ impl BuildFileLoader {
         patterns: Vec<glob::Pattern>,
         file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
         dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+        registry: Arc<ProviderFunctionRegistry>,
+        globals: Arc<OnceLock<Globals>>,
     ) -> Self {
         Self {
             root,
@@ -580,7 +597,14 @@ impl BuildFileLoader {
             file_cache,
             dir_cache,
             in_flight: Mutex::new(HashSet::new()),
+            registry,
+            globals,
         }
+    }
+
+    /// The Starlark globals for this loader, built once from the function registry.
+    fn globals(&self) -> &Globals {
+        self.globals.get_or_init(|| build_globals(&self.registry))
     }
 
     /// Top-level entry: evaluate every BUILD file in `pkg`'s directory matching the
@@ -808,7 +832,7 @@ fn eval_file(path: &Path, pkg: &str, loader: &BuildFileLoader) -> anyhow::Result
     let ast: AstModule =
         AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)?;
 
-    let globals = get_globals();
+    let globals = loader.globals();
 
     let module = Module::new();
 
@@ -874,13 +898,29 @@ mod tests {
     use tempfile::tempdir;
 
     fn run_pkg_blocking(provider: &Provider, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+        let registry = provider
+            .function_registry
+            .get()
+            .cloned()
+            .unwrap_or_default();
         let loader = BuildFileLoader::new(
             provider.root.clone(),
             provider.build_file_patterns.clone(),
             provider.file_cache.clone(),
             provider.dir_cache.clone(),
+            registry,
+            provider.globals.clone(),
         );
         loader.load_pkg(pkg)
+    }
+
+    /// Registry exposing the real `fs` provider functions, so `heph.fs.glob` works
+    /// in these unit tests (which run the buildfile provider without an engine).
+    fn fs_registry() -> Arc<ProviderFunctionRegistry> {
+        use crate::engine::provider::Provider as _;
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider("fs", crate::pluginfs::Provider.functions());
+        Arc::new(reg)
     }
 
     #[test]
@@ -921,7 +961,7 @@ target(
             vec!["label1".to_string(), "label2".to_string()]
         );
 
-        if let Some(TargetSpecValue::String(s)) = target.config.get("config_str") {
+        if let Some(htvalue::Value::String(s)) = target.config.get("config_str") {
             assert_eq!(s, "hello");
         } else {
             panic!(
@@ -930,7 +970,7 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::Int(i)) = target.config.get("config_int") {
+        if let Some(htvalue::Value::Int(i)) = target.config.get("config_int") {
             assert_eq!(*i, 42);
         } else {
             panic!(
@@ -939,7 +979,7 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::Bool(b)) = target.config.get("config_bool") {
+        if let Some(htvalue::Value::Bool(b)) = target.config.get("config_bool") {
             assert!(*b);
         } else {
             panic!(
@@ -948,7 +988,7 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::Float(f)) = target.config.get("config_float") {
+        if let Some(htvalue::Value::Float(f)) = target.config.get("config_float") {
             assert_eq!(*f, 1.5);
         } else {
             panic!(
@@ -957,14 +997,14 @@ target(
             );
         }
 
-        if let Some(TargetSpecValue::List(l)) = target.config.get("config_list") {
+        if let Some(htvalue::Value::List(l)) = target.config.get("config_list") {
             assert_eq!(l.len(), 2);
-            if let TargetSpecValue::String(s) = &l[0] {
+            if let htvalue::Value::String(s) = &l[0] {
                 assert_eq!(s, "a");
             } else {
                 panic!("Expected string in list");
             }
-            if let TargetSpecValue::Int(i) = &l[1] {
+            if let htvalue::Value::Int(i) = &l[1] {
                 assert_eq!(*i, 1);
             } else {
                 panic!("Expected int in list");
@@ -975,10 +1015,13 @@ target(
     }
 
     fn make_provider(tmp_dir: &tempfile::TempDir) -> Provider {
-        Provider {
+        let p = Provider {
             root: tmp_dir.path().to_path_buf(),
             ..Provider::default()
-        }
+        };
+        // Wire the fs provider's functions so `heph.fs.glob` resolves in tests.
+        assert!(p.function_registry.set(fs_registry()).is_ok());
+        p
     }
 
     fn run_transitive(build_content: &str) -> anyhow::Result<Sandbox> {
@@ -1193,7 +1236,7 @@ target(
         assert_eq!(result.targets[0].name, "mytarget");
     }
 
-    fn run_target_config(build_content: &str) -> HashMap<String, TargetSpecValue> {
+    fn run_target_config(build_content: &str) -> HashMap<String, htvalue::Value> {
         let tmp_dir = tempdir().unwrap();
         let pkg_name = "mypkg";
         let pkg_path = tmp_dir.path().join(pkg_name);
@@ -1218,7 +1261,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::file_addr("mypkg/src/main.rs").format();
         match config.get("src") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected file addr string, got {:?}", other),
         }
     }
@@ -1235,7 +1278,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::file_addr("vendor/x.rs").format();
         match config.get("src") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected file addr string, got {:?}", other),
         }
     }
@@ -1252,7 +1295,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::glob_addr("mypkg/src/**/*.rs", &[]).format();
         match config.get("srcs") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
         }
     }
@@ -1270,7 +1313,7 @@ target(
         let expected =
             crate::pluginfs::glob_addr("mypkg/**/*.go", &["vendor/**", "gen/**"]).format();
         match config.get("srcs") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
         }
     }
@@ -1287,7 +1330,7 @@ target(
         let config = run_target_config(content);
         let expected = crate::pluginfs::glob_addr("**/*.rs", &[]).format();
         match config.get("srcs") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
         }
     }
@@ -1568,11 +1611,11 @@ target(name = "t", driver = "d", deps_kind = deps_kind, str_kind = str_kind)
 "#;
         let config = run_target_config(content);
         match config.get("deps_kind") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "list"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "list"),
             other => panic!("expected list type string, got {other:?}"),
         }
         match config.get("str_kind") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "string"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "string"),
             other => panic!("expected string type string, got {other:?}"),
         }
     }
@@ -1589,10 +1632,10 @@ target(name = "t", driver = "d", deps = coerce("single"))
 "#;
         let config = run_target_config(content);
         match config.get("deps") {
-            Some(TargetSpecValue::List(l)) => {
+            Some(htvalue::Value::List(l)) => {
                 assert_eq!(l.len(), 1);
                 match &l[0] {
-                    TargetSpecValue::String(s) => assert_eq!(s, "single"),
+                    htvalue::Value::String(s) => assert_eq!(s, "single"),
                     other => panic!("expected string in list, got {other:?}"),
                 }
             }
@@ -1614,7 +1657,7 @@ target(name = "t", driver = "d", deps = coerce("single"))
         let result = run_pkg_blocking(&provider, "some/pkg").unwrap();
         assert_eq!(result.targets.len(), 1);
         match result.targets[0].config.get("here") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "some/pkg"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "some/pkg"),
             other => panic!("expected pkg string, got {other:?}"),
         }
     }
@@ -1642,11 +1685,11 @@ target(name = "t", driver = "d", loaded_from = WHERE, here = get_pkg())
         let result = run_pkg_blocking(&provider, "app").unwrap();
         let cfg = &result.targets[0].config;
         match cfg.get("loaded_from") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "lib"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "lib"),
             other => panic!("expected lib, got {other:?}"),
         }
         match cfg.get("here") {
-            Some(TargetSpecValue::String(s)) => assert_eq!(s, "app"),
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "app"),
             other => panic!("expected app, got {other:?}"),
         }
     }
@@ -1672,9 +1715,9 @@ target(name = "t", driver = "d")
         assert_eq!(s.provider, "go");
         assert_eq!(
             s.args.get("root"),
-            Some(&TargetSpecValue::String("src".to_string()))
+            Some(&htvalue::Value::String("src".to_string()))
         );
-        assert_eq!(s.args.get("strict"), Some(&TargetSpecValue::Bool(true)));
+        assert_eq!(s.args.get("strict"), Some(&htvalue::Value::Bool(true)));
         assert!(!s.args.contains_key("provider"));
     }
 
@@ -1701,17 +1744,17 @@ target(
 "#;
         let config = run_target_config(content);
         match config.get("cfg") {
-            Some(TargetSpecValue::Map(m)) => {
+            Some(htvalue::Value::Map(m)) => {
                 match m.get("name") {
-                    Some(TargetSpecValue::String(s)) => assert_eq!(s, "n"),
+                    Some(htvalue::Value::String(s)) => assert_eq!(s, "n"),
                     other => panic!("expected name string, got {other:?}"),
                 }
                 match m.get("driver") {
-                    Some(TargetSpecValue::String(s)) => assert_eq!(s, "d"),
+                    Some(htvalue::Value::String(s)) => assert_eq!(s, "d"),
                     other => panic!("expected driver string, got {other:?}"),
                 }
                 match m.get("count") {
-                    Some(TargetSpecValue::Int(i)) => assert_eq!(*i, 3),
+                    Some(htvalue::Value::Int(i)) => assert_eq!(*i, 3),
                     other => panic!("expected count int, got {other:?}"),
                 }
             }
@@ -1843,12 +1886,12 @@ target(name = "t_in_app", driver = SHARED)
         assert_eq!(lib_res.targets[0].name, "t_in_lib");
     }
 
-    fn expect_string_list(v: Option<&TargetSpecValue>) -> Vec<String> {
+    fn expect_string_list(v: Option<&htvalue::Value>) -> Vec<String> {
         match v {
-            Some(TargetSpecValue::List(l)) => l
+            Some(htvalue::Value::List(l)) => l
                 .iter()
                 .map(|e| match e {
-                    TargetSpecValue::String(s) => s.clone(),
+                    htvalue::Value::String(s) => s.clone(),
                     other => panic!("expected string in list, got {other:?}"),
                 })
                 .collect(),
@@ -1960,5 +2003,74 @@ target(name = "t_in_app", driver = SHARED)
         let mut srcs = expect_string_list(result.targets[0].config.get("srcs"));
         srcs.sort();
         assert_eq!(srcs, vec!["a.yaml".to_string(), "b.yaml".to_string()]);
+    }
+
+    struct EchoFn;
+    #[async_trait::async_trait]
+    impl ProviderFn for EchoFn {
+        async fn call(
+            &self,
+            ctx: &FnCallContext<'_>,
+            args: FnArgs,
+        ) -> anyhow::Result<htvalue::Value> {
+            let arg = match args.positional.first() {
+                Some(htvalue::Value::String(s)) => s.clone(),
+                _ => anyhow::bail!("echo expects a string"),
+            };
+            Ok(htvalue::Value::String(format!("{}:{}", ctx.pkg, arg)))
+        }
+    }
+
+    #[test]
+    fn test_provider_function_exposed_as_heph_namespace() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"target(name = "t", driver = "d", v = heph.myprov.echo("hi"))"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "myprov",
+            vec![crate::engine::provider::ProviderFunctionDef {
+                name: "echo".to_string(),
+                func: Arc::new(EchoFn),
+            }],
+        );
+        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+
+        let result = run_pkg_blocking(&provider, "mypkg").unwrap();
+        match result.targets[0].config.get("v") {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "mypkg:hi"),
+            other => panic!("expected echoed string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_provider_function_errors() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"target(name = "t", driver = "d", v = heph.nope.bar())"#,
+        )
+        .unwrap();
+
+        // make_provider wires only the `fs` namespace, so `heph.nope` is undefined.
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "mypkg").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("nope"),
+            "expected error to name `nope`: {chain}"
+        );
     }
 }

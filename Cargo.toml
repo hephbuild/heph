@@ -1,5 +1,5 @@
 [package]
-name = "rheph"
+name = "heph"
 version = "0.1.0"
 edition = "2024"
 
@@ -91,7 +91,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
-rheph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
+heph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
 memoize = "0.6.0"
@@ -100,6 +100,7 @@ pprof = { version = "0.13", features = ["prost-codec"] }
 futures = "0.3.32"
 async-trait = "0.1.86"
 async-recursion = "1"
+stacker = "0.1"
 async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
@@ -112,6 +113,8 @@ tar = "0.4"
 glob = "0.3"
 wax = "0.7"
 walkdir = "2"
+xattr = "1"
+similar = "2"
 tempfile = "3.10"
 thiserror = "1.0.69"
 derivative = "2.2.0"
@@ -122,12 +125,12 @@ r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 parking_lot = "0.12"
 rustc-hash = "2"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm", "macros"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "macros", "scrolling-regions"] }
 ansi-to-tui = "8"
 unicode-width = "0.2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 libc = "0.2"
-templi = "0.1.2"
+minijinja = "2"
 erased-serde = "0.4"
 crossbeam-channel = "0.5"
 quick_cache = "0.6"

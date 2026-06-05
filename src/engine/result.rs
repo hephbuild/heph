@@ -20,15 +20,17 @@ use enclose::enclose;
 
 use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
+use crate::engine::grow_stack::{GrowStack, grow_stack};
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::{CacheArtifact, ManifestArtifactType};
 use crate::engine::result_lock::ResultReadGuard;
-use crate::hartifactcontent::{Content, ReadSeek, WalkEntry};
+use crate::hartifactcontent::{Content, ReadSeek, WalkEntry, WalkEntryKind};
 use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use tokio::task::JoinSet;
 
@@ -36,6 +38,11 @@ use tokio::task::JoinSet;
 /// lock" notice (with the holder's pid) to the progress stream. The notice is
 /// purely informational; the wait itself continues until acquired or cancelled.
 const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The boxed future produced by `#[async_recursion]` for `result_addr_impl`,
+/// wrapped per-poll by [`GrowStack`] in [`Engine::result_addr`].
+type BoxedResultFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<Arc<EResult>>> + Send + 'a>>;
 
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
 /// does not need to store it separately.
@@ -282,6 +289,22 @@ fn build_eresult(
     }
 }
 
+/// Stamp the codegen-provenance xattr on a written-back `copy` output. This is
+/// REQUIRED, not best-effort: the stamp is what makes a later `glob()`/`file()`
+/// exclude the generated file, so a workspace whose filesystem cannot store
+/// extended attributes (some tmpfs/NFS/FAT) must FAIL loudly rather than silently
+/// emit an unstamped output that would then be double-sourced. (`in_place` outputs
+/// are never stamped, so they remain usable on any filesystem.)
+fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()> {
+    xattr::set(path, crate::pluginfs::CODEGEN_XATTR, value.as_bytes()).with_context(|| {
+        format!(
+            "stamp codegen xattr on {:?}: `codegen = \"copy\"` requires a filesystem with \
+             extended-attribute support",
+            path
+        )
+    })
+}
+
 pub type InteractiveInner = Box<
     dyn for<'io> FnOnce(
             Option<&'io mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
@@ -302,6 +325,9 @@ pub struct ResultOptions {
     pub force: bool,
     pub shell: bool,
     pub interactive: Option<InteractiveWrapper>,
+    /// `--frozen`: verify codegen targets' generated output matches the tree
+    /// without writing. A mismatch surfaces a [`FrozenCheckError`].
+    pub frozen: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -318,6 +344,11 @@ struct ExecuteOptions<'a> {
     force: bool,
     interactive: Option<InteractiveWrapper>,
     shell: bool,
+    frozen: bool,
+    /// True only for the directly-requested (top-level) target. Gates codegen
+    /// tree write-back so a codegen target pulled in as a *dependency* doesn't
+    /// materialize its output into the workspace.
+    is_top: bool,
 }
 
 /// Single classifier chokepoint for any target error.
@@ -434,8 +465,26 @@ fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Err
 }
 
 impl Engine {
+    /// Resolve a target's result. Thin wrapper over [`Self::result_addr_impl`]
+    /// that grows the physical stack on demand.
+    ///
+    /// Every dependency-graph edge recurses through here, and a cache-warm
+    /// descent polls the whole subtree synchronously in one go (~100 KiB of
+    /// stack per level). Wrapping each level's poll in [`grow_stack`] keeps that
+    /// cascade from overflowing the 2 MiB tokio worker stack on deep graphs.
+    /// See `engine::grow_stack` for the full rationale.
+    pub fn result_addr<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &'a Addr,
+        outputs: OutputMatcher,
+        opts: &'a ResultOptions,
+    ) -> GrowStack<BoxedResultFuture<'a>> {
+        grow_stack(self.result_addr_impl(rs, addr, outputs, opts))
+    }
+
     #[async_recursion]
-    pub async fn result_addr(
+    async fn result_addr_impl(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
@@ -554,7 +603,14 @@ impl Engine {
         if let OutputMatcher::Exact(names) = &mut key_outputs {
             names.sort();
         }
-        let key = (addr.clone(), key_outputs);
+        // `is_top` is part of the key: the same target can be reached both
+        // top-level (is_top=true) and as a transparent-group member (is_top=false)
+        // in one request. Both produce identical artifacts, but only the top-level
+        // frame writes the codegen tree back / stores the fixpoint, so each
+        // is_top variant needs its own memoizer cell or a race could bake the
+        // wrong is_top into the shared computation. The second variant hits the
+        // on-disk cache (keyed by hashin, not is_top), so there is no re-execute.
+        let key = (addr.clone(), key_outputs, is_top);
         let opts = opts.clone();
         let interactive = opts.interactive.is_some();
         let res = rs
@@ -563,7 +619,7 @@ impl Engine {
             .once(
                 key,
                 enclose!((self => engine, rs, addr, outputs) move || async move {
-                    match engine.inner_result_addr(rs.clone(), &addr, outputs, &opts).await {
+                    match engine.inner_result_addr(rs.clone(), &addr, outputs, &opts, is_top).await {
                         Ok(v) => Ok(Arc::new(v)),
                         Err(e) => Err(classify_failure(&rs, &addr, interactive, e)),
                     }
@@ -706,6 +762,7 @@ impl Engine {
         addr: &Addr,
         outputs: OutputMatcher,
         opts: &ResultOptions,
+        is_top: bool,
     ) -> anyhow::Result<EResult> {
         let addr_str = addr.format();
         crate::engine::event::emit_scope(
@@ -763,6 +820,8 @@ impl Engine {
                         force: opts.force,
                         interactive: opts.interactive.clone(),
                         shell: opts.shell,
+                        frozen: opts.frozen,
+                        is_top,
                     },
                 )
                 .await
@@ -836,6 +895,8 @@ impl Engine {
                 .clone()
                 .execute_and_cache_inner(rs.clone(), opts)
                 .await?;
+            self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
+                .await?;
             return Ok(build_eresult(cached, meta, &outputs, None));
         }
 
@@ -849,7 +910,15 @@ impl Engine {
             .result_from_cache(rs.clone(), def, opts, outputs.clone())
             .await?
         {
-            // A. Cache hit — attach this read lock and return.
+            // A. Cache hit — write back the codegen tree (a cache hit on an
+            // in_place fmt must still materialize), then attach the read lock.
+            self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
+                .await?;
+            // Register the fixpoint even on a hit: a concurrent dependency
+            // resolution may have populated the primary entry without storing
+            // the fixpoint (it ran with is_top=false). Idempotent — a no-op when
+            // already at the fixpoint.
+            self.clone().maybe_store_fixpoint(&rs, opts).await?;
             return Ok(build_eresult(cached, meta, &outputs, Some(Arc::new(read))));
         }
 
@@ -888,7 +957,265 @@ impl Engine {
             .with_context(|| format!("downgrading result lock for {addr}"))?;
         let read = self.result_lock().read(addr, ctoken).await?;
         drop(up);
+        self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
+            .await?;
+        // Must follow write-back so the recomputed key reflects the tree.
+        // Idempotent across hit/miss (see the hit path above).
+        self.clone().maybe_store_fixpoint(&rs, opts).await?;
         Ok(build_eresult(cached, meta, &outputs, Some(Arc::new(read))))
+    }
+
+    /// Materialize the codegen output tree for a freshly-resolved target.
+    ///
+    /// Gated to top-level requested targets (`rs.parent.is_none()`) with at least
+    /// one codegen output path. For each codegen output group:
+    /// - `frozen`: build a unified diff between the generated bytes and the tree
+    ///   file, accumulate per-file diffs, and on any divergence return a
+    ///   [`FrozenCheckError`] without writing anything.
+    /// - otherwise: unpack the cached artifact into the workspace root (copy
+    ///   semantics). `Copy` (net-new) groups additionally stamp every written
+    ///   file with the codegen xattr so a later fs glob excludes them; `InPlace`
+    ///   groups are not stamped (they overwrite tracked source files).
+    async fn materialize_codegen(
+        &self,
+        is_top: bool,
+        def: &LinkedTargetDef,
+        cached: &[CacheArtifact],
+        frozen: bool,
+    ) -> anyhow::Result<()> {
+        use crate::engine::driver::targetdef::path::CodegenMode;
+
+        // Gate: only the top-level requested target writes its tree back, and
+        // only when it actually declares a codegen output path.
+        if !is_top {
+            return Ok(());
+        }
+        let has_codegen = def.target.outputs.iter().any(|o| {
+            o.paths
+                .iter()
+                .any(|p| !matches!(p.codegen_tree, CodegenMode::None))
+        });
+        if !has_codegen {
+            return Ok(());
+        }
+
+        let root = &self.cfg.root;
+        let mut frozen_diff = String::new();
+
+        // Map each codegen output group to its declared mode (first non-None
+        // path wins). One group can back MULTIPLE cached Output artifacts (e.g.
+        // several `out` entries sharing a group), so the loop below is driven off
+        // the cached artifacts and looks the mode up per artifact — covering every
+        // artifact, and exactly once.
+        let mut group_mode: std::collections::HashMap<&str, &CodegenMode> =
+            std::collections::HashMap::new();
+        for output in &def.target.outputs {
+            if let Some(mode) = output
+                .paths
+                .iter()
+                .map(|p| &p.codegen_tree)
+                .find(|m| !matches!(m, CodegenMode::None))
+            {
+                group_mode.entry(output.group.as_str()).or_insert(mode);
+            }
+        }
+
+        for artifact in cached {
+            if artifact.r#type != ManifestArtifactType::Output {
+                continue;
+            }
+            let Some(mode) = group_mode.get(artifact.group.as_str()).copied() else {
+                continue;
+            };
+            let group = artifact.group.as_str();
+
+            if frozen {
+                // Compare each generated file against the tree; never write.
+                let walker = artifact
+                    .walk()
+                    .with_context(|| format!("walk codegen output for frozen check: {group}"))?;
+                for entry in walker {
+                    let entry = entry
+                        .with_context(|| format!("read codegen entry for frozen check: {group}"))?;
+                    let (new_bytes, x) = match entry.kind {
+                        WalkEntryKind::File { mut data, x } => {
+                            let mut buf = Vec::new();
+                            std::io::Read::read_to_end(&mut data, &mut buf)
+                                .with_context(|| format!("read generated file {:?}", entry.path))?;
+                            (buf, x)
+                        }
+                        WalkEntryKind::Symlink { .. } => continue,
+                    };
+                    let tree_path = root.join(&entry.path);
+                    let old_bytes = match std::fs::read(&tree_path) {
+                        Ok(b) => b,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                        Err(e) => {
+                            return Err(e).with_context(|| {
+                                format!("read tree file {:?} for frozen check", tree_path)
+                            });
+                        }
+                    };
+                    let content_same = old_bytes == new_bytes;
+                    // The exec bit is part of the (content + exec-bit) fs hash, so
+                    // a mode-only divergence is real drift the non-frozen run
+                    // would write back — flag it here too, symmetric with the
+                    // write-back reconcile.
+                    #[cfg(unix)]
+                    let exec_same = {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::metadata(&tree_path)
+                            .map(|m| (m.permissions().mode() & 0o111 != 0) == x)
+                            .unwrap_or(!x)
+                    };
+                    #[cfg(not(unix))]
+                    let exec_same = {
+                        // No exec-bit concept on this platform.
+                        let _ = x;
+                        true
+                    };
+                    if content_same && exec_same {
+                        continue;
+                    }
+                    let path_label = entry.path.display().to_string();
+                    if !content_same {
+                        let old = String::from_utf8_lossy(&old_bytes);
+                        let new = String::from_utf8_lossy(&new_bytes);
+                        let diff = similar::TextDiff::from_lines(old.as_ref(), new.as_ref());
+                        // Git-style headers so the per-file path rides on the
+                        // `---`/`+++` lines (no redundant label above them).
+                        let rendered = diff
+                            .unified_diff()
+                            .header(&format!("a/{path_label}"), &format!("b/{path_label}"))
+                            .to_string();
+                        frozen_diff.push_str(&rendered);
+                        if !frozen_diff.ends_with('\n') {
+                            frozen_diff.push('\n');
+                        }
+                    }
+                    #[cfg(unix)]
+                    if !exec_same {
+                        let want = if x { "executable" } else { "non-executable" };
+                        frozen_diff
+                            .push_str(&format!("mode change: {path_label} should be {want}\n"));
+                    }
+                }
+            } else {
+                // Materialize the generated tree into the workspace root, but
+                // write a file's bytes ONLY when they differ from what's on disk
+                // (and reconcile its exec bit separately, below). `@heph/fs`
+                // hashes inputs by (content, exec-bit), so re-reading an
+                // unchanged file yields the same hash and an idempotent in_place
+                // target hits the fixpoint cache instead of re-executing.
+                // Skipping identical writes also avoids needless source-control
+                // churn and pointless mtime bumps.
+                let stamp = def.target.addr.format();
+                let walker = artifact
+                    .walk()
+                    .with_context(|| format!("walk codegen output for write-back: {group}"))?;
+                for entry in walker {
+                    let entry = entry
+                        .with_context(|| format!("read codegen entry for write-back: {group}"))?;
+                    let dest = root.join(&entry.path);
+                    match entry.kind {
+                        WalkEntryKind::File { mut data, x } => {
+                            let mut new_bytes = Vec::new();
+                            std::io::Read::read_to_end(&mut data, &mut new_bytes)
+                                .with_context(|| format!("read generated file {:?}", entry.path))?;
+                            let unchanged =
+                                matches!(std::fs::read(&dest), Ok(old) if old == new_bytes);
+                            if !unchanged {
+                                if let Some(parent) = dest.parent() {
+                                    std::fs::create_dir_all(parent).with_context(|| {
+                                        format!("create parent dir for {:?}", dest)
+                                    })?;
+                                }
+                                std::fs::write(&dest, &new_bytes)
+                                    .with_context(|| format!("write codegen file {:?}", dest))?;
+                            }
+                            // The exec bit is part of the `@heph/fs` (content,
+                            // exec-bit) input hash, so reconcile it to the
+                            // generated artifact's `x` even when the bytes are
+                            // unchanged — otherwise a target that only flips +x
+                            // would never land on disk and the recomputed
+                            // fixpoint key would disagree with what ran. Touch
+                            // only the exec bits, and only when the boolean
+                            // actually differs, so other mode bits stay put and
+                            // an already-correct file sees no spurious churn.
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if let Ok(meta) = std::fs::metadata(&dest) {
+                                    let cur = meta.permissions().mode();
+                                    if (cur & 0o111 != 0) != x {
+                                        let want = if x { cur | 0o111 } else { cur & !0o111 };
+                                        std::fs::set_permissions(
+                                            &dest,
+                                            std::fs::Permissions::from_mode(want),
+                                        )
+                                        .with_context(
+                                            || format!("reconcile exec bit on {:?}", dest),
+                                        )?;
+                                    }
+                                }
+                            }
+                            // Stamp net-new (Copy) outputs so a later fs glob
+                            // excludes them. InPlace outputs overwrite tracked
+                            // sources and stay unstamped. (xattr is file metadata,
+                            // not content, so it does not perturb the content+x
+                            // fs hash.)
+                            if matches!(mode, CodegenMode::Copy) {
+                                stamp_codegen_xattr(&dest, &stamp)?;
+                            }
+                        }
+                        WalkEntryKind::Symlink { target } => {
+                            // Codegen outputs are regular files in practice;
+                            // recreate symlinks only when missing or divergent.
+                            #[cfg(unix)]
+                            {
+                                let recreate = match std::fs::read_link(&dest) {
+                                    Ok(cur) => cur != target,
+                                    Err(_) => true,
+                                };
+                                if recreate {
+                                    if let Some(parent) = dest.parent() {
+                                        std::fs::create_dir_all(parent).with_context(|| {
+                                            format!("create parent dir for {:?}", dest)
+                                        })?;
+                                    }
+                                    match std::fs::remove_file(&dest) {
+                                        Ok(()) => {}
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                        Err(e) => {
+                                            return Err(e).with_context(|| {
+                                                format!("remove {:?} before symlink", dest)
+                                            });
+                                        }
+                                    }
+                                    std::os::unix::fs::symlink(&target, &dest).with_context(
+                                        || format!("symlink {:?} -> {:?}", dest, target),
+                                    )?;
+                                }
+                                // Stamp Copy symlink outputs too, so a later fs
+                                // glob excludes them like regular Copy files.
+                                if matches!(mode, CodegenMode::Copy) {
+                                    stamp_codegen_xattr(&dest, &stamp)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if frozen && !frozen_diff.is_empty() {
+            return Err(anyhow::Error::new(crate::engine::error::FrozenCheckError {
+                addr: def.target.addr.clone(),
+                diff: frozen_diff,
+            }));
+        }
+
+        Ok(())
     }
 
     // Memoized by addr:hashin — at most one execute+cache cycle runs per target per request,
@@ -986,6 +1313,86 @@ impl Engine {
             )
             .await
             .map_err(unwrap_arc_err)
+    }
+
+    /// Register the just-executed in_place target's cache entry under the key a
+    /// subsequent run will compute, so re-running an idempotent transform on the
+    /// already-transformed tree is a no-op cache hit.
+    ///
+    /// Called only on the execute path, *after* `materialize_codegen` has written
+    /// the transformed files back to the tree. We recompute the target's `hashin`
+    /// against that post-write-back state using a *fresh* request (the `@heph/fs`
+    /// inputs are cache-off and memoized per request, so a new request re-reads
+    /// the just-written files and yields exactly the `hashin` the next run will
+    /// see), then duplicate this run's primary cache revision under it.
+    ///
+    /// This is faithful to how `@heph/fs` actually hashes inputs (content +
+    /// exec-bit): the key is derived from the real tree, not from output content
+    /// hashes that the next run would never reproduce. Because the hash tracks
+    /// content (and the write-back leaves an already-correct file byte-for-byte
+    /// identical), re-reading the post-write-back tree reproduces the same key,
+    /// so the hit is stable across repeated runs. Best-effort: any failure leaves
+    /// the primary entry intact and the next run simply re-executes.
+    async fn maybe_store_fixpoint(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        opts: &ExecuteOptions<'_>,
+    ) -> anyhow::Result<()> {
+        use crate::engine::driver::targetdef::path::CodegenMode;
+
+        // Only top-level targets write their tree back, and only in_place targets
+        // mutate their own inputs (so only they can reach a fixpoint). Frozen runs
+        // never write, hence never cache a fixpoint.
+        if opts.frozen || !opts.is_top {
+            return Ok(());
+        }
+        // The fresh request below runs on its own cancellation token (unlinked
+        // from this build), so refuse to start once the original build is
+        // cancelled — the fixpoint is a pure optimization and must never delay a
+        // Ctrl-C teardown.
+        if rs.ctoken().is_cancelled() {
+            return Ok(());
+        }
+        let is_in_place = opts.def.target.outputs.iter().any(|o| {
+            o.paths
+                .iter()
+                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
+        });
+        if !is_in_place {
+            return Ok(());
+        }
+
+        let addr = opts.def.target.addr.clone();
+        // Fresh request → fs inputs re-stat the post-write-back tree, yielding the
+        // exact hashin the NEXT run will compute.
+        let fresh = self.new_state();
+        let fixpoint = match Arc::clone(&self).meta(fresh, &addr).await {
+            Ok(m) => m.hashin,
+            Err(e) => {
+                // Optimization only: the primary entry is already cached.
+                tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: meta recompute failed");
+                return Ok(());
+            }
+        };
+        if fixpoint == *opts.hashin {
+            // Tree already at the fixpoint (idempotent run changed nothing).
+            return Ok(());
+        }
+        // Blob copy is synchronous IO — run it off the async poll like every
+        // other cache write (see `cache_artifact_locally`).
+        let primary = opts.hashin.clone();
+        let dup = crate::process_supervisor::block_or_inline(enclose!(
+            (self => engine, addr, fixpoint, primary) move || {
+                engine.duplicate_cache_revision(&addr, &primary, &fixpoint)
+            }
+        ));
+        if let Err(e) = dup {
+            // Best-effort: the primary cache entry is already written, so a
+            // failure here just means the next run re-executes instead of
+            // hitting the fixpoint. Never fail a successful build over it.
+            tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: duplicate cache revision failed");
+        }
+        Ok(())
     }
 
     /// Look up `def`'s artifacts in the local cache, emitting the hit/miss event.
@@ -1103,7 +1510,14 @@ impl Engine {
             )
             .await
             .with_context(|| format!("{} parse", driver.name))?;
-        let def = rewrite_query_inputs(res.target_def, addr, &spec.provider);
+        let mut def = rewrite_query_inputs(res.target_def, addr, &spec.provider);
+        // Expand the engine-baked `//@heph/introspect:outputs` magic input into
+        // one `@heph/fs` input per declared output path of this target. Done
+        // here (the single seam where `def.inputs` is finalized) so transitive
+        // collection below and every downstream consumer — hashing and
+        // execution alike — see the synthesized fs inputs and never the magic
+        // addr, which no provider serves.
+        crate::engine::expand::expand_introspect_inputs(&mut def);
 
         let all_transitive = if apply_transitive {
             let sb = Arc::clone(&self)
@@ -1115,7 +1529,7 @@ impl Engine {
             None
         };
 
-        let def = match &all_transitive {
+        let mut def = match &all_transitive {
             Some(sb) if !sb.empty() => {
                 let res = driver
                     .driver
@@ -1134,6 +1548,26 @@ impl Engine {
             }
             _ => def,
         };
+
+        // In-place codegen persists TWO cache revisions per logical input state:
+        // the primary (keyed over the pre-transform tree) and the fixpoint (keyed
+        // over the post-write-back tree). Double the GC history so `cache.history`
+        // still retains that many input *states*, not half as many. Applied here,
+        // on the final def, so BOTH GC paths that read `def.cache.history` — the
+        // post-write trim and the `heph gc` sweep — inherit it. The exec hash does
+        // not include `cache`, so this never invalidates existing cache entries.
+        if def.cache.history > 0
+            && def.outputs.iter().any(|o| {
+                o.paths.iter().any(|p| {
+                    matches!(
+                        p.codegen_tree,
+                        crate::engine::driver::targetdef::path::CodegenMode::InPlace
+                    )
+                })
+            })
+        {
+            def.cache.history = def.cache.history.saturating_mul(2);
+        }
 
         if def.hash.is_empty() {
             anyhow::bail!("missing hash");
@@ -1257,6 +1691,9 @@ impl Engine {
         rs: &Arc<RequestState>,
         pkg: &PkgBuf,
     ) -> anyhow::Result<Arc<Vec<State>>> {
+        // Single chokepoint for every provider-dispatch path (get/probe/list all
+        // route through here), so provider functions are wired before any BUILD eval.
+        self.ensure_provider_functions_wired();
         rs.data
             .mem_probe
             .once(
@@ -1631,6 +2068,117 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn provider_functions_lists_exposed_functions() {
+        let root = tempdir().unwrap();
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })
+        .unwrap();
+        engine
+            .register_provider(|_| Box::new(crate::pluginfs::Provider))
+            .unwrap();
+        let fns = engine.provider_functions();
+        assert!(
+            fns.contains(&("fs".to_string(), "glob".to_string())),
+            "{fns:?}"
+        );
+    }
+
+    // Repro: `//...` (PackagePrefix("")) must surface targets in the ROOT
+    // package's BUILD file, not just nested packages.
+    #[tokio::test]
+    async fn query_recursive_includes_root_build_file() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        // Root-package BUILD.
+        std::fs::write(
+            root.path().join("BUILD"),
+            r#"target(name = "root_t", driver = "d")"#,
+        )?;
+        // Nested-package BUILD.
+        std::fs::create_dir_all(root.path().join("sub"))?;
+        std::fs::write(
+            root.path().join("sub").join("BUILD"),
+            r#"target(name = "sub_t", driver = "d")"#,
+        )?;
+
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|root| {
+            Box::new(crate::pluginbuildfile::Provider::new(root.to_path_buf()))
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let addrs: Vec<Addr> = SArc::clone(&engine)
+            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .try_collect()
+            .await?;
+
+        let names: Vec<&str> = addrs.iter().map(|a| a.name.as_str()).collect();
+        assert!(
+            names.contains(&"sub_t"),
+            "nested target must be found: {names:?}"
+        );
+        assert!(
+            names.contains(&"root_t"),
+            "root-package target must be found: {names:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn engine_wires_provider_functions_into_buildfile() -> anyhow::Result<()> {
+        // End-to-end: the engine must aggregate `fs`'s exposed `glob` function and
+        // inject it into the buildfile provider, so a BUILD calling `heph.fs.glob`
+        // resolves at spec time.
+        let root = tempdir()?;
+        std::fs::write(root.path().join("a.txt"), "")?;
+        std::fs::write(root.path().join("b.txt"), "")?;
+        std::fs::write(root.path().join("c.md"), "")?;
+        std::fs::write(
+            root.path().join("BUILD"),
+            r#"target(name = "t", driver = "d", srcs = heph.fs.glob("*.txt"))"#,
+        )?;
+
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|_| Box::new(crate::pluginfs::Provider))?;
+        engine.register_provider(|root| {
+            Box::new(crate::pluginbuildfile::Provider::new(root.to_path_buf()))
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let addr = Addr::new(PkgBuf::from(""), "t".to_string(), Default::default());
+        let spec = SArc::clone(&engine).get_spec(rs, &addr).await?;
+
+        let mut srcs = match spec.spec.config.get("srcs") {
+            Some(crate::htvalue::Value::List(l)) => l
+                .iter()
+                .map(|e| match e {
+                    crate::htvalue::Value::String(s) => s.clone(),
+                    other => panic!("expected string, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("expected list, got {other:?}"),
+        };
+        srcs.sort();
+        assert_eq!(srcs, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn skip_providers_excludes_provider_from_query() -> anyhow::Result<()> {
         let root = tempdir()?;
@@ -2001,13 +2549,13 @@ mod tests {
             .clone();
         let q_spec = engine.clone().get_spec(engine.new_state(), &q_addr).await?;
         let deps = match q_spec.config.get("deps") {
-            Some(crate::loosespecparser::TargetSpecValue::List(l)) => l,
+            Some(crate::htvalue::Value::List(l)) => l,
             other => panic!("expected deps list, got {other:?}"),
         };
         let dep_strs: Vec<String> = deps
             .iter()
             .map(|v| match v {
-                crate::loosespecparser::TargetSpecValue::String(s) => s.clone(),
+                crate::htvalue::Value::String(s) => s.clone(),
                 other => panic!("expected string dep, got {other:?}"),
             })
             .collect();
@@ -2069,10 +2617,10 @@ mod tests {
 
         let extract_deps = |spec: &TargetSpec| -> Vec<String> {
             match spec.config.get("deps") {
-                Some(crate::loosespecparser::TargetSpecValue::List(l)) => l
+                Some(crate::htvalue::Value::List(l)) => l
                     .iter()
                     .map(|v| match v {
-                        crate::loosespecparser::TargetSpecValue::String(s) => s.clone(),
+                        crate::htvalue::Value::String(s) => s.clone(),
                         other => panic!("expected string, got {other:?}"),
                     })
                     .collect(),
@@ -2867,6 +3415,632 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.kind, BuildEventKind::Matched { .. })),
             "inner result must not emit Matched, got {events:?}"
+        );
+        Ok(())
+    }
+
+    // ─── Codegen write-back / fixpoint / frozen ──────────────────────────────
+
+    /// Engine wired with the exec driver AND the `@heph/fs` provider+driver, so
+    /// the `//@heph/introspect:outputs` magic input resolves. Returns the engine
+    /// and the workspace-root `TempDir` (which doubles as the home/cache root).
+    fn engine_with_home_fs(
+        targets: Vec<pluginstatictarget::Target>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        // `bash` driver wraps the `run` string into `bash -u -e -c <script>`,
+        // so codegen targets can run real shell. The `@heph/fs` provider+driver
+        // resolves the synthesized introspect-outputs inputs.
+        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_bash()))?;
+        engine.register_provider(|_| Box::new(crate::pluginfs::Provider))?;
+        engine.register_driver(Box::new(crate::pluginfs::Driver))?;
+        let provider = pluginstatictarget::Provider::new(targets)?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
+    }
+
+    /// A codegen target: `out` group `""` over `paths`, the given `codegen` mode
+    /// (`"copy"`/`"in_place"`), depending on the magic introspect-outputs input
+    /// so its declared output paths become `@heph/fs` inputs. Runs under the
+    /// `bash` driver so `run` may be a shell script (cwd = sandbox `ws/<pkg>`).
+    fn codegen_run_target(
+        addr: &str,
+        codegen: &str,
+        paths: &[&str],
+        run: &str,
+    ) -> pluginstatictarget::Target {
+        let mut out = HashMap::new();
+        out.insert(
+            "".to_string(),
+            paths.iter().map(|s| s.to_string()).collect(),
+        );
+        let mut deps = HashMap::new();
+        deps.insert(
+            "".to_string(),
+            vec!["//@heph/introspect:outputs".to_string()],
+        );
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "bash".to_string(),
+            run: Some(run.to_string()),
+            out,
+            codegen: Some(codegen.to_string()),
+            deps,
+            labels: vec![],
+        }
+    }
+
+    /// in_place does NOT restrict outputs to pre-existing inputs: a run that
+    /// creates a net-new file matching its output glob succeeds and the file is
+    /// written back to the tree. (The mode distinction is `copy` = generated /
+    /// gitignored / glob-excluded vs `in_place` = committed / globbable — not
+    /// "may only touch existing files".)
+    #[tokio::test]
+    async fn in_place_allows_net_new_files() -> anyhow::Result<()> {
+        // out glob `pkg/*.txt`; nothing on disk → empty input set. The run script
+        // (cwd = ws_dir/pkg) creates `created.txt`, a net-new output file.
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:gen",
+            "in_place",
+            &["*.txt"],
+            "echo hi > created.txt",
+        )])?;
+        let addr = crate::htaddr::parse_addr("//pkg:gen")?;
+
+        let (res, _events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("in_place target may emit net-new files");
+        assert_eq!(
+            std::fs::read(root.path().join("pkg/created.txt"))?,
+            b"hi\n",
+            "net-new in_place output must be written back to the tree",
+        );
+        Ok(())
+    }
+
+    /// The on-disk exec bit is part of the `@heph/fs` (content + exec-bit) input
+    /// hash, so the in_place write-back must apply the generated artifact's `x`
+    /// even when the bytes are unchanged — otherwise a `+x`-only change never
+    /// lands on disk and the recomputed fixpoint key would disagree with what ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_back_applies_exec_bit_on_unchanged_content() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:mkexec",
+            "in_place",
+            &["*.sh"],
+            // Rewrite identical bytes, then mark the file executable in the
+            // sandbox. The bytes match what's already on disk, so write-back
+            // takes the unchanged path; only the exec bit differs and must be
+            // reconciled onto the tree.
+            "printf 'echo hi\\n' > run.sh && chmod +x run.sh",
+        )])?;
+        // Seed the exact bytes the run produces, but non-executable.
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let script = pkg_dir.join("run.sh");
+        std::fs::write(&script, b"echo hi\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))?;
+
+        let addr = crate::htaddr::parse_addr("//pkg:mkexec")?;
+        let (res, _events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("mkexec target resolves");
+
+        let mode = std::fs::metadata(&script)?.permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "write-back must apply the exec bit even when content is unchanged (mode {mode:o})",
+        );
+        Ok(())
+    }
+
+    /// The headline guarantee: re-running an idempotent in_place transform over
+    /// the already-transformed tree is a no-op cache hit (no re-execution).
+    ///
+    /// Run 1 normalizes a lowercase, newline-less source into uppercase-with-
+    /// trailing-newline, writes it back, and registers a fixpoint cache revision
+    /// keyed on the post-write-back tree state. Run 2 reads the now-normalized
+    /// tree and must HIT the cache — the `fmt` target emits no `ExecuteStart`.
+    /// (The `@heph/fs` *inputs* are still re-read each run, so we assert
+    /// specifically that the `fmt` target did not execute.)
+    ///
+    /// The transform changes the file CONTENT on run 1 (`hello` → `HELLO\n`), so
+    /// the fixpoint key provably differs from the primary key — `@heph/fs` hashes
+    /// by (content, exec-bit), and the changed bytes alone separate the two keys.
+    /// This makes the stored fixpoint revision observable (≥ 2 cache revisions).
+    #[tokio::test]
+    async fn fixpoint_hit() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:fmt",
+            "in_place",
+            // Package-relative; stored as `FilePath(pkg/in.txt)`.
+            &["in.txt"],
+            // cwd = ws/pkg. Uppercase + ensure exactly one trailing newline. The
+            // command substitution strips trailing newlines, `printf '%s\n'`
+            // re-adds one, so f(f(x)) == f(x); on the FIRST run over a newline-
+            // less lowercase seed it also changes the content.
+            "printf '%s\\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+        )])?;
+        // Seed a lowercase, newline-less source → run 1 yields "HELLO\n", a
+        // guaranteed content change (case + trailing newline).
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+        let addr = crate::htaddr::parse_addr("//pkg:fmt")?;
+        let fmt = addr.format();
+        let fmt_executed = |evs: &[BuildEvent]| {
+            evs.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if *addr == fmt),
+            )
+        };
+
+        // Run 1: executes, writes back the normalized file, stores the fixpoint.
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first.expect("first resolve must succeed");
+        assert!(fmt_executed(&ev1), "first run must execute, got {ev1:?}");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"HELLO\n",
+            "in_place run 1 must transform the tree file"
+        );
+        // Run 2: reads the already-transformed tree → fixpoint cache hit.
+        // Because the transform changed the file CONTENT, run 2's hashin (over the
+        // uppercased bytes) can only match the fixpoint revision, never the
+        // primary (which is keyed over the lowercase seed). So "no execute on run
+        // 2" is proof that the fixpoint revision was stored — no need to count
+        // cache entries (the background GC may legitimately reclaim the now-stale
+        // primary once the fixpoint exists).
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second.expect("second resolve must succeed");
+        assert!(
+            !fmt_executed(&ev2),
+            "second run over the transformed tree must be a cache hit (no execute), got {ev2:?}"
+        );
+        assert!(
+            ev2.iter()
+                .any(|e| matches!(&e.kind, BuildEventKind::LocalCacheHit { addr } if *addr == fmt)),
+            "second run must record a local cache hit for fmt, got {ev2:?}"
+        );
+        // The tree is unchanged by the no-op second run.
+        assert_eq!(std::fs::read(pkg_dir.join("in.txt"))?, b"HELLO\n");
+        Ok(())
+    }
+
+    /// is_top gate: a codegen target reached only as a DEPENDENCY (not the
+    /// directly-requested target) must NOT write its tree back. Locks the
+    /// `is_top` memoizer-key fix — only the top-level frame materializes.
+    #[tokio::test]
+    async fn in_place_dep_is_not_written_back() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![
+            codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["in.txt"],
+                "printf '%s\\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+            ),
+            // A consumer that depends on the in_place target but is itself a
+            // plain (non-codegen) target. Uses the `bash` driver registered by
+            // engine_with_home_fs.
+            pluginstatictarget::Target {
+                addr: "//pkg:consumer".to_string(),
+                driver: "bash".to_string(),
+                run: Some("true".to_string()),
+                out: HashMap::new(),
+                codegen: None,
+                deps: HashMap::from([("".to_string(), vec!["//pkg:fmt".to_string()])]),
+                labels: vec![],
+            },
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+        // Resolve the consumer (top-level). fmt is pulled in only as a dep
+        // (is_top=false), so its tree must remain untouched.
+        let consumer = crate::htaddr::parse_addr("//pkg:consumer")?;
+        let (res, _ev) = resolve_collecting_events(&engine, &consumer).await;
+        res.expect("consumer must resolve");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"hello",
+            "an in_place target reached only as a dependency must NOT write its tree back"
+        );
+
+        // Sanity: requesting fmt directly DOES write it back.
+        let fmt = crate::htaddr::parse_addr("//pkg:fmt")?;
+        let (res, _ev) = resolve_collecting_events(&engine, &fmt).await;
+        res.expect("fmt must resolve");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"HELLO\n",
+            "a directly-requested in_place target must write its tree back"
+        );
+        Ok(())
+    }
+
+    /// Multi-file in_place: a glob output covering several files transforms each
+    /// of them, and a re-run over the transformed tree is a no-op cache hit —
+    /// exercising the per-file write-back walk and the multi-file fixpoint.
+    #[tokio::test]
+    async fn fixpoint_hit_multi_file() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:fmt",
+            "in_place",
+            &["*.txt"],
+            // cwd = ws/pkg. Normalize every .txt file in place.
+            "for f in *.txt; do printf '%s\\n' \"$(tr a-z A-Z < \"$f\")\" > \"$f.t\" && mv \"$f.t\" \"$f\"; done",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"aaa")?;
+        std::fs::write(pkg_dir.join("b.txt"), b"bbb")?;
+
+        let addr = crate::htaddr::parse_addr("//pkg:fmt")?;
+        let fmt = addr.format();
+        let fmt_executed = |evs: &[BuildEvent]| {
+            evs.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if *addr == fmt),
+            )
+        };
+
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first.expect("first resolve must succeed");
+        assert!(fmt_executed(&ev1), "first run must execute");
+        assert_eq!(std::fs::read(pkg_dir.join("a.txt"))?, b"AAA\n");
+        assert_eq!(std::fs::read(pkg_dir.join("b.txt"))?, b"BBB\n");
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second.expect("second resolve must succeed");
+        assert!(
+            !fmt_executed(&ev2),
+            "second run over the transformed multi-file tree must be a cache hit, got {ev2:?}"
+        );
+        Ok(())
+    }
+
+    /// End-to-end provenance: after a `copy` codegen target writes+stamps a
+    /// net-new file, a subsequent `@heph/fs` glob over the same tree EXCLUDES it
+    /// (so it is never double-sourced), while an unstamped in_place output stays
+    /// visible to a glob.
+    #[tokio::test]
+    async fn stamped_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![
+            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
+            codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("keep.txt"), b"keep\n")?;
+
+        // Skip the exclusion assertions on a filesystem that can't persist xattrs.
+        let probe = root.path().join(".xattr_probe");
+        std::fs::write(&probe, b"x")?;
+        let xattr_supported = xattr::set(&probe, crate::pluginfs::CODEGEN_XATTR, b"v").is_ok();
+
+        // Materialize + stamp the copy output, and write back the in_place file.
+        resolve_collecting_events(&engine, &crate::htaddr::parse_addr("//pkg:cp")?)
+            .await
+            .0
+            .expect("copy target resolves");
+        resolve_collecting_events(&engine, &crate::htaddr::parse_addr("//pkg:ip")?)
+            .await
+            .0
+            .expect("in_place target resolves");
+
+        // A glob over the stamped copy output must yield nothing.
+        let gen_glob = crate::pluginfs::glob_addr("pkg/*.gen", &[]);
+        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        let gen_res = res.expect("glob over generated files resolves");
+        // A glob over the unstamped in_place output must still see it.
+        let keep_glob = crate::pluginfs::glob_addr("pkg/keep.txt", &[]);
+        let (res, _) = resolve_collecting_events(&engine, &keep_glob).await;
+        let keep_res = res.expect("glob over in_place output resolves");
+
+        if xattr_supported {
+            assert!(
+                gen_res.artifacts.is_empty(),
+                "stamped copy output must be excluded from a later glob, got {} artifacts",
+                gen_res.artifacts.len(),
+            );
+        }
+        assert!(
+            !keep_res.artifacts.is_empty(),
+            "unstamped in_place output must remain visible to a glob",
+        );
+        Ok(())
+    }
+
+    /// A net-new `copy` codegen target: after resolve the generated file is
+    /// materialized into the workspace root AND carries the codegen xattr (so a
+    /// later fs glob excludes it). An in_place target's re-emitted file exists
+    /// but is NOT stamped.
+    #[tokio::test]
+    async fn writeback_xattr() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![
+            // Copy: generates a net-new file. The introspect input is a glob
+            // (`pkg/*.gen`) so the not-yet-existing output doesn't error at
+            // input resolution the way a `file()` over a missing path would.
+            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
+            // In-place: re-emits an existing tracked source file untouched.
+            codegen_run_target("//pkg:ip", "in_place", &["src.txt"], "true"),
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("src.txt"), b"src\n")?;
+
+        // Probe whether this filesystem actually persists xattrs; skip the
+        // assertions (not the run) if not, so a tmpfs can't make us flake.
+        let probe = root.path().join(".xattr_probe");
+        std::fs::write(&probe, b"x")?;
+        let xattr_supported = xattr::set(&probe, crate::pluginfs::CODEGEN_XATTR, b"v").is_ok();
+
+        let cp_addr = crate::htaddr::parse_addr("//pkg:cp")?;
+        let ip_addr = crate::htaddr::parse_addr("//pkg:ip")?;
+
+        let (res, _e) = resolve_collecting_events(&engine, &cp_addr).await;
+        res.expect("copy codegen target must resolve");
+        let (res, _e) = resolve_collecting_events(&engine, &ip_addr).await;
+        res.expect("in_place codegen target must resolve");
+
+        let gen_file = root.path().join("pkg/out.gen");
+        assert!(
+            gen_file.exists(),
+            "copy codegen file must be written to the tree"
+        );
+        let src_file = root.path().join("pkg/src.txt");
+        assert!(
+            src_file.exists(),
+            "in_place codegen file must exist in the tree"
+        );
+
+        if xattr_supported {
+            assert!(
+                xattr::get(&gen_file, crate::pluginfs::CODEGEN_XATTR)?.is_some(),
+                "net-new copy output must carry the codegen xattr"
+            );
+            assert!(
+                xattr::get(&src_file, crate::pluginfs::CODEGEN_XATTR)?.is_none(),
+                "in_place output must NOT carry the codegen xattr"
+            );
+        }
+        Ok(())
+    }
+
+    /// `--frozen` on an in_place fmt target: when the tree does not yet match the
+    /// generated output, the check fails with a typed `FrozenCheckError` and
+    /// nothing is written; once the tree matches, it succeeds.
+    #[tokio::test]
+    async fn frozen_fails_on_dirty() -> anyhow::Result<()> {
+        // The run script normalizes the input (uppercases) in place, so the
+        // generated output differs from a lowercase tree file but matches an
+        // already-uppercase one. Each scenario uses its OWN engine/root and runs
+        // the target exactly once — avoiding the sandbox reuse that a second
+        // execute on the same no-args addr would trigger.
+        let run = "tr a-z A-Z < in.txt > in.txt.tmp && mv in.txt.tmp in.txt";
+        let addr = crate::htaddr::parse_addr("//pkg:fmt")?;
+        let frozen_opts = ResultOptions {
+            frozen: true,
+            ..Default::default()
+        };
+
+        let seed_engine = |seed: &'static [u8]| {
+            let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["in.txt"],
+                run,
+            )])?;
+            let pkg_dir = root.path().join("pkg");
+            std::fs::create_dir_all(&pkg_dir)?;
+            std::fs::write(pkg_dir.join("in.txt"), seed)?;
+            anyhow::Ok((engine, root))
+        };
+
+        // Dirty tree (lowercase): frozen must fail with a typed FrozenCheckError
+        // and write nothing.
+        let (engine, root) = seed_engine(b"hello\n")?;
+        let tree_file = root.path().join("pkg/in.txt");
+        let rs = engine.new_state();
+        let err = engine
+            .clone()
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &frozen_opts)
+            .await
+            .err()
+            .expect("frozen check on a dirty tree must error");
+        drop(rs);
+        // The top-level frame surfaces the recorded `TargetFailure` whose `source`
+        // anyhow chain carries the original `FrozenCheckError`.
+        let tf = err
+            .downcast_ref::<TargetFailure>()
+            .expect("top-level error must be a recorded TargetFailure");
+        assert!(
+            downcast_chain_ref::<crate::engine::error::FrozenCheckError>(tf.source.as_ref())
+                .is_some(),
+            "frozen failure must carry a FrozenCheckError, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&tree_file)?,
+            b"hello\n",
+            "frozen mode must not modify the tree"
+        );
+
+        // Clean tree (already uppercase): frozen must pass.
+        let (engine, _root) = seed_engine(b"HELLO\n")?;
+        let rs = engine.new_state();
+        engine
+            .clone()
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &frozen_opts)
+            .await
+            .expect("frozen check on a clean tree must succeed");
+        Ok(())
+    }
+
+    /// `--frozen` must also catch an exec-bit-only divergence: the on-disk bytes
+    /// match the generated output but the exec bit differs. Since `@heph/fs` now
+    /// hashes (content + exec-bit), this is real drift a non-frozen run would
+    /// write back, so frozen must fail rather than report the tree clean.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_fails_on_exec_bit_drift() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let addr = crate::htaddr::parse_addr("//pkg:mkexec")?;
+        let frozen_opts = ResultOptions {
+            frozen: true,
+            ..Default::default()
+        };
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:mkexec",
+            "in_place",
+            &["*.sh"],
+            // Identical bytes to the seed, but executable in the sandbox.
+            "printf 'echo hi\\n' > run.sh && chmod +x run.sh",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let script = pkg_dir.join("run.sh");
+        std::fs::write(&script, b"echo hi\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))?;
+
+        let rs = engine.new_state();
+        let err = engine
+            .clone()
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &frozen_opts)
+            .await
+            .err()
+            .expect("frozen check must fail on exec-bit-only drift");
+        drop(rs);
+        let tf = err
+            .downcast_ref::<TargetFailure>()
+            .expect("top-level error must be a recorded TargetFailure");
+        assert!(
+            downcast_chain_ref::<crate::engine::error::FrozenCheckError>(tf.source.as_ref())
+                .is_some(),
+            "frozen failure must carry a FrozenCheckError, got: {err:#}"
+        );
+        // Frozen never writes: the tree file stays non-executable.
+        let mode = std::fs::metadata(&script)?.permissions().mode();
+        assert!(
+            mode & 0o111 == 0,
+            "frozen mode must not chmod the tree (mode {mode:o})"
+        );
+        Ok(())
+    }
+
+    /// Mirror of `write_back_applies_exec_bit_on_unchanged_content` for the strip
+    /// direction: an in_place target that emits a NON-executable file over a
+    /// byte-identical executable tree file must clear the exec bit on write-back
+    /// (x=false is part of the hash identity just as x=true is).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_back_strips_exec_bit_on_unchanged_content() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:rmexec",
+            "in_place",
+            &["*.sh"],
+            // Identical bytes, but explicitly non-executable in the sandbox.
+            "printf 'echo hi\\n' > run.sh && chmod -x run.sh",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let script = pkg_dir.join("run.sh");
+        std::fs::write(&script, b"echo hi\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+
+        let addr = crate::htaddr::parse_addr("//pkg:rmexec")?;
+        let (res, _events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("rmexec target resolves");
+
+        let mode = std::fs::metadata(&script)?.permissions().mode();
+        assert!(
+            mode & 0o111 == 0,
+            "write-back must strip the exec bit even when content is unchanged (mode {mode:o})",
+        );
+        Ok(())
+    }
+
+    /// A codegen target with MULTIPLE output groups must write back EVERY group's
+    /// artifact. The write-back loop is driven off the cached artifacts (looking
+    /// up each group's mode), so it covers all of them — not just the first one
+    /// found for a group.
+    #[tokio::test]
+    async fn multi_group_codegen_writes_all_groups() -> anyhow::Result<()> {
+        let target = pluginstatictarget::Target {
+            addr: "//pkg:fmt".to_string(),
+            driver: "bash".to_string(),
+            run: Some(
+                "tr a-z A-Z < a.txt > a.t && mv a.t a.txt; \
+                 tr a-z A-Z < b.txt > b.t && mv b.t b.txt"
+                    .to_string(),
+            ),
+            out: HashMap::from([
+                ("ga".to_string(), vec!["a.txt".to_string()]),
+                ("gb".to_string(), vec!["b.txt".to_string()]),
+            ]),
+            codegen: Some("in_place".to_string()),
+            deps: HashMap::from([(
+                "".to_string(),
+                vec!["//@heph/introspect:outputs".to_string()],
+            )]),
+            labels: vec![],
+        };
+        let (engine, root) = engine_with_home_fs(vec![target])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"aaa\n")?;
+        std::fs::write(pkg_dir.join("b.txt"), b"bbb\n")?;
+
+        let addr = crate::htaddr::parse_addr("//pkg:fmt")?;
+        resolve_collecting_events(&engine, &addr)
+            .await
+            .0
+            .expect("multi-group codegen target must resolve");
+
+        assert_eq!(
+            std::fs::read(pkg_dir.join("a.txt"))?,
+            b"AAA\n",
+            "output group `ga` must be written back",
+        );
+        assert_eq!(
+            std::fs::read(pkg_dir.join("b.txt"))?,
+            b"BBB\n",
+            "output group `gb` must be written back",
+        );
+        Ok(())
+    }
+
+    /// in_place targets persist two cache revisions per state (primary +
+    /// fixpoint), so their GC `history` is doubled at eval time (on the def both
+    /// GC paths read). copy / plain targets keep their declared history.
+    #[tokio::test]
+    async fn in_place_doubles_gc_history() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with_home_fs(vec![
+            codegen_run_target("//pkg:fmt", "in_place", &["in.txt"], "true"),
+            codegen_run_target("//pkg:gen", "copy", &["*.gen"], "echo x > out.gen"),
+        ])?;
+        let rs = engine.new_state();
+
+        let fmt = Arc::clone(&engine)
+            .get_def(rs.clone(), &crate::htaddr::parse_addr("//pkg:fmt")?)
+            .await?;
+        assert_eq!(
+            fmt.target_def.cache.history, 2,
+            "in_place target must double the default history (1 → 2)",
+        );
+
+        let gen_def = Arc::clone(&engine)
+            .get_def(rs.clone(), &crate::htaddr::parse_addr("//pkg:gen")?)
+            .await?;
+        assert_eq!(
+            gen_def.target_def.cache.history, 1,
+            "copy target keeps its declared history",
         );
         Ok(())
     }

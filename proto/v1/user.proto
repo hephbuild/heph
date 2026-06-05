@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package rheph.v1;
+package heph.v1;
 
 message User {
   string id = 1;

@@ -6,8 +6,8 @@
 
 #![cfg(unix)]
 
-use rheph::hasync::StdCancellationToken;
-use rheph::proc_exec;
+use heph::hasync::StdCancellationToken;
+use heph::proc_exec;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;

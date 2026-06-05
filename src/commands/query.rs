@@ -11,7 +11,9 @@ use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
-#[command(override_usage = "query <TARGET_ADDRESS>\n       query <LABEL> <PACKAGE_MATCHER>")]
+#[command(
+    override_usage = "heph query <TARGET_ADDRESS>\n       heph query <LABEL> <PACKAGE_MATCHER>"
+)]
 pub struct Args {
     /// Target address (e.g., //pkg:name) OR Label
     #[arg(value_name = "TARGET_ADDRESS/LABEL")]

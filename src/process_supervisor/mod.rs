@@ -1,8 +1,8 @@
 //! Sidecar supervisor process that reaps the entire descendant tree when the
-//! main rheph process dies, including hard-kill (SIGKILL/OOM) scenarios.
+//! main heph process dies, including hard-kill (SIGKILL/OOM) scenarios.
 //!
 //! See the design notes in this module's git history for the full rationale.
-//! Summary: a small `__supervisor` subcommand of rheph is forked at startup
+//! Summary: a small `__supervisor` subcommand of heph is forked at startup
 //! and holds one end of an `AF_UNIX` socketpair. Each driver-spawned child
 //! enters its own session (`setsid` → `pid == pgid`) and is reported to the
 //! supervisor via `TRACK <pgid>`. When the main process exits — for any
@@ -15,7 +15,7 @@
 //! it would require writing the pid from inside `pre_exec` over the inherited
 //! socket. Deferred.
 //!
-//! Set `RHEPH_DISABLE_REAPER=1` to bypass the sidecar — [`init`] becomes a
+//! Set `heph_DISABLE_REAPER=1` to bypass the sidecar — [`init`] becomes a
 //! no-op and [`register_child`] returns `None`. The actual wait path lives
 //! in [`crate::proc_exec`].
 
@@ -34,14 +34,14 @@ pub use server::run_supervisor_main;
 
 static TRACKER: OnceLock<Arc<ProcessTracker>> = OnceLock::new();
 
-/// `RHEPH_DISABLE_REAPER=1` short-circuits every supervisor entry point so
+/// `heph_DISABLE_REAPER=1` short-circuits every supervisor entry point so
 /// subprocess execution falls through to tokio's built-in waker. Cached in
 /// a `OnceLock` because `std::env::var` takes a global libc mutex; consistent
 /// with the `stall_threshold` / `cycle_detection_enabled` pattern in
 /// `src/hmemoizer/mod.rs`.
 fn reaper_disabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| matches!(std::env::var("RHEPH_DISABLE_REAPER").as_deref(), Ok("1")))
+    *FLAG.get_or_init(|| matches!(std::env::var("heph_DISABLE_REAPER").as_deref(), Ok("1")))
 }
 
 /// Returns the process-global tracker handle. If [`init`] has not been called

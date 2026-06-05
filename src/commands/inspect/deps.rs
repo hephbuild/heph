@@ -13,6 +13,9 @@ use crate::tui::{self, App, AppContext, LogSink};
 pub struct Args {
     /// Target address
     pub addr: String,
+    /// Explore deps interactively
+    #[arg(short = 'i', long = "interactive")]
+    pub interactive: bool,
 }
 
 struct DepsApp {
@@ -59,11 +62,19 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
     let addr =
         htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
     let (engine, shutdown) = bootstrap::new_engine()?;
+    let interactive = tui::should_use_tui(global.no_tui);
+
+    if args.interactive {
+        if !interactive {
+            anyhow::bail!("--interactive requires a terminal (stderr is not a TTY)");
+        }
+        return super::deps_explorer::run(engine, addr, sink, shutdown).await;
+    }
+
     let app = DepsApp {
         engine,
         addr,
         fail_fast: global.fail_fast,
     };
-    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
 }

@@ -42,7 +42,7 @@ pub(super) fn start(rx: mpsc::Receiver<Registration>) -> io::Result<super::WakeF
     submit_kevents(kq, &[user_ev])?;
 
     std::thread::Builder::new()
-        .name("rheph-child-watcher".into())
+        .name("heph-child-watcher".into())
         .spawn(move || run_loop(kq, rx))
         .map_err(|e| io::Error::other(format!("spawn watcher thread: {e}")))?;
 

@@ -8,14 +8,15 @@ use crate::engine::driver::{
     },
 };
 use crate::engine::provider::{
-    ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, GetError,
-    GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
-    ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec,
+    ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, FnArgs,
+    FnCallContext, GetError, GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest,
+    ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, ProviderFn,
+    ProviderFunctionDef, TargetSpec,
 };
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -27,6 +28,19 @@ use xxhash_rust::xxh3::Xxh3;
 
 const PKG: &str = "@heph/fs";
 pub const DRIVER_NAME: &str = "fs";
+
+/// Extended-attribute name stamped on net-new codegen files written back to the
+/// tree (value = the generator's addr). Raw source reads must skip these so a
+/// generated file is never double-sourced.
+pub const CODEGEN_XATTR: &str = "user.heph.codegen";
+
+/// True if the file at `path` carries the codegen provenance xattr.
+///
+/// A filesystem that does not support xattrs (or any IO error) is treated as
+/// "not stamped" so globbing/file reads never break on such trees.
+fn has_codegen_xattr(path: &std::path::Path) -> bool {
+    matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
+}
 
 /// Returns the `Addr` for a single-file fs target.
 /// Consumers use this to reference a file without knowing the internal address format.
@@ -122,7 +136,7 @@ impl EProvider for Provider {
                 .addr
                 .args
                 .iter()
-                .map(|(k, v)| (k.clone(), TargetSpecValue::String(v.clone())))
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
                 .collect();
 
             Ok(GetResponse {
@@ -143,6 +157,192 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
+    }
+
+    fn functions(&self) -> Vec<ProviderFunctionDef> {
+        vec![
+            ProviderFunctionDef {
+                name: "glob".to_string(),
+                func: Arc::new(GlobFn),
+            },
+            ProviderFunctionDef {
+                name: "join".to_string(),
+                func: Arc::new(JoinFn),
+            },
+            ProviderFunctionDef {
+                name: "dir".to_string(),
+                func: Arc::new(DirFn),
+            },
+            ProviderFunctionDef {
+                name: "base".to_string(),
+                func: Arc::new(BaseFn),
+            },
+        ]
+    }
+}
+
+// ─── Exposed functions ─────────────────────────────────────────────────────────
+
+/// `heph.fs.glob(pattern)` — expand `pattern` (resolved relative to the calling
+/// package) against the workspace filesystem and return matched file paths relative
+/// to that package. Uses the exact same `wax` walk as the `fs` driver
+/// ([`compile_glob`] + [`walk_glob`]), so BUILD-time expansion matches what the
+/// driver globs at execution time: brace alternation, `.`/`..` normalization, and
+/// the built-in `.git`/`.heph`/`.heph3` pruning. Result is sorted.
+struct GlobFn;
+
+#[async_trait]
+impl ProviderFn for GlobFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let pattern = match args.positional.first() {
+            Some(Value::String(s)) => s.as_str(),
+            Some(other) => anyhow::bail!("heph.fs.glob: pattern must be a string, got {:?}", other),
+            None => anyhow::bail!("heph.fs.glob: missing pattern argument"),
+        };
+
+        let resolved = if ctx.pkg.is_empty() {
+            pattern.to_string()
+        } else {
+            format!("{}/{}", ctx.pkg, pattern)
+        };
+        let resolved = normalize_path(&resolved).context("heph.fs.glob: normalizing pattern")?;
+
+        // No user excludes, so `request_id` is irrelevant (the built-in exclude
+        // path is taken). Reuses the driver's compiled glob + walk verbatim.
+        let compiled = compile_glob("heph.fs.glob", &resolved, &[])?;
+        let artifacts = walk_glob(ctx.root, &compiled)?;
+
+        let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
+
+        let mut paths: Vec<String> = Vec::new();
+        for artifact in &artifacts {
+            let Content::File(file) = &artifact.content else {
+                continue;
+            };
+            // `out_path` is root-relative; strip the package prefix to make it
+            // package-relative (a no-op at the workspace root).
+            let rel = std::path::Path::new(&file.out_path);
+            let pkg_rel = pkg_prefix
+                .and_then(|prefix| rel.strip_prefix(prefix).ok())
+                .unwrap_or(rel);
+            let s = pkg_rel.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "heph.fs.glob: entry path is not valid UTF-8: {}",
+                    pkg_rel.display()
+                )
+            })?;
+            paths.push(s.to_string());
+        }
+
+        paths.sort();
+        Ok(Value::List(paths.into_iter().map(Value::String).collect()))
+    }
+}
+
+/// Lexical path cleanup, matching Go's `path.Clean`: collapses `.` and inner
+/// `..`, drops redundant slashes, and preserves a leading `..`/`/`. Returns "."
+/// for an empty result. Purely lexical — never touches the filesystem.
+fn path_clean(path: &str) -> String {
+    let rooted = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                if rooted || matches!(out.last(), Some(&last) if last != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let joined = out.join("/");
+    match (rooted, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".to_string(),
+        (false, false) => joined,
+    }
+}
+
+/// `heph.fs.join(*elems)` — join path elements with `/` and clean the result
+/// (Go `path.Join` semantics). Empty elements are skipped; all-empty yields "".
+fn path_join(elems: &[&str]) -> String {
+    let non_empty: Vec<&str> = elems.iter().copied().filter(|e| !e.is_empty()).collect();
+    if non_empty.is_empty() {
+        return String::new();
+    }
+    path_clean(&non_empty.join("/"))
+}
+
+/// `heph.fs.dir(path)` — everything but the last element, cleaned (Go
+/// `path.Dir`). Returns "." when there is no directory part.
+fn path_dir(path: &str) -> String {
+    match path.rfind('/') {
+        // `split_at` keeps the leading-slash case rooted (Go `path.Dir("/a") == "/"`).
+        Some(i) => path_clean(path.split_at(i + 1).0),
+        None => path_clean(""),
+    }
+}
+
+/// `heph.fs.base(path)` — the last element of `path` (Go `path.Base`). Trailing
+/// slashes are stripped first; returns "." for empty and "/" for all-slashes.
+fn path_base(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    match trimmed.rsplit_once('/') {
+        Some((_, base)) => base.to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Extracts a single string positional arg for `fn_name`, erroring on a missing
+/// or non-string value.
+fn str_arg<'a>(fn_name: &str, args: &'a FnArgs) -> anyhow::Result<&'a str> {
+    match args.positional.first() {
+        Some(Value::String(s)) => Ok(s.as_str()),
+        Some(other) => anyhow::bail!("{fn_name}: argument must be a string, got {other:?}"),
+        None => anyhow::bail!("{fn_name}: missing path argument"),
+    }
+}
+
+struct JoinFn;
+
+#[async_trait]
+impl ProviderFn for JoinFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let mut elems: Vec<&str> = Vec::with_capacity(args.positional.len());
+        for v in &args.positional {
+            match v {
+                Value::String(s) => elems.push(s.as_str()),
+                other => anyhow::bail!("heph.fs.join: arguments must be strings, got {other:?}"),
+            }
+        }
+        Ok(Value::String(path_join(&elems)))
+    }
+}
+
+struct DirFn;
+
+#[async_trait]
+impl ProviderFn for DirFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        Ok(Value::String(path_dir(str_arg("heph.fs.dir", &args)?)))
+    }
+}
+
+struct BaseFn;
+
+#[async_trait]
+impl ProviderFn for BaseFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        Ok(Value::String(path_base(str_arg("heph.fs.base", &args)?)))
     }
 }
 
@@ -429,16 +629,38 @@ fn walk_glob(
             continue;
         }
 
+        // Skip net-new codegen outputs stamped back into the tree — sourcing
+        // them here would double-source the generated content.
+        if has_codegen_xattr(abs_path) {
+            continue;
+        }
+
         let rel_str = rel.to_str().ok_or_else(|| {
             anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
         })?;
 
-        let meta = entry
-            .metadata()
-            .with_context(|| format!("stat glob entry '{}'", abs_path.display()))?;
+        // Resolve through symlinks. The walker has follow_links off (so it never
+        // descends INTO a symlinked dir), but an individual symlink entry that
+        // points at a regular file is still a valid source. Stat the target so
+        // the exec marker and the hashed content both come from what
+        // `file_hashout` actually opens — and so a symlink-to-dir (or a
+        // dangling/vanished link) is skipped instead of erroring on read.
+        let meta = match std::fs::metadata(abs_path) {
+            Ok(m) => m,
+            // A dangling/vanished symlink resolves to nothing — skip, don't fail.
+            // Other stat errors (e.g. permission) still surface with context.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("stat glob entry '{}'", abs_path.display()));
+            }
+        };
+        if meta.is_dir() {
+            continue;
+        }
 
         let x = is_exec(&meta);
-        let hashout = file_hashout(&meta);
+        let hashout = file_hashout(abs_path, x)
+            .with_context(|| format!("hash glob entry '{}'", abs_path.display()))?;
 
         let source_path = abs_path
             .to_str()
@@ -511,18 +733,31 @@ fn is_exec(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
-fn file_hashout(meta: &std::fs::Metadata) -> String {
-    let size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+/// Content identity for a sourced file: a hash of its bytes plus the executable
+/// marker. Deliberately ignores size and mtime — only the content and the `x`
+/// bit determine the artifact, so a file rewritten with identical bytes (new
+/// mtime, same content) hashes the same and stays a cache hit.
+fn file_hashout(path: &std::path::Path, x: bool) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open file for hashing '{}'", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
     let mut h = Xxh3::new();
-    h.update(&size.to_le_bytes());
-    h.update(&mtime.to_le_bytes());
-    format!("{:x}", h.digest())
+    // Stream in chunks so large inputs never load wholesale into memory.
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("read file for hashing '{}'", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        if let Some(chunk) = buf.get(..n) {
+            h.update(chunk);
+        }
+    }
+    h.update(&[x as u8]);
+    Ok(format!("{:x}", h.digest()))
 }
 
 #[async_trait]
@@ -541,7 +776,7 @@ impl crate::engine::driver::Driver for Driver {
         let get_str = |key: &str| -> anyhow::Result<Option<String>> {
             match req.target_spec.config.get(key) {
                 None => Ok(None),
-                Some(TargetSpecValue::String(s)) => Ok(Some(s.clone())),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
                 Some(v) => anyhow::bail!("fs driver: '{}' must be a string, got {:?}", key, v),
             }
         };
@@ -648,10 +883,22 @@ impl crate::engine::driver::Driver for Driver {
         match def {
             FsDef::File { path } => {
                 let abs = root.join(path);
+
+                // A file() over a net-new codegen output (stamped back into the
+                // tree) resolves to nothing — the generated content must only be
+                // sourced from its generator, never re-read as raw source.
+                if has_codegen_xattr(&abs) {
+                    return Ok(RunResponse {
+                        artifacts: vec![],
+                        ..Default::default()
+                    });
+                }
+
                 let meta = std::fs::metadata(&abs)
                     .with_context(|| format!("stat file '{}'", abs.display()))?;
                 let x = is_exec(&meta);
-                let hashout = file_hashout(&meta);
+                let hashout = file_hashout(&abs, x)
+                    .with_context(|| format!("hash file '{}'", abs.display()))?;
 
                 let source_path = abs
                     .to_str()
@@ -753,6 +1000,126 @@ mod tests {
         }
     }
 
+    // ─── Exposed-function (glob) tests ─────────────────────────────────────
+
+    fn call_glob(root: &std::path::Path, pkg: &str, pattern: &str) -> Vec<String> {
+        let ctx = FnCallContext { pkg, root };
+        let args = FnArgs {
+            positional: vec![Value::String(pattern.to_string())],
+            named: Default::default(),
+        };
+        let v = futures::executor::block_on(GlobFn.call(&ctx, args)).unwrap();
+        match v {
+            Value::List(l) => l
+                .into_iter()
+                .map(|e| match e {
+                    Value::String(s) => s,
+                    other => panic!("expected string, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_glob_fn_pkg_relative_and_skips_dirs() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("mypkg");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(pkg.join("src").join("a.yaml"), "").unwrap();
+        fs::write(pkg.join("src").join("b.yaml"), "").unwrap();
+        fs::write(pkg.join("src").join("c.txt"), "").unwrap();
+
+        let got = call_glob(tmp.path(), "mypkg", "src/*.yaml");
+        assert_eq!(
+            got,
+            vec!["src/a.yaml".to_string(), "src/b.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_glob_fn_excludes_builtin_dirs() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("mypkg");
+        let git = pkg.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("HEAD"), "").unwrap();
+        fs::write(pkg.join("main.rs"), "").unwrap();
+
+        let got = call_glob(tmp.path(), "mypkg", "**/*");
+        assert!(!got.iter().any(|s| s.starts_with(".git")), "{got:?}");
+        assert!(got.contains(&"main.rs".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn test_glob_fn_at_root_unprefixed() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.yaml"), "").unwrap();
+        fs::write(tmp.path().join("b.yaml"), "").unwrap();
+
+        let got = call_glob(tmp.path(), "", "*.yaml");
+        assert_eq!(got, vec!["a.yaml".to_string(), "b.yaml".to_string()]);
+    }
+
+    // ─── Path helper (join/dir/base) tests ─────────────────────────────────
+
+    fn call_path_fn(f: &dyn ProviderFn, args: Vec<&str>) -> String {
+        let root = std::path::Path::new("/");
+        let ctx = FnCallContext { pkg: "", root };
+        let args = FnArgs {
+            positional: args
+                .into_iter()
+                .map(|s| Value::String(s.to_string()))
+                .collect(),
+            named: Default::default(),
+        };
+        match futures::executor::block_on(f.call(&ctx, args)).unwrap() {
+            Value::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_join_fn() {
+        assert_eq!(call_path_fn(&JoinFn, vec!["a", "b", "c"]), "a/b/c");
+        // Cleans embedded `.`/`..` and redundant separators.
+        assert_eq!(call_path_fn(&JoinFn, vec!["a/", "b"]), "a/b");
+        assert_eq!(call_path_fn(&JoinFn, vec!["a", "..", "b"]), "b");
+        assert_eq!(call_path_fn(&JoinFn, vec!["a", ".", "b"]), "a/b");
+        // Empty elements are skipped; all-empty yields "".
+        assert_eq!(call_path_fn(&JoinFn, vec!["", "a", ""]), "a");
+        assert_eq!(call_path_fn(&JoinFn, vec!["", ""]), "");
+        assert_eq!(call_path_fn(&JoinFn, vec![]), "");
+    }
+
+    #[test]
+    fn test_dir_fn() {
+        assert_eq!(call_path_fn(&DirFn, vec!["a/b/c"]), "a/b");
+        assert_eq!(call_path_fn(&DirFn, vec!["a"]), ".");
+        assert_eq!(call_path_fn(&DirFn, vec!["/a/b"]), "/a");
+        assert_eq!(call_path_fn(&DirFn, vec!["/a"]), "/");
+        assert_eq!(call_path_fn(&DirFn, vec![""]), ".");
+        assert_eq!(call_path_fn(&DirFn, vec!["a/b/"]), "a/b");
+    }
+
+    #[test]
+    fn test_base_fn() {
+        assert_eq!(call_path_fn(&BaseFn, vec!["a/b/c.rs"]), "c.rs");
+        assert_eq!(call_path_fn(&BaseFn, vec!["c.rs"]), "c.rs");
+        assert_eq!(call_path_fn(&BaseFn, vec!["a/b/"]), "b");
+        assert_eq!(call_path_fn(&BaseFn, vec![""]), ".");
+        assert_eq!(call_path_fn(&BaseFn, vec!["/"]), "/");
+        assert_eq!(call_path_fn(&BaseFn, vec!["///"]), "/");
+    }
+
+    #[test]
+    fn test_dir_fn_requires_string() {
+        let root = std::path::Path::new("/");
+        let ctx = FnCallContext { pkg: "", root };
+        let err = futures::executor::block_on(DirFn.call(&ctx, FnArgs::default())).unwrap_err();
+        assert!(err.to_string().contains("missing path argument"), "{err}");
+    }
+
     // ─── Provider tests ────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -787,7 +1154,7 @@ mod tests {
         assert_eq!(result.target_spec.addr.name, "file");
         assert_eq!(
             result.target_spec.config.get("f"),
-            Some(&TargetSpecValue::String("foo.txt".to_string()))
+            Some(&Value::String("foo.txt".to_string()))
         );
     }
 
@@ -802,13 +1169,13 @@ mod tests {
         assert_eq!(result.target_spec.addr.name, "glob");
         assert_eq!(
             result.target_spec.config.get("p"),
-            Some(&TargetSpecValue::String("src/*.rs".to_string()))
+            Some(&Value::String("src/*.rs".to_string()))
         );
     }
 
     // ─── Driver tests ──────────────────────────────────────────────────────
 
-    fn make_parse_req(config: std::collections::HashMap<String, TargetSpecValue>) -> ParseRequest {
+    fn make_parse_req(config: std::collections::HashMap<String, Value>) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
@@ -862,7 +1229,7 @@ mod tests {
         // Unmatched alternation — wax rejects at parse time.
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("ogen.{yml,yaml".to_string()),
+            Value::String("ogen.{yml,yaml".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         let Err(err) = result else {
@@ -879,10 +1246,10 @@ mod tests {
     async fn test_driver_parse_invalid_exclude_fails() {
         let driver = Driver;
         let config = std::collections::HashMap::from([
-            ("p".to_string(), TargetSpecValue::String("*.rs".to_string())),
+            ("p".to_string(), Value::String("*.rs".to_string())),
             (
                 "e".to_string(),
-                TargetSpecValue::String("good/**,bad.{yml".to_string()),
+                Value::String("good/**,bad.{yml".to_string()),
             ),
         ]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
@@ -901,7 +1268,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("src/main.rs".to_string()),
+            Value::String("src/main.rs".to_string()),
         )]);
         let res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -918,7 +1285,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("src/*.rs".to_string()),
+            Value::String("src/*.rs".to_string()),
         )]);
         let res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -932,13 +1299,10 @@ mod tests {
     async fn test_driver_parse_glob_with_exclude() {
         let driver = Driver;
         let config = std::collections::HashMap::from([
-            (
-                "p".to_string(),
-                TargetSpecValue::String("**/*.rs".to_string()),
-            ),
+            ("p".to_string(), Value::String("**/*.rs".to_string())),
             (
                 "e".to_string(),
-                TargetSpecValue::String("vendor/**,generated/**".to_string()),
+                Value::String("vendor/**,generated/**".to_string()),
             ),
         ]);
         let res = driver
@@ -963,7 +1327,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("hello.txt".to_string()),
+            Value::String("hello.txt".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1000,7 +1364,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("nonexistent.txt".to_string()),
+            Value::String("nonexistent.txt".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1018,6 +1382,116 @@ mod tests {
         assert!(driver.run(req, &ctoken()).await.is_err());
     }
 
+    #[test]
+    fn test_file_hashout_is_content_based() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, b"same bytes").unwrap();
+        fs::write(&b, b"same bytes").unwrap();
+        // Identical bytes + same exec marker hash identically, regardless of path.
+        assert_eq!(
+            file_hashout(&a, false).unwrap(),
+            file_hashout(&b, false).unwrap()
+        );
+        fs::write(&b, b"other bytes").unwrap();
+        assert_ne!(
+            file_hashout(&a, false).unwrap(),
+            file_hashout(&b, false).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_file_hashout_includes_exec_marker() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("f");
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        // Same bytes, different exec marker => different identity.
+        assert_ne!(
+            file_hashout(&p, false).unwrap(),
+            file_hashout(&p, true).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_file_hashout_ignores_mtime() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("f");
+        fs::write(&p, b"stable content").unwrap();
+        let before = file_hashout(&p, false).unwrap();
+        // Bump mtime far into the future without touching the bytes; the content
+        // hash must not move (mtime is no longer part of the identity).
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 365))
+            .unwrap();
+        drop(f);
+        let after = file_hashout(&p, false).unwrap();
+        assert_eq!(
+            before, after,
+            "mtime change must not affect the content hash"
+        );
+    }
+
+    /// A glob over a tree containing a symlink-to-dir (matching the pattern) and a
+    /// dangling symlink must NOT error: `file_hashout` opens+reads, so these
+    /// would otherwise blow up with EISDIR/ENOENT. A symlink-to-FILE is sourced,
+    /// with its exec marker and content both taken from the followed target (so
+    /// it hashes identically to the target itself).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_driver_run_glob_follows_file_links_and_skips_dir_links() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("real.txt"), b"real").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        // Symlink to a real dir, named to MATCH the *.txt pattern.
+        std::os::unix::fs::symlink(root.join("sub"), root.join("subdir.txt")).unwrap();
+        // Symlink to the real file.
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+        // Dangling symlink that matches the pattern.
+        std::os::unix::fs::symlink(root.join("missing"), root.join("dangling.txt")).unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            Value::String("*.txt".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            root.to_path_buf(),
+            &hashin,
+        );
+        // The headline regression: must not error on the symlinked dir / dangling.
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let by_name: std::collections::HashMap<&str, &str> = res
+            .artifacts
+            .iter()
+            .map(|a| (a.name.as_str(), a.hashout.as_str()))
+            .collect();
+        assert!(by_name.contains_key("real.txt"));
+        assert!(by_name.contains_key("link.txt"));
+        assert!(
+            !by_name.contains_key("subdir.txt"),
+            "a symlink-to-dir must be skipped, not hashed"
+        );
+        assert!(
+            !by_name.contains_key("dangling.txt"),
+            "a dangling symlink must be skipped"
+        );
+        // Exec marker + content both come from the followed target, so the link
+        // hashes the same as the file it points at (NOT the symlink's own mode).
+        assert_eq!(by_name["link.txt"], by_name["real.txt"]);
+    }
+
     #[tokio::test]
     async fn test_driver_run_glob_matches_files() {
         let driver = Driver;
@@ -1026,10 +1500,8 @@ mod tests {
         fs::write(tmp.path().join("b.rs"), b"").unwrap();
         fs::write(tmp.path().join("c.txt"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            TargetSpecValue::String("*.rs".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await
@@ -1060,10 +1532,8 @@ mod tests {
         fs::write(git_dir.join("config"), b"").unwrap();
         fs::write(tmp.path().join("main.rs"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            TargetSpecValue::String("**/*".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await
@@ -1097,11 +1567,8 @@ mod tests {
         fs::write(tmp.path().join("skip.rs"), b"").unwrap();
 
         let config = std::collections::HashMap::from([
-            ("p".to_string(), TargetSpecValue::String("*.rs".to_string())),
-            (
-                "e".to_string(),
-                TargetSpecValue::String("skip.rs".to_string()),
-            ),
+            ("p".to_string(), Value::String("*.rs".to_string())),
+            ("e".to_string(), Value::String("skip.rs".to_string())),
         ]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1132,7 +1599,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("**/*.rs".to_string()),
+            Value::String("**/*.rs".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1260,7 +1727,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("mgmt/protos/x/bsdiff/./**/*".to_string()),
+            Value::String("mgmt/protos/x/bsdiff/./**/*".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1307,7 +1774,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("mgmt/protos/x/bsdiff/../go.mod".to_string()),
+            Value::String("mgmt/protos/x/bsdiff/../go.mod".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1333,7 +1800,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("some/../../file".to_string()),
+            Value::String("some/../../file".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         let Err(err) = result else {
@@ -1351,7 +1818,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("../escape/**".to_string()),
+            Value::String("../escape/**".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         assert!(result.is_err());
@@ -1362,7 +1829,7 @@ mod tests {
         let driver = Driver;
         let config = std::collections::HashMap::from([(
             "f".to_string(),
-            TargetSpecValue::String("a/../../file.txt".to_string()),
+            Value::String("a/../../file.txt".to_string()),
         )]);
         let result = driver.parse(make_parse_req(config), &ctoken()).await;
         let Err(err) = result else {
@@ -1380,11 +1847,11 @@ mod tests {
         let driver = Driver;
         let with_parent = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/b/../c/**/*.rs".to_string()),
+            Value::String("a/b/../c/**/*.rs".to_string()),
         )]);
         let collapsed = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/c/**/*.rs".to_string()),
+            Value::String("a/c/**/*.rs".to_string()),
         )]);
         let h1 = driver
             .parse(make_parse_req(with_parent), &ctoken())
@@ -1408,11 +1875,11 @@ mod tests {
         let driver = Driver;
         let with_dot = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/./b/**/*.rs".to_string()),
+            Value::String("a/./b/**/*.rs".to_string()),
         )]);
         let without_dot = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("a/b/**/*.rs".to_string()),
+            Value::String("a/b/**/*.rs".to_string()),
         )]);
         let h1 = driver
             .parse(make_parse_req(with_dot), &ctoken())
@@ -1437,7 +1904,7 @@ mod tests {
         let pattern = "does/not/exist/*.rs";
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String(pattern.to_string()),
+            Value::String(pattern.to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1465,7 +1932,7 @@ mod tests {
         let pattern = "*.rs";
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String(pattern.to_string()),
+            Value::String(pattern.to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1492,7 +1959,7 @@ mod tests {
         let pattern = "dir/ogen.{yml,yaml}";
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String(pattern.to_string()),
+            Value::String(pattern.to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1588,10 +2055,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("a.rs"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            TargetSpecValue::String("*.rs".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await
@@ -1644,10 +2109,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("a.rs"), b"").unwrap();
 
-        let config = std::collections::HashMap::from([(
-            "p".to_string(),
-            TargetSpecValue::String("*.rs".to_string()),
-        )]);
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await
@@ -1719,7 +2182,7 @@ mod tests {
 
         let config = std::collections::HashMap::from([(
             "p".to_string(),
-            TargetSpecValue::String("pkg/**/*.rs".to_string()),
+            Value::String("pkg/**/*.rs".to_string()),
         )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
@@ -1758,5 +2221,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.target_spec.driver, DRIVER_NAME);
+    }
+
+    // ─── Codegen-xattr exclusion ───────────────────────────────────────────
+
+    /// Stamps the codegen xattr on `path` and returns whether the platform/FS
+    /// actually persisted it. Tests skip their assertions when this is `false`
+    /// so a tmpfs without xattr support can't make them flake.
+    fn stamp_codegen(path: &std::path::Path) -> bool {
+        if xattr::set(path, CODEGEN_XATTR, b"//pkg:gen").is_err() {
+            return false;
+        }
+        has_codegen_xattr(path)
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_excludes_stamped_codegen() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let plain = tmp.path().join("plain.rs");
+        let generated = tmp.path().join("generated.rs");
+        fs::write(&plain, b"plain").unwrap();
+        fs::write(&generated, b"generated").unwrap();
+
+        if !stamp_codegen(&generated) {
+            // Filesystem here doesn't support the codegen xattr; the exclusion
+            // can't be exercised, so don't assert anything misleading.
+            return;
+        }
+
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["plain.rs"], "stamped file must be excluded");
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_file_stamped_codegen_yields_nothing() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let generated = tmp.path().join("generated.rs");
+        fs::write(&generated, b"generated").unwrap();
+
+        if !stamp_codegen(&generated) {
+            return;
+        }
+
+        let config = std::collections::HashMap::from([(
+            "f".to_string(),
+            Value::String("generated.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        assert!(
+            res.artifacts.is_empty(),
+            "file() over a stamped codegen file must yield no artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_file_plain_yields_one_artifact() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let plain = tmp.path().join("plain.rs");
+        fs::write(&plain, b"plain").unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "f".to_string(),
+            Value::String("plain.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        assert_eq!(res.artifacts.len(), 1);
+        assert_eq!(res.artifacts[0].name, "plain.rs");
     }
 }

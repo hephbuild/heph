@@ -8,8 +8,8 @@ publish = false
 workspace = true
 
 [dev-dependencies]
-rheph = { path = ".." }
-rheph-testkit = { path = "../testkit" }
+heph = { path = ".." }
+heph-testkit = { path = "../testkit" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
 tempfile = "3"

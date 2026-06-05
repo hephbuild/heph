@@ -2,9 +2,18 @@ name: CI
 
 on:
   push:
-    branches: ["master", "rv1", "v1"]
+    branches: ["master"]
   pull_request:
-    branches: ["master", "rv1", "v1"]
+    branches: ["master"]
+
+# sccache config shared by every compiling job. RUSTC_WRAPPER=sccache is set by
+# the devenv shell; here we pin the cache dir to a workspace path so actions/cache
+# can persist it, and disable incremental compilation (sccache cannot cache
+# incremental units, and fresh runners have no warm incremental dir to reuse).
+env:
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  SCCACHE_CACHE_SIZE: "2G"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   gen:
@@ -22,9 +31,6 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: x86_64-unknown-linux-gnu
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -93,11 +99,29 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ matrix.target }}
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
+
+      # Cargo registry/git only — crate downloads + index. Compiled artifacts are
+      # handled by sccache (below), so target/ is intentionally not cached here.
+      - name: Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.target }}-
+
+      - name: sccache cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ matrix.target }}-
 
       - name: Build
         id: build
@@ -114,11 +138,20 @@ jobs:
           # syslibroot and fails to find `-lfuse`, so the (native arm64) macOS
           # runner uses plain `cargo build` — no cross needed there.
           if [ "${{ matrix.os }}" = "darwin" ]; then
-            cargo build --release --locked --target ${{ matrix.target }} --bin rheph
+            cargo build --release --locked --target ${{ matrix.target }} --bin heph
+            # The nix toolchain hard-links libiconv against its /nix/store path,
+            # which is absent on user machines (dyld aborts at launch). Rewrite
+            # those load commands to the OS /usr/lib copies.
+            bash scripts/macos-portable.sh $CARGO_TARGET_DIR/${{ matrix.target }}/release/heph
           else
-            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rheph
+            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin heph
           fi
-          cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/rheph $BIN_NAME
+          cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/heph $BIN_NAME
+
+      - name: sccache stats
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: sccache --show-stats
 
       # macFUSE is NOT installed on this runner. libfuse is weak-linked, so the
       # binary must still launch — this proves the shipped macOS artifact runs
@@ -135,35 +168,9 @@ jobs:
           name: ${{steps.build.outputs.bin_name}}
           path: ${{steps.build.outputs.bin_name}}
 
-  docs:
-    name: Gen CLI docs
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: build
-    steps:
-      - name: Download linux amd64 binary
-        uses: actions/download-artifact@v7
-        with:
-          name: heph_linux_amd64
-          path: .
-
-      # gen-docs is pure clap introspection — no FUSE, no devenv, runs natively
-      # on the ubuntu runner. Emit md file so upload_artifacts sweeps it into the
-      # release via the heph_* pattern.
-      - name: Generate cli.md
-        run: |
-          chmod +x heph_linux_amd64
-          ./heph_linux_amd64 gen-docs > cli.md
-
-      - name: Upload cli.md
-        uses: actions/upload-artifact@v6
-        with:
-          name: heph_cli.md
-          path: cli.md
-
   upload_artifacts:
     name: Upload artifacts
-    needs: [gen, build, docs]
+    needs: [gen, build]
     if: always() && needs.gen.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -208,15 +215,36 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: x86_64-unknown-linux-gnu
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
+
+      - name: Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-x86_64-unknown-linux-gnu-
+
+      - name: sccache cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            sccache-x86_64-unknown-linux-gnu-
 
       - name: Lint
         shell: devenv shell bash -- -e {0}
         run: lint
+
+      - name: sccache stats
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: sccache --show-stats
 
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
@@ -248,11 +276,27 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ matrix.target }}
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
+
+      - name: Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-${{ matrix.target }}-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.target }}-test-
+
+      - name: sccache cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-${{ matrix.target }}-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ matrix.target }}-test-
 
       # No macFUSE on the runner: the macOS binaries weak-link libfuse, so they
       # launch with the dylib absent. `support_check` finds no macfuse.fs and
@@ -264,10 +308,15 @@ jobs:
           RUST_BACKTRACE: "1"
         run: tst
 
+      - name: sccache stats
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: sccache --show-stats
+
   release:
     name: Release
     needs: [gen, upload_artifacts, lint, test]
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/rv1' || github.ref == 'refs/heads/v1'
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

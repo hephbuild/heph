@@ -1,7 +1,7 @@
 mod common;
 
 use common::Workspace;
-use rheph::pluginstatictarget::Target;
+use heph::pluginstatictarget::Target;
 use std::collections::HashMap;
 
 fn out_map(out: Option<&str>) -> HashMap<String, Vec<String>> {

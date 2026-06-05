@@ -85,16 +85,51 @@ fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
     args
 }
 
+#[derive(serde::Serialize)]
+struct InitLine {
+    /// 1-based line number.
+    n: usize,
+    /// Line number padded to the width of the largest number, for `show`.
+    label: String,
+    /// The command text.
+    text: String,
+    /// The command text wrapped as a single bash single-quoted token, safe to
+    /// drop into the `__heph_cmds` array even when `text` spans multiple lines
+    /// or contains single quotes.
+    quoted: String,
+}
+
+/// Wrap `s` in single quotes for bash, escaping embedded single quotes via the
+/// `'\''` idiom. Newlines inside `s` are preserved literally.
+fn bash_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
-    let mut ctx = serde_json::Map::new();
-    if !run.is_empty() {
-        ctx.insert(
-            "cmds".to_string(),
-            serde_json::Value::String(run.join("\n")),
-        );
-    }
-    templi::render(SHELL_INIT_SH, &serde_json::Value::Object(ctx))
-        .map_err(anyhow::Error::from)
+    let cmds = (!run.is_empty()).then(|| run.join("\n"));
+
+    // Width of the largest line number so the `|` column in `show` stays aligned.
+    let width = run.len().to_string().len();
+    let lines: Vec<InitLine> = run
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let n = i + 1;
+            InitLine {
+                n,
+                label: format!("{n:>width$}"),
+                quoted: bash_squote(text),
+                text: text.clone(),
+            }
+        })
+        .collect();
+
+    let mut env = minijinja::Environment::new();
+    env.add_template("init.sh", SHELL_INIT_SH)
+        .context("compile init.sh template")?;
+    env.get_template("init.sh")
+        .context("load init.sh template")?
+        .render(minijinja::context! { cmds, lines })
         .context("render init.sh template")
 }
 
@@ -1363,6 +1398,131 @@ mod tests {
     }
 
     #[test]
+    fn test_render_shell_init_numbered_runs_and_show() {
+        let run = vec![
+            "echo one".to_string(),
+            "echo two".to_string(),
+            "echo three".to_string(),
+        ];
+        let out = render_shell_init(&run).expect("render");
+
+        // Per-line run/xrun functions exist for every line, each a tiny O(1)
+        // delegator to the shared helper (no per-line command duplication).
+        for n in 1..=3 {
+            assert!(
+                out.contains(&format!("run{n}() {{ __heph_run_upto {n}; }}")),
+                "missing run{n} delegator: {out}"
+            );
+            assert!(
+                out.contains(&format!("xrun{n}() {{ __heph_run_upto {n} x; }}")),
+                "missing xrun{n} delegator: {out}"
+            );
+        }
+
+        // Commands live once in the array; runN replays a prefix via the helper.
+        assert!(out.contains("__heph_cmds=("), "missing cmds array: {out}");
+        assert!(out.contains("'echo one'"), "array missing line 1: {out}");
+        assert!(out.contains("'echo three'"), "array missing line 3: {out}");
+        // Each command is materialized exactly once as a quoted array element —
+        // no per-line duplication (the old runN bodies were O(n^2)).
+        assert_eq!(
+            out.matches("'echo two'").count(),
+            1,
+            "command should appear once as a quoted array element: {out}"
+        );
+
+        // show prints raw commands, showl prints numbered "N | line" form.
+        assert!(out.contains("show()"), "missing show: {out}");
+        assert!(out.contains("showl()"), "missing showl: {out}");
+        assert!(out.contains("1 │ echo one"), "showl line 1: {out}");
+        assert!(out.contains("3 │ echo three"), "showl line 3: {out}");
+        assert!(
+            out.contains("echo one\necho two\necho three"),
+            "show raw cmds: {out}"
+        );
+    }
+
+    #[test]
+    fn test_render_shell_init_pads_line_numbers() {
+        // 10 lines -> numbers 1..10, width 2, so "1" is right-padded to " 1".
+        let run: Vec<String> = (1..=10).map(|i| format!("echo {i}")).collect();
+        let out = render_shell_init(&run).expect("render");
+        assert!(out.contains(" 1 │ echo 1"), "line 1 not padded: {out}");
+        assert!(out.contains("10 │ echo 10"), "line 10 misaligned: {out}");
+    }
+
+    #[test]
+    fn test_render_shell_init_does_not_html_escape_cmds() {
+        // The template renders a shell script, not HTML — special chars must pass
+        // through verbatim, otherwise the generated bash is corrupted.
+        let run = vec!["a && b < c > d \"e\" 'f'".to_string()];
+        let out = render_shell_init(&run).expect("render");
+        assert!(
+            out.contains("a && b < c > d \"e\" 'f'"),
+            "shell chars were escaped: {out}"
+        );
+    }
+
+    #[test]
+    fn test_bash_squote_escapes_single_quotes() {
+        // Commands like `awk -F'"' '/Dir/'` carry single quotes — the array
+        // element must use the `'\''` idiom so eval re-parses the original text.
+        assert_eq!(bash_squote("echo hi"), "'echo hi'");
+        assert_eq!(bash_squote("a'b"), "'a'\\''b'");
+        // Multi-line command stays one token (newline preserved inside quotes).
+        assert_eq!(bash_squote("if x; then\n  y\nfi"), "'if x; then\n  y\nfi'");
+    }
+
+    #[test]
+    fn test_render_shell_init_quotes_array_elements() {
+        // A command containing single quotes must be safely single-quoted in the
+        // __heph_cmds array (otherwise the generated bash fails to parse).
+        let run = vec!["awk -F'\"' '/Dir/'".to_string()];
+        let out = render_shell_init(&run).expect("render");
+        assert!(
+            out.contains("'awk -F'\\''\"'\\'' '\\''/Dir/'\\'''"),
+            "array element not safely single-quoted: {out}"
+        );
+    }
+
+    // Functionally validate that the generated bash parses and that `runN`
+    // replays exactly the first N commands — including a command with single
+    // quotes and a multi-line compound statement (the cases the array+eval
+    // design has to get right).
+    #[test]
+    fn test_render_shell_init_runn_executes_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init_path = dir.path().join("init.sh");
+        let run = vec![
+            "printf 'a\\n' >> out.txt".to_string(),
+            "if true; then\n  printf 'b\\n' >> out.txt\nfi".to_string(),
+            "printf 'c\\n' >> out.txt".to_string(),
+        ];
+        std::fs::write(&init_path, render_shell_init(&run).expect("render")).expect("write");
+
+        // Source the rcfile (defines the functions), then run a 2-line prefix.
+        let output = std::process::Command::new("bash")
+            .arg("--norc")
+            .arg("-c")
+            .arg(format!(
+                "source '{}' >/dev/null 2>&1; run2",
+                init_path.display()
+            ))
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn bash");
+        assert!(
+            output.status.success(),
+            "bash failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let produced = std::fs::read_to_string(dir.path().join("out.txt")).expect("read out.txt");
+        // run2 → lines 1 and 2 only; line 3 ("c") must not run.
+        assert_eq!(produced, "a\nb\n", "run2 should replay exactly lines 1-2");
+    }
+
+    #[test]
     fn test_render_shell_init_without_cmds() {
         let out = render_shell_init(&[]).expect("render");
         assert!(!out.contains("run()"), "should not have run() block: {out}");
@@ -1750,12 +1910,12 @@ mod tests {
     #[tokio::test]
     async fn test_run_runtime_pass_env_injected() -> anyhow::Result<()> {
         unsafe {
-            std::env::set_var("RHEPH_TEST_RUNTIME_PASS", "runtime_pass_value");
+            std::env::set_var("heph_TEST_RUNTIME_PASS", "runtime_pass_value");
         }
         let out = run_bash_env(
-            "echo $RHEPH_TEST_RUNTIME_PASS",
+            "echo $heph_TEST_RUNTIME_PASS",
             BTreeMap::new(),
-            vec!["RHEPH_TEST_RUNTIME_PASS".to_string()],
+            vec!["heph_TEST_RUNTIME_PASS".to_string()],
             HashMap::new(),
         )
         .await?;
@@ -1766,10 +1926,10 @@ mod tests {
     #[tokio::test]
     async fn test_run_env_not_leaked_from_parent() -> anyhow::Result<()> {
         unsafe {
-            std::env::set_var("RHEPH_TEST_PARENT_ONLY", "should_not_see_this");
+            std::env::set_var("heph_TEST_PARENT_ONLY", "should_not_see_this");
         }
         let out = run_bash_env(
-            "echo ${RHEPH_TEST_PARENT_ONLY:-absent}",
+            "echo ${heph_TEST_PARENT_ONLY:-absent}",
             BTreeMap::new(),
             vec![],
             HashMap::new(),
@@ -1782,22 +1942,20 @@ mod tests {
     #[tokio::test]
     async fn test_parse_pass_env_resolves_value() -> anyhow::Result<()> {
         unsafe {
-            std::env::set_var("RHEPH_TEST_PARSE_PASS", "resolved_value");
+            std::env::set_var("heph_TEST_PARSE_PASS", "resolved_value");
         }
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
         let config = HashMap::from([
             (
                 "run".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+                crate::htvalue::Value::String("echo".to_string()),
             ),
             (
                 "pass_env".to_string(),
-                crate::loosespecparser::TargetSpecValue::List(vec![
-                    crate::loosespecparser::TargetSpecValue::String(
-                        "RHEPH_TEST_PARSE_PASS".to_string(),
-                    ),
-                ]),
+                crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                    "heph_TEST_PARSE_PASS".to_string(),
+                )]),
             ),
         ]);
         let res = driver
@@ -1817,7 +1975,7 @@ mod tests {
             .await?;
         let def = res.target_def.def::<TargetDef>();
         assert_eq!(
-            def.pass_env.get("RHEPH_TEST_PARSE_PASS"),
+            def.pass_env.get("heph_TEST_PARSE_PASS"),
             Some(&"resolved_value".to_string())
         );
         Ok(())
@@ -1830,15 +1988,13 @@ mod tests {
         let config = HashMap::from([
             (
                 "run".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+                crate::htvalue::Value::String("echo".to_string()),
             ),
             (
                 "pass_env".to_string(),
-                crate::loosespecparser::TargetSpecValue::List(vec![
-                    crate::loosespecparser::TargetSpecValue::String(
-                        "RHEPH_TEST_DEFINITELY_UNSET_99999".to_string(),
-                    ),
-                ]),
+                crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                    "heph_TEST_DEFINITELY_UNSET_99999".to_string(),
+                )]),
             ),
         ]);
         let res = driver
@@ -1864,13 +2020,13 @@ mod tests {
     /// Drives `parse()` with the given `extra` config keys merged on top of a
     /// minimal exec spec (just `run`). Returns the resulting EngineTargetDef.
     async fn parse_with(
-        extra: HashMap<String, crate::loosespecparser::TargetSpecValue>,
+        extra: HashMap<String, crate::htvalue::Value>,
     ) -> anyhow::Result<crate::engine::driver::targetdef::TargetDef> {
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
         let mut config = HashMap::from([(
             "run".to_string(),
-            crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+            crate::htvalue::Value::String("echo".to_string()),
         )]);
         config.extend(extra);
         let res = driver
@@ -1895,9 +2051,9 @@ mod tests {
     async fn test_parse_hash_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
         let extra = HashMap::from([(
             "hash_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]);
         let td = parse_with(extra).await?;
         let def = td.def::<TargetDef>();
@@ -1922,9 +2078,9 @@ mod tests {
     async fn test_parse_runtime_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
         let extra = HashMap::from([(
             "runtime_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]);
         let td = parse_with(extra).await?;
         let def = td.def::<TargetDef>();
@@ -1949,9 +2105,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_runtime = parse_with(HashMap::from([(
             "runtime_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]))
         .await?;
         // Adding a `runtime_deps` entry must NOT change the per-target def
@@ -1969,9 +2125,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_hash = parse_with(HashMap::from([(
             "hash_deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]))
         .await?;
         assert_eq!(base.hash, with_hash.hash);
@@ -1985,9 +2141,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_deps = parse_with(HashMap::from([(
             "deps".to_string(),
-            crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
-            ]),
+            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                "//some:dep".to_string(),
+            )]),
         )]))
         .await?;
         assert_ne!(base.hash, with_deps.hash);
@@ -2000,17 +2156,17 @@ mod tests {
         // changing an env value is a semantic change to the target's input.
         let with_v1 = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v1".to_string()),
+                crate::htvalue::Value::String("v1".to_string()),
             )])),
         )]))
         .await?;
         let with_v2 = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v2".to_string()),
+                crate::htvalue::Value::String("v2".to_string()),
             )])),
         )]))
         .await?;
@@ -2024,17 +2180,17 @@ mod tests {
         // def hash.
         let with_foo = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+                crate::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;
         let with_bar = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "BAR".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+                crate::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;
@@ -2048,9 +2204,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_env = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+            crate::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+                crate::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;

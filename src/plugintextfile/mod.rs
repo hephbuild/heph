@@ -7,7 +7,7 @@ use crate::engine::driver::{
     },
 };
 use crate::hasync::Cancellable;
-use crate::loosespecparser::{TargetSpecValue, parse_bool, parse_string};
+use crate::htvalue::{Value, parse_bool, parse_string};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -25,17 +25,14 @@ struct TextFileDef {
 
 pub struct Driver;
 
-fn take_string(
-    m: &mut HashMap<&str, &TargetSpecValue>,
-    key: &str,
-) -> anyhow::Result<Option<String>> {
+fn take_string(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Option<String>> {
     match m.remove(key) {
         Some(v) => parse_string(v).with_context(|| format!("parse `{key}`")),
         None => Ok(None),
     }
 }
 
-fn take_bool(m: &mut HashMap<&str, &TargetSpecValue>, key: &str) -> anyhow::Result<Option<bool>> {
+fn take_bool(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Option<bool>> {
     match m.remove(key) {
         Some(v) => parse_bool(v)
             .with_context(|| format!("parse `{key}`"))
@@ -57,7 +54,7 @@ impl crate::engine::driver::Driver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let mut m: HashMap<&str, &TargetSpecValue> = req
+        let mut m: HashMap<&str, &Value> = req
             .target_spec
             .config
             .iter()
@@ -187,7 +184,7 @@ mod tests {
         StdCancellationToken::new()
     }
 
-    fn make_parse_req(addr_str: &str, config: HashMap<String, TargetSpecValue>) -> ParseRequest {
+    fn make_parse_req(addr_str: &str, config: HashMap<String, Value>) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
             target_spec: Arc::new(TargetSpec {
@@ -219,23 +216,17 @@ mod tests {
         }
     }
 
-    fn basic_config(text: &str, out: &str) -> HashMap<String, TargetSpecValue> {
+    fn basic_config(text: &str, out: &str) -> HashMap<String, Value> {
         HashMap::from([
-            (
-                "text".to_string(),
-                TargetSpecValue::String(text.to_string()),
-            ),
-            ("out".to_string(), TargetSpecValue::String(out.to_string())),
+            ("text".to_string(), Value::String(text.to_string())),
+            ("out".to_string(), Value::String(out.to_string())),
         ])
     }
 
     #[tokio::test]
     async fn test_parse_requires_text() {
         let driver = Driver;
-        let cfg = HashMap::from([(
-            "out".to_string(),
-            TargetSpecValue::String("bin/x".to_string()),
-        )]);
+        let cfg = HashMap::from([("out".to_string(), Value::String("bin/x".to_string()))]);
         let err = driver
             .parse(make_parse_req("//pkg:t", cfg), &ctoken())
             .await
@@ -247,10 +238,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_out_defaults_to_addr_name() {
         let driver = Driver;
-        let cfg = HashMap::from([(
-            "text".to_string(),
-            TargetSpecValue::String("hello".to_string()),
-        )]);
+        let cfg = HashMap::from([("text".to_string(), Value::String("hello".to_string()))]);
         let res = driver
             .parse(make_parse_req("//pkg:wrapper", cfg), &ctoken())
             .await
@@ -267,7 +255,7 @@ mod tests {
     async fn test_parse_unknown_key_errors() {
         let driver = Driver;
         let mut cfg = basic_config("hi", "f.txt");
-        cfg.insert("bogus".to_string(), TargetSpecValue::String("x".into()));
+        cfg.insert("bogus".to_string(), Value::String("x".into()));
         let err = driver
             .parse(make_parse_req("//pkg:t", cfg), &ctoken())
             .await
@@ -336,7 +324,7 @@ mod tests {
             .target_def
             .hash;
         let mut cfg = basic_config("hi", "f");
-        cfg.insert("executable".to_string(), TargetSpecValue::Bool(true));
+        cfg.insert("executable".to_string(), Value::Bool(true));
         let b = driver
             .parse(make_parse_req("//pkg:t", cfg), &ctoken())
             .await
@@ -350,7 +338,7 @@ mod tests {
     async fn test_run_produces_raw_artifact() {
         let driver = Driver;
         let mut cfg = basic_config("#!/bin/bash\necho hi\n", "bin/wrap");
-        cfg.insert("executable".to_string(), TargetSpecValue::Bool(true));
+        cfg.insert("executable".to_string(), Value::Bool(true));
         let parsed = driver
             .parse(make_parse_req("//pkg:t", cfg), &ctoken())
             .await

@@ -1,4 +1,5 @@
 pub mod gc;
+mod gen_gitignore;
 
 use clap::{Args, Subcommand};
 
@@ -16,6 +17,9 @@ pub struct ToolArgs {
 pub enum ToolCommands {
     /// Garbage collect the local cache
     Gc(gc::GcArgs),
+    /// Manage the heph-generated section of the root .gitignore
+    #[command(name = "gen-gitignore")]
+    GenGitignore(gen_gitignore::Args),
 }
 
 impl ToolArgs {
@@ -32,6 +36,7 @@ impl ToolCommands {
     pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match self {
             ToolCommands::Gc(args) => gc::execute(args, sink, global),
+            ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
         }
     }
 }

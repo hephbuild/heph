@@ -12,7 +12,7 @@ use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(Args, Clone)]
-#[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
+#[command(override_usage = "heph run <TARGET_ADDRESS>\n       heph run <LABEL> <PACKAGE_MATCHER>")]
 pub struct RunArgs {
     /// Target address (e.g., //pkg:name) OR Label
     #[arg(value_name = "TARGET_ADDRESS/LABEL")]
@@ -35,6 +35,9 @@ pub struct RunArgs {
     /// Exclude target address (repeatable, e.g. -e //pkg:target)
     #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS")]
     pub exclude: Vec<String>,
+    /// Fail if generated output differs from the tree (CI check)
+    #[arg(long = "frozen")]
+    pub frozen: bool,
 }
 
 struct RunApp {
@@ -102,6 +105,7 @@ impl App for RunApp {
             force: self.args.force,
             shell: self.args.shell.is_some(),
             interactive,
+            frozen: self.args.frozen,
         };
         let rs = self
             .engine

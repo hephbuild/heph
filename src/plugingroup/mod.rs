@@ -5,7 +5,7 @@ use crate::engine::driver::{
     targetdef::{CacheConfig, Input, InputMode, TargetDef},
 };
 use crate::hasync::Cancellable;
-use crate::loosespecparser::parse_strings;
+use crate::htvalue::parse_strings;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -127,14 +127,14 @@ mod tests {
     use crate::engine::provider::TargetSpec;
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::parse_addr;
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
     use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
     }
 
-    fn make_parse_req(addr_str: &str, config: HashMap<String, TargetSpecValue>) -> ParseRequest {
+    fn make_parse_req(addr_str: &str, config: HashMap<String, Value>) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
@@ -164,9 +164,9 @@ mod tests {
         let driver = Driver;
         let config = HashMap::from([(
             "deps".to_string(),
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("//pkg:a".to_string()),
-                TargetSpecValue::String("//pkg:b".to_string()),
+            Value::List(vec![
+                Value::String("//pkg:a".to_string()),
+                Value::String("//pkg:b".to_string()),
             ]),
         )]);
         let res = driver
@@ -182,10 +182,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_unknown_key_errors() {
         let driver = Driver;
-        let config = HashMap::from([(
-            "foo".to_string(),
-            TargetSpecValue::String("bar".to_string()),
-        )]);
+        let config = HashMap::from([("foo".to_string(), Value::String("bar".to_string()))]);
         let result = driver
             .parse(make_parse_req("//pkg:g", config), &ctoken())
             .await;
@@ -225,7 +222,7 @@ mod tests {
                     "//pkg:g",
                     HashMap::from([(
                         "deps".to_string(),
-                        TargetSpecValue::List(vec![TargetSpecValue::String("//pkg:a".to_string())]),
+                        Value::List(vec![Value::String("//pkg:a".to_string())]),
                     )]),
                 ),
                 &ctoken(),

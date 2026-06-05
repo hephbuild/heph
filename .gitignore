@@ -17,6 +17,9 @@ target/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# sccache (CI writes its on-disk cache here)
+.sccache
+
 # Devenv
 .devenv*
 devenv.local.nix

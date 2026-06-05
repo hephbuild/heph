@@ -37,15 +37,15 @@ mod tests {
     #[test]
     fn fail_fast_is_opt_in() {
         // Default: fail-fast off — run every matched target, report all failures.
-        assert!(!parse(&["rheph"]).fail_fast);
+        assert!(!parse(&["heph"]).fail_fast);
         // Opt in with the long flag or its `ff` alias.
-        assert!(parse(&["rheph", "--fail-fast"]).fail_fast);
-        assert!(parse(&["rheph", "--ff"]).fail_fast);
+        assert!(parse(&["heph", "--fail-fast"]).fail_fast);
+        assert!(parse(&["heph", "--ff"]).fail_fast);
     }
 
     #[test]
     fn no_tui_defaults_off() {
-        assert!(!parse(&["rheph"]).no_tui);
-        assert!(parse(&["rheph", "--no-tui"]).no_tui);
+        assert!(!parse(&["heph"]).no_tui);
+        assert!(parse(&["heph", "--no-tui"]).no_tui);
     }
 }

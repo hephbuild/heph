@@ -1,5 +1,6 @@
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::htvalue::Value;
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -39,7 +40,7 @@ fn decode_cache() -> &'static DecodeCache {
     DECODE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Decode a rheph package address into its Go package kind.
+/// Decode a heph package address into its Go package kind.
 /// Returns None if the address doesn't correspond to a Go package.
 ///
 /// Results are memoized in a process-wide cache keyed by `(pkg, workspace_root)`
@@ -196,7 +197,7 @@ fn parse_thirdparty(rest: &str, module_root: PathBuf) -> Option<GoPackageKind> {
     })
 }
 
-/// Encode a stdlib import path as a rheph Addr for build_lib.
+/// Encode a stdlib import path as a heph Addr for build_lib.
 pub fn encode_stdlib(import_path: &str, factors: &Factors) -> Addr {
     Addr::new(
         PkgBuf::from(format!("{}{}", STD_PREFIX, import_path)),
@@ -205,7 +206,7 @@ pub fn encode_stdlib(import_path: &str, factors: &Factors) -> Addr {
     )
 }
 
-/// Encode a third-party package as a rheph Addr for build_lib.
+/// Encode a third-party package as a heph Addr for build_lib.
 /// `base_pkg` is the module-root path relative to the workspace root
 /// (e.g. "" for a root go.mod, "go" for go/go.mod).
 pub fn encode_thirdparty(
@@ -250,7 +251,7 @@ pub fn encode_thirdparty_download(module: &str, version: &str, base_pkg: &str) -
     Addr::new(PkgBuf::from(pkg), "download".to_string(), BTreeMap::new())
 }
 
-/// Encode a first-party package (relative to workspace root) as a rheph Addr for build_lib.
+/// Encode a first-party package (relative to workspace root) as a heph Addr for build_lib.
 pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, factors: &Factors) -> Addr {
     let rel = src_dir.strip_prefix(workspace_root).unwrap_or(src_dir);
     Addr::new(
@@ -292,31 +293,53 @@ pub fn dep_group_env_var(group: &str) -> String {
     format!("SRC_{}", group.to_uppercase())
 }
 
+/// Build the `tools` config value exposing the go binary as `tool={go: <addr>}`.
+///
+/// The exec driver symlinks the tool into `bin/` and sets `$TOOL_GO` to its
+/// path (group "go" → `TOOL_GO`), so run scripts invoke `"$TOOL_GO" tool ...`.
+pub fn go_bin_tools_config(go_bin_addr: &str) -> Value {
+    Value::Map(HashMap::from([(
+        "go".to_string(),
+        Value::List(vec![Value::String(go_bin_addr.to_string())]),
+    )]))
+}
+
+/// Wrap a list of shell commands into the `run` config value. The exec driver
+/// joins list entries with newlines, so one command per element reads back as a
+/// single script.
+pub fn to_run_value(lines: Vec<String>) -> Value {
+    Value::List(lines.into_iter().map(Value::String).collect())
+}
+
 /// Build the importcfg shell fragment for a set of transitive libs.
 ///
 /// Emits `importcfg="$PWD/importcfg"`, clears the file, then appends one
 /// `packagefile` line per library, sorted by import path for determinism.
 /// An optional `skip` import path is excluded (used by the linker to omit
-/// the main package from importcfg).
-pub fn write_importcfg_script(transitive_libs: &[(String, Addr)], skip: Option<&str>) -> String {
+/// the main package from importcfg). Returns one shell command per element.
+pub fn write_importcfg_script(
+    transitive_libs: &[(String, Addr)],
+    skip: Option<&str>,
+) -> Vec<String> {
     let mut sorted: Vec<&(String, Addr)> = transitive_libs.iter().collect();
     sorted.sort_by_key(|(ip, _)| ip.as_str());
 
-    let mut script = String::new();
-    script.push_str("importcfg=\"$PWD/importcfg\"\n");
-    script.push_str("> \"$importcfg\"\n");
+    let mut lines = vec![
+        "importcfg=\"$PWD/importcfg\"".to_string(),
+        "> \"$importcfg\"".to_string(),
+    ];
     for (import_path, _) in &sorted {
         if skip.is_some_and(|s| *import_path == s) {
             continue;
         }
         let group = import_path_to_dep_group(import_path);
         let env_var = dep_group_env_var(&group);
-        script.push_str(&format!(
-            "printf \"packagefile {}=%s\\n\" \"${}\" >> \"$importcfg\"\n",
+        lines.push(format!(
+            "printf \"packagefile {}=%s\\n\" \"${}\" >> \"$importcfg\"",
             import_path, env_var
         ));
     }
-    script
+    lines
 }
 
 #[cfg(test)]

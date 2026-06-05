@@ -1,6 +1,6 @@
 use crate::engine::driver::targetdef::path::CodegenMode;
-use crate::loosespecparser::{
-    TargetSpecValue, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
+use crate::htvalue::{
+    Value, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
     parse_strings,
 };
 use anyhow::Context;
@@ -33,14 +33,14 @@ pub(crate) struct TargetSpecCache {
 /// `cache = True/False` toggles both local and remote, history 1) or a dict
 /// `cache = {"enabled": bool, "remote": bool, "history": int}` where any unset
 /// key falls back to its default (enabled/remote true, history 1).
-fn parse_cache(v: &TargetSpecValue) -> anyhow::Result<TargetSpecCache> {
+fn parse_cache(v: &Value) -> anyhow::Result<TargetSpecCache> {
     match v {
-        TargetSpecValue::Bool(b) => Ok(TargetSpecCache {
+        Value::Bool(b) => Ok(TargetSpecCache {
             local: *b,
             remote: *b,
             history: 1,
         }),
-        TargetSpecValue::Map(m) => {
+        Value::Map(m) => {
             let mut c = TargetSpecCache {
                 local: true,
                 remote: true,
@@ -64,10 +64,10 @@ fn parse_cache(v: &TargetSpecValue) -> anyhow::Result<TargetSpecCache> {
     }
 }
 
-fn parse_cache_history(v: &TargetSpecValue) -> anyhow::Result<u32> {
+fn parse_cache_history(v: &Value) -> anyhow::Result<u32> {
     let n: i64 = match v {
-        TargetSpecValue::Int(i) => *i,
-        TargetSpecValue::Uint(u) => i64::try_from(*u).context("`cache.history` too large")?,
+        Value::Int(i) => *i,
+        Value::Uint(u) => i64::try_from(*u).context("`cache.history` too large")?,
         _ => anyhow::bail!("`cache.history` must be an integer"),
     };
     if n < 1 {
@@ -77,9 +77,8 @@ fn parse_cache_history(v: &TargetSpecValue) -> anyhow::Result<u32> {
 }
 
 impl TargetSpec {
-    pub fn from(m: HashMap<String, TargetSpecValue>) -> anyhow::Result<TargetSpec> {
-        let mut m: HashMap<&str, &TargetSpecValue> =
-            m.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    pub fn from(m: HashMap<String, Value>) -> anyhow::Result<TargetSpec> {
+        let mut m: HashMap<&str, &Value> = m.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
         let mut spec = TargetSpec {
             run: vec![],
@@ -121,7 +120,7 @@ impl TargetSpec {
             spec.codegen = match parse_string(v)? {
                 Some(s) => match s.as_str() {
                     "copy" => Ok(CodegenMode::Copy),
-                    "link" => Ok(CodegenMode::Link),
+                    "in_place" => Ok(CodegenMode::InPlace),
                     _ => Err(anyhow::anyhow!("invalid codegen mode: {}", s)),
                 },
                 None => Ok(CodegenMode::None),
@@ -174,22 +173,19 @@ impl TargetSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
 
     fn make_spec(
-        extra: impl IntoIterator<Item = (&'static str, TargetSpecValue)>,
+        extra: impl IntoIterator<Item = (&'static str, Value)>,
     ) -> anyhow::Result<TargetSpec> {
-        let mut m = HashMap::from([(
-            "run".to_string(),
-            TargetSpecValue::String("echo".to_string()),
-        )]);
+        let mut m = HashMap::from([("run".to_string(), Value::String("echo".to_string()))]);
         m.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
         TargetSpec::from(m)
     }
 
     #[test]
     fn test_cache_bool_true() {
-        let spec = make_spec([("cache", TargetSpecValue::Bool(true))]).unwrap();
+        let spec = make_spec([("cache", Value::Bool(true))]).unwrap();
         assert!(spec.cache.local);
         assert!(spec.cache.remote);
         assert_eq!(spec.cache.history, 1);
@@ -197,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_cache_bool_false_disables_both() {
-        let spec = make_spec([("cache", TargetSpecValue::Bool(false))]).unwrap();
+        let spec = make_spec([("cache", Value::Bool(false))]).unwrap();
         assert!(!spec.cache.local);
         assert!(!spec.cache.remote);
         assert_eq!(spec.cache.history, 1);
@@ -216,10 +212,7 @@ mod tests {
         // Only `remote` set — `enabled` and `history` fall back to defaults.
         let spec = make_spec([(
             "cache",
-            TargetSpecValue::Map(HashMap::from([(
-                "remote".to_string(),
-                TargetSpecValue::Bool(false),
-            )])),
+            Value::Map(HashMap::from([("remote".to_string(), Value::Bool(false))])),
         )])
         .unwrap();
         assert!(spec.cache.local, "enabled defaults to true");
@@ -231,10 +224,7 @@ mod tests {
     fn test_cache_dict_history_honored() {
         let spec = make_spec([(
             "cache",
-            TargetSpecValue::Map(HashMap::from([(
-                "history".to_string(),
-                TargetSpecValue::Int(5),
-            )])),
+            Value::Map(HashMap::from([("history".to_string(), Value::Int(5))])),
         )])
         .unwrap();
         assert_eq!(spec.cache.history, 5);
@@ -246,10 +236,7 @@ mod tests {
     fn test_cache_dict_unknown_key_errors() {
         let err = match make_spec([(
             "cache",
-            TargetSpecValue::Map(HashMap::from([(
-                "bogus".to_string(),
-                TargetSpecValue::Bool(true),
-            )])),
+            Value::Map(HashMap::from([("bogus".to_string(), Value::Bool(true))])),
         )]) {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
@@ -264,10 +251,7 @@ mod tests {
     fn test_cache_dict_zero_history_errors() {
         let err = match make_spec([(
             "cache",
-            TargetSpecValue::Map(HashMap::from([(
-                "history".to_string(),
-                TargetSpecValue::Int(0),
-            )])),
+            Value::Map(HashMap::from([("history".to_string(), Value::Int(0))])),
         )]) {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
@@ -279,9 +263,9 @@ mod tests {
     fn test_pass_env_parsed() {
         let spec = make_spec([(
             "pass_env",
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("VAR1".to_string()),
-                TargetSpecValue::String("VAR2".to_string()),
+            Value::List(vec![
+                Value::String("VAR1".to_string()),
+                Value::String("VAR2".to_string()),
             ]),
         )])
         .unwrap();
@@ -292,7 +276,7 @@ mod tests {
     fn test_runtime_pass_env_parsed() {
         let spec = make_spec([(
             "runtime_pass_env",
-            TargetSpecValue::List(vec![TargetSpecValue::String("HOME".to_string())]),
+            Value::List(vec![Value::String("HOME".to_string())]),
         )])
         .unwrap();
         assert_eq!(spec.runtime_pass_env, vec!["HOME"]);
@@ -302,9 +286,9 @@ mod tests {
     fn test_runtime_env_parsed() {
         let spec = make_spec([(
             "runtime_env",
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "KEY".to_string(),
-                TargetSpecValue::String("value".to_string()),
+                Value::String("value".to_string()),
             )])),
         )])
         .unwrap();
@@ -323,7 +307,7 @@ mod tests {
     fn test_tools_parsed() {
         let spec = make_spec([(
             "tools",
-            TargetSpecValue::List(vec![TargetSpecValue::String("//some:tool".to_string())]),
+            Value::List(vec![Value::String("//some:tool".to_string())]),
         )])
         .unwrap();
         assert_eq!(spec.tools.get(""), Some(&vec!["//some:tool".to_string()]));
@@ -339,10 +323,10 @@ mod tests {
     fn test_support_files_parsed() {
         let spec = make_spec([(
             "support_files",
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("foo.txt".to_string()),
-                TargetSpecValue::String("data/*.json".to_string()),
-                TargetSpecValue::String("subdir/".to_string()),
+            Value::List(vec![
+                Value::String("foo.txt".to_string()),
+                Value::String("data/*.json".to_string()),
+                Value::String("subdir/".to_string()),
             ]),
         )])
         .unwrap();
@@ -362,7 +346,7 @@ mod tests {
     fn test_hash_deps_parsed() {
         let spec = make_spec([(
             "hash_deps",
-            TargetSpecValue::List(vec![TargetSpecValue::String("//some:hash".to_string())]),
+            Value::List(vec![Value::String("//some:hash".to_string())]),
         )])
         .unwrap();
         assert_eq!(
@@ -375,9 +359,9 @@ mod tests {
     fn test_runtime_deps_parsed() {
         let spec = make_spec([(
             "runtime_deps",
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "rt".to_string(),
-                TargetSpecValue::String("//some:rt".to_string()),
+                Value::String("//some:rt".to_string()),
             )])),
         )])
         .unwrap();
@@ -398,9 +382,9 @@ mod tests {
     fn test_tools_grouped() {
         let spec = make_spec([(
             "tools",
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "cc".to_string(),
-                TargetSpecValue::String("//toolchain:gcc".to_string()),
+                Value::String("//toolchain:gcc".to_string()),
             )])),
         )])
         .unwrap();
@@ -408,5 +392,35 @@ mod tests {
             spec.tools.get("cc"),
             Some(&vec!["//toolchain:gcc".to_string()])
         );
+    }
+
+    #[test]
+    fn test_codegen_in_place_parsed() {
+        let spec = make_spec([("codegen", Value::String("in_place".to_string()))]).unwrap();
+        assert_eq!(spec.codegen, CodegenMode::InPlace);
+    }
+
+    #[test]
+    fn test_codegen_copy_parsed() {
+        let spec = make_spec([("codegen", Value::String("copy".to_string()))]).unwrap();
+        assert_eq!(spec.codegen, CodegenMode::Copy);
+    }
+
+    #[test]
+    fn test_codegen_link_now_errors() {
+        let err = match make_spec([("codegen", Value::String("link".to_string()))]) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("invalid codegen mode: link"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_default_none() {
+        let spec = make_spec([]).unwrap();
+        assert_eq!(spec.codegen, CodegenMode::None);
     }
 }

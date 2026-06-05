@@ -7,7 +7,7 @@ use crate::engine::driver::{
 use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::{TargetSpecValue, parse_string, parse_strings};
+use crate::htvalue::{Value, parse_string, parse_strings};
 use crate::proc_exec;
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -61,17 +61,14 @@ impl Hash for NixDef {
     }
 }
 
-fn take_string(
-    m: &mut HashMap<&str, &TargetSpecValue>,
-    key: &str,
-) -> anyhow::Result<Option<String>> {
+fn take_string(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Option<String>> {
     match m.remove(key) {
         Some(v) => parse_string(v).with_context(|| format!("parse `{key}`")),
         None => Ok(None),
     }
 }
 
-fn take_strings(m: &mut HashMap<&str, &TargetSpecValue>, key: &str) -> anyhow::Result<Vec<String>> {
+fn take_strings(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Vec<String>> {
     match m.remove(key) {
         Some(v) => parse_strings(v).with_context(|| format!("parse `{key}`")),
         None => Ok(vec![]),
@@ -206,7 +203,7 @@ fn build_nix_expr(
 /// Sanitize an Addr's format into a string usable as a derivation `name` attr.
 fn sanitize_env_name(addr_str: &str) -> String {
     let mut out = String::with_capacity(addr_str.len() + 6);
-    out.push_str("rheph-");
+    out.push_str("heph-");
     for c in addr_str.chars() {
         if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
             out.push(c);
@@ -230,7 +227,7 @@ impl ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let mut m: HashMap<&str, &TargetSpecValue> = req
+        let mut m: HashMap<&str, &Value> = req
             .target_spec
             .config
             .iter()
@@ -509,7 +506,7 @@ mod tests {
         };
     }
 
-    fn make_parse_req(addr: &str, config: HashMap<String, TargetSpecValue>) -> ParseRequest {
+    fn make_parse_req(addr: &str, config: HashMap<String, Value>) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
             target_spec: Arc::new(TargetSpec {
@@ -522,19 +519,19 @@ mod tests {
         }
     }
 
-    fn basic_config() -> HashMap<String, TargetSpecValue> {
+    fn basic_config() -> HashMap<String, Value> {
         HashMap::from([
             (
                 "nixpkgs".to_string(),
-                TargetSpecValue::String("github:NixOS/nixpkgs/abc".to_string()),
+                Value::String("github:NixOS/nixpkgs/abc".to_string()),
             ),
             (
                 "packages".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("pkgs.ripgrep".to_string())]),
+                Value::List(vec![Value::String("pkgs.ripgrep".to_string())]),
             ),
             (
                 "programs".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("rg".to_string())]),
+                Value::List(vec![Value::String("rg".to_string())]),
             ),
         ])
     }
@@ -586,10 +583,7 @@ mod tests {
         require_nix!();
         let d = driver();
         let mut cfg = basic_config();
-        cfg.insert(
-            "bogus".to_string(),
-            TargetSpecValue::String("x".to_string()),
-        );
+        cfg.insert("bogus".to_string(), Value::String("x".to_string()));
         let err = d
             .parse(make_parse_req("//pkg:t", cfg), &ctoken())
             .await
@@ -621,9 +615,9 @@ mod tests {
         let mut cfg = basic_config();
         cfg.insert(
             "programs".to_string(),
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("rg".to_string()),
-                TargetSpecValue::String("fd".to_string()),
+            Value::List(vec![
+                Value::String("rg".to_string()),
+                Value::String("fd".to_string()),
             ]),
         );
         let res = d
@@ -675,7 +669,7 @@ mod tests {
         );
     }
 
-    async fn hash_of(cfg: HashMap<String, TargetSpecValue>) -> Vec<u8> {
+    async fn hash_of(cfg: HashMap<String, Value>) -> Vec<u8> {
         driver()
             .parse(make_parse_req("//pkg:t", cfg), &ctoken())
             .await
@@ -691,7 +685,7 @@ mod tests {
         let mut cfg = basic_config();
         cfg.insert(
             "nixpkgs".to_string(),
-            TargetSpecValue::String("github:NixOS/nixpkgs/zzz".to_string()),
+            Value::String("github:NixOS/nixpkgs/zzz".to_string()),
         );
         let b = hash_of(cfg).await;
         assert_ne!(a, b);
@@ -704,7 +698,7 @@ mod tests {
         let mut cfg = basic_config();
         cfg.insert(
             "packages".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("pkgs.fd".to_string())]),
+            Value::List(vec![Value::String("pkgs.fd".to_string())]),
         );
         let b = hash_of(cfg).await;
         assert_ne!(a, b);
@@ -717,7 +711,7 @@ mod tests {
         let mut cfg = basic_config();
         cfg.insert(
             "programs".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("fd".to_string())]),
+            Value::List(vec![Value::String("fd".to_string())]),
         );
         let b = hash_of(cfg).await;
         assert_ne!(a, b);
@@ -730,7 +724,7 @@ mod tests {
         let mut cfg = basic_config();
         cfg.insert(
             "system".to_string(),
-            TargetSpecValue::String("riscv64-linux".to_string()),
+            Value::String("riscv64-linux".to_string()),
         );
         let b = hash_of(cfg).await;
         assert_ne!(a, b);
@@ -747,10 +741,7 @@ mod tests {
             "aarch64-darwin"
         };
         let mut cfg = basic_config();
-        cfg.insert(
-            "system".to_string(),
-            TargetSpecValue::String(other.to_string()),
-        );
+        cfg.insert("system".to_string(), Value::String(other.to_string()));
         let other_hash = hash_of(cfg).await;
         assert_ne!(
             host_hash, other_hash,
@@ -764,32 +755,32 @@ mod tests {
         let mut cfg_a = basic_config();
         cfg_a.insert(
             "packages".to_string(),
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("pkgs.fd".to_string()),
-                TargetSpecValue::String("pkgs.ripgrep".to_string()),
+            Value::List(vec![
+                Value::String("pkgs.fd".to_string()),
+                Value::String("pkgs.ripgrep".to_string()),
             ]),
         );
         cfg_a.insert(
             "programs".to_string(),
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("fd".to_string()),
-                TargetSpecValue::String("rg".to_string()),
+            Value::List(vec![
+                Value::String("fd".to_string()),
+                Value::String("rg".to_string()),
             ]),
         );
 
         let mut cfg_b = basic_config();
         cfg_b.insert(
             "packages".to_string(),
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("pkgs.ripgrep".to_string()),
-                TargetSpecValue::String("pkgs.fd".to_string()),
+            Value::List(vec![
+                Value::String("pkgs.ripgrep".to_string()),
+                Value::String("pkgs.fd".to_string()),
             ]),
         );
         cfg_b.insert(
             "programs".to_string(),
-            TargetSpecValue::List(vec![
-                TargetSpecValue::String("rg".to_string()),
-                TargetSpecValue::String("fd".to_string()),
+            Value::List(vec![
+                Value::String("rg".to_string()),
+                Value::String("fd".to_string()),
             ]),
         );
 
@@ -803,7 +794,7 @@ mod tests {
         require_nix!();
         let locked = "github:NixOS/nixpkgs/abc1234?narHash=sha256-xxx";
         let packages = vec!["pkgs.ripgrep".to_string(), "pkgs.fd".to_string()];
-        let expr = build_nix_expr(locked, "x86_64-linux", &packages, "rheph-test");
+        let expr = build_nix_expr(locked, "x86_64-linux", &packages, "heph-test");
         assert!(expr.contains(locked), "{expr}");
         assert!(expr.contains("legacyPackages.\"x86_64-linux\""), "{expr}");
         assert!(expr.contains("pkgs.ripgrep"), "{expr}");
@@ -814,7 +805,7 @@ mod tests {
     #[test]
     fn sanitize_env_name_replaces_unsafe_chars() {
         require_nix!();
-        assert_eq!(sanitize_env_name("//pkg/sub:tool"), "rheph-__pkg_sub_tool");
-        assert_eq!(sanitize_env_name("a-b_c.d"), "rheph-a-b_c.d");
+        assert_eq!(sanitize_env_name("//pkg/sub:tool"), "heph-__pkg_sub_tool");
+        assert_eq!(sanitize_env_name("a-b_c.d"), "heph-a-b_c.d");
     }
 }

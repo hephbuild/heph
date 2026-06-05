@@ -1,6 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
+use crate::plugingo::addr_util::{go_bin_tools_config, to_run_value};
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 
@@ -29,68 +30,59 @@ pub fn build_spec(
     goroot: &str,
 ) -> TargetSpec {
     let out_file = archive_filename(import_path);
-    let mut run = String::new();
-    run.push_str(&format!(
-        "export_path=$(\"$SRC_GO_BIN\" list -export -f '{{{{.Export}}}}' \"{}\")\n",
-        import_path
-    ));
-    run.push_str("if [ -z \"$export_path\" ]; then\n");
-    run.push_str(&format!(
-        "  echo \"go list -export returned empty path for {}\" >&2\n",
-        import_path
-    ));
-    run.push_str("  exit 1\nfi\n");
-    // BSD/macOS cp copies extended attributes by default
-    // (com.apple.quarantine from Go's build cache) and fails with EPERM
-    // on filesystems that reject xattr writes (e.g. our FUSE overlay).
-    // `cp -X` on macOS suppresses that; on GNU cp `-X` means
-    // `--one-file-system`, so branch on `uname`.
-    run.push_str("if [ \"$(uname)\" = Darwin ]; then CP=\"cp -X\"; else CP=\"cp\"; fi\n");
-    run.push_str(&format!("$CP \"$export_path\" \"{}\"\n", out_file));
+    let run = vec![
+        format!(
+            "export_path=$(\"$TOOL_GO\" list -export -f '{{{{.Export}}}}' \"{}\")",
+            import_path
+        ),
+        // The if-block stays one element: it's a single compound statement that
+        // breaks if its lines are split across separate `run` entries.
+        format!(
+            "if [ -z \"$export_path\" ]; then\n  \
+               echo \"go list -export returned empty path for {}\" >&2\n  \
+               exit 1\nfi",
+            import_path
+        ),
+        // BSD/macOS cp copies extended attributes by default
+        // (com.apple.quarantine from Go's build cache) and fails with EPERM
+        // on filesystems that reject xattr writes (e.g. our FUSE overlay).
+        // `cp -X` on macOS suppresses that; on GNU cp `-X` means
+        // `--one-file-system`, so branch on `uname`.
+        "if [ \"$(uname)\" = Darwin ]; then CP=\"cp -X\"; else CP=\"cp\"; fi".to_string(),
+        format!("$CP \"$export_path\" \"{}\"", out_file),
+    ];
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
-    config.insert(
-        "deps".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "go_bin".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
-        )])),
-    );
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("run".to_string(), to_run_value(run));
+    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "a".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(out_file)]),
+            Value::List(vec![Value::String(out_file)]),
         )])),
     );
     config.insert(
         "pass_env".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
+        Value::List(vec![Value::String("GOROOT".to_string())]),
     );
     config.insert(
         "runtime_pass_env".to_string(),
-        TargetSpecValue::List(vec![
-            TargetSpecValue::String("HOME".to_string()),
-            TargetSpecValue::String("GOCACHE".to_string()),
+        Value::List(vec![
+            Value::String("HOME".to_string()),
+            Value::String("GOCACHE".to_string()),
         ]),
     );
     config.insert(
         "runtime_env".to_string(),
-        TargetSpecValue::Map(HashMap::from([
-            (
-                "GOOS".to_string(),
-                TargetSpecValue::String(factors.goos.clone()),
-            ),
-            (
-                "GOARCH".to_string(),
-                TargetSpecValue::String(factors.goarch.clone()),
-            ),
+        Value::Map(HashMap::from([
+            ("GOOS".to_string(), Value::String(factors.goos.clone())),
+            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
             (
                 // Set GOROOT explicitly so go can find its tools even from a copied binary.
                 // pass_env also captures GOROOT for cache invalidation if set in the host env.
                 "GOROOT".to_string(),
-                TargetSpecValue::String(goroot.to_string()),
+                Value::String(goroot.to_string()),
             ),
         ])),
     );
@@ -99,9 +91,9 @@ pub fn build_spec(
     // from the def hash (see pluginexec/mod.rs:70).
     config.insert(
         "env".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
+        Value::Map(HashMap::from([(
             "CGO_ENABLED".to_string(),
-            TargetSpecValue::String("0".to_string()),
+            Value::String("0".to_string()),
         )])),
     );
 
@@ -119,6 +111,21 @@ mod tests {
     use super::*;
     use crate::htaddr::Addr;
     use crate::htpkg::PkgBuf;
+
+    fn run_str(spec: &TargetSpec) -> String {
+        match spec.config.get("run").unwrap() {
+            Value::String(s) => s.clone(),
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.as_str(),
+                    _ => panic!("run entry not a string"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => panic!("run not string or list"),
+        }
+    }
 
     fn test_addr() -> Addr {
         Addr::new(
@@ -158,7 +165,7 @@ mod tests {
             "/usr/local/go",
         );
         let out = spec.config.get("out").unwrap();
-        assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
+        assert!(matches!(out, Value::Map(m) if m.contains_key("a")));
     }
 
     #[test]
@@ -170,10 +177,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s,
-            _ => panic!(),
-        };
+        let run = run_str(&spec);
         assert!(
             run.contains("list -export"),
             "run should use go list -export: {}",
@@ -184,15 +188,11 @@ mod tests {
             "run should reference import path: {}",
             run
         );
-        assert!(
-            run.contains("$SRC_GO_BIN"),
-            "run should use $SRC_GO_BIN: {}",
-            run
-        );
+        assert!(run.contains("$TOOL_GO"), "run should use $TOOL_GO: {}", run);
     }
 
     #[test]
-    fn test_build_spec_has_go_bin_dep() {
+    fn test_build_spec_has_go_tool() {
         let spec = build_spec(
             test_addr(),
             "fmt",
@@ -200,11 +200,11 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
+        let tools = match spec.config.get("tools").unwrap() {
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(deps.contains_key("go_bin"));
+        assert!(tools.contains_key("go"));
     }
 
     #[test]
@@ -217,15 +217,11 @@ mod tests {
             "/usr/local/go",
         );
         let runtime_env = match spec.config.get("runtime_env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(
-            matches!(runtime_env.get("GOOS"), Some(TargetSpecValue::String(s)) if s == "linux")
-        );
-        assert!(
-            matches!(runtime_env.get("GOARCH"), Some(TargetSpecValue::String(s)) if s == "amd64")
-        );
+        assert!(matches!(runtime_env.get("GOOS"), Some(Value::String(s)) if s == "linux"));
+        assert!(matches!(runtime_env.get("GOARCH"), Some(Value::String(s)) if s == "amd64"));
     }
 
     #[test]
@@ -238,11 +234,11 @@ mod tests {
             "/usr/local/go",
         );
         let env = match spec.config.get("env").unwrap() {
-            TargetSpecValue::Map(m) => m,
+            Value::Map(m) => m,
             _ => panic!("expected map"),
         };
         assert!(
-            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "0"),
             "CGO_ENABLED must be pinned to 0 in the hashed `env` map: {:?}",
             env.get("CGO_ENABLED")
         );

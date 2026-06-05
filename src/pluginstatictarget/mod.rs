@@ -6,7 +6,7 @@ use crate::engine::provider::{
 use crate::hasync::Cancellable;
 use crate::htaddr::parse_addr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -35,32 +35,32 @@ impl Provider {
             .map(|t| -> anyhow::Result<TargetSpec> {
                 let mut config = HashMap::new();
                 if let Some(run) = t.run {
-                    config.insert("run".to_string(), TargetSpecValue::String(run));
+                    config.insert("run".to_string(), Value::String(run));
                 }
                 if !t.out.is_empty() {
                     let map = t
                         .out
                         .into_iter()
                         .map(|(k, vs)| {
-                            let list = vs.into_iter().map(TargetSpecValue::String).collect();
-                            (k, TargetSpecValue::List(list))
+                            let list = vs.into_iter().map(Value::String).collect();
+                            (k, Value::List(list))
                         })
                         .collect();
-                    config.insert("out".to_string(), TargetSpecValue::Map(map));
+                    config.insert("out".to_string(), Value::Map(map));
                 }
                 if let Some(codegen) = t.codegen {
-                    config.insert("codegen".to_string(), TargetSpecValue::String(codegen));
+                    config.insert("codegen".to_string(), Value::String(codegen));
                 }
                 if !t.deps.is_empty() {
                     let map = t
                         .deps
                         .into_iter()
                         .map(|(k, vs)| {
-                            let list = vs.into_iter().map(TargetSpecValue::String).collect();
-                            (k, TargetSpecValue::List(list))
+                            let list = vs.into_iter().map(Value::String).collect();
+                            (k, Value::List(list))
                         })
                         .collect();
-                    config.insert("deps".to_string(), TargetSpecValue::Map(map));
+                    config.insert("deps".to_string(), Value::Map(map));
                 }
                 Ok(TargetSpec {
                     addr: parse_addr(&t.addr)?,

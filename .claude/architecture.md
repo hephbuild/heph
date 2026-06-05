@@ -1,6 +1,6 @@
 # Architecture
 
-**rheph** is a build/task execution engine with a provider/driver plugin model.
+**heph** is a build/task execution engine with a provider/driver plugin model.
 
 ## Core Concepts
 
@@ -39,7 +39,7 @@ When implementing a new `Driver`:
 
 ## Proto / Codegen
 
-Protobuf definitions live in `proto/`. Generated Rust code is output to `gen/proto/src/` via the `gen` devenv command. The `gen/proto` crate is a workspace member and is imported as `rheph-proto-gen` with the `proto_full` feature.
+Protobuf definitions live in `proto/`. Generated Rust code is output to `gen/proto/src/` via the `gen` devenv command. The `gen/proto` crate is a workspace member and is imported as `heph-proto-gen` with the `proto_full` feature.
 
 ## Workspace Layout
 

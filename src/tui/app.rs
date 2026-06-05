@@ -153,13 +153,74 @@ pub trait TUIAppView: Send {
     /// the render tick, so this must not draw.
     fn apply(&mut self, ev: &BuildEvent);
 
-    /// Number of pinned inline viewport rows to reserve.
-    fn rows(&self) -> u16;
+    /// Number of pinned inline viewport rows to reserve, given the full terminal
+    /// height. The paved-road view targets one third of the terminal.
+    fn rows(&self, term_height: u16) -> u16;
+
+    /// Scroll the body by `delta` rows (negative = up, positive = down). Called
+    /// from the backend's key handler; the repaint happens on the next render
+    /// tick. No-op by default for views without a scrollable body.
+    fn scroll(&mut self, _delta: i32) {}
+
+    /// Pan the body horizontally by `delta` columns (negative = left, positive =
+    /// right) for content wider than the viewport. No-op by default.
+    fn hscroll(&mut self, _delta: i32) {}
+
+    /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
+    /// the next view, otherwise the previous. Called from the backend's key
+    /// handler; the repaint happens on the next render tick. No-op by default for
+    /// views with a single view.
+    fn tab(&mut self, _forward: bool) {}
+
+    /// Toggle the header counters between the matched-target set and every
+    /// observed target (the `a` key). Called from the backend's key handler; the
+    /// repaint happens on the next render tick. No-op by default for views without
+    /// a scope toggle.
+    fn toggle_scope(&mut self) {}
+
+    /// Whether the view is currently capturing keystrokes into a search query
+    /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
+    /// Enter and Esc to the search methods below instead of the normal shortcuts.
+    /// Default `false` for views without search.
+    fn is_searching(&self) -> bool {
+        false
+    }
+
+    /// Enter search-input mode (the `/` key). No-op by default.
+    fn search_start(&mut self) {}
+
+    /// Append a typed character to the active search query. No-op by default.
+    fn search_input(&mut self, _c: char) {}
+
+    /// Delete the last character of the active search query. No-op by default.
+    fn search_backspace(&mut self) {}
+
+    /// Cancel search: leave input mode and clear the filter (the `Esc` key).
+    /// No-op by default.
+    fn search_cancel(&mut self) {}
+
+    /// Confirm search: leave input mode but keep the filter applied so the body
+    /// can be scrolled (the `Enter` key). No-op by default.
+    fn search_confirm(&mut self) {}
 
     /// The lines for the pinned viewport, including the spinner row built from
     /// `spinner`. Called every render tick. `width` is the current terminal
-    /// column count, so the view can size borders and scroll long labels.
-    fn render(&self, spinner: &str, now_ms: u64, width: u16) -> Vec<Line<'static>>;
+    /// column count and `height` the reserved viewport row count, so the view can
+    /// size borders, scroll long labels, and grow its body to fill the rows.
+    fn render(&self, spinner: &str, now_ms: u64, width: u16, height: u16) -> Vec<Line<'static>>;
+
+    /// Whether the viewport should stay open after the run finishes and wait for
+    /// an explicit quit (`q` / Ctrl-C) instead of auto-exiting — e.g. the user
+    /// navigated away from the main view and would lose what they are looking at
+    /// on auto-tear-down. Default `false` (auto-exit).
+    fn hold_after_finish(&self) -> bool {
+        false
+    }
+
+    /// Mark the run as finished so the view can surface a "done — press q to
+    /// quit" notice. Called once when the viewport is being held open. No-op by
+    /// default.
+    fn set_finished(&mut self) {}
 
     /// After the live viewport is torn down, render a final build summary
     /// directly to the terminal (stderr) so it persists in scrollback. NOT

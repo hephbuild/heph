@@ -7,7 +7,7 @@ use crate::engine::driver::{
 };
 use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
-use crate::loosespecparser::{parse_map_string_strings, parse_string};
+use crate::htvalue::{parse_map_string_strings, parse_string};
 use crate::plugingo::embed;
 use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
@@ -270,7 +270,7 @@ mod tests {
     use crate::engine::provider::TargetSpec;
     use crate::htaddr::Addr;
     use crate::htpkg::PkgBuf;
-    use crate::loosespecparser::TargetSpecValue;
+    use crate::htvalue::Value;
     use std::collections::HashMap;
 
     fn driver() -> GoEmbedDriver {
@@ -282,23 +282,20 @@ mod tests {
     }
 
     fn make_parse_request(pkg: &str, variant: &str, golist_addr: &str) -> ParseRequest {
-        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-        config.insert(
-            "variant".to_string(),
-            TargetSpecValue::String(variant.to_string()),
-        );
+        let mut config: HashMap<String, Value> = HashMap::new();
+        config.insert("variant".to_string(), Value::String(variant.to_string()));
         config.insert(
             "deps".to_string(),
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "golist".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String(golist_addr.to_string())]),
+                Value::List(vec![Value::String(golist_addr.to_string())]),
             )])),
         );
         config.insert(
             "out".to_string(),
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "cfg".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("embedcfg".to_string())]),
+                Value::List(vec![Value::String("embedcfg".to_string())]),
             )])),
         );
 
@@ -352,14 +349,12 @@ mod tests {
     #[tokio::test]
     async fn test_parse_missing_variant_errors() {
         let ct = noop_ctoken();
-        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        let mut config: HashMap<String, Value> = HashMap::new();
         config.insert(
             "deps".to_string(),
-            TargetSpecValue::Map(HashMap::from([(
+            Value::Map(HashMap::from([(
                 "golist".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String(
-                    "//mypkg:_golist|pkg".to_string(),
-                )]),
+                Value::List(vec![Value::String("//mypkg:_golist|pkg".to_string())]),
             )])),
         );
         let req = ParseRequest {

@@ -1,10 +1,10 @@
 mod common;
 
 use common::Workspace;
-use rheph::engine::ResultOptions;
-use rheph::htmatcher::Matcher;
-use rheph::htpkg::PkgBuf;
-use rheph::pluginstatictarget::Target;
+use heph::engine::ResultOptions;
+use heph::htmatcher::Matcher;
+use heph::htpkg::PkgBuf;
+use heph::pluginstatictarget::Target;
 
 fn bash(addr: &str, run: &str, out: &str) -> Target {
     let mut out_map = std::collections::HashMap::new();
@@ -109,6 +109,6 @@ async fn test_static_cached_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn artifact_string(result: &rheph::engine::EResult) -> String {
+fn artifact_string(result: &heph::engine::EResult) -> String {
     common::artifact_string(result)
 }

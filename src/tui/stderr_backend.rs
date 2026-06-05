@@ -21,7 +21,7 @@
 //! the resume-time `Terminal::with_options`.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -30,13 +30,15 @@ use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
 
 pub struct StderrBackend {
-    inner: CrosstermBackend<io::Stderr>,
+    inner: CrosstermBackend<BufWriter<io::Stderr>>,
 }
 
 impl StderrBackend {
     pub fn new(stderr: io::Stderr) -> Self {
+        // Wrap stderr in a `BufWriter` so each backend write coalesces
+        // into one syscall on `flush`, matching stdout's buffering.
         Self {
-            inner: CrosstermBackend::new(stderr),
+            inner: CrosstermBackend::new(BufWriter::new(stderr)),
         }
     }
 }
@@ -55,6 +57,14 @@ impl Backend for StderrBackend {
         self.inner.append_lines(n)
     }
 
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_up(region, amount)
+    }
+
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_down(region, amount)
+    }
+
     fn hide_cursor(&mut self) -> io::Result<()> {
         self.inner.hide_cursor()
     }
@@ -66,6 +76,10 @@ impl Backend for StderrBackend {
     /// Query cursor position via stderr (not stdout) so a piped stdout
     /// is never corrupted by the DSR escape.
     fn get_cursor_position(&mut self) -> io::Result<Position> {
+        // Drain any buffered backend writes first — the DSR query below
+        // writes raw to `io::stderr()`, bypassing `inner`'s `BufWriter`,
+        // so unflushed cells would otherwise land after the query.
+        Backend::flush(&mut self.inner)?;
         query_cursor_position_via_stderr()
     }
 

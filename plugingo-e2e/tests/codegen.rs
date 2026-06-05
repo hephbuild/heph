@@ -72,7 +72,7 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
                 .to_owned();
             let dest = tmp.path().join(&name);
             match entry.kind {
-                rheph::hartifactcontent::WalkEntryKind::File { mut data, x } => {
+                heph::hartifactcontent::WalkEntryKind::File { mut data, x } => {
                     let mut buf = Vec::new();
                     data.read_to_end(&mut buf)?;
                     std::fs::write(&dest, &buf)?;
@@ -81,7 +81,7 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
                         binary_path = Some(dest);
                     }
                 }
-                rheph::hartifactcontent::WalkEntryKind::Symlink { .. } => {}
+                heph::hartifactcontent::WalkEntryKind::Symlink { .. } => {}
             }
         }
     }

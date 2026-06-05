@@ -1,10 +1,10 @@
 mod common;
 
 use common::Workspace;
-use rheph::engine::ResultOptions;
-use rheph::htmatcher::Matcher;
-use rheph::htpkg::PkgBuf;
-use rheph::loosespecparser::TargetSpecValue;
+use heph::engine::ResultOptions;
+use heph::htmatcher::Matcher;
+use heph::htpkg::PkgBuf;
+use heph::htvalue::Value as TargetSpecValue;
 // ── Discovery ────────────────────────────────────────────────────────────────
 
 // Regression: a matcher-phase BUILD eval error surfaces from `engine.result` as

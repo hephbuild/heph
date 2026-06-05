@@ -1,12 +1,12 @@
 use clap::Parser;
-use rheph::commands;
-use rheph::commands::GlobalOptions;
-use rheph::log;
+use heph::commands;
+use heph::commands::GlobalOptions;
+use heph::log;
 use std::process::ExitCode;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
-#[command(name = "rheph")]
+#[command(name = "heph")]
 #[command(about = "An efficient build system", long_about = None)]
 struct Cli {
     #[command(flatten)]
@@ -18,9 +18,9 @@ struct Cli {
 fn main() -> ExitCode {
     // Hidden re-exec for the process supervisor sidecar. Must run BEFORE any
     // logging, tokio runtime, or clap parsing so the supervisor stays small
-    // and predictable. Format: `rheph __supervisor --ipc-fd <N>`.
+    // and predictable. Format: `heph __supervisor --ipc-fd <N>`.
     if let Some(fd) = parse_supervisor_args() {
-        rheph::process_supervisor::run_supervisor_main(fd);
+        heph::process_supervisor::run_supervisor_main(fd);
     }
 
     // Ignore SIGTTOU/SIGTTIN so terminal-control syscalls (tcsetattr,
@@ -41,17 +41,17 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
     }
 
-    // Raise the open-file limit before any build work: rheph holds an flock fd
+    // Raise the open-file limit before any build work: heph holds an flock fd
     // per in-use cached artifact, and the default macOS soft limit (256) is
     // exhausted almost immediately on a wide build.
-    rheph::fdlimit::raise_open_file_limit();
+    heph::fdlimit::raise_open_file_limit();
 
     let sink = log::init();
-    rheph::tui::panic::install(sink.clone());
+    heph::tui::panic::install(sink.clone());
 
     // Fork the supervisor sidecar that will SIGKILL every tracked child
     // process group when this binary exits — including hard-kill scenarios.
-    if let Err(e) = rheph::process_supervisor::init() {
+    if let Err(e) = heph::process_supervisor::init() {
         error!(error = %format!("{e:#}"), "Failed to start process supervisor");
         return ExitCode::FAILURE;
     }
@@ -80,7 +80,7 @@ fn main() -> ExitCode {
             // (Starlark/Go diagnostics from single-error commands). The TUI is
             // already torn down here, so plain stderr output is safe. Fall back
             // to the one-line log when nothing renderable is found.
-            if !rheph::commands::errors::render_anyhow(&e) {
+            if !heph::commands::errors::render_anyhow(&e) {
                 error!(error = %format!("{:#}", e), "Failed");
             }
             ExitCode::FAILURE

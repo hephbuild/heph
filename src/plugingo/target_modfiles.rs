@@ -1,6 +1,6 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
-use crate::loosespecparser::TargetSpecValue;
+use crate::htvalue::Value;
 use crate::pluginfs;
 use std::collections::HashMap;
 
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 pub fn build_spec(addr: Addr, mod_files: &[String]) -> TargetSpec {
     let pkg = addr.package.as_str();
 
-    let file_deps: Vec<TargetSpecValue> = mod_files
+    let file_deps: Vec<Value> = mod_files
         .iter()
         .map(|f| {
             let rel = if pkg.is_empty() {
@@ -17,12 +17,12 @@ pub fn build_spec(addr: Addr, mod_files: &[String]) -> TargetSpec {
             } else {
                 format!("{}/{}", pkg, f)
             };
-            TargetSpecValue::String(pluginfs::file_addr(&rel).format())
+            Value::String(pluginfs::file_addr(&rel).format())
         })
         .collect();
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("deps".to_string(), TargetSpecValue::List(file_deps));
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("deps".to_string(), Value::List(file_deps));
 
     TargetSpec {
         addr,
@@ -55,13 +55,13 @@ mod tests {
         let files = vec!["go.mod".to_string(), "go.sum".to_string()];
         let spec = build_spec(test_addr(), &files);
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!("expected list"),
         };
         assert_eq!(deps.len(), 2);
         for (entry, file) in deps.iter().zip(files.iter()) {
             let addr_str = match entry {
-                TargetSpecValue::String(s) => s,
+                Value::String(s) => s,
                 _ => panic!("expected string"),
             };
             assert!(
@@ -82,11 +82,11 @@ mod tests {
         let files = vec!["go.mod".to_string()];
         let spec = build_spec(nested_addr(), &files);
         let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::List(v) => v,
+            Value::List(v) => v,
             _ => panic!("expected list"),
         };
         let addr_str = match &deps[0] {
-            TargetSpecValue::String(s) => s,
+            Value::String(s) => s,
             _ => panic!("expected string"),
         };
         assert!(

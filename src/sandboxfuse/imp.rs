@@ -242,7 +242,7 @@ impl LayeredFs {
     pub fn set_notifier(&self, n: Notifier) -> std::thread::JoinHandle<()> {
         let (tx, rx) = unbounded::<InvalEntry>();
         let handle = std::thread::Builder::new()
-            .name("rheph-fuse-notify".into())
+            .name("heph-fuse-notify".into())
             .spawn(move || {
                 while let Ok(msg) = rx.recv() {
                     // Best-effort: ignore errors. A failed writev means

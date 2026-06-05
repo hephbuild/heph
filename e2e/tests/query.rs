@@ -1,8 +1,8 @@
 mod common;
 
 use common::Workspace;
-use rheph::loosespecparser::TargetSpecValue;
-use rheph::pluginquery::PACKAGE;
+use heph::htvalue::Value as TargetSpecValue;
+use heph::pluginquery::PACKAGE;
 
 // Query by label resolves to group spec with all matching targets as deps
 #[tokio::test]
@@ -24,7 +24,7 @@ target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt", labels
 
     let spec = ws.get_spec(&format!("//{PACKAGE}:q@label=lint")).await?;
 
-    assert_eq!(spec.driver, rheph::plugingroup::DRIVER_NAME);
+    assert_eq!(spec.driver, heph::plugingroup::DRIVER_NAME);
     let deps = match spec.config.get("deps") {
         Some(TargetSpecValue::List(l)) => l,
         _ => panic!("expected deps list, got: {:?}", spec.config.get("deps")),

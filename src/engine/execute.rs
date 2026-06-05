@@ -39,6 +39,22 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
 
+        crate::hmemoizer::set_phase("execute:inputs_result_exec");
+        let deps_result = self
+            .clone()
+            .inputs_result_exec(rs.clone(), &def.inputs)
+            .await?;
+
+        // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
+        // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
+        // waiting for a leaf that also needs a permit.
+        crate::hmemoizer::set_phase("execute:semaphore_acquire");
+        let semaphore = Arc::clone(&self.result_semaphore);
+        let _permit = semaphore
+            .acquire()
+            .await
+            .context("result semaphore closed")?;
+
         let addr_str = addr.format();
         crate::engine::event::emit_scope(
             &rs,
@@ -52,22 +68,6 @@ impl Engine {
                 error,
             },
             async {
-                crate::hmemoizer::set_phase("execute:inputs_result_exec");
-                let deps_result = self
-                    .clone()
-                    .inputs_result_exec(rs.clone(), &def.inputs)
-                    .await?;
-
-                // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
-                // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
-                // waiting for a leaf that also needs a permit.
-                crate::hmemoizer::set_phase("execute:semaphore_acquire");
-                let semaphore = Arc::clone(&self.result_semaphore);
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .context("result semaphore closed")?;
-
                 let sandbox_dir = {
                     let mut dir = self.home.join("sandbox");
                     for c in addr.package.components() {
@@ -85,7 +85,7 @@ impl Engine {
                 // orphan empty dir when the bridge picks the FUSE side.
                 crate::hmemoizer::set_phase("execute:sandbox_remove");
                 sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
-                    match std::fs::remove_dir_all(&sandbox_dir) {
+                    match crate::engine::sandbox_cleaner::remove_dir_all(&sandbox_dir) {
                         Ok(_) => Ok(()),
                         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
                         Err(err) => Err(err),

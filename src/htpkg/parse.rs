@@ -32,7 +32,7 @@ pub fn parse(input: &str, base: &PkgBuf) -> anyhow::Result<Matcher> {
     }
 
     // Relative package reference
-    if input.starts_with("./") || input.starts_with("../") {
+    if input == "." || input == ".." || input.starts_with("./") || input.starts_with("../") {
         // Extract the path portion before `...` if present
         let (path_part, has_ellipsis) = if let Some(p) = input.strip_suffix("/...") {
             (p, true)
@@ -140,6 +140,20 @@ mod tests {
     fn test_relative_current_package() {
         let base = PkgBuf::from("a/b");
         let m = parse("./", &base).unwrap();
+        assert_eq!(m, Matcher::Package(PkgBuf::from("a/b")));
+    }
+
+    #[test]
+    fn test_relative_dot() {
+        let base = PkgBuf::from("a/b");
+        let m = parse(".", &base).unwrap();
+        assert_eq!(m, Matcher::Package(PkgBuf::from("a/b")));
+    }
+
+    #[test]
+    fn test_relative_dot_dot() {
+        let base = PkgBuf::from("a/b/c");
+        let m = parse("..", &base).unwrap();
         assert_eq!(m, Matcher::Package(PkgBuf::from("a/b")));
     }
 

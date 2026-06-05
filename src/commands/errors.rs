@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
-use crate::engine::error::{CancelledError, TargetFailure};
+use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
 use crate::hmemoizer::downcast_chain_ref;
 
 /// Whether to emit ANSI color: only when stderr is a terminal and `NO_COLOR`
@@ -64,6 +64,49 @@ fn render_log_box(out: &mut String, log: &str, color: bool) {
     }
 }
 
+/// Render a unified diff inside a framed box, indented two spaces. With `color`,
+/// addition lines (`+`) are green and deletion lines (`-`) are red; the box
+/// border + `[diff]` header are white. Hunk/context lines pass through unstyled.
+/// ```text
+///   ╭─[diff]
+///   │ --- tree
+///   │ +++ generated
+///   │ -old line
+///   │ +new line
+///   ╰────
+/// ```
+fn render_diff_box(out: &mut String, diff: &str, color: bool) {
+    if color {
+        out.push_str(&format!("  {}\n", "╭─[diff]".white()));
+    } else {
+        out.push_str("  ╭─[diff]\n");
+    }
+    for line in diff.lines() {
+        // A leading `+`/`-` marks an addition/deletion; `+++`/`---` file headers
+        // are left unstyled so the green/red is reserved for content lines.
+        let is_header = line.starts_with("+++") || line.starts_with("---");
+        let styled = if !color || is_header {
+            line.to_string()
+        } else if line.starts_with('+') {
+            format!("{}", line.green())
+        } else if line.starts_with('-') {
+            format!("{}", line.red())
+        } else {
+            line.to_string()
+        };
+        if color {
+            out.push_str(&format!("  {} {styled}\n", "│".white()));
+        } else {
+            out.push_str(&format!("  │ {styled}\n"));
+        }
+    }
+    if color {
+        out.push_str(&format!("  {}\n", "╰────".white()));
+    } else {
+        out.push_str("  ╰────\n");
+    }
+}
+
 /// Render a single target failure to a string. The `×` and `╰─▶` markers are red
 /// when `color`.
 fn render_target_failure(f: &TargetFailure, color: bool) -> String {
@@ -73,6 +116,19 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
         "×".to_string()
     };
     let mut out = format!("{cross} target failed: {}\n", f.addr.format());
+    // A frozen-check failure carries its diff in a dedicated box; render a clean
+    // one-line cause (the addr is already in the title) plus the framed diff,
+    // instead of dumping the whole multi-line diff into the inline cause chain.
+    if let Some(fc) = downcast_chain_ref::<FrozenCheckError>(&f.source) {
+        let arrow = if color {
+            format!("{}", "╰─▶".red())
+        } else {
+            "╰─▶".to_string()
+        };
+        out.push_str(&format!("{arrow} generated output differs from tree\n"));
+        render_diff_box(&mut out, &fc.diff, color);
+        return out;
+    }
     let cause = cause_chain(&f.source, &f.addr.format());
     if !cause.is_empty() {
         let arrow = if color {
@@ -197,6 +253,20 @@ pub fn render_anyhow(e: &anyhow::Error) -> bool {
         eprint!("{}", render_target_failure(tf, color_enabled()));
         return true;
     }
+    // A frozen-check failure that arrived outside a `TargetFailure` still gets the
+    // framed diff treatment so CI output is legible.
+    if let Some(fc) = downcast_chain_ref::<FrozenCheckError>(e) {
+        let color = color_enabled();
+        let cross = if color {
+            format!("{}", "×".red())
+        } else {
+            "×".to_string()
+        };
+        let mut out = format!("{cross} frozen check failed: {}\n", fc.addr.format());
+        render_diff_box(&mut out, &fc.diff, color);
+        eprint!("{out}");
+        return true;
+    }
     let frames: Vec<String> = e.chain().map(|c| c.to_string()).collect();
     let Some(top) = frames.first() else {
         return false;
@@ -292,6 +362,61 @@ mod tests {
             render_target_failure(&f, false),
             "× target failed: //pkg:a\n╰─▶ target not found: //pkg:a\n"
         );
+    }
+
+    #[test]
+    fn renders_frozen_check_failure_with_diff_box() {
+        // A FrozenCheckError carried inside a TargetFailure's source chain renders
+        // a clean one-line cause plus the diff framed in a [diff] box — not the
+        // raw multi-line Display dumped into the inline cause.
+        let addr = crate::htaddr::parse_addr("//gen:proto").unwrap();
+        let diff = "--- tree\n+++ generated\n-old line\n+new line\n";
+        let source = anyhow::Error::new(FrozenCheckError {
+            addr: addr.clone(),
+            diff: diff.to_string(),
+        })
+        .context("execute //gen:proto");
+        let f = TargetFailure::new(addr, None, source);
+
+        let rendered = render_target_failure(&f, false);
+        let expected = "\
+× target failed: //gen:proto
+╰─▶ generated output differs from tree
+  ╭─[diff]
+  │ --- tree
+  │ +++ generated
+  │ -old line
+  │ +new line
+  ╰────
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn renders_bare_frozen_check_error() {
+        // A FrozenCheckError surfaced directly (not wrapped in a TargetFailure)
+        // still gets the framed diff treatment via render_anyhow.
+        let addr = crate::htaddr::parse_addr("//gen:proto").unwrap();
+        let diff = "-old\n+new\n";
+        let e = anyhow::Error::new(FrozenCheckError {
+            addr,
+            diff: diff.to_string(),
+        });
+        // render_anyhow prints to stderr; assert it claims the error as handled.
+        assert!(render_anyhow(&e));
+    }
+
+    #[test]
+    fn frozen_diff_box_colors_additions_green_deletions_red() {
+        let mut out = String::new();
+        render_diff_box(&mut out, "-gone\n+added\n context\n", true);
+        // Additions green, deletions red, context unstyled.
+        assert!(out.contains(&format!("{}", "+added".green())));
+        assert!(out.contains(&format!("{}", "-gone".red())));
+        assert!(out.contains(" context"));
+        // Border + header white.
+        assert!(out.contains(&format!("{}", "╭─[diff]".white())));
+        assert!(out.contains(&format!("{}", "╰────".white())));
     }
 
     #[test]
