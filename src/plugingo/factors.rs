@@ -42,28 +42,13 @@ impl Factors {
 }
 
 pub fn current_goos() -> String {
-    rust_os_to_go(std::env::consts::OS).to_string()
-}
-
-fn rust_os_to_go(os: &str) -> &str {
-    match os {
-        "macos" => "darwin",
-        other => other,
-    }
+    // Go's GOOS naming matches the canonical (Go/OCI) convention.
+    crate::htplatform::os().to_string()
 }
 
 pub fn current_goarch() -> String {
-    rust_arch_to_go(std::env::consts::ARCH).to_string()
-}
-
-fn rust_arch_to_go(arch: &str) -> &str {
-    match arch {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        "x86" => "386",
-        "arm" => "arm",
-        other => other,
-    }
+    // Go's GOARCH naming matches the canonical (Go/OCI) convention.
+    crate::htplatform::arch().to_string()
 }
 
 #[cfg(test)]
@@ -118,21 +103,5 @@ mod tests {
             build_tags: vec!["foo".into(), "bar".into()],
         };
         assert_eq!(f.go_list_flags(), vec!["-tags", "foo,bar"]);
-    }
-
-    #[test]
-    fn test_arch_mapping() {
-        assert_eq!(rust_arch_to_go("x86_64"), "amd64");
-        assert_eq!(rust_arch_to_go("aarch64"), "arm64");
-        assert_eq!(rust_arch_to_go("x86"), "386");
-        assert_eq!(rust_arch_to_go("arm"), "arm");
-        assert_eq!(rust_arch_to_go("riscv64"), "riscv64");
-    }
-
-    #[test]
-    fn test_os_mapping() {
-        assert_eq!(rust_os_to_go("macos"), "darwin");
-        assert_eq!(rust_os_to_go("linux"), "linux");
-        assert_eq!(rust_os_to_go("windows"), "windows");
     }
 }
