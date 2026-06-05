@@ -118,7 +118,7 @@ jobs:
             # The nix toolchain hard-links libiconv against its /nix/store path,
             # which is absent on user machines (dyld aborts at launch). Rewrite
             # those load commands to the OS /usr/lib copies.
-            scripts/macos-portable.sh $CARGO_TARGET_DIR/${{ matrix.target }}/release/heph
+            bash scripts/macos-portable.sh $CARGO_TARGET_DIR/${{ matrix.target }}/release/heph
           else
             cargo zigbuild --release --locked --target ${{ matrix.target }} --bin heph
           fi
