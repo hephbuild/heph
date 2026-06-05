@@ -160,10 +160,24 @@ impl EProvider for Provider {
     }
 
     fn functions(&self) -> Vec<ProviderFunctionDef> {
-        vec![ProviderFunctionDef {
-            name: "glob".to_string(),
-            func: Arc::new(GlobFn),
-        }]
+        vec![
+            ProviderFunctionDef {
+                name: "glob".to_string(),
+                func: Arc::new(GlobFn),
+            },
+            ProviderFunctionDef {
+                name: "join".to_string(),
+                func: Arc::new(JoinFn),
+            },
+            ProviderFunctionDef {
+                name: "dir".to_string(),
+                func: Arc::new(DirFn),
+            },
+            ProviderFunctionDef {
+                name: "base".to_string(),
+                func: Arc::new(BaseFn),
+            },
+        ]
     }
 }
 
@@ -222,6 +236,113 @@ impl ProviderFn for GlobFn {
 
         paths.sort();
         Ok(Value::List(paths.into_iter().map(Value::String).collect()))
+    }
+}
+
+/// Lexical path cleanup, matching Go's `path.Clean`: collapses `.` and inner
+/// `..`, drops redundant slashes, and preserves a leading `..`/`/`. Returns "."
+/// for an empty result. Purely lexical — never touches the filesystem.
+fn path_clean(path: &str) -> String {
+    let rooted = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                if rooted || matches!(out.last(), Some(&last) if last != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let joined = out.join("/");
+    match (rooted, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".to_string(),
+        (false, false) => joined,
+    }
+}
+
+/// `heph.fs.join(*elems)` — join path elements with `/` and clean the result
+/// (Go `path.Join` semantics). Empty elements are skipped; all-empty yields "".
+fn path_join(elems: &[&str]) -> String {
+    let non_empty: Vec<&str> = elems.iter().copied().filter(|e| !e.is_empty()).collect();
+    if non_empty.is_empty() {
+        return String::new();
+    }
+    path_clean(&non_empty.join("/"))
+}
+
+/// `heph.fs.dir(path)` — everything but the last element, cleaned (Go
+/// `path.Dir`). Returns "." when there is no directory part.
+fn path_dir(path: &str) -> String {
+    match path.rfind('/') {
+        // `split_at` keeps the leading-slash case rooted (Go `path.Dir("/a") == "/"`).
+        Some(i) => path_clean(path.split_at(i + 1).0),
+        None => path_clean(""),
+    }
+}
+
+/// `heph.fs.base(path)` — the last element of `path` (Go `path.Base`). Trailing
+/// slashes are stripped first; returns "." for empty and "/" for all-slashes.
+fn path_base(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    match trimmed.rsplit_once('/') {
+        Some((_, base)) => base.to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Extracts a single string positional arg for `fn_name`, erroring on a missing
+/// or non-string value.
+fn str_arg<'a>(fn_name: &str, args: &'a FnArgs) -> anyhow::Result<&'a str> {
+    match args.positional.first() {
+        Some(Value::String(s)) => Ok(s.as_str()),
+        Some(other) => anyhow::bail!("{fn_name}: argument must be a string, got {other:?}"),
+        None => anyhow::bail!("{fn_name}: missing path argument"),
+    }
+}
+
+struct JoinFn;
+
+#[async_trait]
+impl ProviderFn for JoinFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let mut elems: Vec<&str> = Vec::with_capacity(args.positional.len());
+        for v in &args.positional {
+            match v {
+                Value::String(s) => elems.push(s.as_str()),
+                other => anyhow::bail!("heph.fs.join: arguments must be strings, got {other:?}"),
+            }
+        }
+        Ok(Value::String(path_join(&elems)))
+    }
+}
+
+struct DirFn;
+
+#[async_trait]
+impl ProviderFn for DirFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        Ok(Value::String(path_dir(str_arg("heph.fs.dir", &args)?)))
+    }
+}
+
+struct BaseFn;
+
+#[async_trait]
+impl ProviderFn for BaseFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        Ok(Value::String(path_base(str_arg("heph.fs.base", &args)?)))
     }
 }
 
@@ -938,6 +1059,65 @@ mod tests {
 
         let got = call_glob(tmp.path(), "", "*.yaml");
         assert_eq!(got, vec!["a.yaml".to_string(), "b.yaml".to_string()]);
+    }
+
+    // ─── Path helper (join/dir/base) tests ─────────────────────────────────
+
+    fn call_path_fn(f: &dyn ProviderFn, args: Vec<&str>) -> String {
+        let root = std::path::Path::new("/");
+        let ctx = FnCallContext { pkg: "", root };
+        let args = FnArgs {
+            positional: args
+                .into_iter()
+                .map(|s| Value::String(s.to_string()))
+                .collect(),
+            named: Default::default(),
+        };
+        match futures::executor::block_on(f.call(&ctx, args)).unwrap() {
+            Value::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_join_fn() {
+        assert_eq!(call_path_fn(&JoinFn, vec!["a", "b", "c"]), "a/b/c");
+        // Cleans embedded `.`/`..` and redundant separators.
+        assert_eq!(call_path_fn(&JoinFn, vec!["a/", "b"]), "a/b");
+        assert_eq!(call_path_fn(&JoinFn, vec!["a", "..", "b"]), "b");
+        assert_eq!(call_path_fn(&JoinFn, vec!["a", ".", "b"]), "a/b");
+        // Empty elements are skipped; all-empty yields "".
+        assert_eq!(call_path_fn(&JoinFn, vec!["", "a", ""]), "a");
+        assert_eq!(call_path_fn(&JoinFn, vec!["", ""]), "");
+        assert_eq!(call_path_fn(&JoinFn, vec![]), "");
+    }
+
+    #[test]
+    fn test_dir_fn() {
+        assert_eq!(call_path_fn(&DirFn, vec!["a/b/c"]), "a/b");
+        assert_eq!(call_path_fn(&DirFn, vec!["a"]), ".");
+        assert_eq!(call_path_fn(&DirFn, vec!["/a/b"]), "/a");
+        assert_eq!(call_path_fn(&DirFn, vec!["/a"]), "/");
+        assert_eq!(call_path_fn(&DirFn, vec![""]), ".");
+        assert_eq!(call_path_fn(&DirFn, vec!["a/b/"]), "a/b");
+    }
+
+    #[test]
+    fn test_base_fn() {
+        assert_eq!(call_path_fn(&BaseFn, vec!["a/b/c.rs"]), "c.rs");
+        assert_eq!(call_path_fn(&BaseFn, vec!["c.rs"]), "c.rs");
+        assert_eq!(call_path_fn(&BaseFn, vec!["a/b/"]), "b");
+        assert_eq!(call_path_fn(&BaseFn, vec![""]), ".");
+        assert_eq!(call_path_fn(&BaseFn, vec!["/"]), "/");
+        assert_eq!(call_path_fn(&BaseFn, vec!["///"]), "/");
+    }
+
+    #[test]
+    fn test_dir_fn_requires_string() {
+        let root = std::path::Path::new("/");
+        let ctx = FnCallContext { pkg: "", root };
+        let err = futures::executor::block_on(DirFn.call(&ctx, FnArgs::default())).unwrap_err();
+        assert!(err.to_string().contains("missing path argument"), "{err}");
     }
 
     // ─── Provider tests ────────────────────────────────────────────────────
