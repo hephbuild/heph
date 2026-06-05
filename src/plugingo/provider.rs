@@ -1876,11 +1876,21 @@ impl ProviderInner {
             dep_addr.args.clone(),
         );
 
-        let sub_imports = self
-            .read_golist_package(executor, &golist_addr)
-            .await
-            .map(|p| p.imports.clone())
-            .with_context(|| format!("read _golist for {}", import_path))?;
+        let sub_imports = match self.read_golist_package(executor, &golist_addr).await {
+            Ok(p) => p.imports.clone(),
+            // The dep's directory has Go files but none are buildable for these
+            // factors (all excluded by build constraints). Its `build_lib`
+            // resolves to NotFound (see the NoGoFilesError arm in `handle_get`),
+            // so there's no lib to link against — drop the import instead of
+            // failing the importer's get_spec, exactly as an unresolvable import
+            // returns `None` above.
+            Err(e) if downcast_chain_ref::<NoGoFilesError>(&e).is_some() => {
+                return Ok((import_path.to_string(), None, vec![]));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("read _golist for {}", import_path));
+            }
+        };
 
         Ok((import_path.to_string(), Some(dep_addr), sub_imports))
     }
@@ -2452,6 +2462,48 @@ mod tests {
             has_lib_dep,
             "cmd build_lib should depend on lib: got {:?}",
             deps.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Regression: an imported package whose directory has Go files that are all
+    // excluded by build constraints (here a never-set `//go:build` tag, modeling
+    // a goos/goarch-excluded package) resolves its `build_lib` to NotFound via
+    // NoGoFilesError. Resolving the *importer's* deps must drop that import
+    // rather than fail the importer's get_spec — otherwise a query touching the
+    // importer dies with "read _golist for …: no Go files in package …".
+    #[tokio::test]
+    async fn test_dep_constrained_importer_skips_unbuildable_dep() {
+        require_go!();
+        let sandbox = copy_fixture("dep_constrained");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        // The excluded dep itself is NotFound (no buildable Go files).
+        let lib_res = provider_get(&p, make_addr("lib", "build_lib")).await;
+        assert!(
+            matches!(lib_res, Err(GetError::NotFound)),
+            "constraint-excluded lib must be NotFound"
+        );
+
+        // The importer's get_spec must still succeed, with the unbuildable dep dropped.
+        let resp = provider_get(&p, make_addr("cmd", "build_lib"))
+            .await
+            .expect("cmd build_lib get_spec must succeed despite unbuildable dep");
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        // Dep addrs live in the group values; the excluded lib's `//lib:build_lib`
+        // addr must not appear in any group.
+        let has_lib = deps.values().any(|v| match v {
+            Value::List(items) => items
+                .iter()
+                .any(|it| matches!(it, Value::String(s) if s.contains("//lib:"))),
+            _ => false,
+        });
+        assert!(
+            !has_lib,
+            "unbuildable lib must not appear in cmd deps: {:?}",
+            deps
         );
     }
 
