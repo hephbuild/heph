@@ -1,0 +1,22 @@
+name: Autodoc trigger
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  fire-routine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire Claude Code routine
+        env:
+          ROUTINE_TOKEN: ${{ secrets.CC_AUTODOC_TOKEN }}
+          ROUTINE_ID: ${{ vars.CC_AUTODOC_ROUTINE_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          curl -X POST "https://api.anthropic.com/v1/claude_code/routines/$ROUTINE_ID/fire" \
+            -H "Authorization: Bearer $ROUTINE_TOKEN" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: experimental-cc-routine-2026-04-01" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg sha "$COMMIT_SHA" '{text: "New commit \($sha) pushed to master."}')"
