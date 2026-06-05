@@ -518,12 +518,29 @@ fn walk_glob(
             anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
         })?;
 
-        let meta = entry
-            .metadata()
-            .with_context(|| format!("stat glob entry '{}'", abs_path.display()))?;
+        // Resolve through symlinks. The walker has follow_links off (so it never
+        // descends INTO a symlinked dir), but an individual symlink entry that
+        // points at a regular file is still a valid source. Stat the target so
+        // the exec marker and the hashed content both come from what
+        // `file_hashout` actually opens — and so a symlink-to-dir (or a
+        // dangling/vanished link) is skipped instead of erroring on read.
+        let meta = match std::fs::metadata(abs_path) {
+            Ok(m) => m,
+            // A dangling/vanished symlink resolves to nothing — skip, don't fail.
+            // Other stat errors (e.g. permission) still surface with context.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("stat glob entry '{}'", abs_path.display()));
+            }
+        };
+        if meta.is_dir() {
+            continue;
+        }
 
         let x = is_exec(&meta);
-        let hashout = file_hashout(&meta);
+        let hashout = file_hashout(abs_path, x)
+            .with_context(|| format!("hash glob entry '{}'", abs_path.display()))?;
 
         let source_path = abs_path
             .to_str()
@@ -596,18 +613,31 @@ fn is_exec(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
-fn file_hashout(meta: &std::fs::Metadata) -> String {
-    let size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+/// Content identity for a sourced file: a hash of its bytes plus the executable
+/// marker. Deliberately ignores size and mtime — only the content and the `x`
+/// bit determine the artifact, so a file rewritten with identical bytes (new
+/// mtime, same content) hashes the same and stays a cache hit.
+fn file_hashout(path: &std::path::Path, x: bool) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open file for hashing '{}'", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
     let mut h = Xxh3::new();
-    h.update(&size.to_le_bytes());
-    h.update(&mtime.to_le_bytes());
-    format!("{:x}", h.digest())
+    // Stream in chunks so large inputs never load wholesale into memory.
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("read file for hashing '{}'", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        if let Some(chunk) = buf.get(..n) {
+            h.update(chunk);
+        }
+    }
+    h.update(&[x as u8]);
+    Ok(format!("{:x}", h.digest()))
 }
 
 #[async_trait]
@@ -747,7 +777,8 @@ impl crate::engine::driver::Driver for Driver {
                 let meta = std::fs::metadata(&abs)
                     .with_context(|| format!("stat file '{}'", abs.display()))?;
                 let x = is_exec(&meta);
-                let hashout = file_hashout(&meta);
+                let hashout = file_hashout(&abs, x)
+                    .with_context(|| format!("hash file '{}'", abs.display()))?;
 
                 let source_path = abs
                     .to_str()
@@ -1170,6 +1201,111 @@ mod tests {
             &hashin,
         );
         assert!(driver.run(req, &ctoken()).await.is_err());
+    }
+
+    #[test]
+    fn test_file_hashout_is_content_based() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, b"same bytes").unwrap();
+        fs::write(&b, b"same bytes").unwrap();
+        // Identical bytes + same exec marker hash identically, regardless of path.
+        assert_eq!(
+            file_hashout(&a, false).unwrap(),
+            file_hashout(&b, false).unwrap()
+        );
+        fs::write(&b, b"other bytes").unwrap();
+        assert_ne!(
+            file_hashout(&a, false).unwrap(),
+            file_hashout(&b, false).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_file_hashout_includes_exec_marker() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("f");
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        // Same bytes, different exec marker => different identity.
+        assert_ne!(
+            file_hashout(&p, false).unwrap(),
+            file_hashout(&p, true).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_file_hashout_ignores_mtime() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("f");
+        fs::write(&p, b"stable content").unwrap();
+        let before = file_hashout(&p, false).unwrap();
+        // Bump mtime far into the future without touching the bytes; the content
+        // hash must not move (mtime is no longer part of the identity).
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(60 * 60 * 24 * 365))
+            .unwrap();
+        drop(f);
+        let after = file_hashout(&p, false).unwrap();
+        assert_eq!(before, after, "mtime change must not affect the content hash");
+    }
+
+    /// A glob over a tree containing a symlink-to-dir (matching the pattern) and a
+    /// dangling symlink must NOT error: `file_hashout` opens+reads, so these
+    /// would otherwise blow up with EISDIR/ENOENT. A symlink-to-FILE is sourced,
+    /// with its exec marker and content both taken from the followed target (so
+    /// it hashes identically to the target itself).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_driver_run_glob_follows_file_links_and_skips_dir_links() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("real.txt"), b"real").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        // Symlink to a real dir, named to MATCH the *.txt pattern.
+        std::os::unix::fs::symlink(root.join("sub"), root.join("subdir.txt")).unwrap();
+        // Symlink to the real file.
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+        // Dangling symlink that matches the pattern.
+        std::os::unix::fs::symlink(root.join("missing"), root.join("dangling.txt")).unwrap();
+
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.txt".to_string()))]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            root.to_path_buf(),
+            &hashin,
+        );
+        // The headline regression: must not error on the symlinked dir / dangling.
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let by_name: std::collections::HashMap<&str, &str> = res
+            .artifacts
+            .iter()
+            .map(|a| (a.name.as_str(), a.hashout.as_str()))
+            .collect();
+        assert!(by_name.contains_key("real.txt"));
+        assert!(by_name.contains_key("link.txt"));
+        assert!(
+            !by_name.contains_key("subdir.txt"),
+            "a symlink-to-dir must be skipped, not hashed"
+        );
+        assert!(
+            !by_name.contains_key("dangling.txt"),
+            "a dangling symlink must be skipped"
+        );
+        // Exec marker + content both come from the followed target, so the link
+        // hashes the same as the file it points at (NOT the symlink's own mode).
+        assert_eq!(by_name["link.txt"], by_name["real.txt"]);
     }
 
     #[tokio::test]

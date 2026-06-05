@@ -1037,12 +1037,12 @@ impl Engine {
                 for entry in walker {
                     let entry = entry
                         .with_context(|| format!("read codegen entry for frozen check: {group}"))?;
-                    let new_bytes = match entry.kind {
-                        WalkEntryKind::File { mut data, .. } => {
+                    let (new_bytes, x) = match entry.kind {
+                        WalkEntryKind::File { mut data, x } => {
                             let mut buf = Vec::new();
                             std::io::Read::read_to_end(&mut data, &mut buf)
                                 .with_context(|| format!("read generated file {:?}", entry.path))?;
-                            buf
+                            (buf, x)
                         }
                         WalkEntryKind::Symlink { .. } => continue,
                     };
@@ -1056,32 +1056,58 @@ impl Engine {
                             });
                         }
                     };
-                    if old_bytes == new_bytes {
+                    let content_same = old_bytes == new_bytes;
+                    // The exec bit is part of the (content + exec-bit) fs hash, so
+                    // a mode-only divergence is real drift the non-frozen run
+                    // would write back — flag it here too, symmetric with the
+                    // write-back reconcile.
+                    #[cfg(unix)]
+                    let exec_same = {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::metadata(&tree_path)
+                            .map(|m| (m.permissions().mode() & 0o111 != 0) == x)
+                            .unwrap_or(!x)
+                    };
+                    #[cfg(not(unix))]
+                    let exec_same = {
+                        // No exec-bit concept on this platform.
+                        let _ = x;
+                        true
+                    };
+                    if content_same && exec_same {
                         continue;
                     }
-                    let old = String::from_utf8_lossy(&old_bytes);
-                    let new = String::from_utf8_lossy(&new_bytes);
-                    let diff = similar::TextDiff::from_lines(old.as_ref(), new.as_ref());
                     let path_label = entry.path.display().to_string();
-                    // Git-style headers so the per-file path rides on the
-                    // `---`/`+++` lines (no redundant label above them).
-                    let rendered = diff
-                        .unified_diff()
-                        .header(&format!("a/{path_label}"), &format!("b/{path_label}"))
-                        .to_string();
-                    frozen_diff.push_str(&rendered);
-                    if !frozen_diff.ends_with('\n') {
-                        frozen_diff.push('\n');
+                    if !content_same {
+                        let old = String::from_utf8_lossy(&old_bytes);
+                        let new = String::from_utf8_lossy(&new_bytes);
+                        let diff = similar::TextDiff::from_lines(old.as_ref(), new.as_ref());
+                        // Git-style headers so the per-file path rides on the
+                        // `---`/`+++` lines (no redundant label above them).
+                        let rendered = diff
+                            .unified_diff()
+                            .header(&format!("a/{path_label}"), &format!("b/{path_label}"))
+                            .to_string();
+                        frozen_diff.push_str(&rendered);
+                        if !frozen_diff.ends_with('\n') {
+                            frozen_diff.push('\n');
+                        }
+                    }
+                    #[cfg(unix)]
+                    if !exec_same {
+                        let want = if x { "executable" } else { "non-executable" };
+                        frozen_diff.push_str(&format!("mode change: {path_label} should be {want}\n"));
                     }
                 }
             } else {
                 // Materialize the generated tree into the workspace root, but
-                // write each file ONLY when its content differs from what's on
-                // disk. Skipping unchanged files keeps their mtime stable — and
-                // because `@heph/fs` hashes inputs by (size, mtime), a stable
-                // mtime is exactly what lets a re-run of an idempotent in_place
-                // target hit the fixpoint cache instead of re-executing. It also
-                // avoids needless source-control churn.
+                // write a file's bytes ONLY when they differ from what's on disk
+                // (and reconcile its exec bit separately, below). `@heph/fs`
+                // hashes inputs by (content, exec-bit), so re-reading an
+                // unchanged file yields the same hash and an idempotent in_place
+                // target hits the fixpoint cache instead of re-executing.
+                // Skipping identical writes also avoids needless source-control
+                // churn and pointless mtime bumps.
                 let stamp = def.target.addr.format();
                 let walker = artifact
                     .walk()
@@ -1105,20 +1131,38 @@ impl Engine {
                                 }
                                 std::fs::write(&dest, &new_bytes)
                                     .with_context(|| format!("write codegen file {:?}", dest))?;
-                                #[cfg(unix)]
-                                if x {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    std::fs::set_permissions(
-                                        &dest,
-                                        std::fs::Permissions::from_mode(0o755),
-                                    )
-                                    .with_context(|| format!("chmod +x {:?}", dest))?;
+                            }
+                            // The exec bit is part of the `@heph/fs` (content,
+                            // exec-bit) input hash, so reconcile it to the
+                            // generated artifact's `x` even when the bytes are
+                            // unchanged — otherwise a target that only flips +x
+                            // would never land on disk and the recomputed
+                            // fixpoint key would disagree with what ran. Touch
+                            // only the exec bits, and only when the boolean
+                            // actually differs, so other mode bits stay put and
+                            // an already-correct file sees no spurious churn.
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if let Ok(meta) = std::fs::metadata(&dest) {
+                                    let cur = meta.permissions().mode();
+                                    if (cur & 0o111 != 0) != x {
+                                        let want = if x { cur | 0o111 } else { cur & !0o111 };
+                                        std::fs::set_permissions(
+                                            &dest,
+                                            std::fs::Permissions::from_mode(want),
+                                        )
+                                        .with_context(|| {
+                                            format!("reconcile exec bit on {:?}", dest)
+                                        })?;
+                                    }
                                 }
                             }
                             // Stamp net-new (Copy) outputs so a later fs glob
                             // excludes them. InPlace outputs overwrite tracked
-                            // sources and stay unstamped. (xattr touches ctime,
-                            // not mtime, so it does not perturb the fixpoint.)
+                            // sources and stay unstamped. (xattr is file metadata,
+                            // not content, so it does not perturb the content+x
+                            // fs hash.)
                             if matches!(mode, CodegenMode::Copy) {
                                 stamp_codegen_xattr(&dest, &stamp)?;
                             }
@@ -1277,16 +1321,17 @@ impl Engine {
     /// Called only on the execute path, *after* `materialize_codegen` has written
     /// the transformed files back to the tree. We recompute the target's `hashin`
     /// against that post-write-back state using a *fresh* request (the `@heph/fs`
-    /// inputs are cache-off and memoized per request, so a new request re-stats
+    /// inputs are cache-off and memoized per request, so a new request re-reads
     /// the just-written files and yields exactly the `hashin` the next run will
     /// see), then duplicate this run's primary cache revision under it.
     ///
-    /// This is faithful to how `@heph/fs` actually hashes inputs (size + mtime):
-    /// the key is derived from the real tree, not from output content hashes that
-    /// the next run would never reproduce. Combined with the write-if-changed
-    /// write-back (which leaves an already-correct file's mtime untouched), the
-    /// hit is stable across repeated runs. Best-effort: any failure leaves the
-    /// primary entry intact and the next run simply re-executes.
+    /// This is faithful to how `@heph/fs` actually hashes inputs (content +
+    /// exec-bit): the key is derived from the real tree, not from output content
+    /// hashes that the next run would never reproduce. Because the hash tracks
+    /// content (and the write-back leaves an already-correct file byte-for-byte
+    /// identical), re-reading the post-write-back tree reproduces the same key,
+    /// so the hit is stable across repeated runs. Best-effort: any failure leaves
+    /// the primary entry intact and the next run simply re-executes.
     async fn maybe_store_fixpoint(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
@@ -3411,6 +3456,43 @@ mod tests {
         Ok(())
     }
 
+    /// The on-disk exec bit is part of the `@heph/fs` (content + exec-bit) input
+    /// hash, so the in_place write-back must apply the generated artifact's `x`
+    /// even when the bytes are unchanged — otherwise a `+x`-only change never
+    /// lands on disk and the recomputed fixpoint key would disagree with what ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_back_applies_exec_bit_on_unchanged_content() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:mkexec",
+            "in_place",
+            &["*.sh"],
+            // Rewrite identical bytes, then mark the file executable in the
+            // sandbox. The bytes match what's already on disk, so write-back
+            // takes the unchanged path; only the exec bit differs and must be
+            // reconciled onto the tree.
+            "printf 'echo hi\\n' > run.sh && chmod +x run.sh",
+        )])?;
+        // Seed the exact bytes the run produces, but non-executable.
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let script = pkg_dir.join("run.sh");
+        std::fs::write(&script, b"echo hi\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))?;
+
+        let addr = crate::htaddr::parse_addr("//pkg:mkexec")?;
+        let (res, _events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("mkexec target resolves");
+
+        let mode = std::fs::metadata(&script)?.permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "write-back must apply the exec bit even when content is unchanged (mode {mode:o})",
+        );
+        Ok(())
+    }
+
     /// The headline guarantee: re-running an idempotent in_place transform over
     /// the already-transformed tree is a no-op cache hit (no re-execution).
     ///
@@ -3418,14 +3500,13 @@ mod tests {
     /// trailing-newline, writes it back, and registers a fixpoint cache revision
     /// keyed on the post-write-back tree state. Run 2 reads the now-normalized
     /// tree and must HIT the cache — the `fmt` target emits no `ExecuteStart`.
-    /// (The `@heph/fs` *inputs* still re-stat each run, so we assert specifically
-    /// that the `fmt` target did not execute.)
+    /// (The `@heph/fs` *inputs* are still re-read each run, so we assert
+    /// specifically that the `fmt` target did not execute.)
     ///
-    /// The transform changes the file SIZE on run 1 (5 → 6 bytes), so the fixpoint
-    /// key provably differs from the primary key on EVERY filesystem — `@heph/fs`
-    /// hashes by (size, mtime), and size alone separates the two keys regardless
-    /// of mtime granularity. This makes the stored fixpoint revision observable
-    /// (≥ 2 cache revisions) rather than relying on fine-grained mtime.
+    /// The transform changes the file CONTENT on run 1 (`hello` → `HELLO\n`), so
+    /// the fixpoint key provably differs from the primary key — `@heph/fs` hashes
+    /// by (content, exec-bit), and the changed bytes alone separate the two keys.
+    /// This makes the stored fixpoint revision observable (≥ 2 cache revisions).
     #[tokio::test]
     async fn fixpoint_hit() -> anyhow::Result<()> {
         let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
@@ -3436,11 +3517,11 @@ mod tests {
             // cwd = ws/pkg. Uppercase + ensure exactly one trailing newline. The
             // command substitution strips trailing newlines, `printf '%s\n'`
             // re-adds one, so f(f(x)) == f(x); on the FIRST run over a newline-
-            // less lowercase seed it also changes the size.
+            // less lowercase seed it also changes the content.
             "printf '%s\\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
         )])?;
-        // Seed a lowercase, newline-less source (5 bytes) → run 1 yields "HELLO\n"
-        // (6 bytes), a guaranteed size change.
+        // Seed a lowercase, newline-less source → run 1 yields "HELLO\n", a
+        // guaranteed content change (case + trailing newline).
         let pkg_dir = root.path().join("pkg");
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
@@ -3463,12 +3544,12 @@ mod tests {
             "in_place run 1 must transform the tree file"
         );
         // Run 2: reads the already-transformed tree → fixpoint cache hit.
-        // Because the transform changed the file SIZE, run 2's hashin (over the
-        // 6-byte file) can only match the fixpoint revision, never the primary
-        // (which is keyed over the 5-byte seed). So "no execute on run 2" is, on
-        // every filesystem, proof that the fixpoint revision was stored — no need
-        // to count cache entries (the background GC may legitimately reclaim the
-        // now-stale primary once the fixpoint exists).
+        // Because the transform changed the file CONTENT, run 2's hashin (over the
+        // uppercased bytes) can only match the fixpoint revision, never the
+        // primary (which is keyed over the lowercase seed). So "no execute on run
+        // 2" is proof that the fixpoint revision was stored — no need to count
+        // cache entries (the background GC may legitimately reclaim the now-stale
+        // primary once the fixpoint exists).
         let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
         second.expect("second resolve must succeed");
         assert!(
@@ -3751,6 +3832,90 @@ mod tests {
             .result_addr(rs.clone(), &addr, OutputMatcher::All, &frozen_opts)
             .await
             .expect("frozen check on a clean tree must succeed");
+        Ok(())
+    }
+
+    /// `--frozen` must also catch an exec-bit-only divergence: the on-disk bytes
+    /// match the generated output but the exec bit differs. Since `@heph/fs` now
+    /// hashes (content + exec-bit), this is real drift a non-frozen run would
+    /// write back, so frozen must fail rather than report the tree clean.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_fails_on_exec_bit_drift() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let addr = crate::htaddr::parse_addr("//pkg:mkexec")?;
+        let frozen_opts = ResultOptions {
+            frozen: true,
+            ..Default::default()
+        };
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:mkexec",
+            "in_place",
+            &["*.sh"],
+            // Identical bytes to the seed, but executable in the sandbox.
+            "printf 'echo hi\\n' > run.sh && chmod +x run.sh",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let script = pkg_dir.join("run.sh");
+        std::fs::write(&script, b"echo hi\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))?;
+
+        let rs = engine.new_state();
+        let err = engine
+            .clone()
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &frozen_opts)
+            .await
+            .err()
+            .expect("frozen check must fail on exec-bit-only drift");
+        drop(rs);
+        let tf = err
+            .downcast_ref::<TargetFailure>()
+            .expect("top-level error must be a recorded TargetFailure");
+        assert!(
+            downcast_chain_ref::<crate::engine::error::FrozenCheckError>(tf.source.as_ref())
+                .is_some(),
+            "frozen failure must carry a FrozenCheckError, got: {err:#}"
+        );
+        // Frozen never writes: the tree file stays non-executable.
+        let mode = std::fs::metadata(&script)?.permissions().mode();
+        assert!(
+            mode & 0o111 == 0,
+            "frozen mode must not chmod the tree (mode {mode:o})"
+        );
+        Ok(())
+    }
+
+    /// Mirror of `write_back_applies_exec_bit_on_unchanged_content` for the strip
+    /// direction: an in_place target that emits a NON-executable file over a
+    /// byte-identical executable tree file must clear the exec bit on write-back
+    /// (x=false is part of the hash identity just as x=true is).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_back_strips_exec_bit_on_unchanged_content() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:rmexec",
+            "in_place",
+            &["*.sh"],
+            // Identical bytes, but explicitly non-executable in the sandbox.
+            "printf 'echo hi\\n' > run.sh && chmod -x run.sh",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let script = pkg_dir.join("run.sh");
+        std::fs::write(&script, b"echo hi\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+
+        let addr = crate::htaddr::parse_addr("//pkg:rmexec")?;
+        let (res, _events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("rmexec target resolves");
+
+        let mode = std::fs::metadata(&script)?.permissions().mode();
+        assert!(
+            mode & 0o111 == 0,
+            "write-back must strip the exec bit even when content is unchanged (mode {mode:o})",
+        );
         Ok(())
     }
 
