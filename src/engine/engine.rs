@@ -44,8 +44,11 @@ impl Default for MemCacheOptions {
     }
 }
 
-pub type ProviderFactory =
-    Box<dyn FnOnce(&Path, &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync>;
+/// Factory args: workspace root, the engine-owned directories every provider
+/// must skip (e.g. the heph home dir), and the provider's YAML options.
+pub type ProviderFactory = Box<
+    dyn FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync,
+>;
 pub type DriverFactory =
     Box<dyn FnOnce(&Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync>;
 pub type ManagedDriverFactory =
@@ -443,7 +446,7 @@ impl Engine {
     pub fn register_provider_factory(
         &mut self,
         name: &str,
-        factory: impl FnOnce(&Path, &Options) -> anyhow::Result<Box<dyn SDKProvider>>
+        factory: impl FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>>
         + Send
         + Sync
         + 'static,
@@ -504,12 +507,15 @@ impl Engine {
         drivers: &[PluginEntry],
     ) -> anyhow::Result<()> {
         let root = self.cfg.root.clone();
+        // Directories the engine owns and no provider should walk into. The
+        // home dir holds the local cache, sandboxes, locks — never packages.
+        let skip_dirs = [self.home.clone()];
         for entry in providers {
             let factory = self
                 .provider_factories
                 .remove(&entry.name)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", entry.name))?;
-            let provider = factory(&root, &entry.options)?;
+            let provider = factory(&root, &skip_dirs, &entry.options)?;
             let resolved_name = provider.config(provider::ConfigRequest {})?.name;
             if resolved_name != entry.name {
                 return Err(anyhow::anyhow!(

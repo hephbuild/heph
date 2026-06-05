@@ -2088,6 +2088,52 @@ mod tests {
         );
     }
 
+    // Repro: `//...` (PackagePrefix("")) must surface targets in the ROOT
+    // package's BUILD file, not just nested packages.
+    #[tokio::test]
+    async fn query_recursive_includes_root_build_file() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        // Root-package BUILD.
+        std::fs::write(
+            root.path().join("BUILD"),
+            r#"target(name = "root_t", driver = "d")"#,
+        )?;
+        // Nested-package BUILD.
+        std::fs::create_dir_all(root.path().join("sub"))?;
+        std::fs::write(
+            root.path().join("sub").join("BUILD"),
+            r#"target(name = "sub_t", driver = "d")"#,
+        )?;
+
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|root| {
+            Box::new(crate::pluginbuildfile::Provider::new(root.to_path_buf()))
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let addrs: Vec<Addr> = SArc::clone(&engine)
+            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .try_collect()
+            .await?;
+
+        let names: Vec<&str> = addrs.iter().map(|a| a.name.as_str()).collect();
+        assert!(
+            names.contains(&"sub_t"),
+            "nested target must be found: {names:?}"
+        );
+        assert!(
+            names.contains(&"root_t"),
+            "root-package target must be found: {names:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn engine_wires_provider_functions_into_buildfile() -> anyhow::Result<()> {
         // End-to-end: the engine must aggregate `fs`'s exposed `glob` function and

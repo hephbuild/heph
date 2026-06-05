@@ -37,14 +37,60 @@ use std::sync::Arc;
 
 const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
 
+/// Prunes directories during Go package discovery. Two prune sources:
+///  - `dirs`: absolute engine-owned paths (e.g. the heph home) the engine hands
+///    every provider; matched by exact path.
+///  - `globs`: user `skip` wax patterns, matched against the workspace-relative
+///    package path.
+#[derive(Debug, Default)]
+pub struct SkipMatcher {
+    dirs: Vec<PathBuf>,
+    globs: Option<wax::Any<'static>>,
+}
+
+impl SkipMatcher {
+    fn new(dirs: &[PathBuf], globs: &[String]) -> anyhow::Result<Self> {
+        let compiled = if globs.is_empty() {
+            None
+        } else {
+            let gs = globs
+                .iter()
+                .map(|s| {
+                    wax::Glob::new(s)
+                        .map(wax::Glob::into_owned)
+                        .with_context(|| format!("go provider: invalid skip pattern `{s}`"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Some(wax::any(gs).context("compiling go skip patterns")?)
+        };
+        Ok(Self {
+            dirs: dirs.to_vec(),
+            globs: compiled,
+        })
+    }
+
+    /// True if the dir at absolute `path` (workspace-relative `rel`) is pruned.
+    fn is_skipped(&self, path: &Path, rel: &Path) -> bool {
+        use wax::Program as _;
+        if self.dirs.iter().any(|d| d == path) {
+            return true;
+        }
+        self.globs.as_ref().is_some_and(|any| any.is_match(rel))
+    }
+}
+
 pub struct Config {
     pub go_bin_addr: String,
+    /// Directories to prune during package discovery: engine-owned dirs plus
+    /// user `skip` globs. See [`SkipMatcher`].
+    pub skip: Arc<SkipMatcher>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             go_bin_addr: DEFAULT_GO_BIN_ADDR.to_string(),
+            skip: Arc::new(SkipMatcher::default()),
         }
     }
 }
@@ -63,6 +109,8 @@ pub(crate) struct ProviderInner {
     gopath: String,
     gocache: String,
     go_bin_addr: String,
+    /// Directories pruned during `collect_go_packages` (engine home + user globs).
+    skip: Arc<SkipMatcher>,
     /// Cache: golist addr → parsed GoPackage. Memoizes the artifact parse only;
     /// the underlying `executor.result(golist_addr)` is always called outside
     /// the `once` closure so every caller (owner + waiter) registers the
@@ -130,13 +178,18 @@ impl Provider {
 
     pub fn from_options(
         workspace_root: PathBuf,
+        skip_dirs: &[PathBuf],
         opts: &crate::engine::config_file::Options,
     ) -> anyhow::Result<Self> {
-        crate::engine::config_file::deny_unknown("go provider", opts, &["gotool"])?;
+        crate::engine::config_file::deny_unknown("go provider", opts, &["gotool", "skip"])?;
         let go_bin_addr: String =
             crate::engine::config_file::decode_opt(opts, "go provider", "gotool")?
                 .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
-        Self::with_config(workspace_root, Config { go_bin_addr })
+        let skip_globs: Vec<String> =
+            crate::engine::config_file::decode_opt(opts, "go provider", "skip")?
+                .unwrap_or_default();
+        let skip = Arc::new(SkipMatcher::new(skip_dirs, &skip_globs)?);
+        Self::with_config(workspace_root, Config { go_bin_addr, skip })
     }
 
     pub fn go_bin_addr(&self) -> &str {
@@ -156,6 +209,7 @@ impl Provider {
                 gopath,
                 gocache,
                 go_bin_addr: config.go_bin_addr,
+                skip: config.skip,
                 pkg_cache: Memoizer::with_tag("pkg_cache"),
                 pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
                 libs_cache: Memoizer::with_tag("libs_cache"),
@@ -203,6 +257,7 @@ fn collect_go_packages(
     dir: &Path,
     workspace_root: &Path,
     under_gomod: bool,
+    skip: &SkipMatcher,
     result: &mut Vec<anyhow::Result<ListPackageResponse>>,
 ) {
     let is_under = under_gomod || crate::plugingo::addr_util::find_go_mod(dir).is_some();
@@ -236,7 +291,14 @@ fn collect_go_packages(
         {
             continue;
         }
-        collect_go_packages(&entry.path(), workspace_root, is_under, result);
+        let entry_path = entry.path();
+        let rel = entry_path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&entry_path);
+        if skip.is_skipped(&entry_path, rel) {
+            continue;
+        }
+        collect_go_packages(&entry_path, workspace_root, is_under, skip, result);
     }
 }
 
@@ -441,9 +503,9 @@ impl ProviderInner {
             }
 
             let packages = crate::process_supervisor::block_or_inline(
-                enclose!((self.workspace_root => workspace_root) move || {
+                enclose!((self.workspace_root => workspace_root, self.skip => skip) move || {
                     let mut packages = Vec::new();
-                    collect_go_packages(&search_dir, &workspace_root, false, &mut packages);
+                    collect_go_packages(&search_dir, &workspace_root, false, &skip, &mut packages);
                     packages
                 }),
             );
@@ -2300,6 +2362,35 @@ mod tests {
 
     fn make_addr(package: &str, name: &str) -> Addr {
         Addr::new(PkgBuf::from(package), name.to_string(), Default::default())
+    }
+
+    #[test]
+    fn collect_go_packages_respects_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.mod"), "module example.com/x\n").unwrap();
+        // root/heph-home (core skip dir, non-dotted so the dot-rule can't mask
+        // it), root/internal (glob skip), root/src (kept).
+        let home = root.join("heph-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(root.join("internal")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let skip = SkipMatcher::new(&[home.clone()], &["internal".to_string()]).unwrap();
+        let mut out = Vec::new();
+        collect_go_packages(root, root, false, &skip, &mut out);
+        let pkgs: Vec<String> = out
+            .into_iter()
+            .map(|r| r.unwrap().pkg.to_string())
+            .collect();
+
+        assert!(pkgs.contains(&"".to_string()));
+        assert!(pkgs.contains(&"src".to_string()));
+        assert!(
+            !pkgs.contains(&"heph-home".to_string()),
+            "core dir not pruned"
+        );
+        assert!(!pkgs.contains(&"internal".to_string()), "glob not pruned");
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {

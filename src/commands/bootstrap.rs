@@ -138,15 +138,17 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     )))?;
 
     // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
-    e.register_provider_factory("buildfile", |root, opts| {
+    e.register_provider_factory("buildfile", |root, skip_dirs, opts| {
         Ok(Box::new(pluginbuildfile::Provider::from_options(
             root.to_path_buf(),
+            skip_dirs,
             opts,
         )?))
     })?;
-    e.register_provider_factory("go", |root, opts| {
+    e.register_provider_factory("go", |root, skip_dirs, opts| {
         Ok(Box::new(plugingo::Provider::from_options(
             root.to_path_buf(),
+            skip_dirs,
             opts,
         )?))
     })?;
@@ -257,9 +259,10 @@ mod tests {
             home_dir.join("nix-driver"),
         )))?;
 
-        e.register_provider_factory("buildfile", |root, opts| {
+        e.register_provider_factory("buildfile", |root, skip_dirs, opts| {
             Ok(Box::new(pluginbuildfile::Provider::from_options(
                 root.to_path_buf(),
+                skip_dirs,
                 opts,
             )?))
         })?;
