@@ -140,6 +140,29 @@ impl std::error::Error for TargetFailure {
     }
 }
 
+/// Raised by `--frozen` codegen verification when a target's generated output
+/// does not match what is currently on disk in the workspace tree. Carries the
+/// offending target's addr and a concatenated unified-diff body (one diff per
+/// differing file, tree=old / generated=new). Nothing is written in frozen mode.
+#[derive(Debug)]
+pub struct FrozenCheckError {
+    pub addr: Addr,
+    pub diff: String,
+}
+
+impl fmt::Display for FrozenCheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "frozen check failed: {} — generated output differs from tree:",
+            self.addr.format()
+        )?;
+        write!(f, "{}", self.diff)
+    }
+}
+
+impl std::error::Error for FrozenCheckError {}
+
 /// Returns the last `n` lines of `s`, joined with `\n`. A trailing newline does
 /// not count as an extra empty line (`str::lines` already drops it).
 pub fn last_n_lines(s: &str, n: usize) -> String {

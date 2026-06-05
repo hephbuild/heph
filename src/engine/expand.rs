@@ -1,4 +1,6 @@
 use crate::engine::Engine;
+use crate::engine::driver::TargetAddr;
+use crate::engine::driver::targetdef::path::Content;
 use crate::engine::driver::targetdef::{Input, InputMode};
 use crate::engine::request_state::RequestState;
 use crate::hmemoizer::unwrap_arc_err;
@@ -8,6 +10,106 @@ use enclose::enclose;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Package of the engine-baked magic introspection targets.
+pub const INTROSPECT_PKG: &str = "@heph/introspect";
+/// Name of the magic input that expands to one `@heph/fs` input per declared
+/// output path of the *owning* target.
+pub const INTROSPECT_OUTPUTS_NAME: &str = "outputs";
+
+/// True if `addr` is the `//@heph/introspect:outputs` magic input.
+fn is_introspect_outputs(addr: &Addr) -> bool {
+    addr.package.as_str() == INTROSPECT_PKG && addr.name == INTROSPECT_OUTPUTS_NAME
+}
+
+/// Builds one `Input` referencing the `@heph/fs` addr `fs_addr`. The fs addr
+/// already encodes a root-relative path/pattern (see [`synthesized_fs_inputs`]).
+///
+/// The synthesized input INHERITS the replaced magic input's `origin_id`, `mode`
+/// and `annotations`. This is load-bearing for the exec driver: `$SRC_<GROUP>` /
+/// `$LIST_<GROUP>` routing matches a target's declared `dep_group_inputs` (which
+/// still carry the magic input's origin id) against the materialized run inputs
+/// by `origin_id`. Reusing the template's origin id makes the synthesized fs
+/// files surface through the same `SRC`/`LIST` group the user declared the
+/// `//@heph/introspect:outputs` dep under (multiple paths share one origin id, so
+/// the managed bridge merges them into one list file).
+fn introspect_input(fs_addr: Addr, template: &Input) -> Input {
+    Input {
+        r#ref: TargetAddr {
+            r#ref: fs_addr,
+            output: None,
+            filters: vec![],
+        },
+        mode: template.mode.clone(),
+        origin_id: template.origin_id.clone(),
+        annotations: template.annotations.clone(),
+        hashed: true,
+        runtime: true,
+    }
+}
+
+/// Expands the `//@heph/introspect:outputs` magic input into one `@heph/fs`
+/// input per declared output path of `outputs`.
+///
+/// Output path strings are already root-relative: the exec driver prepends the
+/// owning package to each declared `out` entry (`spec_path_to_target_path`), so
+/// a `//pkg:gen` target declaring `out=["*.go"]` stores `Glob("pkg/*.go")`. The
+/// `@heph/fs` driver resolves a glob/file addr's `p`/`f` arg relative to the
+/// same workspace root (`walk_glob` joins the pattern's literal prefix onto
+/// `root`), so feeding the path verbatim into `glob_addr`/`file_addr` makes the
+/// synthesized input read exactly the files the output declares.
+///
+/// Ordering is deterministic (outputs then their paths, in declaration order);
+/// the same fs addr is never emitted twice within one expansion.
+fn synthesized_fs_inputs(
+    outputs: &[crate::engine::driver::targetdef::Output],
+    template: &Input,
+) -> Vec<Input> {
+    let mut seen = FxHashSet::default();
+    let mut out = Vec::new();
+    for output in outputs {
+        for path in &output.paths {
+            let fs_addr = match &path.content {
+                Content::FilePath(p) => crate::pluginfs::file_addr(p),
+                Content::Glob(p) => crate::pluginfs::glob_addr(p, &[]),
+                Content::DirPath(p) => {
+                    crate::pluginfs::glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[])
+                }
+            };
+            if seen.insert(fs_addr.clone()) {
+                out.push(introspect_input(fs_addr, template));
+            }
+        }
+    }
+    out
+}
+
+/// Returns `def.inputs` with every `//@heph/introspect:outputs` magic input
+/// replaced by the `@heph/fs` inputs synthesized from `def.outputs`. Non-magic
+/// inputs pass through unchanged and in order.
+///
+/// Allocate-on-write: if no magic input is present the original `inputs` Vec is
+/// cloned only once (the common case still pays a clone because the caller needs
+/// an owned `Vec` for `expand_inputs`).
+pub(crate) fn expand_introspect_inputs(def: &mut crate::engine::driver::targetdef::TargetDef) {
+    if !def
+        .inputs
+        .iter()
+        .any(|i| is_introspect_outputs(&i.r#ref.r#ref))
+    {
+        return;
+    }
+
+    let mut rebuilt = Vec::with_capacity(def.inputs.len());
+    for input in &def.inputs {
+        if is_introspect_outputs(&input.r#ref.r#ref) {
+            rebuilt.extend(synthesized_fs_inputs(&def.outputs, input));
+        } else {
+            rebuilt.push(input.clone());
+        }
+    }
+    def.inputs = rebuilt;
+}
 
 /// Routing context inherited from a parent transparent-group input. Carries
 /// origin_id/mode/annotations plus the parent's `hashed`/`runtime` flags so
@@ -39,6 +141,11 @@ impl Engine {
                     // _no_track: result_addr (the upstream entry point) already set
                     // parent=addr before getting here, so tracked get_def would
                     // record addr→addr (spurious self-cycle).
+                    // `def.target_def.inputs` has already had the engine-baked
+                    // `//@heph/introspect:outputs` magic input expanded into
+                    // `@heph/fs` inputs during `get_def` (see
+                    // `expand_introspect_inputs` in result.rs::get_def_inner),
+                    // so the transparent-group walk below never sees it.
                     let def = Arc::clone(&engine)
                         .get_def_no_track(rs.clone(), &addr)
                         .await?;
@@ -300,8 +407,11 @@ mod tests {
             ..Default::default()
         })?;
         // group driver is registered by Engine::new; only the exec driver
-        // needs adding here.
+        // needs adding here. The fs provider/driver resolves the synthesized
+        // `@heph/fs` inputs produced by introspect-outputs expansion.
         engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
+        engine.register_provider(|_| Box::new(crate::pluginfs::Provider))?;
+        engine.register_driver(Box::new(crate::pluginfs::Driver))?;
         engine.register_provider(move |_| Box::new(CannedProvider { specs }))?;
         Ok((Arc::new(engine), root))
     }
@@ -383,6 +493,101 @@ mod tests {
         assert_eq!(
             expanded[0].annotations.get("custom").map(String::as_str),
             Some("p"),
+        );
+        Ok(())
+    }
+
+    /// An exec spec declaring `out` paths and a dep on the magic
+    /// `//@heph/introspect:outputs` target. The driver stores `out` entries as
+    /// package-prefixed output paths and the magic dep as a `Standard` input.
+    fn introspect_exec_spec(addr: &str, out: &[&str], deps: &[&str]) -> TargetSpec {
+        let mut config = HashMap::new();
+        config.insert("run".to_string(), Value::String("true".to_string()));
+        config.insert(
+            "out".to_string(),
+            Value::List(
+                out.iter()
+                    .map(|s| Value::String((*s).to_string()))
+                    .collect(),
+            ),
+        );
+        config.insert(
+            "deps".to_string(),
+            Value::List(
+                deps.iter()
+                    .map(|s| Value::String((*s).to_string()))
+                    .collect(),
+            ),
+        );
+        TargetSpec {
+            addr: crate::htaddr::parse_addr(addr).expect("parse addr"),
+            driver: "exec".to_string(),
+            config,
+            labels: vec![],
+            transitive: Default::default(),
+        }
+    }
+
+    // The engine-baked `//@heph/introspect:outputs` magic input must expand into
+    // one `@heph/fs` input per declared output path of the *owning* target —
+    // never a plain glob, and a FilePath output yields `@heph/fs:file`. Both the
+    // hashing and execution paths consume `expanded_inputs_for`, so verifying it
+    // here covers both. Output paths are package-prefixed by the exec driver and
+    // fed verbatim into the fs addr, so the fs target resolves the same on-disk
+    // files relative to the workspace root.
+    #[tokio::test]
+    async fn introspect_outputs_expands_to_fs_inputs() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with(vec![introspect_exec_spec(
+            "//pkg:gen",
+            &["*.go", "foo.txt"],
+            &["//@heph/introspect:outputs"],
+        )])?;
+
+        let rs = engine.new_state();
+        let addr = crate::htaddr::parse_addr("//pkg:gen")?;
+        let expanded = Arc::clone(&engine).expanded_inputs_for(rs, &addr).await?;
+
+        let addrs: Vec<String> = expanded.iter().map(|i| i.r#ref.r#ref.format()).collect();
+
+        // The magic addr itself is gone.
+        assert!(
+            !addrs.iter().any(|a| a.contains("@heph/introspect")),
+            "magic addr must be expanded away, got: {addrs:?}",
+        );
+
+        // `*.go` → glob over the package-prefixed pattern.
+        let want_glob = crate::pluginfs::glob_addr("pkg/*.go", &[]).format();
+        assert!(
+            addrs.contains(&want_glob),
+            "expected glob input {want_glob}, got: {addrs:?}",
+        );
+
+        // `foo.txt` → single-file fs input over the package-prefixed path.
+        let want_file = crate::pluginfs::file_addr("pkg/foo.txt").format();
+        assert!(
+            addrs.contains(&want_file),
+            "expected file input {want_file}, got: {addrs:?}",
+        );
+
+        assert_eq!(
+            expanded.len(),
+            2,
+            "exactly one fs input per declared output path, got: {addrs:?}",
+        );
+
+        // Both synthesized inputs INHERIT the magic dep's origin_id (not a
+        // per-path synthesized one), so the exec driver's $SRC_/$LIST_ routing —
+        // which matches a target's declared dep groups against materialized run
+        // inputs by origin_id — surfaces the introspect files to the run script.
+        let oids: Vec<&str> = expanded.iter().map(|i| i.origin_id.as_str()).collect();
+        assert!(
+            oids.iter().all(|o| *o == oids[0]),
+            "introspect inputs must share the magic dep's origin_id, got: {oids:?}",
+        );
+        assert!(
+            !oids[0].starts_with("introspect_outputs"),
+            "origin_id must be inherited from the magic dep, not synthesized, got: {:?}",
+            oids[0],
         );
         Ok(())
     }

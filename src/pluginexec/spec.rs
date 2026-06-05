@@ -120,7 +120,7 @@ impl TargetSpec {
             spec.codegen = match parse_string(v)? {
                 Some(s) => match s.as_str() {
                     "copy" => Ok(CodegenMode::Copy),
-                    "link" => Ok(CodegenMode::Link),
+                    "in_place" => Ok(CodegenMode::InPlace),
                     _ => Err(anyhow::anyhow!("invalid codegen mode: {}", s)),
                 },
                 None => Ok(CodegenMode::None),
@@ -392,5 +392,35 @@ mod tests {
             spec.tools.get("cc"),
             Some(&vec!["//toolchain:gcc".to_string()])
         );
+    }
+
+    #[test]
+    fn test_codegen_in_place_parsed() {
+        let spec = make_spec([("codegen", Value::String("in_place".to_string()))]).unwrap();
+        assert_eq!(spec.codegen, CodegenMode::InPlace);
+    }
+
+    #[test]
+    fn test_codegen_copy_parsed() {
+        let spec = make_spec([("codegen", Value::String("copy".to_string()))]).unwrap();
+        assert_eq!(spec.codegen, CodegenMode::Copy);
+    }
+
+    #[test]
+    fn test_codegen_link_now_errors() {
+        let err = match make_spec([("codegen", Value::String("link".to_string()))]) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("invalid codegen mode: link"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_default_none() {
+        let spec = make_spec([]).unwrap();
+        assert_eq!(spec.codegen, CodegenMode::None);
     }
 }

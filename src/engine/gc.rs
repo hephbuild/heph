@@ -18,13 +18,12 @@
 
 use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
-use crate::engine::local_cache::{MANIFEST_V1, Manifest, NotFoundError};
+use crate::engine::local_cache::MANIFEST_V1;
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::ResultWriteGuard;
 use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::{Addr, parse_addr};
 use anyhow::{Context, Result};
-use std::io::Read as _;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -65,24 +64,6 @@ enum Decision {
 }
 
 impl Engine {
-    /// Read and deserialize a group's manifest. `Ok(None)` if it is absent.
-    fn read_manifest(&self, addr: &Addr, hashin: &str) -> Result<Option<Manifest>> {
-        let sized = match self.local_cache.reader(addr, hashin, MANIFEST_V1) {
-            Ok(s) => s,
-            Err(e) if e.is::<NotFoundError>() => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("read manifest for {addr} {hashin}")),
-        };
-        let mut buf = Vec::with_capacity(sized.size as usize);
-        sized
-            .reader
-            .take(sized.size)
-            .read_to_end(&mut buf)
-            .with_context(|| format!("read manifest bytes for {addr} {hashin}"))?;
-        let manifest = borsh::from_slice::<Manifest>(&buf)
-            .with_context(|| format!("deserialize manifest for {addr} {hashin}"))?;
-        Ok(Some(manifest))
-    }
-
     /// Delete one cache revision: every artifact named in its manifest, then the
     /// manifest itself. Returns the bytes freed (Σ manifest artifact sizes).
     /// Best-effort if the manifest is missing (still removes the manifest key in

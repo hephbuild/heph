@@ -10,6 +10,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use enclose::enclose;
 use std::fs::File;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::{io, time};
@@ -306,6 +307,7 @@ impl Engine {
         )
     }
 
+    /// Persist `artifacts` for `addr` under the input hash `hashin`.
     pub async fn cache_locally(
         &self,
         ctoken: &dyn Cancellable,
@@ -353,6 +355,105 @@ impl Engine {
             .with_context(|| format!("write manifest for {addr}"))?;
 
         Ok(res_artifacts)
+    }
+
+    /// Read and deserialize a group's manifest. `Ok(None)` if it is absent.
+    pub(crate) fn read_manifest(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<Manifest>> {
+        let sized = match self.local_cache.reader(addr, hashin, MANIFEST_V1) {
+            Ok(s) => s,
+            Err(e) if e.is::<NotFoundError>() => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read manifest for {addr} {hashin}")),
+        };
+        let mut buf = Vec::with_capacity(sized.size as usize);
+        sized
+            .reader
+            .take(sized.size)
+            .read_to_end(&mut buf)
+            .with_context(|| format!("read manifest bytes for {addr} {hashin}"))?;
+        let manifest = borsh::from_slice::<Manifest>(&buf)
+            .with_context(|| format!("deserialize manifest for {addr} {hashin}"))?;
+        Ok(Some(manifest))
+    }
+
+    /// Copy a complete cache revision (manifest + every blob) from `src_key` to
+    /// `dst_key`. Returns `false` (no-op) when the keys are equal or the source
+    /// manifest is absent. Used by the in_place fixpoint path to register the
+    /// just-written entry under the key a subsequent run will compute.
+    pub(crate) fn duplicate_cache_revision(
+        &self,
+        addr: &Addr,
+        src_key: &str,
+        dst_key: &str,
+    ) -> anyhow::Result<bool> {
+        if src_key == dst_key {
+            return Ok(false);
+        }
+        let Some(manifest) = self.read_manifest(addr, src_key)? else {
+            return Ok(false);
+        };
+        self.duplicate_cache_entry(addr, src_key, dst_key, &manifest)?;
+        Ok(true)
+    }
+
+    /// Copy the blobs named in `manifest` from `src_key` to `dst_key`, then write
+    /// `manifest` (rewritten with `hashin = dst_key`) under `dst_key`. Blob bytes
+    /// are copied verbatim so the duplicate is identical to the primary; only the
+    /// manifest's `hashin` differs so a reader keyed by `dst_key` sees a
+    /// consistent revision.
+    fn duplicate_cache_entry(
+        &self,
+        addr: &Addr,
+        src_key: &str,
+        dst_key: &str,
+        manifest: &Manifest,
+    ) -> anyhow::Result<()> {
+        for artifact in &manifest.artifacts {
+            let mut reader = self
+                .local_cache
+                .reader(addr, src_key, &artifact.name)
+                .with_context(|| {
+                    format!("open source blob {} for {addr} {src_key}", artifact.name)
+                })?
+                .reader;
+            let mut writer = self
+                .local_cache
+                .writer(addr, dst_key, &artifact.name)
+                .with_context(|| {
+                    format!("open dest blob {} for {addr} {dst_key}", artifact.name)
+                })?;
+            io::copy(&mut reader, &mut writer).with_context(|| {
+                format!("copy blob {} for {addr} into {dst_key}", artifact.name)
+            })?;
+        }
+
+        // Stamp the duplicate with a freshly-sampled, strictly-newer timestamp.
+        // The fixpoint key is the most useful revision for a *subsequent* run
+        // (it makes the already-transformed tree hit cache), so it must not be
+        // the first thing the post-write history trim (`keep` newest) reclaims:
+        // it has to outrank the primary on `created_at_nanos`. The primary is
+        // independently protected by the trim, so both survive even at
+        // `history = 1`.
+        let dup_created = Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .max(manifest.created_at_nanos.saturating_add(1));
+        let dup_manifest = Manifest {
+            hashin: dst_key.to_string(),
+            created_at_nanos: dup_created,
+            ..manifest.clone()
+        };
+        let mut manifest_writer = self
+            .local_cache
+            .writer(addr, dst_key, MANIFEST_V1)
+            .with_context(|| format!("open manifest writer for {addr} {dst_key}"))?;
+        borsh::to_writer(&mut manifest_writer, &dup_manifest)
+            .with_context(|| format!("write manifest for {addr} {dst_key}"))?;
+
+        Ok(())
     }
 
     pub async fn artifacts_from_local_cache(
@@ -427,5 +528,147 @@ impl Engine {
                 anyhow::Ok(Some((results, result_meta)))
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Config;
+    use crate::engine::driver::outputartifact;
+    use crate::engine::driver::targetdef::{CacheConfig, TargetDef};
+    use crate::engine::link::LinkedTargetDef;
+    use crate::hasync::StdCancellationToken;
+    use crate::htpkg::PkgBuf;
+    use std::collections::BTreeMap;
+
+    fn test_engine() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })
+        .expect("engine");
+        (engine, dir)
+    }
+
+    fn test_addr() -> Addr {
+        Addr::new(PkgBuf::from("pkg"), "tgt".to_string(), BTreeMap::new())
+    }
+
+    fn linked_def(addr: &Addr) -> LinkedTargetDef {
+        let target = Arc::new(TargetDef {
+            addr: addr.clone(),
+            labels: Vec::new(),
+            raw_def: Arc::new(()),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            support_files: Vec::new(),
+            cache: CacheConfig::on(false),
+            pty: false,
+            hash: Vec::new(),
+            transparent: false,
+        });
+        LinkedTargetDef {
+            target,
+            inputs: Vec::new(),
+        }
+    }
+
+    fn raw_artifact(name: &str, data: &[u8]) -> outputartifact::OutputArtifact {
+        outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: name.to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                data: data.to_vec(),
+                path: format!("{name}.txt"),
+                x: false,
+            }),
+            hashout: format!("hashout-{name}"),
+        }
+    }
+
+    /// `duplicate_cache_revision` (the in_place fixpoint primitive) must copy both
+    /// the manifest and every blob under the destination key, so a reader keyed by
+    /// it finds a complete revision identical to the source; and it must no-op on
+    /// equal keys or a missing source manifest.
+    #[tokio::test]
+    async fn duplicate_cache_revision_copies_manifest_and_blobs() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "PRIMARYHASH",
+                vec![raw_artifact("a", b"hello fixpoint")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        // No-ops: equal keys and a missing source manifest.
+        assert!(
+            !engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "PRIMARYHASH")
+                .expect("equal keys")
+        );
+        assert!(
+            !engine
+                .duplicate_cache_revision(&addr, "MISSINGHASH", "FIXPOINTKEY")
+                .expect("missing source")
+        );
+
+        // Real duplication under a derived key.
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "FIXPOINTKEY")
+                .expect("duplicate")
+        );
+
+        let (primary_arts, _) = engine
+            .artifacts_from_local_cache(&ctoken, &def, "PRIMARYHASH", vec!["out".to_string()])
+            .await
+            .expect("read primary")
+            .expect("primary present");
+        let (extra_arts, _) = engine
+            .artifacts_from_local_cache(&ctoken, &def, "FIXPOINTKEY", vec!["out".to_string()])
+            .await
+            .expect("read extra")
+            .expect("extra present");
+
+        assert_eq!(extra_arts.len(), 1);
+        assert_eq!(extra_arts[0].name, primary_arts[0].name);
+        assert_eq!(extra_arts[0].hashout, primary_arts[0].hashout);
+
+        // Blob bytes under the derived key match the primary's exactly.
+        let primary_bytes = drain_reader(
+            engine
+                .local_cache
+                .reader(&addr, "PRIMARYHASH", &primary_arts[0].name)
+                .expect("primary blob")
+                .reader,
+        );
+        let extra_bytes = drain_reader(
+            engine
+                .local_cache
+                .reader(&addr, "FIXPOINTKEY", &extra_arts[0].name)
+                .expect("extra blob")
+                .reader,
+        );
+        assert_eq!(primary_bytes, extra_bytes);
+        assert!(!primary_bytes.is_empty());
+    }
+
+    fn drain_reader(mut r: Box<dyn io::Read>) -> Vec<u8> {
+        let mut out = Vec::new();
+        io::Read::read_to_end(&mut r, &mut out).expect("read");
+        out
     }
 }

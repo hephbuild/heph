@@ -29,6 +29,19 @@ use xxhash_rust::xxh3::Xxh3;
 const PKG: &str = "@heph/fs";
 pub const DRIVER_NAME: &str = "fs";
 
+/// Extended-attribute name stamped on net-new codegen files written back to the
+/// tree (value = the generator's addr). Raw source reads must skip these so a
+/// generated file is never double-sourced.
+pub const CODEGEN_XATTR: &str = "user.heph.codegen";
+
+/// True if the file at `path` carries the codegen provenance xattr.
+///
+/// A filesystem that does not support xattrs (or any IO error) is treated as
+/// "not stamped" so globbing/file reads never break on such trees.
+fn has_codegen_xattr(path: &std::path::Path) -> bool {
+    matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
+}
+
 /// Returns the `Addr` for a single-file fs target.
 /// Consumers use this to reference a file without knowing the internal address format.
 pub fn file_addr(path: &str) -> Addr {
@@ -495,6 +508,12 @@ fn walk_glob(
             continue;
         }
 
+        // Skip net-new codegen outputs stamped back into the tree — sourcing
+        // them here would double-source the generated content.
+        if has_codegen_xattr(abs_path) {
+            continue;
+        }
+
         let rel_str = rel.to_str().ok_or_else(|| {
             anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
         })?;
@@ -714,6 +733,17 @@ impl crate::engine::driver::Driver for Driver {
         match def {
             FsDef::File { path } => {
                 let abs = root.join(path);
+
+                // A file() over a net-new codegen output (stamped back into the
+                // tree) resolves to nothing — the generated content must only be
+                // sourced from its generator, never re-read as raw source.
+                if has_codegen_xattr(&abs) {
+                    return Ok(RunResponse {
+                        artifacts: vec![],
+                        ..Default::default()
+                    });
+                }
+
                 let meta = std::fs::metadata(&abs)
                     .with_context(|| format!("stat file '{}'", abs.display()))?;
                 let x = is_exec(&meta);
@@ -1871,5 +1901,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.target_spec.driver, DRIVER_NAME);
+    }
+
+    // ─── Codegen-xattr exclusion ───────────────────────────────────────────
+
+    /// Stamps the codegen xattr on `path` and returns whether the platform/FS
+    /// actually persisted it. Tests skip their assertions when this is `false`
+    /// so a tmpfs without xattr support can't make them flake.
+    fn stamp_codegen(path: &std::path::Path) -> bool {
+        if xattr::set(path, CODEGEN_XATTR, b"//pkg:gen").is_err() {
+            return false;
+        }
+        has_codegen_xattr(path)
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_excludes_stamped_codegen() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let plain = tmp.path().join("plain.rs");
+        let generated = tmp.path().join("generated.rs");
+        fs::write(&plain, b"plain").unwrap();
+        fs::write(&generated, b"generated").unwrap();
+
+        if !stamp_codegen(&generated) {
+            // Filesystem here doesn't support the codegen xattr; the exclusion
+            // can't be exercised, so don't assert anything misleading.
+            return;
+        }
+
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["plain.rs"], "stamped file must be excluded");
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_file_stamped_codegen_yields_nothing() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let generated = tmp.path().join("generated.rs");
+        fs::write(&generated, b"generated").unwrap();
+
+        if !stamp_codegen(&generated) {
+            return;
+        }
+
+        let config = std::collections::HashMap::from([(
+            "f".to_string(),
+            Value::String("generated.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        assert!(
+            res.artifacts.is_empty(),
+            "file() over a stamped codegen file must yield no artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_file_plain_yields_one_artifact() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let plain = tmp.path().join("plain.rs");
+        fs::write(&plain, b"plain").unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "f".to_string(),
+            Value::String("plain.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        assert_eq!(res.artifacts.len(), 1);
+        assert_eq!(res.artifacts[0].name, "plain.rs");
     }
 }

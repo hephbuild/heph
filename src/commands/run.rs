@@ -35,6 +35,9 @@ pub struct RunArgs {
     /// Exclude target address (repeatable, e.g. -e //pkg:target)
     #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS")]
     pub exclude: Vec<String>,
+    /// Fail if generated output differs from the tree (CI check)
+    #[arg(long = "frozen")]
+    pub frozen: bool,
 }
 
 struct RunApp {
@@ -102,6 +105,7 @@ impl App for RunApp {
             force: self.args.force,
             shell: self.args.shell.is_some(),
             interactive,
+            frozen: self.args.frozen,
         };
         let rs = self
             .engine

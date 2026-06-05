@@ -61,7 +61,7 @@ impl Engine {
         Ok(ResultMeta { hashin })
     }
 
-    fn hashin(
+    pub(crate) fn hashin(
         &self,
         def: &ExtendedTargetDef,
         results: Box<dyn Iterator<Item = String>>,

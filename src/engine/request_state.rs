@@ -165,8 +165,11 @@ pub struct RequestStateData {
     pub request_id: String,
     pub ctoken: StdCancellationToken,
     pub dep_dag: Mutex<DepDag>,
+    // Key includes `is_top`: top-level vs dependency resolution of the same
+    // (addr, outputs) must not share a cell, because only the top-level frame
+    // writes a codegen target's tree back / stores its fixpoint.
     pub mem_result:
-        Memoizer<(Addr, OutputMatcher), Result<Arc<crate::engine::result::EResult>, ArcErr>>,
+        Memoizer<(Addr, OutputMatcher, bool), Result<Arc<crate::engine::result::EResult>, ArcErr>>,
     pub mem_execute_cache: Memoizer<(Addr, String), ExecuteCacheResult>,
     pub mem_meta: Memoizer<Addr, Result<ResultMeta, ArcErr>>,
     pub mem_spec: Memoizer<Addr, Result<Arc<EngineTargetSpec>, ArcErr>>,
