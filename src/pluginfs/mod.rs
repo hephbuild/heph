@@ -530,8 +530,7 @@ fn walk_glob(
             // Other stat errors (e.g. permission) still surface with context.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("stat glob entry '{}'", abs_path.display()));
+                return Err(e).with_context(|| format!("stat glob entry '{}'", abs_path.display()));
             }
         };
         if meta.is_dir() {
@@ -1248,7 +1247,10 @@ mod tests {
             .unwrap();
         drop(f);
         let after = file_hashout(&p, false).unwrap();
-        assert_eq!(before, after, "mtime change must not affect the content hash");
+        assert_eq!(
+            before, after,
+            "mtime change must not affect the content hash"
+        );
     }
 
     /// A glob over a tree containing a symlink-to-dir (matching the pattern) and a
@@ -1271,8 +1273,10 @@ mod tests {
         // Dangling symlink that matches the pattern.
         std::os::unix::fs::symlink(root.join("missing"), root.join("dangling.txt")).unwrap();
 
-        let config =
-            std::collections::HashMap::from([("p".to_string(), Value::String("*.txt".to_string()))]);
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            Value::String("*.txt".to_string()),
+        )]);
         let parse_res = driver
             .parse(make_parse_req(config), &ctoken())
             .await

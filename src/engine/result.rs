@@ -1096,7 +1096,8 @@ impl Engine {
                     #[cfg(unix)]
                     if !exec_same {
                         let want = if x { "executable" } else { "non-executable" };
-                        frozen_diff.push_str(&format!("mode change: {path_label} should be {want}\n"));
+                        frozen_diff
+                            .push_str(&format!("mode change: {path_label} should be {want}\n"));
                     }
                 }
             } else {
@@ -1152,9 +1153,9 @@ impl Engine {
                                             &dest,
                                             std::fs::Permissions::from_mode(want),
                                         )
-                                        .with_context(|| {
-                                            format!("reconcile exec bit on {:?}", dest)
-                                        })?;
+                                        .with_context(
+                                            || format!("reconcile exec bit on {:?}", dest),
+                                        )?;
                                     }
                                 }
                             }
