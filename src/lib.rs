@@ -38,6 +38,7 @@ pub mod hmemoizer;
 pub mod htaddr;
 pub mod htmatcher;
 pub mod htpkg;
+pub mod htplatform;
 pub mod htvalue;
 pub mod log;
 pub mod pluginbuildfile;

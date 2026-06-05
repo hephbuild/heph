@@ -21,14 +21,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Build the Starlark globals: the static `starlark_module` builtins plus a
-/// dynamic `heph.<provider>.<fn>` namespace for every function the providers
-/// expose. Built once per buildfile-provider lifetime (the registry is fixed
-/// after the engine injects it).
+/// Build the Starlark globals: the static `starlark_module` builtins, the static
+/// `heph.core` host/platform namespace, plus a dynamic `heph.<provider>.<fn>`
+/// namespace for every function the providers expose. Built once per
+/// buildfile-provider lifetime (the registry is fixed after the engine injects it).
 fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
     let mut builder = GlobalsBuilder::standard();
     builder = builder.with(starlark_module);
     builder.with_namespace("heph", |hb| {
+        // Static `heph.core` host/platform builtins.
+        hb.namespace("core", heph_core_module);
         // One `heph.<provider>` namespace per provider; each function becomes a
         // native callable bridging into its async `ProviderFn`.
         for (provider, fns) in registry.providers() {
@@ -527,11 +529,35 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
 
         Ok(starlark::values::none::NoneType)
     }
+}
 
-    fn get_pkg<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
+#[starlark_module]
+fn heph_core_module(builder: &mut GlobalsBuilder) {
+    /// Host operating system in canonical (Go/OCI) naming, e.g. `linux`, `darwin`.
+    fn os() -> starlark::Result<String> {
+        Ok(crate::htplatform::os().to_string())
+    }
+
+    /// Host architecture in canonical (Go/OCI) naming, e.g. `amd64`, `arm64`.
+    fn arch() -> starlark::Result<String> {
+        Ok(crate::htplatform::arch().to_string())
+    }
+
+    /// Host operating system as Rust reports it, e.g. `linux`, `macos`.
+    fn os_raw() -> starlark::Result<String> {
+        Ok(crate::htplatform::os_raw().to_string())
+    }
+
+    /// Host architecture as Rust reports it, e.g. `x86_64`, `aarch64`.
+    fn arch_raw() -> starlark::Result<String> {
+        Ok(crate::htplatform::arch_raw().to_string())
+    }
+
+    /// The package currently being evaluated.
+    fn pkg<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
         let extra = eval
             .extra
-            .expect("evaluator extra must be set before calling get_pkg()")
+            .expect("evaluator extra must be set before calling heph.core.pkg()")
             .downcast_ref::<Extra>()
             .expect("evaluator extra must be of type Extra");
         Ok(extra.pkg.to_string())
@@ -1644,13 +1670,13 @@ target(name = "t", driver = "d", deps = coerce("single"))
     }
 
     #[test]
-    fn test_get_pkg_returns_current_pkg() {
+    fn test_heph_core_pkg_returns_current_pkg() {
         let tmp_dir = tempdir().unwrap();
         let pkg = tmp_dir.path().join("some").join("pkg");
         fs::create_dir_all(&pkg).unwrap();
         fs::write(
             pkg.join("BUILD"),
-            r#"target(name = "t", driver = "d", here = get_pkg())"#,
+            r#"target(name = "t", driver = "d", here = heph.core.pkg())"#,
         )
         .unwrap();
         let provider = make_provider(&tmp_dir);
@@ -1663,21 +1689,21 @@ target(name = "t", driver = "d", deps = coerce("single"))
     }
 
     #[test]
-    fn test_get_pkg_in_loaded_file_reports_loader_pkg() {
-        // load("//lib", ...) evaluates lib's BUILD under pkg "lib" — get_pkg() there
-        // returns "lib", not the caller's package.
+    fn test_heph_core_pkg_in_loaded_file_reports_loader_pkg() {
+        // load("//lib", ...) evaluates lib's BUILD under pkg "lib" — heph.core.pkg()
+        // there returns "lib", not the caller's package.
         let tmp_dir = tempdir().unwrap();
         let root = tmp_dir.path();
         let lib = root.join("lib");
         fs::create_dir_all(&lib).unwrap();
-        fs::write(lib.join("BUILD"), r#"WHERE = get_pkg()"#).unwrap();
+        fs::write(lib.join("BUILD"), r#"WHERE = heph.core.pkg()"#).unwrap();
         let app = root.join("app");
         fs::create_dir_all(&app).unwrap();
         fs::write(
             app.join("BUILD"),
             r#"
 load("//lib", "WHERE")
-target(name = "t", driver = "d", loaded_from = WHERE, here = get_pkg())
+target(name = "t", driver = "d", loaded_from = WHERE, here = heph.core.pkg())
 "#,
         )
         .unwrap();
@@ -1760,6 +1786,29 @@ target(
             }
             other => panic!("expected dict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_heph_core_host_builtins() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    os = heph.core.os(),
+    arch = heph.core.arch(),
+    os_raw = heph.core.os_raw(),
+    arch_raw = heph.core.arch_raw(),
+)
+"#;
+        let config = run_target_config(content);
+        let expect = |key: &str, want: &str| match config.get(key) {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, want, "for {key}"),
+            other => panic!("expected {key} string, got {other:?}"),
+        };
+        expect("os", crate::htplatform::os());
+        expect("arch", crate::htplatform::arch());
+        expect("os_raw", std::env::consts::OS);
+        expect("arch_raw", std::env::consts::ARCH);
     }
 
     #[test]
