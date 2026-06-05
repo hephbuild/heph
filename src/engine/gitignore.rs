@@ -60,7 +60,10 @@ impl Engine {
 /// Convert an output path into a root-anchored `.gitignore` pattern. Output
 /// paths are already workspace-root-relative (package-rooted), so a leading
 /// `/` anchors them precisely.
-fn content_to_pattern(content: &Content) -> String {
+///
+/// Reused by `validate` as the canonical, normalized output-path key for
+/// detecting overlapping `codegen = copy` outputs across targets.
+pub(crate) fn content_to_pattern(content: &Content) -> String {
     match content {
         Content::FilePath(p) => format!("/{}", p.trim_start_matches('/')),
         Content::DirPath(p) => format!("/{}/", p.trim_start_matches('/').trim_end_matches('/')),
