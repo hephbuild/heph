@@ -51,3 +51,4 @@ mod link;
 mod matcher_spec;
 mod meta;
 pub mod sandbox_cleaner;
+pub mod validate;

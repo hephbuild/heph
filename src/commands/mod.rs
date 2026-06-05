@@ -8,6 +8,7 @@ pub mod query;
 pub mod run;
 pub mod tool;
 mod utils;
+pub mod validate;
 pub mod version;
 
 pub use global::GlobalOptions;
@@ -27,6 +28,9 @@ pub enum Commands {
     /// Query targets
     #[command(visible_alias = "q")]
     Query(query::Args),
+    /// Validate all targets (link graph + check codegen outputs)
+    #[command(visible_alias = "v")]
+    Validate(validate::ValidateArgs),
     /// Prints version
     Version(version::Args),
     /// Garbage collect the local cache
@@ -44,6 +48,7 @@ impl Commands {
             Commands::Run(args) => run::execute(args, sink, global),
             Commands::Inspect(args) => args.execute(sink, global),
             Commands::Query(args) => query::execute(args, sink, global),
+            Commands::Validate(args) => validate::execute(args, sink, global),
             Commands::Version(args) => version::execute(args),
             Commands::Gc(args) => gc::execute(args, sink, global),
             Commands::Tool(args) => args.execute(sink, global),
