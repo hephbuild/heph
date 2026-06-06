@@ -14,9 +14,9 @@ use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
-    /// Target address
+    /// Target address (e.g. //pkg:name)
     pub addr: String,
-    /// Skip applying transitive deps
+    /// Show the direct def only, without applying transitive deps
     #[arg(long)]
     pub no_transitive: bool,
 }

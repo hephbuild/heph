@@ -11,7 +11,7 @@ use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
-    /// Packages matcher
+    /// Package matcher (defaults to all packages)
     pub matcher: Option<String>,
 }
 

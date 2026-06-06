@@ -11,7 +11,7 @@ use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
-    /// Target address
+    /// Target address (e.g. //pkg:name)
     pub addr: String,
 }
 

@@ -20,10 +20,10 @@ pub struct RunArgs {
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
-    /// Force execution
+    /// Force execution, ignoring any cached result
     #[arg(long = "force")]
     pub force: bool,
-    /// Interactive shell
+    /// Drop into an interactive shell in the target's sandbox instead of running it
     #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
     pub shell: Option<String>,
     /// Print output artifacts to stdout

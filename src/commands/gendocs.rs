@@ -40,7 +40,10 @@ fn render_command(cmd: &clap::Command, parent_path: &str, out: &mut String) {
 
     out.push_str(&format!("## `{path}`\n\n"));
 
-    if let Some(about) = cmd.get_about() {
+    // Prefer the long description (multi-paragraph doc comment incl. examples)
+    // so the reference carries the same detail as `--help`; fall back to the
+    // one-line about for commands without one.
+    if let Some(about) = cmd.get_long_about().or_else(|| cmd.get_about()) {
         out.push_str(&format!("{about}\n\n"));
     }
 
@@ -240,6 +243,45 @@ mod tests {
         );
         assert!(table.contains("`off`"), "row missing default: {table}");
         assert!(table.contains("Force it"), "row missing help: {table}");
+    }
+
+    #[test]
+    fn long_about_preferred_over_short() {
+        let mut out = String::new();
+        let cmd = clap::Command::new("run")
+            .about("short")
+            .long_about("long body\n\nExamples:\n  heph run //pkg:bin");
+        render_command(&cmd, BIN, &mut out);
+
+        assert!(
+            out.contains("long body") && out.contains("heph run //pkg:bin"),
+            "long_about (with examples) not rendered:\n{out}"
+        );
+        assert!(
+            !out.contains("short\n"),
+            "short about leaked when long_about present:\n{out}"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_short_about_when_no_long() {
+        let mut out = String::new();
+        let cmd = clap::Command::new("ver").about("Prints version");
+        render_command(&cmd, BIN, &mut out);
+
+        assert!(
+            out.contains("Prints version"),
+            "short about not rendered as fallback:\n{out}"
+        );
+    }
+
+    #[test]
+    fn real_cli_examples_reach_markdown() {
+        let md = render_markdown(&cli_command());
+        assert!(
+            md.contains("heph run //cmd/server:bin"),
+            "run command examples missing from reference:\n{md}"
+        );
     }
 
     #[test]

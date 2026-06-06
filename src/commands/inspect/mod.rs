@@ -21,19 +21,71 @@ pub struct InspectArgs {
 
 #[derive(Subcommand)]
 pub enum InspectCommands {
-    /// List packages
+    /// List packages matching a matcher
+    ///
+    /// Walks providers to discover packages and prints those matching the given
+    /// matcher, one per line. With no argument, lists every package in the
+    /// workspace.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect packages`
+    ///
+    /// `heph inspect packages //cmd/...`
     Packages(packages::Args),
-    /// Prints targets hashin
+    /// Print a target's input hash
+    ///
+    /// Computes and prints the content hash of all the target's declared
+    /// inputs — the key heph uses to decide a cache hit. Does not run the
+    /// target.
+    ///
+    /// Example: `heph inspect hashin //cmd/server:bin`
     Hashin(hashin::Args),
-    /// Prints targets hashout
+    /// Print a target's output hashes
+    ///
+    /// Runs the target (or reads its cached result) and prints the content hash
+    /// of each output artifact, one per line.
+    ///
+    /// Example: `heph inspect hashout //cmd/server:bin`
     Hashout(hashout::Args),
-    /// Prints target spec
+    /// Print a target's spec, as supplied by its provider
+    ///
+    /// Prints the raw spec — the unresolved definition a provider returns
+    /// before a driver parses it — as pretty JSON.
+    ///
+    /// Example: `heph inspect spec //cmd/server:bin`
     Spec(spec::Args),
-    /// Prints target def
+    /// Print a target's resolved def (inputs, outputs, sandbox)
+    ///
+    /// Parses the target's spec into a def and prints it as pretty JSON,
+    /// including declared inputs, outputs, and sandbox configuration. By
+    /// default transitive deps are applied; pass --no-transitive for the
+    /// direct def only.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect def //cmd/server:bin`
+    ///
+    /// `heph inspect def //cmd/server:bin --no-transitive`
     Def(def::Args),
-    /// Prints target deps
+    /// Print a target's input dependencies
+    ///
+    /// Resolves the target's def and prints the ref of each declared input,
+    /// one per line. Pass -i/--interactive to browse the dependency tree in a
+    /// TUI.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect deps //cmd/server:bin`
+    ///
+    /// `heph inspect deps //cmd/server:bin -i`
     Deps(deps::Args),
     /// List provider-exposed functions (`heph.<provider>.<fn>`)
+    ///
+    /// Prints every function registered by a provider for use in BUILD files,
+    /// in `heph.<provider>.<function>` form, one per line.
+    ///
+    /// Example: `heph inspect functions`
     Functions(functions::Args),
 }
 
