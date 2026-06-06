@@ -75,6 +75,11 @@ in
   scripts.pheph.exec = ''cargo run -q --profile profiling -- "''${@}"'';
   scripts.dheph.exec = ''cargo run -q --profile dev -- "''${@}"'';
 
+  # Start a Claude Code session in HEPH release-candidate mode: HEPH_RC=1
+  # triggers the SessionStart hook (checkout master + ff-only pull) and the
+  # session opens in a fresh git worktree.
+  scripts.ccrc.exec = ''HEPH_RC=1 claude rc --spawn=worktree "''${@}"'';
+
   scripts.rsync-to.exec = ''cd $DEVENV_ROOT && rsync -avz --exclude='.heph3/' --exclude='.claude/' --exclude='**/.claude/' --exclude='target/' --exclude='.devenv/' --exclude='.git/' $DEVENV_ROOT/ "''${@}"'';
 
   scripts.install-dev.exec = ''
