@@ -105,7 +105,7 @@ jobs:
       # Cargo registry/git only — crate downloads + index. Compiled artifacts are
       # handled by sccache (below), so target/ is intentionally not cached here.
       - name: Cargo registry cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -116,7 +116,7 @@ jobs:
             cargo-${{ matrix.target }}-
 
       - name: sccache cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.sccache
           key: sccache-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
@@ -219,7 +219,7 @@ jobs:
         run: nix profile add nixpkgs#devenv
 
       - name: Cargo registry cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -230,7 +230,7 @@ jobs:
             cargo-x86_64-unknown-linux-gnu-
 
       - name: sccache cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.sccache
           key: sccache-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
@@ -280,7 +280,7 @@ jobs:
         run: nix profile add nixpkgs#devenv
 
       - name: Cargo registry cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -291,7 +291,7 @@ jobs:
             cargo-${{ matrix.target }}-test-
 
       - name: sccache cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.sccache
           key: sccache-${{ matrix.target }}-test-${{ hashFiles('**/Cargo.lock') }}
