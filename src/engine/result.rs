@@ -351,6 +351,33 @@ struct ExecuteOptions<'a> {
     is_top: bool,
 }
 
+/// Output-independent result of the per-addr lock dance, single-flighted by
+/// `mem_locked_result` (keyed by `Addr` alone). Every `(outputs, is_top)`
+/// memoizer cell of one addr awaits the same cell and shares its single riding
+/// read, so two sibling computations can never both contend the non-reentrant
+/// per-addr result lock — the self-deadlock this prevents.
+pub(crate) struct LockedResolution {
+    /// The single riding read shared by all callers, pinning the cache entry for
+    /// the request lifetime. `None` only on the non-cacheable force/shell path
+    /// (ephemeral artifacts, no long-lived read).
+    guard: Option<Arc<ResultReadGuard>>,
+    /// `Some(full set)` when THIS cell produced the artifacts (cacheable execute,
+    /// or the force/shell branch); [`build_eresult`] filters it to each caller's
+    /// outputs. `None` on a pre-existing cache hit — callers then read only THEIR
+    /// own outputs from the local cache under the shared `guard`, so a partial /
+    /// remote cache pulls just the blobs each caller asked for rather than every
+    /// output group (the lazy-pull invariant this preserves).
+    executed: Option<Arc<ExecutedArtifacts>>,
+}
+
+/// The full freshly-produced artifact set of an executing [`LockedResolution`]
+/// cell (every output group), shared across all `(outputs, is_top)` callers and
+/// filtered per caller by [`build_eresult`].
+struct ExecutedArtifacts {
+    cached: Vec<CacheArtifact>,
+    meta: Vec<ArtifactMeta>,
+}
+
 /// Single classifier chokepoint for any target error.
 ///
 /// Decides whether an error is this target's **own** failure (record it once in
@@ -862,6 +889,21 @@ impl Engine {
         }
     }
 
+    /// Thin per-`(outputs, is_top)` wrapper over [`resolve_locked`]. The lock
+    /// dance runs at most once per addr per request (single-flighted in
+    /// `resolve_locked`), producing one shared riding read.
+    ///
+    /// If that cell executed, it hands back the full freshly-produced set and we
+    /// filter it here. On a pre-existing cache hit it hands back only the shared
+    /// read, and we fetch *just this caller's* outputs from the local cache under
+    /// it — so a partial/remote cache pulls only the blobs each caller asked for,
+    /// never the whole output set.
+    ///
+    /// The codegen write-back + fixpoint registration live here (not in the
+    /// shared cell) because they are per-`(outputs, is_top)`: `materialize_codegen`
+    /// is is_top-gated, and both run under this caller's shared riding read. This
+    /// matches the pre-single-flight placement — `materialize_codegen` on every
+    /// path, `maybe_store_fixpoint` only on the cacheable path (never force/shell).
     async fn execute_and_cache(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -869,7 +911,139 @@ impl Engine {
         outputs: Vec<String>,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<EResult> {
+        let locked = self.clone().resolve_locked(rs.clone(), def, opts).await?;
+        let (cached, meta) = match &locked.executed {
+            // This cell produced the artifacts; filter the full set to `outputs`.
+            Some(ex) => (ex.cached.clone(), ex.meta.clone()),
+            // Pre-existing hit: read only this caller's outputs under the shared
+            // riding read. Silent — the shared cell already emitted the addr's
+            // hit/miss event; re-emitting per caller would double-count.
+            None => self
+                .clone()
+                .artifacts_from_local_cache(rs.ctoken(), def, opts.hashin.as_str(), outputs.clone())
+                .await?
+                .with_context(|| {
+                    format!(
+                        "result lock confirmed a cache entry for {} but it vanished before read",
+                        def.target.addr
+                    )
+                })?,
+        };
+
+        // Codegen tree write-back: is_top-gated, idempotent, runs on every path
+        // (a cache hit on an in_place fmt must still materialize). Uses this
+        // caller's `cached`, so the is_top requester must have asked for the
+        // codegen output groups — exactly as before the single-flight split.
+        self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
+            .await?;
+        // Fixpoint registration only on the cacheable path (force/shell never
+        // cache a fixpoint). Idempotent across hit/miss; a no-op unless this is a
+        // top-level in_place codegen target whose tree just moved.
         let can_cache = !opts.force && opts.def.target.cache.enabled && !opts.shell;
+        if can_cache {
+            self.clone().maybe_store_fixpoint(&rs, opts).await?;
+        }
+
+        Ok(build_eresult(cached, meta, &outputs, locked.guard.clone()))
+    }
+
+    /// Single-flight the per-addr result-lock + cache-fetch/execute, keyed by
+    /// `Addr` ALONE (not `outputs`/`is_top`). All `(outputs, is_top)` cells of
+    /// one addr await this one cell and share its single riding read, so two
+    /// sibling computations of the same addr can never both hold the
+    /// non-reentrant per-addr lock (the self-deadlock this prevents).
+    ///
+    /// Sound because the on-disk cache is keyed by `hashin` (independent of
+    /// `outputs`/`is_top`) and execution always produces the full output set:
+    /// the shared cell only decides build-vs-hit and hands back one riding read.
+    /// Each caller then materializes just its own outputs (see
+    /// [`execute_and_cache`](Self::execute_and_cache)), so the pull stays lazy.
+    ///
+    /// Invariants preserved: cross-process serialization (still exactly one real
+    /// flock acquire here; other processes have their own `mem_locked_result`),
+    /// cross-request contention (the cell is per-`RequestStateData`), and
+    /// read-pinning (the riding read is a real flock read — `try_write` still
+    /// fails while it's alive). Only the *duplicate* same-addr acquire is removed.
+    async fn resolve_locked(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        def: &LinkedTargetDef,
+        opts: &ExecuteOptions<'_>,
+    ) -> anyhow::Result<Arc<LockedResolution>> {
+        let addr = def.target.addr.clone();
+        // Owned copies so the memoizer closure is `'static`.
+        let def_owned = opts.def.clone();
+        let hashin = opts.hashin.clone();
+        let spec = opts.spec.clone();
+        let force = opts.force;
+        let shell = opts.shell;
+        let interactive = opts.interactive.clone();
+
+        rs.data
+            .mem_locked_result
+            .once(
+                addr,
+                enclose!((self => engine, rs) move || async move {
+                    // is_top/frozen are deliberately fixed here: the shared cell
+                    // is addr-keyed and output/is_top-agnostic. It never runs
+                    // codegen write-back or fixpoint storage (those are per-caller,
+                    // in `execute_and_cache`), and neither `execute_and_cache_inner`
+                    // nor `execute` reads these fields — so the values are inert.
+                    let opts = ExecuteOptions {
+                        hashin: &hashin,
+                        spec: &spec,
+                        def: &def_owned,
+                        force,
+                        interactive,
+                        shell,
+                        frozen: false,
+                        is_top: false,
+                    };
+                    engine.resolve_locked_inner(rs, &opts).await
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err)
+    }
+
+    /// Body of the per-addr lock dance: the optimistic read → miss → drop →
+    /// write → re-check → execute → downgrade → riding-read sequence (and the
+    /// non-cacheable force/shell branch). Runs once per addr per request via
+    /// [`resolve_locked`].
+    ///
+    /// Cache presence is decided at the **manifest** level, not per output:
+    /// `cache_locally` writes the manifest last and GC deletes whole revisions
+    /// under this very lock, so a present manifest guarantees every output blob
+    /// for this `hashin` is already on disk. Probing with an empty output set
+    /// therefore answers "has this addr been built?" without forcing any output
+    /// blob to be fetched — each caller pulls only its own outputs afterwards in
+    /// [`execute_and_cache`], keeping partial/remote pulls lazy.
+    ///
+    /// **Remote-cache contract (TODO(remote-cache)) — keep this split intact:**
+    /// - *Presence (here):* must stay manifest-only. When remote lands, this
+    ///   becomes a manifest-exists check that consults **local OR remote** and
+    ///   downloads NO output blobs — a remote manifest still means "already
+    ///   built, do not execute". Note the empty-output probe below is not a true
+    ///   manifest-only check: it still `exists`-checks SupportFile blobs, so once
+    ///   support files can live remote-only it must be replaced by an explicit
+    ///   `manifest_exists(addr, hashin)` (local-or-remote, no blob I/O).
+    /// - *Materialization (per caller, in [`execute_and_cache`]):* this is where
+    ///   lazy download belongs. The local read there becomes local→remote: use
+    ///   the blob if local, else download just the requested output group(s);
+    ///   only a genuine local+remote miss returns `None` (→ execute). Each caller
+    ///   pulls only the groups it asked for — never the full output set.
+    /// - *Hazard:* that per-caller download writes blobs into the local cache
+    ///   while holding only the riding **read** lock. It is content-addressed by
+    ///   `hashin` (idempotent), but a concurrent GC `try_write` could race a
+    ///   half-written blob — the download path will need atomic
+    ///   rename-into-place or a per-blob write guard.
+    async fn resolve_locked_inner(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        opts: &ExecuteOptions<'_>,
+    ) -> anyhow::Result<Arc<LockedResolution>> {
+        let def = opts.def;
+        let can_cache = !opts.force && def.target.cache.enabled && !opts.shell;
         let addr = &def.target.addr;
         let ctoken = rs.ctoken();
 
@@ -895,31 +1069,30 @@ impl Engine {
                 .clone()
                 .execute_and_cache_inner(rs.clone(), opts)
                 .await?;
-            self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
-                .await?;
-            return Ok(build_eresult(cached, meta, &outputs, None));
+            return Ok(Arc::new(LockedResolution {
+                guard: None,
+                executed: Some(Arc::new(ExecutedArtifacts { cached, meta })),
+            }));
         }
 
-        // 1. Optimistically take a plain shared read lock and look in the cache.
-        //    The read lock rides with the returned artifacts (attached per
-        //    artifact in build_eresult), protecting the cache entry while in use.
+        // 1. Optimistically take a plain shared read lock and probe the cache at
+        //    the manifest level (empty output set — see the doc comment). The read
+        //    rides with every caller's artifacts, protecting the entry while in use.
         let read = self
             .acquire_with_notice(&rs, addr, self.result_lock().read(addr, ctoken))
             .await?;
-        if let Some((cached, meta)) = self
-            .result_from_cache(rs.clone(), def, opts, outputs.clone())
+        if self
+            .result_from_cache(rs.clone(), def, opts, Vec::new())
             .await?
+            .is_some()
         {
-            // A. Cache hit — write back the codegen tree (a cache hit on an
-            // in_place fmt must still materialize), then attach the read lock.
-            self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
-                .await?;
-            // Register the fixpoint even on a hit: a concurrent dependency
-            // resolution may have populated the primary entry without storing
-            // the fixpoint (it ran with is_top=false). Idempotent — a no-op when
-            // already at the fixpoint.
-            self.clone().maybe_store_fixpoint(&rs, opts).await?;
-            return Ok(build_eresult(cached, meta, &outputs, Some(Arc::new(read))));
+            // A. Hit — share this read; each caller reads its own outputs under
+            // it and runs its own codegen write-back / fixpoint in
+            // `execute_and_cache` (is_top-gated, under this riding read).
+            return Ok(Arc::new(LockedResolution {
+                guard: Some(Arc::new(read)),
+                executed: None,
+            }));
         }
 
         // B. Miss: a plain read cannot upgrade. Drop it and take the exclusive
@@ -931,19 +1104,22 @@ impl Engine {
             .acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
             .await?;
 
-        // Re-check under the write lock: covers the drop window above and any
-        // writer that produced the artifacts while we waited. The write lock
-        // excludes all others, so one re-check suffices. On the rare hit (another
-        // worker raced us) we skip execution; otherwise we execute + cache.
-        let (cached, meta) = match self
-            .result_from_cache(rs.clone(), def, opts, outputs.clone())
+        // Re-check (manifest level) under the write lock: covers the drop window
+        // above and any writer that produced the artifacts while we waited. The
+        // write lock excludes all others, so one re-check suffices. On the rare
+        // race-win we share without executing; otherwise we execute + cache the
+        // full set, which `build_eresult` filters per caller.
+        let executed = match self
+            .result_from_cache(rs.clone(), def, opts, Vec::new())
             .await?
         {
-            Some(res) => res,
+            Some(_) => None,
             None => {
-                self.clone()
+                let (cached, meta) = self
+                    .clone()
                     .execute_and_cache_inner(rs.clone(), opts)
-                    .await?
+                    .await?;
+                Some(Arc::new(ExecutedArtifacts { cached, meta }))
             }
         };
 
@@ -957,12 +1133,10 @@ impl Engine {
             .with_context(|| format!("downgrading result lock for {addr}"))?;
         let read = self.result_lock().read(addr, ctoken).await?;
         drop(up);
-        self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
-            .await?;
-        // Must follow write-back so the recomputed key reflects the tree.
-        // Idempotent across hit/miss (see the hit path above).
-        self.clone().maybe_store_fixpoint(&rs, opts).await?;
-        Ok(build_eresult(cached, meta, &outputs, Some(Arc::new(read))))
+        Ok(Arc::new(LockedResolution {
+            guard: Some(Arc::new(read)),
+            executed,
+        }))
     }
 
     /// Materialize the codegen output tree for a freshly-resolved target.
@@ -3417,6 +3591,369 @@ mod tests {
             "inner result must not emit Matched, got {events:?}"
         );
         Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-addr result-lock self-deadlock regression (mem_locked_result).
+    // ----------------------------------------------------------------------
+
+    use crate::engine::driver::targetdef::{CacheConfig, Output};
+    use crate::engine::driver::{
+        ApplyTransitiveResponse, ConfigRequest as DriverConfigRequest,
+        ConfigResponse as DriverConfigResponse, Driver as RawDriver, ParseResponse, RunRequest,
+        RunResponse,
+    };
+    use async_trait::async_trait;
+
+    /// Raw driver whose `run` produces one cacheable Raw output per `(group,
+    /// name)` in `outputs` and counts executions. Lets the per-addr result-lock
+    /// paths be exercised without spawning a subprocess or writing real files.
+    struct BlockingDriver {
+        exec_count: SArc<AtomicUsize>,
+        /// `(output group, artifact name)` pairs this target emits.
+        outputs: SArc<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl RawDriver for BlockingDriver {
+        fn config(&self, _req: DriverConfigRequest) -> anyhow::Result<DriverConfigResponse> {
+            Ok(DriverConfigResponse {
+                name: "blocking".to_string(),
+            })
+        }
+        async fn parse(
+            &self,
+            req: ParseRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            Ok(ParseResponse {
+                target_def: TargetDef {
+                    addr: req.target_spec.addr.clone(),
+                    labels: vec![],
+                    raw_def: SArc::new(()),
+                    inputs: vec![],
+                    outputs: self
+                        .outputs
+                        .iter()
+                        .map(|(group, _)| Output {
+                            group: group.clone(),
+                            paths: vec![],
+                        })
+                        .collect(),
+                    support_files: vec![],
+                    cache: CacheConfig::on(false),
+                    pty: false,
+                    hash: vec![1, 2, 3, 4],
+                    transparent: false,
+                },
+            })
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            self.exec_count.fetch_add(1, Ordering::SeqCst);
+            Ok(RunResponse {
+                artifacts: self
+                    .outputs
+                    .iter()
+                    .map(|(group, name)| outputartifact::OutputArtifact {
+                        group: group.clone(),
+                        name: name.clone(),
+                        r#type: outputartifact::Type::Output,
+                        content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                            data: b"hi".to_vec(),
+                            path: name.clone(),
+                            x: false,
+                        }),
+                        hashout: "feedface".to_string(),
+                    })
+                    .collect(),
+                sandbox_cleanup: None,
+                fuse_slot_guards: vec![],
+            })
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            anyhow::bail!("run_shell not supported by BlockingDriver")
+        }
+    }
+
+    /// Provider serving exactly one `TargetSpec` (driven by `blocking`).
+    struct OneTargetProvider {
+        spec: TargetSpec,
+    }
+
+    impl crate::engine::provider::Provider for OneTargetProvider {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "onetarget".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            let spec = self.spec.clone();
+            Box::pin(async move {
+                if req.addr == spec.addr {
+                    Ok(GetResponse { target_spec: spec })
+                } else {
+                    Err(GetError::NotFound)
+                }
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    /// Engine with the `blocking` driver + a single cacheable target `//pkg:a`.
+    /// Holds the cache/lock dirs in the returned `TempDir` (kept alive by caller).
+    fn blocking_engine(
+        exec_count: SArc<AtomicUsize>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
+        blocking_engine_outputs(exec_count, vec![("main".to_string(), "out".to_string())])
+    }
+
+    /// Like [`blocking_engine`] but with a custom set of `(group, name)` outputs,
+    /// for exercising multi-output / partial-cache behavior.
+    fn blocking_engine_outputs(
+        exec_count: SArc<AtomicUsize>,
+        outputs: Vec<(String, String)>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
+        let dir = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            // sqlite-direct (no in-memory layer) so `list_target_entries` /
+            // `delete` reflect writes synchronously — the partial-cache test
+            // discovers the hashin and drops a blob by name deterministically.
+            mem_cache: crate::engine::MemCacheOptions {
+                capacity_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        })?;
+        engine.register_driver(Box::new(BlockingDriver {
+            exec_count,
+            outputs: SArc::new(outputs),
+        }))?;
+        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let spec = TargetSpec {
+            addr: addr.clone(),
+            driver: "blocking".to_string(),
+            config: HashMap::new(),
+            labels: vec![],
+            transitive: Default::default(),
+        };
+        engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
+        Ok((Arc::new(engine), dir, addr))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_addr_two_output_variants_resolve_concurrently_completes() {
+        // Reproduction. Two distinct `mem_result` cells for one addr — `All` and
+        // `Exact["main"]` — both keep the produced artifact and so both hold a
+        // riding read. On a cold cache the shared (memoized) meta wakes both at
+        // once; both take coexisting shared reads, both miss, both then contend
+        // the exclusive per-addr write. Pre-fix, the write-waiter blocks forever
+        // on the sibling's riding read (single-process self-deadlock). Post-fix,
+        // the addr-keyed `mem_locked_result` single-flight hands both callers one
+        // shared read, so they complete.
+        let exec_count = SArc::new(AtomicUsize::new(0));
+        let (engine, _dir, addr) = blocking_engine(SArc::clone(&exec_count)).expect("engine");
+        let rs = engine.new_state();
+
+        let t1 = tokio::spawn(enclose!((engine, rs, addr) async move {
+            engine
+                .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                .await
+        }));
+        let t2 = tokio::spawn(enclose!((engine, rs, addr) async move {
+            engine
+                .result_addr(
+                    rs,
+                    &addr,
+                    OutputMatcher::Exact(vec!["main".to_string()]),
+                    &ResultOptions::default(),
+                )
+                .await
+        }));
+
+        let (j1, j2) = tokio::time::timeout(Duration::from_secs(5), async {
+            (t1.await.expect("t1 join"), t2.await.expect("t2 join"))
+        })
+        .await
+        .expect("resolves must not self-deadlock on the per-addr result lock");
+
+        let r1 = j1.expect("All variant resolves");
+        let r2 = j2.expect("Exact[main] variant resolves");
+        assert_eq!(r1.artifacts.len(), 1, "All must surface the 'main' output");
+        assert_eq!(
+            r2.artifacts.len(),
+            1,
+            "Exact[main] must surface the 'main' output"
+        );
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            1,
+            "execute must be single-flighted across both output variants"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_requests_same_addr_share_cache_and_complete() {
+        // The single-flight is per-`RequestStateData`: two separate requests get
+        // separate `mem_locked_result` cells and still go through the real flock.
+        // That's legitimate cross-request serialization (not the self-deadlock):
+        // both complete, and the second hits the shared on-disk cache (keyed by
+        // hashin), so execute runs exactly once across the two requests.
+        let exec_count = SArc::new(AtomicUsize::new(0));
+        let (engine, _dir, addr) = blocking_engine(SArc::clone(&exec_count)).expect("engine");
+
+        let r1 = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("first request resolves");
+        let r2 = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("second request resolves");
+
+        assert_eq!(r1.artifacts.len(), 1);
+        assert_eq!(r2.artifacts.len(), 1);
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            1,
+            "second request must hit the cross-request on-disk cache, not re-execute"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cache_hit_pulls_only_requested_output_not_every_group() {
+        // Lazy-pull invariant: requesting one output group must NOT require the
+        // other groups' blobs to be present. A target with two outputs (`main`,
+        // `extra`) is built once; we then delete `extra`'s blob locally (the
+        // manifest stays — modelling a partial/remote cache that only pulled
+        // `main`). A fresh request for just `main` must hit the cache and return
+        // it WITHOUT re-executing. The earlier all-outputs resolution would have
+        // missed here (every group's blob required present) and re-run execute.
+        let exec_count = SArc::new(AtomicUsize::new(0));
+        let (engine, _dir, addr) = blocking_engine_outputs(
+            SArc::clone(&exec_count),
+            vec![
+                ("main".to_string(), "out_main".to_string()),
+                ("extra".to_string(), "out_extra".to_string()),
+            ],
+        )
+        .expect("engine");
+
+        // Build everything once (both blobs + manifest now cached locally).
+        let built = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("initial build resolves");
+        assert_eq!(built.artifacts.len(), 2, "All surfaces both output groups");
+        assert_eq!(exec_count.load(Ordering::SeqCst), 1);
+
+        // Drop the `extra` group's blob, keeping the manifest (partial cache).
+        // Derive the cache key from `meta` (the input hash — computed from inputs,
+        // no cache read) rather than enumerating the cache: the sqlite writer is
+        // async and a fresh read connection may not yet see the just-written rows.
+        let hashin = Arc::clone(&engine)
+            .meta(engine.new_state(), &addr)
+            .await
+            .expect("meta")
+            .hashin;
+        engine
+            .local_cache
+            .delete(&addr, &hashin, "out_extra")
+            .expect("delete extra blob");
+
+        // Request only `main` in a fresh request: must hit, not re-execute.
+        let r = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::Exact(vec!["main".to_string()]),
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("Exact[main] resolves against the partial cache");
+        assert_eq!(
+            r.artifacts.len(),
+            1,
+            "only the requested 'main' is surfaced"
+        );
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            1,
+            "requesting one output must not re-execute just because another \
+             group's blob is absent — the pull stays lazy"
+        );
     }
 
     // ─── Codegen write-back / fixpoint / frozen ──────────────────────────────
