@@ -1,6 +1,6 @@
 use crate::engine::driver::{RunInput, RunRequest, RunResponse};
 use crate::engine::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, build_source_map, collect_outputs, invoke_inner,
+    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, write_source_map,
     list_path_for, resolve_unpack_root,
 };
 use crate::hartifactcontent;
@@ -124,11 +124,7 @@ impl ManagedDriverFuse {
         fs::create_dir_all(&sandbox_pkg_dir)
             .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
-        let source_map = build_source_map(&inputs, &ws_dir)?;
-        let source_map_json =
-            serde_json::to_string(&source_map).with_context(|| "serialize source_map")?;
-        fs::write(sandbox_pkg_dir.join("source_map.json"), source_map_json)
-            .with_context(|| "write source_map.json")?;
+        write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir)?;
 
         let target = req.target;
         let hashin = req.hashin;

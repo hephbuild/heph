@@ -446,12 +446,32 @@ pub(crate) fn collect_outputs(
     Ok(())
 }
 
+/// Input annotation key opting a dep into source_map.json generation.
+/// Absent (the default) means the input is excluded — source_map.json is
+/// only emitted for targets whose inputs explicitly request it (e.g. the
+/// go plugin's golist deps). Value must be the string `"true"`.
+pub(crate) const SOURCE_MAP_ANNOTATION: &str = "source_map";
+
+fn source_map_enabled(input: &RunInput) -> bool {
+    input
+        .annotations
+        .get(SOURCE_MAP_ANNOTATION)
+        .is_some_and(|v| v == "true")
+}
+
+/// Build the source_map.json contents from the opted-in inputs. Only inputs
+/// carrying the `source_map=true` annotation contribute; everything else is
+/// skipped so the map (and the file) stays empty by default. Returns an empty
+/// map when no input opts in — callers skip writing the file in that case.
 pub(crate) fn build_source_map(
     inputs: &[ManagedRunInput],
     ws_dir: &Path,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let mut source_map: BTreeMap<String, String> = BTreeMap::new();
     for managed_input in inputs {
+        if !source_map_enabled(&managed_input.input) {
+            continue;
+        }
         if managed_input.unpack_root != ws_dir {
             continue;
         }
@@ -484,6 +504,26 @@ pub(crate) fn build_source_map(
         }
     }
     Ok(source_map)
+}
+
+/// Write `source_map.json` into the sandbox package dir, but only when at
+/// least one input opted in. With no opted-in inputs the map is empty and the
+/// file is skipped entirely — consumers (e.g. golist) treat a missing file as
+/// an empty map.
+pub(crate) fn write_source_map(
+    inputs: &[ManagedRunInput],
+    ws_dir: &Path,
+    sandbox_pkg_dir: &Path,
+) -> anyhow::Result<()> {
+    let source_map = build_source_map(inputs, ws_dir)?;
+    if source_map.is_empty() {
+        return Ok(());
+    }
+    let source_map_json =
+        serde_json::to_string(&source_map).with_context(|| "serialize source_map")?;
+    fs::write(sandbox_pkg_dir.join("source_map.json"), source_map_json)
+        .with_context(|| "write source_map.json")?;
+    Ok(())
 }
 
 pub(crate) fn resolve_unpack_root(input: &RunInput, sandbox_dir: &Path, ws_dir: &Path) -> PathBuf {
@@ -833,7 +873,10 @@ mod source_map_tests {
                 origin_id: origin_id.to_string(),
                 source_addr: parse_addr(source_addr).expect("parse addr"),
                 filters: vec![],
-                annotations: BTreeMap::new(),
+                annotations: BTreeMap::from([(
+                    SOURCE_MAP_ANNOTATION.to_string(),
+                    "true".to_string(),
+                )]),
             },
             list_path: Some(PathBuf::from("/dev/null")),
             unpack_root: PathBuf::from("/ws"),
@@ -890,6 +933,20 @@ mod source_map_tests {
         assert!(
             !m.contains_key("pkg/b.txt"),
             "filtered paths must not appear in source_map: {:?}",
+            m
+        );
+    }
+
+    #[test]
+    fn build_source_map_skips_inputs_without_opt_in() {
+        let ws_dir = PathBuf::from("/ws");
+        let mut input = make_input("dep|t|0", "//pkg:_t", &[("pkg/a.txt", "a")]);
+        // Default: no opt-in annotation → excluded entirely.
+        input.input.annotations.remove(SOURCE_MAP_ANNOTATION);
+        let m = build_source_map(&[input], &ws_dir).expect("build_source_map");
+        assert!(
+            m.is_empty(),
+            "inputs without the source_map opt-in must not contribute: {:?}",
             m
         );
     }
