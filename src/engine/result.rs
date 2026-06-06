@@ -2358,7 +2358,9 @@ mod tests {
         .unwrap();
         let fns = engine.provider_functions();
         assert!(
-            fns.contains(&("fs".to_string(), "glob".to_string())),
+            fns.iter().any(|(p, n, sig)| p == "fs"
+                && n == "glob"
+                && sig == "glob(pattern: string) -> list[string]"),
             "{fns:?}"
         );
     }

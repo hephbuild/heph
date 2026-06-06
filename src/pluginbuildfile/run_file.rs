@@ -4,6 +4,7 @@ use crate::engine::provider::{FnArgs, FnCallContext, ProviderFn, ProviderFunctio
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
+use crate::htvalue::signature::{FnSignature, Param, ParamType};
 use crate::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use crate::htwalk::{CachedWalker, EntryKind};
 use crate::pluginbuildfile::provider::Provider;
@@ -29,36 +30,83 @@ use std::sync::{Arc, Mutex, OnceLock};
 fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
     let mut builder = GlobalsBuilder::standard();
     builder = builder.with(starlark_module);
-    builder.with_namespace("heph", |hb| {
-        // Static `heph.core` host/platform builtins.
-        hb.namespace("core", heph_core_module);
-        // One `heph.<provider>` namespace per provider; each function becomes a
-        // native callable bridging into its async `ProviderFn`.
-        for (provider, fns) in registry.providers() {
-            hb.namespace(provider, |nb| {
-                for (name, func) in fns {
-                    nb.set_function(
-                        name.as_str(),
-                        starlark::__derive_refs::components::NativeCallableComponents {
-                            speculative_exec_safe: false,
-                            rust_docstring: None,
-                            param_spec:
-                                starlark::__derive_refs::param_spec::NativeCallableParamSpec::for_arguments(
-                                ),
-                            return_type: starlark::typing::Ty::any(),
-                        },
-                        None,
-                        None,
-                        None,
-                        ProviderNativeFn {
-                            func: Arc::clone(func),
-                        },
-                    );
-                }
-            });
-        }
-    })
-    .build()
+    builder
+        .with_namespace("heph", |hb| {
+            // Static `heph.core` host/platform builtins.
+            hb.namespace("core", heph_core_module);
+            // One `heph.<provider>` namespace per provider; each function becomes a
+            // native callable bridging into its async `ProviderFn`.
+            for (provider, fns) in registry.providers() {
+                hb.namespace(provider, |nb| {
+                    for (name, rf) in fns {
+                        nb.set_function(
+                            name.as_str(),
+                            starlark::__derive_refs::components::NativeCallableComponents {
+                                speculative_exec_safe: false,
+                                rust_docstring: None,
+                                // Drive Starlark's native typing from the declared
+                                // signature so BUILD-time gets arity/type errors and
+                                // docs. The engine-side validator in `invoke` is the
+                                // canonical guard (and the only one that checks the
+                                // return value at runtime).
+                                param_spec: build_param_spec(&rf.signature),
+                                return_type: param_type_to_ty(&rf.signature.returns),
+                            },
+                            None,
+                            None,
+                            None,
+                            ProviderNativeFn {
+                                display: format!("heph.{provider}.{name}"),
+                                signature: Arc::clone(&rf.signature),
+                                func: Arc::clone(&rf.func),
+                            },
+                        );
+                    }
+                });
+            }
+        })
+        .build()
+}
+
+/// Map a [`ParamType`] to the Starlark `Ty` used for native param/return typing.
+fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
+    use starlark::typing::Ty;
+    match t {
+        ParamType::String => Ty::string(),
+        ParamType::Bool => Ty::bool(),
+        // htvalue distinguishes Int/Uint but Starlark has a single int type.
+        ParamType::Int | ParamType::Uint => Ty::int(),
+        ParamType::Float => Ty::float(),
+        ParamType::Null => Ty::none(),
+        ParamType::List(inner) => Ty::list(param_type_to_ty(inner)),
+        ParamType::Map(value) => Ty::dict(Ty::string(), param_type_to_ty(value)),
+    }
+}
+
+/// Build a native param spec from a declared signature: positional params as
+/// pos-or-named, named params as named-only, no `*args`/`**kwargs` (no variadic).
+fn build_param_spec(
+    sig: &FnSignature,
+) -> starlark::__derive_refs::param_spec::NativeCallableParamSpec {
+    use starlark::__derive_refs::param_spec::{
+        NativeCallableParam, NativeCallableParamDefaultValue, NativeCallableParamSpec,
+    };
+    let to_param = |p: &Param| NativeCallableParam {
+        name: p.name,
+        ty: param_type_to_ty(&p.ty),
+        // Documentation-only; the engine validator substitutes the real default.
+        required: p
+            .default
+            .as_ref()
+            .map(|_| NativeCallableParamDefaultValue::Optional),
+    };
+    NativeCallableParamSpec {
+        pos_only: Vec::new(),
+        pos_or_named: sig.positional.iter().map(to_param).collect(),
+        args: None,
+        named_only: sig.named.iter().map(to_param).collect(),
+        kwargs: None,
+    }
 }
 
 /// Native Starlark function bridging a `heph.<provider>.<fn>` call to the
@@ -67,6 +115,9 @@ fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
 /// `futures::executor::block_on` — runtime-agnostic, works under `#[test]`,
 /// inline eval, and `block_in_place`.
 struct ProviderNativeFn {
+    /// `heph.<provider>.<fn>`, used in validation error messages.
+    display: String,
+    signature: Arc<FnSignature>,
     func: Arc<dyn ProviderFn>,
 }
 
@@ -83,8 +134,9 @@ impl starlark::values::function::NativeFunc for ProviderNativeFn {
             .expect("evaluator extra must be of type Extra");
 
         // No public accessor returns an arbitrary positional slice; read up to a
-        // fixed cap (errors past it) and keep the ones actually supplied. Eight is
-        // far beyond any current provider function (glob takes one).
+        // fixed cap and let the signature validator enforce the real arity. Eight
+        // is far beyond any provider function (the widest takes one positional);
+        // more than that trips Starlark's own too-many-args error first.
         let (_, optional) =
             starlark::__derive_refs::parse_args::parse_positional::<0, 8>(args, eval.heap())?;
         let positional: Vec<htvalue::Value> =
@@ -95,6 +147,13 @@ impl starlark::values::function::NativeFunc for ProviderNativeFn {
             .map(|(k, v)| (k.as_str().to_string(), starlark_to_rust(v)))
             .collect();
 
+        // Enforce the declared signature: hard-fail on bad arity, missing
+        // required, unknown named, or wrong type; substitute optional defaults.
+        let (positional, named) = self
+            .signature
+            .validate_args(&self.display, positional, named)
+            .map_err(starlark::Error::new_other)?;
+
         let ctx = FnCallContext {
             pkg: extra.pkg,
             root: extra.root,
@@ -102,6 +161,12 @@ impl starlark::values::function::NativeFunc for ProviderNativeFn {
         let fn_args = FnArgs { positional, named };
 
         let result = futures::executor::block_on(self.func.call(&ctx, fn_args))
+            .map_err(starlark::Error::new_other)?;
+
+        // Native `return_type` is documentation-only for native fns, so validate
+        // the actual return value here.
+        self.signature
+            .validate_return(&self.display, &result)
             .map_err(starlark::Error::new_other)?;
 
         Ok(rust_to_starlark(eval.heap(), &result))
@@ -2103,6 +2168,11 @@ target(name = "t_in_app", driver = SHARED)
             "myprov",
             vec![crate::engine::provider::ProviderFunctionDef {
                 name: "echo".to_string(),
+                signature: FnSignature {
+                    positional: vec![Param::required("v", ParamType::String)],
+                    named: vec![],
+                    returns: ParamType::String,
+                },
                 func: Arc::new(EchoFn),
             }],
         );
@@ -2134,5 +2204,74 @@ target(name = "t_in_app", driver = SHARED)
             chain.contains("nope"),
             "expected error to name `nope`: {chain}"
         );
+    }
+
+    /// Evaluate a BUILD whose `target` reads `expr`, returning the eval error chain.
+    fn eval_expr_err(call: &str) -> String {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            format!(r#"target(name = "t", driver = "d", v = {call})"#),
+        )
+        .unwrap();
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "mypkg").unwrap_err();
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn provider_fn_missing_required_arg_errors() {
+        let msg = eval_expr_err("heph.fs.glob()");
+        assert!(msg.contains("pattern"), "{msg}");
+    }
+
+    #[test]
+    fn provider_fn_wrong_arg_type_errors() {
+        let msg = eval_expr_err("heph.fs.glob(123)");
+        assert!(msg.contains("heph.fs.glob"), "{msg}");
+        assert!(msg.contains("expected string"), "{msg}");
+    }
+
+    #[test]
+    fn provider_fn_too_many_positional_errors() {
+        // Two positionals for a one-arg function.
+        let msg = eval_expr_err(r#"heph.fs.glob("a", "b")"#);
+        assert!(
+            msg.contains("at most 1 positional") || msg.contains("too many"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn provider_fn_unknown_kwarg_errors() {
+        let msg = eval_expr_err(r#"heph.fs.glob("*.rs", bogus = 1)"#);
+        assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    #[test]
+    fn provider_fn_join_requires_list() {
+        // `join` now takes a single `list[string]`; a bare string is rejected.
+        let msg = eval_expr_err(r#"heph.fs.join("a")"#);
+        assert!(msg.contains("expected list[string]"), "{msg}");
+    }
+
+    #[test]
+    fn provider_fn_join_accepts_list() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"target(name = "t", driver = "d", v = heph.fs.join(["a", "b", "c"]))"#,
+        )
+        .unwrap();
+        let provider = make_provider(&tmp_dir);
+        let result = run_pkg_blocking(&provider, "mypkg").unwrap();
+        match result.targets[0].config.get("v") {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "a/b/c"),
+            other => panic!("expected joined path, got {other:?}"),
+        }
     }
 }

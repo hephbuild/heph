@@ -5,6 +5,7 @@ use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::Value;
+use crate::htvalue::signature::FnSignature;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -112,9 +113,21 @@ pub trait ProviderFn: Send + Sync {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value>;
 }
 
-/// One exposed function: its bare name (no `heph.<provider>.` prefix) and handler.
+/// One exposed function: its bare name (no `heph.<provider>.` prefix), its
+/// declarative signature, and its handler. The engine enforces `signature`
+/// against every call (see [`crate::htvalue::signature::FnSignature`]).
 pub struct ProviderFunctionDef {
     pub name: String,
+    pub signature: FnSignature,
+    pub func: Arc<dyn ProviderFn>,
+}
+
+/// A function as held in the [`ProviderFunctionRegistry`]: its signature
+/// (shared, so the Starlark bridge can both enforce it and derive a native
+/// param spec from it) plus the handler.
+#[derive(Clone)]
+pub struct RegisteredFn {
+    pub signature: Arc<FnSignature>,
     pub func: Arc<dyn ProviderFn>,
 }
 
@@ -144,7 +157,7 @@ pub struct FnArgs {
 /// (the buildfile provider) via [`Provider::set_function_registry`].
 #[derive(Default)]
 pub struct ProviderFunctionRegistry {
-    map: HashMap<String, HashMap<String, Arc<dyn ProviderFn>>>,
+    map: HashMap<String, HashMap<String, RegisteredFn>>,
 }
 
 impl ProviderFunctionRegistry {
@@ -155,25 +168,31 @@ impl ProviderFunctionRegistry {
         }
         let entry = self.map.entry(provider.to_string()).or_default();
         for def in defs {
-            entry.insert(def.name, def.func);
+            entry.insert(
+                def.name,
+                RegisteredFn {
+                    signature: Arc::new(def.signature),
+                    func: def.func,
+                },
+            );
         }
     }
 
-    /// Look up a single handler by provider + function name.
-    pub fn get(&self, provider: &str, func: &str) -> Option<&Arc<dyn ProviderFn>> {
+    /// Look up a single function by provider + function name.
+    pub fn get(&self, provider: &str, func: &str) -> Option<&RegisteredFn> {
         self.map.get(provider).and_then(|m| m.get(func))
     }
 
-    /// Iterate `(provider, function name, handler)` over every registered function.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &Arc<dyn ProviderFn>)> {
+    /// Iterate `(provider, function name, function)` over every registered function.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &RegisteredFn)> {
         self.map.iter().flat_map(|(p, fns)| {
             fns.iter()
-                .map(move |(name, func)| (p.as_str(), name.as_str(), func))
+                .map(move |(name, rf)| (p.as_str(), name.as_str(), rf))
         })
     }
 
     /// Iterate `(provider name, its functions)` — one entry per provider.
-    pub fn providers(&self) -> impl Iterator<Item = (&str, &HashMap<String, Arc<dyn ProviderFn>>)> {
+    pub fn providers(&self) -> impl Iterator<Item = (&str, &HashMap<String, RegisteredFn>)> {
         self.map.iter().map(|(p, fns)| (p.as_str(), fns))
     }
 }

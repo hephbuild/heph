@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod signature;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(String),

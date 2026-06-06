@@ -11,8 +11,8 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 
 async fn execute_async(_args: Args, _sink: LogSink, _global: GlobalOptions) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine()?;
-    for (provider, func) in engine.provider_functions() {
-        println!("heph.{provider}.{func}");
+    for (provider, _func, rendered) in engine.provider_functions() {
+        println!("{provider}.{rendered}");
     }
     Ok(())
 }
