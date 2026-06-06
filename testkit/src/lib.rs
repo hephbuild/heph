@@ -60,6 +60,27 @@ impl WorkspaceBuilder {
         self
     }
 
+    /// Registers the built-in `fs` provider + driver, wired with the engine's own
+    /// skip dirs (the heph home) and config skip globs — mirroring how the real
+    /// bootstrap registers them. Prefer this over registering `pluginfs` manually
+    /// so glob walks prune the engine-owned subtrees.
+    pub fn with_fs(mut self) -> Self {
+        let root = self.dir.path().to_path_buf();
+        self.setups.push(Box::new(move |e: &mut Engine| {
+            let skip = Arc::new(heph::pluginfs::FsSkip::new(
+                &root,
+                &e.skip_dirs(),
+                e.skip_globs(),
+            )?);
+            e.register_provider({
+                let skip = skip.clone();
+                move |_| Box::new(heph::pluginfs::Provider::new(skip))
+            })?;
+            e.register_driver(Box::new(heph::pluginfs::Driver::new(skip)))
+        }));
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<Workspace> {
         let mut e = Engine::new(Config {
             root: self.dir.path().to_path_buf(),
