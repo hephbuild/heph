@@ -1,7 +1,6 @@
 use anyhow::Context as _;
 use heph::pluginbuildfile;
 use heph::pluginexec;
-use heph::pluginfs;
 use heph::plugingo;
 use heph::pluginstatictarget;
 use heph_testkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
@@ -53,8 +52,8 @@ fn go_bin_path() -> String {
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
     let go_bin = go_bin_path();
     WorkspaceBuilder::from_dir(dir)
+        .with_fs()
         .with_provider(|root| Box::new(pluginbuildfile::Provider::new(root.to_path_buf())))
-        .with_provider(|_root| Box::new(pluginfs::Provider))
         .with_provider(move |_| {
             Box::new(
                 pluginstatictarget::Provider::new(vec![pluginstatictarget::Target {
@@ -77,7 +76,6 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
         .with_managed_driver(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
         .with_managed_driver(Box::new(plugingo::GoEmbedDriver))
-        .with_driver(Box::new(pluginfs::Driver))
         .build()
         .context("build plugingo workspace")
 }
