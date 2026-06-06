@@ -135,7 +135,13 @@ impl ManagedDriver for GoGolistDriver {
                         .with_context(|| format!("parse dep addr {addr_str}"))?,
                     mode: InputMode::Standard,
                     origin_id: format!("dep|{group}|{i}"),
-                    annotations: std::collections::BTreeMap::new(),
+                    // golist reads source_map.json to map codegen-produced
+                    // files back to their source target; opt these deps in so
+                    // the managed bridge emits it (default is off).
+                    annotations: std::collections::BTreeMap::from([(
+                        crate::engine::driver_managed::SOURCE_MAP_ANNOTATION.to_string(),
+                        "true".to_string(),
+                    )]),
                     hashed: true,
                     runtime: true,
                 });
