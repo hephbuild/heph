@@ -1,3 +1,4 @@
+mod completions;
 pub mod gc;
 mod gen_gitignore;
 
@@ -32,6 +33,14 @@ pub enum ToolCommands {
     /// Example: `heph tool gen-gitignore`
     #[command(name = "gen-gitignore")]
     GenGitignore(gen_gitignore::Args),
+    /// Print a shell completion-registration script
+    ///
+    /// Emits the script that enables dynamic tab-completion of subcommands,
+    /// flags, and target addresses for the given shell. Source it from your
+    /// shell rc, e.g. `source <(heph tool completions zsh)`.
+    ///
+    /// Example: `heph tool completions bash`
+    Completions(completions::Args),
 }
 
 impl ToolArgs {
@@ -49,6 +58,7 @@ impl ToolCommands {
         match self {
             ToolCommands::Gc(args) => gc::execute(args, sink, global),
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
+            ToolCommands::Completions(args) => completions::execute(args),
         }
     }
 }

@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use clap_complete::engine::ArgValueCompleter;
 use futures::TryStreamExt;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::completion::complete_target_addr;
 use crate::commands::utils::matcher_from_args;
 use crate::engine::{Engine, get_cwp};
 use crate::htmatcher::Matcher;
@@ -16,13 +18,13 @@ use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 )]
 pub struct Args {
     /// Target address (e.g., //pkg:name) OR Label
-    #[arg(value_name = "TARGET_ADDRESS/LABEL")]
+    #[arg(value_name = "TARGET_ADDRESS/LABEL", add = ArgValueCompleter::new(complete_target_addr))]
     pub arg1: String,
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
     /// Exclude target address (repeatable, e.g. -e //pkg:target)
-    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS")]
+    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS", add = ArgValueCompleter::new(complete_target_addr))]
     pub exclude: Vec<String>,
 }
 

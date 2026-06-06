@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::completion::complete_target_addr;
 use crate::engine::{Engine, OutputMatcher, ResultOptions};
 use crate::htaddr::{self, Addr};
 use crate::tui::{self, App, AppContext, LogSink};
@@ -12,6 +14,7 @@ use crate::tui::{self, App, AppContext, LogSink};
 #[derive(clap::Args, Clone)]
 pub struct Args {
     /// Target address (e.g. //pkg:name)
+    #[arg(add = ArgValueCompleter::new(complete_target_addr))]
     pub addr: String,
 }
 
