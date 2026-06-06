@@ -1,7 +1,7 @@
 use crate::engine::driver::{RunInput, RunRequest, RunResponse};
 use crate::engine::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, write_source_map,
-    list_path_for, resolve_unpack_root,
+    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, list_path_for,
+    resolve_unpack_root, write_source_map,
 };
 use crate::hartifactcontent;
 use crate::hasync::Cancellable;
