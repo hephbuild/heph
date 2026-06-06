@@ -151,8 +151,13 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
         return parse_addr(&full);
     }
 
-    // bare "name" or "name@args" — no slashes, colons, or leading dots
-    parse_addr(&format!("//{}:{}", base, input))
+    // A bare "name" (no leading ':', './', '../', or '//') is too ambiguous to
+    // accept — it reads like a plain identifier yet would silently resolve into
+    // the current package. Require an explicit ':' so relative references are
+    // unmistakable.
+    Err(anyhow::anyhow!(
+        "invalid address '{input}': relative references must start with ':', './', '../', or '//'"
+    ))
 }
 
 pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
@@ -214,17 +219,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_addr_with_base_bare_name() {
+    fn test_parse_addr_with_base_bare_name_rejected() {
+        // A bare identifier is ambiguous and must be written as `:mytarget`.
         let base = PkgBuf::from("base/pkg");
-        let res = parse_addr_with_base("mytarget", &base).unwrap();
-        assert_eq!(res.package, "base/pkg");
-        assert_eq!(res.name, "mytarget");
+        let res = parse_addr_with_base("mytarget", &base);
+        assert!(res.is_err());
     }
 
     #[test]
-    fn test_parse_addr_with_base_bare_name_args() {
+    fn test_parse_addr_with_base_bare_name_args_rejected() {
         let base = PkgBuf::from("base/pkg");
-        let res = parse_addr_with_base("mytarget@k=v", &base).unwrap();
+        let res = parse_addr_with_base("mytarget@k=v", &base);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_parse_addr_with_base_colon_name_args() {
+        // The explicit colon form still carries args through.
+        let base = PkgBuf::from("base/pkg");
+        let res = parse_addr_with_base(":mytarget@k=v", &base).unwrap();
         assert_eq!(res.package, "base/pkg");
         assert_eq!(res.name, "mytarget");
         assert_eq!(res.args.get("k").unwrap(), "v");

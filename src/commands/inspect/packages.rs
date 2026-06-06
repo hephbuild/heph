@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::engine::Engine;
-use crate::htmatcher::{self, Matcher};
-use crate::htpkg::PkgBuf;
+use crate::htmatcher::Matcher;
+use crate::htpkg::{self, PkgBuf};
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
@@ -62,7 +62,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let matcher = match &args.matcher {
-        Some(s) => htmatcher::parse(s.as_str())?,
+        Some(s) => htpkg::parse(s.as_str(), &crate::engine::get_cwp()?)?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
     let (engine, shutdown) = bootstrap::new_engine()?;
