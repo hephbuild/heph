@@ -21,6 +21,9 @@ pub struct Config {
     pub root: PathBuf,
     /// Workspace state/cache directory. If empty, defaults to `root/.heph3`.
     pub home_dir: PathBuf,
+    /// Extra workspace-relative glob patterns the `fs` plugin excludes from every
+    /// glob walk (from the config file's top-level `skip`).
+    pub skip: Vec<String>,
     pub parallelism: Option<usize>,
     pub mem_cache: MemCacheOptions,
     pub fuse: FuseConfig,
@@ -504,6 +507,12 @@ impl Engine {
     /// the same engine-owned subtrees.
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
         vec![self.home.clone()]
+    }
+
+    /// Extra workspace-relative exclude globs from the config file's `skip`,
+    /// applied to every `fs` glob walk on top of [`Engine::skip_dirs`].
+    pub fn skip_globs(&self) -> &[String] {
+        &self.cfg.skip
     }
 
     /// Instantiates every provider/driver listed in the entries by looking up the
