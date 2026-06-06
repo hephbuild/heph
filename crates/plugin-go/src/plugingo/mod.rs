@@ -25,5 +25,6 @@ pub use driver_format::{GoFormatCheckDriver, GoFormatDriver};
 pub use driver_golist::GoGolistDriver;
 pub use driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;
+pub use factors::Factors;
 pub use provider::{Config, Provider};
 pub use toolchain::GoToolchainDriver;

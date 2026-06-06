@@ -1,5 +1,5 @@
 use crate::plugingo::addr_util::{
-    go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    build_env_map, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
     import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::driver_compile::{CompileParams, build_compile_spec};
@@ -218,9 +218,10 @@ pub fn build_test_spec(
             ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
         ])),
     );
-    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
-    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert("env".to_string(), go_build_env());
+    // CGO/toolchain pins + build-env factor knobs (GOEXPERIMENT, GODEBUG, …) live in
+    // `env` (hashed) so stale archives don't survive cache lookups (pluginexec/mod.rs:70
+    // excludes runtime_env from the def hash).
+    config.insert("env".to_string(), Value::Map(build_env_map(factors)));
 
     TargetSpec {
         addr,
@@ -360,6 +361,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
 

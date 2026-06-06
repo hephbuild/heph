@@ -1,5 +1,5 @@
 use crate::plugingo::addr_util::{
-    go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    build_env_map, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
     import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
@@ -58,12 +58,22 @@ pub fn build_spec(
         .unwrap_or(import_path)
         .to_string();
 
+    // Link flags come from two sources, both applied to the link step only:
+    // provider_state `link.flags`, and the addr-level `ldflags` factor. Neither
+    // touches the shared lib archives (factors_to_args omits ldflags), so distinct
+    // flags produce a distinct binary cache entry without rebuilding libs.
+    let link_flags: Vec<String> = link
+        .flags
+        .iter()
+        .chain(factors.ldflags.iter())
+        .cloned()
+        .collect();
     let mut run = go_run_prelude(go_version);
     run.extend(generate_link_script(
         import_path,
         &binary_name,
         transitive_libs,
-        &link.flags,
+        &link_flags,
     ));
 
     let mut deps: BTreeMap<String, Value> = transitive_libs
@@ -131,9 +141,11 @@ pub fn build_spec(
             ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
         ])),
     );
-    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
-    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert("env".to_string(), go_build_env());
+    // CGO/toolchain pins + build-env factor knobs (GOEXPERIMENT, GODEBUG, …) live in
+    // `env` (hashed) so stale archives don't survive cache lookups (pluginexec/mod.rs:70
+    // excludes runtime_env from the def hash). ldflags are baked into the link command
+    // (`run`) instead — see generate_link_script.
+    config.insert("env".to_string(), Value::Map(build_env_map(factors)));
 
     TargetSpec {
         addr,
@@ -197,6 +209,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
 
@@ -336,6 +350,76 @@ mod tests {
             "env must pin CGO_ENABLED=0 in the hashed map: {:?}",
             env.get("CGO_ENABLED")
         );
+    }
+
+    #[test]
+    fn test_env_carries_factor_knobs() {
+        let mut factors = test_factors();
+        factors
+            .env
+            .insert("GOEXPERIMENT".to_string(), "rangefunc".to_string());
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &factors,
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
+        let env = match spec.config.get("env").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            matches!(env.get("GOEXPERIMENT"), Some(Value::String(s)) if s == "rangefunc"),
+            "hashed env must carry GOEXPERIMENT: {:?}",
+            env.get("GOEXPERIMENT")
+        );
+    }
+
+    #[test]
+    fn test_ldflags_factor_in_link_command() {
+        let mut factors = test_factors();
+        factors.ldflags = vec!["-s".into(), "-w".into(), "-X".into(), "main.v=1".into()];
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &factors,
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
+        let run = run_str(&spec);
+        let link_line = run
+            .lines()
+            .find(|l| l.contains("tool link"))
+            .expect("link line present");
+        assert!(
+            link_line.contains("-s -w -X main.v=1"),
+            "ldflags factor must reach the link command: {link_line}"
+        );
+        // ldflags sit before -o so they reach the linker, not the output path.
+        assert!(link_line.find("-s -w").unwrap() < link_line.find(" -o ").unwrap());
+    }
+
+    #[test]
+    fn test_link_flags_and_ldflags_factor_combine() {
+        let mut factors = test_factors();
+        factors.ldflags = vec!["-w".into()];
+        let link = LinkConfig {
+            flags: vec!["-X main.version=9".to_string()],
+            ..Default::default()
+        };
+        let spec = build_spec(test_addr(), "example.com/cmd", &factors, &[], &link, V);
+        let link_line = run_str(&spec)
+            .lines()
+            .find(|l| l.contains("tool link"))
+            .expect("link line present")
+            .to_string();
+        // provider_state flags precede the addr-level ldflags factor.
+        let x_pos = link_line.find("-X main.version=9").expect("link.flags present");
+        let w_pos = link_line.find(" -w ").expect("ldflags factor present");
+        assert!(x_pos < w_pos, "link.flags precede ldflags factor: {link_line}");
     }
 
     #[test]

@@ -109,6 +109,10 @@ struct GoCompileSpec {
     deps: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// Build-env factor knobs keyed by Go env var (e.g. `GOEXPERIMENT`,
+    /// `GODEBUG`). Folded into the compile env and hashed so a knob change
+    /// invalidates the archive. Empty for the common case.
+    env: HashMap<String, String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -125,11 +129,14 @@ struct GoCompileDef {
     golist_origin_id: Option<String>,
     /// origin_ids of the `go_embed_src` inputs (assets `go list` never saw).
     embed_src_origin_ids: Vec<String>,
+    /// Build-env factor knobs keyed by Go env var — sorted for deterministic
+    /// hashing. Folded into the compile env in `run()`.
+    env: BTreeMap<String, String>,
 }
 
 /// Bump to invalidate every cached `go_compile` archive whenever the compile
 /// command shape or embed resolution semantics change.
-const GO_COMPILE_FORMAT_VERSION: u32 = 2;
+const GO_COMPILE_FORMAT_VERSION: u32 = 3;
 
 impl Hash for GoCompileDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -154,6 +161,12 @@ impl Hash for GoCompileDef {
         self.embed_variant.map(|v| v.hash_tag()).hash(state);
         self.golist_origin_id.hash(state);
         self.embed_src_origin_ids.hash(state);
+        // BTreeMap iterates in sorted key order → deterministic.
+        self.env.len().hash(state);
+        for (k, v) in &self.env {
+            k.hash(state);
+            v.hash(state);
+        }
         // Archives, sources, SDK arrive via inputs; the engine hashes their
         // content, so no per-file hashing here.
     }
@@ -253,6 +266,7 @@ impl ManagedDriver for GoCompileDriver {
                 None
             },
             embed_src_origin_ids,
+            env: spec.env.into_iter().collect(),
         };
 
         let outputs: Vec<Output> = spec
@@ -355,6 +369,11 @@ impl ManagedDriver for GoCompileDriver {
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
         env.insert("CGO_ENABLED".to_string(), "0".to_string());
+        // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) — hashed into the def,
+        // so a knob change already invalidated this archive before we get here.
+        for (k, v) in &def.env {
+            env.insert(k.clone(), v.clone());
+        }
         if host && let Ok(v) = std::env::var("PATH") {
             env.insert("PATH".to_string(), v);
         }
@@ -800,6 +819,20 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         "go_version".to_string(),
         Value::String(p.go_version.to_string()),
     );
+    // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) — folded into the compile
+    // env in run() and hashed via GoCompileDef. Absent for the common (no-knob) case.
+    if !p.factors.env.is_empty() {
+        config.insert(
+            "env".to_string(),
+            Value::Map(
+                p.factors
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                    .collect(),
+            ),
+        );
+    }
     config.insert("import_paths".to_string(), Value::List(import_paths));
     config.insert("s_files".to_string(), str_list(p.s_files));
     config.insert(
@@ -865,6 +898,8 @@ mod driver_tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
 
@@ -1086,6 +1121,7 @@ mod driver_tests {
             embed_variant: None,
             golist_origin_id: None,
             embed_src_origin_ids: vec![],
+            env: Default::default(),
         };
         let a = mk(&["net", "os", "errors", "io", "crypto/rand"]);
         let b = mk(&["crypto/rand", "io", "net", "errors", "os"]);
@@ -1100,6 +1136,53 @@ mod driver_tests {
             def_hash(&a),
             def_hash(&c),
             "different import set must differ"
+        );
+    }
+
+    // A build-env factor knob (e.g. GOEXPERIMENT) must reach the go_compile config
+    // and change the def hash, so an archive built under one knob never satisfies a
+    // lookup under another.
+    #[tokio::test]
+    async fn compile_env_factor_knob_changes_def_hash() {
+        let mut knob_factors = factors();
+        knob_factors
+            .env
+            .insert("GOEXPERIMENT".to_string(), "rangefunc".to_string());
+        let with_knob = build_compile_spec(CompileParams {
+            addr: Addr::new(
+                PkgBuf::from("mylib"),
+                "build_lib".to_string(),
+                Default::default(),
+            ),
+            p_flag: "example.com/mylib".to_string(),
+            out_file: "x.a".to_string(),
+            factors: &knob_factors,
+            go_version: V,
+            transitive_libs: &[],
+            src_addrs: &["//mylib:a.go".to_string()],
+            s_files: &[],
+            s_file_addrs: &[],
+            hdr_addrs: &[],
+            golist_addr: None,
+            embed_variant: "",
+            embed_file_addrs: &[],
+            embed_src_addrs: &[],
+        });
+        let env = match with_knob.config.get("env").expect("env config present") {
+            Value::Map(m) => m,
+            v => panic!("env not a map: {v:?}"),
+        };
+        assert!(
+            matches!(env.get("GOEXPERIMENT"), Some(Value::String(s)) if s == "rangefunc"),
+            "compile config must carry the knob: {env:?}"
+        );
+
+        let plain = parse_def(spec_with_libs(&[])).await;
+        let knobbed = parse_def(with_knob).await;
+        assert_ne!(
+            def_hash(&plain.def::<GoCompileDef>()),
+            def_hash(&knobbed.def::<GoCompileDef>()),
+            "a knob change must invalidate the archive cache key"
         );
     }
 }

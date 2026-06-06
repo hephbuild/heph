@@ -108,24 +108,29 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
         ])),
     );
     // Hashed env pins the target platform + cgo so std archives don't bleed
-    // across factor variants. GODEBUG forces `go install std` to write pkg/.
-    config.insert(
-        "env".to_string(),
-        Value::Map(HashMap::from([
-            ("GOOS".to_string(), Value::String(factors.goos.clone())),
-            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-            ("CGO_ENABLED".to_string(), Value::String("0".to_string())),
-            (
-                "GOTOOLCHAIN".to_string(),
-                Value::String("local".to_string()),
-            ),
-            ("GOWORK".to_string(), Value::String("off".to_string())),
-            (
-                "GODEBUG".to_string(),
-                Value::String("installgoroot=all".to_string()),
-            ),
-        ])),
-    );
+    // across factor variants, plus any build-env factor knobs (GOEXPERIMENT, GODEBUG,
+    // …) so std is built under the same knobs as its consumers. GODEBUG forces
+    // `go install std` to write pkg/, so a user `godebug` factor is merged with
+    // `installgoroot=all` rather than replacing it.
+    let mut env = HashMap::from([
+        ("GOOS".to_string(), Value::String(factors.goos.clone())),
+        ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
+        ("CGO_ENABLED".to_string(), Value::String("0".to_string())),
+        (
+            "GOTOOLCHAIN".to_string(),
+            Value::String("local".to_string()),
+        ),
+        ("GOWORK".to_string(), Value::String("off".to_string())),
+    ]);
+    for (key, value) in &factors.env {
+        env.insert(key.clone(), Value::String(value.clone()));
+    }
+    let godebug = match env.get("GODEBUG") {
+        Some(Value::String(s)) if !s.is_empty() => format!("{s},installgoroot=all"),
+        _ => "installgoroot=all".to_string(),
+    };
+    env.insert("GODEBUG".to_string(), Value::String(godebug));
+    config.insert("env".to_string(), Value::Map(env));
 
     TargetSpec {
         addr,
@@ -213,6 +218,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
 
@@ -271,6 +278,8 @@ mod tests {
             goos: "darwin".into(),
             goarch: "arm64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let spec = install_spec(install_addr(&factors), &factors, V);
         let env = match spec.config.get("env").unwrap() {
@@ -280,6 +289,29 @@ mod tests {
         assert!(matches!(env.get("GODEBUG"), Some(Value::String(s)) if s == "installgoroot=all"));
         assert!(matches!(env.get("GOOS"), Some(Value::String(s)) if s == "darwin"));
         assert!(matches!(env.get("GOARCH"), Some(Value::String(s)) if s == "arm64"));
+    }
+
+    #[test]
+    fn test_install_env_carries_factor_knobs_and_merges_godebug() {
+        let mut factors = test_factors();
+        factors
+            .env
+            .insert("GOEXPERIMENT".to_string(), "rangefunc".to_string());
+        factors
+            .env
+            .insert("GODEBUG".to_string(), "http2debug=1".to_string());
+        let spec = install_spec(install_addr(&factors), &factors, V);
+        let env = match spec.config.get("env").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("env must be map"),
+        };
+        assert!(matches!(env.get("GOEXPERIMENT"), Some(Value::String(s)) if s == "rangefunc"));
+        // A user GODEBUG must not drop std's required installgoroot=all.
+        assert!(
+            matches!(env.get("GODEBUG"), Some(Value::String(s)) if s == "http2debug=1,installgoroot=all"),
+            "user GODEBUG must merge with installgoroot=all: {:?}",
+            env.get("GODEBUG")
+        );
     }
 
     #[test]

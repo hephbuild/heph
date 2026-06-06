@@ -86,6 +86,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
     fn lib_spec(

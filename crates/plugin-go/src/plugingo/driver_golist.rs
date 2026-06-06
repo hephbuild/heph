@@ -15,7 +15,7 @@ use hplugin::driver::{
 };
 use hplugin::htspec::Spec;
 use hproc::proc_exec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -43,6 +43,9 @@ struct GoGolistSpec {
     go_version: String,
     /// Go build tags.
     build_tags: Vec<String>,
+    /// Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) keyed by Go env var —
+    /// applied to `go list` and hashed into the def. Empty for the common case.
+    env: HashMap<String, String>,
     /// For thirdparty packages: the `download` target whose filtered outputs are
     /// staged into consumers' sandboxes.
     #[spec(ty = ParamType::String)]
@@ -72,6 +75,9 @@ struct GoGolistDef {
     goarch: String,
     go_version: String,
     build_tags: Vec<String>,
+    /// Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) keyed by Go env var.
+    /// Affect `go list` resolution, so they participate in the def hash.
+    env: BTreeMap<String, String>,
     dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
     /// will be staged into consumers' sandboxes. Threaded through so
@@ -87,7 +93,8 @@ struct GoGolistDef {
 /// `go_compile`; cached `_golist` artifacts from intermediate builds of that
 /// work could carry empty `EmbedFiles` for a now-resolvable embed, surfacing as
 /// `compute embedcfg: //go:embed pattern(s) matched no files` until evicted.
-const GO_GOLIST_FORMAT_VERSION: u32 = 15;
+/// v16: build-env factor knobs (GOEXPERIMENT, GODEBUG, …) now join the def hash.
+const GO_GOLIST_FORMAT_VERSION: u32 = 16;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -97,6 +104,7 @@ impl Hash for GoGolistDef {
         self.goarch.hash(state);
         self.go_version.hash(state);
         self.build_tags.hash(state);
+        self.env.hash(state);
         self.dep_inputs.hash(state);
         self.thirdparty_download_addr.hash(state);
         // The hermetic SDK arrives via dep_inputs (group `gosdk`); the engine
@@ -171,6 +179,7 @@ impl ManagedDriver for GoGolistDriver {
             goarch: spec.goarch,
             go_version: spec.go_version,
             build_tags: spec.build_tags,
+            env: spec.env.into_iter().collect(),
             dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
         };
@@ -306,6 +315,11 @@ impl ManagedDriver for GoGolistDriver {
         // PATH-independent.
         if host && let Ok(v) = std::env::var("PATH") {
             env.insert("PATH".to_string(), v);
+        }
+        // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) win over any inherited
+        // value so `go list` resolution matches the requested factors.
+        for (k, v) in &def.env {
+            env.insert(k.clone(), v.clone());
         }
 
         let mut cmd_args = vec![
@@ -481,6 +495,35 @@ mod tests {
 
     fn driver() -> GoGolistDriver {
         GoGolistDriver::new()
+    }
+
+    fn def_hash(def: &GoGolistDef) -> u64 {
+        let mut h = Xxh3Default::new();
+        def.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn test_env_factor_changes_def_hash() {
+        let base = GoGolistDef {
+            import_path: "example.com/mylib".to_string(),
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            goroot: "/usr/local/go".to_string(),
+            build_tags: vec![],
+            env: BTreeMap::new(),
+            dep_inputs: vec![],
+            thirdparty_download_addr: None,
+        };
+        let mut with_env = base.clone();
+        with_env
+            .env
+            .insert("GOEXPERIMENT".to_string(), "rangefunc".to_string());
+        assert_ne!(
+            def_hash(&base),
+            def_hash(&with_env),
+            "env factor must change the golist def hash"
+        );
     }
 
     fn make_parse_request(
