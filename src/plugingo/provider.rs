@@ -1,20 +1,20 @@
 use crate::engine::provider::{
-    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait, ProviderExecutor,
-    State,
+    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
+    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
+    ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
 };
 use crate::hasync::Cancellable;
 use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
-use crate::htvalue::{Value, parse_strings};
+use crate::htvalue::{Value, parse_string, parse_strings};
 use crate::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
     encode_thirdparty_download, factors_to_args,
 };
 use crate::plugingo::errors::NoGoFilesError;
-use crate::plugingo::factors::{Factors, current_goarch, current_goos};
+use crate::plugingo::factors::{ENV_FACTORS, Factors, current_goarch, current_goos};
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
     is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires,
@@ -196,6 +196,15 @@ impl Provider {
         &self.inner.go_bin_addr
     }
 
+    /// Compose the address of the binary `build` target for `package` under `factors`
+    /// (goos/goarch/tags, env knobs like GOEXPERIMENT/GODEBUG, and linker flags).
+    ///
+    /// Also exposed to BUILD files as the `heph.go.build_addr(...)` provider function —
+    /// see [`BuildAddrFn`].
+    pub fn build_addr(&self, package: &str, factors: &Factors) -> Addr {
+        crate::plugingo::addr_util::build_addr(package, factors)
+    }
+
     pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
         let goroot = resolve_goroot()?;
         let gomodcache = resolve_go_env_var("GOMODCACHE")?;
@@ -302,9 +311,89 @@ fn collect_go_packages(
     }
 }
 
+/// `heph.go.build_addr(package, goos=, goarch=, tags=, goexperiment=, godebug=, ldflags=)`
+/// → the binary `build` target address as a string, for BUILD files (or other
+/// providers' functions) to depend on.
+///
+/// `package` is the first positional arg (or named `package`). All factor args are
+/// optional named args; `goos`/`goarch` default to the host. `tags`/`ldflags` accept
+/// either a list of strings or a single string (tags split on `,`, ldflags on
+/// whitespace). The env knobs are the keys in [`ENV_FACTORS`] (`goexperiment`, `godebug`).
+struct BuildAddrFn;
+
+#[async_trait::async_trait]
+impl ProviderFn for BuildAddrFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let package = match args
+            .positional
+            .first()
+            .or_else(|| args.named.get("package"))
+        {
+            Some(v) => parse_string(v)
+                .context("build_addr: parse 'package'")?
+                .ok_or_else(|| anyhow::anyhow!("build_addr: 'package' must be a string"))?,
+            None => anyhow::bail!("build_addr: missing 'package' argument"),
+        };
+
+        let opt_str = |key: &str| -> anyhow::Result<Option<String>> {
+            args.named
+                .get(key)
+                .map(|v| parse_string(v).with_context(|| format!("build_addr: parse '{key}'")))
+                .transpose()
+                .map(Option::flatten)
+        };
+        // A list arg passes through as-is; a string is split on `sep`.
+        let list_or_split = |key: &str, sep: char| -> anyhow::Result<Vec<String>> {
+            match args.named.get(key) {
+                None => Ok(Vec::new()),
+                Some(v @ Value::List(_)) => {
+                    parse_strings(v).with_context(|| format!("build_addr: parse '{key}'"))
+                }
+                Some(v) => Ok(parse_string(v)
+                    .with_context(|| format!("build_addr: parse '{key}'"))?
+                    .into_iter()
+                    .flat_map(|s| {
+                        s.split(sep)
+                            .filter(|p| !p.is_empty())
+                            .map(String::from)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()),
+            }
+        };
+
+        let mut build_tags = list_or_split("tags", ',')?;
+        build_tags.sort();
+        let mut env = BTreeMap::new();
+        for (arg_key, go_var) in ENV_FACTORS {
+            if let Some(value) = opt_str(arg_key)? {
+                env.insert(go_var.to_string(), value);
+            }
+        }
+        let factors = Factors {
+            goos: opt_str("goos")?.unwrap_or_else(current_goos),
+            goarch: opt_str("goarch")?.unwrap_or_else(current_goarch),
+            build_tags,
+            env,
+            ldflags: list_or_split("ldflags", ' ')?,
+        };
+
+        Ok(Value::String(
+            crate::plugingo::addr_util::build_addr(&package, &factors).to_string(),
+        ))
+    }
+}
+
 impl ProviderTrait for Provider {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         self.inner.config(req)
+    }
+
+    fn functions(&self) -> Vec<ProviderFunctionDef> {
+        vec![ProviderFunctionDef {
+            name: "build_addr".to_string(),
+            func: Arc::new(BuildAddrFn),
+        }]
     }
 
     fn list<'a>(
@@ -363,6 +452,8 @@ impl ProviderInner {
                 goos: current_goos(),
                 goarch: current_goarch(),
                 build_tags: vec![],
+                env: Default::default(),
+                ldflags: vec![],
             };
 
             let kind = match decode_package(&req.package, &self.workspace_root) {
@@ -2406,6 +2497,92 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let workspace = p.inner.workspace_root.clone();
         p.get(make_get_req(addr, &workspace), &ctoken).await
+    }
+
+    #[test]
+    fn test_build_addr_composes_build_target_with_factors() {
+        require_go!();
+        let sandbox = tempfile::tempdir().unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let factors = Factors {
+            goos: "linux".into(),
+            goarch: "amd64".into(),
+            build_tags: vec!["integration".into()],
+            env: std::collections::BTreeMap::from([(
+                "GOEXPERIMENT".to_string(),
+                "rangefunc".to_string(),
+            )]),
+            ldflags: vec!["-s".into(), "-w".into()],
+        };
+        let addr = p.build_addr("cmd/app", &factors);
+        assert_eq!(addr.package.as_str(), "cmd/app");
+        assert_eq!(addr.name, "build");
+        assert_eq!(addr.args.get("goos").map(|s| s.as_str()), Some("linux"));
+        assert_eq!(
+            addr.args.get("goexperiment").map(|s| s.as_str()),
+            Some("rangefunc")
+        );
+        assert_eq!(addr.args.get("ldflags").map(|s| s.as_str()), Some("-s -w"));
+
+        // Round-trips: re-parsing recovers env knobs and ldflags tokens.
+        let recovered = Factors::from_addr(&addr);
+        assert_eq!(recovered.env.get("GOEXPERIMENT").unwrap(), "rangefunc");
+        assert_eq!(recovered.ldflags, vec!["-s", "-w"]);
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_fn_composes_addr() {
+        let ctx = FnCallContext {
+            pkg: "cmd/app",
+            root: std::path::Path::new("/ws"),
+        };
+        let args = FnArgs {
+            positional: vec![Value::String("cmd/app".to_string())],
+            named: HashMap::from([
+                ("goos".to_string(), Value::String("linux".to_string())),
+                ("goarch".to_string(), Value::String("amd64".to_string())),
+                (
+                    "tags".to_string(),
+                    Value::List(vec![
+                        Value::String("integration".to_string()),
+                        Value::String("netgo".to_string()),
+                    ]),
+                ),
+                (
+                    "goexperiment".to_string(),
+                    Value::String("rangefunc".to_string()),
+                ),
+                ("ldflags".to_string(), Value::String("-s -w".to_string())),
+            ]),
+        };
+        let out = BuildAddrFn.call(&ctx, args).await.unwrap();
+        let addr_str = match out {
+            Value::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        };
+        let addr = crate::htaddr::parse_addr(&addr_str).unwrap();
+        assert_eq!(addr.package.as_str(), "cmd/app");
+        assert_eq!(addr.name, "build");
+        assert_eq!(addr.args.get("goos").map(|s| s.as_str()), Some("linux"));
+        assert_eq!(
+            addr.args.get("tags").map(|s| s.as_str()),
+            Some("integration,netgo")
+        );
+        assert_eq!(
+            addr.args.get("goexperiment").map(|s| s.as_str()),
+            Some("rangefunc")
+        );
+        assert_eq!(addr.args.get("ldflags").map(|s| s.as_str()), Some("-s -w"));
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_fn_requires_package() {
+        let ctx = FnCallContext {
+            pkg: "",
+            root: std::path::Path::new("/ws"),
+        };
+        let err = BuildAddrFn.call(&ctx, FnArgs::default()).await.unwrap_err();
+        assert!(err.to_string().contains("package"), "{err}");
     }
 
     // ---- simple_lib ----

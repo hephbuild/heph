@@ -8,14 +8,16 @@ use crate::engine::driver::{
 use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
-use crate::htvalue::{parse_map_string_strings, parse_string, parse_strings};
+use crate::htvalue::{
+    parse_map_string_string, parse_map_string_strings, parse_string, parse_strings,
+};
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
 use crate::proc_exec;
 use anyhow::Context;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
@@ -42,6 +44,9 @@ struct GoGolistDef {
     goarch: String,
     goroot: String,
     build_tags: Vec<String>,
+    /// Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) keyed by Go env var.
+    /// Affect `go list` resolution, so they participate in the def hash.
+    env: BTreeMap<String, String>,
     dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
     /// will be staged into consumers' sandboxes. Threaded through so
@@ -52,7 +57,7 @@ struct GoGolistDef {
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
 /// output format (package.bin layout, package_addrs.bin schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 10;
+const GO_GOLIST_FORMAT_VERSION: u32 = 11;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -62,6 +67,7 @@ impl Hash for GoGolistDef {
         self.goarch.hash(state);
         self.goroot.hash(state);
         self.build_tags.hash(state);
+        self.env.hash(state);
         self.dep_inputs.hash(state);
         self.thirdparty_download_addr.hash(state);
         // go_bin input excluded (added at runtime, not hashed here — engine hashes content)
@@ -110,6 +116,16 @@ impl ManagedDriver for GoGolistDriver {
             .map(|v| parse_strings(v).context("parse build_tags"))
             .transpose()?
             .unwrap_or_default();
+
+        // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) — applied to `go list`
+        // and part of the def hash so a knob change reruns resolution.
+        let env: BTreeMap<String, String> = config
+            .get("env")
+            .map(|v| parse_map_string_string(v).context("parse env"))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         let thirdparty_download_addr = config
             .get("thirdparty_download_addr")
@@ -162,6 +178,7 @@ impl ManagedDriver for GoGolistDriver {
             goarch,
             goroot,
             build_tags,
+            env,
             dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr,
         };
@@ -278,6 +295,11 @@ impl ManagedDriver for GoGolistDriver {
             if let Ok(v) = std::env::var(name) {
                 env.insert(name.to_string(), v);
             }
+        }
+        // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) win over any inherited
+        // value so `go list` resolution matches the requested factors.
+        for (k, v) in &def.env {
+            env.insert(k.clone(), v.clone());
         }
 
         let mut cmd_args = vec![
@@ -405,6 +427,35 @@ mod tests {
 
     fn driver() -> GoGolistDriver {
         GoGolistDriver::new("//@heph/bin:go")
+    }
+
+    fn def_hash(def: &GoGolistDef) -> u64 {
+        let mut h = Xxh3Default::new();
+        def.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn test_env_factor_changes_def_hash() {
+        let base = GoGolistDef {
+            import_path: "example.com/mylib".to_string(),
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            goroot: "/usr/local/go".to_string(),
+            build_tags: vec![],
+            env: BTreeMap::new(),
+            dep_inputs: vec![],
+            thirdparty_download_addr: None,
+        };
+        let mut with_env = base.clone();
+        with_env
+            .env
+            .insert("GOEXPERIMENT".to_string(), "rangefunc".to_string());
+        assert_ne!(
+            def_hash(&base),
+            def_hash(&with_env),
+            "env factor must change the golist def hash"
+        );
     }
 
     fn make_parse_request(

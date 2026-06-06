@@ -1,7 +1,7 @@
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::Value;
-use crate::plugingo::factors::Factors;
+use crate::plugingo::factors::{ENV_FACTORS, Factors};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -261,6 +261,13 @@ pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, factors: &Factor
     )
 }
 
+/// Encode factors as address args for a dependency/child addr.
+///
+/// Includes goos/goarch/tags and the build-env knobs (GOEXPERIMENT, GODEBUG, …) so the
+/// whole dependency graph rebuilds under the same knob. Deliberately omits `ldflags`:
+/// this is the shared build_lib/stdlib/thirdparty encoder, and ldflags is link-only —
+/// keeping it out lets archives stay cache-shared across binaries that differ only in
+/// link flags. `build_addr` re-attaches ldflags for the binary `build` target.
 pub fn factors_to_args(factors: &Factors) -> BTreeMap<String, String> {
     let mut args = BTreeMap::new();
     args.insert("goos".to_string(), factors.goos.clone());
@@ -268,7 +275,38 @@ pub fn factors_to_args(factors: &Factors) -> BTreeMap<String, String> {
     if !factors.build_tags.is_empty() {
         args.insert("tags".to_string(), factors.build_tags.join(","));
     }
+    for (arg_key, go_var) in ENV_FACTORS {
+        if let Some(value) = factors.env.get(*go_var) {
+            args.insert(arg_key.to_string(), value.clone());
+        }
+    }
     args
+}
+
+/// Compose the address of the binary `build` target for `package` under `factors`.
+///
+/// Encodes goos/goarch/tags + env knobs (via `factors_to_args`) and re-attaches
+/// `ldflags` — which `factors_to_args` deliberately omits (it encodes shared
+/// dependency `build_lib` addrs), so the binary addr carries link flags while the
+/// dependency archives stay cache-shared.
+pub fn build_addr(package: &str, factors: &Factors) -> Addr {
+    let mut args = factors_to_args(factors);
+    if !factors.ldflags.is_empty() {
+        args.insert("ldflags".to_string(), factors.ldflags.join(" "));
+    }
+    Addr::new(PkgBuf::from(package), "build".to_string(), args)
+}
+
+/// Build the hashed `env` map for a Go compile/link target: the CGO pin plus any
+/// build-env factor knobs (GOEXPERIMENT, GODEBUG, …). Lives in the hashed `env` config
+/// (not `runtime_env`) so changing a knob invalidates the artifact cache.
+pub fn build_env_map(factors: &Factors) -> HashMap<String, Value> {
+    let mut env = HashMap::with_capacity(1 + factors.env.len());
+    env.insert("CGO_ENABLED".to_string(), Value::String("0".to_string()));
+    for (key, value) in &factors.env {
+        env.insert(key.clone(), Value::String(value.clone()));
+    }
+    env
 }
 
 /// Convert an import path to a dep group name.
@@ -522,6 +560,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let addr = encode_stdlib("fmt", &factors);
         assert_eq!(addr.package.as_str(), "@heph/go/std/fmt");
@@ -534,6 +574,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "", &factors);
         assert_eq!(
@@ -548,6 +590,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let addr = encode_thirdparty("github.com/foo/bar", "v1.0.0", "", "", &factors);
         assert_eq!(
@@ -562,6 +606,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "go", &factors);
         assert_eq!(
@@ -613,6 +659,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let addr = encode_thirdparty(
             "k8s.io/apimachinery",
@@ -643,11 +691,46 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let addr = encode_firstparty(&src, ws.path(), &factors);
         assert_eq!(addr.package.as_str(), "mylib");
         assert_eq!(addr.name, "build_lib");
         assert_eq!(addr.args.get("goos").map(|s| s.as_str()), Some("linux"));
+    }
+
+    #[test]
+    fn test_factors_to_args_env_roundtrip() {
+        let factors = Factors {
+            goos: "linux".into(),
+            goarch: "amd64".into(),
+            build_tags: vec!["foo".into()],
+            env: BTreeMap::from([
+                ("GOEXPERIMENT".to_string(), "rangefunc,arenas".to_string()),
+                ("GODEBUG".to_string(), "http2debug=1".to_string()),
+            ]),
+            // ldflags must NOT survive factors_to_args (link-only).
+            ldflags: vec!["-s".into(), "-w".into()],
+        };
+        let args = factors_to_args(&factors);
+        assert_eq!(args.get("goexperiment").unwrap(), "rangefunc,arenas");
+        assert_eq!(args.get("godebug").unwrap(), "http2debug=1");
+        assert!(
+            !args.contains_key("ldflags"),
+            "factors_to_args must not emit ldflags (link-only)"
+        );
+
+        // Render to an addr string and re-parse — env factors round-trip.
+        let addr = encode_stdlib("fmt", &factors);
+        let rendered = addr.to_string();
+        let parsed = crate::htaddr::parse_addr(&rendered).unwrap();
+        let recovered = Factors::from_addr(&parsed);
+        assert_eq!(recovered.env, factors.env);
+        assert!(
+            recovered.ldflags.is_empty(),
+            "ldflags must not propagate through dependency addrs"
+        );
     }
 
     #[test]
