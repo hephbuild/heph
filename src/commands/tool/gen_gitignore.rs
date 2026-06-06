@@ -6,14 +6,29 @@ use async_trait::async_trait;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::engine::{Engine, get_root, gitignore};
+use crate::engine::{Engine, get_cwp, get_root, gitignore};
+use crate::htmatcher::Matcher;
+use crate::htpkg::{self, PkgBuf};
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
-pub struct Args {}
+#[command(override_usage = "heph gen-gitignore\n       heph gen-gitignore <PACKAGE_MATCHER>")]
+pub struct Args {
+    /// Package matcher (e.g. //pkg/...); omit to regenerate the whole section.
+    /// When given, only the lines emitted by targets under that matcher are
+    /// rebuilt — a smaller graph walk, so a faster run.
+    #[arg(value_name = "PACKAGE_MATCHER")]
+    pub matcher: Option<String>,
+}
 
 struct GenGitignoreApp {
     engine: Arc<Engine>,
+    /// Targets to scan for codegen-copy outputs. Whole-workspace selector, or
+    /// the user's package matcher when scoped.
+    matcher: Matcher,
+    /// True when the user passed a matcher: rebuild only the matching slice of
+    /// the section and preserve every other line.
+    scoped: bool,
     root: PathBuf,
     fail_fast: bool,
 }
@@ -39,8 +54,8 @@ impl App for GenGitignoreApp {
 
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
-            let entries = Arc::clone(&self.engine)
-                .codegen_copy_gitignore_patterns(rs.clone())
+            let fresh = Arc::clone(&self.engine)
+                .codegen_copy_gitignore_patterns(rs.clone(), &self.matcher)
                 .await?;
 
             let path = self.root.join(".gitignore");
@@ -50,6 +65,14 @@ impl App for GenGitignoreApp {
                 Err(e) => {
                     return Err(e).with_context(|| format!("reading {}", path.display()));
                 }
+            };
+            // Scoped: graft the freshly-scanned slice over the existing section,
+            // keeping every line emitted by a target outside the matcher.
+            // Whole-workspace: replace the section wholesale.
+            let entries = if self.scoped {
+                gitignore::merge_section(&existing, fresh, &self.matcher)
+            } else {
+                fresh
             };
             let updated = gitignore::render(&existing, &entries);
             if updated == existing {
@@ -77,11 +100,19 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
     bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
-async fn execute_async(_args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let root = get_root()?;
+    // Scoped runs walk only the matched packages; whole-workspace runs use the
+    // codegen-tree selector that reaches every codegen target.
+    let (matcher, scoped) = match args.matcher {
+        Some(s) => (htpkg::parse(&s, &get_cwp()?)?, true),
+        None => (Matcher::TreeOutputTo(PkgBuf::from("")), false),
+    };
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = GenGitignoreApp {
         engine,
+        matcher,
+        scoped,
         root,
         fail_fast: global.fail_fast,
     };
