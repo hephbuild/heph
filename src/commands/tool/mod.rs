@@ -16,8 +16,20 @@ pub struct ToolArgs {
 #[derive(Subcommand)]
 pub enum ToolCommands {
     /// Garbage collect the local cache
+    ///
+    /// Sweeps the local cache (.heph3/cache) and removes artifacts no longer
+    /// reachable from any current target, reclaiming disk space. Resolves every
+    /// cached target's spec, so providers may run.
+    ///
+    /// Example: `heph tool gc`
     Gc(gc::GcArgs),
     /// Manage the heph-generated section of the root .gitignore
+    ///
+    /// Computes the ignore patterns for codegen-copy outputs and writes them
+    /// into a managed block in the workspace root .gitignore, leaving the rest
+    /// of the file untouched. Idempotent: a no-op when already up to date.
+    ///
+    /// Example: `heph tool gen-gitignore`
     #[command(name = "gen-gitignore")]
     GenGitignore(gen_gitignore::Args),
 }

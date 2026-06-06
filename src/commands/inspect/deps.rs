@@ -11,9 +11,9 @@ use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
-    /// Target address
+    /// Target address (e.g. //pkg:name)
     pub addr: String,
-    /// Explore deps interactively
+    /// Explore the dependency tree in an interactive TUI (requires a terminal)
     #[arg(short = 'i', long = "interactive")]
     pub interactive: bool,
 }
