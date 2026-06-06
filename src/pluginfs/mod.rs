@@ -74,7 +74,17 @@ pub fn is_glob_addr(addr: &Addr) -> bool {
 
 // ─── Provider ────────────────────────────────────────────────────────────────
 
-pub struct Provider;
+#[derive(Default)]
+pub struct Provider {
+    /// Dirs the `glob` provider function must prune, shared with the driver.
+    skip: Arc<FsSkip>,
+}
+
+impl Provider {
+    pub fn new(skip: Arc<FsSkip>) -> Self {
+        Self { skip }
+    }
+}
 
 impl EProvider for Provider {
     fn config(&self, _req: ProviderConfigRequest) -> anyhow::Result<ProviderConfigResponse> {
@@ -163,7 +173,9 @@ impl EProvider for Provider {
         vec![
             ProviderFunctionDef {
                 name: "glob".to_string(),
-                func: Arc::new(GlobFn),
+                func: Arc::new(GlobFn {
+                    skip: self.skip.clone(),
+                }),
             },
             ProviderFunctionDef {
                 name: "join".to_string(),
@@ -188,8 +200,10 @@ impl EProvider for Provider {
 /// to that package. Uses the exact same `wax` walk as the `fs` driver
 /// ([`compile_glob`] + [`walk_glob`]), so BUILD-time expansion matches what the
 /// driver globs at execution time: brace alternation, `.`/`..` normalization, and
-/// the built-in `.git`/`.heph`/`.heph3` pruning. Result is sorted.
-struct GlobFn;
+/// the built-in `.git` + engine skip-dir pruning. Result is sorted.
+struct GlobFn {
+    skip: Arc<FsSkip>,
+}
 
 #[async_trait]
 impl ProviderFn for GlobFn {
@@ -209,7 +223,7 @@ impl ProviderFn for GlobFn {
 
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.
-        let compiled = compile_glob("heph.fs.glob", &resolved, &[])?;
+        let compiled = compile_glob(&self.skip, "heph.fs.glob", &resolved, &[])?;
         let artifacts = walk_glob(ctx.root, &compiled)?;
 
         let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
@@ -348,14 +362,79 @@ impl ProviderFn for BaseFn {
 
 // ─── Driver ──────────────────────────────────────────────────────────────────
 
-const BUILT_IN_GLOB_EXCLUDES: &[&str] = &["**/.git/**", "**/.heph3/**", "**/.heph/**"];
+/// Directories the fs walk never descends into. Two sources:
+///  - `.git`, pruned by basename at any depth (a VCS dir is never a build input,
+///    and submodules nest it).
+///  - `skip_dirs`: absolute engine-owned paths handed in by the engine (see
+///    [`Engine::skip_dirs`](crate::engine::Engine::skip_dirs)) — the heph home,
+///    holding the cache/sandboxes/locks. Matched by exact path.
+///
+/// Replaces the former hardcoded `BUILT_IN_*` lists: the engine is now the single
+/// source of truth for which engine-owned subtrees to skip.
+#[derive(Debug)]
+pub struct FsSkip {
+    /// Absolute engine-owned directories pruned by exact path during the walk.
+    skip_dirs: Vec<std::path::PathBuf>,
+    /// Built-in exclude glob patterns — `**/.git/**` plus a root-relative
+    /// `<rel>/**` for each skip dir under the workspace root. Chained ahead of a
+    /// target's user excludes when compiling its exclude `Any`.
+    exclude_globs: Vec<String>,
+    /// Compiled [`exclude_globs`](Self::exclude_globs), reused as the `not`
+    /// matcher for the common case of a target with no user excludes.
+    builtin_any: Arc<wax::Any<'static>>,
+}
 
-/// Directory basenames whose subtree is always excluded — pruned during the
-/// walk so we never descend into them. Kept in sync with the recursive
-/// `**/<name>/**` entries in `BUILT_IN_GLOB_EXCLUDES`: matching the basename at
-/// any depth is equivalent to those patterns, and every descendant is excluded,
-/// so pruning is a pure optimization with identical results.
-const BUILT_IN_PRUNE_DIRS: &[&str] = &[".git", ".heph3", ".heph"];
+impl FsSkip {
+    /// Builds the skip set from the engine-provided `skip_dirs` (absolute paths).
+    /// Each skip dir located under `root` also contributes a `<rel>/**` exclude
+    /// glob so the compiled `not` matcher agrees with the walk-time pruning.
+    pub fn new(root: &std::path::Path, skip_dirs: &[std::path::PathBuf]) -> anyhow::Result<Self> {
+        let mut exclude_globs = vec!["**/.git/**".to_string()];
+        for dir in skip_dirs {
+            if let Some(rel) = dir.strip_prefix(root).ok().and_then(|r| r.to_str())
+                && !rel.is_empty()
+            {
+                exclude_globs.push(format!("{rel}/**"));
+            }
+        }
+        let builtin_any = compile_any(&exclude_globs).context("compiling built-in fs excludes")?;
+        Ok(Self {
+            skip_dirs: skip_dirs.to_vec(),
+            exclude_globs,
+            builtin_any,
+        })
+    }
+
+    /// True if the directory at absolute `path` must be pruned: a `.git` dir at
+    /// any depth, or one of the engine-owned skip dirs.
+    fn is_pruned_dir(&self, path: &std::path::Path) -> bool {
+        path.file_name().and_then(|n| n.to_str()) == Some(".git")
+            || self.skip_dirs.iter().any(|d| d == path)
+    }
+}
+
+impl Default for FsSkip {
+    fn default() -> Self {
+        // Only `.git` is pruned; the `**/.git/**` literal is statically valid.
+        Self::new(std::path::Path::new(""), &[]).expect("built-in .git exclude is valid")
+    }
+}
+
+/// Compiles a set of glob patterns into a single `wax::Any`, reusing the
+/// process-wide [`cached_glob`] cache for each pattern.
+fn compile_any(patterns: &[String]) -> anyhow::Result<Arc<wax::Any<'static>>> {
+    let globs = patterns
+        .iter()
+        .map(|s| {
+            cached_glob(s)
+                .map(|g| (*g).clone())
+                .with_context(|| format!("invalid exclude pattern '{s}'"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Arc::new(
+        wax::any(globs).context("compiling exclude patterns")?,
+    ))
+}
 
 /// Returns the leading literal path prefix of `pattern` — the run of complete
 /// components that contain no glob metacharacters.
@@ -415,6 +494,8 @@ struct CompiledGlob {
     not: Arc<wax::Any<'static>>,
     /// Literal directory prefix of the pattern, used as the walk root.
     prefix: String,
+    /// Engine-owned + built-in dirs to prune during the walk.
+    skip: Arc<FsSkip>,
 }
 
 /// Process-global cache of compiled globs keyed by pattern string.
@@ -439,28 +520,6 @@ fn cached_glob(pattern: &str) -> Result<Arc<wax::Glob<'static>>, wax::BuildError
         .entry(pattern.to_owned())
         .or_insert_with(|| glob.clone());
     Ok(glob)
-}
-
-/// Returns the compiled built-in exclude `Any`, built once per process.
-///
-/// The common case is a glob target with no user excludes, so reusing this Arc
-/// avoids rebuilding the 3-pattern regex union (`**/.git/**`, …) on every parse.
-fn builtin_excludes() -> anyhow::Result<Arc<wax::Any<'static>>> {
-    static BUILTIN: OnceLock<Arc<wax::Any<'static>>> = OnceLock::new();
-    if let Some(a) = BUILTIN.get() {
-        return Ok(a.clone());
-    }
-    let globs = BUILT_IN_GLOB_EXCLUDES
-        .iter()
-        .map(|s| {
-            cached_glob(s)
-                .map(|g| (*g).clone())
-                .with_context(|| format!("invalid built-in exclude pattern '{s}'"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let any = Arc::new(wax::any(globs).context("compiling built-in exclude patterns")?);
-    // Lost a race? Keep whichever value won; both are equivalent.
-    Ok(BUILTIN.get_or_init(|| any).clone())
 }
 
 /// Per-request cache of compiled exclude `Any` unions.
@@ -499,8 +558,9 @@ fn glob_result_cache() -> &'static RwLock<GlobResultCache> {
 
 /// Returns the compiled exclude `Any` (built-ins + user `exclude`) for
 /// `request_id`, memoizing across calls within that request. `exclude` must be
-/// non-empty; the no-exclude case uses the cheaper [`builtin_excludes`] path.
+/// non-empty; the no-exclude case reuses `skip.builtin_any` directly.
 fn cached_exclude_any(
+    skip: &FsSkip,
     request_id: &str,
     exclude: &[String],
 ) -> anyhow::Result<Arc<wax::Any<'static>>> {
@@ -516,17 +576,13 @@ fn cached_exclude_any(
         return Ok(a.clone());
     }
 
-    let exclude_globs: Vec<wax::Glob<'static>> = BUILT_IN_GLOB_EXCLUDES
+    let patterns: Vec<String> = skip
+        .exclude_globs
         .iter()
-        .copied()
-        .chain(exclude.iter().map(String::as_str))
-        .map(|s| {
-            cached_glob(s)
-                .map(|g| (*g).clone())
-                .with_context(|| format!("invalid exclude pattern '{s}'"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let any = Arc::new(wax::any(exclude_globs).context("compiling exclude patterns")?);
+        .cloned()
+        .chain(exclude.iter().cloned())
+        .collect();
+    let any = compile_any(&patterns)?;
 
     Ok(exclude_any_cache()
         .write()
@@ -551,23 +607,25 @@ enum FsDef {
 }
 
 fn compile_glob(
+    skip: &Arc<FsSkip>,
     request_id: &str,
     pattern: &str,
     exclude: &[String],
 ) -> anyhow::Result<CompiledGlob> {
     let glob = cached_glob(pattern).with_context(|| format!("invalid glob pattern '{pattern}'"))?;
 
-    // No user excludes: reuse the cached built-in `Any` directly.
+    // No user excludes: reuse the skip's prebuilt built-in `Any` directly.
     let not = if exclude.is_empty() {
-        builtin_excludes()?
+        skip.builtin_any.clone()
     } else {
-        cached_exclude_any(request_id, exclude)?
+        cached_exclude_any(skip, request_id, exclude)?
     };
 
     Ok(CompiledGlob {
         glob,
         not,
         prefix: literal_prefix(pattern).to_owned(),
+        skip: skip.clone(),
     })
 }
 
@@ -591,12 +649,9 @@ fn walk_glob(
     let walker = walkdir::WalkDir::new(&walk_root)
         .into_iter()
         .filter_entry(|entry| {
-            // Never descend into always-excluded subtrees (.git, …).
-            !(entry.file_type().is_dir()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| BUILT_IN_PRUNE_DIRS.contains(&n)))
+            // Never descend into always-excluded subtrees (.git + engine-owned
+            // skip dirs like the heph home).
+            !(entry.file_type().is_dir() && compiled.skip.is_pruned_dir(entry.path()))
         });
 
     for entry in walker {
@@ -720,7 +775,17 @@ fn cached_glob_walk(
         .clone())
 }
 
-pub struct Driver;
+#[derive(Default)]
+pub struct Driver {
+    /// Engine-owned + built-in dirs pruned during glob walks.
+    skip: Arc<FsSkip>,
+}
+
+impl Driver {
+    pub fn new(skip: Arc<FsSkip>) -> Self {
+        Self { skip }
+    }
+}
 
 #[cfg(unix)]
 fn is_exec(meta: &std::fs::Metadata) -> bool {
@@ -825,7 +890,12 @@ impl crate::engine::driver::Driver for Driver {
                 }
                 let hash = format!("{:x}", h.digest()).into_bytes();
 
-                let compiled = Arc::new(compile_glob(&req.request_id, &pattern, &exclude)?);
+                let compiled = Arc::new(compile_glob(
+                    &self.skip,
+                    &req.request_id,
+                    &pattern,
+                    &exclude,
+                )?);
                 let def = FsDef::Glob {
                     pattern: pattern.clone(),
                     exclude,
@@ -1008,7 +1078,13 @@ mod tests {
             positional: vec![Value::String(pattern.to_string())],
             named: Default::default(),
         };
-        let v = futures::executor::block_on(GlobFn.call(&ctx, args)).unwrap();
+        let v = futures::executor::block_on(
+            GlobFn {
+                skip: Arc::<FsSkip>::default(),
+            }
+            .call(&ctx, args),
+        )
+        .unwrap();
         match v {
             Value::List(l) => l
                 .into_iter()
@@ -1124,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_wrong_package_not_found() {
-        let p = Provider;
+        let p = Provider::default();
         let result = p
             .get(make_get_req("//other/pkg:file@f=foo.txt"), &ctoken())
             .await;
@@ -1133,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_wrong_name_not_found() {
-        let p = Provider;
+        let p = Provider::default();
         let result = p
             .get(
                 make_get_req(&format!("//{PKG}:unknown@f=foo.txt")),
@@ -1145,7 +1221,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_file_returns_spec() {
-        let p = Provider;
+        let p = Provider::default();
         let result = p
             .get(make_get_req(&format!("//{PKG}:file@f=foo.txt")), &ctoken())
             .await
@@ -1160,7 +1236,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_glob_returns_spec() {
-        let p = Provider;
+        let p = Provider::default();
         let result = p
             .get(make_get_req(&format!("//{PKG}:glob@p=src/*.rs")), &ctoken())
             .await
@@ -1209,7 +1285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_missing_both_errors() {
-        let driver = Driver;
+        let driver = Driver::default();
         let result = driver
             .parse(make_parse_req(Default::default()), &ctoken())
             .await;
@@ -1225,7 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_invalid_glob_fails() {
-        let driver = Driver;
+        let driver = Driver::default();
         // Unmatched alternation — wax rejects at parse time.
         let config = std::collections::HashMap::from([(
             "p".to_string(),
@@ -1244,7 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_invalid_exclude_fails() {
-        let driver = Driver;
+        let driver = Driver::default();
         let config = std::collections::HashMap::from([
             ("p".to_string(), Value::String("*.rs".to_string())),
             (
@@ -1265,7 +1341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_file_config() {
-        let driver = Driver;
+        let driver = Driver::default();
         let config = std::collections::HashMap::from([(
             "f".to_string(),
             Value::String("src/main.rs".to_string()),
@@ -1282,7 +1358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_glob_config() {
-        let driver = Driver;
+        let driver = Driver::default();
         let config = std::collections::HashMap::from([(
             "p".to_string(),
             Value::String("src/*.rs".to_string()),
@@ -1297,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_glob_with_exclude() {
-        let driver = Driver;
+        let driver = Driver::default();
         let config = std::collections::HashMap::from([
             ("p".to_string(), Value::String("**/*.rs".to_string())),
             (
@@ -1320,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_file_exists() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let file_path = tmp.path().join("hello.txt");
         fs::write(&file_path, b"hello world").unwrap();
@@ -1359,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_file_missing_errors() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
 
         let config = std::collections::HashMap::from([(
@@ -1441,7 +1517,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_driver_run_glob_follows_file_links_and_skips_dir_links() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let root = tmp.path();
         fs::write(root.join("real.txt"), b"real").unwrap();
@@ -1494,7 +1570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_matches_files() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("a.rs"), b"").unwrap();
         fs::write(tmp.path().join("b.rs"), b"").unwrap();
@@ -1525,7 +1601,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_excludes_git() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let git_dir = tmp.path().join(".git");
         fs::create_dir_all(&git_dir).unwrap();
@@ -1560,8 +1636,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_driver_run_glob_excludes_engine_skip_dir() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join(".heph3");
+        fs::create_dir_all(home.join("cache")).unwrap();
+        fs::write(home.join("cache").join("blob"), b"").unwrap();
+        fs::write(tmp.path().join("main.rs"), b"").unwrap();
+
+        // The engine hands the fs plugin its skip dirs (the heph home); the walk
+        // must prune that subtree rather than relying on a hardcoded basename.
+        let skip = Arc::new(FsSkip::new(tmp.path(), &[home]).unwrap());
+        let driver = Driver::new(skip);
+
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["main.rs"],
+            "engine skip dir must be pruned: {names:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_driver_run_glob_user_exclude() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("keep.rs"), b"").unwrap();
         fs::write(tmp.path().join("skip.rs"), b"").unwrap();
@@ -1591,7 +1705,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_out_path_relative() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let sub = tmp.path().join("sub");
         fs::create_dir_all(&sub).unwrap();
@@ -1677,7 +1791,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_accepts_file_addr() {
-        let p = Provider;
+        let p = Provider::default();
         let addr = file_addr("README.md");
         let result = p
             .get(
@@ -1718,7 +1832,7 @@ mod tests {
         // Pattern with `/./` in the middle previously compiled in wax but
         // matched nothing because wax walks on-disk paths that never contain
         // literal `.` segments. Driver normalizes before compile.
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let nested = tmp.path().join("mgmt/protos/x/bsdiff/v1");
         fs::create_dir_all(&nested).unwrap();
@@ -1766,7 +1880,7 @@ mod tests {
     async fn test_driver_run_glob_parent_segment_in_middle_matches() {
         // `a/b/../c` is equivalent to `a/c` on disk; wax does not collapse
         // `..` so driver normalizes before compile.
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("mgmt/protos/x")).unwrap();
         fs::write(tmp.path().join("mgmt/protos/x/go.mod"), b"").unwrap();
@@ -1797,7 +1911,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_glob_rejects_root_escape() {
-        let driver = Driver;
+        let driver = Driver::default();
         let config = std::collections::HashMap::from([(
             "p".to_string(),
             Value::String("some/../../file".to_string()),
@@ -1815,7 +1929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_glob_rejects_leading_parent() {
-        let driver = Driver;
+        let driver = Driver::default();
         let config = std::collections::HashMap::from([(
             "p".to_string(),
             Value::String("../escape/**".to_string()),
@@ -1826,7 +1940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_parse_file_rejects_root_escape() {
-        let driver = Driver;
+        let driver = Driver::default();
         let config = std::collections::HashMap::from([(
             "f".to_string(),
             Value::String("a/../../file.txt".to_string()),
@@ -1844,7 +1958,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_parent_segments_hash_equivalence() {
-        let driver = Driver;
+        let driver = Driver::default();
         let with_parent = std::collections::HashMap::from([(
             "p".to_string(),
             Value::String("a/b/../c/**/*.rs".to_string()),
@@ -1872,7 +1986,7 @@ mod tests {
     async fn test_driver_run_glob_dot_segments_hash_equivalence() {
         // Two semantically equal patterns must produce the same hash, so the
         // cache key is stable regardless of how the user wrote the path.
-        let driver = Driver;
+        let driver = Driver::default();
         let with_dot = std::collections::HashMap::from([(
             "p".to_string(),
             Value::String("a/./b/**/*.rs".to_string()),
@@ -1898,7 +2012,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_missing_path_is_empty() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
 
         let pattern = "does/not/exist/*.rs";
@@ -1925,7 +2039,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_missing_root_is_empty() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let missing_root = tmp.path().join("nonexistent");
 
@@ -1948,7 +2062,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_brace_pattern() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let sub = tmp.path().join("dir");
         fs::create_dir_all(&sub).unwrap();
@@ -1999,19 +2113,12 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_excludes_shared() {
-        let a = builtin_excludes().unwrap();
-        let b = builtin_excludes().unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "built-in Any built once per process");
-    }
-
-    #[test]
     fn test_compile_glob_no_exclude_reuses_builtin() {
-        let builtin = builtin_excludes().unwrap();
-        let compiled = compile_glob("req-test", "**/*.rs", &[]).unwrap();
+        let skip = Arc::new(FsSkip::default());
+        let compiled = compile_glob(&skip, "req-test", "**/*.rs", &[]).unwrap();
         assert!(
-            Arc::ptr_eq(&compiled.not, &builtin),
-            "empty-exclude path must reuse the cached built-in Any"
+            Arc::ptr_eq(&compiled.not, &skip.builtin_any),
+            "empty-exclude path must reuse the skip's prebuilt built-in Any"
         );
     }
 
@@ -2019,15 +2126,28 @@ mod tests {
     fn test_compile_glob_user_exclude_shares_any() {
         // Within one request, the same exclude set (any order) reuses one
         // compiled `Any`; a different set does not.
+        let skip = Arc::new(FsSkip::default());
         let req = "req-share";
-        let a = compile_glob(req, "**/*.go", &["vendor/**".into(), "out/**".into()]).unwrap();
-        let b = compile_glob(req, "src/**/*.go", &["out/**".into(), "vendor/**".into()]).unwrap();
+        let a = compile_glob(
+            &skip,
+            req,
+            "**/*.go",
+            &["vendor/**".into(), "out/**".into()],
+        )
+        .unwrap();
+        let b = compile_glob(
+            &skip,
+            req,
+            "src/**/*.go",
+            &["out/**".into(), "vendor/**".into()],
+        )
+        .unwrap();
         assert!(
             Arc::ptr_eq(&a.not, &b.not),
             "identical exclude sets must share one Any regardless of order"
         );
 
-        let c = compile_glob(req, "**/*.go", &["other/**".into()]).unwrap();
+        let c = compile_glob(&skip, req, "**/*.go", &["other/**".into()]).unwrap();
         assert!(
             !Arc::ptr_eq(&a.not, &c.not),
             "distinct exclude sets must not share an Any"
@@ -2038,9 +2158,10 @@ mod tests {
     fn test_compile_glob_exclude_cache_is_per_request() {
         // Different request ids do not share exclude `Any`s, even for the same
         // set — buckets are keyed by request.
+        let skip = Arc::new(FsSkip::default());
         let exclude = ["vendor/**".to_string()];
-        let a = compile_glob("req-iso-a", "**/*.go", &exclude).unwrap();
-        let b = compile_glob("req-iso-b", "**/*.go", &exclude).unwrap();
+        let a = compile_glob(&skip, "req-iso-a", "**/*.go", &exclude).unwrap();
+        let b = compile_glob(&skip, "req-iso-b", "**/*.go", &exclude).unwrap();
         assert!(
             !Arc::ptr_eq(&a.not, &b.not),
             "distinct requests must not share an exclude Any"
@@ -2051,7 +2172,7 @@ mod tests {
     async fn test_driver_run_glob_memoized_per_request_skips_rewalk() {
         // Within one request the walk result is memoized: a file created after
         // the first run must NOT appear in a second run with the same id.
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("a.rs"), b"").unwrap();
 
@@ -2105,7 +2226,7 @@ mod tests {
     #[tokio::test]
     async fn test_driver_run_glob_distinct_requests_rewalk() {
         // A different request id must not see the first request's memoized walk.
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("a.rs"), b"").unwrap();
 
@@ -2172,7 +2293,7 @@ mod tests {
     async fn test_driver_run_glob_rooted_prefix_ignores_siblings() {
         // A rooted pattern walks only its literal-prefix subtree; sibling
         // directories with matching-looking files must not appear.
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("pkg/sub")).unwrap();
         fs::write(tmp.path().join("pkg/keep.rs"), b"").unwrap();
@@ -2206,7 +2327,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_accepts_glob_addr() {
-        let p = Provider;
+        let p = Provider::default();
         let addr = glob_addr("**/*.rs", &[]);
         let result = p
             .get(
@@ -2237,7 +2358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_glob_excludes_stamped_codegen() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let plain = tmp.path().join("plain.rs");
         let generated = tmp.path().join("generated.rs");
@@ -2273,7 +2394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_file_stamped_codegen_yields_nothing() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let generated = tmp.path().join("generated.rs");
         fs::write(&generated, b"generated").unwrap();
@@ -2309,7 +2430,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_run_file_plain_yields_one_artifact() {
-        let driver = Driver;
+        let driver = Driver::default();
         let tmp = tempdir().unwrap();
         let plain = tmp.path().join("plain.rs");
         fs::write(&plain, b"plain").unwrap();

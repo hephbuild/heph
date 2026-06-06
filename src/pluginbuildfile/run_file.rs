@@ -942,7 +942,7 @@ mod tests {
     fn fs_registry() -> Arc<ProviderFunctionRegistry> {
         use crate::engine::provider::Provider as _;
         let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider("fs", crate::pluginfs::Provider.functions());
+        reg.insert_provider("fs", crate::pluginfs::Provider::default().functions());
         Arc::new(reg)
     }
 

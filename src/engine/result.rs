@@ -2253,7 +2253,7 @@ mod tests {
         })
         .unwrap();
         engine
-            .register_provider(|_| Box::new(crate::pluginfs::Provider))
+            .register_provider(|_| Box::new(crate::pluginfs::Provider::default()))
             .unwrap();
         let fns = engine.provider_functions();
         assert!(
@@ -2328,7 +2328,7 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_provider(|_| Box::new(crate::pluginfs::Provider))?;
+        engine.register_provider(|_| Box::new(crate::pluginfs::Provider::default()))?;
         engine.register_provider(|root| {
             Box::new(crate::pluginbuildfile::Provider::new(root.to_path_buf()))
         })?;
@@ -3975,8 +3975,8 @@ mod tests {
         // so codegen targets can run real shell. The `@heph/fs` provider+driver
         // resolves the synthesized introspect-outputs inputs.
         engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_bash()))?;
-        engine.register_provider(|_| Box::new(crate::pluginfs::Provider))?;
-        engine.register_driver(Box::new(crate::pluginfs::Driver))?;
+        engine.register_provider(|_| Box::new(crate::pluginfs::Provider::default()))?;
+        engine.register_driver(Box::new(crate::pluginfs::Driver::default()))?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))

@@ -498,6 +498,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Directories the engine owns and no provider/driver should walk into. The
+    /// home dir holds the local cache, sandboxes, locks — never packages. Handed
+    /// to provider factories (and the built-in `fs` plugin) so every walk prunes
+    /// the same engine-owned subtrees.
+    pub fn skip_dirs(&self) -> Vec<PathBuf> {
+        vec![self.home.clone()]
+    }
+
     /// Instantiates every provider/driver listed in the entries by looking up the
     /// matching factory by name. Errors if any name has no registered factory.
     /// Factories are consumed — calling twice on the same name will error.
@@ -507,9 +515,7 @@ impl Engine {
         drivers: &[PluginEntry],
     ) -> anyhow::Result<()> {
         let root = self.cfg.root.clone();
-        // Directories the engine owns and no provider should walk into. The
-        // home dir holds the local cache, sandboxes, locks — never packages.
-        let skip_dirs = [self.home.clone()];
+        let skip_dirs = self.skip_dirs();
         for entry in providers {
             let factory = self
                 .provider_factories

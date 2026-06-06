@@ -127,9 +127,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         lock_backend,
     })?;
 
-    // Auto-registered built-ins (no options).
-    e.register_provider(|_| Box::new(pluginfs::Provider))?;
-    e.register_driver(Box::new(pluginfs::Driver))?;
+    // Auto-registered built-ins (no options). The fs plugin prunes the engine's
+    // own skip dirs (the heph home) during glob walks.
+    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(&root, &e.skip_dirs())?);
+    e.register_provider({
+        let fs_skip = fs_skip.clone();
+        move |_| Box::new(pluginfs::Provider::new(fs_skip))
+    })?;
+    e.register_driver(Box::new(pluginfs::Driver::new(fs_skip)))?;
     e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
     e.register_driver(Box::new(pluginhostbin::Driver))?;
     e.register_driver(Box::new(plugintextfile::Driver))?;
@@ -250,8 +255,12 @@ mod tests {
             ..Default::default()
         })?;
 
-        e.register_provider(|_| Box::new(pluginfs::Provider))?;
-        e.register_driver(Box::new(pluginfs::Driver))?;
+        let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(dir.path(), &e.skip_dirs())?);
+        e.register_provider({
+            let fs_skip = fs_skip.clone();
+            move |_| Box::new(pluginfs::Provider::new(fs_skip))
+        })?;
+        e.register_driver(Box::new(pluginfs::Driver::new(fs_skip)))?;
         e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
         e.register_driver(Box::new(pluginhostbin::Driver))?;
         e.register_driver(Box::new(plugintextfile::Driver))?;
