@@ -3,7 +3,7 @@ use crate::engine::error::{CycleError, TargetFailure};
 use crate::engine::local_cache::CacheArtifact;
 use crate::engine::meta::ResultMeta;
 use crate::engine::provider::State;
-use crate::engine::result::{ArtifactMeta, ExtendedTargetDef, OutputMatcher};
+use crate::engine::result::{ArtifactMeta, ExtendedTargetDef, LockedResolution, OutputMatcher};
 use crate::engine::spec::EngineTargetSpec;
 use crate::hasync::StdCancellationToken;
 use crate::hmemoizer::Memoizer;
@@ -171,6 +171,13 @@ pub struct RequestStateData {
     pub mem_result:
         Memoizer<(Addr, OutputMatcher, bool), Result<Arc<crate::engine::result::EResult>, ArcErr>>,
     pub mem_execute_cache: Memoizer<(Addr, String), ExecuteCacheResult>,
+    /// Single-flights the per-addr result-LOCK + cache-fetch/execute, keyed by
+    /// `Addr` ALONE (not `is_top`/`outputs`). The `(outputs, is_top)`
+    /// `mem_result` cells all await this, share its one riding read guard, then
+    /// filter outputs on top. Keyed addr-only so two sibling computations of one
+    /// addr can never both hold the non-reentrant per-addr lock — the
+    /// self-deadlock this prevents.
+    pub(crate) mem_locked_result: Memoizer<Addr, Result<Arc<LockedResolution>, ArcErr>>,
     pub mem_meta: Memoizer<Addr, Result<ResultMeta, ArcErr>>,
     pub mem_spec: Memoizer<Addr, Result<Arc<EngineTargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<Addr, Result<Arc<ExtendedTargetDef>, ArcErr>>,
@@ -391,6 +398,7 @@ impl Engine {
             ctoken: StdCancellationToken::new(),
             dep_dag: Mutex::new(DepDag::new()),
             mem_execute_cache: Memoizer::with_tag("execute_cache"),
+            mem_locked_result: Memoizer::with_tag("locked_result"),
             mem_result: Memoizer::with_tag("result"),
             mem_meta: Memoizer::with_tag("meta"),
             mem_spec: Memoizer::with_tag("spec"),
