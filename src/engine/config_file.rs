@@ -12,6 +12,11 @@ pub type Options = BTreeMap<String, serde_yaml::Value>;
 pub struct ConfigFile {
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
+    /// Extra workspace-relative glob patterns the `fs` plugin excludes from every
+    /// glob walk, on top of the always-skipped `.git` and engine-owned dirs.
+    /// Matched against file paths like a target's own `exclude`.
+    #[serde(default)]
+    pub skip: Vec<String>,
     #[serde(default)]
     pub providers: Vec<PluginEntry>,
     #[serde(default)]
@@ -214,6 +219,22 @@ drivers:
             .expect("present");
         assert_eq!(patterns, vec!["BUILD2".to_string(), "*.BUILD2".to_string()]);
         assert_eq!(cfg.drivers.len(), 2);
+    }
+
+    #[test]
+    fn parses_top_level_skip() {
+        let yaml = "skip:\n  - vendor/**\n  - \"**/*.tmp\"\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(
+            cfg.skip,
+            vec!["vendor/**".to_string(), "**/*.tmp".to_string()]
+        );
+    }
+
+    #[test]
+    fn skip_defaults_empty() {
+        let cfg: ConfigFile = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        assert!(cfg.skip.is_empty());
     }
 
     #[test]

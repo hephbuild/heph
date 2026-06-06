@@ -121,6 +121,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
         home_dir: home_dir.clone(),
+        skip: file.skip.clone(),
         parallelism: None,
         mem_cache,
         fuse,
@@ -128,8 +129,12 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     })?;
 
     // Auto-registered built-ins (no options). The fs plugin prunes the engine's
-    // own skip dirs (the heph home) during glob walks.
-    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(&root, &e.skip_dirs())?);
+    // own skip dirs (the heph home) plus the config file's extra `skip` globs.
+    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(
+        &root,
+        &e.skip_dirs(),
+        e.skip_globs(),
+    )?);
     e.register_provider({
         let fs_skip = fs_skip.clone();
         move |_| Box::new(pluginfs::Provider::new(fs_skip))
@@ -251,11 +256,16 @@ mod tests {
         let mut e = engine::Engine::new(engine::Config {
             root,
             home_dir: home_dir.clone(),
+            skip: file.skip.clone(),
             parallelism: None,
             ..Default::default()
         })?;
 
-        let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(dir.path(), &e.skip_dirs())?);
+        let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(
+            dir.path(),
+            &e.skip_dirs(),
+            e.skip_globs(),
+        )?);
         e.register_provider({
             let fs_skip = fs_skip.clone();
             move |_| Box::new(pluginfs::Provider::new(fs_skip))
