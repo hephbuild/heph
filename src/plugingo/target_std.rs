@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
-use crate::plugingo::addr_util::{go_bin_tools_config, to_run_value};
+use crate::plugingo::addr_util::{build_env_map, go_bin_tools_config, to_run_value};
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 
@@ -86,16 +86,10 @@ pub fn build_spec(
             ),
         ])),
     );
-    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
-    // cache lookups across the rollout. `runtime_env` is intentionally excluded
-    // from the def hash (see pluginexec/mod.rs:70).
-    config.insert(
-        "env".to_string(),
-        Value::Map(HashMap::from([(
-            "CGO_ENABLED".to_string(),
-            Value::String("0".to_string()),
-        )])),
-    );
+    // CGO pin + build-env factor knobs (GOEXPERIMENT, GODEBUG, …) live in `env`
+    // (hashed) so stale archives don't survive cache lookups. `runtime_env` is
+    // intentionally excluded from the def hash (see pluginexec/mod.rs:70).
+    config.insert("env".to_string(), Value::Map(build_env_map(factors)));
 
     TargetSpec {
         addr,
@@ -140,6 +134,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
 

@@ -196,6 +196,20 @@ impl Provider {
         &self.inner.go_bin_addr
     }
 
+    /// Compose the address of the binary `build` target for `package` under `factors`.
+    ///
+    /// Encodes goos/goarch/tags and the build-env knobs (GOEXPERIMENT, GODEBUG, …) plus
+    /// any linker flags. `ldflags` is re-attached here (it is deliberately omitted from
+    /// `factors_to_args`, which encodes shared dependency `build_lib` addrs), so the
+    /// binary addr carries link flags while the dependency archives stay cache-shared.
+    pub fn build_addr(&self, package: &str, factors: &Factors) -> Addr {
+        let mut args = factors_to_args(factors);
+        if !factors.ldflags.is_empty() {
+            args.insert("ldflags".to_string(), factors.ldflags.join(" "));
+        }
+        Addr::new(PkgBuf::from(package), "build".to_string(), args)
+    }
+
     pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
         let goroot = resolve_goroot()?;
         let gomodcache = resolve_go_env_var("GOMODCACHE")?;
@@ -363,6 +377,8 @@ impl ProviderInner {
                 goos: current_goos(),
                 goarch: current_goarch(),
                 build_tags: vec![],
+                env: Default::default(),
+                ldflags: vec![],
             };
 
             let kind = match decode_package(&req.package, &self.workspace_root) {
@@ -2406,6 +2422,37 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let workspace = p.inner.workspace_root.clone();
         p.get(make_get_req(addr, &workspace), &ctoken).await
+    }
+
+    #[test]
+    fn test_build_addr_composes_build_target_with_factors() {
+        require_go!();
+        let sandbox = tempfile::tempdir().unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let factors = Factors {
+            goos: "linux".into(),
+            goarch: "amd64".into(),
+            build_tags: vec!["integration".into()],
+            env: std::collections::BTreeMap::from([(
+                "GOEXPERIMENT".to_string(),
+                "rangefunc".to_string(),
+            )]),
+            ldflags: vec!["-s".into(), "-w".into()],
+        };
+        let addr = p.build_addr("cmd/app", &factors);
+        assert_eq!(addr.package.as_str(), "cmd/app");
+        assert_eq!(addr.name, "build");
+        assert_eq!(addr.args.get("goos").map(|s| s.as_str()), Some("linux"));
+        assert_eq!(
+            addr.args.get("goexperiment").map(|s| s.as_str()),
+            Some("rangefunc")
+        );
+        assert_eq!(addr.args.get("ldflags").map(|s| s.as_str()), Some("-s -w"));
+
+        // Round-trips: re-parsing recovers env knobs and ldflags tokens.
+        let recovered = Factors::from_addr(&addr);
+        assert_eq!(recovered.env.get("GOEXPERIMENT").unwrap(), "rangefunc");
+        assert_eq!(recovered.ldflags, vec!["-s", "-w"]);
     }
 
     // ---- simple_lib ----

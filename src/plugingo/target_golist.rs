@@ -107,6 +107,20 @@ fn build_spec_inner(
             ),
         );
     }
+    // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) — affect `go list`
+    // resolution, so they ride in the golist config and the GoGolistDef hash.
+    if !factors.env.is_empty() {
+        config.insert(
+            "env".to_string(),
+            Value::Map(
+                factors
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                    .collect(),
+            ),
+        );
+    }
     if !deps.is_empty() {
         config.insert("deps".to_string(), Value::Map(deps));
     }
@@ -151,6 +165,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
 
@@ -391,6 +407,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec!["integration".to_string()],
+            env: Default::default(),
+            ldflags: vec![],
         };
         let spec = build_spec_stdlib(test_addr(), "fmt", &factors, "/usr/local/go").unwrap();
         assert!(
@@ -399,6 +417,38 @@ mod tests {
                 Some(Value::List(tags)) if tags.len() == 1
             ),
             "build_tags must be in config when non-empty"
+        );
+    }
+
+    #[test]
+    fn test_env_factors_in_config() {
+        let factors = Factors {
+            goos: "linux".into(),
+            goarch: "amd64".into(),
+            build_tags: vec![],
+            env: std::collections::BTreeMap::from([(
+                "GOEXPERIMENT".to_string(),
+                "rangefunc".to_string(),
+            )]),
+            ldflags: vec![],
+        };
+        let spec = build_spec_stdlib(test_addr(), "fmt", &factors, "/usr/local/go").unwrap();
+        let env = match spec.config.get("env").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected env map"),
+        };
+        assert!(
+            matches!(env.get("GOEXPERIMENT"), Some(Value::String(s)) if s == "rangefunc"),
+            "golist config env must carry GOEXPERIMENT"
+        );
+    }
+
+    #[test]
+    fn test_no_env_key_when_empty() {
+        let spec = build_spec_stdlib(test_addr(), "fmt", &test_factors(), "/usr/local/go").unwrap();
+        assert!(
+            !spec.config.contains_key("env"),
+            "env must not appear when no factor knobs set"
         );
     }
 

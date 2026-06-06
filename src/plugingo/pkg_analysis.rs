@@ -329,6 +329,11 @@ pub(crate) async fn run_go_list(
         }
     }
 
+    // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) — match the driver's resolution.
+    for (k, v) in &factors.env {
+        cmd.env(k, v);
+    }
+
     let output = cmd.output().await.context("spawn go list")?;
 
     if !output.status.success() {

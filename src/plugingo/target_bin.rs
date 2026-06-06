@@ -2,7 +2,8 @@ use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::htvalue::Value;
 use crate::plugingo::addr_util::{
-    go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
+    build_env_map, go_bin_tools_config, import_path_to_dep_group, to_run_value,
+    write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
@@ -22,7 +23,7 @@ pub fn build_spec(
         .unwrap_or(import_path)
         .to_string();
 
-    let run = generate_link_script(import_path, &binary_name, transitive_libs);
+    let run = generate_link_script(import_path, &binary_name, transitive_libs, &factors.ldflags);
 
     let deps: BTreeMap<String, Value> = transitive_libs
         .iter()
@@ -58,15 +59,11 @@ pub fn build_spec(
             ("GOROOT".to_string(), Value::String(goroot.to_string())),
         ])),
     );
-    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
-    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert(
-        "env".to_string(),
-        Value::Map(HashMap::from([(
-            "CGO_ENABLED".to_string(),
-            Value::String("0".to_string()),
-        )])),
-    );
+    // CGO pin + build-env factor knobs (GOEXPERIMENT, GODEBUG, …) live in `env`
+    // (hashed) so stale archives don't survive cache lookups (pluginexec/mod.rs:70
+    // excludes runtime_env from the def hash). ldflags are baked into the link
+    // command (`run`) instead — see generate_link_script.
+    config.insert("env".to_string(), Value::Map(build_env_map(factors)));
 
     TargetSpec {
         addr,
@@ -81,17 +78,26 @@ fn generate_link_script(
     self_import_path: &str,
     binary_name: &str,
     transitive_libs: &[(String, Addr)],
+    ldflags: &[String],
 ) -> Vec<String> {
     // The main package is passed as a positional arg to the linker, not via importcfg.
     let mut lines = write_importcfg_script(transitive_libs, Some(self_import_path));
     let self_group = import_path_to_dep_group(self_import_path);
     let self_env_var = format!("SRC_{}", self_group.to_uppercase());
+    // User-supplied linker flags (factor `ldflags`) apply to the LINK STEP ONLY.
+    // Baked into the `run` string (which is hashed), so distinct flags → distinct
+    // binary cache entry without touching the shared lib archives.
+    let ldflags_str = if ldflags.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", ldflags.join(" "))
+    };
     // -buildmode=pie matches Go's default on darwin/arm64 (and most modern
     // platforms). Libs were compiled with -shared, so the link must agree on
     // PIE — otherwise asm relocations from transitive deps fail to resolve.
     lines.push(format!(
-        "\"$TOOL_GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"",
-        binary_name, self_env_var
+        "\"$TOOL_GO\" tool link -importcfg \"$importcfg\" -buildmode=pie {}-o {} \"${}\"",
+        ldflags_str, binary_name, self_env_var
     ));
     lines
 }
@@ -121,6 +127,8 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            env: Default::default(),
+            ldflags: vec![],
         }
     }
 
@@ -230,6 +238,71 @@ mod tests {
             matches!(&go[0], Value::String(s) if s.contains("@heph/bin")),
             "go tool should reference go bin addr: {:?}",
             go
+        );
+    }
+
+    #[test]
+    fn test_ldflags_in_link_command() {
+        let mut factors = test_factors();
+        factors.ldflags = vec!["-s".into(), "-w".into(), "-X".into(), "main.v=1".into()];
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &factors,
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = run_str(&spec);
+        assert!(
+            run.contains("-s -w -X main.v=1"),
+            "link command must carry ldflags: {}",
+            run
+        );
+        // ldflags sit before -o so they reach the linker, not the output path.
+        assert!(run.find("-s -w").unwrap() < run.find("-o ").unwrap());
+    }
+
+    #[test]
+    fn test_no_ldflags_link_command_unchanged() {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = run_str(&spec);
+        assert!(
+            run.contains("-buildmode=pie -o "),
+            "no stray flag space: {}",
+            run
+        );
+    }
+
+    #[test]
+    fn test_env_carries_factor_knobs() {
+        let mut factors = test_factors();
+        factors
+            .env
+            .insert("GOEXPERIMENT".to_string(), "rangefunc".to_string());
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &factors,
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let env = match spec.config.get("env").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            matches!(env.get("GOEXPERIMENT"), Some(Value::String(s)) if s == "rangefunc"),
+            "hashed env must carry GOEXPERIMENT: {:?}",
+            env.get("GOEXPERIMENT")
         );
     }
 
