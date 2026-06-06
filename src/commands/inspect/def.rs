@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use clap_complete::engine::ArgValueCompleter;
 use serde::Serialize;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::completion::complete_target_addr;
 use crate::engine::Engine;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::driver::targetdef::TargetDef;
@@ -15,6 +17,7 @@ use crate::tui::{self, App, AppContext, LogSink};
 #[derive(clap::Args, Clone)]
 pub struct Args {
     /// Target address (e.g. //pkg:name)
+    #[arg(add = ArgValueCompleter::new(complete_target_addr))]
     pub addr: String,
     /// Show the direct def only, without applying transitive deps
     #[arg(long)]

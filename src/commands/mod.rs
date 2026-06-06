@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod completion;
 pub mod errors;
 pub mod gendocs;
 mod global;

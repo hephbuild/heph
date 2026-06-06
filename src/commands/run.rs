@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use clap::Args;
+use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::completion::complete_target_addr;
 use crate::commands::utils::matcher_from_args;
 use crate::engine::{Engine, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp};
 use crate::htmatcher::Matcher;
@@ -15,7 +17,7 @@ use crate::tui::{self, App, AppContext, LogSink};
 #[command(override_usage = "heph run <TARGET_ADDRESS>\n       heph run <LABEL> <PACKAGE_MATCHER>")]
 pub struct RunArgs {
     /// Target address (e.g., //pkg:name) OR Label
-    #[arg(value_name = "TARGET_ADDRESS/LABEL")]
+    #[arg(value_name = "TARGET_ADDRESS/LABEL", add = ArgValueCompleter::new(complete_target_addr))]
     pub arg1: String,
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
@@ -33,7 +35,7 @@ pub struct RunArgs {
     #[arg(long = "list-out")]
     pub list_out: bool,
     /// Exclude target address (repeatable, e.g. -e //pkg:target)
-    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS")]
+    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS", add = ArgValueCompleter::new(complete_target_addr))]
     pub exclude: Vec<String>,
     /// Fail if generated output differs from the tree (CI check)
     #[arg(long = "frozen")]

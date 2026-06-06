@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
@@ -22,6 +22,14 @@ fn main() -> ExitCode {
     if let Some(fd) = parse_supervisor_args() {
         heph::process_supervisor::run_supervisor_main(fd);
     }
+
+    // Dynamic shell completion. A no-op unless the `COMPLETE` env var is set
+    // (a tab press or `heph tool completions` registration), in which case it
+    // emits candidates / the registration script and exits the process. Runs
+    // before the supervisor fork and logging init so a tab press never forks
+    // the sidecar or writes log noise; the address completers spin up their
+    // own short-lived engine on demand.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
     // Ignore SIGTTOU/SIGTTIN so terminal-control syscalls (tcsetattr,
     // tcgetattr, tcsetpgrp …) from a background process group fail with
