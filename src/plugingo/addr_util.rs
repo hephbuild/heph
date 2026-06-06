@@ -283,6 +283,20 @@ pub fn factors_to_args(factors: &Factors) -> BTreeMap<String, String> {
     args
 }
 
+/// Compose the address of the binary `build` target for `package` under `factors`.
+///
+/// Encodes goos/goarch/tags + env knobs (via `factors_to_args`) and re-attaches
+/// `ldflags` — which `factors_to_args` deliberately omits (it encodes shared
+/// dependency `build_lib` addrs), so the binary addr carries link flags while the
+/// dependency archives stay cache-shared.
+pub fn build_addr(package: &str, factors: &Factors) -> Addr {
+    let mut args = factors_to_args(factors);
+    if !factors.ldflags.is_empty() {
+        args.insert("ldflags".to_string(), factors.ldflags.join(" "));
+    }
+    Addr::new(PkgBuf::from(package), "build".to_string(), args)
+}
+
 /// Build the hashed `env` map for a Go compile/link target: the CGO pin plus any
 /// build-env factor knobs (GOEXPERIMENT, GODEBUG, …). Lives in the hashed `env` config
 /// (not `runtime_env`) so changing a knob invalidates the artifact cache.
