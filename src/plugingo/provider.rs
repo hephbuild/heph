@@ -17,7 +17,7 @@ use crate::plugingo::errors::NoGoFilesError;
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
-    is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires,
+    is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires, parse_go_sum_modules,
 };
 use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
@@ -1713,8 +1713,33 @@ impl ProviderInner {
                 enclose!((go_mod_path) move || std::fs::read_to_string(&go_mod_path)),
             )
             .with_context(|| format!("reading {}", go_mod_path.display()))?;
+
+            // Start from go.mod's explicit requires, then fill in modules that
+            // appear only in go.sum. An untidied go.mod (pre-1.17 / never
+            // tidied) omits indirect requires, so a thirdparty package's
+            // transitive imports (e.g. golang.org/x/net behind oauth2) would
+            // otherwise fail to resolve to a module version and get dropped from
+            // the importcfg. go.mod entries win on conflict — they carry the
+            // authoritative/replace intent — so go.sum only adds modules go.mod
+            // doesn't already pin.
+            let mut requires = parse_go_mod_requires(&content);
+            let go_sum_path = module_root.join("go.sum");
+            if go_sum_path.exists() {
+                let sum_content = crate::process_supervisor::block_or_inline(
+                    enclose!((go_sum_path) move || std::fs::read_to_string(&go_sum_path)),
+                )
+                .with_context(|| format!("reading {}", go_sum_path.display()))?;
+                let known: std::collections::HashSet<&str> =
+                    requires.iter().map(|(m, _)| m.as_str()).collect();
+                let extra: Vec<(String, String)> = parse_go_sum_modules(&sum_content)
+                    .into_iter()
+                    .filter(|(m, _)| !known.contains(m.as_str()))
+                    .collect();
+                requires.extend(extra);
+            }
+
             Arc::new(GoModData {
-                requires: parse_go_mod_requires(&content),
+                requires,
                 module_path: parse_go_mod_module_path(&content).unwrap_or_default(),
             })
         } else {
@@ -2406,6 +2431,49 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let workspace = p.inner.workspace_root.clone();
         p.get(make_get_req(addr, &workspace), &ctoken).await
+    }
+
+    #[test]
+    fn test_load_go_mod_merges_go_sum_for_indirect_modules() {
+        require_go!();
+        // An untidied go.mod that directly requires oauth2 but not x/net, with a
+        // go.sum that carries x/net's selected version. load_go_mod must expose
+        // x/net so that oauth2/internal's import of x/net/context/ctxhttp can
+        // resolve to a thirdparty addr instead of being silently dropped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module infiot.com/infiot/tools/gogithub\n\ngo 1.12\n\nrequire golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("go.sum"),
+            "golang.org/x/net v0.0.0-20190108225652-1e06a53dbb7e h1:bRhVy7zSSasaqNksaRZiA5EEI+Ei4I1nO5Jh72wfHlg=\n\
+golang.org/x/net v0.0.0-20190108225652-1e06a53dbb7e/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=\n\
+golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0HISf9D4TzseP40cEA6IGfs=\n",
+        )
+        .unwrap();
+
+        let p = Provider::new(dir.path().to_path_buf()).expect("provider");
+        let data = p.inner.load_go_mod(dir.path()).expect("load_go_mod");
+
+        let net = find_module_for_import("golang.org/x/net/context/ctxhttp", &data.requires)
+            .expect("x/net must resolve via go.sum even though go.mod omits it");
+        assert_eq!(net.0, "golang.org/x/net");
+        assert_eq!(net.1, "v0.0.0-20190108225652-1e06a53dbb7e");
+
+        // go.mod-listed module still resolves, and only once (no go.sum dup).
+        let oauth2 = find_module_for_import("golang.org/x/oauth2", &data.requires).unwrap();
+        assert_eq!(oauth2.1, "v0.0.0-20200107190931-bf48bf16ab8d");
+        let oauth2_count = data
+            .requires
+            .iter()
+            .filter(|(m, _)| m == "golang.org/x/oauth2")
+            .count();
+        assert_eq!(
+            oauth2_count, 1,
+            "go.mod module must not be duplicated by go.sum"
+        );
     }
 
     // ---- simple_lib ----

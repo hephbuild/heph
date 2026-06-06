@@ -283,6 +283,38 @@ pub fn parse_go_mod_requires(content: &str) -> Vec<(String, String)> {
     result
 }
 
+/// Parse the *selected* module versions out of a `go.sum` file.
+///
+/// `go.sum` carries two line kinds per module version:
+///   `<module> <version> h1:<hash>`          — the module's source tree hash
+///   `<module> <version>/go.mod h1:<hash>`    — only the module's go.mod hash
+///
+/// The plain (non-`/go.mod`) line is present exactly for the version whose
+/// *source* participates in the build — i.e. the MVS-selected version. The
+/// `/go.mod`-only lines are graph entries for versions whose source is never
+/// compiled, so they're skipped.
+///
+/// This fills the gap left by `parse_go_mod_requires`: an untidied `go.mod`
+/// (pre-1.17, or never `go mod tidy`'d) lists only direct requires, so indirect
+/// modules pulled in transitively by a dependency (e.g. `golang.org/x/net`
+/// behind `golang.org/x/oauth2`) appear *only* in `go.sum`. Without them their
+/// import paths fail to resolve to a thirdparty addr and get silently dropped.
+pub fn parse_go_sum_modules(content: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(module), Some(version)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        // Skip the go.mod-only graph entries; keep only source-hash lines.
+        if version.ends_with("/go.mod") {
+            continue;
+        }
+        result.push((module.to_string(), version.to_string()));
+    }
+    result
+}
+
 /// Find which module in `requires` best matches `import_path`.
 /// Returns `Some((module_path, version))` for the longest matching prefix.
 pub fn find_module_for_import(
@@ -372,6 +404,58 @@ mod tests {
             incomplete: false,
             error: None,
         }
+    }
+
+    #[test]
+    fn test_parse_go_sum_modules_keeps_source_lines_skips_go_mod() {
+        // Two version lines for x/net: only the source-hash (non-/go.mod) line
+        // names the selected version whose source is compiled. The /go.mod-only
+        // graph entry (an older version) must be skipped.
+        let go_sum = "\
+golang.org/x/net v0.0.0-20180724234803-3673e40ba225/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+golang.org/x/net v0.0.0-20190108225652-1e06a53dbb7e h1:bRhVy7zSSasaqNksaRZiA5EEI+Ei4I1nO5Jh72wfHlg=
+golang.org/x/net v0.0.0-20190108225652-1e06a53dbb7e/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0HISf9D4TzseP40cEA6IGfs=
+golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
+";
+        let mods = parse_go_sum_modules(go_sum);
+        assert_eq!(
+            mods,
+            vec![
+                (
+                    "golang.org/x/net".to_string(),
+                    "v0.0.0-20190108225652-1e06a53dbb7e".to_string()
+                ),
+                (
+                    "golang.org/x/oauth2".to_string(),
+                    "v0.0.0-20200107190931-bf48bf16ab8d".to_string()
+                ),
+            ],
+            "must keep exactly one source-version entry per module, dropping /go.mod graph lines"
+        );
+    }
+
+    #[test]
+    fn test_go_sum_module_resolves_when_absent_from_go_mod() {
+        // The regression: an indirect module reachable only through go.sum must
+        // still resolve. gogithub's untidied go.mod requires oauth2 but not
+        // x/net, yet oauth2/internal imports golang.org/x/net/context/ctxhttp.
+        let go_sum = "golang.org/x/net v0.0.0-20190108225652-1e06a53dbb7e h1:bRhVy7zSSasaqNksaRZiA5EEI+Ei4I1nO5Jh72wfHlg=\n";
+        let mut requires = parse_go_mod_requires(
+            "module example.com/m\n\nrequire golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d\n",
+        );
+        let known: std::collections::HashSet<&str> =
+            requires.iter().map(|(m, _)| m.as_str()).collect();
+        let extra: Vec<(String, String)> = parse_go_sum_modules(go_sum)
+            .into_iter()
+            .filter(|(m, _)| !known.contains(m.as_str()))
+            .collect();
+        requires.extend(extra);
+
+        let resolved = find_module_for_import("golang.org/x/net/context/ctxhttp", &requires)
+            .expect("x/net must resolve via go.sum-sourced version");
+        assert_eq!(resolved.0, "golang.org/x/net");
+        assert_eq!(resolved.1, "v0.0.0-20190108225652-1e06a53dbb7e");
     }
 
     #[test]
