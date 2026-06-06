@@ -7,7 +7,7 @@ pub fn matcher_from_args(
     arg1: &String,
     arg2: &Option<String>,
     excludes: &[String],
-    _base_pkg: &PkgBuf,
+    base_pkg: &PkgBuf,
     allow_all: bool,
 ) -> anyhow::Result<Matcher> {
     let positive = if let Some(package_matcher) = &arg2 {
@@ -27,7 +27,8 @@ pub fn matcher_from_args(
         }
     } else {
         let addr_str = arg1;
-        let addr = htaddr::parse_addr(addr_str).with_context(|| format!("parse {}", addr_str))?;
+        let addr = htaddr::parse_addr_with_base(addr_str, base_pkg)
+            .with_context(|| format!("parse {}", addr_str))?;
         Matcher::Addr(addr)
     };
 
@@ -38,7 +39,8 @@ pub fn matcher_from_args(
     let mut and = Vec::with_capacity(1 + excludes.len());
     and.push(positive);
     for ex in excludes {
-        let addr = htaddr::parse_addr(ex).with_context(|| format!("parse exclude {}", ex))?;
+        let addr = htaddr::parse_addr_with_base(ex, base_pkg)
+            .with_context(|| format!("parse exclude {}", ex))?;
         and.push(Matcher::Not(Box::new(Matcher::Addr(addr))));
     }
     Ok(Matcher::And(and))
@@ -54,6 +56,19 @@ mod tests {
         let pkg = PkgBuf::from("");
         let m = matcher_from_args(&"//foo:bar".to_string(), &None, &[], &pkg, false).unwrap();
         assert!(matches!(m, Matcher::Addr(_)));
+    }
+
+    #[test]
+    fn colon_name_resolves_against_base_pkg() {
+        let pkg = PkgBuf::from("foo/bar");
+        let m = matcher_from_args(&":build".to_string(), &None, &[], &pkg, false).unwrap();
+        match m {
+            Matcher::Addr(addr) => {
+                assert_eq!(addr.package.as_str(), "foo/bar");
+                assert_eq!(addr.name, "build");
+            }
+            other => panic!("expected Addr, got {other:?}"),
+        }
     }
 
     #[test]
