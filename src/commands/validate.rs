@@ -135,15 +135,12 @@ impl App for ValidateApp {
 
             let mut problems: Vec<String> = Vec::new();
             for o in &overlaps {
-                let addrs = o
-                    .addrs
-                    .iter()
-                    .map(|a| a.format())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 problems.push(format!(
-                    "codegen=copy output `{}` is produced by multiple targets: {}",
-                    o.path, addrs
+                    "codegen=copy outputs overlap: `{}` ({}) and `{}` ({})",
+                    o.a.path,
+                    o.a.addr.format(),
+                    o.b.path,
+                    o.b.addr.format()
                 ));
             }
             if stale {

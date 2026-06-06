@@ -1,16 +1,17 @@
 //! Workspace validation helpers.
 //!
-//! `codegen_copy_overlaps` detects when two *different* targets declare a
-//! `codegen = copy` output on the *same* tree path — those outputs would clobber
-//! each other when materialized into the source tree, so they must be rejected.
+//! `codegen_copy_overlaps` detects when two *different* targets declare
+//! `codegen = copy` outputs that collide in the source tree — they would clobber
+//! each other when materialized, so they must be rejected.
 //!
-//! The overlap key is the normalized, root-anchored output path produced by
-//! [`crate::engine::gitignore::content_to_pattern`]. This matches identical
-//! *declared* paths; it does not resolve glob-vs-file fuzzy overlap (a `*.go`
-//! glob and a concrete `foo.go` are treated as distinct keys), mirroring the
-//! precision of the gitignore enumeration that shares this normalization.
+//! Outputs are normalized to root-anchored paths via
+//! [`crate::engine::gitignore::content_to_pattern`] (directories carry a trailing
+//! `/`). Two outputs overlap when they are the *same* path, or when one is a
+//! directory that *contains* the other (e.g. `/gen/` vs `/gen/a.go`). Glob
+//! patterns are compared as their literal strings, so a glob lying inside a
+//! declared directory is caught, but glob-vs-concrete-file fuzzy matching is not
+//! resolved.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use enclose::enclose;
@@ -25,13 +26,43 @@ use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
 
-/// A single overlap: one normalized output path produced by two or more targets.
+/// One `codegen = copy` output: its normalized, root-anchored path and the
+/// target that emits it.
+#[derive(Debug, Clone)]
+pub struct CodegenOutput {
+    pub path: String,
+    pub addr: Addr,
+}
+
+/// A single collision between two `codegen = copy` outputs from *different*
+/// targets — either the same path, or a directory containing the other.
 #[derive(Debug, Clone)]
 pub struct CodegenOverlap {
-    /// Normalized, root-anchored output path (the collision key).
-    pub path: String,
-    /// The (≥2) distinct targets producing it, sorted by formatted address.
-    pub addrs: Vec<Addr>,
+    pub a: CodegenOutput,
+    pub b: CodegenOutput,
+}
+
+/// Split a normalized path into its `/`-separated components, ignoring a trailing
+/// slash. Used as a sort key so a directory and its descendants stay adjacent
+/// (component order, unlike raw byte order, never lets a sibling slip between).
+fn path_components(p: &str) -> std::str::Split<'_, char> {
+    p.trim_end_matches('/').split('/')
+}
+
+/// True when `ancestor` is a strict parent directory of `descendant` — both
+/// already trailing-slash-trimmed. `descendant` must continue past `ancestor`
+/// at a `/` boundary, so `/a` is an ancestor of `/a/b` but not of `/ab`.
+fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    descendant.starts_with(ancestor) && descendant.as_bytes().get(ancestor.len()) == Some(&b'/')
+}
+
+/// True when two normalized output paths collide in the tree: the same path
+/// (trailing slash ignored, so a file and a same-named directory still clash),
+/// or one is an ancestor directory of the other (`/gen/` vs `/gen/a.go`).
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let a = a.trim_end_matches('/');
+    let b = b.trim_end_matches('/');
+    a == b || is_ancestor(a, b) || is_ancestor(b, a)
 }
 
 impl Engine {
@@ -90,27 +121,49 @@ impl Engine {
         });
         let per_target = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
 
-        // Group addrs by output path. A path declared twice by the *same* target
-        // is not a conflict, so dedupe per path (Addr interning makes `==` cheap).
-        let mut by_path: HashMap<String, Vec<Addr>> = HashMap::new();
-        for (addr, paths) in per_target {
-            for path in paths {
-                let entry = by_path.entry(path).or_default();
-                if !entry.iter().any(|a| a == &addr) {
-                    entry.push(addr.clone());
+        // Flatten to (path, addr) outputs, then sort by path *components* (ties by
+        // addr) so every group of overlapping outputs is contiguous: equal paths
+        // sit together and a directory's descendants sort immediately after it.
+        // Component order (not raw string order) is what guarantees contiguity —
+        // it keeps `/a` next to `/a/x` instead of letting a sibling like `/a-b`
+        // (where `-` < `/`) slip between them. Dedupe identical (path, addr) — a
+        // target listing the same output twice is not a self-conflict.
+        let mut outs: Vec<CodegenOutput> = per_target
+            .into_iter()
+            .flat_map(|(addr, paths)| {
+                paths.into_iter().map(move |path| CodegenOutput {
+                    path,
+                    addr: addr.clone(),
+                })
+            })
+            .collect();
+        outs.sort_by(|a, b| {
+            path_components(&a.path)
+                .cmp(path_components(&b.path))
+                .then_with(|| a.addr.format().cmp(&b.addr.format()))
+        });
+        outs.dedup_by(|a, b| a.path == b.path && a.addr == b.addr);
+
+        // Sorted scan: for each output, the only outputs that can overlap it are
+        // the contiguous run that follows (equal paths, then — if it is a
+        // directory — its contained children). The first non-overlapping entry
+        // ends the run, since everything beyond sorts lexicographically clear of
+        // it. Cross-target only: a target owning a dir *and* a file under it is
+        // fine.
+        let mut overlaps: Vec<CodegenOverlap> = Vec::new();
+        for (i, a) in outs.iter().enumerate() {
+            for b in outs.iter().skip(i + 1) {
+                if !paths_overlap(&a.path, &b.path) {
+                    break;
+                }
+                if a.addr != b.addr {
+                    overlaps.push(CodegenOverlap {
+                        a: a.clone(),
+                        b: b.clone(),
+                    });
                 }
             }
         }
-
-        let mut overlaps: Vec<CodegenOverlap> = by_path
-            .into_iter()
-            .filter(|(_, addrs)| addrs.len() > 1)
-            .map(|(path, mut addrs)| {
-                addrs.sort_by_key(|a| a.format());
-                CodegenOverlap { path, addrs }
-            })
-            .collect();
-        overlaps.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(overlaps)
     }
 }
@@ -167,6 +220,15 @@ mod tests {
         Matcher::TreeOutputTo(PkgBuf::from(""))
     }
 
+    /// True if `overlaps` contains the collision between the two given outputs,
+    /// in either order.
+    fn has_pair(overlaps: &[CodegenOverlap], p1: &str, a1: &str, p2: &str, a2: &str) -> bool {
+        let want = |x: &CodegenOutput, p: &str, a: &str| x.path == p && x.addr.format() == a;
+        overlaps.iter().any(|o| {
+            (want(&o.a, p1, a1) && want(&o.b, p2, a2)) || (want(&o.a, p2, a2) && want(&o.b, p1, a1))
+        })
+    }
+
     #[tokio::test]
     async fn detects_overlapping_copy_outputs() -> anyhow::Result<()> {
         // Two targets in the same package both emitting `gen.go` as copy.
@@ -180,14 +242,71 @@ mod tests {
             .codegen_copy_overlaps(rs, &all())
             .await?;
 
-        assert_eq!(
-            overlaps.len(),
-            1,
-            "exactly one overlapping path: {overlaps:?}"
+        assert_eq!(overlaps.len(), 1, "one collision: {overlaps:?}");
+        assert!(
+            has_pair(&overlaps, "/a/gen.go", "//a:t1", "/a/gen.go", "//a:t2"),
+            "{overlaps:?}"
         );
-        assert_eq!(overlaps[0].path, "/a/gen.go");
-        let addrs: Vec<String> = overlaps[0].addrs.iter().map(|a| a.format()).collect();
-        assert_eq!(addrs, vec!["//a:t1".to_string(), "//a:t2".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_output_overlaps_file_inside_it() -> anyhow::Result<()> {
+        // One target emits the directory `gen/`, another a file inside it.
+        let (engine, _root) = engine_with(vec![
+            codegen_target("//a:dir", &["gen/"], "copy"),
+            codegen_target("//a:file", &["gen/sub/x.go"], "copy"),
+        ])?;
+        let rs = engine.new_state();
+
+        let overlaps = Arc::clone(&engine)
+            .codegen_copy_overlaps(rs, &all())
+            .await?;
+
+        assert_eq!(overlaps.len(), 1, "one collision: {overlaps:?}");
+        assert!(
+            has_pair(
+                &overlaps,
+                "/a/gen/",
+                "//a:dir",
+                "/a/gen/sub/x.go",
+                "//a:file"
+            ),
+            "{overlaps:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sibling_paths_with_shared_prefix_do_not_overlap() -> anyhow::Result<()> {
+        // `gen/` must not be treated as a parent of the sibling `gen-extra.go`
+        // just because the strings share a prefix.
+        let (engine, _root) = engine_with(vec![
+            codegen_target("//a:dir", &["gen/"], "copy"),
+            codegen_target("//a:sib", &["gen-extra.go"], "copy"),
+        ])?;
+        let rs = engine.new_state();
+
+        let overlaps = Arc::clone(&engine)
+            .codegen_copy_overlaps(rs, &all())
+            .await?;
+
+        assert!(overlaps.is_empty(), "siblings do not overlap: {overlaps:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_target_dir_and_file_within_is_not_a_conflict() -> anyhow::Result<()> {
+        // A single target owning a directory and a file inside it is fine.
+        let (engine, _root) =
+            engine_with(vec![codegen_target("//a:t", &["gen/", "gen/x.go"], "copy")])?;
+        let rs = engine.new_state();
+
+        let overlaps = Arc::clone(&engine)
+            .codegen_copy_overlaps(rs, &all())
+            .await?;
+
+        assert!(overlaps.is_empty(), "same-target nesting ok: {overlaps:?}");
         Ok(())
     }
 
