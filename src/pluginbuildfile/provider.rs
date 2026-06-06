@@ -67,6 +67,10 @@ pub struct Provider {
     /// Directories to prune during the BUILD-file walk: engine-owned dirs
     /// (e.g. the heph home) plus user `skip` globs. See [`SkipMatcher`].
     pub skip: Arc<SkipMatcher>,
+    /// Driver applied to targets that omit `driver` in their `target(...)` call.
+    /// Set via the `defaultDriver` provider option. `None` means a target with no
+    /// driver is an error.
+    pub default_driver: Option<String>,
     pub requests: Mutex<HashMap<String, RequestState>>,
     /// Cache: pkg name → parsed BUILD file result. Avoids re-parsing the Starlark
     /// AST on every `list`/`get`/`probe` call for the same package (3+ calls per
@@ -100,6 +104,7 @@ impl Default for Provider {
             root: std::path::PathBuf::from("/"),
             build_file_patterns: vec![glob::Pattern::new("BUILD").expect("BUILD literal")],
             skip: Arc::new(SkipMatcher::default()),
+            default_driver: None,
             requests: Mutex::new(HashMap::new()),
             pkg_cache: Memoizer::with_tag("buildfile_pkg"),
             packages_cache: Memoizer::with_tag("buildfile_packages"),
@@ -127,7 +132,7 @@ impl Provider {
         crate::engine::config_file::deny_unknown(
             "buildfile provider",
             opts,
-            &["patterns", "skip"],
+            &["patterns", "skip", "defaultDriver"],
         )?;
         let patterns: Vec<String> =
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "patterns")?
@@ -142,10 +147,13 @@ impl Provider {
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "skip")?
                 .unwrap_or_default();
         let skip = SkipMatcher::new(skip_dirs, &skip_globs)?;
+        let default_driver: Option<String> =
+            crate::engine::config_file::decode_opt(opts, "buildfile provider", "defaultDriver")?;
         Ok(Self {
             root,
             build_file_patterns: compiled,
             skip: Arc::new(skip),
+            default_driver,
             ..Self::default()
         })
     }
@@ -288,10 +296,20 @@ impl EProvider for Provider {
 
             for p in res.targets.iter() {
                 if p.name == req.addr.name {
+                    let driver = if p.driver.is_empty() {
+                        self.default_driver.clone().ok_or_else(|| {
+                            GetError::Other(anyhow::anyhow!(
+                                "target {} has no driver and no defaultDriver is configured for the buildfile provider",
+                                req.addr.format()
+                            ))
+                        })?
+                    } else {
+                        p.driver.clone()
+                    };
                     return Ok(GetResponse {
                         target_spec: TargetSpec {
                             addr: req.addr.clone(),
-                            driver: p.driver.clone(),
+                            driver,
                             config: p.config.clone(),
                             labels: p.labels.clone(),
                             transitive: p.transitive.clone(),
@@ -402,6 +420,115 @@ mod tests {
             .err()
             .expect("must error");
         assert!(err.to_string().contains("patterns"), "{err}");
+    }
+
+    struct NoopExecutor;
+    impl crate::engine::provider::ProviderExecutor for NoopExecutor {
+        fn result<'a>(
+            &'a self,
+            _addr: &'a Addr,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Arc<crate::engine::EResult>>> {
+            Box::pin(async { anyhow::bail!("noop") })
+        }
+
+        fn query<'a>(
+            &'a self,
+            _m: &'a crate::htmatcher::Matcher,
+            _extra_skip: &'a [String],
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+            Box::pin(async { anyhow::bail!("noop") })
+        }
+    }
+
+    fn get_req(pkg: &str, name: &str) -> GetRequest {
+        GetRequest {
+            request_id: "test".to_string(),
+            addr: Addr::new(PkgBuf::from(pkg), name.to_string(), Default::default()),
+            states: vec![],
+            executor: Arc::new(NoopExecutor),
+        }
+    }
+
+    #[test]
+    fn from_options_reads_default_driver() {
+        let dir = tempdir().expect("tempdir");
+        let mut opts = Options::new();
+        opts.insert(
+            "defaultDriver".to_string(),
+            serde_yaml::Value::String("exec".to_string()),
+        );
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &opts).expect("from_options");
+        assert_eq!(p.default_driver.as_deref(), Some("exec"));
+    }
+
+    #[test]
+    fn from_options_default_driver_absent_is_none() {
+        let dir = tempdir().expect("tempdir");
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &Options::new())
+            .expect("from_options");
+        assert!(p.default_driver.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_applies_default_driver_when_omitted() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_path = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(pkg_path.join("BUILD"), r#"target(name = "t")"#).unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            default_driver: Some("exec".to_string()),
+            ..Provider::default()
+        };
+
+        let ctoken = StdCancellationToken::new();
+        let res = provider.get(get_req("p", "t"), &ctoken).await.expect("get");
+        assert_eq!(res.target_spec.driver, "exec");
+    }
+
+    #[tokio::test]
+    async fn get_explicit_driver_overrides_default() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_path = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(
+            pkg_path.join("BUILD"),
+            r#"target(name = "t", driver = "bash")"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            default_driver: Some("exec".to_string()),
+            ..Provider::default()
+        };
+
+        let ctoken = StdCancellationToken::new();
+        let res = provider.get(get_req("p", "t"), &ctoken).await.expect("get");
+        assert_eq!(res.target_spec.driver, "bash");
+    }
+
+    #[tokio::test]
+    async fn get_errors_when_no_driver_and_no_default() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_path = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(pkg_path.join("BUILD"), r#"target(name = "t")"#).unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+
+        let ctoken = StdCancellationToken::new();
+        let err = provider
+            .get(get_req("p", "t"), &ctoken)
+            .await
+            .err()
+            .expect("must error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("no driver"), "{msg}");
     }
 
     #[tokio::test]

@@ -428,11 +428,8 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                 "target name cannot be empty"
             )));
         }
-        if driver.is_empty() {
-            return Err(starlark::Error::new_other(anyhow::anyhow!(
-                "target driver cannot be empty"
-            )));
-        }
+        // An empty driver is allowed here: the provider resolves it against the
+        // configured `defaultDriver` (and errors if neither is set).
 
         let p = OnTargetPayload {
             name: name.clone(),
