@@ -189,7 +189,7 @@ jobs:
 
       - name: Create Release in artifacts repo
         id: create_release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           repository: hephbuild/heph-artifacts-v1
           token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
@@ -321,7 +321,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Update Release to Production
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           repository: hephbuild/heph-artifacts-v1
           token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
