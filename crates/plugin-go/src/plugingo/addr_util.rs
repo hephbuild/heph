@@ -283,6 +283,20 @@ pub fn factors_to_args(factors: &Factors) -> BTreeMap<String, String> {
     args
 }
 
+/// Compose the address of the binary `build` target for `package` under `factors`.
+///
+/// Encodes goos/goarch/tags + env knobs (via `factors_to_args`) and re-attaches
+/// `ldflags` — which `factors_to_args` deliberately omits (it encodes shared
+/// dependency `build_lib` addrs), so the binary addr carries link flags while the
+/// dependency archives stay cache-shared.
+pub fn build_addr(package: &str, factors: &Factors) -> Addr {
+    let mut args = factors_to_args(factors);
+    if !factors.ldflags.is_empty() {
+        args.insert("ldflags".to_string(), factors.ldflags.join(" "));
+    }
+    Addr::new(PkgBuf::from(package), "build".to_string(), args)
+}
+
 /// Base hashed `env` shared by every Go compile/link/list target: disable cgo, pin
 /// the toolchain to the (hermetic) local SDK, and ignore any workspace `go.work`.
 fn go_build_env_base() -> HashMap<String, Value> {
@@ -839,7 +853,7 @@ mod tests {
         // Render to an addr string and re-parse — env factors round-trip.
         let addr = encode_stdlib("fmt", &factors);
         let rendered = addr.to_string();
-        let parsed = crate::htaddr::parse_addr(&rendered).unwrap();
+        let parsed = hmodel::htaddr::parse_addr(&rendered).unwrap();
         let recovered = Factors::from_addr(&parsed);
         assert_eq!(recovered.env, factors.env);
         assert!(

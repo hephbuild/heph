@@ -509,7 +509,7 @@ mod tests {
             import_path: "example.com/mylib".to_string(),
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
-            goroot: "/usr/local/go".to_string(),
+            go_version: crate::plugingo::toolchain::DEFAULT_GO_VERSION.to_string(),
             build_tags: vec![],
             env: BTreeMap::new(),
             dep_inputs: vec![],

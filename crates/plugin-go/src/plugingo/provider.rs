@@ -3,7 +3,7 @@ use crate::plugingo::addr_util::{
     encode_thirdparty_download, factors_to_args,
 };
 use crate::plugingo::errors::NoGoFilesError;
-use crate::plugingo::factors::{Factors, current_goarch, current_goos};
+use crate::plugingo::factors::{ENV_FACTORS, Factors, current_goarch, current_goos};
 use crate::plugingo::govet;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
@@ -19,14 +19,13 @@ use crate::plugingo::thirdparty;
 use crate::plugingo::toolchain;
 use anyhow::Context;
 use async_recursion::async_recursion;
-use async_trait::async_trait;
 use enclose::enclose;
 use futures::future::{BoxFuture, try_join_all};
 use hbuiltins::pluginfs;
 use hcore::hasync::Cancellable;
 use hcore::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
-use hcore::htvalue::{Value, parse_map_string_strings, parse_strings};
+use hcore::htvalue::{Value, parse_map_string_strings, parse_string, parse_strings};
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
 use hplugin::provider::{
@@ -279,18 +278,13 @@ impl Provider {
         )
     }
 
-    /// Compose the address of the binary `build` target for `package` under `factors`.
+    /// Compose the address of the binary `build` target for `package` under `factors`
+    /// (goos/goarch/tags, env knobs like GOEXPERIMENT/GODEBUG, and linker flags).
     ///
-    /// Encodes goos/goarch/tags and the build-env knobs (GOEXPERIMENT, GODEBUG, …) plus
-    /// any linker flags. `ldflags` is re-attached here (it is deliberately omitted from
-    /// `factors_to_args`, which encodes shared dependency `build_lib` addrs), so the
-    /// binary addr carries link flags while the dependency archives stay cache-shared.
+    /// Also exposed to BUILD files as the `heph.go.build_addr(...)` provider function —
+    /// see [`BuildAddrFn`].
     pub fn build_addr(&self, package: &str, factors: &Factors) -> Addr {
-        let mut args = factors_to_args(factors);
-        if !factors.ldflags.is_empty() {
-            args.insert("ldflags".to_string(), factors.ldflags.join(" "));
-        }
-        Addr::new(PkgBuf::from(package), "build".to_string(), args)
+        crate::plugingo::addr_util::build_addr(package, factors)
     }
 
     pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
@@ -375,6 +369,79 @@ fn collect_go_packages(
     }
 }
 
+/// `heph.go.build_addr(package, goos=, goarch=, tags=, goexperiment=, godebug=, ldflags=)`
+/// → the binary `build` target address as a string, for BUILD files (or other
+/// providers' functions) to depend on.
+///
+/// `package` is the first positional arg (or named `package`). All factor args are
+/// optional named args; `goos`/`goarch` default to the host. `tags`/`ldflags` accept
+/// either a list of strings or a single string (tags split on `,`, ldflags on
+/// whitespace). The env knobs are the keys in [`ENV_FACTORS`] (`goexperiment`, `godebug`).
+struct BuildAddrFn;
+
+#[async_trait::async_trait]
+impl ProviderFn for BuildAddrFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let package = match args
+            .positional
+            .first()
+            .or_else(|| args.named.get("package"))
+        {
+            Some(v) => parse_string(v)
+                .context("build_addr: parse 'package'")?
+                .ok_or_else(|| anyhow::anyhow!("build_addr: 'package' must be a string"))?,
+            None => anyhow::bail!("build_addr: missing 'package' argument"),
+        };
+
+        let opt_str = |key: &str| -> anyhow::Result<Option<String>> {
+            args.named
+                .get(key)
+                .map(|v| parse_string(v).with_context(|| format!("build_addr: parse '{key}'")))
+                .transpose()
+                .map(Option::flatten)
+        };
+        // A list arg passes through as-is; a string is split on `sep`.
+        let list_or_split = |key: &str, sep: char| -> anyhow::Result<Vec<String>> {
+            match args.named.get(key) {
+                None => Ok(Vec::new()),
+                Some(v @ Value::List(_)) => {
+                    parse_strings(v).with_context(|| format!("build_addr: parse '{key}'"))
+                }
+                Some(v) => Ok(parse_string(v)
+                    .with_context(|| format!("build_addr: parse '{key}'"))?
+                    .into_iter()
+                    .flat_map(|s| {
+                        s.split(sep)
+                            .filter(|p| !p.is_empty())
+                            .map(String::from)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()),
+            }
+        };
+
+        let mut build_tags = list_or_split("tags", ',')?;
+        build_tags.sort();
+        let mut env = BTreeMap::new();
+        for (arg_key, go_var) in ENV_FACTORS {
+            if let Some(value) = opt_str(arg_key)? {
+                env.insert(go_var.to_string(), value);
+            }
+        }
+        let factors = Factors {
+            goos: opt_str("goos")?.unwrap_or_else(current_goos),
+            goarch: opt_str("goarch")?.unwrap_or_else(current_goarch),
+            build_tags,
+            env,
+            ldflags: list_or_split("ldflags", ' ')?,
+        };
+
+        Ok(Value::String(
+            crate::plugingo::addr_util::build_addr(&package, &factors).to_string(),
+        ))
+    }
+}
+
 impl ProviderTrait for Provider {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         self.inner.config(req)
@@ -421,21 +488,35 @@ impl ProviderTrait for Provider {
         vec![ProviderFunctionDef {
             name: "build_addr".to_string(),
             signature: FnSignature {
-                positional: vec![
-                    Param::required("pkg", ParamType::String),
-                    Param::required("goos", ParamType::String),
-                    Param::required("goarch", ParamType::String),
+                positional: vec![Param::required("package", ParamType::String)],
+                named: vec![
+                    Param::optional("goos", ParamType::String, Value::String(String::new())),
+                    Param::optional("goarch", ParamType::String, Value::String(String::new())),
+                    Param::optional(
+                        "tags",
+                        ParamType::list(ParamType::String),
+                        Value::List(vec![]),
+                    ),
+                    Param::optional(
+                        "goexperiment",
+                        ParamType::String,
+                        Value::String(String::new()),
+                    ),
+                    Param::optional("godebug", ParamType::String, Value::String(String::new())),
+                    Param::optional(
+                        "ldflags",
+                        ParamType::list(ParamType::String),
+                        Value::List(vec![]),
+                    ),
                 ],
-                named: vec![Param::optional(
-                    "tags",
-                    ParamType::list(ParamType::String),
-                    Value::List(vec![]),
-                )],
                 variadic: None,
                 returns: ParamType::String,
             },
-            doc: "Build the address of a Go package's `_golist` target for a given \
-                  GOOS/GOARCH (and optional build tags), as used in `deps`."
+            doc: "Compose the binary `build` target address for a Go package under the \
+                  given factors. `goos`/`goarch` default to the host; `tags`/`ldflags` \
+                  accept a list or a single string (tags split on `,`, ldflags on \
+                  whitespace); `goexperiment`/`godebug` set the matching Go build-env \
+                  knobs. Returns the canonical addr string."
                 .to_string(),
             func: Arc::new(BuildAddrFn),
         }]
@@ -486,6 +567,20 @@ impl ProviderTrait for Provider {
                      descendant packages too.",
                 ),
                 field(
+                    "build",
+                    ParamType::strukt(vec![(
+                        "env",
+                        ParamType::map(ParamType::String),
+                    )]),
+                    "Build-env settings for this package's Go compile/list/link targets. \
+                     `env` (map[string]) sets build-env knobs keyed by the Go env var \
+                     (e.g. `GOEXPERIMENT`, `GODEBUG`); they land in the hashed build env \
+                     and propagate to dependency archives. An explicit addr-level knob \
+                     (e.g. `:build@goexperiment=…`) overrides the package default. By \
+                     default applies only to this package; set `recursive = True` to \
+                     apply to descendant packages too.",
+                ),
+                field(
                     "link",
                     ParamType::strukt(vec![
                         ("flags", ParamType::list(ParamType::String)),
@@ -504,63 +599,13 @@ impl ProviderTrait for Provider {
                 field(
                     "recursive",
                     ParamType::Bool,
-                    "Apply this state's config (the `test` toggle/struct and `link = {...}`) \
-                     to descendant packages, not just the exact declaring package. \
-                     `go_codegen_root`/`go_codegen_deps` are unaffected — they always \
-                     apply to descendants.",
+                    "Apply this state's config (the `test` toggle/struct, `build = {...}`, \
+                     and `link = {...}`) to descendant packages, not just the exact \
+                     declaring package. `go_codegen_root`/`go_codegen_deps` are unaffected \
+                     — they always apply to descendants.",
                 ),
             ],
         })
-    }
-}
-
-/// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — format the heph
-/// address of a Go target without resolving anything. Takes a heph package (the addr's
-/// package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a thirdparty `@heph/go/thirdparty/…@v`
-/// path) and the platform factors, and returns the canonical addr
-/// string `//<pkg>:build@goos=…,goarch=…[,tags=…]`. Pure string transform — same
-/// factor encoding the provider uses internally ([`factors_to_args`]), so the result
-/// matches the addr the provider serves for that package.
-struct BuildAddrFn;
-
-impl BuildAddrFn {
-    fn arg_str<'a>(args: &'a FnArgs, idx: usize, name: &str) -> anyhow::Result<&'a str> {
-        let v = args
-            .named
-            .get(name)
-            .or_else(|| args.positional.get(idx))
-            .ok_or_else(|| anyhow::anyhow!("heph.go.build_addr: missing `{name}` argument"))?;
-        match v {
-            Value::String(s) => Ok(s.as_str()),
-            other => anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}"),
-        }
-    }
-}
-
-#[async_trait]
-impl ProviderFn for BuildAddrFn {
-    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        let pkg = Self::arg_str(&args, 0, "pkg")?;
-        let goos = Self::arg_str(&args, 1, "goos")?;
-        let goarch = Self::arg_str(&args, 2, "goarch")?;
-
-        let mut build_tags = match args.named.get("tags") {
-            Some(v) => parse_strings(v).context("heph.go.build_addr: parsing `tags`")?,
-            None => Vec::new(),
-        };
-        build_tags.sort();
-
-        let factors = Factors {
-            goos: goos.to_string(),
-            goarch: goarch.to_string(),
-            build_tags,
-        };
-        let addr = Addr::new(
-            PkgBuf::from(pkg),
-            "build".to_string(),
-            factors_to_args(&factors),
-        );
-        Ok(Value::String(addr.format()))
     }
 }
 
@@ -1060,6 +1105,39 @@ fn pick_link(states: &[State], addr_pkg: &str) -> anyhow::Result<target_bin::Lin
     Ok(out)
 }
 
+/// Keys accepted inside a `build = {...}` go provider_state map.
+const BUILD_STATE_KEYS: &[&str] = &["env"];
+
+/// Collect build-env factor knobs from `build = {...}` provider_states applying to
+/// `addr_pkg` (its own package plus any `recursive` ancestor). Values are keyed by
+/// the Go env var (e.g. `GOEXPERIMENT`, `GODEBUG`) and land in the hashed compile/
+/// list/link env. Deeper (more specific) states override shallower ancestors; an
+/// explicit addr-level knob still wins over all of them (merged in `handle_get`).
+fn pick_build_env(states: &[State], addr_pkg: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    // applicable_states yields shallow→deep, so deeper states overwrite here.
+    for state in applicable_states(states, addr_pkg, "build") {
+        let Some(Value::Map(build_map)) = state.state.get("build") else {
+            anyhow::bail!(
+                "go provider_state `build` must be a struct, got: {:?}",
+                state.state.get("build")
+            );
+        };
+        for key in build_map.keys() {
+            if !BUILD_STATE_KEYS.contains(&key.as_str()) {
+                anyhow::bail!(
+                    "unknown key `{key}` in go provider_state `build` map (allowed: {})",
+                    BUILD_STATE_KEYS.join(", "),
+                );
+            }
+        }
+        if let Some(v) = build_map.get("env") {
+            out.extend(parse_str_map(v).context("parsing build env from go provider_state")?);
+        }
+    }
+    Ok(out)
+}
+
 /// Pick the closest (deepest) ancestor state carrying `go_codegen_deps`.
 /// Independent of `go_codegen_root` — a BUILD file declaring only
 /// `go_codegen_deps` must still inject those deps into descendant `_golist`
@@ -1241,7 +1319,18 @@ fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
 impl ProviderInner {
     async fn handle_get(self: Arc<Self>, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
-        let factors = Factors::from_addr(addr);
+        let mut factors = Factors::from_addr(addr);
+
+        // Build-env factor knobs (GOEXPERIMENT, GODEBUG, …) may also be set via
+        // `provider_state(provider="go", build={"env": {...}})`. An explicit
+        // addr-level knob wins over the package default, so only fill keys the
+        // addr didn't already set. These propagate through factors_to_args into
+        // dependency addrs, so the whole graph builds under the same knobs.
+        let state_env =
+            pick_build_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
+        for (go_var, value) in state_env {
+            factors.env.entry(go_var).or_insert(value);
+        }
 
         // Hermetic Go toolchain: `//@heph/go/toolchain/<version>:go` downloads
         // the pinned SDK for the host platform. This replaces the former
@@ -2437,6 +2526,8 @@ impl ProviderInner {
                 goos: current_goos(),
                 goarch: current_goarch(),
                 build_tags: vec![],
+                env: Default::default(),
+                ldflags: vec![],
             }),
         ))
     }
@@ -3021,85 +3112,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn build_addr_ctx() -> FnCallContext<'static> {
-        FnCallContext {
-            pkg: "",
-            root: std::path::Path::new("/"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_build_addr_basic() {
-        let args = FnArgs {
-            positional: vec![
-                Value::String("mylib".into()),
-                Value::String("linux".into()),
-                Value::String("amd64".into()),
-            ],
-            named: HashMap::new(),
-        };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(
-            v,
-            Value::String("//mylib:build@goarch=amd64,goos=linux".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_addr_tags() {
-        let mut named = HashMap::new();
-        // Unsorted on input — must come out sorted (bar,foo) in the addr.
-        named.insert(
-            "tags".to_string(),
-            Value::List(vec![
-                Value::String("foo".into()),
-                Value::String("bar".into()),
-            ]),
-        );
-        let args = FnArgs {
-            positional: vec![
-                Value::String("@heph/go/std/fmt".into()),
-                Value::String("darwin".into()),
-                Value::String("arm64".into()),
-            ],
-            named,
-        };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(
-            v,
-            Value::String(
-                "//@heph/go/std/fmt:build@goarch=arm64,goos=darwin,tags=\"bar,foo\"".into()
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_addr_named_args() {
-        let mut named = HashMap::new();
-        named.insert("pkg".to_string(), Value::String("mylib".into()));
-        named.insert("goos".to_string(), Value::String("linux".into()));
-        named.insert("goarch".to_string(), Value::String("amd64".into()));
-        let args = FnArgs {
-            positional: vec![],
-            named,
-        };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(
-            v,
-            Value::String("//mylib:build@goarch=amd64,goos=linux".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_addr_missing_goarch_errors() {
-        let args = FnArgs {
-            positional: vec![Value::String("mylib".into()), Value::String("linux".into())],
-            named: HashMap::new(),
-        };
-        let err = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap_err();
-        assert!(err.to_string().contains("missing `goarch`"), "{err}");
-    }
-
     fn run_str(spec: &hplugin::provider::TargetSpec) -> String {
         match spec.config.get("run").unwrap() {
             Value::String(s) => s.clone(),
@@ -3680,6 +3692,61 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let recovered = Factors::from_addr(&addr);
         assert_eq!(recovered.env.get("GOEXPERIMENT").unwrap(), "rangefunc");
         assert_eq!(recovered.ldflags, vec!["-s", "-w"]);
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_fn_composes_addr() {
+        let ctx = FnCallContext {
+            pkg: "cmd/app",
+            root: std::path::Path::new("/ws"),
+        };
+        let args = FnArgs {
+            positional: vec![Value::String("cmd/app".to_string())],
+            named: HashMap::from([
+                ("goos".to_string(), Value::String("linux".to_string())),
+                ("goarch".to_string(), Value::String("amd64".to_string())),
+                (
+                    "tags".to_string(),
+                    Value::List(vec![
+                        Value::String("integration".to_string()),
+                        Value::String("netgo".to_string()),
+                    ]),
+                ),
+                (
+                    "goexperiment".to_string(),
+                    Value::String("rangefunc".to_string()),
+                ),
+                ("ldflags".to_string(), Value::String("-s -w".to_string())),
+            ]),
+        };
+        let out = BuildAddrFn.call(&ctx, args).await.unwrap();
+        let addr_str = match out {
+            Value::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        };
+        let addr = hmodel::htaddr::parse_addr(&addr_str).unwrap();
+        assert_eq!(addr.package.as_str(), "cmd/app");
+        assert_eq!(addr.name, "build");
+        assert_eq!(addr.args.get("goos").map(|s| s.as_str()), Some("linux"));
+        assert_eq!(
+            addr.args.get("tags").map(|s| s.as_str()),
+            Some("integration,netgo")
+        );
+        assert_eq!(
+            addr.args.get("goexperiment").map(|s| s.as_str()),
+            Some("rangefunc")
+        );
+        assert_eq!(addr.args.get("ldflags").map(|s| s.as_str()), Some("-s -w"));
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_fn_requires_package() {
+        let ctx = FnCallContext {
+            pkg: "",
+            root: std::path::Path::new("/ws"),
+        };
+        let err = BuildAddrFn.call(&ctx, FnArgs::default()).await.unwrap_err();
+        assert!(err.to_string().contains("package"), "{err}");
     }
 
     // ---- simple_lib ----
@@ -5437,6 +5504,74 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             vec![("bogus", Value::Bool(true))],
         )];
         let err = pick_link(&states, "foo").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("bogus"),
+            "error must name the bad key"
+        );
+    }
+
+    fn state_with_build_map(pkg: &str, entries: Vec<(&str, Value)>) -> State {
+        let build_map: HashMap<String, Value> = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let mut m = HashMap::new();
+        m.insert("build".to_string(), Value::Map(build_map));
+        State {
+            package: PkgBuf::from(pkg),
+            provider: "go".to_string(),
+            state: m,
+        }
+    }
+
+    #[test]
+    fn pick_build_env_empty_when_no_states() {
+        assert!(pick_build_env(&[], "foo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pick_build_env_reads_knobs() {
+        let states = vec![state_with_build_map(
+            "foo",
+            vec![env_entry("GOEXPERIMENT", "rangefunc")],
+        )];
+        let env = pick_build_env(&states, "foo").unwrap();
+        assert_eq!(env.get("GOEXPERIMENT").map(String::as_str), Some("rangefunc"));
+    }
+
+    #[test]
+    fn pick_build_env_exact_package_only_by_default() {
+        let states = vec![state_with_build_map(
+            "foo",
+            vec![env_entry("GOEXPERIMENT", "rangefunc")],
+        )];
+        assert!(
+            pick_build_env(&states, "foo/bar").unwrap().is_empty(),
+            "non-recursive build env must not leak to descendants"
+        );
+    }
+
+    #[test]
+    fn pick_build_env_recursive_applies_and_deeper_overrides() {
+        let states = vec![
+            with_recursive(state_with_build_map(
+                "foo",
+                vec![env_entry("GODEBUG", "http2debug=1")],
+            )),
+            state_with_build_map("foo/bar", vec![env_entry("GODEBUG", "http2debug=2")]),
+        ];
+        let env = pick_build_env(&states, "foo/bar").unwrap();
+        // Deeper (more specific) package wins over the recursive ancestor.
+        assert_eq!(env.get("GODEBUG").map(String::as_str), Some("http2debug=2"));
+    }
+
+    #[test]
+    fn pick_build_env_errors_on_unknown_key() {
+        let states = vec![state_with_build_map(
+            "foo",
+            vec![("bogus", Value::Bool(true))],
+        )];
+        let err = pick_build_env(&states, "foo").unwrap_err();
         assert!(
             format!("{err:#}").contains("bogus"),
             "error must name the bad key"
