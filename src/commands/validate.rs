@@ -116,7 +116,10 @@ impl App for ValidateApp {
                     return Ok::<bool, anyhow::Error>(false);
                 }
                 let entries = Arc::clone(&engine)
-                    .codegen_copy_gitignore_patterns(rs.clone())
+                    .codegen_copy_gitignore_patterns(
+                        rs.clone(),
+                        &Matcher::TreeOutputTo(PkgBuf::from("")),
+                    )
                     .await?;
                 let path = root.join(".gitignore");
                 let existing = match std::fs::read_to_string(&path) {
