@@ -372,12 +372,11 @@ impl Engine {
         engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;
 
         // The `fs` provider + driver are always-on built-ins. The engine owns
-        // their skip set (home + `fs.skip` dirs/globs) and builds it once from the
-        // same data it hands every plugin via `PluginInit`, so every fs glob walk
-        // prunes the same paths. Provider + driver share one `FsSkip` so BUILD-time
-        // `glob()` and the run-time walk agree.
-        let fs_skip = Arc::new(crate::pluginfs::FsSkip::new(
-            &root,
+        // their ignore set (home + `fs.skip` dirs/globs) and builds it once from
+        // the same data it hands every plugin via `PluginInit`, so every fs glob
+        // walk prunes the same paths. Provider + driver share one `Ignore` so
+        // BUILD-time `glob()` and the run-time walk agree.
+        let fs_skip = Arc::new(crate::htwalk::Ignore::new(
             &engine.skip_dirs(),
             &engine.skip_globs(),
         )?);

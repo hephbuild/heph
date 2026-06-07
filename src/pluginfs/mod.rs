@@ -17,6 +17,7 @@ use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::Value;
+use crate::htwalk::Ignore;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -77,11 +78,11 @@ pub fn is_glob_addr(addr: &Addr) -> bool {
 #[derive(Default)]
 pub struct Provider {
     /// Dirs the `glob` provider function must prune, shared with the driver.
-    skip: Arc<FsSkip>,
+    skip: Arc<Ignore>,
 }
 
 impl Provider {
-    pub fn new(skip: Arc<FsSkip>) -> Self {
+    pub fn new(skip: Arc<Ignore>) -> Self {
         Self { skip }
     }
 }
@@ -215,7 +216,7 @@ impl EProvider for Provider {
 /// driver globs at execution time: brace alternation, `.`/`..` normalization, and
 /// the engine's skip dirs/globs. Result is sorted.
 struct GlobFn {
-    skip: Arc<FsSkip>,
+    skip: Arc<Ignore>,
 }
 
 #[async_trait]
@@ -375,80 +376,6 @@ impl ProviderFn for BaseFn {
 
 // ─── Driver ──────────────────────────────────────────────────────────────────
 
-/// Directories the fs walk never descends into. Both sources come from the
-/// engine — pluginfs hardcodes nothing:
-///  - `skip_dirs`: absolute paths (see
-///    [`Engine::skip_dirs`](crate::engine::Engine::skip_dirs)) — the heph home and
-///    the literal `fs.skip` dirs. Matched by exact path.
-///  - `skip_globs`: exclude globs (see
-///    [`Engine::skip_globs`](crate::engine::Engine::skip_globs)), matched against
-///    the workspace-relative path.
-#[derive(Debug)]
-pub struct FsSkip {
-    /// Absolute directories pruned by exact path during the walk.
-    skip_dirs: Vec<std::path::PathBuf>,
-    /// Exclude glob patterns: a root-relative `<rel>/**` for each skip dir under
-    /// the root, plus the engine's `skip_globs`. Chained ahead of a target's user
-    /// excludes when compiling its exclude `Any`.
-    exclude_globs: Vec<String>,
-    /// Compiled [`exclude_globs`](Self::exclude_globs), reused as the `not`
-    /// matcher for the common case of a target with no user excludes, and as the
-    /// glob source for walk-time directory pruning.
-    builtin_any: Arc<wax::Any<'static>>,
-}
-
-/// Sentinel filename probed under a directory to decide whether a `<…>/**`-style
-/// exclude glob covers the whole subtree (so the walk can prune it). Chosen to be
-/// extremely unlikely to be a real file an exclude pattern targets by name.
-const PRUNE_PROBE: &str = "\u{0}heph-prune-probe";
-
-impl FsSkip {
-    /// Builds the skip set from the engine-provided `skip_dirs` (absolute: heph
-    /// home + literal `fs.skip` dirs) and `skip_globs` (glob `fs.skip` entries).
-    /// Each skip dir under `root` also contributes a `<rel>/**` exclude glob so the
-    /// compiled `not` matcher agrees with the walk-time pruning.
-    pub fn new(
-        root: &std::path::Path,
-        skip_dirs: &[std::path::PathBuf],
-        skip_globs: &[String],
-    ) -> anyhow::Result<Self> {
-        let mut exclude_globs = Vec::new();
-        for dir in skip_dirs {
-            if let Some(rel) = dir.strip_prefix(root).ok().and_then(|r| r.to_str())
-                && !rel.is_empty()
-            {
-                exclude_globs.push(format!("{rel}/**"));
-            }
-        }
-        exclude_globs.extend(skip_globs.iter().cloned());
-        let builtin_any = compile_any(&exclude_globs).context("compiling built-in fs excludes")?;
-        Ok(Self {
-            skip_dirs: skip_dirs.to_vec(),
-            exclude_globs,
-            builtin_any,
-        })
-    }
-
-    /// True if the directory at absolute `path` (workspace-relative `rel`) must be
-    /// pruned: an exact skip dir, or a directory whose entire subtree is covered
-    /// by an exclude glob (probed by testing a sentinel child against the compiled
-    /// excludes — so a `**/node_modules/**`-style glob prunes the dir instead of
-    /// walking into it).
-    fn is_pruned_dir(&self, path: &std::path::Path, rel: &std::path::Path) -> bool {
-        use wax::Program as _;
-        self.skip_dirs.iter().any(|d| d == path)
-            || self.builtin_any.is_match(rel.join(PRUNE_PROBE).as_path())
-    }
-}
-
-impl Default for FsSkip {
-    fn default() -> Self {
-        // No skip dirs/globs — the engine supplies them via `skip_dirs`/
-        // `skip_globs`. An empty exclude set matches nothing.
-        Self::new(std::path::Path::new(""), &[], &[]).expect("empty fs skip set is valid")
-    }
-}
-
 /// Compiles a set of glob patterns into a single `wax::Any`, reusing the
 /// process-wide [`cached_glob`] cache for each pattern.
 fn compile_any(patterns: &[String]) -> anyhow::Result<Arc<wax::Any<'static>>> {
@@ -523,8 +450,8 @@ struct CompiledGlob {
     not: Arc<wax::Any<'static>>,
     /// Literal directory prefix of the pattern, used as the walk root.
     prefix: String,
-    /// Engine-owned + built-in dirs to prune during the walk.
-    skip: Arc<FsSkip>,
+    /// Engine-provided dirs/globs to prune during the walk.
+    skip: Arc<Ignore>,
 }
 
 /// Process-global cache of compiled globs keyed by pattern string.
@@ -585,11 +512,11 @@ fn glob_result_cache() -> &'static RwLock<GlobResultCache> {
     CACHE.get_or_init(|| RwLock::new(GlobResultCache::default()))
 }
 
-/// Returns the compiled exclude `Any` (built-ins + user `exclude`) for
+/// Returns the compiled exclude `Any` (engine ignore globs + user `exclude`) for
 /// `request_id`, memoizing across calls within that request. `exclude` must be
-/// non-empty; the no-exclude case reuses `skip.builtin_any` directly.
+/// non-empty; the no-exclude case reuses the ignore's file matcher directly.
 fn cached_exclude_any(
-    skip: &FsSkip,
+    skip: &Ignore,
     request_id: &str,
     exclude: &[String],
 ) -> anyhow::Result<Arc<wax::Any<'static>>> {
@@ -606,7 +533,7 @@ fn cached_exclude_any(
     }
 
     let patterns: Vec<String> = skip
-        .exclude_globs
+        .globs()
         .iter()
         .cloned()
         .chain(exclude.iter().cloned())
@@ -636,16 +563,16 @@ enum FsDef {
 }
 
 fn compile_glob(
-    skip: &Arc<FsSkip>,
+    skip: &Arc<Ignore>,
     request_id: &str,
     pattern: &str,
     exclude: &[String],
 ) -> anyhow::Result<CompiledGlob> {
     let glob = cached_glob(pattern).with_context(|| format!("invalid glob pattern '{pattern}'"))?;
 
-    // No user excludes: reuse the skip's prebuilt built-in `Any` directly.
+    // No user excludes: reuse the ignore's prebuilt file matcher directly.
     let not = if exclude.is_empty() {
-        skip.builtin_any.clone()
+        skip.file_matcher().clone()
     } else {
         cached_exclude_any(skip, request_id, exclude)?
     };
@@ -684,7 +611,7 @@ fn walk_glob(
                 return true;
             }
             let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
-            !compiled.skip.is_pruned_dir(entry.path(), rel)
+            !compiled.skip.prune_dir(entry.path(), rel)
         });
 
     for entry in walker {
@@ -811,11 +738,11 @@ fn cached_glob_walk(
 #[derive(Default)]
 pub struct Driver {
     /// Engine-owned + built-in dirs pruned during glob walks.
-    skip: Arc<FsSkip>,
+    skip: Arc<Ignore>,
 }
 
 impl Driver {
-    pub fn new(skip: Arc<FsSkip>) -> Self {
+    pub fn new(skip: Arc<Ignore>) -> Self {
         Self { skip }
     }
 }
@@ -1106,14 +1033,14 @@ mod tests {
     // ─── Exposed-function (glob) tests ─────────────────────────────────────
 
     fn call_glob(root: &std::path::Path, pkg: &str, pattern: &str) -> Vec<String> {
-        call_glob_with_skip(root, pkg, pattern, Arc::<FsSkip>::default())
+        call_glob_with_skip(root, pkg, pattern, Arc::<Ignore>::default())
     }
 
     fn call_glob_with_skip(
         root: &std::path::Path,
         pkg: &str,
         pattern: &str,
-        skip: Arc<FsSkip>,
+        skip: Arc<Ignore>,
     ) -> Vec<String> {
         let ctx = FnCallContext { pkg, root };
         let args = FnArgs {
@@ -1158,8 +1085,7 @@ mod tests {
         fs::write(pkg.join("main.rs"), "").unwrap();
 
         // The engine's skip globs prune matching subtrees for `heph.fs.glob` too.
-        let skip =
-            Arc::new(FsSkip::new(tmp.path(), &[], &["**/node_modules/**".to_string()]).unwrap());
+        let skip = Arc::new(Ignore::new(&[], &["**/node_modules/**".to_string()]).unwrap());
         let got = call_glob_with_skip(tmp.path(), "mypkg", "**/*", skip);
         assert!(!got.iter().any(|s| s.contains("node_modules")), "{got:?}");
         assert!(got.contains(&"main.rs".to_string()), "{got:?}");
@@ -1671,7 +1597,7 @@ mod tests {
 
         // The engine hands the fs plugin its skip dirs (the heph home); the walk
         // must prune that subtree.
-        let skip = Arc::new(FsSkip::new(tmp.path(), &[home], &[]).unwrap());
+        let skip = Arc::new(Ignore::new(&[home], &[]).unwrap());
         let driver = Driver::new(skip);
 
         let config =
@@ -1708,7 +1634,7 @@ mod tests {
 
         // A `fs.skip` dir from the config file (resolved to an absolute path) is
         // pruned just like the engine home.
-        let skip = Arc::new(FsSkip::new(tmp.path(), &[tmp.path().join("vendor")], &[]).unwrap());
+        let skip = Arc::new(Ignore::new(&[tmp.path().join("vendor")], &[]).unwrap());
         let driver = Driver::new(skip);
 
         let config =
@@ -1745,8 +1671,7 @@ mod tests {
 
         // A `fs.skip` glob (`**/node_modules/**`) excludes the whole subtree at
         // any depth — and prunes the dir so the walk never descends into it.
-        let skip =
-            Arc::new(FsSkip::new(tmp.path(), &[], &["**/node_modules/**".to_string()]).unwrap());
+        let skip = Arc::new(Ignore::new(&[], &["**/node_modules/**".to_string()]).unwrap());
         let driver = Driver::new(skip);
 
         let config =
@@ -2215,11 +2140,11 @@ mod tests {
 
     #[test]
     fn test_compile_glob_no_exclude_reuses_builtin() {
-        let skip = Arc::new(FsSkip::default());
+        let skip = Arc::new(Ignore::default());
         let compiled = compile_glob(&skip, "req-test", "**/*.rs", &[]).unwrap();
         assert!(
-            Arc::ptr_eq(&compiled.not, &skip.builtin_any),
-            "empty-exclude path must reuse the skip's prebuilt built-in Any"
+            Arc::ptr_eq(&compiled.not, skip.file_matcher()),
+            "empty-exclude path must reuse the ignore's prebuilt file matcher"
         );
     }
 
@@ -2227,7 +2152,7 @@ mod tests {
     fn test_compile_glob_user_exclude_shares_any() {
         // Within one request, the same exclude set (any order) reuses one
         // compiled `Any`; a different set does not.
-        let skip = Arc::new(FsSkip::default());
+        let skip = Arc::new(Ignore::default());
         let req = "req-share";
         let a = compile_glob(
             &skip,
@@ -2259,7 +2184,7 @@ mod tests {
     fn test_compile_glob_exclude_cache_is_per_request() {
         // Different request ids do not share exclude `Any`s, even for the same
         // set — buckets are keyed by request.
-        let skip = Arc::new(FsSkip::default());
+        let skip = Arc::new(Ignore::default());
         let exclude = ["vendor/**".to_string()];
         let a = compile_glob(&skip, "req-iso-a", "**/*.go", &exclude).unwrap();
         let b = compile_glob(&skip, "req-iso-b", "**/*.go", &exclude).unwrap();

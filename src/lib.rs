@@ -40,6 +40,7 @@ pub mod htmatcher;
 pub mod htpkg;
 pub mod htplatform;
 pub mod htvalue;
+pub mod htwalk;
 pub mod log;
 pub mod pluginbuildfile;
 pub mod pluginexec;

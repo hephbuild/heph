@@ -8,6 +8,7 @@ use crate::hasync::Cancellable;
 use crate::hmemoizer::Memoizer;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::htwalk::Ignore;
 use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use enclose::enclose;
@@ -17,63 +18,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Sentinel child filename used to decide whether a `<…>/**`-style skip glob
-/// covers a whole directory subtree (so the walk can prune it).
-const PRUNE_PROBE: &str = "\u{0}heph-prune-probe";
-
-/// Prunes directories during the BUILD-file walk. Two prune sources:
-///  - `dirs`: absolute paths the engine hands every provider (the heph home plus
-///    literal `fs.skip` dirs); matched by exact path.
-///  - `globs`: `fs.skip` glob entries plus the provider's own `skip` option,
-///    matched against the workspace-relative package path (and against a sentinel
-///    child, so a `<dir>/**` pattern prunes the whole subtree).
-#[derive(Debug, Default)]
-pub struct SkipMatcher {
-    dirs: Vec<PathBuf>,
-    globs: Option<wax::Any<'static>>,
-}
-
-impl SkipMatcher {
-    fn new(dirs: &[PathBuf], globs: &[String]) -> anyhow::Result<Self> {
-        let compiled = if globs.is_empty() {
-            None
-        } else {
-            let gs = globs
-                .iter()
-                .map(|s| {
-                    wax::Glob::new(s)
-                        .map(wax::Glob::into_owned)
-                        .with_context(|| format!("buildfile provider: invalid skip pattern `{s}`"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            Some(wax::any(gs).context("compiling buildfile skip patterns")?)
-        };
-        Ok(Self {
-            dirs: dirs.to_vec(),
-            globs: compiled,
-        })
-    }
-
-    /// True if the dir at absolute `path` (workspace-relative `rel`) is pruned.
-    fn is_skipped(&self, path: &std::path::Path, rel: &std::path::Path) -> bool {
-        use wax::Program as _;
-        if self.dirs.iter().any(|d| d == path) {
-            return true;
-        }
-        self.globs
-            .as_ref()
-            .is_some_and(|any| any.is_match(rel) || any.is_match(rel.join(PRUNE_PROBE).as_path()))
-    }
-}
-
 pub struct RequestState {}
 
 pub struct Provider {
     pub root: std::path::PathBuf,
     pub build_file_patterns: Vec<glob::Pattern>,
-    /// Directories to prune during the BUILD-file walk: engine-owned dirs
-    /// (e.g. the heph home) plus user `skip` globs. See [`SkipMatcher`].
-    pub skip: Arc<SkipMatcher>,
+    /// Directories pruned during the BUILD-file walk: engine skip dirs/globs plus
+    /// this provider's own `skip` option. See [`crate::htwalk::Ignore`].
+    pub skip: Arc<Ignore>,
     /// Driver applied to targets that omit `driver` in their `target(...)` call.
     /// Set via the `defaultDriver` provider option. `None` means a target with no
     /// driver is an error.
@@ -110,7 +62,7 @@ impl Default for Provider {
         Self {
             root: std::path::PathBuf::from("/"),
             build_file_patterns: vec![glob::Pattern::new("BUILD").expect("BUILD literal")],
-            skip: Arc::new(SkipMatcher::default()),
+            skip: Arc::new(Ignore::default()),
             default_driver: None,
             requests: Mutex::new(HashMap::new()),
             pkg_cache: Memoizer::with_tag("buildfile_pkg"),
@@ -158,7 +110,7 @@ impl Provider {
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "skip")?
                 .unwrap_or_default();
         globs.extend(user_skip);
-        let skip = SkipMatcher::new(skip_dirs, &globs)?;
+        let skip = Ignore::new(skip_dirs, &globs)?;
         let default_driver: Option<String> =
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "defaultDriver")?;
         Ok(Self {
@@ -175,7 +127,7 @@ fn find_packages_sync(
     path: &std::path::Path,
     root: &std::path::Path,
     patterns: &[glob::Pattern],
-    skip: &SkipMatcher,
+    skip: &Ignore,
     packages: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let mut has_build_file = false;
@@ -195,7 +147,7 @@ fn find_packages_sync(
             }
         } else if ft.is_dir() {
             let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
-            if skip.is_skipped(&entry_path, rel) {
+            if skip.prune_dir(&entry_path, rel) {
                 continue;
             }
             find_packages_sync(&entry_path, root, patterns, skip, packages)?;

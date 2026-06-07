@@ -8,6 +8,7 @@ use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::{Value, parse_strings};
+use crate::htwalk::Ignore;
 use crate::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
@@ -37,67 +38,18 @@ use std::sync::Arc;
 
 const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
 
-/// Sentinel child filename used to decide whether a `<…>/**`-style skip glob
-/// covers a whole directory subtree (so discovery can prune it).
-const PRUNE_PROBE: &str = "\u{0}heph-prune-probe";
-
-/// Prunes directories during Go package discovery. Two prune sources:
-///  - `dirs`: absolute paths the engine hands every provider (the heph home plus
-///    literal `fs.skip` dirs); matched by exact path.
-///  - `globs`: `fs.skip` glob entries plus the provider's own `skip` option,
-///    matched against the workspace-relative package path (and against a sentinel
-///    child, so a `<dir>/**` pattern prunes the whole subtree).
-#[derive(Debug, Default)]
-pub struct SkipMatcher {
-    dirs: Vec<PathBuf>,
-    globs: Option<wax::Any<'static>>,
-}
-
-impl SkipMatcher {
-    fn new(dirs: &[PathBuf], globs: &[String]) -> anyhow::Result<Self> {
-        let compiled = if globs.is_empty() {
-            None
-        } else {
-            let gs = globs
-                .iter()
-                .map(|s| {
-                    wax::Glob::new(s)
-                        .map(wax::Glob::into_owned)
-                        .with_context(|| format!("go provider: invalid skip pattern `{s}`"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            Some(wax::any(gs).context("compiling go skip patterns")?)
-        };
-        Ok(Self {
-            dirs: dirs.to_vec(),
-            globs: compiled,
-        })
-    }
-
-    /// True if the dir at absolute `path` (workspace-relative `rel`) is pruned.
-    fn is_skipped(&self, path: &Path, rel: &Path) -> bool {
-        use wax::Program as _;
-        if self.dirs.iter().any(|d| d == path) {
-            return true;
-        }
-        self.globs
-            .as_ref()
-            .is_some_and(|any| any.is_match(rel) || any.is_match(rel.join(PRUNE_PROBE).as_path()))
-    }
-}
-
 pub struct Config {
     pub go_bin_addr: String,
-    /// Directories to prune during package discovery: engine-owned dirs plus
-    /// user `skip` globs. See [`SkipMatcher`].
-    pub skip: Arc<SkipMatcher>,
+    /// Directories pruned during package discovery: engine skip dirs/globs plus
+    /// this provider's own `skip` option. See [`crate::htwalk::Ignore`].
+    pub skip: Arc<Ignore>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             go_bin_addr: DEFAULT_GO_BIN_ADDR.to_string(),
-            skip: Arc::new(SkipMatcher::default()),
+            skip: Arc::new(Ignore::default()),
         }
     }
 }
@@ -117,7 +69,7 @@ pub(crate) struct ProviderInner {
     gocache: String,
     go_bin_addr: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
-    skip: Arc<SkipMatcher>,
+    skip: Arc<Ignore>,
     /// Cache: golist addr → parsed GoPackage. Memoizes the artifact parse only;
     /// the underlying `executor.result(golist_addr)` is always called outside
     /// the `once` closure so every caller (owner + waiter) registers the
@@ -200,7 +152,7 @@ impl Provider {
             crate::engine::config_file::decode_opt(opts, "go provider", "skip")?
                 .unwrap_or_default();
         globs.extend(user_skip);
-        let skip = Arc::new(SkipMatcher::new(skip_dirs, &globs)?);
+        let skip = Arc::new(Ignore::new(skip_dirs, &globs)?);
         Self::with_config(workspace_root, Config { go_bin_addr, skip })
     }
 
@@ -269,7 +221,7 @@ fn collect_go_packages(
     dir: &Path,
     workspace_root: &Path,
     under_gomod: bool,
-    skip: &SkipMatcher,
+    skip: &Ignore,
     result: &mut Vec<anyhow::Result<ListPackageResponse>>,
 ) {
     let is_under = under_gomod || crate::plugingo::addr_util::find_go_mod(dir).is_some();
@@ -307,7 +259,7 @@ fn collect_go_packages(
         let rel = entry_path
             .strip_prefix(workspace_root)
             .unwrap_or(&entry_path);
-        if skip.is_skipped(&entry_path, rel) {
+        if skip.prune_dir(&entry_path, rel) {
             continue;
         }
         collect_go_packages(&entry_path, workspace_root, is_under, skip, result);
@@ -2413,7 +2365,7 @@ mod tests {
         std::fs::create_dir_all(root.join("internal")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
 
-        let skip = SkipMatcher::new(&[home.clone()], &["internal".to_string()]).unwrap();
+        let skip = Ignore::new(&[home.clone()], &["internal".to_string()]).unwrap();
         let mut out = Vec::new();
         collect_go_packages(root, root, false, &skip, &mut out);
         let pkgs: Vec<String> = out
