@@ -96,12 +96,6 @@ fn fs_driver_skip(drivers: &[config_file::PluginEntry]) -> anyhow::Result<Vec<St
     }
 }
 
-/// The `drivers:` list minus the built-in `fs` entry, which is registered
-/// directly (with its options) rather than through `apply_config`.
-fn drivers_without_fs(drivers: &[config_file::PluginEntry]) -> Vec<config_file::PluginEntry> {
-    drivers.iter().filter(|d| d.name != "fs").cloned().collect()
-}
-
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -205,10 +199,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         Ok(Box::new(plugingo::GoTestmainDriver))
     })?;
 
-    // `fs` was registered directly above, so drop it from the list `apply_config`
-    // validates (it has no factory and would otherwise be "unknown driver 'fs'").
-    let drivers = drivers_without_fs(&file.drivers);
-    e.apply_config(&file.providers, &drivers)?;
+    e.apply_config(&file.providers, &file.drivers)?;
 
     let engine = Arc::new(e);
     let (tx, rx) = mpsc::unbounded_channel();
@@ -315,8 +306,7 @@ mod tests {
             Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
         })?;
 
-        let drivers = drivers_without_fs(&file.drivers);
-        e.apply_config(&file.providers, &drivers)?;
+        e.apply_config(&file.providers, &file.drivers)?;
         Ok((dir, e))
     }
 

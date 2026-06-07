@@ -547,6 +547,10 @@ impl Engine {
             } else if let Some(factory) = self.managed_driver_factories.remove(&entry.name) {
                 let driver = factory(&entry.options)?;
                 self.register_managed_driver(driver)?;
+            } else if self.drivers_by_name.contains_key(&entry.name) {
+                // A built-in registered directly (e.g. `fs`) may be listed to
+                // carry options, which are consumed where it is registered. The
+                // entry is allowed here but does not re-instantiate the driver.
             } else {
                 return Err(anyhow::anyhow!("unknown driver '{}'", entry.name));
             }

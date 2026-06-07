@@ -124,7 +124,7 @@ pub enum LockBackendConfig {
     Mem,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginEntry {
     pub name: String,
