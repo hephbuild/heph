@@ -214,6 +214,14 @@ mod tests {
     }
 
     #[test]
+    fn exact_dir_with_trailing_slash_matches() {
+        // `node_modules/` resolves to a skip dir with a trailing slash; `Path`
+        // equality is component-wise, so it still prunes the walked dir.
+        let ig = Ignore::new(&[PathBuf::from("/ws/node_modules/")], &[]).unwrap();
+        assert!(ig.prune_dir(p("/ws/node_modules"), p("node_modules")));
+    }
+
+    #[test]
     fn walk_root_is_never_glob_pruned() {
         // The root's rel is empty; a glob must not prune it (else the whole walk
         // yields nothing). Only an exact `dirs` entry can prune.
