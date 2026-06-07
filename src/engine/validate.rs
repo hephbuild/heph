@@ -208,9 +208,7 @@ mod tests {
         // exec driver parses specs into defs (with codegen-stamped outputs); the
         // fs provider/driver resolves any synthesized inputs; the static provider
         // supplies the specs and the `list_packages` query needs.
-        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
-        engine.register_provider(|_| Box::new(crate::pluginfs::Provider::default()))?;
-        engine.register_driver(Box::new(crate::pluginfs::Driver::default()))?;
+        engine.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))

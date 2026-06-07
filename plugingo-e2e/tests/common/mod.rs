@@ -51,9 +51,9 @@ fn go_bin_path() -> String {
 
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
     let go_bin = go_bin_path();
+    // `fs` is auto-registered by `Engine::new`.
     WorkspaceBuilder::from_dir(dir)
-        .with_fs()
-        .with_provider(|root| Box::new(pluginbuildfile::Provider::new(root.to_path_buf())))
+        .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
         .with_provider(move |_| {
             Box::new(
                 pluginstatictarget::Provider::new(vec![pluginstatictarget::Target {
@@ -68,8 +68,8 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
                 .expect("static provider"),
             )
         })
-        .with_provider(|root| {
-            Box::new(plugingo::Provider::new(root.to_path_buf()).expect("plugingo provider"))
+        .with_provider(|init| {
+            Box::new(plugingo::Provider::new(init.root.to_path_buf()).expect("plugingo provider"))
         })
         .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_sh()))

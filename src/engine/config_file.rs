@@ -232,12 +232,13 @@ drivers:
 
     #[test]
     fn parses_fs_skip() {
-        let yaml = "fs:\n  skip: [vendor, third_party/foo]\n";
+        // `skip` mixes literal dirs and glob patterns.
+        let yaml = "fs:\n  skip: [vendor, \"**/node_modules/**\"]\n";
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
         let fs = cfg.fs.expect("fs config present");
         assert_eq!(
             fs.skip,
-            vec!["vendor".to_string(), "third_party/foo".to_string()]
+            vec!["vendor".to_string(), "**/node_modules/**".to_string()]
         );
     }
 
