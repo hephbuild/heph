@@ -84,6 +84,22 @@ impl Ignore {
         self.file_any.is_match(rel)
     }
 
+    /// True if the package at workspace-relative `pkg` lies inside a pruned
+    /// subtree — `pkg` itself or any ancestor directory is pruned. Used by
+    /// `get`/`list` so a directly-addressed target under a skipped dir resolves
+    /// to nothing, matching what the package walk would have surfaced. `root`
+    /// resolves absolute paths for exact-dir matching.
+    pub fn prunes_package(&self, root: &Path, pkg: &Path) -> bool {
+        let mut cur = Some(pkg);
+        while let Some(c) = cur {
+            if !c.as_os_str().is_empty() && self.prune_dir(&root.join(c), c) {
+                return true;
+            }
+            cur = c.parent();
+        }
+        false
+    }
+
     /// The raw ignore globs, for chaining with a target's own exclude patterns.
     pub fn globs(&self) -> &[String] {
         &self.globs
@@ -211,6 +227,25 @@ mod tests {
         let ig = Ignore::new(std::slice::from_ref(&home), &[]).unwrap();
         assert!(ig.prune_dir(&home, p(".heph3")));
         assert!(!ig.prune_dir(p("/ws/src"), p("src")));
+    }
+
+    #[test]
+    fn prunes_package_checks_ancestors() {
+        let ig = Ignore::new(
+            &[PathBuf::from("/ws/node_modules")],
+            &["**/gen/**".to_string()],
+        )
+        .unwrap();
+        // Package directly under an exact skip dir.
+        assert!(ig.prunes_package(p("/ws"), p("node_modules/dep")));
+        // Package under a glob-pruned dir (any depth).
+        assert!(ig.prunes_package(p("/ws"), p("a/gen/proto")));
+        // The skip dir / pruned dir itself.
+        assert!(ig.prunes_package(p("/ws"), p("node_modules")));
+        // Unrelated package.
+        assert!(!ig.prunes_package(p("/ws"), p("src/lib")));
+        // Root package is never pruned.
+        assert!(!ig.prunes_package(p("/ws"), p("")));
     }
 
     #[test]
