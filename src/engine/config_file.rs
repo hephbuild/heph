@@ -22,20 +22,6 @@ pub struct ConfigFile {
     pub fuse: Option<FuseConfig>,
     #[serde(default)]
     pub lock: Option<LockConfig>,
-    /// Config for the built-in `fs` provider/driver.
-    #[serde(default)]
-    pub fs: Option<FsConfig>,
-}
-
-/// Config for the built-in `fs` provider/driver. `fs: { skip: [glob, ...] }`.
-#[derive(Debug, Deserialize, Default, Clone)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct FsConfig {
-    /// Extra workspace-relative glob patterns the `fs` plugin excludes from every
-    /// glob walk, on top of the always-skipped `.git` and engine-owned dirs.
-    /// Matched against file paths like a target's own `exclude`.
-    #[serde(default)]
-    pub skip: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -138,7 +124,7 @@ pub enum LockBackendConfig {
     Mem,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PluginEntry {
     pub name: String,
@@ -231,26 +217,15 @@ drivers:
     }
 
     #[test]
-    fn parses_fs_skip() {
-        let yaml = "fs:\n  skip:\n    - vendor/**\n    - \"**/*.tmp\"\n";
+    fn parses_fs_driver_skip_option() {
+        let yaml = "drivers:\n  - name: fs\n    options:\n      skip: [vendor/**, \"**/*.tmp\"]\n";
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
-        let fs = cfg.fs.expect("fs config present");
-        assert_eq!(
-            fs.skip,
-            vec!["vendor/**".to_string(), "**/*.tmp".to_string()]
-        );
-    }
-
-    #[test]
-    fn fs_config_defaults_absent() {
-        let cfg: ConfigFile = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
-        assert!(cfg.fs.is_none());
-    }
-
-    #[test]
-    fn rejects_unknown_fs_field() {
-        let err = serde_yaml::from_str::<ConfigFile>("fs:\n  bogus: 1\n").expect_err("must reject");
-        assert!(err.to_string().contains("bogus"), "{err}");
+        assert_eq!(cfg.drivers.len(), 1);
+        assert_eq!(cfg.drivers[0].name, "fs");
+        let skip: Vec<String> = decode_opt(&cfg.drivers[0].options, "fs driver", "skip")
+            .expect("decode")
+            .expect("present");
+        assert_eq!(skip, vec!["vendor/**".to_string(), "**/*.tmp".to_string()]);
     }
 
     #[test]
