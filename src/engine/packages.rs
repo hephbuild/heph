@@ -113,7 +113,9 @@ mod tests {
         > {
             Box::pin(async {
                 Ok(Box::new(std::iter::empty())
-                    as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                    as Box<
+                        dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                    >)
             })
         }
         fn list_packages<'a>(
@@ -134,7 +136,9 @@ mod tests {
                     }),
                 ];
                 Ok(Box::new(items.into_iter())
-                    as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                    as Box<
+                        dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                    >)
             })
         }
         fn get<'a>(

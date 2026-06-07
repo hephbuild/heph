@@ -151,12 +151,18 @@ mod tests {
                 Box::pin(async {
                     let mk = || {
                         Ok(ListResponse {
-                            addr: Addr::new(PkgBuf::from("foo"), "a".to_string(), Default::default()),
+                            addr: Addr::new(
+                                PkgBuf::from("foo"),
+                                "a".to_string(),
+                                Default::default(),
+                            ),
                         })
                     };
                     let items: Vec<anyhow::Result<ListResponse>> = vec![mk(), mk()];
                     Ok(Box::new(items.into_iter())
-                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                        as Box<
+                            dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                        >)
                 })
             }
             fn list_packages<'a>(
@@ -179,7 +185,9 @@ mod tests {
                         }),
                     ];
                     Ok(Box::new(items.into_iter())
-                        as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                        as Box<
+                            dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                        >)
                 })
             }
             fn get<'a>(
