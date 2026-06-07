@@ -186,7 +186,10 @@ mod tests {
             .await?
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        assert_eq!(pkgs, vec!["foo".to_string()]);
+        // The always-on built-in `fs` provider also advertises its `@heph/fs`
+        // package; it sorts first because it is registered before `p1`/`p2`.
+        // `foo` still appears exactly once despite four listings across providers.
+        assert_eq!(pkgs, vec!["@heph/fs".to_string(), "foo".to_string()]);
         Ok(())
     }
 
