@@ -365,20 +365,24 @@ impl Engine {
         engine.register_driver(|_| Box::new(crate::plugingroup::Driver))?;
         engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;
 
-        // The `fs` provider + driver are always-on built-ins. The engine owns
-        // their ignore set (home + `fs.skip` dirs/globs) and builds it once from
-        // the same data it hands every plugin via `PluginInit`, so every fs glob
-        // walk prunes the same paths. Provider + driver share one `Ignore` so
-        // BUILD-time `glob()` and the run-time walk agree.
-        let fs_skip = Arc::new(crate::htwalk::Ignore::new(
-            &engine.skip_dirs(),
-            &engine.skip_globs(),
-        )?);
-        engine.register_provider({
-            let fs_skip = fs_skip.clone();
-            move |_| Box::new(crate::pluginfs::Provider::new(fs_skip))
+        // The `fs` provider + driver are always-on built-ins. Each builds its
+        // `Ignore` from the same `PluginInit` (home + `fs.skip` dirs/globs) the
+        // engine hands every plugin, so every fs glob walk prunes the same paths.
+        // The fallible variant lets a bad `fs.skip` glob surface as an error here.
+        engine.try_register_provider(|init| {
+            let ignore = Arc::new(crate::htwalk::Ignore::new(
+                &init.skip_dirs,
+                &init.skip_globs,
+            )?);
+            Ok(Box::new(crate::pluginfs::Provider::new(ignore)))
         })?;
-        engine.register_driver(move |_| Box::new(crate::pluginfs::Driver::new(fs_skip)))?;
+        engine.try_register_driver(|init| {
+            let ignore = Arc::new(crate::htwalk::Ignore::new(
+                &init.skip_dirs,
+                &init.skip_globs,
+            )?);
+            Ok(Box::new(crate::pluginfs::Driver::new(ignore)))
+        })?;
 
         Ok(engine)
     }
@@ -479,7 +483,16 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKDriver>,
     ) -> anyhow::Result<()> {
-        let driver = factory(&self.plugin_init_payload());
+        self.try_register_driver(|init| Ok(factory(init)))
+    }
+
+    /// Like [`Self::register_driver`], but the factory may fail (e.g. compiling a
+    /// glob set). The error propagates out of registration.
+    pub fn try_register_driver(
+        &mut self,
+        factory: impl FnOnce(&PluginInit) -> anyhow::Result<Box<dyn SDKDriver>>,
+    ) -> anyhow::Result<()> {
+        let driver = factory(&self.plugin_init_payload())?;
         self.insert_driver(driver)
     }
 
@@ -487,7 +500,16 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider>,
     ) -> anyhow::Result<()> {
-        let provider = factory(&self.plugin_init_payload());
+        self.try_register_provider(|init| Ok(factory(init)))
+    }
+
+    /// Like [`Self::register_provider`], but the factory may fail (e.g. compiling
+    /// a glob set). The error propagates out of registration.
+    pub fn try_register_provider(
+        &mut self,
+        factory: impl FnOnce(&PluginInit) -> anyhow::Result<Box<dyn SDKProvider>>,
+    ) -> anyhow::Result<()> {
+        let provider = factory(&self.plugin_init_payload())?;
 
         let provider = Arc::new(Provider {
             name: provider.config(provider::ConfigRequest {})?.name,
