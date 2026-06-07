@@ -84,6 +84,24 @@ impl SuppressionHandle {
     }
 }
 
+/// Reads the `skip` option (extra exclude globs) off the `fs` entry in the
+/// `drivers:` config list. Returns an empty list when `fs` is not listed.
+fn fs_driver_skip(drivers: &[config_file::PluginEntry]) -> anyhow::Result<Vec<String>> {
+    match drivers.iter().find(|d| d.name == "fs") {
+        Some(entry) => {
+            config_file::deny_unknown("fs driver", &entry.options, &["skip"])?;
+            Ok(config_file::decode_opt(&entry.options, "fs driver", "skip")?.unwrap_or_default())
+        }
+        None => Ok(vec![]),
+    }
+}
+
+/// The `drivers:` list minus the built-in `fs` entry, which is registered
+/// directly (with its options) rather than through `apply_config`.
+fn drivers_without_fs(drivers: &[config_file::PluginEntry]) -> Vec<config_file::PluginEntry> {
+    drivers.iter().filter(|d| d.name != "fs").cloned().collect()
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -127,9 +145,11 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         lock_backend,
     })?;
 
-    // Auto-registered built-ins. The fs plugin prunes the engine's own skip dirs
-    // (the heph home) plus the `fs.skip` globs from the config file.
-    let fs_skip_globs = file.fs.map(|f| f.skip).unwrap_or_default();
+    // `fs` is a built-in registered directly, but its `skip` option is read from
+    // the `drivers: [{name: fs, options: {skip: […]}}]` entry like any other
+    // driver. The provider and driver share one `FsSkip` so BUILD-time `glob()`
+    // and the driver's run-time walk prune the same dirs.
+    let fs_skip_globs = fs_driver_skip(&file.drivers)?;
     let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(
         &root,
         &e.skip_dirs(),
@@ -185,7 +205,10 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         Ok(Box::new(plugingo::GoTestmainDriver))
     })?;
 
-    e.apply_config(&file.providers, &file.drivers)?;
+    // `fs` was registered directly above, so drop it from the list `apply_config`
+    // validates (it has no factory and would otherwise be "unknown driver 'fs'").
+    let drivers = drivers_without_fs(&file.drivers);
+    e.apply_config(&file.providers, &drivers)?;
 
     let engine = Arc::new(e);
     let (tx, rx) = mpsc::unbounded_channel();
@@ -260,7 +283,7 @@ mod tests {
             ..Default::default()
         })?;
 
-        let fs_skip_globs = file.fs.map(|f| f.skip).unwrap_or_default();
+        let fs_skip_globs = fs_driver_skip(&file.drivers)?;
         let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(
             dir.path(),
             &e.skip_dirs(),
@@ -292,7 +315,8 @@ mod tests {
             Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
         })?;
 
-        e.apply_config(&file.providers, &file.drivers)?;
+        let drivers = drivers_without_fs(&file.drivers);
+        e.apply_config(&file.providers, &drivers)?;
         Ok((dir, e))
     }
 
@@ -312,6 +336,33 @@ drivers:
         assert!(e.drivers_by_name.contains_key("exec"));
         assert!(e.drivers_by_name.contains_key("bash"));
         assert!(e.providers_by_name.contains_key("fs"));
+    }
+
+    #[test]
+    fn fs_driver_skip_option_applies() {
+        let yaml = r#"
+drivers:
+  - name: fs
+    options:
+      skip: [vendor/**]
+"#;
+        // `fs` listed with options builds the engine (registered directly, dropped
+        // from apply_config) and stays registered as both provider and driver.
+        let (_dir, e) = build_engine_from_yaml(yaml).expect("engine");
+        assert!(e.providers_by_name.contains_key("fs"));
+        assert!(e.drivers_by_name.contains_key("fs"));
+    }
+
+    #[test]
+    fn fs_driver_unknown_option_errors() {
+        let yaml = r#"
+drivers:
+  - name: fs
+    options:
+      bogus: 1
+"#;
+        let err = build_engine_from_yaml(yaml).err().expect("must error");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]
