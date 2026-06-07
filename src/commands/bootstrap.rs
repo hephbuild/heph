@@ -106,6 +106,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         })
         .unwrap_or_default();
 
+    let tmp_cache = file
+        .tmp_cache
+        .map(|c| engine::MemCacheOptions {
+            per_entry_bytes: c.per_entry_bytes,
+            capacity_bytes: c.capacity_bytes,
+        })
+        .unwrap_or_else(engine::MemCacheOptions::default_tmp);
+
     let fuse = file.fuse.unwrap_or_default();
 
     let lock_backend = file
@@ -123,6 +131,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         fs_skip: file.fs.map(|f| f.skip).unwrap_or_default(),
         parallelism: None,
         mem_cache,
+        tmp_cache,
         fuse,
         lock_backend,
     })?;

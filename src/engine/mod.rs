@@ -24,6 +24,7 @@ mod local_cache;
 mod local_cache_fs;
 mod local_cache_mem;
 mod local_cache_sqlite;
+mod local_cache_tmp;
 mod packages;
 pub mod provider;
 mod query;

@@ -664,12 +664,25 @@ fn walk_glob(
         let hashout = file_hashout(abs_path, x)
             .with_context(|| format!("hash glob entry '{}'", abs_path.display()))?;
 
-        let source_path = abs_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("glob entry path is not valid UTF-8"))?
-            .to_string();
-
+        // Materialize the owned strings that borrow `abs_path`/`rel_str` *before*
+        // consuming `entry` for `source_path` below — the borrows end here.
+        let out_path = rel_str.to_string();
         let name = rel_str.replace('/', "_");
+
+        // `source_path` is `abs_path` owned. Reuse walkdir's already-allocated
+        // `PathBuf` instead of copying its bytes into a fresh String: on Unix
+        // `OsString -> String` reuses the buffer (validate-in-place, no realloc),
+        // so this drops one allocation per matched file off the glob hot path.
+        let source_path = entry
+            .into_path()
+            .into_os_string()
+            .into_string()
+            .map_err(|os| {
+                anyhow::anyhow!(
+                    "glob entry path is not valid UTF-8: {}",
+                    os.to_string_lossy()
+                )
+            })?;
 
         artifacts.push(OutputArtifact {
             group: "".to_string(),
@@ -677,7 +690,7 @@ fn walk_glob(
             r#type: Type::Output,
             content: Content::File(ContentFile {
                 source_path,
-                out_path: rel_str.to_string(),
+                out_path,
                 x,
             }),
             hashout,

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub root: PathBuf,
     /// Workspace state/cache directory. If empty, defaults to `root/.heph3`.
@@ -25,23 +25,61 @@ pub struct Config {
     /// every plugin that walks the tree. See [`Engine::skip_dirs`].
     pub fs_skip: Vec<String>,
     pub parallelism: Option<usize>,
+    /// In-memory tier fronting the durable (SQLite) local cache.
     pub mem_cache: MemCacheOptions,
+    /// Mem-only store for tmp/uncacheable revisions ([`LocalCacheTmp`]).
+    /// Entries over `per_entry_bytes`, or that would push the store past
+    /// `capacity_bytes`, spill to the durable cache.
+    ///
+    /// [`LocalCacheTmp`]: crate::engine::local_cache_tmp::LocalCacheTmp
+    pub tmp_cache: MemCacheOptions,
     pub fuse: FuseConfig,
     /// Backend serializing the execute phase per addr. Defaults to `Fs`.
     pub lock_backend: LockBackend,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::new(),
+            home_dir: PathBuf::new(),
+            fs_skip: Vec::new(),
+            parallelism: None,
+            mem_cache: MemCacheOptions::default(),
+            tmp_cache: MemCacheOptions::default_tmp(),
+            fuse: FuseConfig::default(),
+            lock_backend: LockBackend::default(),
+        }
+    }
+}
+
+/// Byte limits for one in-memory cache store. Used for both the local-cache mem
+/// tier (`mem_cache`) and the tmp store (`tmp_cache`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemCacheOptions {
+    /// Per-entry size cap. For `mem_cache`, larger entries pass through
+    /// uncached; for `tmp_cache`, larger entries spill to the durable cache.
     pub per_entry_bytes: usize,
-    /// Total byte budget. `0` disables the in-memory layer entirely.
+    /// Total byte budget. For `mem_cache`, `0` disables the in-memory layer
+    /// entirely; for `tmp_cache`, entries that would exceed it spill to durable.
     pub capacity_bytes: u64,
 }
 
 impl Default for MemCacheOptions {
+    /// Defaults for the local-cache mem tier.
     fn default() -> Self {
         Self {
             per_entry_bytes: 16 * 1024,
+            capacity_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl MemCacheOptions {
+    /// Defaults for the tmp store: 1 MiB per entry, 64 MiB total budget.
+    pub fn default_tmp() -> Self {
+        Self {
+            per_entry_bytes: 1024 * 1024,
             capacity_bytes: 64 * 1024 * 1024,
         }
     }
@@ -90,6 +128,10 @@ pub type ManagedDriverFactory = Box<
 pub struct Engine {
     pub(crate) cfg: Config,
     pub(crate) local_cache: Arc<dyn LocalCache>,
+    /// Mem-only store for `tmp`/uncacheable revisions. Small entries live in
+    /// memory and never touch the SQLite WAL; entries over the per-entry cap
+    /// spill to `local_cache`. See [`LocalCacheTmp`].
+    pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub(crate) providers_by_name: HashMap<String, Arc<Provider>>,
@@ -339,6 +381,15 @@ impl Engine {
             ))
         };
 
+        // Mem-only tier for tmp/uncacheable revisions; spills oversized or
+        // over-budget entries to the durable cache so a reader never misses.
+        let local_cache_tmp: Arc<dyn LocalCache> =
+            Arc::new(crate::engine::local_cache_tmp::LocalCacheTmp::new(
+                local_cache.clone(),
+                cfg.tmp_cache.per_entry_bytes,
+                cfg.tmp_cache.capacity_bytes,
+            ));
+
         // Best-effort sweep of stale `sandboxfuse<pid>` dirs from crashed runs.
         sweep_stale_sandboxfuse_dirs(&home);
 
@@ -355,6 +406,7 @@ impl Engine {
             cfg: cfg.clone(),
             home: home.clone(),
             local_cache,
+            local_cache_tmp,
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],

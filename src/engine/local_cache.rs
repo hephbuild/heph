@@ -189,6 +189,7 @@ impl Engine {
     pub async fn cache_artifact_locally(
         &self,
         _ctoken: &dyn Cancellable,
+        cache: &Arc<dyn LocalCache>,
         addr: &Addr,
         hashin: &str,
         artifact: &outputartifact::OutputArtifact,
@@ -200,7 +201,11 @@ impl Engine {
         // is observed to drop wakeups on macOS under heavy load — see
         // `RCA_MACOS_WAKER.md`.
         crate::process_supervisor::block_or_inline(
-            enclose!((self.local_cache => local_cache, addr, artifact) move || {
+            enclose!((cache => local_cache, addr, artifact) move || {
+                let open_writer =
+                    |name: &str| -> anyhow::Result<Box<dyn io::Write>> {
+                        local_cache.writer(&addr, &hashin, name)
+                    };
                 let type_prefix = match artifact.r#type {
                     outputartifact::Type::Output => "out",
                     outputartifact::Type::Log => "log",
@@ -211,7 +216,7 @@ impl Engine {
                     outputartifact::Content::Raw(raw) => {
                         let name = format!("{}_{}.tar", type_prefix, artifact.name);
                         let mut cw = CountingWriter::new(
-                            local_cache.writer(&addr, &hashin, &name).with_context(|| {
+                            open_writer(&name).with_context(|| {
                                 format!("open cache writer for {addr} {name}")
                             })?,
                         );
@@ -224,7 +229,7 @@ impl Engine {
                     outputartifact::Content::File(file) => {
                         let name = format!("{}_{}.tar", type_prefix, artifact.name);
                         let mut cw = CountingWriter::new(
-                            local_cache.writer(&addr, &hashin, &name).with_context(|| {
+                            open_writer(&name).with_context(|| {
                                 format!("open cache writer for {addr} {name}")
                             })?,
                         );
@@ -246,8 +251,7 @@ impl Engine {
                             .metadata()
                             .with_context(|| format!("stat tar artifact {path}"))?
                             .size();
-                        let mut w = local_cache
-                            .writer(&addr, &hashin, &name)
+                        let mut w = open_writer(&name)
                             .with_context(|| format!("open cache writer for {addr} {name}"))?;
                         io::copy(&mut f, &mut w).with_context(|| {
                             format!("copy tar artifact {path} into {addr} {name}")
@@ -262,8 +266,7 @@ impl Engine {
                             .metadata()
                             .with_context(|| format!("stat cpio artifact {path}"))?
                             .size();
-                        let mut w = local_cache
-                            .writer(&addr, &hashin, &name)
+                        let mut w = open_writer(&name)
                             .with_context(|| format!("open cache writer for {addr} {name}"))?;
                         io::copy(&mut f, &mut w).with_context(|| {
                             format!("copy cpio artifact {path} into {addr} {name}")
@@ -329,10 +332,21 @@ impl Engine {
             hashin.to_string()
         };
 
+        // `tmp` (uncacheable/shell) revisions get a unique `{hashin}_{nanos}` key
+        // and are never read back across runs, so route them to the mem-only
+        // `local_cache_tmp` — small entries stay in memory and skip the SQLite
+        // WAL write. `CacheArtifact` carries the cache it was written to, so
+        // reads resolve against the same store.
+        let cache = if tmp {
+            &self.local_cache_tmp
+        } else {
+            &self.local_cache
+        };
+
         for artifact in artifacts {
             let artifact_name = artifact.name.clone();
             let (cached_artifact, manifest_artifact) = self
-                .cache_artifact_locally(ctoken, addr, &key, &artifact)
+                .cache_artifact_locally(ctoken, cache, addr, &key, &artifact)
                 .await
                 .with_context(|| format!("cache artifact {artifact_name} for {addr}"))?;
             res_artifacts.push(cached_artifact);
@@ -347,8 +361,7 @@ impl Engine {
             artifacts: manifest_artifacts,
         };
 
-        let mut manifest_writer = self
-            .local_cache
+        let mut manifest_writer = cache
             .writer(addr, &key, MANIFEST_V1)
             .with_context(|| format!("open manifest writer for {addr}"))?;
         borsh::to_writer(&mut manifest_writer, &manifest)

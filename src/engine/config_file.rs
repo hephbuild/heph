@@ -19,6 +19,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub mem_cache: Option<MemCacheConfig>,
     #[serde(default)]
+    pub tmp_cache: Option<MemCacheConfig>,
+    #[serde(default)]
     pub fuse: Option<FuseConfig>,
     #[serde(default)]
     pub lock: Option<LockConfig>,
@@ -38,11 +40,14 @@ pub struct FsConfig {
     pub skip: Vec<String>,
 }
 
+/// Byte limits for one in-memory cache store. Shared shape for `mem_cache`
+/// (the local-cache mem tier) and `tmp_cache` (the tmp/uncacheable store).
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MemCacheConfig {
     pub per_entry_bytes: usize,
-    /// Total byte budget for the in-memory cache. `0` disables it entirely.
+    /// Total byte budget. For `mem_cache`, `0` disables the layer entirely; for
+    /// `tmp_cache`, entries that would exceed it spill to the durable cache.
     pub capacity_bytes: u64,
 }
 
@@ -197,6 +202,9 @@ homeDir: .heph2
 memCache:
   perEntryBytes: 16384
   capacityBytes: 67108864
+tmpCache:
+  perEntryBytes: 1048576
+  capacityBytes: 134217728
 providers:
   - name: buildfile
     options:
@@ -221,6 +229,9 @@ drivers:
         let mc = cfg.mem_cache.expect("mem_cache present");
         assert_eq!(mc.per_entry_bytes, 16384);
         assert_eq!(mc.capacity_bytes, 67108864);
+        let tc = cfg.tmp_cache.expect("tmp_cache present");
+        assert_eq!(tc.per_entry_bytes, 1048576);
+        assert_eq!(tc.capacity_bytes, 134217728);
         assert_eq!(cfg.providers.len(), 2);
         assert_eq!(cfg.providers[0].name, "buildfile");
         let patterns: Vec<String> = decode_opt(&cfg.providers[0].options, "buildfile", "patterns")
