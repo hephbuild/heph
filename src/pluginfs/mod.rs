@@ -385,16 +385,11 @@ pub struct FsSkip {
 }
 
 impl FsSkip {
-    /// Builds the skip set from the engine-provided `skip_dirs` (absolute paths)
-    /// plus `extra_globs` — workspace-relative exclude patterns from the config
-    /// file's top-level `skip`. Each skip dir located under `root` also
-    /// contributes a `<rel>/**` exclude glob so the compiled `not` matcher agrees
-    /// with the walk-time pruning.
-    pub fn new(
-        root: &std::path::Path,
-        skip_dirs: &[std::path::PathBuf],
-        extra_globs: &[String],
-    ) -> anyhow::Result<Self> {
+    /// Builds the skip set from the engine-provided `skip_dirs` (absolute paths:
+    /// the heph home plus the config file's `fs.skip` dirs). Each skip dir located
+    /// under `root` also contributes a `<rel>/**` exclude glob so the compiled
+    /// `not` matcher agrees with the walk-time pruning.
+    pub fn new(root: &std::path::Path, skip_dirs: &[std::path::PathBuf]) -> anyhow::Result<Self> {
         let mut exclude_globs = vec!["**/.git/**".to_string()];
         for dir in skip_dirs {
             if let Some(rel) = dir.strip_prefix(root).ok().and_then(|r| r.to_str())
@@ -403,7 +398,6 @@ impl FsSkip {
                 exclude_globs.push(format!("{rel}/**"));
             }
         }
-        exclude_globs.extend(extra_globs.iter().cloned());
         let builtin_any = compile_any(&exclude_globs).context("compiling built-in fs excludes")?;
         Ok(Self {
             skip_dirs: skip_dirs.to_vec(),
@@ -423,7 +417,7 @@ impl FsSkip {
 impl Default for FsSkip {
     fn default() -> Self {
         // Only `.git` is pruned; the `**/.git/**` literal is statically valid.
-        Self::new(std::path::Path::new(""), &[], &[]).expect("built-in .git exclude is valid")
+        Self::new(std::path::Path::new(""), &[]).expect("built-in .git exclude is valid")
     }
 }
 
@@ -1652,7 +1646,7 @@ mod tests {
 
         // The engine hands the fs plugin its skip dirs (the heph home); the walk
         // must prune that subtree rather than relying on a hardcoded basename.
-        let skip = Arc::new(FsSkip::new(tmp.path(), &[home], &[]).unwrap());
+        let skip = Arc::new(FsSkip::new(tmp.path(), &[home]).unwrap());
         let driver = Driver::new(skip);
 
         let config =
@@ -1681,14 +1675,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_driver_run_glob_excludes_config_extra_skip() {
+    async fn test_driver_run_glob_excludes_config_skip_dir() {
         let tmp = tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("vendor")).unwrap();
         fs::write(tmp.path().join("vendor").join("dep.rs"), b"").unwrap();
         fs::write(tmp.path().join("main.rs"), b"").unwrap();
 
-        // Extra exclude globs from the config file's top-level `skip`.
-        let skip = Arc::new(FsSkip::new(tmp.path(), &[], &["vendor/**".to_string()]).unwrap());
+        // A `fs.skip` dir from the config file (resolved to an absolute path) is
+        // pruned just like the engine home.
+        let skip = Arc::new(FsSkip::new(tmp.path(), &[tmp.path().join("vendor")]).unwrap());
         let driver = Driver::new(skip);
 
         let config =
@@ -1712,7 +1707,7 @@ mod tests {
         assert_eq!(
             names,
             vec!["main.rs"],
-            "config extra skip glob must exclude matched files: {names:?}"
+            "config skip dir must be pruned: {names:?}"
         );
     }
 
