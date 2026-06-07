@@ -187,6 +187,15 @@ impl EProvider for Provider {
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
         Box::pin(async move {
+            // A package inside a skipped subtree lists nothing — matching what the
+            // package walk would have surfaced.
+            if self
+                .skip
+                .prunes_package(&self.root, std::path::Path::new(req.package.as_str()))
+            {
+                return Ok(Box::new(std::iter::empty())
+                    as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
+            }
             let res = self.run_pkg(req.package.as_str()).await?;
 
             let items: Vec<anyhow::Result<ListResponse>> = res
@@ -253,6 +262,13 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
+            // A target inside a skipped subtree does not resolve.
+            if self
+                .skip
+                .prunes_package(&self.root, std::path::Path::new(req.addr.package.as_str()))
+            {
+                return Err(NotFound);
+            }
             let res = self
                 .run_pkg(req.addr.package.as_str())
                 .await
@@ -580,6 +596,49 @@ mod tests {
             !packages.contains(&"vendor".to_string()),
             "engine skip dir not pruned: {packages:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_and_list_skip_pruned_packages() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        let vendor_dep = root.join("vendor/dep");
+        fs::create_dir_all(&vendor_dep).unwrap();
+        fs::write(
+            vendor_dep.join("BUILD"),
+            r#"target(name = "t", driver = "d")"#,
+        )
+        .unwrap();
+
+        // `vendor` is an engine skip dir; a target directly addressed under it
+        // must not resolve, and listing it yields nothing.
+        let provider = Provider::from_options(
+            root.to_path_buf(),
+            &[root.join("vendor")],
+            &[],
+            &Options::new(),
+        )
+        .expect("provider");
+
+        let ctoken = StdCancellationToken::new();
+        let got = provider.get(get_req("vendor/dep", "t"), &ctoken).await;
+        assert!(
+            matches!(got, Err(NotFound)),
+            "expected NotFound for skipped pkg"
+        );
+
+        let listed = provider
+            .list(
+                ListRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from("vendor/dep"),
+                    states: vec![],
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.count(), 0);
     }
 
     #[tokio::test]

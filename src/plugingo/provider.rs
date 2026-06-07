@@ -337,6 +337,17 @@ impl ProviderInner {
                 }
             };
 
+            // A first-party package inside a skipped subtree lists nothing —
+            // mirroring what the package walk (`collect_go_packages`) prunes.
+            if matches!(&*kind, GoPackageKind::FirstParty { .. })
+                && self
+                    .skip
+                    .prunes_package(&self.workspace_root, Path::new(req.package.as_str()))
+            {
+                return Ok(Box::new(std::iter::empty())
+                    as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
+            }
+
             match &*kind {
                 GoPackageKind::Stdlib { .. } => {
                     let addrs = vec![
@@ -649,6 +660,16 @@ impl ProviderInner {
             Some(k) => k,
             None => return Err(GetError::NotFound),
         };
+
+        // A first-party package inside a skipped subtree does not resolve —
+        // mirroring what the package walk (`collect_go_packages`) prunes.
+        if matches!(&*kind, GoPackageKind::FirstParty { .. })
+            && self
+                .skip
+                .prunes_package(&self.workspace_root, Path::new(addr.package.as_str()))
+        {
+            return Err(GetError::NotFound);
+        }
 
         // _golist — generate spec without executing go list (before stdlib check so
         // stdlib packages can also expose a _golist target for cached dep resolution)
