@@ -21,6 +21,9 @@ pub struct Config {
     pub root: PathBuf,
     /// Workspace state/cache directory. If empty, defaults to `root/.heph3`.
     pub home_dir: PathBuf,
+    /// Workspace-relative exclude globs from the config file's `fs.skip`, handed
+    /// to every plugin that walks the tree. See [`SkipConfig`].
+    pub fs_skip: Vec<String>,
     pub parallelism: Option<usize>,
     pub mem_cache: MemCacheOptions,
     pub fuse: FuseConfig,
@@ -44,10 +47,20 @@ impl Default for MemCacheOptions {
     }
 }
 
-/// Factory args: workspace root, the engine-owned directories every provider
-/// must skip (e.g. the heph home dir), and the provider's YAML options.
+/// Filesystem-walk config the engine hands to every plugin factory that walks
+/// the workspace tree, so they prune the same paths. `dirs` are absolute
+/// engine-owned directories (e.g. the heph home) matched by exact path; `globs`
+/// are workspace-relative exclude patterns from the config file's `fs.skip`.
+#[derive(Debug, Clone, Default)]
+pub struct SkipConfig {
+    pub dirs: Vec<PathBuf>,
+    pub globs: Vec<String>,
+}
+
+/// Factory args: workspace root, the engine's filesystem-skip config (see
+/// [`SkipConfig`]), and the provider's YAML options.
 pub type ProviderFactory = Box<
-    dyn FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync,
+    dyn FnOnce(&Path, &SkipConfig, &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync,
 >;
 pub type DriverFactory =
     Box<dyn FnOnce(&Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync>;
@@ -446,7 +459,7 @@ impl Engine {
     pub fn register_provider_factory(
         &mut self,
         name: &str,
-        factory: impl FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>>
+        factory: impl FnOnce(&Path, &SkipConfig, &Options) -> anyhow::Result<Box<dyn SDKProvider>>
         + Send
         + Sync
         + 'static,
@@ -498,12 +511,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Directories the engine owns and no provider/driver should walk into. The
-    /// home dir holds the local cache, sandboxes, locks — never packages. Handed
-    /// to provider factories (and the built-in `fs` plugin) so every walk prunes
-    /// the same engine-owned subtrees.
-    pub fn skip_dirs(&self) -> Vec<PathBuf> {
-        vec![self.home.clone()]
+    /// Filesystem-skip config handed to every plugin that walks the tree: the
+    /// engine-owned dirs to prune (the heph home, holding cache/sandboxes/locks —
+    /// never packages) plus the config file's `fs.skip` globs.
+    pub fn skip_config(&self) -> SkipConfig {
+        SkipConfig {
+            dirs: vec![self.home.clone()],
+            globs: self.cfg.fs_skip.clone(),
+        }
     }
 
     /// Instantiates every provider/driver listed in the entries by looking up the
@@ -515,13 +530,13 @@ impl Engine {
         drivers: &[PluginEntry],
     ) -> anyhow::Result<()> {
         let root = self.cfg.root.clone();
-        let skip_dirs = self.skip_dirs();
+        let skip = self.skip_config();
         for entry in providers {
             let factory = self
                 .provider_factories
                 .remove(&entry.name)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", entry.name))?;
-            let provider = factory(&root, &skip_dirs, &entry.options)?;
+            let provider = factory(&root, &skip, &entry.options)?;
             let resolved_name = provider.config(provider::ConfigRequest {})?.name;
             if resolved_name != entry.name {
                 return Err(anyhow::anyhow!(
@@ -547,10 +562,6 @@ impl Engine {
             } else if let Some(factory) = self.managed_driver_factories.remove(&entry.name) {
                 let driver = factory(&entry.options)?;
                 self.register_managed_driver(driver)?;
-            } else if self.drivers_by_name.contains_key(&entry.name) {
-                // A built-in registered directly (e.g. `fs`) may be listed to
-                // carry options, which are consumed where it is registered. The
-                // entry is allowed here but does not re-instantiate the driver.
             } else {
                 return Err(anyhow::anyhow!("unknown driver '{}'", entry.name));
             }

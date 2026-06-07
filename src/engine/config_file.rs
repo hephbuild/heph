@@ -22,6 +22,19 @@ pub struct ConfigFile {
     pub fuse: Option<FuseConfig>,
     #[serde(default)]
     pub lock: Option<LockConfig>,
+    #[serde(default)]
+    pub fs: Option<FsConfig>,
+}
+
+/// Filesystem-walk config shared across plugins. `fs: { skip: [glob, ...] }`.
+/// The engine hands `skip` to every plugin factory that walks the tree (the
+/// built-in `fs` plugin, the buildfile/go providers), so it prunes the same
+/// workspace-relative paths everywhere.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FsConfig {
+    #[serde(default)]
+    pub skip: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -217,15 +230,26 @@ drivers:
     }
 
     #[test]
-    fn parses_fs_driver_skip_option() {
-        let yaml = "drivers:\n  - name: fs\n    options:\n      skip: [vendor/**, \"**/*.tmp\"]\n";
+    fn parses_fs_skip() {
+        let yaml = "fs:\n  skip: [vendor/**, \"**/*.tmp\"]\n";
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
-        assert_eq!(cfg.drivers.len(), 1);
-        assert_eq!(cfg.drivers[0].name, "fs");
-        let skip: Vec<String> = decode_opt(&cfg.drivers[0].options, "fs driver", "skip")
-            .expect("decode")
-            .expect("present");
-        assert_eq!(skip, vec!["vendor/**".to_string(), "**/*.tmp".to_string()]);
+        let fs = cfg.fs.expect("fs config present");
+        assert_eq!(
+            fs.skip,
+            vec!["vendor/**".to_string(), "**/*.tmp".to_string()]
+        );
+    }
+
+    #[test]
+    fn fs_config_defaults_absent() {
+        let cfg: ConfigFile = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        assert!(cfg.fs.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_fs_field() {
+        let err = serde_yaml::from_str::<ConfigFile>("fs:\n  bogus: 1\n").expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

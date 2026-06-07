@@ -67,7 +67,8 @@ impl WorkspaceBuilder {
     pub fn with_fs(mut self) -> Self {
         let root = self.dir.path().to_path_buf();
         self.setups.push(Box::new(move |e: &mut Engine| {
-            let skip = Arc::new(heph::pluginfs::FsSkip::new(&root, &e.skip_dirs(), &[])?);
+            let skip = e.skip_config();
+            let skip = Arc::new(heph::pluginfs::FsSkip::new(&root, &skip.dirs, &skip.globs)?);
             e.register_provider({
                 let skip = skip.clone();
                 move |_| Box::new(heph::pluginfs::Provider::new(skip))
