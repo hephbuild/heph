@@ -110,29 +110,16 @@ impl EProvider for Provider {
 
     fn list_packages<'a>(
         &'a self,
-        req: ListPackagesRequest,
+        _req: ListPackagesRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<
         'a,
         anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
     > {
         Box::pin(async move {
-            // `fs` owns exactly one synthetic package (`@heph/fs`). Yield it only
-            // when it falls under the requested prefix, so a narrowed query (e.g.
-            // `//a/b/c:...`) doesn't spuriously surface it.
-            let prefix = req.prefix.as_str();
-            let under_prefix = prefix.is_empty()
-                || prefix == PKG
-                || PKG
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('/'));
-            let items: Vec<anyhow::Result<ListPackageResponse>> = if under_prefix {
-                vec![Ok(ListPackageResponse {
-                    pkg: PkgBuf::from(PKG),
-                })]
-            } else {
-                vec![]
-            };
+            let items: Vec<anyhow::Result<ListPackageResponse>> = vec![Ok(ListPackageResponse {
+                pkg: PkgBuf::from(PKG),
+            })];
             Ok(Box::new(items.into_iter())
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
@@ -1211,30 +1198,6 @@ mod tests {
             result.target_spec.config.get("p"),
             Some(&Value::String("src/*.rs".to_string()))
         );
-    }
-
-    async fn list_pkgs(prefix: &str) -> Vec<String> {
-        let p = Provider::default();
-        let it = p
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(prefix),
-                },
-                &ctoken(),
-            )
-            .await
-            .unwrap();
-        it.map(|r| r.unwrap().pkg.to_string()).collect()
-    }
-
-    #[tokio::test]
-    async fn test_list_packages_honors_prefix() {
-        // Yielded only when `@heph/fs` falls under the requested prefix.
-        assert_eq!(list_pkgs("").await, vec![PKG.to_string()]);
-        assert_eq!(list_pkgs("@heph").await, vec![PKG.to_string()]);
-        assert_eq!(list_pkgs(PKG).await, vec![PKG.to_string()]);
-        assert!(list_pkgs("a/b/c").await.is_empty());
-        assert!(list_pkgs("@hep").await.is_empty());
     }
 
     // ─── Driver tests ──────────────────────────────────────────────────────
