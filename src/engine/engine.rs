@@ -65,6 +65,12 @@ pub struct PluginInit<'a> {
     pub skip_globs: &'a [String],
 }
 
+/// Always-on exclude glob: a `.git` directory at any depth is never a build
+/// input (and submodules nest it). Handed to every tree-walking plugin via
+/// [`Engine::skip_globs`], so the fs plugin and the buildfile/go providers all
+/// prune it without each hardcoding the rule.
+const GIT_SKIP_GLOB: &str = "**/.git/**";
+
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
 /// into literal directories vs glob patterns.
 pub(crate) fn is_skip_glob(entry: &str) -> bool {
@@ -591,14 +597,12 @@ impl Engine {
         dirs
     }
 
-    /// The glob `fs.skip` entries (e.g. `**/node_modules/**`), matched against
-    /// workspace-relative paths by every tree-walking plugin.
+    /// Exclude globs every tree-walking plugin honors: the always-on `.git`
+    /// exclusion plus the glob `fs.skip` entries (e.g. `**/node_modules/**`),
+    /// matched against workspace-relative paths.
     pub fn skip_globs(&self) -> Vec<String> {
-        self.cfg
-            .fs_skip
-            .iter()
-            .filter(|e| is_skip_glob(e))
-            .cloned()
+        std::iter::once(GIT_SKIP_GLOB.to_string())
+            .chain(self.cfg.fs_skip.iter().filter(|e| is_skip_glob(e)).cloned())
             .collect()
     }
 

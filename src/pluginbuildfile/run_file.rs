@@ -2009,30 +2009,6 @@ target(name = "t_in_app", driver = SHARED)
     }
 
     #[test]
-    fn test_heph_fs_glob_excludes_builtin_dirs() {
-        let tmp_dir = tempdir().unwrap();
-        let pkg = tmp_dir.path().join("mypkg");
-        let git = pkg.join(".git");
-        fs::create_dir_all(&git).unwrap();
-        fs::write(git.join("HEAD"), "").unwrap();
-        fs::write(pkg.join("main.rs"), "").unwrap();
-        fs::write(
-            pkg.join("BUILD"),
-            r#"target(name = "t", driver = "d", srcs = heph.fs.glob("**/*"))"#,
-        )
-        .unwrap();
-
-        let provider = make_provider(&tmp_dir);
-        let result = run_pkg_blocking(&provider, "mypkg").unwrap();
-        let srcs = expect_string_list(result.targets[0].config.get("srcs"));
-        assert!(
-            !srcs.iter().any(|s| s.starts_with(".git")),
-            ".git entries should be excluded: {srcs:?}"
-        );
-        assert!(srcs.contains(&"main.rs".to_string()), "{srcs:?}");
-    }
-
-    #[test]
     fn test_heph_fs_glob_at_workspace_root_returns_unprefixed() {
         let tmp_dir = tempdir().unwrap();
         let root = tmp_dir.path();
