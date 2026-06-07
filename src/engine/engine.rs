@@ -55,21 +55,15 @@ impl Default for MemCacheOptions {
 ///
 /// [`skip_dirs`]: PluginInit::skip_dirs
 /// [`skip_globs`]: PluginInit::skip_globs
-pub struct PluginInit<'a> {
-    pub root: &'a Path,
+pub struct PluginInit {
+    pub root: PathBuf,
     /// Absolute directories to prune by exact path: the heph home plus the
     /// literal (non-glob) `fs.skip` entries, resolved relative to the repo root.
-    pub skip_dirs: &'a [PathBuf],
+    pub skip_dirs: Vec<PathBuf>,
     /// Workspace-relative `fs.skip` glob patterns (e.g. `**/node_modules/**`),
     /// matched against entry paths.
-    pub skip_globs: &'a [String],
+    pub skip_globs: Vec<String>,
 }
-
-/// Always-on exclude glob: a `.git` directory at any depth is never a build
-/// input (and submodules nest it). Handed to every tree-walking plugin via
-/// [`Engine::skip_globs`], so the fs plugin and the buildfile/go providers all
-/// prune it without each hardcoding the rule.
-const GIT_SKIP_GLOB: &str = "**/.git/**";
 
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
 /// into literal directories vs glob patterns.
@@ -443,10 +437,14 @@ impl Engine {
         });
     }
 
-    /// Builds the owned data backing a [`PluginInit`] (`root`, skip dirs, skip
-    /// globs). Borrow the parts into a `PluginInit` at the call site.
-    fn plugin_init_parts(&self) -> (PathBuf, Vec<PathBuf>, Vec<String>) {
-        (self.cfg.root.clone(), self.skip_dirs(), self.skip_globs())
+    /// The [`PluginInit`] context handed to every plugin constructor (direct
+    /// registration or factory): workspace root + the engine's skip dirs/globs.
+    fn plugin_init_payload(&self) -> PluginInit {
+        PluginInit {
+            root: self.cfg.root.clone(),
+            skip_dirs: self.skip_dirs(),
+            skip_globs: self.skip_globs(),
+        }
     }
 
     /// Registers an already-constructed driver. Shared by [`Self::register_driver`]
@@ -472,12 +470,7 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver>,
     ) -> anyhow::Result<()> {
-        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
-        let managed = factory(&PluginInit {
-            root: &root,
-            skip_dirs: &skip_dirs,
-            skip_globs: &skip_globs,
-        });
+        let managed = factory(&self.plugin_init_payload());
         let driver = self.new_managed_driver(managed);
         self.insert_driver(Box::new(driver))
     }
@@ -486,12 +479,7 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKDriver>,
     ) -> anyhow::Result<()> {
-        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
-        let driver = factory(&PluginInit {
-            root: &root,
-            skip_dirs: &skip_dirs,
-            skip_globs: &skip_globs,
-        });
+        let driver = factory(&self.plugin_init_payload());
         self.insert_driver(driver)
     }
 
@@ -499,12 +487,7 @@ impl Engine {
         &mut self,
         factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider>,
     ) -> anyhow::Result<()> {
-        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
-        let provider = factory(&PluginInit {
-            root: &root,
-            skip_dirs: &skip_dirs,
-            skip_globs: &skip_globs,
-        });
+        let provider = factory(&self.plugin_init_payload());
 
         let provider = Arc::new(Provider {
             name: provider.config(provider::ConfigRequest {})?.name,
@@ -597,10 +580,11 @@ impl Engine {
     }
 
     /// Exclude globs every tree-walking plugin honors: the always-on `.git`
-    /// exclusion plus the glob `fs.skip` entries (e.g. `**/node_modules/**`),
-    /// matched against workspace-relative paths.
+    /// exclusion (a `.git` dir is never a build input, and submodules nest it)
+    /// plus the glob `fs.skip` entries (e.g. `**/node_modules/**`), matched
+    /// against workspace-relative paths.
     pub fn skip_globs(&self) -> Vec<String> {
-        std::iter::once(GIT_SKIP_GLOB.to_string())
+        std::iter::once("**/.git/**".to_string())
             .chain(self.cfg.fs_skip.iter().filter(|e| is_skip_glob(e)).cloned())
             .collect()
     }
@@ -613,12 +597,7 @@ impl Engine {
         providers: &[PluginEntry],
         drivers: &[PluginEntry],
     ) -> anyhow::Result<()> {
-        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
-        let init = PluginInit {
-            root: &root,
-            skip_dirs: &skip_dirs,
-            skip_globs: &skip_globs,
-        };
+        let init = self.plugin_init_payload();
         for entry in providers {
             let factory = self
                 .provider_factories
