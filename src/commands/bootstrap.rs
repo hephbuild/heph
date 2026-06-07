@@ -310,7 +310,11 @@ fs:
             "{:?}",
             e.skip_dirs()
         );
-        assert_eq!(e.skip_globs(), vec!["**/node_modules/**".to_string()]);
+        // `.git` is an always-on engine built-in, ahead of the config globs.
+        assert_eq!(
+            e.skip_globs(),
+            vec!["**/.git/**".to_string(), "**/node_modules/**".to_string()]
+        );
         assert!(e.providers_by_name.contains_key("fs"));
         assert!(e.drivers_by_name.contains_key("fs"));
     }

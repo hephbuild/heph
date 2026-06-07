@@ -213,7 +213,7 @@ impl EProvider for Provider {
 /// to that package. Uses the exact same `wax` walk as the `fs` driver
 /// ([`compile_glob`] + [`walk_glob`]), so BUILD-time expansion matches what the
 /// driver globs at execution time: brace alternation, `.`/`..` normalization, and
-/// the built-in `.git` + engine skip-dir pruning. Result is sorted.
+/// the engine's skip dirs/globs. Result is sorted.
 struct GlobFn {
     skip: Arc<FsSkip>,
 }
@@ -375,24 +375,21 @@ impl ProviderFn for BaseFn {
 
 // ─── Driver ──────────────────────────────────────────────────────────────────
 
-/// Directories the fs walk never descends into. Sources:
-///  - `.git`, pruned by basename at any depth (a VCS dir is never a build input,
-///    and submodules nest it).
-///  - `skip_dirs`: absolute engine-owned paths handed in by the engine (see
+/// Directories the fs walk never descends into. Both sources come from the
+/// engine — pluginfs hardcodes nothing:
+///  - `skip_dirs`: absolute paths (see
 ///    [`Engine::skip_dirs`](crate::engine::Engine::skip_dirs)) — the heph home and
 ///    the literal `fs.skip` dirs. Matched by exact path.
-///  - `skip_globs`: the glob `fs.skip` entries (e.g. `**/node_modules/**`),
-///    matched against the workspace-relative path.
-///
-/// Replaces the former hardcoded `BUILT_IN_*` lists: the engine is now the single
-/// source of truth for which subtrees to skip.
+///  - `skip_globs`: exclude globs (see
+///    [`Engine::skip_globs`](crate::engine::Engine::skip_globs)), matched against
+///    the workspace-relative path.
 #[derive(Debug)]
 pub struct FsSkip {
     /// Absolute directories pruned by exact path during the walk.
     skip_dirs: Vec<std::path::PathBuf>,
-    /// Built-in exclude glob patterns — `**/.git/**`, a root-relative `<rel>/**`
-    /// for each skip dir under the root, and the `fs.skip` glob entries. Chained
-    /// ahead of a target's user excludes when compiling its exclude `Any`.
+    /// Exclude glob patterns: a root-relative `<rel>/**` for each skip dir under
+    /// the root, plus the engine's `skip_globs`. Chained ahead of a target's user
+    /// excludes when compiling its exclude `Any`.
     exclude_globs: Vec<String>,
     /// Compiled [`exclude_globs`](Self::exclude_globs), reused as the `not`
     /// matcher for the common case of a target with no user excludes, and as the
@@ -415,7 +412,7 @@ impl FsSkip {
         skip_dirs: &[std::path::PathBuf],
         skip_globs: &[String],
     ) -> anyhow::Result<Self> {
-        let mut exclude_globs = vec!["**/.git/**".to_string()];
+        let mut exclude_globs = Vec::new();
         for dir in skip_dirs {
             if let Some(rel) = dir.strip_prefix(root).ok().and_then(|r| r.to_str())
                 && !rel.is_empty()
@@ -433,22 +430,22 @@ impl FsSkip {
     }
 
     /// True if the directory at absolute `path` (workspace-relative `rel`) must be
-    /// pruned: a `.git` dir at any depth, an exact skip dir, or a directory whose
-    /// entire subtree is covered by a built-in/`fs.skip` exclude glob (probed by
-    /// testing a sentinel child against the compiled excludes — so
-    /// `**/node_modules/**` prunes `node_modules` instead of walking into it).
+    /// pruned: an exact skip dir, or a directory whose entire subtree is covered
+    /// by an exclude glob (probed by testing a sentinel child against the compiled
+    /// excludes — so a `**/node_modules/**`-style glob prunes the dir instead of
+    /// walking into it).
     fn is_pruned_dir(&self, path: &std::path::Path, rel: &std::path::Path) -> bool {
         use wax::Program as _;
-        path.file_name().and_then(|n| n.to_str()) == Some(".git")
-            || self.skip_dirs.iter().any(|d| d == path)
+        self.skip_dirs.iter().any(|d| d == path)
             || self.builtin_any.is_match(rel.join(PRUNE_PROBE).as_path())
     }
 }
 
 impl Default for FsSkip {
     fn default() -> Self {
-        // Only `.git` is pruned; the `**/.git/**` literal is statically valid.
-        Self::new(std::path::Path::new(""), &[], &[]).expect("built-in .git exclude is valid")
+        // No skip dirs/globs — the engine supplies them via `skip_dirs`/
+        // `skip_globs`. An empty exclude set matches nothing.
+        Self::new(std::path::Path::new(""), &[], &[]).expect("empty fs skip set is valid")
     }
 }
 
@@ -681,9 +678,8 @@ fn walk_glob(
     let walker = walkdir::WalkDir::new(&walk_root)
         .into_iter()
         .filter_entry(|entry| {
-            // Never descend into always-excluded subtrees (.git, the heph home +
-            // literal `fs.skip` dirs, and `fs.skip` glob subtrees like
-            // `**/node_modules/**`).
+            // Never descend into the engine's skip dirs (heph home + literal
+            // `fs.skip` dirs) or skip-glob subtrees (e.g. `**/node_modules/**`).
             if !entry.file_type().is_dir() {
                 return true;
             }
@@ -1110,18 +1106,21 @@ mod tests {
     // ─── Exposed-function (glob) tests ─────────────────────────────────────
 
     fn call_glob(root: &std::path::Path, pkg: &str, pattern: &str) -> Vec<String> {
+        call_glob_with_skip(root, pkg, pattern, Arc::<FsSkip>::default())
+    }
+
+    fn call_glob_with_skip(
+        root: &std::path::Path,
+        pkg: &str,
+        pattern: &str,
+        skip: Arc<FsSkip>,
+    ) -> Vec<String> {
         let ctx = FnCallContext { pkg, root };
         let args = FnArgs {
             positional: vec![Value::String(pattern.to_string())],
             named: Default::default(),
         };
-        let v = futures::executor::block_on(
-            GlobFn {
-                skip: Arc::<FsSkip>::default(),
-            }
-            .call(&ctx, args),
-        )
-        .unwrap();
+        let v = futures::executor::block_on(GlobFn { skip }.call(&ctx, args)).unwrap();
         match v {
             Value::List(l) => l
                 .into_iter()
@@ -1151,16 +1150,18 @@ mod tests {
     }
 
     #[test]
-    fn test_glob_fn_excludes_builtin_dirs() {
+    fn test_glob_fn_excludes_skip_globs() {
         let tmp = tempdir().unwrap();
         let pkg = tmp.path().join("mypkg");
-        let git = pkg.join(".git");
-        fs::create_dir_all(&git).unwrap();
-        fs::write(git.join("HEAD"), "").unwrap();
+        fs::create_dir_all(pkg.join("node_modules/dep")).unwrap();
+        fs::write(pkg.join("node_modules/dep/index.js"), "").unwrap();
         fs::write(pkg.join("main.rs"), "").unwrap();
 
-        let got = call_glob(tmp.path(), "mypkg", "**/*");
-        assert!(!got.iter().any(|s| s.starts_with(".git")), "{got:?}");
+        // The engine's skip globs prune matching subtrees for `heph.fs.glob` too.
+        let skip =
+            Arc::new(FsSkip::new(tmp.path(), &[], &["**/node_modules/**".to_string()]).unwrap());
+        let got = call_glob_with_skip(tmp.path(), "mypkg", "**/*", skip);
+        assert!(!got.iter().any(|s| s.contains("node_modules")), "{got:?}");
         assert!(got.contains(&"main.rs".to_string()), "{got:?}");
     }
 
@@ -1661,42 +1662,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_driver_run_glob_excludes_git() {
-        let driver = Driver::default();
-        let tmp = tempdir().unwrap();
-        let git_dir = tmp.path().join(".git");
-        fs::create_dir_all(&git_dir).unwrap();
-        fs::write(git_dir.join("config"), b"").unwrap();
-        fs::write(tmp.path().join("main.rs"), b"").unwrap();
-
-        let config =
-            std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
-        let parse_res = driver
-            .parse(make_parse_req(config), &ctoken())
-            .await
-            .unwrap();
-
-        let request_id = "test".to_string();
-        let hashin = String::new();
-        let req = make_run_req(
-            &parse_res.target_def,
-            &request_id,
-            tmp.path().to_path_buf(),
-            &hashin,
-        );
-        let res = driver.run(req, &ctoken()).await.unwrap();
-
-        let names: Vec<_> = res.artifacts.iter().map(|a| &a.name).collect();
-        assert!(
-            names.iter().all(|n| !n.contains(".git")),
-            "should exclude .git: {:?}",
-            names
-        );
-        assert_eq!(res.artifacts.len(), 1);
-        assert_eq!(res.artifacts[0].name, "main.rs");
-    }
-
-    #[tokio::test]
     async fn test_driver_run_glob_excludes_engine_skip_dir() {
         let tmp = tempdir().unwrap();
         let home = tmp.path().join(".heph3");
@@ -1705,7 +1670,7 @@ mod tests {
         fs::write(tmp.path().join("main.rs"), b"").unwrap();
 
         // The engine hands the fs plugin its skip dirs (the heph home); the walk
-        // must prune that subtree rather than relying on a hardcoded basename.
+        // must prune that subtree.
         let skip = Arc::new(FsSkip::new(tmp.path(), &[home], &[]).unwrap());
         let driver = Driver::new(skip);
 
