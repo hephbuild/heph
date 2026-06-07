@@ -225,8 +225,8 @@ mod tests {
         e.register_provider_factory("buildfile", |init, opts| {
             Ok(Box::new(pluginbuildfile::Provider::from_options(
                 init.root.to_path_buf(),
-                init.skip_dirs,
-                init.skip_globs,
+                &init.skip_dirs,
+                &init.skip_globs,
                 opts,
             )?))
         })
