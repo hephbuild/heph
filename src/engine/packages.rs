@@ -5,6 +5,7 @@ use crate::hmemoizer::unwrap_arc_err;
 use crate::htmatcher;
 use crate::htpkg::PkgBuf;
 use enclose::enclose;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 /// Walk the matcher and pick the most specific `Package` / `PackagePrefix`
@@ -36,6 +37,10 @@ impl Engine {
         let prefix = narrowing_prefix(m);
 
         let mut all_packages = Vec::new();
+        // Different providers can list the same package; dedup so callers
+        // (e.g. `query`) don't scan a package more than once. First-seen
+        // order is preserved for determinism.
+        let mut seen: FxHashSet<String> = FxHashSet::default();
 
         for provider in &self.providers {
             let req = ListPackagesRequest {
@@ -63,7 +68,11 @@ impl Engine {
                 .await
                 .map_err(unwrap_arc_err)?;
 
-            all_packages.extend((*pkgs).clone());
+            for p in pkgs.iter() {
+                if seen.insert(p.clone()) {
+                    all_packages.push(p.clone());
+                }
+            }
         }
 
         Ok(Box::new(all_packages.into_iter().map(Ok)))
@@ -73,10 +82,108 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Config;
+    use crate::engine::provider::{
+        ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+        ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
+    };
+    use crate::hasync::Cancellable;
     use crate::htmatcher::Matcher;
+    use futures::future::BoxFuture;
 
     fn pkg(s: &str) -> PkgBuf {
         PkgBuf::from(s)
+    }
+
+    // Lists `foo` twice; also used to register two instances under distinct names.
+    struct DupPkgs(&'static str);
+    impl crate::engine::provider::Provider for DupPkgs {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: self.0.to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty())
+                    as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                let items: Vec<anyhow::Result<ListPackageResponse>> = vec![
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from("foo"),
+                    }),
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from("foo"),
+                    }),
+                ];
+                Ok(Box::new(items.into_iter())
+                    as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            let pkg = req.package.clone();
+            Box::pin(async move {
+                Ok(ProbeResponse {
+                    states: vec![crate::engine::provider::State {
+                        package: pkg,
+                        provider: "dp".to_string(),
+                        state: Default::default(),
+                    }],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn packages_dedups_within_and_across_providers() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        // Each provider lists `foo` twice; two providers list it again.
+        engine.register_provider(move |_| Box::new(DupPkgs("p1")))?;
+        engine.register_provider(move |_| Box::new(DupPkgs("p2")))?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let pkgs: Vec<String> = engine
+            .packages(&Matcher::PackagePrefix(pkg("")), &rs)
+            .await?
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        assert_eq!(pkgs, vec!["foo".to_string()]);
+        Ok(())
     }
 
     #[test]

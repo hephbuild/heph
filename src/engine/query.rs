@@ -8,6 +8,7 @@ use crate::htmatcher;
 use crate::htmatcher::MatchResult;
 use crate::htpkg::PkgBuf;
 use futures::Stream;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 impl Engine {
@@ -17,6 +18,9 @@ impl Engine {
         m: &'a htmatcher::Matcher,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         async_stream::try_stream! {
+            // Multiple providers can surface the same addr (or the same package
+            // from `packages()`), so dedup before yielding.
+            let mut seen: FxHashSet<Addr> = FxHashSet::default();
             for pkg_result in self.packages(m, &rs).await? {
                 let pkg = PkgBuf::from(pkg_result?);
 
@@ -41,7 +45,9 @@ impl Engine {
                         }
 
                         match m.matches_addr(&addr) {
-                            MatchResult::MatchYes => yield addr,
+                            MatchResult::MatchYes => {
+                                if seen.insert(addr.clone()) { yield addr; }
+                            }
                             MatchResult::MatchNo => {}
                             MatchResult::MatchShrug => {
                                 let spec = match Arc::clone(&self).get_spec(rs.clone(), &addr).await {
@@ -52,7 +58,9 @@ impl Engine {
                                 }?;
 
                                 match m.matches_spec(&spec) {
-                                    MatchResult::MatchYes => yield addr,
+                                    MatchResult::MatchYes => {
+                                        if seen.insert(addr.clone()) { yield addr; }
+                                    }
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
                                         let def = match Arc::clone(&self).get_def(rs.clone(), &addr).await {
@@ -63,7 +71,9 @@ impl Engine {
                                             Err(e) => Err(e)?,
                                         };
 
-                                        if m.matches(&def.target_def) == MatchResult::MatchYes {
+                                        if m.matches(&def.target_def) == MatchResult::MatchYes
+                                            && seen.insert(addr.clone())
+                                        {
                                             yield addr;
                                         }
                                     }
@@ -110,6 +120,112 @@ mod tests {
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok(Arc::new(engine))
+    }
+
+    #[tokio::test]
+    async fn query_dedups_repeated_addrs() -> anyhow::Result<()> {
+        use crate::engine::provider::{
+            ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+            ListPackagesRequest, ListResponse, ProbeRequest, ProbeResponse,
+        };
+        use crate::hasync::Cancellable;
+        use futures::future::BoxFuture;
+
+        // Provider that surfaces the same addr twice in one package, and the
+        // same package twice from `list_packages`.
+        struct Dup;
+        impl crate::engine::provider::Provider for Dup {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "dup".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                _req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async {
+                    let mk = || {
+                        Ok(ListResponse {
+                            addr: Addr::new(PkgBuf::from("foo"), "a".to_string(), Default::default()),
+                        })
+                    };
+                    let items: Vec<anyhow::Result<ListResponse>> = vec![mk(), mk()];
+                    Ok(Box::new(items.into_iter())
+                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                Box::pin(async {
+                    let items: Vec<anyhow::Result<ListPackageResponse>> = vec![
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from("foo"),
+                        }),
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from("foo"),
+                        }),
+                    ];
+                    Ok(Box::new(items.into_iter())
+                        as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                let pkg = req.package.clone();
+                Box::pin(async move {
+                    Ok(ProbeResponse {
+                        states: vec![crate::engine::provider::State {
+                            package: pkg,
+                            provider: "dup".to_string(),
+                            state: Default::default(),
+                        }],
+                    })
+                })
+            }
+        }
+
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(move |_| Box::new(Dup))?;
+        let engine = Arc::new(engine);
+
+        let rs = engine.new_state();
+        let addrs: Vec<Addr> = engine
+            .query(rs, &Matcher::Package(PkgBuf::from("foo")))
+            .try_collect()
+            .await?;
+
+        assert_eq!(addrs.len(), 1, "duplicate addrs collapsed");
+        assert_eq!(addrs[0].name, "a");
+        Ok(())
     }
 
     #[tokio::test]
