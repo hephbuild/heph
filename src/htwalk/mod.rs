@@ -3,15 +3,16 @@
 //!
 //! The core idea: distinguish *pruning* a directory subtree (stop descending —
 //! cheap, the whole point of an ignore) from merely *excluding* individual
-//! files. A recursive ignore glob — one ending in `/**` or `/**/*` — targets a
-//! whole subtree, so [`Ignore`] derives a directory matcher from its prefix and
-//! prunes the directory itself (`**/node_modules/**` never walks into
-//! `node_modules`). A non-recursive glob (`**/*.tmp`, `foo/*`) only filters
-//! files. No probing or sentinel paths.
+//! files. A glob prunes a directory when it names directories — its final
+//! component is a literal (`foo/**/bar` prunes every `bar` under `foo`), or it
+//! ends in a recursive `/**` / `/**/*` whose prefix names the dir
+//! (`**/node_modules/**` → `**/node_modules`). A glob whose final component is a
+//! wildcard (`some/*.go`) only filters files. No probing or sentinel paths.
 //!
-//! Two ignore sources:
-//!  - `dirs`: absolute directories pruned by exact path (e.g. the heph home).
-//!  - `globs`: workspace-relative wax glob patterns.
+//! Two ignore sources, both workspace-root-relative:
+//!  - `dirs`: absolute directories pruned by exact path (heph home + literal
+//!    `fs.skip` entries resolved against the root).
+//!  - `globs`: wax glob patterns matched against root-relative paths.
 
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
@@ -44,13 +45,16 @@ impl Ignore {
     /// workspace-relative `globs`.
     pub fn new(dirs: &[PathBuf], globs: &[String]) -> anyhow::Result<Self> {
         let file_any = compile_any(globs.iter().map(String::as_str))?;
-        // A directory is pruned when its own path matches a glob (so `vendor` /
-        // `**/vendor` prune the `vendor` dir directly), OR when it matches the
-        // prefix of a recursive glob (so `**/node_modules/**`, which only matches
-        // *files* under node_modules, still prunes the dir via `**/node_modules`).
+        // A directory is pruned when a glob names directories of that path —
+        // i.e. its final component is a literal (`foo/**/bar` prunes every `bar`
+        // dir under `foo`) — OR when it matches the prefix of a recursive glob
+        // (`**/node_modules/**`, which only matches *files* under node_modules,
+        // still prunes the dir via its `**/node_modules` prefix). A glob whose
+        // last component is a wildcard (`some/*.go`) is file-only and never prunes.
         let dir_globs: Vec<&str> = globs
             .iter()
             .map(String::as_str)
+            .filter(|g| names_directory(g))
             .chain(globs.iter().filter_map(|g| prune_prefix(g)))
             .collect();
         let dir_any = compile_any(dir_globs.into_iter())?;
@@ -90,6 +94,17 @@ impl Ignore {
     pub fn file_matcher(&self) -> &Arc<Any<'static>> {
         &self.file_any
     }
+}
+
+/// True if `pattern`'s final path component is a literal (no glob
+/// metacharacter): the pattern names directories of that path, so a matching
+/// directory is pruned (`foo/**/bar`, `internal`). A wildcard final component
+/// (`some/*.go`, `vendor/**`) is not directory-naming.
+fn names_directory(pattern: &str) -> bool {
+    pattern
+        .rsplit('/')
+        .next()
+        .is_some_and(|last| !last.is_empty() && !last.contains(['*', '?', '[', ']', '{', '}']))
 }
 
 /// If `pattern` recursively covers a subtree (ends in `/**` or `/**/*`), returns
@@ -167,6 +182,27 @@ mod tests {
         assert!(!ig.exclude_file(p("a/b/c.rs")));
         // `*.tmp` is not a subtree — directories are still walked.
         assert!(!ig.prune_dir(p("/ws/a"), p("a")));
+    }
+
+    #[test]
+    fn mid_doublestar_with_literal_tail_prunes() {
+        // `foo/**/bar` prunes every `bar` dir under `foo` (final component is a
+        // literal, so it names directories), root-relative.
+        let ig = Ignore::new(&[], &["foo/**/bar".to_string()]).unwrap();
+        assert!(ig.prune_dir(p("/ws/foo/bar"), p("foo/bar")));
+        assert!(ig.prune_dir(p("/ws/foo/x/y/bar"), p("foo/x/y/bar")));
+        assert!(!ig.prune_dir(p("/ws/foo/x"), p("foo/x")));
+        // Not under `foo`.
+        assert!(!ig.prune_dir(p("/ws/bar"), p("bar")));
+    }
+
+    #[test]
+    fn file_glob_with_wildcard_tail_does_not_prune() {
+        // `some/*.go` is a file pattern (wildcard final component): excludes the
+        // matching files, never prunes a directory.
+        let ig = Ignore::new(&[], &["some/*.go".to_string()]).unwrap();
+        assert!(ig.exclude_file(p("some/a.go")));
+        assert!(!ig.prune_dir(p("/ws/some"), p("some")));
     }
 
     #[test]

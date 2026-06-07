@@ -71,6 +71,13 @@ pub(crate) fn is_skip_glob(entry: &str) -> bool {
     entry.contains(['*', '?', '[', ']', '{', '}'])
 }
 
+/// Normalizes a `fs.skip` entry to a root-relative path: a leading `./` (the
+/// "current dir" form, e.g. `./node_modules`) is dropped so it resolves the same
+/// as the bare form.
+pub(crate) fn normalize_skip(entry: &str) -> &str {
+    entry.strip_prefix("./").unwrap_or(entry)
+}
+
 /// Factory args: the [`PluginInit`] context and the plugin's YAML options.
 pub type ProviderFactory =
     Box<dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync>;
@@ -596,18 +603,24 @@ impl Engine {
                 .fs_skip
                 .iter()
                 .filter(|e| !is_skip_glob(e))
-                .map(|rel| self.cfg.root.join(rel)),
+                .map(|rel| self.cfg.root.join(normalize_skip(rel))),
         );
         dirs
     }
 
     /// Exclude globs every tree-walking plugin honors: the always-on `.git`
     /// exclusion (a `.git` dir is never a build input, and submodules nest it)
-    /// plus the glob `fs.skip` entries (e.g. `**/node_modules/**`), matched
-    /// against workspace-relative paths.
+    /// plus the glob `fs.skip` entries (e.g. `**/node_modules/**`). All are
+    /// root-relative.
     pub fn skip_globs(&self) -> Vec<String> {
         std::iter::once("**/.git/**".to_string())
-            .chain(self.cfg.fs_skip.iter().filter(|e| is_skip_glob(e)).cloned())
+            .chain(
+                self.cfg
+                    .fs_skip
+                    .iter()
+                    .filter(|e| is_skip_glob(e))
+                    .map(|e| normalize_skip(e).to_string()),
+            )
             .collect()
     }
 
