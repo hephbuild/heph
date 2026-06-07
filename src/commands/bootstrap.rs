@@ -84,18 +84,6 @@ impl SuppressionHandle {
     }
 }
 
-/// Reads the `skip` option (extra exclude globs) off the `fs` entry in the
-/// `drivers:` config list. Returns an empty list when `fs` is not listed.
-fn fs_driver_skip(drivers: &[config_file::PluginEntry]) -> anyhow::Result<Vec<String>> {
-    match drivers.iter().find(|d| d.name == "fs") {
-        Some(entry) => {
-            config_file::deny_unknown("fs driver", &entry.options, &["skip"])?;
-            Ok(config_file::decode_opt(&entry.options, "fs driver", "skip")?.unwrap_or_default())
-        }
-        None => Ok(vec![]),
-    }
-}
-
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -133,22 +121,19 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
         home_dir: home_dir.clone(),
+        fs_skip: file.fs.map(|f| f.skip).unwrap_or_default(),
         parallelism: None,
         mem_cache,
         fuse,
         lock_backend,
     })?;
 
-    // `fs` is a built-in registered directly, but its `skip` option is read from
-    // the `drivers: [{name: fs, options: {skip: […]}}]` entry like any other
-    // driver. The provider and driver share one `FsSkip` so BUILD-time `glob()`
-    // and the driver's run-time walk prune the same dirs.
-    let fs_skip_globs = fs_driver_skip(&file.drivers)?;
-    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(
-        &root,
-        &e.skip_dirs(),
-        &fs_skip_globs,
-    )?);
+    // `fs` is a built-in, registered directly. It gets the same engine skip
+    // config (home dir + `fs.skip` globs) the engine hands to provider factories,
+    // so its glob walk prunes the same paths. Provider + driver share one
+    // `FsSkip` so BUILD-time `glob()` and the run-time walk agree.
+    let skip = e.skip_config();
+    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(&root, &skip.dirs, &skip.globs)?);
     e.register_provider({
         let fs_skip = fs_skip.clone();
         move |_| Box::new(pluginfs::Provider::new(fs_skip))
@@ -162,17 +147,17 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     )))?;
 
     // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
-    e.register_provider_factory("buildfile", |root, skip_dirs, opts| {
+    e.register_provider_factory("buildfile", |root, skip, opts| {
         Ok(Box::new(pluginbuildfile::Provider::from_options(
             root.to_path_buf(),
-            skip_dirs,
+            skip,
             opts,
         )?))
     })?;
-    e.register_provider_factory("go", |root, skip_dirs, opts| {
+    e.register_provider_factory("go", |root, skip, opts| {
         Ok(Box::new(plugingo::Provider::from_options(
             root.to_path_buf(),
-            skip_dirs,
+            skip,
             opts,
         )?))
     })?;
@@ -270,16 +255,14 @@ mod tests {
         let mut e = engine::Engine::new(engine::Config {
             root,
             home_dir: home_dir.clone(),
+            fs_skip: file.fs.clone().map(|f| f.skip).unwrap_or_default(),
             parallelism: None,
             ..Default::default()
         })?;
 
-        let fs_skip_globs = fs_driver_skip(&file.drivers)?;
-        let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(
-            dir.path(),
-            &e.skip_dirs(),
-            &fs_skip_globs,
-        )?);
+        let skip = e.skip_config();
+        let fs_skip =
+            std::sync::Arc::new(pluginfs::FsSkip::new(dir.path(), &skip.dirs, &skip.globs)?);
         e.register_provider({
             let fs_skip = fs_skip.clone();
             move |_| Box::new(pluginfs::Provider::new(fs_skip))
@@ -292,10 +275,10 @@ mod tests {
             home_dir.join("nix-driver"),
         )))?;
 
-        e.register_provider_factory("buildfile", |root, skip_dirs, opts| {
+        e.register_provider_factory("buildfile", |root, skip, opts| {
             Ok(Box::new(pluginbuildfile::Provider::from_options(
                 root.to_path_buf(),
-                skip_dirs,
+                skip,
                 opts,
             )?))
         })?;
@@ -329,30 +312,17 @@ drivers:
     }
 
     #[test]
-    fn fs_driver_skip_option_applies() {
+    fn fs_skip_config_threads_to_engine() {
         let yaml = r#"
-drivers:
-  - name: fs
-    options:
-      skip: [vendor/**]
+fs:
+  skip: [vendor/**]
 "#;
-        // `fs` listed with options builds the engine (registered directly, dropped
-        // from apply_config) and stays registered as both provider and driver.
+        // The `fs.skip` globs reach the engine's skip config, which is handed to
+        // the fs plugin and every provider factory.
         let (_dir, e) = build_engine_from_yaml(yaml).expect("engine");
+        assert_eq!(e.skip_config().globs, vec!["vendor/**".to_string()]);
         assert!(e.providers_by_name.contains_key("fs"));
         assert!(e.drivers_by_name.contains_key("fs"));
-    }
-
-    #[test]
-    fn fs_driver_unknown_option_errors() {
-        let yaml = r#"
-drivers:
-  - name: fs
-    options:
-      bogus: 1
-"#;
-        let err = build_engine_from_yaml(yaml).err().expect("must error");
-        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

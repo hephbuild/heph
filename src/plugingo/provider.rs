@@ -178,17 +178,21 @@ impl Provider {
 
     pub fn from_options(
         workspace_root: PathBuf,
-        skip_dirs: &[PathBuf],
+        skip: &crate::engine::SkipConfig,
         opts: &crate::engine::config_file::Options,
     ) -> anyhow::Result<Self> {
         crate::engine::config_file::deny_unknown("go provider", opts, &["gotool", "skip"])?;
         let go_bin_addr: String =
             crate::engine::config_file::decode_opt(opts, "go provider", "gotool")?
                 .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
-        let skip_globs: Vec<String> =
+        // Engine-wide `fs.skip` globs are merged ahead of this provider's own
+        // `skip` option so both prune the same workspace-relative paths.
+        let mut skip_globs = skip.globs.clone();
+        let user_skip: Vec<String> =
             crate::engine::config_file::decode_opt(opts, "go provider", "skip")?
                 .unwrap_or_default();
-        let skip = Arc::new(SkipMatcher::new(skip_dirs, &skip_globs)?);
+        skip_globs.extend(user_skip);
+        let skip = Arc::new(SkipMatcher::new(&skip.dirs, &skip_globs)?);
         Self::with_config(workspace_root, Config { go_bin_addr, skip })
     }
 
