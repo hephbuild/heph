@@ -2245,16 +2245,14 @@ mod tests {
     #[test]
     fn provider_functions_lists_exposed_functions() {
         let root = tempdir().unwrap();
-        let mut engine = Engine::new(Config {
+        // `fs` is auto-registered by `Engine::new`.
+        let engine = Engine::new(Config {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
             ..Default::default()
         })
         .unwrap();
-        engine
-            .register_provider(|_| Box::new(crate::pluginfs::Provider::default()))
-            .unwrap();
         let fns = engine.provider_functions();
         assert!(
             fns.contains(&("fs".to_string(), "glob".to_string())),
@@ -2285,8 +2283,10 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_provider(|root| {
-            Box::new(crate::pluginbuildfile::Provider::new(root.to_path_buf()))
+        engine.register_provider(|init| {
+            Box::new(crate::pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+            ))
         })?;
         let engine = SArc::new(engine);
         let rs = engine.new_state();
@@ -2328,9 +2328,11 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_provider(|_| Box::new(crate::pluginfs::Provider::default()))?;
-        engine.register_provider(|root| {
-            Box::new(crate::pluginbuildfile::Provider::new(root.to_path_buf()))
+        // `fs` is auto-registered by `Engine::new`.
+        engine.register_provider(|init| {
+            Box::new(crate::pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+            ))
         })?;
         let engine = SArc::new(engine);
         let rs = engine.new_state();
@@ -2502,7 +2504,7 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok(Arc::new(engine))
@@ -3254,7 +3256,7 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -3778,10 +3780,12 @@ mod tests {
             },
             ..Default::default()
         })?;
-        engine.register_driver(Box::new(BlockingDriver {
-            exec_count,
-            outputs: SArc::new(outputs),
-        }))?;
+        engine.register_driver(|_| {
+            Box::new(BlockingDriver {
+                exec_count,
+                outputs: SArc::new(outputs),
+            })
+        })?;
         let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
         let spec = TargetSpec {
             addr: addr.clone(),
@@ -3973,10 +3977,9 @@ mod tests {
         })?;
         // `bash` driver wraps the `run` string into `bash -u -e -c <script>`,
         // so codegen targets can run real shell. The `@heph/fs` provider+driver
-        // resolves the synthesized introspect-outputs inputs.
-        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_bash()))?;
-        engine.register_provider(|_| Box::new(crate::pluginfs::Provider::default()))?;
-        engine.register_driver(Box::new(crate::pluginfs::Driver::default()))?;
+        // (auto-registered by `Engine::new`) resolves the synthesized
+        // introspect-outputs inputs.
+        engine.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_bash()))?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))

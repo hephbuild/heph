@@ -37,11 +37,16 @@ use std::sync::Arc;
 
 const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
 
+/// Sentinel child filename used to decide whether a `<…>/**`-style skip glob
+/// covers a whole directory subtree (so discovery can prune it).
+const PRUNE_PROBE: &str = "\u{0}heph-prune-probe";
+
 /// Prunes directories during Go package discovery. Two prune sources:
-///  - `dirs`: absolute engine-owned paths (e.g. the heph home) the engine hands
-///    every provider; matched by exact path.
-///  - `globs`: user `skip` wax patterns, matched against the workspace-relative
-///    package path.
+///  - `dirs`: absolute paths the engine hands every provider (the heph home plus
+///    literal `fs.skip` dirs); matched by exact path.
+///  - `globs`: `fs.skip` glob entries plus the provider's own `skip` option,
+///    matched against the workspace-relative package path (and against a sentinel
+///    child, so a `<dir>/**` pattern prunes the whole subtree).
 #[derive(Debug, Default)]
 pub struct SkipMatcher {
     dirs: Vec<PathBuf>,
@@ -75,7 +80,9 @@ impl SkipMatcher {
         if self.dirs.iter().any(|d| d == path) {
             return true;
         }
-        self.globs.as_ref().is_some_and(|any| any.is_match(rel))
+        self.globs
+            .as_ref()
+            .is_some_and(|any| any.is_match(rel) || any.is_match(rel.join(PRUNE_PROBE).as_path()))
     }
 }
 
@@ -179,16 +186,21 @@ impl Provider {
     pub fn from_options(
         workspace_root: PathBuf,
         skip_dirs: &[PathBuf],
+        skip_globs: &[String],
         opts: &crate::engine::config_file::Options,
     ) -> anyhow::Result<Self> {
         crate::engine::config_file::deny_unknown("go provider", opts, &["gotool", "skip"])?;
         let go_bin_addr: String =
             crate::engine::config_file::decode_opt(opts, "go provider", "gotool")?
                 .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
-        let skip_globs: Vec<String> =
+        // Engine-wide `fs.skip` globs are merged ahead of this provider's own
+        // `skip` option so both prune the same workspace-relative paths.
+        let mut globs = skip_globs.to_vec();
+        let user_skip: Vec<String> =
             crate::engine::config_file::decode_opt(opts, "go provider", "skip")?
                 .unwrap_or_default();
-        let skip = Arc::new(SkipMatcher::new(skip_dirs, &skip_globs)?);
+        globs.extend(user_skip);
+        let skip = Arc::new(SkipMatcher::new(skip_dirs, &globs)?);
         Self::with_config(workspace_root, Config { go_bin_addr, skip })
     }
 
@@ -3096,15 +3108,15 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         e.register_provider(|_| Box::new(crate::pluginhostbin::Provider))
             .unwrap();
 
-        e.register_driver(Box::new(crate::pluginhostbin::Driver))
+        e.register_driver(|_| Box::new(crate::pluginhostbin::Driver))
             .unwrap();
 
-        e.register_managed_driver(Box::new(crate::pluginexec::Driver::new_sh()))
+        e.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_sh()))
             .unwrap();
-        e.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))
+        e.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))
             .unwrap();
 
-        e.register_provider(|root| Box::new(Provider::new(root.to_path_buf()).unwrap()))
+        e.register_provider(|init| Box::new(Provider::new(init.root.to_path_buf()).unwrap()))
             .unwrap();
 
         Arc::new(e)

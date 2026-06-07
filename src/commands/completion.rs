@@ -222,10 +222,11 @@ mod tests {
         })
         .expect("engine");
 
-        e.register_provider_factory("buildfile", |root, skip, opts| {
+        e.register_provider_factory("buildfile", |init, opts| {
             Ok(Box::new(pluginbuildfile::Provider::from_options(
-                root.to_path_buf(),
-                skip,
+                init.root.to_path_buf(),
+                init.skip_dirs,
+                init.skip_globs,
                 opts,
             )?))
         })

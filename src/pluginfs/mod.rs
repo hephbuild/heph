@@ -109,16 +109,29 @@ impl EProvider for Provider {
 
     fn list_packages<'a>(
         &'a self,
-        _req: ListPackagesRequest,
+        req: ListPackagesRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<
         'a,
         anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
     > {
         Box::pin(async move {
-            let items: Vec<anyhow::Result<ListPackageResponse>> = vec![Ok(ListPackageResponse {
-                pkg: PkgBuf::from(PKG),
-            })];
+            // `fs` owns exactly one synthetic package (`@heph/fs`). Yield it only
+            // when it falls under the requested prefix, so a narrowed query (e.g.
+            // `//a/b/c:...`) doesn't spuriously surface it.
+            let prefix = req.prefix.as_str();
+            let under_prefix = prefix.is_empty()
+                || prefix == PKG
+                || PKG
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'));
+            let items: Vec<anyhow::Result<ListPackageResponse>> = if under_prefix {
+                vec![Ok(ListPackageResponse {
+                    pkg: PkgBuf::from(PKG),
+                })]
+            } else {
+                vec![]
+            };
             Ok(Box::new(items.into_iter())
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
@@ -362,34 +375,46 @@ impl ProviderFn for BaseFn {
 
 // ─── Driver ──────────────────────────────────────────────────────────────────
 
-/// Directories the fs walk never descends into. Two sources:
+/// Directories the fs walk never descends into. Sources:
 ///  - `.git`, pruned by basename at any depth (a VCS dir is never a build input,
 ///    and submodules nest it).
 ///  - `skip_dirs`: absolute engine-owned paths handed in by the engine (see
-///    [`Engine::skip_dirs`](crate::engine::Engine::skip_dirs)) — the heph home,
-///    holding the cache/sandboxes/locks. Matched by exact path.
+///    [`Engine::skip_dirs`](crate::engine::Engine::skip_dirs)) — the heph home and
+///    the literal `fs.skip` dirs. Matched by exact path.
+///  - `skip_globs`: the glob `fs.skip` entries (e.g. `**/node_modules/**`),
+///    matched against the workspace-relative path.
 ///
 /// Replaces the former hardcoded `BUILT_IN_*` lists: the engine is now the single
-/// source of truth for which engine-owned subtrees to skip.
+/// source of truth for which subtrees to skip.
 #[derive(Debug)]
 pub struct FsSkip {
-    /// Absolute engine-owned directories pruned by exact path during the walk.
+    /// Absolute directories pruned by exact path during the walk.
     skip_dirs: Vec<std::path::PathBuf>,
-    /// Built-in exclude glob patterns — `**/.git/**` plus a root-relative
-    /// `<rel>/**` for each skip dir under the workspace root. Chained ahead of a
-    /// target's user excludes when compiling its exclude `Any`.
+    /// Built-in exclude glob patterns — `**/.git/**`, a root-relative `<rel>/**`
+    /// for each skip dir under the root, and the `fs.skip` glob entries. Chained
+    /// ahead of a target's user excludes when compiling its exclude `Any`.
     exclude_globs: Vec<String>,
     /// Compiled [`exclude_globs`](Self::exclude_globs), reused as the `not`
-    /// matcher for the common case of a target with no user excludes.
+    /// matcher for the common case of a target with no user excludes, and as the
+    /// glob source for walk-time directory pruning.
     builtin_any: Arc<wax::Any<'static>>,
 }
 
+/// Sentinel filename probed under a directory to decide whether a `<…>/**`-style
+/// exclude glob covers the whole subtree (so the walk can prune it). Chosen to be
+/// extremely unlikely to be a real file an exclude pattern targets by name.
+const PRUNE_PROBE: &str = "\u{0}heph-prune-probe";
+
 impl FsSkip {
-    /// Builds the skip set from the engine-provided `skip_dirs` (absolute paths:
-    /// the heph home plus the config file's `fs.skip` dirs). Each skip dir located
-    /// under `root` also contributes a `<rel>/**` exclude glob so the compiled
-    /// `not` matcher agrees with the walk-time pruning.
-    pub fn new(root: &std::path::Path, skip_dirs: &[std::path::PathBuf]) -> anyhow::Result<Self> {
+    /// Builds the skip set from the engine-provided `skip_dirs` (absolute: heph
+    /// home + literal `fs.skip` dirs) and `skip_globs` (glob `fs.skip` entries).
+    /// Each skip dir under `root` also contributes a `<rel>/**` exclude glob so the
+    /// compiled `not` matcher agrees with the walk-time pruning.
+    pub fn new(
+        root: &std::path::Path,
+        skip_dirs: &[std::path::PathBuf],
+        skip_globs: &[String],
+    ) -> anyhow::Result<Self> {
         let mut exclude_globs = vec!["**/.git/**".to_string()];
         for dir in skip_dirs {
             if let Some(rel) = dir.strip_prefix(root).ok().and_then(|r| r.to_str())
@@ -398,6 +423,7 @@ impl FsSkip {
                 exclude_globs.push(format!("{rel}/**"));
             }
         }
+        exclude_globs.extend(skip_globs.iter().cloned());
         let builtin_any = compile_any(&exclude_globs).context("compiling built-in fs excludes")?;
         Ok(Self {
             skip_dirs: skip_dirs.to_vec(),
@@ -406,18 +432,23 @@ impl FsSkip {
         })
     }
 
-    /// True if the directory at absolute `path` must be pruned: a `.git` dir at
-    /// any depth, or one of the engine-owned skip dirs.
-    fn is_pruned_dir(&self, path: &std::path::Path) -> bool {
+    /// True if the directory at absolute `path` (workspace-relative `rel`) must be
+    /// pruned: a `.git` dir at any depth, an exact skip dir, or a directory whose
+    /// entire subtree is covered by a built-in/`fs.skip` exclude glob (probed by
+    /// testing a sentinel child against the compiled excludes — so
+    /// `**/node_modules/**` prunes `node_modules` instead of walking into it).
+    fn is_pruned_dir(&self, path: &std::path::Path, rel: &std::path::Path) -> bool {
+        use wax::Program as _;
         path.file_name().and_then(|n| n.to_str()) == Some(".git")
             || self.skip_dirs.iter().any(|d| d == path)
+            || self.builtin_any.is_match(rel.join(PRUNE_PROBE).as_path())
     }
 }
 
 impl Default for FsSkip {
     fn default() -> Self {
         // Only `.git` is pruned; the `**/.git/**` literal is statically valid.
-        Self::new(std::path::Path::new(""), &[]).expect("built-in .git exclude is valid")
+        Self::new(std::path::Path::new(""), &[], &[]).expect("built-in .git exclude is valid")
     }
 }
 
@@ -650,9 +681,14 @@ fn walk_glob(
     let walker = walkdir::WalkDir::new(&walk_root)
         .into_iter()
         .filter_entry(|entry| {
-            // Never descend into always-excluded subtrees (.git + engine-owned
-            // skip dirs like the heph home).
-            !(entry.file_type().is_dir() && compiled.skip.is_pruned_dir(entry.path()))
+            // Never descend into always-excluded subtrees (.git, the heph home +
+            // literal `fs.skip` dirs, and `fs.skip` glob subtrees like
+            // `**/node_modules/**`).
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            !compiled.skip.is_pruned_dir(entry.path(), rel)
         });
 
     for entry in walker {
@@ -1250,6 +1286,30 @@ mod tests {
         );
     }
 
+    async fn list_pkgs(prefix: &str) -> Vec<String> {
+        let p = Provider::default();
+        let it = p
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(prefix),
+                },
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        it.map(|r| r.unwrap().pkg.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_list_packages_honors_prefix() {
+        // Yielded only when `@heph/fs` falls under the requested prefix.
+        assert_eq!(list_pkgs("").await, vec![PKG.to_string()]);
+        assert_eq!(list_pkgs("@heph").await, vec![PKG.to_string()]);
+        assert_eq!(list_pkgs(PKG).await, vec![PKG.to_string()]);
+        assert!(list_pkgs("a/b/c").await.is_empty());
+        assert!(list_pkgs("@hep").await.is_empty());
+    }
+
     // ─── Driver tests ──────────────────────────────────────────────────────
 
     fn make_parse_req(config: std::collections::HashMap<String, Value>) -> ParseRequest {
@@ -1646,7 +1706,7 @@ mod tests {
 
         // The engine hands the fs plugin its skip dirs (the heph home); the walk
         // must prune that subtree rather than relying on a hardcoded basename.
-        let skip = Arc::new(FsSkip::new(tmp.path(), &[home]).unwrap());
+        let skip = Arc::new(FsSkip::new(tmp.path(), &[home], &[]).unwrap());
         let driver = Driver::new(skip);
 
         let config =
@@ -1683,7 +1743,7 @@ mod tests {
 
         // A `fs.skip` dir from the config file (resolved to an absolute path) is
         // pruned just like the engine home.
-        let skip = Arc::new(FsSkip::new(tmp.path(), &[tmp.path().join("vendor")]).unwrap());
+        let skip = Arc::new(FsSkip::new(tmp.path(), &[tmp.path().join("vendor")], &[]).unwrap());
         let driver = Driver::new(skip);
 
         let config =
@@ -1708,6 +1768,44 @@ mod tests {
             names,
             vec!["main.rs"],
             "config skip dir must be pruned: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_excludes_config_skip_glob() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg/node_modules/dep")).unwrap();
+        fs::write(tmp.path().join("pkg/node_modules/dep/index.js"), b"").unwrap();
+        fs::write(tmp.path().join("pkg/main.rs"), b"").unwrap();
+
+        // A `fs.skip` glob (`**/node_modules/**`) excludes the whole subtree at
+        // any depth — and prunes the dir so the walk never descends into it.
+        let skip =
+            Arc::new(FsSkip::new(tmp.path(), &[], &["**/node_modules/**".to_string()]).unwrap());
+        let driver = Driver::new(skip);
+
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["pkg_main.rs"],
+            "config skip glob must exclude node_modules subtree: {names:?}"
         );
     }
 

@@ -8,8 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::config_file;
 use crate::{
-    engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin, pluginnix,
-    plugintextfile,
+    engine, pluginbuildfile, pluginexec, plugingo, pluginhostbin, pluginnix, plugintextfile,
 };
 
 /// Builds the multi-thread runtime used by every command entry point.
@@ -128,57 +127,49 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         lock_backend,
     })?;
 
-    // `fs` is a built-in, registered directly. It gets the same skip dirs (home +
-    // `fs.skip` dirs) the engine hands to provider factories, so its glob walk
-    // prunes the same dirs. Provider + driver share one `FsSkip` so BUILD-time
-    // `glob()` and the run-time walk agree.
-    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(&root, &e.skip_dirs())?);
-    e.register_provider({
-        let fs_skip = fs_skip.clone();
-        move |_| Box::new(pluginfs::Provider::new(fs_skip))
-    })?;
-    e.register_driver(Box::new(pluginfs::Driver::new(fs_skip)))?;
+    // `fs` (provider + driver) is registered by `Engine::new` itself, with the
+    // engine's own skip dirs. The remaining built-ins have no config.
     e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
-    e.register_driver(Box::new(pluginhostbin::Driver))?;
-    e.register_driver(Box::new(plugintextfile::Driver))?;
-    e.register_managed_driver(Box::new(pluginnix::Driver::new(
-        home_dir.join("nix-driver"),
-    )))?;
+    e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
+    e.register_driver(|_| Box::new(plugintextfile::Driver))?;
+    e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
     // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
-    e.register_provider_factory("buildfile", |root, skip, opts| {
+    e.register_provider_factory("buildfile", |init, opts| {
         Ok(Box::new(pluginbuildfile::Provider::from_options(
-            root.to_path_buf(),
-            skip,
+            init.root.to_path_buf(),
+            init.skip_dirs,
+            init.skip_globs,
             opts,
         )?))
     })?;
-    e.register_provider_factory("go", |root, skip, opts| {
+    e.register_provider_factory("go", |init, opts| {
         Ok(Box::new(plugingo::Provider::from_options(
-            root.to_path_buf(),
-            skip,
+            init.root.to_path_buf(),
+            init.skip_dirs,
+            init.skip_globs,
             opts,
         )?))
     })?;
 
-    e.register_managed_driver_factory("exec", |opts| {
+    e.register_managed_driver_factory("exec", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
     })?;
-    e.register_managed_driver_factory("bash", |opts| {
+    e.register_managed_driver_factory("bash", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
     })?;
-    e.register_managed_driver_factory("sh", |opts| {
+    e.register_managed_driver_factory("sh", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
     })?;
-    e.register_managed_driver_factory("go_golist", |opts| {
+    e.register_managed_driver_factory("go_golist", |_init, opts| {
         config_file::deny_unknown("go_golist driver", opts, &[])?;
         Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
     })?;
-    e.register_managed_driver_factory("go_embed", |opts| {
+    e.register_managed_driver_factory("go_embed", |_init, opts| {
         config_file::deny_unknown("go_embed driver", opts, &[])?;
         Ok(Box::new(plugingo::GoEmbedDriver))
     })?;
-    e.register_managed_driver_factory("go_testmain", |opts| {
+    e.register_managed_driver_factory("go_testmain", |_init, opts| {
         config_file::deny_unknown("go_testmain driver", opts, &[])?;
         Ok(Box::new(plugingo::GoTestmainDriver))
     })?;
@@ -259,30 +250,26 @@ mod tests {
             ..Default::default()
         })?;
 
-        let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(dir.path(), &e.skip_dirs())?);
-        e.register_provider({
-            let fs_skip = fs_skip.clone();
-            move |_| Box::new(pluginfs::Provider::new(fs_skip))
-        })?;
-        e.register_driver(Box::new(pluginfs::Driver::new(fs_skip)))?;
+        // `fs` is auto-registered by `Engine::new`.
         e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
-        e.register_driver(Box::new(pluginhostbin::Driver))?;
-        e.register_driver(Box::new(plugintextfile::Driver))?;
-        e.register_managed_driver(Box::new(pluginnix::Driver::new(
-            home_dir.join("nix-driver"),
-        )))?;
+        e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
+        e.register_driver(|_| Box::new(plugintextfile::Driver))?;
+        e.register_managed_driver(|_| {
+            Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
+        })?;
 
-        e.register_provider_factory("buildfile", |root, skip, opts| {
+        e.register_provider_factory("buildfile", |init, opts| {
             Ok(Box::new(pluginbuildfile::Provider::from_options(
-                root.to_path_buf(),
-                skip,
+                init.root.to_path_buf(),
+                init.skip_dirs,
+                init.skip_globs,
                 opts,
             )?))
         })?;
-        e.register_managed_driver_factory("exec", |opts| {
+        e.register_managed_driver_factory("exec", |_init, opts| {
             Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
         })?;
-        e.register_managed_driver_factory("bash", |opts| {
+        e.register_managed_driver_factory("bash", |_init, opts| {
             Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
         })?;
 
@@ -309,19 +296,21 @@ drivers:
     }
 
     #[test]
-    fn fs_skip_dirs_resolved_relative_to_root() {
+    fn fs_skip_splits_dirs_and_globs() {
         let yaml = r#"
 fs:
-  skip: [vendor]
+  skip: [vendor, "**/node_modules/**"]
 "#;
-        // The `fs.skip` dir is resolved against the repo root and shows up in the
-        // engine skip dirs handed to the fs plugin and every provider factory.
+        // Literal entries resolve to absolute skip dirs (relative to the repo
+        // root); glob entries become skip globs. Both are handed to the fs plugin
+        // and every provider factory.
         let (dir, e) = build_engine_from_yaml(yaml).expect("engine");
         assert!(
             e.skip_dirs().contains(&dir.path().join("vendor")),
             "{:?}",
             e.skip_dirs()
         );
+        assert_eq!(e.skip_globs(), vec!["**/node_modules/**".to_string()]);
         assert!(e.providers_by_name.contains_key("fs"));
         assert!(e.drivers_by_name.contains_key("fs"));
     }

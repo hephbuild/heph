@@ -26,7 +26,7 @@ impl Workspace {
         let p = parallelism.into();
         let builder = WorkspaceBuilder::new()
             .expect("workspace tempdir")
-            .with_provider(|root| Box::new(pluginbuildfile::Provider::new(root.to_path_buf())))
+            .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
             .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
             .with_managed_driver(Box::new(pluginexec::Driver::new_bash()));
         let builder = if let Some(p) = p {
@@ -40,7 +40,7 @@ impl Workspace {
     pub fn with_static(targets: Vec<pluginstatictarget::Target>) -> Result<Self> {
         let provider = pluginstatictarget::Provider::new(targets)?;
         let ws = WorkspaceBuilder::new()?
-            .with_provider(move |_root| Box::new(provider))
+            .with_provider(move |_| Box::new(provider))
             .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
             .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
             .build()?;

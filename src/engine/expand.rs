@@ -406,12 +406,10 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        // group driver is registered by Engine::new; only the exec driver
-        // needs adding here. The fs provider/driver resolves the synthesized
-        // `@heph/fs` inputs produced by introspect-outputs expansion.
-        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
-        engine.register_provider(|_| Box::new(crate::pluginfs::Provider::default()))?;
-        engine.register_driver(Box::new(crate::pluginfs::Driver::default()))?;
+        // group + fs are registered by Engine::new; only the exec driver needs
+        // adding here. The fs provider/driver resolves the synthesized `@heph/fs`
+        // inputs produced by introspect-outputs expansion.
+        engine.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))?;
         engine.register_provider(move |_| Box::new(CannedProvider { specs }))?;
         Ok((Arc::new(engine), root))
     }

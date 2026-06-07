@@ -2,7 +2,9 @@ use anyhow::Context as _;
 use heph::engine::driver::Driver as SDKDriver;
 use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use heph::engine::provider::Provider as SDKProvider;
-use heph::engine::{Config, EResult, Engine, EngineTargetSpec, OutputMatcher, ResultOptions};
+use heph::engine::{
+    Config, EResult, Engine, EngineTargetSpec, OutputMatcher, PluginInit, ResultOptions,
+};
 use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,7 +42,7 @@ impl WorkspaceBuilder {
 
     pub fn with_provider(
         mut self,
-        factory: impl FnOnce(&Path) -> Box<dyn SDKProvider> + 'static,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider> + 'static,
     ) -> Self {
         self.setups
             .push(Box::new(move |e: &mut Engine| e.register_provider(factory)));
@@ -49,30 +51,14 @@ impl WorkspaceBuilder {
 
     pub fn with_managed_driver(mut self, driver: Box<dyn SDKManagedDriver>) -> Self {
         self.setups.push(Box::new(move |e: &mut Engine| {
-            e.register_managed_driver(driver)
+            e.register_managed_driver(|_| driver)
         }));
         self
     }
 
     pub fn with_driver(mut self, driver: Box<dyn SDKDriver>) -> Self {
-        self.setups
-            .push(Box::new(move |e: &mut Engine| e.register_driver(driver)));
-        self
-    }
-
-    /// Registers the built-in `fs` provider + driver, wired with the engine's own
-    /// skip dirs (the heph home) — mirroring how the real bootstrap registers
-    /// them. Prefer this over registering `pluginfs` manually so glob walks prune
-    /// the engine-owned subtrees.
-    pub fn with_fs(mut self) -> Self {
-        let root = self.dir.path().to_path_buf();
         self.setups.push(Box::new(move |e: &mut Engine| {
-            let skip = Arc::new(heph::pluginfs::FsSkip::new(&root, &e.skip_dirs())?);
-            e.register_provider({
-                let skip = skip.clone();
-                move |_| Box::new(heph::pluginfs::Provider::new(skip))
-            })?;
-            e.register_driver(Box::new(heph::pluginfs::Driver::new(skip)))
+            e.register_driver(|_| driver)
         }));
         self
     }

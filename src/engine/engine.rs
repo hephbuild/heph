@@ -47,15 +47,38 @@ impl Default for MemCacheOptions {
     }
 }
 
-/// Factory args: workspace root, the absolute directories every walk must prune
-/// (see [`Engine::skip_dirs`]), and the provider's YAML options.
-pub type ProviderFactory = Box<
-    dyn FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync,
->;
+/// Context the engine injects when constructing any plugin (provider, driver, or
+/// managed driver — whether registered directly or through a factory): the
+/// workspace root plus the filesystem-skip config every tree walk must honor.
+/// `fs.skip` entries are split by the engine into literal directories ([`skip_dirs`])
+/// and glob patterns ([`skip_globs`]).
+///
+/// [`skip_dirs`]: PluginInit::skip_dirs
+/// [`skip_globs`]: PluginInit::skip_globs
+pub struct PluginInit<'a> {
+    pub root: &'a Path,
+    /// Absolute directories to prune by exact path: the heph home plus the
+    /// literal (non-glob) `fs.skip` entries, resolved relative to the repo root.
+    pub skip_dirs: &'a [PathBuf],
+    /// Workspace-relative `fs.skip` glob patterns (e.g. `**/node_modules/**`),
+    /// matched against entry paths.
+    pub skip_globs: &'a [String],
+}
+
+/// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
+/// into literal directories vs glob patterns.
+pub(crate) fn is_skip_glob(entry: &str) -> bool {
+    entry.contains(['*', '?', '[', ']', '{', '}'])
+}
+
+/// Factory args: the [`PluginInit`] context and the plugin's YAML options.
+pub type ProviderFactory =
+    Box<dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync>;
 pub type DriverFactory =
-    Box<dyn FnOnce(&Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync>;
-pub type ManagedDriverFactory =
-    Box<dyn FnOnce(&Options) -> anyhow::Result<Box<dyn SDKManagedDriver>> + Send + Sync>;
+    Box<dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync>;
+pub type ManagedDriverFactory = Box<
+    dyn FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKManagedDriver>> + Send + Sync,
+>;
 
 pub struct Engine {
     pub(crate) cfg: Config,
@@ -339,8 +362,25 @@ impl Engine {
             result_lock,
             provider_functions_wired: std::sync::Once::new(),
         };
-        engine.register_driver(Box::new(crate::plugingroup::Driver))?;
+        engine.register_driver(|_| Box::new(crate::plugingroup::Driver))?;
         engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;
+
+        // The `fs` provider + driver are always-on built-ins. The engine owns
+        // their skip set (home + `fs.skip` dirs/globs) and builds it once from the
+        // same data it hands every plugin via `PluginInit`, so every fs glob walk
+        // prunes the same paths. Provider + driver share one `FsSkip` so BUILD-time
+        // `glob()` and the run-time walk agree.
+        let fs_skip = Arc::new(crate::pluginfs::FsSkip::new(
+            &root,
+            &engine.skip_dirs(),
+            &engine.skip_globs(),
+        )?);
+        engine.register_provider({
+            let fs_skip = fs_skip.clone();
+            move |_| Box::new(crate::pluginfs::Provider::new(fs_skip))
+        })?;
+        engine.register_driver(move |_| Box::new(crate::pluginfs::Driver::new(fs_skip)))?;
+
         Ok(engine)
     }
 
@@ -398,15 +438,15 @@ impl Engine {
         });
     }
 
-    pub fn register_managed_driver(
-        &mut self,
-        driver: Box<dyn SDKManagedDriver>,
-    ) -> anyhow::Result<()> {
-        let driver = self.new_managed_driver(driver);
-        self.register_driver(Box::new(driver))
+    /// Builds the owned data backing a [`PluginInit`] (`root`, skip dirs, skip
+    /// globs). Borrow the parts into a `PluginInit` at the call site.
+    fn plugin_init_parts(&self) -> (PathBuf, Vec<PathBuf>, Vec<String>) {
+        (self.cfg.root.clone(), self.skip_dirs(), self.skip_globs())
     }
 
-    pub fn register_driver(&mut self, driver: Box<dyn SDKDriver>) -> anyhow::Result<()> {
+    /// Registers an already-constructed driver. Shared by [`Self::register_driver`]
+    /// and [`Self::register_managed_driver`].
+    fn insert_driver(&mut self, driver: Box<dyn SDKDriver>) -> anyhow::Result<()> {
         let driver = Arc::new(Driver {
             name: driver.config(driver::ConfigRequest {})?.name,
             driver,
@@ -423,11 +463,43 @@ impl Engine {
         Ok(())
     }
 
+    pub fn register_managed_driver(
+        &mut self,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKManagedDriver>,
+    ) -> anyhow::Result<()> {
+        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
+        let managed = factory(&PluginInit {
+            root: &root,
+            skip_dirs: &skip_dirs,
+            skip_globs: &skip_globs,
+        });
+        let driver = self.new_managed_driver(managed);
+        self.insert_driver(Box::new(driver))
+    }
+
+    pub fn register_driver(
+        &mut self,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKDriver>,
+    ) -> anyhow::Result<()> {
+        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
+        let driver = factory(&PluginInit {
+            root: &root,
+            skip_dirs: &skip_dirs,
+            skip_globs: &skip_globs,
+        });
+        self.insert_driver(driver)
+    }
+
     pub fn register_provider(
         &mut self,
-        provider_factory: impl FnOnce(&Path) -> Box<dyn SDKProvider>,
+        factory: impl FnOnce(&PluginInit) -> Box<dyn SDKProvider>,
     ) -> anyhow::Result<()> {
-        let provider = provider_factory(self.cfg.root.as_path());
+        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
+        let provider = factory(&PluginInit {
+            root: &root,
+            skip_dirs: &skip_dirs,
+            skip_globs: &skip_globs,
+        });
 
         let provider = Arc::new(Provider {
             name: provider.config(provider::ConfigRequest {})?.name,
@@ -449,7 +521,7 @@ impl Engine {
     pub fn register_provider_factory(
         &mut self,
         name: &str,
-        factory: impl FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>>
+        factory: impl FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKProvider>>
         + Send
         + Sync
         + 'static,
@@ -467,7 +539,10 @@ impl Engine {
     pub fn register_driver_factory(
         &mut self,
         name: &str,
-        factory: impl FnOnce(&Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync + 'static,
+        factory: impl FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKDriver>>
+        + Send
+        + Sync
+        + 'static,
     ) -> anyhow::Result<()> {
         if self.driver_factories.contains_key(name)
             || self.managed_driver_factories.contains_key(name)
@@ -484,7 +559,7 @@ impl Engine {
     pub fn register_managed_driver_factory(
         &mut self,
         name: &str,
-        factory: impl FnOnce(&Options) -> anyhow::Result<Box<dyn SDKManagedDriver>>
+        factory: impl FnOnce(&PluginInit, &Options) -> anyhow::Result<Box<dyn SDKManagedDriver>>
         + Send
         + Sync
         + 'static,
@@ -501,14 +576,30 @@ impl Engine {
         Ok(())
     }
 
-    /// Absolute directories every plugin that walks the tree must prune: the
-    /// engine-owned home (cache/sandboxes/locks — never packages) plus the config
-    /// file's `fs.skip` dirs, resolved relative to the repo root.
+    /// Absolute directories every plugin that walks the tree must prune by exact
+    /// path: the engine-owned home (cache/sandboxes/locks — never packages) plus
+    /// the literal (non-glob) `fs.skip` entries, resolved relative to the root.
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = Vec::with_capacity(1 + self.cfg.fs_skip.len());
-        dirs.push(self.home.clone());
-        dirs.extend(self.cfg.fs_skip.iter().map(|rel| self.cfg.root.join(rel)));
+        let mut dirs = vec![self.home.clone()];
+        dirs.extend(
+            self.cfg
+                .fs_skip
+                .iter()
+                .filter(|e| !is_skip_glob(e))
+                .map(|rel| self.cfg.root.join(rel)),
+        );
         dirs
+    }
+
+    /// The glob `fs.skip` entries (e.g. `**/node_modules/**`), matched against
+    /// workspace-relative paths by every tree-walking plugin.
+    pub fn skip_globs(&self) -> Vec<String> {
+        self.cfg
+            .fs_skip
+            .iter()
+            .filter(|e| is_skip_glob(e))
+            .cloned()
+            .collect()
     }
 
     /// Instantiates every provider/driver listed in the entries by looking up the
@@ -519,14 +610,18 @@ impl Engine {
         providers: &[PluginEntry],
         drivers: &[PluginEntry],
     ) -> anyhow::Result<()> {
-        let root = self.cfg.root.clone();
-        let skip_dirs = self.skip_dirs();
+        let (root, skip_dirs, skip_globs) = self.plugin_init_parts();
+        let init = PluginInit {
+            root: &root,
+            skip_dirs: &skip_dirs,
+            skip_globs: &skip_globs,
+        };
         for entry in providers {
             let factory = self
                 .provider_factories
                 .remove(&entry.name)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", entry.name))?;
-            let provider = factory(&root, &skip_dirs, &entry.options)?;
+            let provider = factory(&init, &entry.options)?;
             let resolved_name = provider.config(provider::ConfigRequest {})?.name;
             if resolved_name != entry.name {
                 return Err(anyhow::anyhow!(
@@ -539,7 +634,7 @@ impl Engine {
         }
         for entry in drivers {
             if let Some(factory) = self.driver_factories.remove(&entry.name) {
-                let driver = factory(&entry.options)?;
+                let driver = factory(&init, &entry.options)?;
                 let resolved_name = driver.config(driver::ConfigRequest {})?.name;
                 if resolved_name != entry.name {
                     return Err(anyhow::anyhow!(
@@ -548,10 +643,11 @@ impl Engine {
                         resolved_name
                     ));
                 }
-                self.register_driver(driver)?;
+                self.insert_driver(driver)?;
             } else if let Some(factory) = self.managed_driver_factories.remove(&entry.name) {
-                let driver = factory(&entry.options)?;
-                self.register_managed_driver(driver)?;
+                let managed = factory(&init, &entry.options)?;
+                let driver = self.new_managed_driver(managed);
+                self.insert_driver(Box::new(driver))?;
             } else {
                 return Err(anyhow::anyhow!("unknown driver '{}'", entry.name));
             }
