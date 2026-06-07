@@ -4,7 +4,7 @@ description: >
   Profile the heph binary with samply and produce performance recommendations.
   Builds the profiling target, runs samply twice (first run is warmup, second is the captured profile),
   analyzes the resulting profile.json.gz + profile.json.syms.json (plus /tmp/cpu.prof if present),
-  and writes findings + suggestions to PERFORMANCE.md at the repo root.
+  and writes findings + suggestions to ai-docs/PERFORMANCE.md.
   Trigger when user says "perf test", "profile heph", "run a perf run", "performance test", or invokes /perf-test.
 ---
 
@@ -63,7 +63,7 @@ Goal: measure heph hot paths, surface concrete bottlenecks, propose actionable f
 
    Cross-reference frame indices to function names via the syms file.
 
-5. **Write `PERFORMANCE.md`** at repo root. Refresh findings, but **preserve prior justification notes** (entries explaining why a given optimization cannot or should not be done). Drop a preserved note only when the underlying finding no longer shows up in the new profile. When in doubt, keep the note and re-anchor it to the current finding. Structure:
+5. **Write `ai-docs/PERFORMANCE.md`**. Refresh findings, but **preserve prior justification notes** (entries explaining why a given optimization cannot or should not be done). Drop a preserved note only when the underlying finding no longer shows up in the new profile. When in doubt, keep the note and re-anchor it to the current finding. Structure:
 
    ```markdown
    # Performance Report
@@ -109,4 +109,4 @@ Goal: measure heph hot paths, surface concrete bottlenecks, propose actionable f
 - Do not commit `PERFORMANCE.md` automatically. Surface it for the user to review.
 - If `build-profile` fails, stop and surface the build error — do not fall back to debug binary.
 - If samply is unavailable (non-Darwin host), tell user and stop. devenv only ships samply on macOS.
-- Keep `PERFORMANCE.md` focused on the latest run, **but never delete won't-fix / justification notes** unless the underlying finding is gone from the new profile. Before overwriting, read existing `PERFORMANCE.md` and carry forward the "Won't-fix / constraints" section.
+- Keep `ai-docs/PERFORMANCE.md` focused on the latest run, **but never delete won't-fix / justification notes** unless the underlying finding is gone from the new profile. Before overwriting, read existing `ai-docs/PERFORMANCE.md` and carry forward the "Won't-fix / constraints" section.
