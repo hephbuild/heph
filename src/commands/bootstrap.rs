@@ -128,12 +128,11 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         lock_backend,
     })?;
 
-    // `fs` is a built-in, registered directly. It gets the same engine skip
-    // config (home dir + `fs.skip` globs) the engine hands to provider factories,
-    // so its glob walk prunes the same paths. Provider + driver share one
-    // `FsSkip` so BUILD-time `glob()` and the run-time walk agree.
-    let skip = e.skip_config();
-    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(&root, &skip.dirs, &skip.globs)?);
+    // `fs` is a built-in, registered directly. It gets the same skip dirs (home +
+    // `fs.skip` dirs) the engine hands to provider factories, so its glob walk
+    // prunes the same dirs. Provider + driver share one `FsSkip` so BUILD-time
+    // `glob()` and the run-time walk agree.
+    let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(&root, &e.skip_dirs())?);
     e.register_provider({
         let fs_skip = fs_skip.clone();
         move |_| Box::new(pluginfs::Provider::new(fs_skip))
@@ -260,9 +259,7 @@ mod tests {
             ..Default::default()
         })?;
 
-        let skip = e.skip_config();
-        let fs_skip =
-            std::sync::Arc::new(pluginfs::FsSkip::new(dir.path(), &skip.dirs, &skip.globs)?);
+        let fs_skip = std::sync::Arc::new(pluginfs::FsSkip::new(dir.path(), &e.skip_dirs())?);
         e.register_provider({
             let fs_skip = fs_skip.clone();
             move |_| Box::new(pluginfs::Provider::new(fs_skip))
@@ -312,15 +309,19 @@ drivers:
     }
 
     #[test]
-    fn fs_skip_config_threads_to_engine() {
+    fn fs_skip_dirs_resolved_relative_to_root() {
         let yaml = r#"
 fs:
-  skip: [vendor/**]
+  skip: [vendor]
 "#;
-        // The `fs.skip` globs reach the engine's skip config, which is handed to
-        // the fs plugin and every provider factory.
-        let (_dir, e) = build_engine_from_yaml(yaml).expect("engine");
-        assert_eq!(e.skip_config().globs, vec!["vendor/**".to_string()]);
+        // The `fs.skip` dir is resolved against the repo root and shows up in the
+        // engine skip dirs handed to the fs plugin and every provider factory.
+        let (dir, e) = build_engine_from_yaml(yaml).expect("engine");
+        assert!(
+            e.skip_dirs().contains(&dir.path().join("vendor")),
+            "{:?}",
+            e.skip_dirs()
+        );
         assert!(e.providers_by_name.contains_key("fs"));
         assert!(e.drivers_by_name.contains_key("fs"));
     }

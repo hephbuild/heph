@@ -126,7 +126,7 @@ impl Provider {
 
     pub fn from_options(
         root: std::path::PathBuf,
-        skip: &crate::engine::SkipConfig,
+        skip_dirs: &[std::path::PathBuf],
         opts: &crate::engine::config_file::Options,
     ) -> anyhow::Result<Self> {
         crate::engine::config_file::deny_unknown(
@@ -143,14 +143,10 @@ impl Provider {
                 glob::Pattern::new(&p).with_context(|| format!("invalid buildfile pattern `{p}`"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        // Engine-wide `fs.skip` globs are merged ahead of this provider's own
-        // `skip` option so both prune the same workspace-relative paths.
-        let mut skip_globs = skip.globs.clone();
-        let user_skip: Vec<String> =
+        let skip_globs: Vec<String> =
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "skip")?
                 .unwrap_or_default();
-        skip_globs.extend(user_skip);
-        let skip = SkipMatcher::new(&skip.dirs, &skip_globs)?;
+        let skip = SkipMatcher::new(skip_dirs, &skip_globs)?;
         let default_driver: Option<String> =
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "defaultDriver")?;
         Ok(Self {
@@ -368,12 +364,8 @@ mod tests {
     #[test]
     fn from_options_defaults_to_build() {
         let dir = tempdir().expect("tempdir");
-        let p = Provider::from_options(
-            dir.path().to_path_buf(),
-            &crate::engine::SkipConfig::default(),
-            &Options::new(),
-        )
-        .expect("from_options");
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &Options::new())
+            .expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
         assert_eq!(names, vec!["BUILD"]);
     }
@@ -386,12 +378,7 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::from_str("[BUILD2, \"*.BUILD2\"]").expect("yaml"),
         );
-        let p = Provider::from_options(
-            dir.path().to_path_buf(),
-            &crate::engine::SkipConfig::default(),
-            &opts,
-        )
-        .expect("from_options");
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &opts).expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
         assert_eq!(names, vec!["BUILD2", "*.BUILD2"]);
     }
@@ -404,13 +391,9 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::from_str("[\"[bad\"]").expect("yaml"),
         );
-        let err = Provider::from_options(
-            dir.path().to_path_buf(),
-            &crate::engine::SkipConfig::default(),
-            &opts,
-        )
-        .err()
-        .expect("must error");
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &opts)
+            .err()
+            .expect("must error");
         assert!(err.to_string().contains("[bad"), "{err}");
     }
 
@@ -419,13 +402,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut opts = Options::new();
         opts.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
-        let err = Provider::from_options(
-            dir.path().to_path_buf(),
-            &crate::engine::SkipConfig::default(),
-            &opts,
-        )
-        .err()
-        .expect("must error");
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &opts)
+            .err()
+            .expect("must error");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
@@ -437,13 +416,9 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::Value::String("not a list".to_string()),
         );
-        let err = Provider::from_options(
-            dir.path().to_path_buf(),
-            &crate::engine::SkipConfig::default(),
-            &opts,
-        )
-        .err()
-        .expect("must error");
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &opts)
+            .err()
+            .expect("must error");
         assert!(err.to_string().contains("patterns"), "{err}");
     }
 
@@ -482,24 +457,15 @@ mod tests {
             "defaultDriver".to_string(),
             serde_yaml::Value::String("exec".to_string()),
         );
-        let p = Provider::from_options(
-            dir.path().to_path_buf(),
-            &crate::engine::SkipConfig::default(),
-            &opts,
-        )
-        .expect("from_options");
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &opts).expect("from_options");
         assert_eq!(p.default_driver.as_deref(), Some("exec"));
     }
 
     #[test]
     fn from_options_default_driver_absent_is_none() {
         let dir = tempdir().expect("tempdir");
-        let p = Provider::from_options(
-            dir.path().to_path_buf(),
-            &crate::engine::SkipConfig::default(),
-            &Options::new(),
-        )
-        .expect("from_options");
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &Options::new())
+            .expect("from_options");
         assert!(p.default_driver.is_none());
     }
 
@@ -588,11 +554,8 @@ mod tests {
             "skip".to_string(),
             serde_yaml::from_str("[vendor]").expect("yaml"),
         );
-        let skip = crate::engine::SkipConfig {
-            dirs: vec![heph.clone()],
-            globs: vec![],
-        };
-        let provider = Provider::from_options(root.to_path_buf(), &skip, &opts).expect("provider");
+        let provider =
+            Provider::from_options(root.to_path_buf(), &[heph.clone()], &opts).expect("provider");
 
         let ctoken = StdCancellationToken::new();
         let res = provider
@@ -616,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_packages_skips_engine_fs_skip_globs() {
+    async fn list_packages_skips_engine_skip_dirs() {
         let tmp_dir = tempdir().unwrap();
         let root = tmp_dir.path();
 
@@ -628,14 +591,11 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("BUILD"), "").unwrap();
 
-        // `vendor/**` comes from the engine's `fs.skip` (SkipConfig.globs), not
+        // `vendor` comes in as an engine skip dir (the resolved `fs.skip`), not
         // the provider's own `skip` option — proving the engine threads it in.
-        let skip = crate::engine::SkipConfig {
-            dirs: vec![],
-            globs: vec!["vendor".to_string()],
-        };
         let provider =
-            Provider::from_options(root.to_path_buf(), &skip, &Options::new()).expect("provider");
+            Provider::from_options(root.to_path_buf(), &[vendor.clone()], &Options::new())
+                .expect("provider");
 
         let ctoken = StdCancellationToken::new();
         let res = provider
@@ -652,7 +612,7 @@ mod tests {
         assert!(packages.contains(&"src".to_string()));
         assert!(
             !packages.contains(&"vendor".to_string()),
-            "engine fs.skip glob not pruned: {packages:?}"
+            "engine skip dir not pruned: {packages:?}"
         );
     }
 

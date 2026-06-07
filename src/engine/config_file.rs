@@ -26,10 +26,11 @@ pub struct ConfigFile {
     pub fs: Option<FsConfig>,
 }
 
-/// Filesystem-walk config shared across plugins. `fs: { skip: [glob, ...] }`.
-/// The engine hands `skip` to every plugin factory that walks the tree (the
-/// built-in `fs` plugin, the buildfile/go providers), so it prunes the same
-/// workspace-relative paths everywhere.
+/// Filesystem-walk config shared across plugins. `fs: { skip: [dir, ...] }`.
+/// Each `skip` entry is a directory path relative to the repo root (no globs);
+/// the engine resolves them to absolute paths and hands them to every plugin
+/// that walks the tree (the built-in `fs` plugin, the buildfile/go providers),
+/// so every walk prunes the same directories.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FsConfig {
@@ -231,12 +232,12 @@ drivers:
 
     #[test]
     fn parses_fs_skip() {
-        let yaml = "fs:\n  skip: [vendor/**, \"**/*.tmp\"]\n";
+        let yaml = "fs:\n  skip: [vendor, third_party/foo]\n";
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
         let fs = cfg.fs.expect("fs config present");
         assert_eq!(
             fs.skip,
-            vec!["vendor/**".to_string(), "**/*.tmp".to_string()]
+            vec!["vendor".to_string(), "third_party/foo".to_string()]
         );
     }
 

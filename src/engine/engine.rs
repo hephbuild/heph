@@ -21,8 +21,8 @@ pub struct Config {
     pub root: PathBuf,
     /// Workspace state/cache directory. If empty, defaults to `root/.heph3`.
     pub home_dir: PathBuf,
-    /// Workspace-relative exclude globs from the config file's `fs.skip`, handed
-    /// to every plugin that walks the tree. See [`SkipConfig`].
+    /// Repo-root-relative directories from the config file's `fs.skip`, pruned by
+    /// every plugin that walks the tree. See [`Engine::skip_dirs`].
     pub fs_skip: Vec<String>,
     pub parallelism: Option<usize>,
     pub mem_cache: MemCacheOptions,
@@ -47,20 +47,10 @@ impl Default for MemCacheOptions {
     }
 }
 
-/// Filesystem-walk config the engine hands to every plugin factory that walks
-/// the workspace tree, so they prune the same paths. `dirs` are absolute
-/// engine-owned directories (e.g. the heph home) matched by exact path; `globs`
-/// are workspace-relative exclude patterns from the config file's `fs.skip`.
-#[derive(Debug, Clone, Default)]
-pub struct SkipConfig {
-    pub dirs: Vec<PathBuf>,
-    pub globs: Vec<String>,
-}
-
-/// Factory args: workspace root, the engine's filesystem-skip config (see
-/// [`SkipConfig`]), and the provider's YAML options.
+/// Factory args: workspace root, the absolute directories every walk must prune
+/// (see [`Engine::skip_dirs`]), and the provider's YAML options.
 pub type ProviderFactory = Box<
-    dyn FnOnce(&Path, &SkipConfig, &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync,
+    dyn FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync,
 >;
 pub type DriverFactory =
     Box<dyn FnOnce(&Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync>;
@@ -459,7 +449,7 @@ impl Engine {
     pub fn register_provider_factory(
         &mut self,
         name: &str,
-        factory: impl FnOnce(&Path, &SkipConfig, &Options) -> anyhow::Result<Box<dyn SDKProvider>>
+        factory: impl FnOnce(&Path, &[PathBuf], &Options) -> anyhow::Result<Box<dyn SDKProvider>>
         + Send
         + Sync
         + 'static,
@@ -511,14 +501,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Filesystem-skip config handed to every plugin that walks the tree: the
-    /// engine-owned dirs to prune (the heph home, holding cache/sandboxes/locks —
-    /// never packages) plus the config file's `fs.skip` globs.
-    pub fn skip_config(&self) -> SkipConfig {
-        SkipConfig {
-            dirs: vec![self.home.clone()],
-            globs: self.cfg.fs_skip.clone(),
-        }
+    /// Absolute directories every plugin that walks the tree must prune: the
+    /// engine-owned home (cache/sandboxes/locks — never packages) plus the config
+    /// file's `fs.skip` dirs, resolved relative to the repo root.
+    pub fn skip_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::with_capacity(1 + self.cfg.fs_skip.len());
+        dirs.push(self.home.clone());
+        dirs.extend(self.cfg.fs_skip.iter().map(|rel| self.cfg.root.join(rel)));
+        dirs
     }
 
     /// Instantiates every provider/driver listed in the entries by looking up the
@@ -530,13 +520,13 @@ impl Engine {
         drivers: &[PluginEntry],
     ) -> anyhow::Result<()> {
         let root = self.cfg.root.clone();
-        let skip = self.skip_config();
+        let skip_dirs = self.skip_dirs();
         for entry in providers {
             let factory = self
                 .provider_factories
                 .remove(&entry.name)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", entry.name))?;
-            let provider = factory(&root, &skip, &entry.options)?;
+            let provider = factory(&root, &skip_dirs, &entry.options)?;
             let resolved_name = provider.config(provider::ConfigRequest {})?.name;
             if resolved_name != entry.name {
                 return Err(anyhow::anyhow!(
