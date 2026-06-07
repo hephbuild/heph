@@ -269,11 +269,17 @@ mod tests {
             .await?;
 
         let recorded = list_states.lock().unwrap();
-        assert_eq!(recorded.len(), 1, "list called once");
-        let pkgs: Vec<String> = recorded[0]
+        // The built-in `fs` provider also advertises its `@heph/fs` package, so
+        // `list` may run for that too; assert the call for the queried package.
+        let abc = recorded
             .iter()
-            .map(|s| s.package.as_str().to_string())
-            .collect();
+            .find(|states| {
+                states
+                    .first()
+                    .is_some_and(|s| s.package.as_str() == "a/b/c")
+            })
+            .expect("list called for queried package a/b/c");
+        let pkgs: Vec<String> = abc.iter().map(|s| s.package.as_str().to_string()).collect();
         assert_eq!(pkgs, vec!["a/b/c", "a/b", "a", ""]);
         Ok(())
     }
