@@ -300,17 +300,19 @@ fn collect_go_packages(
         }
     };
 
+    use std::os::unix::ffi::OsStrExt;
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
         let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() {
             continue;
         }
-        if name_str.starts_with('.')
-            || name_str.starts_with('_')
-            || name_str == "vendor"
-            || name_str == "testdata"
+        let name = entry.file_name();
+        // Skip dot/underscore-prefixed dirs and the go-convention non-package
+        // dirs by raw bytes — no `to_string_lossy` Cow per entry. A leading
+        // `.`/`_` is a single ASCII byte and UTF-8 lead/continuation bytes are
+        // all >= 0x80, so a byte compare can't misfire on a multibyte name.
+        let bytes = name.as_bytes();
+        if matches!(bytes.first(), Some(b'.' | b'_')) || bytes == b"vendor" || bytes == b"testdata"
         {
             continue;
         }
@@ -2595,6 +2597,12 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(root.join("internal")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
+        // Built-in (byte-compared) prunes: dot/underscore prefixes and the
+        // go-convention `vendor` / `testdata` dirs.
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::create_dir_all(root.join("_ignored")).unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::create_dir_all(root.join("testdata")).unwrap();
 
         let skip = Ignore::new(&[home.clone()], &["internal".to_string()]).unwrap();
         let mut out = Vec::new();
@@ -2611,6 +2619,12 @@ mod tests {
             "core dir not pruned"
         );
         assert!(!pkgs.contains(&"internal".to_string()), "glob not pruned");
+        for pruned in [".hidden", "_ignored", "vendor", "testdata"] {
+            assert!(
+                !pkgs.contains(&pruned.to_string()),
+                "built-in prune rule dropped: {pruned}"
+            );
+        }
     }
 
     #[test]
