@@ -219,10 +219,14 @@ impl Provider {
     }
 
     pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
-        let goroot = resolve_goroot()?;
-        let gomodcache = resolve_go_env_var("GOMODCACHE")?;
-        let gopath = resolve_go_env_var("GOPATH")?;
-        let gocache = resolve_go_env_var("GOCACHE")?;
+        // One `go env` round-trip for all four variables instead of four spawns.
+        let env = resolve_go_env_vars(&["GOROOT", "GOMODCACHE", "GOPATH", "GOCACHE"])?;
+        let [goroot, gomodcache, gopath, gocache] = <[String; 4]>::try_from(env).map_err(|v| {
+            anyhow::anyhow!(
+                "resolve_go_env_vars returned {} values, expected 4",
+                v.len()
+            )
+        })?;
         Ok(Self {
             inner: Arc::new(ProviderInner {
                 workspace_root,
@@ -243,28 +247,60 @@ impl Provider {
     }
 }
 
-fn resolve_go_env_var(name: &str) -> anyhow::Result<String> {
-    if let Ok(val) = std::env::var(name)
-        && !val.is_empty()
-    {
-        return Ok(val);
+/// Resolve several `go env` variables in a single subprocess, in the order
+/// requested. A process env var of the same name overrides (matching go's own
+/// precedence); only the names not already set are fetched, via one
+/// `go env A B C` round-trip rather than one `go` spawn per variable. Each
+/// spawn is ~15-20 ms, and the go provider needs four of these at construction,
+/// so batching removes ~3 subprocess spawns from every invocation's startup.
+fn resolve_go_env_vars(names: &[&str]) -> anyhow::Result<Vec<String>> {
+    // Per name: `Some` if satisfied from the process environment, else `None`
+    // (must come from `go env`). `missing` preserves request order.
+    let mut from_env: Vec<Option<String>> = Vec::with_capacity(names.len());
+    let mut missing: Vec<&str> = Vec::new();
+    for name in names {
+        match std::env::var(name) {
+            Ok(val) if !val.is_empty() => from_env.push(Some(val)),
+            _ => {
+                from_env.push(None);
+                missing.push(name);
+            }
+        }
     }
-    let output = std::process::Command::new("go")
-        .arg("env")
-        .arg(name)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to run `go env {}`: {}", name, e))?;
-    if !output.status.success() {
-        anyhow::bail!("go env {} failed", name);
-    }
-    Ok(String::from_utf8(output.stdout)
-        .map_err(|e| anyhow::anyhow!("go env {} output not utf-8: {}", name, e))?
-        .trim()
-        .to_string())
-}
 
-fn resolve_goroot() -> anyhow::Result<String> {
-    resolve_go_env_var("GOROOT")
+    let mut fetched: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    if !missing.is_empty() {
+        let output = std::process::Command::new("go")
+            .arg("env")
+            .args(&missing)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to run `go env {}`: {}", missing.join(" "), e))?;
+        if !output.status.success() {
+            anyhow::bail!("go env {} failed", missing.join(" "));
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|e| anyhow::anyhow!("go env output not utf-8: {}", e))?;
+        // `go env A B C` prints one value per line, in the requested order.
+        let lines: Vec<&str> = stdout.lines().collect();
+        if lines.len() != missing.len() {
+            anyhow::bail!(
+                "go env returned {} lines for {} variables",
+                lines.len(),
+                missing.len()
+            );
+        }
+        for (name, line) in missing.iter().zip(lines) {
+            fetched.insert(name, line.trim().to_string());
+        }
+    }
+
+    Ok(names
+        .iter()
+        .zip(from_env)
+        .map(|(name, env_val)| {
+            env_val.unwrap_or_else(|| fetched.get(name).cloned().unwrap_or_default())
+        })
+        .collect())
 }
 
 /// Recursively enumerate directories at or below `dir` that live under a
@@ -2667,6 +2703,29 @@ mod tests {
         let merged = compose_closures(&[a, b], None);
         let ips: Vec<&str> = merged.iter().map(|(ip, _)| ip.as_ref()).collect();
         assert_eq!(ips, ["x", "y", "z"], "diamond 'y' deduped, order preserved");
+    }
+
+    #[test]
+    fn resolve_go_env_vars_batches_in_request_order() {
+        require_go!();
+        // One value per requested name, in request order, matching individual
+        // `go env` calls — the batched single-spawn path must not reorder or drop.
+        let vals = resolve_go_env_vars(&["GOROOT", "GOCACHE", "GOMODCACHE"]).expect("go env");
+        assert_eq!(vals.len(), 3, "one value per requested variable");
+        let single = |name: &str| {
+            let out = std::process::Command::new("go")
+                .args(["env", name])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(vals[0], single("GOROOT"), "GOROOT stays in slot 0");
+        assert_eq!(vals[1], single("GOCACHE"), "GOCACHE stays in slot 1");
+        assert_eq!(vals[2], single("GOMODCACHE"), "GOMODCACHE stays in slot 2");
+        assert!(
+            !vals[0].is_empty() && !vals[1].is_empty(),
+            "GOROOT/GOCACHE resolve to non-empty paths"
+        );
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {
