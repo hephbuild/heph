@@ -1,9 +1,11 @@
+use crate::engine::LocalCache;
 use crate::engine::provider::GetError::NotFound;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
+use crate::engine::walk_cache::{WalkCache, WalkSignature};
 use crate::hasync::Cancellable;
 use crate::hmemoizer::Memoizer;
 use crate::htaddr::Addr;
@@ -55,6 +57,12 @@ pub struct Provider {
     /// Lazily-built Starlark globals (built from `function_registry` on first eval),
     /// shared with every `BuildFileLoader` so the namespace is built at most once.
     pub(crate) globals: Arc<OnceLock<Globals>>,
+    /// Cross-run cache of the package-discovery walk, validated by directory
+    /// mtimes only (a BUILD file's *contents* don't change the package set —
+    /// that's handled by `pkg_cache`). Disabled until [`with_cache`] is called.
+    ///
+    /// [`with_cache`]: Provider::with_cache
+    pub(crate) packages_walk_cache: Arc<WalkCache<Vec<String>>>,
 }
 
 impl Default for Provider {
@@ -71,9 +79,13 @@ impl Default for Provider {
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             function_registry: OnceLock::new(),
             globals: Arc::new(OnceLock::new()),
+            packages_walk_cache: Arc::new(WalkCache::new(None, PACKAGES_CACHE_NS)),
         }
     }
 }
+
+/// KV namespace for the buildfile package-discovery walk cache.
+const PACKAGES_CACHE_NS: &str = "pluginbuildfile.packages";
 
 impl Provider {
     pub fn new(root: std::path::PathBuf) -> Self {
@@ -81,6 +93,14 @@ impl Provider {
             root,
             ..Self::default()
         }
+    }
+
+    /// Enable the cross-run package-discovery cache backed by `cache`'s KV store.
+    /// Without this the provider re-walks the tree to discover packages on every
+    /// run (the in-process `packages_cache` only dedupes within one run).
+    pub fn with_cache(mut self, cache: Option<Arc<dyn LocalCache>>) -> Self {
+        self.packages_walk_cache = Arc::new(WalkCache::new(cache, PACKAGES_CACHE_NS));
+        self
     }
 
     pub fn from_options(
@@ -123,13 +143,41 @@ impl Provider {
     }
 }
 
+/// Stable cross-run cache key for a package-discovery walk: the (sorted) build
+/// file patterns and skip globs that determine which dirs are visited and which
+/// count as packages. `root` is not included — it's the validation reference.
+fn packages_cache_key(patterns: &[glob::Pattern], skip: &Ignore) -> String {
+    let mut pats: Vec<&str> = patterns.iter().map(glob::Pattern::as_str).collect();
+    pats.sort_unstable();
+    let mut globs: Vec<&str> = skip.globs().iter().map(String::as_str).collect();
+    globs.sort_unstable();
+    format!("{}\u{1}{}", pats.join(","), globs.join(","))
+}
+
 fn find_packages_sync(
     path: &std::path::Path,
     root: &std::path::Path,
     patterns: &[glob::Pattern],
     skip: &Ignore,
     packages: &mut std::collections::HashSet<String>,
+    sig: &mut WalkSignature,
+    persistable: &mut bool,
 ) -> anyhow::Result<()> {
+    // Record this directory's mtime for the cross-run cache: it bumps on any
+    // entry add/remove/rename, so matching every descended dir proves the package
+    // set is unchanged without re-reading the tree.
+    match (
+        path.strip_prefix(root).ok().and_then(|r| r.to_str()),
+        std::fs::metadata(path).ok(),
+    ) {
+        (Some(rel), Some(meta)) if meta.is_dir() => {
+            if !sig.push_dir(rel, &meta) {
+                *persistable = false;
+            }
+        }
+        _ => *persistable = false,
+    }
+
     let mut has_build_file = false;
     for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
         let entry = entry?;
@@ -150,7 +198,15 @@ fn find_packages_sync(
             if skip.prune_dir(&entry_path, rel) {
                 continue;
             }
-            find_packages_sync(&entry_path, root, patterns, skip, packages)?;
+            find_packages_sync(
+                &entry_path,
+                root,
+                patterns,
+                skip,
+                packages,
+                sig,
+                persistable,
+            )?;
         }
     }
 
@@ -228,11 +284,25 @@ impl EProvider for Provider {
                 .packages_cache
                 .once(
                     (),
-                    enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip) move || async move {
+                    enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip, self.packages_walk_cache => walk_cache) move || async move {
                         let packages = crate::process_supervisor::block_or_inline(move || {
+                            let key = packages_cache_key(&patterns, &skip);
+                            // Cross-run cache hit: the directory set is unchanged.
+                            if let Some(pkgs) = walk_cache.get(&key, &root) {
+                                return Ok::<_, anyhow::Error>(pkgs);
+                            }
                             let mut packages = std::collections::HashSet::new();
-                            find_packages_sync(&root, &root, &patterns, &skip, &mut packages)?;
-                            Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
+                            let mut sig = WalkSignature::default();
+                            let mut persistable = true;
+                            find_packages_sync(
+                                &root, &root, &patterns, &skip,
+                                &mut packages, &mut sig, &mut persistable,
+                            )?;
+                            let pkgs: Vec<String> = packages.into_iter().collect();
+                            if persistable {
+                                walk_cache.insert(key, sig, pkgs.clone());
+                            }
+                            Ok(pkgs)
                         })?;
                         Ok(Arc::new(packages))
                     }),
@@ -340,6 +410,122 @@ mod tests {
     use crate::hasync::StdCancellationToken;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Minimal `LocalCache` exposing only the KV methods over an in-memory map.
+    #[derive(Default)]
+    struct KvMock {
+        kv: Mutex<HashMap<(String, String), Vec<u8>>>,
+    }
+    impl LocalCache for KvMock {
+        fn reader(
+            &self,
+            _a: &Addr,
+            _h: &str,
+            _n: &str,
+        ) -> anyhow::Result<crate::engine::SizedReader> {
+            unimplemented!()
+        }
+        fn writer(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<Box<dyn std::io::Write>> {
+            unimplemented!()
+        }
+        fn exists(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn delete(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn kv_get(&self, ns: &str, k: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self
+                .kv
+                .lock()
+                .unwrap()
+                .get(&(ns.to_owned(), k.to_owned()))
+                .cloned())
+        }
+        fn kv_list(&self, ns: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+            Ok(self
+                .kv
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((n, _), _)| n == ns)
+                .map(|((_, k), v)| (k.clone(), v.clone()))
+                .collect())
+        }
+        fn kv_put(&self, ns: &str, k: &str, v: &[u8]) -> anyhow::Result<()> {
+            self.kv
+                .lock()
+                .unwrap()
+                .insert((ns.to_owned(), k.to_owned()), v.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Package discovery is cached across runs: a fresh provider sharing the KV
+    /// reuses the discovered set for an unchanged tree, and a newly-added package
+    /// (which bumps a recorded dir's mtime) is re-discovered.
+    #[tokio::test]
+    async fn test_list_packages_cross_run_cache() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("BUILD"), "").unwrap();
+        let a = root.join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("BUILD"), "").unwrap();
+
+        let backend: Arc<dyn LocalCache> = Arc::new(KvMock::default());
+        let list = |p: Provider| async move {
+            let ctoken = StdCancellationToken::new();
+            let res = p
+                .list_packages(
+                    ListPackagesRequest {
+                        prefix: PkgBuf::from(""),
+                    },
+                    &ctoken,
+                )
+                .await
+                .unwrap();
+            let mut v: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
+            v.sort();
+            v
+        };
+
+        let p1 = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        }
+        .with_cache(Some(backend.clone()));
+        assert_eq!(list(p1).await, vec!["".to_string(), "a".to_string()]);
+
+        // Fresh provider sharing the KV (simulates a new run) → same set, served
+        // from the cross-run cache for the unchanged tree.
+        let p2 = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        }
+        .with_cache(Some(backend.clone()));
+        assert_eq!(list(p2).await, vec!["".to_string(), "a".to_string()]);
+
+        // Add a new package; bump root mtime so the recorded dir invalidates.
+        let b = root.join("b");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("BUILD"), "").unwrap();
+        std::fs::File::open(root)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
+            .unwrap();
+
+        let p3 = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        }
+        .with_cache(Some(backend.clone()));
+        assert_eq!(
+            list(p3).await,
+            vec!["".to_string(), "a".to_string(), "b".to_string()],
+            "a newly-added package is re-discovered"
+        );
+    }
 
     #[test]
     fn from_options_defaults_to_build() {

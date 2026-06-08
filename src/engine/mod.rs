@@ -20,6 +20,7 @@ pub mod driver;
 pub mod error;
 pub mod event;
 mod local_cache;
+pub use local_cache::{LocalCache, SizedReader};
 #[cfg(test)]
 mod local_cache_fs;
 mod local_cache_mem;
@@ -46,6 +47,7 @@ pub use result_lock::{LockBackend, ResultLock};
 mod expand;
 pub mod fanout;
 mod gc;
+pub mod walk_cache;
 pub use gc::GcStats;
 pub mod gitignore;
 mod grow_stack;
