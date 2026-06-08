@@ -166,9 +166,19 @@ struct DeleteJob {
     slot: Arc<PendingSlot>,
 }
 
+/// Namespaced key→blob upsert for the `kv` table. Fire-and-forget: callers keep
+/// their own in-memory copy and only read the table once at startup, so there is
+/// no read-after-write race to track with a [`PendingSlot`].
+struct KvPutJob {
+    ns: String,
+    k: String,
+    v: Vec<u8>,
+}
+
 enum WriterCmd {
     Write(WriteJob),
     Delete(DeleteJob),
+    KvPut(KvPutJob),
 }
 
 pub struct LocalCacheSQLite {
@@ -214,7 +224,13 @@ impl LocalCacheSQLite {
                      data   BLOB NOT NULL,
                      PRIMARY KEY (addr, hashin, name)
                  );
-                 CREATE INDEX IF NOT EXISTS idx_artifacts_addr_hashin ON artifacts (addr, hashin);",
+                 CREATE INDEX IF NOT EXISTS idx_artifacts_addr_hashin ON artifacts (addr, hashin);
+                 CREATE TABLE IF NOT EXISTS kv (
+                     ns TEXT NOT NULL,
+                     k  TEXT NOT NULL,
+                     v  BLOB NOT NULL,
+                     PRIMARY KEY (ns, k)
+                 );",
             )
             .context("initialising sqlite cache schema")?;
 
@@ -303,6 +319,8 @@ fn writer_loop(conn: &mut Connection, rx: &mpsc::Receiver<WriterCmd>, pending: &
             match cmd {
                 WriterCmd::Write(j) => pending.complete(&j.key, &j.slot),
                 WriterCmd::Delete(j) => pending.complete(&j.key, &j.slot),
+                // KvPut is fire-and-forget — no pending slot to release.
+                WriterCmd::KvPut(_) => {}
             }
         }
     }
@@ -358,6 +376,13 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
                         name = job.key.2
                     )
                 })?;
+            }
+            WriterCmd::KvPut(job) => {
+                tx.execute(
+                    "INSERT OR REPLACE INTO kv (ns, k, v) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![job.ns, job.k, job.v.as_slice()],
+                )
+                .with_context(|| format!("kv put {}/{}", job.ns, job.k))?;
             }
         }
     }
@@ -493,6 +518,52 @@ impl LocalCache for LocalCacheSQLite {
         };
 
         Ok(found)
+    }
+
+    fn kv_get(&self, ns: &str, k: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self
+            .read_pool
+            .get()
+            .context("acquiring read connection from pool")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT v FROM kv WHERE ns=?1 AND k=?2")
+            .context("preparing kv get")?;
+        match stmt.query_row(rusqlite::params![ns, k], |row| row.get::<_, Vec<u8>>(0)) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("reading kv value"),
+        }
+    }
+
+    fn kv_list(&self, ns: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let conn = self
+            .read_pool
+            .get()
+            .context("acquiring read connection from pool")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT k, v FROM kv WHERE ns=?1")
+            .context("preparing kv list")?;
+        let rows = stmt
+            .query_map(rusqlite::params![ns], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .context("querying kv namespace")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading kv rows")
+    }
+
+    fn kv_put(&self, ns: &str, k: &str, v: &[u8]) -> Result<()> {
+        // Fire-and-forget through the writer thread (batched with artifact
+        // writes). The `Drop` impl joins the writer, so enqueued puts flush
+        // before the process exits.
+        self.writer_tx()?
+            .send(WriterCmd::KvPut(KvPutJob {
+                ns: ns.to_owned(),
+                k: k.to_owned(),
+                v: v.to_vec(),
+            }))
+            .context("enqueuing kv put")?;
+        Ok(())
     }
 
     fn list_targets(&self) -> Result<TargetStream> {
@@ -750,6 +821,63 @@ mod tests {
 
         cache.delete(&addr, hashin, name)?;
         assert!(!cache.exists(&addr, hashin, name)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_kv_put_get_list() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+
+        assert!(cache.kv_get("ns", "missing")?.is_none());
+
+        cache.kv_put("ns", "a", b"alpha")?;
+        cache.kv_put("ns", "b", b"beta")?;
+        cache.kv_put("other", "a", b"zzz")?;
+        // kv_put is async through the writer thread; block until it lands by
+        // dropping into a short spin on kv_get.
+        let mut tries = 0;
+        while cache.kv_get("ns", "a")?.is_none() && tries < 1000 {
+            std::thread::yield_now();
+            tries += 1;
+        }
+
+        assert_eq!(
+            cache.kv_get("ns", "a")?.as_deref(),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            cache.kv_get("ns", "b")?.as_deref(),
+            Some(b"beta".as_slice())
+        );
+
+        // kv_list is scoped to the namespace.
+        let mut listed = cache.kv_list("ns")?;
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                ("a".to_string(), b"alpha".to_vec()),
+                ("b".to_string(), b"beta".to_vec()),
+            ]
+        );
+
+        // Overwrite replaces.
+        cache.kv_put("ns", "a", b"alpha2")?;
+        let mut tries = 0;
+        while cache.kv_get("ns", "a")?.as_deref() != Some(b"alpha2".as_slice()) && tries < 1000 {
+            std::thread::yield_now();
+            tries += 1;
+        }
+        assert_eq!(
+            cache.kv_get("ns", "a")?.as_deref(),
+            Some(b"alpha2".as_slice())
+        );
 
         Ok(())
     }

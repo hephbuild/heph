@@ -145,12 +145,15 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
 
     // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
     e.register_provider_factory("buildfile", |init, opts| {
-        Ok(Box::new(pluginbuildfile::Provider::from_options(
-            init.root.to_path_buf(),
-            &init.skip_dirs,
-            &init.skip_globs,
-            opts,
-        )?))
+        Ok(Box::new(
+            pluginbuildfile::Provider::from_options(
+                init.root.to_path_buf(),
+                &init.skip_dirs,
+                &init.skip_globs,
+                opts,
+            )?
+            .with_cache(Some(init.cache.clone())),
+        ))
     })?;
     e.register_provider_factory("go", |init, opts| {
         Ok(Box::new(plugingo::Provider::from_options(
@@ -268,12 +271,15 @@ mod tests {
         })?;
 
         e.register_provider_factory("buildfile", |init, opts| {
-            Ok(Box::new(pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-            )?))
+            Ok(Box::new(
+                pluginbuildfile::Provider::from_options(
+                    init.root.to_path_buf(),
+                    &init.skip_dirs,
+                    &init.skip_globs,
+                    opts,
+                )?
+                .with_cache(Some(init.cache.clone())),
+            ))
         })?;
         e.register_managed_driver_factory("exec", |_init, opts| {
             Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))

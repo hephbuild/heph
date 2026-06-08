@@ -117,6 +117,18 @@ impl LocalCache for LocalCacheMem {
         self.inner.list_target_entries(addr)
     }
 
+    // KV is not fronted by the mem LRU (small, read once at startup) — delegate
+    // straight to the durable backend.
+    fn kv_get(&self, ns: &str, k: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.kv_get(ns, k)
+    }
+    fn kv_list(&self, ns: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        self.inner.kv_list(ns)
+    }
+    fn kv_put(&self, ns: &str, k: &str, v: &[u8]) -> Result<()> {
+        self.inner.kv_put(ns, k, v)
+    }
+
     fn seekable_reader(
         &self,
         addr: &Addr,

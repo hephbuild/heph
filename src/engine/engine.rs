@@ -101,6 +101,9 @@ pub struct PluginInit {
     /// Workspace-relative `fs.skip` glob patterns (e.g. `**/node_modules/**`),
     /// matched against entry paths.
     pub skip_globs: Vec<String>,
+    /// The engine's durable local cache, handed to plugins for cross-run scratch
+    /// state via its namespaced KV store (see [`crate::engine::walk_cache`]).
+    pub cache: Arc<dyn LocalCache>,
 }
 
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
@@ -440,7 +443,10 @@ impl Engine {
                 &init.skip_dirs,
                 &init.skip_globs,
             )?);
-            Ok(Box::new(crate::pluginfs::Driver::new(ignore)))
+            Ok(Box::new(crate::pluginfs::Driver::new(
+                ignore,
+                Some(init.cache.clone()),
+            )))
         })?;
 
         Ok(engine)
@@ -507,6 +513,7 @@ impl Engine {
             root: self.cfg.root.clone(),
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
+            cache: self.local_cache.clone(),
         }
     }
 
