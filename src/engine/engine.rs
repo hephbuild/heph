@@ -101,9 +101,8 @@ pub struct PluginInit {
     /// Workspace-relative `fs.skip` glob patterns (e.g. `**/node_modules/**`),
     /// matched against entry paths.
     pub skip_globs: Vec<String>,
-    /// The engine's durable local cache, handed to plugins for cross-run scratch
-    /// state via its namespaced KV store (see [`crate::engine::walk_cache`]).
-    pub cache: Arc<dyn LocalCache>,
+    /// Shared cross-run filesystem-walk cache for tree-walking plugins.
+    pub walker: Arc<crate::htwalk::CachedWalker>,
 }
 
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
@@ -135,6 +134,9 @@ pub struct Engine {
     /// memory and never touch the SQLite WAL; entries over the per-entry cap
     /// spill to `local_cache`. See [`LocalCacheTmp`].
     pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
+    /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
+    /// tree-walking plugins via [`PluginInit`].
+    pub(crate) walker: Arc<crate::htwalk::CachedWalker>,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub(crate) providers_by_name: HashMap<String, Arc<Provider>>,
@@ -403,6 +405,12 @@ impl Engine {
             .with_context(|| format!("create lock dir {lock_dir:?}"))?;
         let result_lock = ResultLock::new(cfg.lock_backend, lock_dir);
 
+        // Shared cross-run filesystem-walk cache, handed to tree-walking plugins
+        // via `PluginInit`. Its own sqlite db so it can be pruned independently.
+        let walker = Arc::new(crate::htwalk::CachedWalker::open(
+            &home.join("cache").join("fswalk.db"),
+        ));
+
         let max_workers = 2 * parallelism;
 
         let mut engine = Engine {
@@ -410,6 +418,7 @@ impl Engine {
             home: home.clone(),
             local_cache,
             local_cache_tmp,
+            walker,
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],
@@ -436,7 +445,10 @@ impl Engine {
                 &init.skip_dirs,
                 &init.skip_globs,
             )?);
-            Ok(Box::new(crate::pluginfs::Provider::new(ignore)))
+            Ok(Box::new(crate::pluginfs::Provider::new(
+                ignore,
+                init.walker.clone(),
+            )))
         })?;
         engine.try_register_driver(|init| {
             let ignore = Arc::new(crate::htwalk::Ignore::new(
@@ -445,7 +457,7 @@ impl Engine {
             )?);
             Ok(Box::new(crate::pluginfs::Driver::new(
                 ignore,
-                Some(init.cache.clone()),
+                init.walker.clone(),
             )))
         })?;
 
@@ -513,7 +525,7 @@ impl Engine {
             root: self.cfg.root.clone(),
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
-            cache: self.local_cache.clone(),
+            walker: self.walker.clone(),
         }
     }
 

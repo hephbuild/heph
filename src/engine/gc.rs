@@ -41,6 +41,9 @@ pub struct GcStats {
     /// Targets that could not be processed (resolve/delete failed). GC logs each
     /// and keeps going — a single bad target never aborts the sweep.
     pub errored: usize,
+    /// Rows pruned from the shared filesystem-walk cache (stale past the TTL or
+    /// orphaned because their path no longer exists).
+    pub fswalk_rows_removed: usize,
 }
 
 /// Per-target result of a GC pass, accumulated into [`GcStats`].
@@ -224,6 +227,17 @@ impl Engine {
         }
         while !set.is_empty() {
             Self::drain_one(&mut set, &rs, &mut stats).await;
+        }
+
+        // Prune the shared filesystem-walk cache: drop rows untouched past the
+        // TTL and rows whose path no longer exists. Best-effort — a prune failure
+        // never fails the artifact GC.
+        let walker = self.walker.clone();
+        match crate::process_supervisor::block_or_inline(move || {
+            walker.prune(crate::htwalk::cached_walker::DEFAULT_TTL, true)
+        }) {
+            Ok(n) => stats.fswalk_rows_removed = n,
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "fswalk prune failed"),
         }
 
         Ok(stats)

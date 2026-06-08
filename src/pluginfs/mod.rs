@@ -1,4 +1,3 @@
-use crate::engine::LocalCache;
 use crate::engine::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
@@ -14,12 +13,11 @@ use crate::engine::provider::{
     ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, ProviderFn,
     ProviderFunctionDef, TargetSpec,
 };
-use crate::engine::walk_cache::{WalkCache, WalkSignature};
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::Value;
-use crate::htwalk::Ignore;
+use crate::htwalk::{CachedWalker, Ignore};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -81,11 +79,13 @@ pub fn is_glob_addr(addr: &Addr) -> bool {
 pub struct Provider {
     /// Dirs the `glob` provider function must prune, shared with the driver.
     skip: Arc<Ignore>,
+    /// Shared cross-run filesystem-walk cache, used by the `glob` function.
+    walker: Arc<CachedWalker>,
 }
 
 impl Provider {
-    pub fn new(skip: Arc<Ignore>) -> Self {
-        Self { skip }
+    pub fn new(skip: Arc<Ignore>, walker: Arc<CachedWalker>) -> Self {
+        Self { skip, walker }
     }
 }
 
@@ -178,6 +178,7 @@ impl EProvider for Provider {
                 name: "glob".to_string(),
                 func: Arc::new(GlobFn {
                     skip: self.skip.clone(),
+                    walker: self.walker.clone(),
                 }),
             },
             ProviderFunctionDef {
@@ -206,6 +207,7 @@ impl EProvider for Provider {
 /// the engine's skip dirs/globs. Result is sorted.
 struct GlobFn {
     skip: Arc<Ignore>,
+    walker: Arc<CachedWalker>,
 }
 
 #[async_trait]
@@ -227,9 +229,7 @@ impl ProviderFn for GlobFn {
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.
         let compiled = compile_glob(&self.skip, "heph.fs.glob", &resolved, &[])?;
-        // BUILD-time expansion: only the artifacts are needed here (the
-        // cross-run cache entry is produced for the `run`-path walk).
-        let (artifacts, _) = walk_glob(ctx.root, &compiled)?;
+        let artifacts = walk_glob(&self.walker, ctx.root, &compiled)?;
 
         let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
 
@@ -576,249 +576,114 @@ fn compile_glob(
     })
 }
 
-/// Walks `root` for files matching `compiled`, returning their artifacts plus a
-/// [`CachedGlobEntry`] for the cross-run cache (or `None` when the walk root is
-/// missing or an mtime is unreadable, so the result is not persistable).
+/// Walks `root` for files matching `compiled`, returning their artifacts.
 ///
-/// Starts at the pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans
-/// only `<root>/a/b`, not the whole tree. Matching uses the cached glob/exclude
-/// NFAs directly — no per-run regex compilation.
-fn walk_glob(root: &std::path::Path, compiled: &CompiledGlob) -> anyhow::Result<GlobWalk> {
+/// Recursion runs through the shared [`CachedWalker`]: every `readdir` and every
+/// file content hash is served from the cross-run fswalk cache when the tree is
+/// unchanged. Filtering (glob match, excludes, skip-dir pruning, codegen xattr)
+/// is applied here — the walker itself is consumer-agnostic. Starts at the
+/// pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans only
+/// `<root>/a/b`, not the whole tree.
+fn walk_glob(
+    walker: &CachedWalker,
+    root: &std::path::Path,
+    compiled: &CompiledGlob,
+) -> anyhow::Result<Vec<OutputArtifact>> {
     let walk_root = if compiled.prefix.is_empty() {
         root.to_path_buf()
     } else {
         root.join(&compiled.prefix)
     };
 
-    // A missing walk root is an empty match — but must not be cached: were it
-    // stored as "empty", a later-created tree (which doesn't change any recorded
-    // dir's mtime, since none were recorded) would keep serving the stale empty
-    // set. Return `None` so every run re-walks until the root exists.
-    if std::fs::metadata(&walk_root).is_err() {
-        return Ok((vec![], None));
-    }
-
     let mut artifacts = vec![];
-    // Cross-run cache accumulation. `persistable` flips off if any mtime can't be
-    // read, in which case we never store a (possibly unverifiable) entry.
-    let mut sig = WalkSignature::default();
-    let mut value = GlobValue::default();
-    let mut persistable = true;
-
-    let walker = walkdir::WalkDir::new(&walk_root)
-        .into_iter()
-        .filter_entry(|entry| {
-            // Never descend into the engine's skip dirs (heph home + literal
-            // `fs.skip` dirs) or skip-glob subtrees (e.g. `**/node_modules/**`).
-            if !entry.file_type().is_dir() {
-                return true;
-            }
-            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
-            !compiled.skip.prune_dir(entry.path(), rel)
-        });
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                // A missing walk root (or a path that vanished mid-walk) is an
-                // empty match, not an error.
-                if e.io_error()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-                {
-                    continue;
-                }
-                return Err(anyhow::Error::from(e)).context("walking glob entries");
-            }
-        };
-
-        if entry.file_type().is_dir() {
-            // Record every descended dir's mtime: it bumps on any entry
-            // add/remove/rename, so matching all of them on a later run proves
-            // the matched file *set* is unchanged without re-reading the dir.
-            match (
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .ok()
-                    .and_then(|r| r.to_str()),
-                entry.metadata().ok(),
-            ) {
-                (Some(rel), Some(meta)) => {
-                    if !sig.push_dir(rel, &meta) {
-                        persistable = false;
+    // The literal prefix can name a file directly (a fully-literal pattern), in
+    // which case the walk root is that single file, not a directory to descend.
+    match std::fs::metadata(&walk_root) {
+        Ok(m) if m.is_dir() => {
+            let mut stack = vec![walk_root];
+            while let Some(dir) = stack.pop() {
+                let listing = walker.read_dir(&dir)?;
+                for entry in &listing.entries {
+                    let abs = dir.join(&entry.name);
+                    if entry.kind == crate::htwalk::EntryKind::Dir {
+                        // Never descend into skip dirs or skip-glob subtrees.
+                        let rel = abs.strip_prefix(root).unwrap_or(&abs);
+                        if !compiled.skip.prune_dir(&abs, rel) {
+                            stack.push(abs);
+                        }
+                    } else if matches!(
+                        entry.kind,
+                        crate::htwalk::EntryKind::File | crate::htwalk::EntryKind::Symlink
+                    ) {
+                        // A symlink-to-dir is rejected by `file_hash` (which follows
+                        // and errors on a dir), matching the old walk.
+                        emit_glob_file(walker, root, compiled, &abs, &mut artifacts)?;
                     }
                 }
-                _ => persistable = false,
             }
-            continue;
         }
-
-        let abs_path = entry.path();
-        let rel = abs_path
-            .strip_prefix(root)
-            .with_context(|| "strip root prefix from glob entry")?;
-
-        // Include on a pattern match, drop on an exclude match.
-        use wax::Program as _;
-        if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
-            continue;
-        }
-
-        // Skip net-new codegen outputs stamped back into the tree — sourcing
-        // them here would double-source the generated content.
-        if has_codegen_xattr(abs_path) {
-            continue;
-        }
-
-        let rel_str = rel.to_str().ok_or_else(|| {
-            anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
-        })?;
-
-        // Resolve through symlinks. The walker has follow_links off (so it never
-        // descends INTO a symlinked dir), but an individual symlink entry that
-        // points at a regular file is still a valid source. Stat the target so
-        // the exec marker and the hashed content both come from what
-        // `file_hashout` actually opens — and so a symlink-to-dir (or a
-        // dangling/vanished link) is skipped instead of erroring on read.
-        let meta = match std::fs::metadata(abs_path) {
-            Ok(m) => m,
-            // A dangling/vanished symlink resolves to nothing — skip, don't fail.
-            // Other stat errors (e.g. permission) still surface with context.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(e).with_context(|| format!("stat glob entry '{}'", abs_path.display()));
-            }
-        };
-        if meta.is_dir() {
-            continue;
-        }
-
-        let x = is_exec(&meta);
-        let hashout = file_hashout(abs_path, x)
-            .with_context(|| format!("hash glob entry '{}'", abs_path.display()))?;
-
-        // Cross-run cache: record (size, mtime) in the signature so a later run
-        // can validate this file's content without re-reading it, and the
-        // (rel, x, hashout) needed to rebuild the artifact. A missing mtime makes
-        // the whole walk non-persistable.
-        if sig.push_file(rel_str, &meta) {
-            value.files.push(GlobFile {
-                rel: rel_str.to_string(),
-                x,
-                hashout: hashout.clone(),
-            });
-        } else {
-            persistable = false;
-        }
-
-        // Materialize the owned strings that borrow `abs_path`/`rel_str` *before*
-        // consuming `entry` for `source_path` below — the borrows end here.
-        let out_path = rel_str.to_string();
-        let name = rel_str.replace('/', "_");
-
-        // `source_path` is `abs_path` owned. Reuse walkdir's already-allocated
-        // `PathBuf` instead of copying its bytes into a fresh String: on Unix
-        // `OsString -> String` reuses the buffer (validate-in-place, no realloc),
-        // so this drops one allocation per matched file off the glob hot path.
-        let source_path = entry
-            .into_path()
-            .into_os_string()
-            .into_string()
-            .map_err(|os| {
-                anyhow::anyhow!(
-                    "glob entry path is not valid UTF-8: {}",
-                    os.to_string_lossy()
-                )
-            })?;
-
-        artifacts.push(OutputArtifact {
-            group: "".to_string(),
-            name,
-            r#type: Type::Output,
-            content: Content::File(ContentFile {
-                source_path,
-                out_path,
-                x,
-            }),
-            hashout,
-        });
+        Ok(_) => emit_glob_file(walker, root, compiled, &walk_root, &mut artifacts)?,
+        Err(_) => {} // missing walk root ⇒ empty match
     }
 
-    let entry = if persistable {
-        Some((sig, value))
-    } else {
-        None
+    Ok(artifacts)
+}
+
+/// If `abs` matches the glob (and isn't excluded or a codegen output), hash it
+/// via the walker and push its artifact onto `out`.
+fn emit_glob_file(
+    walker: &CachedWalker,
+    root: &std::path::Path,
+    compiled: &CompiledGlob,
+    abs: &std::path::Path,
+    out: &mut Vec<OutputArtifact>,
+) -> anyhow::Result<()> {
+    use wax::Program as _;
+
+    let Ok(rel) = abs.strip_prefix(root) else {
+        return Ok(());
     };
-    Ok((artifacts, entry))
-}
-
-// ── Cross-run glob cache ─────────────────────────────────────────────────────
-//
-// fs-glob targets are `CacheConfig::off()`, so the engine re-walks the tree on
-// every run (walkdir + per-entry stat + per-file open/read/hash). The generic
-// `walk_cache` memoizes a walk's result per `(root, pattern, exclude)` across
-// runs in the durable cache's KV store, validated by directory mtimes (the
-// matched file *set*) and per-file `(size, mtime)` (file *content*). A full
-// match reconstructs the artifacts with stat only — no readdir, opens, reads, or
-// hashing. Disable with `HEPH_FS_GLOB_CACHE=0`.
-
-/// KV namespace for the fs glob walk cache.
-const GLOB_CACHE_NS: &str = "pluginfs.glob";
-
-/// Per-matched-file reconstruction data stored in the [`WalkCache`]. The
-/// validating `(size, mtime)` live in the [`WalkSignature`]; this carries only
-/// what's needed to rebuild an [`OutputArtifact`]. `source = root/rel`,
-/// `out_path = rel`, `name = rel.replace('/', "_")` — mirrors `walk_glob`.
-#[derive(Clone, borsh::BorshSerialize, borsh::BorshDeserialize)]
-struct GlobFile {
-    rel: String,
-    x: bool,
-    hashout: String,
-}
-
-#[derive(Default, Clone, borsh::BorshSerialize, borsh::BorshDeserialize)]
-struct GlobValue {
-    files: Vec<GlobFile>,
-}
-
-/// `walk_glob`'s result: the artifacts plus an optional `(signature, value)` to
-/// store in the [`WalkCache`] (`None` ⇒ the walk is not cacheable this run).
-type GlobWalk = (Vec<OutputArtifact>, Option<(WalkSignature, GlobValue)>);
-
-/// Rebuild the glob artifacts from a cache-validated [`GlobValue`]. The file
-/// `(size, mtime)` were already checked by [`WalkCache::get`]; only the codegen
-/// xattr (which bumps neither) is re-checked here, matching `walk_glob`. Returns
-/// `None` (⇒ caller re-walks) if any file has since been codegen-stamped.
-fn reconstruct_glob(root: &std::path::Path, value: &GlobValue) -> Option<Vec<OutputArtifact>> {
-    let mut artifacts = Vec::with_capacity(value.files.len());
-    for f in &value.files {
-        let abs = root.join(&f.rel);
-        if has_codegen_xattr(&abs) {
-            return None;
-        }
-        let source_path = abs.into_os_string().into_string().ok()?;
-        artifacts.push(OutputArtifact {
-            group: String::new(),
-            name: f.rel.replace('/', "_"),
-            r#type: Type::Output,
-            content: Content::File(ContentFile {
-                source_path,
-                out_path: f.rel.clone(),
-                x: f.x,
-            }),
-            hashout: f.hashout.clone(),
-        });
+    // Include on a pattern match, drop on an exclude match.
+    if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
+        return Ok(());
     }
-    Some(artifacts)
+    // Skip net-new codegen outputs stamped back into the tree — sourcing them
+    // here would double-source the generated content.
+    if has_codegen_xattr(abs) {
+        return Ok(());
+    }
+    let Some(rel_str) = rel.to_str() else {
+        anyhow::bail!("glob entry path is not valid UTF-8: {}", rel.display());
+    };
+    // Hash via the walker (follows symlinks). A symlink-to-dir or a
+    // dangling/vanished link errors here → skip.
+    let fh = match walker.file_hash(abs) {
+        Ok(fh) => fh,
+        Err(_) => return Ok(()),
+    };
+    let Some(source_path) = abs.to_str().map(str::to_owned) else {
+        anyhow::bail!("glob entry path is not valid UTF-8: {}", abs.display());
+    };
+    out.push(OutputArtifact {
+        group: String::new(),
+        name: rel_str.replace('/', "_"),
+        r#type: Type::Output,
+        content: Content::File(ContentFile {
+            source_path,
+            out_path: rel_str.to_string(),
+            x: fh.exec,
+        }),
+        hashout: fh.hashout.clone(),
+    });
+    Ok(())
 }
 
-/// Returns the glob walk artifacts for `(root, pattern, exclude)`. Within a
-/// request the result is memoized (the tree is immutable mid-request); across
-/// runs it is served from `store` (the single-file sidecar) when the tree is
-/// unchanged. The first uncached call walks the tree.
+/// Returns the glob walk artifacts for `(root, pattern, exclude)`, memoized
+/// within `request_id` (the tree is immutable mid-request, so repeat calls reuse
+/// the assembled list). Cross-run reuse of readdir + file hashes happens inside
+/// the shared [`CachedWalker`].
 fn cached_glob_walk(
-    glob_cache: &WalkCache<GlobValue>,
+    walker: &CachedWalker,
     request_id: &str,
     root: &std::path::Path,
     pattern: &str,
@@ -839,21 +704,7 @@ fn cached_glob_walk(
         return Ok(a.clone());
     }
 
-    // Cross-run cache: on a signature-validated hit, reconstruct with stat only.
-    // On a miss, walk and record (write-through to the KV).
-    let artifacts = match glob_cache
-        .get(&key, root)
-        .and_then(|value| reconstruct_glob(root, &value))
-    {
-        Some(arts) => Arc::new(arts),
-        None => {
-            let (arts, entry) = walk_glob(root, compiled)?;
-            if let Some((sig, value)) = entry {
-                glob_cache.insert(key.clone(), sig, value);
-            }
-            Arc::new(arts)
-        }
-    };
+    let artifacts = Arc::new(walk_glob(walker, root, compiled)?);
 
     Ok(glob_result_cache()
         .write()
@@ -867,70 +718,23 @@ fn cached_glob_walk(
 pub struct Driver {
     /// Engine-owned + built-in dirs pruned during glob walks.
     skip: Arc<Ignore>,
-    /// Cross-run glob walk cache (KV-backed; write-through, no flush needed).
-    glob_cache: Arc<WalkCache<GlobValue>>,
+    /// Shared cross-run filesystem-walk cache (readdir + file hashes).
+    walker: Arc<CachedWalker>,
 }
 
 impl Default for Driver {
     fn default() -> Self {
         Self {
             skip: Arc::default(),
-            glob_cache: Arc::new(WalkCache::new(None, GLOB_CACHE_NS)),
+            walker: Arc::new(CachedWalker::disabled()),
         }
     }
 }
 
 impl Driver {
-    pub fn new(skip: Arc<Ignore>, cache: Option<Arc<dyn LocalCache>>) -> Self {
-        // `HEPH_FS_GLOB_CACHE=0` is a kill-switch: disable the cache entirely.
-        let cache = if std::env::var_os("HEPH_FS_GLOB_CACHE").is_some_and(|v| v == "0") {
-            None
-        } else {
-            cache
-        };
-        Self {
-            skip,
-            glob_cache: Arc::new(WalkCache::new(cache, GLOB_CACHE_NS)),
-        }
+    pub fn new(skip: Arc<Ignore>, walker: Arc<CachedWalker>) -> Self {
+        Self { skip, walker }
     }
-}
-
-#[cfg(unix)]
-fn is_exec(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_exec(_meta: &std::fs::Metadata) -> bool {
-    false
-}
-
-/// Content identity for a sourced file: a hash of its bytes plus the executable
-/// marker. Deliberately ignores size and mtime — only the content and the `x`
-/// bit determine the artifact, so a file rewritten with identical bytes (new
-/// mtime, same content) hashes the same and stays a cache hit.
-fn file_hashout(path: &std::path::Path, x: bool) -> anyhow::Result<String> {
-    use std::io::Read as _;
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("open file for hashing '{}'", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut h = Xxh3::new();
-    // Stream in chunks so large inputs never load wholesale into memory.
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("read file for hashing '{}'", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        if let Some(chunk) = buf.get(..n) {
-            h.update(chunk);
-        }
-    }
-    h.update(&[x as u8]);
-    Ok(format!("{:x}", h.digest()))
 }
 
 #[async_trait]
@@ -1072,10 +876,10 @@ impl crate::engine::driver::Driver for Driver {
                     });
                 }
 
-                let meta = std::fs::metadata(&abs)
-                    .with_context(|| format!("stat file '{}'", abs.display()))?;
-                let x = is_exec(&meta);
-                let hashout = file_hashout(&abs, x)
+                // Content hash + exec bit via the shared walker (cross-run cached).
+                let fh = self
+                    .walker
+                    .file_hash(&abs)
                     .with_context(|| format!("hash file '{}'", abs.display()))?;
 
                 let source_path = abs
@@ -1099,9 +903,9 @@ impl crate::engine::driver::Driver for Driver {
                         content: Content::File(ContentFile {
                             source_path,
                             out_path: path.clone(),
-                            x,
+                            x: fh.exec,
                         }),
-                        hashout,
+                        hashout: fh.hashout.clone(),
                     }],
                     ..Default::default()
                 })
@@ -1114,9 +918,9 @@ impl crate::engine::driver::Driver for Driver {
             } => {
                 // Within a request the tree is immutable, so the walk result for
                 // this `(root, pattern, excludes)` is memoized — repeat calls
-                // skip walkdir + per-entry stat entirely.
+                // skip even the walker round-trips.
                 let artifacts = cached_glob_walk(
-                    &self.glob_cache,
+                    &self.walker,
                     req.request_id,
                     root,
                     pattern,
@@ -1150,6 +954,7 @@ mod tests {
     use crate::engine::provider::Provider as EProvider;
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::parse_addr;
+    use crate::htwalk::file_hashout;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1202,7 +1007,14 @@ mod tests {
             positional: vec![Value::String(pattern.to_string())],
             named: Default::default(),
         };
-        let v = futures::executor::block_on(GlobFn { skip }.call(&ctx, args)).unwrap();
+        let v = futures::executor::block_on(
+            GlobFn {
+                skip,
+                walker: Arc::new(CachedWalker::disabled()),
+            }
+            .call(&ctx, args),
+        )
+        .unwrap();
         match v {
             Value::List(l) => l
                 .into_iter()
@@ -1628,12 +1440,11 @@ mod tests {
         );
     }
 
-    /// `walk_glob` returns a [`WalkSignature`] that validates the unchanged tree
-    /// (and invalidates on a content change) plus a value that reconstructs the
-    /// identical artifact set. (Signature-validation edge cases live in
-    /// `engine::walk_cache`.)
+    /// `walk_glob` matches the right files (recursively), hashes them, and skips a
+    /// codegen-stamped file. Cross-run cache mechanics are tested in
+    /// `htwalk::cached_walker`.
     #[test]
-    fn test_walk_glob_signature_and_reconstruct() {
+    fn test_walk_glob_matches_and_skips_codegen() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir(root.join("sub")).unwrap();
@@ -1643,150 +1454,61 @@ mod tests {
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
+        let walker = CachedWalker::disabled();
 
-        let key = |arts: &[OutputArtifact]| {
-            let mut v: Vec<_> = arts
-                .iter()
-                .map(|a| (a.name.clone(), a.hashout.clone()))
-                .collect();
-            v.sort();
-            v
-        };
+        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let mut names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.rs".to_string(), "sub_b.rs".to_string()]);
+        assert!(arts.iter().all(|a| !a.hashout.is_empty()));
 
-        let (arts, entry) = walk_glob(root, &compiled).unwrap();
-        let (sig, value) = entry.expect("walk over a present tree is persistable");
-        assert_eq!(arts.len(), 2, "matches a.rs + sub/b.rs, not c.txt");
-
-        // The value rebuilds the identical artifact set.
-        let rebuilt = reconstruct_glob(root, &value).expect("reconstructs");
-        assert_eq!(key(&arts), key(&rebuilt));
-
-        // The signature validates the unchanged tree, and a content change (size)
-        // invalidates it.
-        assert!(sig.is_valid(root), "unchanged tree validates");
-        fs::write(root.join("a.rs"), b"a much longer body").unwrap();
-        assert!(!sig.is_valid(root), "changed file size invalidates");
-    }
-
-    /// A file that gains the codegen provenance xattr (which bumps neither size
-    /// nor mtime, so the signature still validates) must drop out of a
-    /// reconstructed glob, matching `walk_glob`.
-    #[cfg(unix)]
-    #[test]
-    fn test_reconstruct_glob_drops_codegen_xattr() {
-        let tmp = tempdir().unwrap();
-        let root = tmp.path();
-        fs::write(root.join("gen.rs"), b"x").unwrap();
-        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
-        let compiled = compile_glob(&skip, "t", "*.rs", &[]).unwrap();
-
-        let (arts, entry) = walk_glob(root, &compiled).unwrap();
-        assert_eq!(arts.len(), 1);
-        let (_, value) = entry.unwrap();
-
-        // Stamp the codegen xattr without touching content/mtime.
-        if xattr::set(root.join("gen.rs"), CODEGEN_XATTR, b"//gen:it").is_err() {
-            return; // filesystem without xattr support — nothing to assert
-        }
-        assert!(
-            reconstruct_glob(root, &value).is_none(),
-            "a newly codegen-stamped file must invalidate the cache"
-        );
-    }
-
-    /// Minimal `LocalCache` exposing only the KV methods over an in-memory map,
-    /// so the cross-run test exercises the real `WalkCache` path without SQLite.
-    #[derive(Default)]
-    struct KvMock {
-        kv: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>,
-    }
-    impl LocalCache for KvMock {
-        fn reader(
-            &self,
-            _a: &Addr,
-            _h: &str,
-            _n: &str,
-        ) -> anyhow::Result<crate::engine::SizedReader> {
-            unimplemented!()
-        }
-        fn writer(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<Box<dyn std::io::Write>> {
-            unimplemented!()
-        }
-        fn exists(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-        fn delete(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn kv_get(&self, ns: &str, k: &str) -> anyhow::Result<Option<Vec<u8>>> {
-            Ok(self
-                .kv
-                .lock()
-                .unwrap()
-                .get(&(ns.to_owned(), k.to_owned()))
-                .cloned())
-        }
-        fn kv_list(&self, ns: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-            Ok(self
-                .kv
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|((n, _), _)| n == ns)
-                .map(|((_, k), v)| (k.clone(), v.clone()))
-                .collect())
-        }
-        fn kv_put(&self, ns: &str, k: &str, v: &[u8]) -> anyhow::Result<()> {
-            self.kv
-                .lock()
-                .unwrap()
-                .insert((ns.to_owned(), k.to_owned()), v.to_vec());
-            Ok(())
+        // A codegen-stamped file drops out of a re-walk.
+        #[cfg(unix)]
+        if xattr::set(root.join("a.rs"), CODEGEN_XATTR, b"//gen:it").is_ok() {
+            let arts = walk_glob(&walker, root, &compiled).unwrap();
+            assert_eq!(arts.len(), 1, "codegen-stamped a.rs is excluded");
         }
     }
 
-    /// End-to-end cross-run: a first driver populates the KV-backed walk cache; a
-    /// *fresh* driver sharing the same backend (simulating a new process) reuses
-    /// it for the unchanged tree, then re-walks once a file is added.
+    /// Cross-run via the shared walker: a first driver populates the fswalk db; a
+    /// fresh driver (new process) serves the unchanged tree from it, and re-walks
+    /// after a file is added.
     #[tokio::test]
-    async fn test_glob_cache_cross_run() {
+    async fn test_glob_cross_run_via_walker() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
+        // Keep the fswalk db out of the globbed tree so its writes don't bump the
+        // walked dirs' mtimes (in production it lives under the pruned `.heph3`).
+        let dbdir = tempdir().unwrap();
+        let db = dbdir.path().join("fswalk.db");
         fs::write(root.join("a.rs"), b"aaa").unwrap();
         fs::write(root.join("b.rs"), b"bbb").unwrap();
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
-        let backend: Arc<dyn LocalCache> = Arc::new(KvMock::default());
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
         let hashin = String::new();
-        let (id1, id2, id3) = (
-            "req-1".to_string(),
-            "req-2".to_string(),
-            "req-3".to_string(),
-        );
+        let (id1, id2, id3) = ("r1".to_string(), "r2".to_string(), "r3".to_string());
 
-        // First driver populates the shared KV.
         let parse_res = {
-            let driver = Driver::new(skip.clone(), Some(backend.clone()));
-            let parse_res = driver
+            let driver = Driver::new(skip.clone(), Arc::new(CachedWalker::open(&db)));
+            let pr = driver
                 .parse(make_parse_req(config), &ctoken())
                 .await
                 .unwrap();
             let first = driver
                 .run(
-                    make_run_req(&parse_res.target_def, &id1, root.to_path_buf(), &hashin),
+                    make_run_req(&pr.target_def, &id1, root.to_path_buf(), &hashin),
                     &ctoken(),
                 )
                 .await
                 .unwrap();
             assert_eq!(first.artifacts.len(), 2);
-            parse_res
+            pr
         };
 
-        // Fresh driver sharing the backend loads the entry from the KV and
-        // reconstructs the unchanged tree — same artifacts.
-        let driver2 = Driver::new(skip.clone(), Some(backend.clone()));
+        // A fresh walker reads the populated db (unchanged tree).
+        let driver2 = Driver::new(skip.clone(), Arc::new(CachedWalker::open(&db)));
         let second = driver2
             .run(
                 make_run_req(&parse_res.target_def, &id2, root.to_path_buf(), &hashin),
@@ -1796,7 +1518,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.artifacts.len(), 2);
 
-        // Adding a matching file bumps the root dir mtime → re-walk includes it.
+        // Add a file → dir mtime bumps → re-walk picks it up.
         fs::write(root.join("c.rs"), b"ccc").unwrap();
         std::fs::File::open(root)
             .unwrap()
@@ -1913,7 +1635,7 @@ mod tests {
         // The engine hands the fs plugin its skip dirs (the heph home); the walk
         // must prune that subtree.
         let skip = Arc::new(Ignore::new(&[home], &[]).unwrap());
-        let driver = Driver::new(skip, None);
+        let driver = Driver::new(skip, Arc::new(CachedWalker::disabled()));
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
@@ -1950,7 +1672,7 @@ mod tests {
         // A `fs.skip` dir from the config file (resolved to an absolute path) is
         // pruned just like the engine home.
         let skip = Arc::new(Ignore::new(&[tmp.path().join("vendor")], &[]).unwrap());
-        let driver = Driver::new(skip, None);
+        let driver = Driver::new(skip, Arc::new(CachedWalker::disabled()));
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);
@@ -1987,7 +1709,7 @@ mod tests {
         // A `fs.skip` glob (`**/node_modules/**`) excludes the whole subtree at
         // any depth — and prunes the dir so the walk never descends into it.
         let skip = Arc::new(Ignore::new(&[], &["**/node_modules/**".to_string()]).unwrap());
-        let driver = Driver::new(skip, None);
+        let driver = Driver::new(skip, Arc::new(CachedWalker::disabled()));
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("**/*".to_string()))]);

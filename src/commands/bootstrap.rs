@@ -152,7 +152,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
                 &init.skip_globs,
                 opts,
             )?
-            .with_cache(Some(init.cache.clone())),
+            .with_walker(init.walker.clone()),
         ))
     })?;
     e.register_provider_factory("go", |init, opts| {
@@ -278,7 +278,7 @@ mod tests {
                     &init.skip_globs,
                     opts,
                 )?
-                .with_cache(Some(init.cache.clone())),
+                .with_walker(init.walker.clone()),
             ))
         })?;
         e.register_managed_driver_factory("exec", |_init, opts| {
