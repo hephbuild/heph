@@ -225,7 +225,9 @@ impl ProviderFn for GlobFn {
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.
         let compiled = compile_glob(&self.skip, "heph.fs.glob", &resolved, &[])?;
-        let artifacts = walk_glob(ctx.root, &compiled)?;
+        // BUILD-time expansion: only the artifacts are needed here (the
+        // cross-run cache entry is produced for the `run`-path walk).
+        let (artifacts, _) = walk_glob(ctx.root, &compiled)?;
 
         let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
 
@@ -572,7 +574,9 @@ fn compile_glob(
     })
 }
 
-/// Walks `root` for files matching `compiled`, returning their artifacts.
+/// Walks `root` for files matching `compiled`, returning their artifacts plus a
+/// [`CachedGlobEntry`] for the cross-run cache (or `None` when the walk root is
+/// missing or an mtime is unreadable, so the result is not persistable).
 ///
 /// Starts at the pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans
 /// only `<root>/a/b`, not the whole tree. Matching uses the cached glob/exclude
@@ -580,14 +584,27 @@ fn compile_glob(
 fn walk_glob(
     root: &std::path::Path,
     compiled: &CompiledGlob,
-) -> anyhow::Result<Vec<OutputArtifact>> {
+) -> anyhow::Result<(Vec<OutputArtifact>, Option<CachedGlobEntry>)> {
     let walk_root = if compiled.prefix.is_empty() {
         root.to_path_buf()
     } else {
         root.join(&compiled.prefix)
     };
 
+    // A missing walk root is an empty match — but must not be persisted: were it
+    // cached as "empty", a later-created tree (which doesn't change any recorded
+    // dir's mtime, since none were recorded) would keep serving the stale empty
+    // set. Return `None` so every run re-walks until the root exists.
+    if std::fs::metadata(&walk_root).is_err() {
+        return Ok((vec![], None));
+    }
+
     let mut artifacts = vec![];
+    // Cross-run cache accumulation. `persistable` flips off if any mtime can't be
+    // read, in which case we never write a (possibly unverifiable) entry.
+    let mut dirs: Vec<(String, i64)> = vec![];
+    let mut files: Vec<CachedGlobFile> = vec![];
+    let mut persistable = true;
 
     let walker = walkdir::WalkDir::new(&walk_root)
         .into_iter()
@@ -617,6 +634,19 @@ fn walk_glob(
         };
 
         if entry.file_type().is_dir() {
+            // Record every descended dir's mtime: it bumps on any entry
+            // add/remove/rename, so matching all of them on a later run proves
+            // the matched file *set* is unchanged without re-reading the dir.
+            if let Ok(rel) = entry.path().strip_prefix(root) {
+                if let Some(rel) = rel.to_str() {
+                    match entry.metadata().ok().as_ref().and_then(mtime_ns) {
+                        Some(mt) => dirs.push((rel.to_owned(), mt)),
+                        None => persistable = false,
+                    }
+                } else {
+                    persistable = false;
+                }
+            }
             continue;
         }
 
@@ -664,6 +694,20 @@ fn walk_glob(
         let hashout = file_hashout(abs_path, x)
             .with_context(|| format!("hash glob entry '{}'", abs_path.display()))?;
 
+        // Cross-run cache: record (size, mtime) so a later run can validate this
+        // file's content without re-reading it. A missing mtime makes the whole
+        // walk non-persistable.
+        match mtime_ns(&meta) {
+            Some(mt) => files.push(CachedGlobFile {
+                rel: rel_str.to_string(),
+                x,
+                size: meta.len(),
+                mtime_ns: mt,
+                hashout: hashout.clone(),
+            }),
+            None => persistable = false,
+        }
+
         // Materialize the owned strings that borrow `abs_path`/`rel_str` *before*
         // consuming `entry` for `source_path` below — the borrows end here.
         let out_path = rel_str.to_string();
@@ -697,13 +741,222 @@ fn walk_glob(
         });
     }
 
-    Ok(artifacts)
+    let entry = if persistable {
+        Some(CachedGlobEntry {
+            version: GLOB_CACHE_VERSION,
+            dirs,
+            files,
+        })
+    } else {
+        None
+    };
+    Ok((artifacts, entry))
 }
 
-/// Returns the glob walk artifacts for `(root, pattern, exclude)`, memoizing
-/// across calls within `request_id`. The first call walks; repeats reuse the
-/// cached `Arc`.
+// ── Persistent cross-run glob cache ──────────────────────────────────────────
+//
+// fs-glob targets are `CacheConfig::off()`, so the engine re-walks the tree on
+// every run (walkdir + per-entry stat + per-file open/read/hash). This sidecar
+// memoizes a walk's result per `(root, pattern, exclude)` *across* runs,
+// validated by directory mtimes (the matched file *set*) and per-file
+// `(size, mtime)` (file *content*). A full match reconstructs the artifacts with
+// only stat syscalls — no readdir, no file opens, no reads, no hashing.
+//
+// `mtime+size` is a fast-path proxy for content identity; heph otherwise hashes
+// content precisely, so a same-size in-place rewrite within the filesystem's
+// mtime granularity can be missed (accepted tradeoff). Correct-by-fallback: any
+// IO/decode/validation mismatch falls through to a full walk, and the whole
+// layer is disabled with `HEPH_FS_GLOB_CACHE=0`.
+
+const GLOB_CACHE_VERSION: u32 = 1;
+
+#[derive(Clone, borsh::BorshSerialize, borsh::BorshDeserialize)]
+struct CachedGlobFile {
+    /// Path relative to the tree root. `source = root/rel`, `out_path = rel`,
+    /// `name = rel.replace('/', "_")` — mirrors `walk_glob`'s artifact build.
+    rel: String,
+    x: bool,
+    size: u64,
+    mtime_ns: i64,
+    hashout: String,
+}
+
+#[derive(Clone, borsh::BorshSerialize, borsh::BorshDeserialize)]
+struct CachedGlobEntry {
+    version: u32,
+    /// (dir rel-to-root, mtime_ns) for every directory descended during the walk.
+    dirs: Vec<(String, i64)>,
+    files: Vec<CachedGlobFile>,
+}
+
+/// Nanoseconds since the unix epoch for `meta`'s mtime, or `None` if unreadable.
+fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
+    let t = meta.modified().ok()?;
+    let d = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(d.as_nanos()).ok()
+}
+
+/// On-disk format for the single-file glob cache sidecar.
+#[derive(Default, borsh::BorshSerialize, borsh::BorshDeserialize)]
+struct GlobStoreFile {
+    version: u32,
+    entries: Vec<(String, CachedGlobEntry)>,
+}
+
+/// Process-lifetime, single-file cache of glob walk results, shared by the fs
+/// `Driver`. Backed by one `<root>/.heph3/cache/fsglob.bin` sidecar loaded once
+/// and flushed on `Driver` drop — a single open/read amortized over every glob
+/// target, instead of one cache file (one `open`) per target.
+#[derive(Default)]
+struct GlobStore {
+    inner: parking_lot::Mutex<GlobStoreInner>,
+}
+
+#[derive(Default)]
+struct GlobStoreInner {
+    /// Sidecar path; empty until the first walk sets it from the tree root.
+    path: std::path::PathBuf,
+    /// Whether the sidecar has been loaded (or loading was disabled).
+    loaded: bool,
+    /// Set when `map` holds inserts not yet persisted.
+    dirty: bool,
+    /// Disabled (no read, no write) via `HEPH_FS_GLOB_CACHE=0`.
+    enabled: bool,
+    map: FxHashMap<String, Arc<CachedGlobEntry>>,
+}
+
+/// Read + decode the glob sidecar at `path`, or `None` on any IO/decode/version
+/// mismatch (⇒ start empty).
+fn load_glob_sidecar(path: &std::path::Path) -> Option<FxHashMap<String, Arc<CachedGlobEntry>>> {
+    let bytes = std::fs::read(path).ok()?;
+    let file: GlobStoreFile = borsh::from_slice(&bytes).ok()?;
+    (file.version == GLOB_CACHE_VERSION).then(|| {
+        file.entries
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect()
+    })
+}
+
+impl GlobStore {
+    /// Load the sidecar on first use, deriving its path from the tree `root`.
+    /// Holding the lock across the read serializes the (one-time) load.
+    fn ensure_loaded(&self, root: &std::path::Path) {
+        let mut inner = self.inner.lock();
+        if inner.loaded {
+            return;
+        }
+        inner.loaded = true;
+        inner.enabled = std::env::var_os("HEPH_FS_GLOB_CACHE").is_none_or(|v| v != "0");
+        if !inner.enabled {
+            return;
+        }
+        inner.path = root.join(".heph3").join("cache").join("fsglob.bin");
+        if let Some(map) = load_glob_sidecar(&inner.path) {
+            inner.map = map;
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<Arc<CachedGlobEntry>> {
+        self.inner.lock().map.get(key).cloned()
+    }
+
+    fn insert(&self, key: String, entry: CachedGlobEntry) {
+        let mut inner = self.inner.lock();
+        if !inner.enabled {
+            return;
+        }
+        inner.map.insert(key, Arc::new(entry));
+        inner.dirty = true;
+    }
+
+    /// Persist the map to its sidecar (temp + atomic rename). Best-effort, called
+    /// on `Driver` drop; a no-op when nothing changed (e.g. a pure cache-hit run).
+    fn flush(&self) {
+        let mut inner = self.inner.lock();
+        if !inner.dirty || inner.path.as_os_str().is_empty() {
+            return;
+        }
+        let file = GlobStoreFile {
+            version: GLOB_CACHE_VERSION,
+            entries: inner
+                .map
+                .iter()
+                .map(|(k, v)| (k.clone(), (**v).clone()))
+                .collect(),
+        };
+        let Some(parent) = inner.path.parent().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        if std::fs::create_dir_all(&parent).is_err() {
+            return;
+        }
+        let Ok(bytes) = borsh::to_vec(&file) else {
+            return;
+        };
+        let tmp = inner
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            if std::fs::rename(&tmp, &inner.path).is_ok() {
+                inner.dirty = false;
+            } else {
+                drop(std::fs::remove_file(&tmp));
+            }
+        }
+    }
+}
+
+/// Validate `entry` against the current tree; on a full match reconstruct the
+/// artifacts. Returns `None` (⇒ caller re-walks) on any mismatch.
+fn reconstruct_glob(
+    root: &std::path::Path,
+    entry: &CachedGlobEntry,
+) -> Option<Vec<OutputArtifact>> {
+    // Set check: every walked dir's mtime must match. An added/removed/renamed
+    // entry bumps its parent dir's mtime, so this proves the file set is intact.
+    for (rel, mt) in &entry.dirs {
+        let meta = std::fs::metadata(root.join(rel)).ok()?;
+        if !meta.is_dir() || mtime_ns(&meta) != Some(*mt) {
+            return None;
+        }
+    }
+    let mut artifacts = Vec::with_capacity(entry.files.len());
+    for f in &entry.files {
+        let abs = root.join(&f.rel);
+        let meta = std::fs::metadata(&abs).ok()?;
+        // Content check: size + mtime. An in-place edit changes at least the
+        // mtime (and bumps no parent dir), so this is load-bearing.
+        if meta.is_dir() || meta.len() != f.size || mtime_ns(&meta) != Some(f.mtime_ns) {
+            return None;
+        }
+        // A file that gained the codegen xattr (which bumps neither size nor
+        // mtime) must drop out, matching `walk_glob`.
+        if has_codegen_xattr(&abs) {
+            return None;
+        }
+        let source_path = abs.into_os_string().into_string().ok()?;
+        artifacts.push(OutputArtifact {
+            group: String::new(),
+            name: f.rel.replace('/', "_"),
+            r#type: Type::Output,
+            content: Content::File(ContentFile {
+                source_path,
+                out_path: f.rel.clone(),
+                x: f.x,
+            }),
+            hashout: f.hashout.clone(),
+        });
+    }
+    Some(artifacts)
+}
+
+/// Returns the glob walk artifacts for `(root, pattern, exclude)`. Within a
+/// request the result is memoized (the tree is immutable mid-request); across
+/// runs it is served from `store` (the single-file sidecar) when the tree is
+/// unchanged. The first uncached call walks the tree.
 fn cached_glob_walk(
+    store: &GlobStore,
     request_id: &str,
     root: &std::path::Path,
     pattern: &str,
@@ -724,7 +977,22 @@ fn cached_glob_walk(
         return Ok(a.clone());
     }
 
-    let artifacts = Arc::new(walk_glob(root, compiled)?);
+    // Cross-run persistent cache: on a full validation hit, reconstruct without
+    // touching the directory tree beyond stat. On a miss, walk and record.
+    store.ensure_loaded(root);
+    let artifacts = match store
+        .get(&key)
+        .and_then(|entry| reconstruct_glob(root, &entry))
+    {
+        Some(arts) => Arc::new(arts),
+        None => {
+            let (arts, entry) = walk_glob(root, compiled)?;
+            if let Some(entry) = entry {
+                store.insert(key.clone(), entry);
+            }
+            Arc::new(arts)
+        }
+    };
 
     Ok(glob_result_cache()
         .write()
@@ -739,11 +1007,24 @@ fn cached_glob_walk(
 pub struct Driver {
     /// Engine-owned + built-in dirs pruned during glob walks.
     skip: Arc<Ignore>,
+    /// Cross-run glob walk cache, flushed to disk when the driver drops.
+    glob_store: Arc<GlobStore>,
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        // Persist any new glob walk results gathered this run. A pure cache-hit
+        // run leaves the store clean, so this is a no-op there.
+        self.glob_store.flush();
+    }
 }
 
 impl Driver {
     pub fn new(skip: Arc<Ignore>) -> Self {
-        Self { skip }
+        Self {
+            skip,
+            glob_store: Arc::default(),
+        }
     }
 }
 
@@ -967,7 +1248,14 @@ impl crate::engine::driver::Driver for Driver {
                 // Within a request the tree is immutable, so the walk result for
                 // this `(root, pattern, excludes)` is memoized — repeat calls
                 // skip walkdir + per-entry stat entirely.
-                let artifacts = cached_glob_walk(req.request_id, root, pattern, exclude, compiled)?;
+                let artifacts = cached_glob_walk(
+                    &self.glob_store,
+                    req.request_id,
+                    root,
+                    pattern,
+                    exclude,
+                    compiled,
+                )?;
 
                 Ok(RunResponse {
                     artifacts: (*artifacts).clone(),
@@ -1471,6 +1759,161 @@ mod tests {
             before, after,
             "mtime change must not affect the content hash"
         );
+    }
+
+    /// The persistent glob cache must reconstruct an unchanged tree's artifacts
+    /// and reject every kind of change: a file's content (size/mtime), the file
+    /// *set* (a recorded dir's mtime), and a freshly-stamped codegen xattr.
+    #[test]
+    fn test_glob_cache_reconstruct_and_invalidation() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("a.rs"), b"aaa").unwrap();
+        fs::write(root.join("sub").join("b.rs"), b"bbbb").unwrap();
+        fs::write(root.join("c.txt"), b"ignored").unwrap();
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
+
+        let key = |arts: &[OutputArtifact]| {
+            let mut v: Vec<_> = arts
+                .iter()
+                .map(|a| (a.name.clone(), a.hashout.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        let (arts, entry) = walk_glob(root, &compiled).unwrap();
+        let entry = entry.expect("walk over a present tree is persistable");
+        assert_eq!(arts.len(), 2, "matches a.rs + sub/b.rs, not c.txt");
+
+        // Unchanged tree → reconstruct yields the identical artifact set.
+        let rebuilt = reconstruct_glob(root, &entry).expect("unchanged tree reconstructs");
+        assert_eq!(key(&arts), key(&rebuilt));
+
+        // Content change: rewrite a.rs with a different size → must invalidate.
+        fs::write(root.join("a.rs"), b"a much longer body").unwrap();
+        assert!(
+            reconstruct_glob(root, &entry).is_none(),
+            "a changed file size must invalidate the cache"
+        );
+        fs::write(root.join("a.rs"), b"aaa").unwrap(); // restore size; mtime moved
+
+        // Set change: bump a recorded dir's mtime (simulating an add/remove/rename
+        // in it) → must invalidate even though no recorded file changed.
+        let (_, fresh) = walk_glob(root, &compiled).unwrap();
+        let fresh = fresh.expect("persistable");
+        let dir_handle = std::fs::File::open(root.join("sub")).unwrap();
+        dir_handle
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
+            .unwrap();
+        assert!(
+            reconstruct_glob(root, &fresh).is_none(),
+            "a bumped directory mtime must invalidate the cache"
+        );
+    }
+
+    /// A file that gains the codegen provenance xattr (which bumps neither size
+    /// nor mtime) must drop out of a reconstructed glob, matching `walk_glob`.
+    #[cfg(unix)]
+    #[test]
+    fn test_glob_cache_reconstruct_drops_codegen_xattr() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("gen.rs"), b"x").unwrap();
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "*.rs", &[]).unwrap();
+
+        let (arts, entry) = walk_glob(root, &compiled).unwrap();
+        assert_eq!(arts.len(), 1);
+        let entry = entry.unwrap();
+
+        // Stamp the codegen xattr without touching content/mtime.
+        if xattr::set(root.join("gen.rs"), CODEGEN_XATTR, b"//gen:it").is_err() {
+            return; // filesystem without xattr support — nothing to assert
+        }
+        assert!(
+            reconstruct_glob(root, &entry).is_none(),
+            "a newly codegen-stamped file must invalidate the cache"
+        );
+    }
+
+    /// End-to-end cross-run persistence: a first driver populates and (on drop)
+    /// flushes the single-file sidecar; a *fresh* driver loads it from disk and
+    /// reuses it for the unchanged tree, then re-walks once a file is added.
+    /// `.heph3` is pruned, so writing the sidecar never self-invalidates a
+    /// recorded directory.
+    #[tokio::test]
+    async fn test_glob_cache_cross_run() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let home = root.join(".heph3");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(root.join("a.rs"), b"aaa").unwrap();
+        fs::write(root.join("b.rs"), b"bbb").unwrap();
+
+        let skip = Arc::new(Ignore::new(&[home], &[]).unwrap());
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
+        let hashin = String::new();
+        let (id1, id2, id3) = (
+            "req-1".to_string(),
+            "req-2".to_string(),
+            "req-3".to_string(),
+        );
+
+        // First driver: walk + populate, then drop to flush the sidecar.
+        let parse_res = {
+            let driver = Driver::new(skip.clone());
+            let parse_res = driver
+                .parse(make_parse_req(config), &ctoken())
+                .await
+                .unwrap();
+            let first = driver
+                .run(
+                    make_run_req(&parse_res.target_def, &id1, root.to_path_buf(), &hashin),
+                    &ctoken(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(first.artifacts.len(), 2);
+            parse_res
+        }; // driver dropped here → flush
+
+        let sidecar = root.join(".heph3").join("cache").join("fsglob.bin");
+        assert!(
+            sidecar.exists(),
+            "dropping the driver persists the single-file glob sidecar"
+        );
+
+        // Fresh driver loads the sidecar from disk and reconstructs the unchanged
+        // tree without re-walking — same artifacts.
+        let driver2 = Driver::new(skip.clone());
+        let second = driver2
+            .run(
+                make_run_req(&parse_res.target_def, &id2, root.to_path_buf(), &hashin),
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.artifacts.len(), 2);
+
+        // Adding a matching file bumps the root dir mtime → re-walk includes it.
+        fs::write(root.join("c.rs"), b"ccc").unwrap();
+        std::fs::File::open(root)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
+            .unwrap();
+        let third = driver2
+            .run(
+                make_run_req(&parse_res.target_def, &id3, root.to_path_buf(), &hashin),
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.artifacts.len(), 3, "newly added c.rs is picked up");
     }
 
     /// A glob over a tree containing a symlink-to-dir (matching the pattern) and a
