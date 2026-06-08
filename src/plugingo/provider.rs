@@ -138,9 +138,47 @@ struct ImportClosureKey {
 /// transitive closure, in topological order (deps before dependents). Composing
 /// multiple `ImportClosure`s requires de-duplication by `import_path` at the
 /// composition site (see `compose_closures`).
+///
+/// Import paths are `Arc<str>` so that composing a node's closure from its
+/// children's closures (which copies every transitive entry, at every node — an
+/// O(closure-size) copy per node) is a refcount bump rather than a String
+/// heap-allocation+copy. The flattened result is converted to owned `String`s
+/// once, at the top of `collect_libs_inner`.
 #[derive(Debug, Clone, Default)]
 struct ImportClosure {
-    libs: Vec<(String, Addr)>,
+    libs: Vec<(Arc<str>, Addr)>,
+}
+
+/// Flatten already-deps-first-deduped `sub_closures` into one deps-first list,
+/// deduped by import_path, with `self_lib` (if any) appended last. Shared by
+/// `import_closure` (composing a node from its children's closures) and
+/// `collect_libs_inner` (composing the transitive set from the root imports).
+///
+/// Import paths are `Arc<str>`, so re-listing a child's transitive entries here —
+/// which happens at *every* node, an O(closure-size) copy per node — is a refcount
+/// bump rather than a String heap-copy. The dedup set and result are pre-sized to
+/// the summed child closure size (+ self).
+fn compose_closures(
+    sub_closures: &[Arc<ImportClosure>],
+    self_lib: Option<(Arc<str>, Addr)>,
+) -> Vec<(Arc<str>, Addr)> {
+    let extra = self_lib.is_some() as usize;
+    let cap = sub_closures.iter().map(|s| s.libs.len()).sum::<usize>() + extra;
+    let mut seen: HashSet<Arc<str>> = HashSet::with_capacity(cap);
+    let mut libs: Vec<(Arc<str>, Addr)> = Vec::with_capacity(cap);
+    for sub in sub_closures {
+        for (ip, addr) in &sub.libs {
+            if seen.insert(Arc::clone(ip)) {
+                libs.push((Arc::clone(ip), addr.clone()));
+            }
+        }
+    }
+    if let Some((ip, addr)) = self_lib
+        && seen.insert(Arc::clone(&ip))
+    {
+        libs.push((ip, addr));
+    }
+    libs
 }
 
 impl Provider {
@@ -1901,22 +1939,11 @@ impl ProviderInner {
                     )
                     .await?;
 
-                    // Deps first, then self. Dedup by import_path across all
-                    // sub-closures so a diamond dependency only shows once.
-                    let mut seen: HashSet<String> = HashSet::new();
-                    let mut libs: Vec<(String, Addr)> = Vec::new();
-                    for sub in &sub_closures {
-                        for (ip, addr) in &sub.libs {
-                            if seen.insert(ip.clone()) {
-                                libs.push((ip.clone(), addr.clone()));
-                            }
-                        }
-                    }
-                    if let Some(addr) = dep_addr_opt
-                        && seen.insert(resolved_path.clone())
-                    {
-                        libs.push((resolved_path, addr));
-                    }
+                    // Deps first, then self (deduped by import_path so a diamond
+                    // dependency only shows once).
+                    let self_lib =
+                        dep_addr_opt.map(|addr| (Arc::<str>::from(resolved_path), addr));
+                    let libs = compose_closures(&sub_closures, self_lib);
 
                     anyhow::Ok(Arc::new(ImportClosure { libs }))
                 }),
@@ -1961,17 +1988,13 @@ impl ProviderInner {
             }))
             .await?;
 
-            // Compose: deps-first order, dedup by import_path across all
-            // sub-closures (each sub-closure is itself deps-first deduped).
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut libs: Vec<(String, Addr)> = Vec::new();
-            for sub in &sub_closures {
-                for (ip, addr) in &sub.libs {
-                    if seen.insert(ip.clone()) {
-                        libs.push((ip.clone(), addr.clone()));
-                    }
-                }
-            }
+            // Compose the root sub-closures into one deps-first deduped set, then
+            // materialize owned `String`s once for `TransitiveDeps` — O(closure)
+            // String allocations total rather than O(closure) per node.
+            let libs = compose_closures(&sub_closures, None)
+                .into_iter()
+                .map(|(ip, addr)| (ip.to_string(), addr))
+                .collect();
             return Ok(TransitiveDeps { libs });
         }
 
@@ -2588,6 +2611,48 @@ mod tests {
             "core dir not pruned"
         );
         assert!(!pkgs.contains(&"internal".to_string()), "glob not pruned");
+    }
+
+    #[test]
+    fn compose_closures_dedups_diamond_and_keeps_deps_first() {
+        // T1.3 froze the closure-composition contract while switching import paths
+        // to `Arc<str>`: children's transitive libs come first, a diamond dep
+        // appears once (first-seen wins), and the composing node's own lib is
+        // appended last. `import_closure` and `collect_libs_inner` both route
+        // through `compose_closures`, so this freezes both.
+        let mk = |ip: &str| {
+            (
+                Arc::<str>::from(ip),
+                Addr::new(PkgBuf::from("p"), format!("lib_{ip}"), Default::default()),
+            )
+        };
+        // Diamond: top → {left, right}; left → shared; right → shared.
+        let left = Arc::new(ImportClosure {
+            libs: vec![mk("shared"), mk("left")],
+        });
+        let right = Arc::new(ImportClosure {
+            libs: vec![mk("shared"), mk("right")],
+        });
+
+        let composed = compose_closures(&[left, right], Some(mk("top")));
+        let ips: Vec<&str> = composed.iter().map(|(ip, _)| ip.as_ref()).collect();
+        assert_eq!(
+            ips,
+            ["shared", "left", "right", "top"],
+            "deps-first, diamond 'shared' deduped to its first occurrence, self last"
+        );
+
+        // Without a self lib (the `collect_libs_inner` shape), only the merged,
+        // deduped child set remains.
+        let a = Arc::new(ImportClosure {
+            libs: vec![mk("x"), mk("y")],
+        });
+        let b = Arc::new(ImportClosure {
+            libs: vec![mk("y"), mk("z")],
+        });
+        let merged = compose_closures(&[a, b], None);
+        let ips: Vec<&str> = merged.iter().map(|(ip, _)| ip.as_ref()).collect();
+        assert_eq!(ips, ["x", "y", "z"], "diamond 'y' deduped, order preserved");
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {
