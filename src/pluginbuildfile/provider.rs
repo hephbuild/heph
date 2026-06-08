@@ -1,16 +1,14 @@
-use crate::engine::LocalCache;
 use crate::engine::provider::GetError::NotFound;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
-use crate::engine::walk_cache::{WalkCache, WalkSignature};
 use crate::hasync::Cancellable;
 use crate::hmemoizer::Memoizer;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
-use crate::htwalk::Ignore;
+use crate::htwalk::{CachedWalker, Ignore};
 use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use enclose::enclose;
@@ -57,12 +55,13 @@ pub struct Provider {
     /// Lazily-built Starlark globals (built from `function_registry` on first eval),
     /// shared with every `BuildFileLoader` so the namespace is built at most once.
     pub(crate) globals: Arc<OnceLock<Globals>>,
-    /// Cross-run cache of the package-discovery walk, validated by directory
-    /// mtimes only (a BUILD file's *contents* don't change the package set —
-    /// that's handled by `pkg_cache`). Disabled until [`with_cache`] is called.
+    /// Shared cross-run filesystem-walk cache. The package-discovery walk reads
+    /// directories through it, so an unchanged tree skips `readdir` entirely (a
+    /// BUILD file's *contents* don't change the package set — that's handled by
+    /// `pkg_cache`). Disabled until [`with_walker`] is called.
     ///
-    /// [`with_cache`]: Provider::with_cache
-    pub(crate) packages_walk_cache: Arc<WalkCache<Vec<String>>>,
+    /// [`with_walker`]: Provider::with_walker
+    pub(crate) walker: Arc<CachedWalker>,
 }
 
 impl Default for Provider {
@@ -79,13 +78,10 @@ impl Default for Provider {
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             function_registry: OnceLock::new(),
             globals: Arc::new(OnceLock::new()),
-            packages_walk_cache: Arc::new(WalkCache::new(None, PACKAGES_CACHE_NS)),
+            walker: Arc::new(CachedWalker::disabled()),
         }
     }
 }
-
-/// KV namespace for the buildfile package-discovery walk cache.
-const PACKAGES_CACHE_NS: &str = "pluginbuildfile.packages";
 
 impl Provider {
     pub fn new(root: std::path::PathBuf) -> Self {
@@ -95,11 +91,11 @@ impl Provider {
         }
     }
 
-    /// Enable the cross-run package-discovery cache backed by `cache`'s KV store.
-    /// Without this the provider re-walks the tree to discover packages on every
-    /// run (the in-process `packages_cache` only dedupes within one run).
-    pub fn with_cache(mut self, cache: Option<Arc<dyn LocalCache>>) -> Self {
-        self.packages_walk_cache = Arc::new(WalkCache::new(cache, PACKAGES_CACHE_NS));
+    /// Use `walker` (the shared cross-run fs-walk cache) for package discovery, so
+    /// an unchanged tree skips `readdir`. Without it the provider walks the tree
+    /// live every run (the in-process `packages_cache` only dedupes within a run).
+    pub fn with_walker(mut self, walker: Arc<CachedWalker>) -> Self {
+        self.walker = walker;
         self
     }
 
@@ -143,70 +139,35 @@ impl Provider {
     }
 }
 
-/// Stable cross-run cache key for a package-discovery walk: the (sorted) build
-/// file patterns and skip globs that determine which dirs are visited and which
-/// count as packages. `root` is not included — it's the validation reference.
-fn packages_cache_key(patterns: &[glob::Pattern], skip: &Ignore) -> String {
-    let mut pats: Vec<&str> = patterns.iter().map(glob::Pattern::as_str).collect();
-    pats.sort_unstable();
-    let mut globs: Vec<&str> = skip.globs().iter().map(String::as_str).collect();
-    globs.sort_unstable();
-    format!("{}\u{1}{}", pats.join(","), globs.join(","))
-}
-
+/// Recursively discover packages under `path`, reading each directory through
+/// the shared [`CachedWalker`] (so an unchanged tree skips `readdir`). Filtering
+/// (build-file pattern, skip-dir pruning) is applied here.
 fn find_packages_sync(
+    walker: &CachedWalker,
     path: &std::path::Path,
     root: &std::path::Path,
     patterns: &[glob::Pattern],
     skip: &Ignore,
     packages: &mut std::collections::HashSet<String>,
-    sig: &mut WalkSignature,
-    persistable: &mut bool,
 ) -> anyhow::Result<()> {
-    // Record this directory's mtime for the cross-run cache: it bumps on any
-    // entry add/remove/rename, so matching every descended dir proves the package
-    // set is unchanged without re-reading the tree.
-    match (
-        path.strip_prefix(root).ok().and_then(|r| r.to_str()),
-        std::fs::metadata(path).ok(),
-    ) {
-        (Some(rel), Some(meta)) if meta.is_dir() => {
-            if !sig.push_dir(rel, &meta) {
-                *persistable = false;
-            }
-        }
-        _ => *persistable = false,
-    }
-
+    let listing = walker.read_dir(path)?;
     let mut has_build_file = false;
-    for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
-        let entry = entry?;
-        let Ok(ft) = entry.file_type() else { continue };
-        let entry_path = entry.path();
-
-        if ft.is_file() {
-            if entry_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| patterns.iter().any(|p| p.matches(n)))
-                .unwrap_or(false)
-            {
-                has_build_file = true;
+    for entry in &listing.entries {
+        match entry.kind {
+            crate::htwalk::EntryKind::File | crate::htwalk::EntryKind::Symlink => {
+                if patterns.iter().any(|p| p.matches(&entry.name)) {
+                    has_build_file = true;
+                }
             }
-        } else if ft.is_dir() {
-            let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
-            if skip.prune_dir(&entry_path, rel) {
-                continue;
+            crate::htwalk::EntryKind::Dir => {
+                let entry_path = path.join(&entry.name);
+                let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
+                if skip.prune_dir(&entry_path, rel) {
+                    continue;
+                }
+                find_packages_sync(walker, &entry_path, root, patterns, skip, packages)?;
             }
-            find_packages_sync(
-                &entry_path,
-                root,
-                patterns,
-                skip,
-                packages,
-                sig,
-                persistable,
-            )?;
+            crate::htwalk::EntryKind::Other => {}
         }
     }
 
@@ -284,25 +245,13 @@ impl EProvider for Provider {
                 .packages_cache
                 .once(
                     (),
-                    enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip, self.packages_walk_cache => walk_cache) move || async move {
+                    enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip, self.walker => walker) move || async move {
                         let packages = crate::process_supervisor::block_or_inline(move || {
-                            let key = packages_cache_key(&patterns, &skip);
-                            // Cross-run cache hit: the directory set is unchanged.
-                            if let Some(pkgs) = walk_cache.get(&key, &root) {
-                                return Ok::<_, anyhow::Error>(pkgs);
-                            }
+                            // Recursion reads dirs through the shared walker, so an
+                            // unchanged tree is served from the cross-run fswalk cache.
                             let mut packages = std::collections::HashSet::new();
-                            let mut sig = WalkSignature::default();
-                            let mut persistable = true;
-                            find_packages_sync(
-                                &root, &root, &patterns, &skip,
-                                &mut packages, &mut sig, &mut persistable,
-                            )?;
-                            let pkgs: Vec<String> = packages.into_iter().collect();
-                            if persistable {
-                                walk_cache.insert(key, sig, pkgs.clone());
-                            }
-                            Ok(pkgs)
+                            find_packages_sync(&walker, &root, &root, &patterns, &skip, &mut packages)?;
+                            Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
                         })?;
                         Ok(Arc::new(packages))
                     }),
@@ -411,69 +360,23 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    /// Minimal `LocalCache` exposing only the KV methods over an in-memory map.
-    #[derive(Default)]
-    struct KvMock {
-        kv: Mutex<HashMap<(String, String), Vec<u8>>>,
-    }
-    impl LocalCache for KvMock {
-        fn reader(
-            &self,
-            _a: &Addr,
-            _h: &str,
-            _n: &str,
-        ) -> anyhow::Result<crate::engine::SizedReader> {
-            unimplemented!()
-        }
-        fn writer(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<Box<dyn std::io::Write>> {
-            unimplemented!()
-        }
-        fn exists(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-        fn delete(&self, _a: &Addr, _h: &str, _n: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn kv_get(&self, ns: &str, k: &str) -> anyhow::Result<Option<Vec<u8>>> {
-            Ok(self
-                .kv
-                .lock()
-                .unwrap()
-                .get(&(ns.to_owned(), k.to_owned()))
-                .cloned())
-        }
-        fn kv_list(&self, ns: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-            Ok(self
-                .kv
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|((n, _), _)| n == ns)
-                .map(|((_, k), v)| (k.clone(), v.clone()))
-                .collect())
-        }
-        fn kv_put(&self, ns: &str, k: &str, v: &[u8]) -> anyhow::Result<()> {
-            self.kv
-                .lock()
-                .unwrap()
-                .insert((ns.to_owned(), k.to_owned()), v.to_vec());
-            Ok(())
-        }
-    }
-
-    /// Package discovery is cached across runs: a fresh provider sharing the KV
-    /// reuses the discovered set for an unchanged tree, and a newly-added package
-    /// (which bumps a recorded dir's mtime) is re-discovered.
+    /// Package discovery is cached across runs through the shared walker: a fresh
+    /// provider sharing the fswalk db reuses the discovered set for an unchanged
+    /// tree, and a newly-added package (which bumps a recorded dir's mtime) is
+    /// re-discovered.
     #[tokio::test]
     async fn test_list_packages_cross_run_cache() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
+        // fswalk db outside the walked tree (in production it's under pruned
+        // `.heph3`), so its writes don't bump the discovered dirs' mtimes.
+        let dbdir = tempdir().unwrap();
+        let db = dbdir.path().join("fswalk.db");
         fs::write(root.join("BUILD"), "").unwrap();
         let a = root.join("a");
         fs::create_dir_all(&a).unwrap();
         fs::write(a.join("BUILD"), "").unwrap();
 
-        let backend: Arc<dyn LocalCache> = Arc::new(KvMock::default());
         let list = |p: Provider| async move {
             let ctoken = StdCancellationToken::new();
             let res = p
@@ -489,22 +392,25 @@ mod tests {
             v.sort();
             v
         };
+        let provider = || {
+            Provider {
+                root: root.to_path_buf(),
+                ..Provider::default()
+            }
+            .with_walker(Arc::new(CachedWalker::open(&db)))
+        };
 
-        let p1 = Provider {
-            root: root.to_path_buf(),
-            ..Provider::default()
-        }
-        .with_cache(Some(backend.clone()));
-        assert_eq!(list(p1).await, vec!["".to_string(), "a".to_string()]);
+        assert_eq!(
+            list(provider()).await,
+            vec!["".to_string(), "a".to_string()]
+        );
 
-        // Fresh provider sharing the KV (simulates a new run) → same set, served
-        // from the cross-run cache for the unchanged tree.
-        let p2 = Provider {
-            root: root.to_path_buf(),
-            ..Provider::default()
-        }
-        .with_cache(Some(backend.clone()));
-        assert_eq!(list(p2).await, vec!["".to_string(), "a".to_string()]);
+        // Fresh provider sharing the walker db (new run) → same set, served from
+        // the cross-run readdir cache for the unchanged tree.
+        assert_eq!(
+            list(provider()).await,
+            vec!["".to_string(), "a".to_string()]
+        );
 
         // Add a new package; bump root mtime so the recorded dir invalidates.
         let b = root.join("b");
@@ -515,13 +421,8 @@ mod tests {
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
             .unwrap();
 
-        let p3 = Provider {
-            root: root.to_path_buf(),
-            ..Provider::default()
-        }
-        .with_cache(Some(backend.clone()));
         assert_eq!(
-            list(p3).await,
+            list(provider()).await,
             vec!["".to_string(), "a".to_string(), "b".to_string()],
             "a newly-added package is re-discovered"
         );

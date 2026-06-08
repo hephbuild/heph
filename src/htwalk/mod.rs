@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wax::{Any, Glob, Program as _};
 
+pub mod cached_walker;
+pub use cached_walker::{CachedWalker, DirEntry, DirListing, EntryKind, FileHash, file_hashout};
+
 /// Directory + glob ignore rules for a filesystem walk. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Ignore {

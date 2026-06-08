@@ -125,23 +125,6 @@ pub trait LocalCache: Send + Sync {
     ) -> anyhow::Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
         Ok(None)
     }
-
-    // ── Namespaced key→blob store ────────────────────────────────────────────
-    //
-    // A general scratch store, separate from the (addr, hashin, name) artifact
-    // space, used for cross-run plugin state such as filesystem-walk caches
-    // (see `crate::engine::walk_cache`). Defaults are no-ops so only the durable
-    // backend (and its fronting tiers) need implement it; a no-op backend simply
-    // makes those caches always miss (correctness-neutral).
-    fn kv_get(&self, _ns: &str, _k: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-    fn kv_list(&self, _ns: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-        Ok(Vec::new())
-    }
-    fn kv_put(&self, _ns: &str, _k: &str, _v: &[u8]) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
