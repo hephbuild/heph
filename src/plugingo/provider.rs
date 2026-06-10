@@ -8,7 +8,7 @@ use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::{Value, parse_strings};
-use crate::htwalk::Ignore;
+use crate::htwalk::{CachedWalker, EntryKind, Ignore};
 use crate::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
@@ -53,6 +53,12 @@ pub struct Config {
     /// correctness crutch — tests that exercise the engine's containment path
     /// turn it off.
     pub foreign_name_guard: bool,
+    /// Shared cross-run filesystem-walk cache. `collect_go_packages` reads each
+    /// directory through it, so an unchanged tree skips `readdir` (package
+    /// identity depends only on the directory layout, which the walker caches by
+    /// mtime). Disabled by default — unit tests that build a bare provider walk
+    /// live; the engine injects the real shared walker via `from_options`.
+    pub walker: Arc<CachedWalker>,
 }
 
 impl Default for Config {
@@ -61,6 +67,7 @@ impl Default for Config {
             go_bin_addr: DEFAULT_GO_BIN_ADDR.to_string(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
+            walker: Arc::new(CachedWalker::disabled()),
         }
     }
 }
@@ -81,6 +88,8 @@ pub(crate) struct ProviderInner {
     go_bin_addr: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
+    /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
+    walker: Arc<CachedWalker>,
     /// See [`Config::foreign_name_guard`].
     foreign_name_guard: bool,
     /// Cache: golist addr → parsed GoPackage. Memoizes the artifact parse only;
@@ -138,9 +147,47 @@ struct ImportClosureKey {
 /// transitive closure, in topological order (deps before dependents). Composing
 /// multiple `ImportClosure`s requires de-duplication by `import_path` at the
 /// composition site (see `compose_closures`).
+///
+/// Import paths are `Arc<str>` so that composing a node's closure from its
+/// children's closures (which copies every transitive entry, at every node — an
+/// O(closure-size) copy per node) is a refcount bump rather than a String
+/// heap-allocation+copy. The flattened result is converted to owned `String`s
+/// once, at the top of `collect_libs_inner`.
 #[derive(Debug, Clone, Default)]
 struct ImportClosure {
-    libs: Vec<(String, Addr)>,
+    libs: Vec<(Arc<str>, Addr)>,
+}
+
+/// Flatten already-deps-first-deduped `sub_closures` into one deps-first list,
+/// deduped by import_path, with `self_lib` (if any) appended last. Shared by
+/// `import_closure` (composing a node from its children's closures) and
+/// `collect_libs_inner` (composing the transitive set from the root imports).
+///
+/// Import paths are `Arc<str>`, so re-listing a child's transitive entries here —
+/// which happens at *every* node, an O(closure-size) copy per node — is a refcount
+/// bump rather than a String heap-copy. The dedup set and result are pre-sized to
+/// the summed child closure size (+ self).
+fn compose_closures(
+    sub_closures: &[Arc<ImportClosure>],
+    self_lib: Option<(Arc<str>, Addr)>,
+) -> Vec<(Arc<str>, Addr)> {
+    let extra = self_lib.is_some() as usize;
+    let cap = sub_closures.iter().map(|s| s.libs.len()).sum::<usize>() + extra;
+    let mut seen: HashSet<Arc<str>> = HashSet::with_capacity(cap);
+    let mut libs: Vec<(Arc<str>, Addr)> = Vec::with_capacity(cap);
+    for sub in sub_closures {
+        for (ip, addr) in &sub.libs {
+            if seen.insert(Arc::clone(ip)) {
+                libs.push((Arc::clone(ip), addr.clone()));
+            }
+        }
+    }
+    if let Some((ip, addr)) = self_lib
+        && seen.insert(Arc::clone(&ip))
+    {
+        libs.push((ip, addr));
+    }
+    libs
 }
 
 impl Provider {
@@ -153,6 +200,7 @@ impl Provider {
         skip_dirs: &[PathBuf],
         skip_globs: &[String],
         opts: &crate::engine::config_file::Options,
+        walker: Arc<CachedWalker>,
     ) -> anyhow::Result<Self> {
         crate::engine::config_file::deny_unknown("go provider", opts, &["gotool", "skip"])?;
         let go_bin_addr: String =
@@ -171,6 +219,7 @@ impl Provider {
             Config {
                 go_bin_addr,
                 skip,
+                walker,
                 ..Default::default()
             },
         )
@@ -181,10 +230,14 @@ impl Provider {
     }
 
     pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
-        let goroot = resolve_goroot()?;
-        let gomodcache = resolve_go_env_var("GOMODCACHE")?;
-        let gopath = resolve_go_env_var("GOPATH")?;
-        let gocache = resolve_go_env_var("GOCACHE")?;
+        // One `go env` round-trip for all four variables instead of four spawns.
+        let env = resolve_go_env_vars(&["GOROOT", "GOMODCACHE", "GOPATH", "GOCACHE"])?;
+        let [goroot, gomodcache, gopath, gocache] = <[String; 4]>::try_from(env).map_err(|v| {
+            anyhow::anyhow!(
+                "resolve_go_env_vars returned {} values, expected 4",
+                v.len()
+            )
+        })?;
         Ok(Self {
             inner: Arc::new(ProviderInner {
                 workspace_root,
@@ -194,6 +247,7 @@ impl Provider {
                 gocache,
                 go_bin_addr: config.go_bin_addr,
                 skip: config.skip,
+                walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
                 pkg_cache: Memoizer::with_tag("pkg_cache"),
                 pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
@@ -205,28 +259,60 @@ impl Provider {
     }
 }
 
-fn resolve_go_env_var(name: &str) -> anyhow::Result<String> {
-    if let Ok(val) = std::env::var(name)
-        && !val.is_empty()
-    {
-        return Ok(val);
+/// Resolve several `go env` variables in a single subprocess, in the order
+/// requested. A process env var of the same name overrides (matching go's own
+/// precedence); only the names not already set are fetched, via one
+/// `go env A B C` round-trip rather than one `go` spawn per variable. Each
+/// spawn is ~15-20 ms, and the go provider needs four of these at construction,
+/// so batching removes ~3 subprocess spawns from every invocation's startup.
+fn resolve_go_env_vars(names: &[&str]) -> anyhow::Result<Vec<String>> {
+    // Per name: `Some` if satisfied from the process environment, else `None`
+    // (must come from `go env`). `missing` preserves request order.
+    let mut from_env: Vec<Option<String>> = Vec::with_capacity(names.len());
+    let mut missing: Vec<&str> = Vec::new();
+    for name in names {
+        match std::env::var(name) {
+            Ok(val) if !val.is_empty() => from_env.push(Some(val)),
+            _ => {
+                from_env.push(None);
+                missing.push(name);
+            }
+        }
     }
-    let output = std::process::Command::new("go")
-        .arg("env")
-        .arg(name)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to run `go env {}`: {}", name, e))?;
-    if !output.status.success() {
-        anyhow::bail!("go env {} failed", name);
-    }
-    Ok(String::from_utf8(output.stdout)
-        .map_err(|e| anyhow::anyhow!("go env {} output not utf-8: {}", name, e))?
-        .trim()
-        .to_string())
-}
 
-fn resolve_goroot() -> anyhow::Result<String> {
-    resolve_go_env_var("GOROOT")
+    let mut fetched: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    if !missing.is_empty() {
+        let output = std::process::Command::new("go")
+            .arg("env")
+            .args(&missing)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to run `go env {}`: {}", missing.join(" "), e))?;
+        if !output.status.success() {
+            anyhow::bail!("go env {} failed", missing.join(" "));
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|e| anyhow::anyhow!("go env output not utf-8: {}", e))?;
+        // `go env A B C` prints one value per line, in the requested order.
+        let lines: Vec<&str> = stdout.lines().collect();
+        if lines.len() != missing.len() {
+            anyhow::bail!(
+                "go env returned {} lines for {} variables",
+                lines.len(),
+                missing.len()
+            );
+        }
+        for (name, line) in missing.iter().zip(lines) {
+            fetched.insert(name, line.trim().to_string());
+        }
+    }
+
+    Ok(names
+        .iter()
+        .zip(from_env)
+        .map(|(name, env_val)| {
+            env_val.unwrap_or_else(|| fetched.get(name).cloned().unwrap_or_default())
+        })
+        .collect())
 }
 
 /// Recursively enumerate directories at or below `dir` that live under a
@@ -239,6 +325,7 @@ fn resolve_goroot() -> anyhow::Result<String> {
 /// skip the per-dir `find_go_mod` lookup. The `find_go_mod` cache absorbs the
 /// cost when the flag is unset.
 fn collect_go_packages(
+    walker: &CachedWalker,
     dir: &Path,
     workspace_root: &Path,
     under_gomod: bool,
@@ -254,36 +341,39 @@ fn collect_go_packages(
         }));
     }
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
+    // Read through the shared walker: an unchanged tree skips the `readdir`
+    // syscall entirely (the cached listing is keyed by directory mtime). A
+    // symlinked dir lists as `Symlink`, not `Dir`, so it is not descended —
+    // matching the previous `file_type()` (no-follow) behavior.
+    let listing = match walker.read_dir(dir) {
+        Ok(l) => l,
         Err(e) => {
-            result.push(Err(anyhow::anyhow!("read_dir {}: {}", dir.display(), e)));
+            result.push(Err(e.context(format!("read_dir {}", dir.display()))));
             return;
         }
     };
 
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
+    for entry in &listing.entries {
+        if entry.kind != EntryKind::Dir {
             continue;
         }
-        if name_str.starts_with('.')
-            || name_str.starts_with('_')
-            || name_str == "vendor"
-            || name_str == "testdata"
+        // Skip dot/underscore-prefixed dirs and the go-convention non-package
+        // dirs by raw bytes. A leading `.`/`_` is a single ASCII byte and UTF-8
+        // lead/continuation bytes are all >= 0x80, so a byte compare can't
+        // misfire on a multibyte name.
+        let bytes = entry.name.as_bytes();
+        if matches!(bytes.first(), Some(b'.' | b'_')) || bytes == b"vendor" || bytes == b"testdata"
         {
             continue;
         }
-        let entry_path = entry.path();
+        let entry_path = dir.join(&entry.name);
         let rel = entry_path
             .strip_prefix(workspace_root)
             .unwrap_or(&entry_path);
         if skip.prune_dir(&entry_path, rel) {
             continue;
         }
-        collect_go_packages(&entry_path, workspace_root, is_under, skip, result);
+        collect_go_packages(walker, &entry_path, workspace_root, is_under, skip, result);
     }
 }
 
@@ -556,9 +646,9 @@ impl ProviderInner {
             }
 
             let packages = crate::process_supervisor::block_or_inline(
-                enclose!((self.workspace_root => workspace_root, self.skip => skip) move || {
+                enclose!((self.workspace_root => workspace_root, self.skip => skip, self.walker => walker) move || {
                     let mut packages = Vec::new();
-                    collect_go_packages(&search_dir, &workspace_root, false, &skip, &mut packages);
+                    collect_go_packages(&walker, &search_dir, &workspace_root, false, &skip, &mut packages);
                     packages
                 }),
             );
@@ -1901,22 +1991,11 @@ impl ProviderInner {
                     )
                     .await?;
 
-                    // Deps first, then self. Dedup by import_path across all
-                    // sub-closures so a diamond dependency only shows once.
-                    let mut seen: HashSet<String> = HashSet::new();
-                    let mut libs: Vec<(String, Addr)> = Vec::new();
-                    for sub in &sub_closures {
-                        for (ip, addr) in &sub.libs {
-                            if seen.insert(ip.clone()) {
-                                libs.push((ip.clone(), addr.clone()));
-                            }
-                        }
-                    }
-                    if let Some(addr) = dep_addr_opt
-                        && seen.insert(resolved_path.clone())
-                    {
-                        libs.push((resolved_path, addr));
-                    }
+                    // Deps first, then self (deduped by import_path so a diamond
+                    // dependency only shows once).
+                    let self_lib =
+                        dep_addr_opt.map(|addr| (Arc::<str>::from(resolved_path), addr));
+                    let libs = compose_closures(&sub_closures, self_lib);
 
                     anyhow::Ok(Arc::new(ImportClosure { libs }))
                 }),
@@ -1961,17 +2040,13 @@ impl ProviderInner {
             }))
             .await?;
 
-            // Compose: deps-first order, dedup by import_path across all
-            // sub-closures (each sub-closure is itself deps-first deduped).
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut libs: Vec<(String, Addr)> = Vec::new();
-            for sub in &sub_closures {
-                for (ip, addr) in &sub.libs {
-                    if seen.insert(ip.clone()) {
-                        libs.push((ip.clone(), addr.clone()));
-                    }
-                }
-            }
+            // Compose the root sub-closures into one deps-first deduped set, then
+            // materialize owned `String`s once for `TransitiveDeps` — O(closure)
+            // String allocations total rather than O(closure) per node.
+            let libs = compose_closures(&sub_closures, None)
+                .into_iter()
+                .map(|(ip, addr)| (ip.to_string(), addr))
+                .collect();
             return Ok(TransitiveDeps { libs });
         }
 
@@ -2572,10 +2647,17 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(root.join("internal")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
+        // Built-in (byte-compared) prunes: dot/underscore prefixes and the
+        // go-convention `vendor` / `testdata` dirs.
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::create_dir_all(root.join("_ignored")).unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::create_dir_all(root.join("testdata")).unwrap();
 
         let skip = Ignore::new(&[home.clone()], &["internal".to_string()]).unwrap();
+        let walker = CachedWalker::disabled();
         let mut out = Vec::new();
-        collect_go_packages(root, root, false, &skip, &mut out);
+        collect_go_packages(&walker, root, root, false, &skip, &mut out);
         let pkgs: Vec<String> = out
             .into_iter()
             .map(|r| r.unwrap().pkg.to_string())
@@ -2588,6 +2670,123 @@ mod tests {
             "core dir not pruned"
         );
         assert!(!pkgs.contains(&"internal".to_string()), "glob not pruned");
+        for pruned in [".hidden", "_ignored", "vendor", "testdata"] {
+            assert!(
+                !pkgs.contains(&pruned.to_string()),
+                "built-in prune rule dropped: {pruned}"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_go_packages_through_enabled_walker_matches_uncached() {
+        // The package walk reads each dir through the shared CachedWalker. With a
+        // real (enabled) walker backing it the discovered package set must be
+        // identical to a raw, uncached walk — the walker is transparent, it only
+        // caches the `readdir` by directory mtime.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.mod"), "module example.com/x\n").unwrap();
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+
+        let skip = Ignore::default();
+        let to_pkgs = |v: Vec<anyhow::Result<ListPackageResponse>>| {
+            let mut s: Vec<String> = v.into_iter().map(|r| r.unwrap().pkg.to_string()).collect();
+            s.sort();
+            s
+        };
+
+        let mut uncached = Vec::new();
+        collect_go_packages(
+            &CachedWalker::disabled(),
+            root,
+            root,
+            false,
+            &skip,
+            &mut uncached,
+        );
+
+        let dbdir = tempfile::tempdir().unwrap();
+        let walker = CachedWalker::open(&dbdir.path().join("fswalk.db"));
+        let mut cached = Vec::new();
+        collect_go_packages(&walker, root, root, false, &skip, &mut cached);
+        // Second walk: now served from the walker's cache; still identical.
+        let mut cached2 = Vec::new();
+        collect_go_packages(&walker, root, root, false, &skip, &mut cached2);
+
+        let expected = to_pkgs(uncached);
+        assert!(expected.contains(&"a".to_string()));
+        assert!(expected.contains(&"a/b".to_string()));
+        assert!(!expected.iter().any(|p| p == "vendor"));
+        assert_eq!(expected, to_pkgs(cached));
+        assert_eq!(expected, to_pkgs(cached2));
+    }
+
+    #[test]
+    fn compose_closures_dedups_diamond_and_keeps_deps_first() {
+        // T1.3 froze the closure-composition contract while switching import paths
+        // to `Arc<str>`: children's transitive libs come first, a diamond dep
+        // appears once (first-seen wins), and the composing node's own lib is
+        // appended last. `import_closure` and `collect_libs_inner` both route
+        // through `compose_closures`, so this freezes both.
+        let mk = |ip: &str| {
+            (
+                Arc::<str>::from(ip),
+                Addr::new(PkgBuf::from("p"), format!("lib_{ip}"), Default::default()),
+            )
+        };
+        // Diamond: top → {left, right}; left → shared; right → shared.
+        let left = Arc::new(ImportClosure {
+            libs: vec![mk("shared"), mk("left")],
+        });
+        let right = Arc::new(ImportClosure {
+            libs: vec![mk("shared"), mk("right")],
+        });
+
+        let composed = compose_closures(&[left, right], Some(mk("top")));
+        let ips: Vec<&str> = composed.iter().map(|(ip, _)| ip.as_ref()).collect();
+        assert_eq!(
+            ips,
+            ["shared", "left", "right", "top"],
+            "deps-first, diamond 'shared' deduped to its first occurrence, self last"
+        );
+
+        // Without a self lib (the `collect_libs_inner` shape), only the merged,
+        // deduped child set remains.
+        let a = Arc::new(ImportClosure {
+            libs: vec![mk("x"), mk("y")],
+        });
+        let b = Arc::new(ImportClosure {
+            libs: vec![mk("y"), mk("z")],
+        });
+        let merged = compose_closures(&[a, b], None);
+        let ips: Vec<&str> = merged.iter().map(|(ip, _)| ip.as_ref()).collect();
+        assert_eq!(ips, ["x", "y", "z"], "diamond 'y' deduped, order preserved");
+    }
+
+    #[test]
+    fn resolve_go_env_vars_batches_in_request_order() {
+        require_go!();
+        // One value per requested name, in request order, matching individual
+        // `go env` calls — the batched single-spawn path must not reorder or drop.
+        let vals = resolve_go_env_vars(&["GOROOT", "GOCACHE", "GOMODCACHE"]).expect("go env");
+        assert_eq!(vals.len(), 3, "one value per requested variable");
+        let single = |name: &str| {
+            let out = std::process::Command::new("go")
+                .args(["env", name])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(vals[0], single("GOROOT"), "GOROOT stays in slot 0");
+        assert_eq!(vals[1], single("GOCACHE"), "GOCACHE stays in slot 1");
+        assert_eq!(vals[2], single("GOMODCACHE"), "GOMODCACHE stays in slot 2");
+        assert!(
+            !vals[0].is_empty() && !vals[1].is_empty(),
+            "GOROOT/GOCACHE resolve to non-empty paths"
+        );
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {

@@ -22,7 +22,7 @@ use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::grow_stack::{GrowStack, grow_stack};
 use crate::engine::link::LinkedTargetDef;
-use crate::engine::local_cache::{CacheArtifact, ManifestArtifactType};
+use crate::engine::local_cache::{CacheArtifact, Manifest, ManifestArtifactType};
 use crate::engine::result_lock::ResultReadGuard;
 use crate::hartifactcontent::{Content, ReadSeek, WalkEntry, WalkEntryKind};
 use crate::htmatcher::Matcher;
@@ -368,6 +368,13 @@ pub(crate) struct LockedResolution {
     /// remote cache pulls just the blobs each caller asked for rather than every
     /// output group (the lazy-pull invariant this preserves).
     executed: Option<Arc<ExecutedArtifacts>>,
+    /// The parsed manifest of a pre-existing cache hit, captured once by the
+    /// presence-probe and reused by every `(outputs, is_top)` caller in
+    /// [`execute_and_cache`] — so each caller filters its own outputs from this
+    /// shared manifest instead of re-reading + re-deserializing it from the cache
+    /// backend. `Some` exactly when `executed` is `None` (a pre-existing hit);
+    /// `None` on the execute / force / shell paths (no pre-existing manifest).
+    manifest: Option<Arc<Manifest>>,
 }
 
 /// The full freshly-produced artifact set of an executing [`LockedResolution`]
@@ -917,17 +924,40 @@ impl Engine {
             Some(ex) => (ex.cached.clone(), ex.meta.clone()),
             // Pre-existing hit: read only this caller's outputs under the shared
             // riding read. Silent — the shared cell already emitted the addr's
-            // hit/miss event; re-emitting per caller would double-count.
-            None => self
-                .clone()
-                .artifacts_from_local_cache(rs.ctoken(), def, opts.hashin.as_str(), outputs.clone())
-                .await?
-                .with_context(|| {
+            // hit/miss event; re-emitting per caller would double-count. Reuse the
+            // manifest the probe already parsed (shared across all callers of this
+            // single-flight cell) instead of re-reading + re-deserializing it;
+            // fall back to a fresh read only if it is somehow absent.
+            None => {
+                let res = match &locked.manifest {
+                    Some(manifest) => {
+                        self.artifacts_from_manifest(
+                            rs.ctoken(),
+                            &def.target.addr,
+                            opts.hashin.as_str(),
+                            manifest,
+                            &outputs,
+                        )
+                        .await?
+                    }
+                    None => {
+                        self.clone()
+                            .artifacts_from_local_cache(
+                                rs.ctoken(),
+                                def,
+                                opts.hashin.as_str(),
+                                outputs.clone(),
+                            )
+                            .await?
+                    }
+                };
+                res.with_context(|| {
                     format!(
                         "result lock confirmed a cache entry for {} but it vanished before read",
                         def.target.addr
                     )
-                })?,
+                })?
+            }
         };
 
         // Codegen tree write-back: is_top-gated, idempotent, runs on every path
@@ -1072,6 +1102,7 @@ impl Engine {
             return Ok(Arc::new(LockedResolution {
                 guard: None,
                 executed: Some(Arc::new(ExecutedArtifacts { cached, meta })),
+                manifest: None,
             }));
         }
 
@@ -1081,17 +1112,15 @@ impl Engine {
         let read = self
             .acquire_with_notice(&rs, addr, self.result_lock().read(addr, ctoken))
             .await?;
-        if self
-            .result_from_cache(rs.clone(), def, opts, Vec::new())
-            .await?
-            .is_some()
-        {
+        if let Some(manifest) = self.probe_cache_manifest(&rs, def, opts).await? {
             // A. Hit — share this read; each caller reads its own outputs under
             // it and runs its own codegen write-back / fixpoint in
-            // `execute_and_cache` (is_top-gated, under this riding read).
+            // `execute_and_cache` (is_top-gated, under this riding read). The
+            // parsed manifest rides along so callers skip a second read+parse.
             return Ok(Arc::new(LockedResolution {
                 guard: Some(Arc::new(read)),
                 executed: None,
+                manifest: Some(manifest),
             }));
         }
 
@@ -1109,17 +1138,14 @@ impl Engine {
         // write lock excludes all others, so one re-check suffices. On the rare
         // race-win we share without executing; otherwise we execute + cache the
         // full set, which `build_eresult` filters per caller.
-        let executed = match self
-            .result_from_cache(rs.clone(), def, opts, Vec::new())
-            .await?
-        {
-            Some(_) => None,
+        let (executed, manifest) = match self.probe_cache_manifest(&rs, def, opts).await? {
+            Some(manifest) => (None, Some(manifest)),
             None => {
                 let (cached, meta) = self
                     .clone()
                     .execute_and_cache_inner(rs.clone(), opts)
                     .await?;
-                Some(Arc::new(ExecutedArtifacts { cached, meta }))
+                (Some(Arc::new(ExecutedArtifacts { cached, meta })), None)
             }
         };
 
@@ -1136,6 +1162,7 @@ impl Engine {
         Ok(Arc::new(LockedResolution {
             guard: Some(Arc::new(read)),
             executed,
+            manifest,
         }))
     }
 
@@ -1569,37 +1596,50 @@ impl Engine {
         Ok(())
     }
 
-    /// Look up `def`'s artifacts in the local cache, emitting the hit/miss event.
-    /// Returns the raw cached artifacts (already filtered to `outputs` by
-    /// [`artifacts_from_local_cache`](Self::artifacts_from_local_cache)); the
-    /// caller wraps them via [`build_eresult`], attaching the read lock it holds.
-    async fn result_from_cache(
+    /// Presence-probe the local cache at the manifest level (empty output set —
+    /// see the [`resolve_locked_inner`](Self::resolve_locked_inner) doc), emitting
+    /// the hit/miss event. On a hit, returns the parsed manifest so the per-caller
+    /// output read in [`execute_and_cache`](Self::execute_and_cache) reuses it
+    /// instead of re-reading + re-deserializing the manifest from the cache backend.
+    ///
+    /// Confirming SupportFile blobs exist (via `artifacts_from_manifest` with no
+    /// requested outputs) preserves the exact hit/miss semantics of the former
+    /// empty-output `artifacts_from_local_cache` probe — a present manifest whose
+    /// support blob has been GC'd is still a miss.
+    async fn probe_cache_manifest(
         &self,
-        rs: Arc<RequestState>,
+        rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
         opts: &ExecuteOptions<'_>,
-        outputs: Vec<String>,
-    ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
-        match self
-            .artifacts_from_local_cache(rs.ctoken(), def, opts.hashin.as_str(), outputs)
+    ) -> anyhow::Result<Option<Arc<Manifest>>> {
+        let addr = &def.target.addr;
+        let hashin = opts.hashin.as_str();
+        // TODO(remote-cache): when remote lands, this becomes a manifest-exists
+        // check consulting local OR remote and downloading NO output blobs.
+        let hit = match self
+            .read_manifest_blocking(rs.ctoken(), addr, hashin)
             .await?
         {
-            // TODO(remote-cache): emit RemoteCache* here; bracket the remote
-            // lookup with its own RemoteCacheRead{Start,End} events so it shows in
-            // the per-target op breakdown.
-            Some(res) => {
-                rs.emit(crate::engine::event::BuildEventKind::LocalCacheHit {
-                    addr: def.target.addr.format(),
-                });
-                Ok(Some(res))
+            Some(manifest)
+                if self
+                    .artifacts_from_manifest(rs.ctoken(), addr, hashin, &manifest, &[])
+                    .await?
+                    .is_some() =>
+            {
+                Some(Arc::new(manifest))
             }
-            None => {
-                rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
-                    addr: def.target.addr.format(),
-                });
-                Ok(None)
+            _ => None,
+        };
+        rs.emit(if hit.is_some() {
+            crate::engine::event::BuildEventKind::LocalCacheHit {
+                addr: addr.format(),
             }
-        }
+        } else {
+            crate::engine::event::BuildEventKind::LocalCacheMiss {
+                addr: addr.format(),
+            }
+        });
+        Ok(hit)
     }
 
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
@@ -4107,6 +4147,144 @@ mod tests {
             1,
             "requesting one output must not re-execute just because another \
              group's blob is absent — the pull stays lazy"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cache_hit_reads_manifest_once() {
+        // T1.1: on a full cache hit the manifest must be read + deserialized
+        // EXACTLY ONCE and reused for the per-caller output read. Pre-fix the
+        // presence-probe and the per-caller read each parsed the manifest (two
+        // backend reads per hit); now the probe stashes the parsed manifest on
+        // `LockedResolution` and the caller filters its outputs from it.
+        use crate::engine::local_cache::{LocalCache, MANIFEST_V1, SizedReader, TargetStream};
+
+        struct CountingCache {
+            inner: SArc<dyn LocalCache>,
+            manifest_reads: SArc<AtomicUsize>,
+        }
+        impl LocalCache for CountingCache {
+            fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
+                if name == MANIFEST_V1 {
+                    self.manifest_reads.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.reader(addr, hashin, name)
+            }
+            fn writer(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<Box<dyn std::io::Write>> {
+                self.inner.writer(addr, hashin, name)
+            }
+            fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
+                self.inner.exists(addr, hashin, name)
+            }
+            fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
+                self.inner.delete(addr, hashin, name)
+            }
+            fn list_targets(&self) -> anyhow::Result<TargetStream> {
+                self.inner.list_targets()
+            }
+            fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
+                self.inner.list_target_entries(addr)
+            }
+            fn seekable_reader(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<Option<Box<dyn crate::hartifactcontent::ReadSeek + Send>>>
+            {
+                self.inner.seekable_reader(addr, hashin, name)
+            }
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            // sqlite-direct (no in-memory tier) so every manifest read reaches the
+            // counter instead of being served from an LRU on the second touch.
+            mem_cache: crate::engine::MemCacheOptions {
+                capacity_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("engine");
+        let manifest_reads = SArc::new(AtomicUsize::new(0));
+        engine.local_cache = SArc::new(CountingCache {
+            inner: engine.local_cache.clone(),
+            manifest_reads: SArc::clone(&manifest_reads),
+        });
+        let exec_count = SArc::new(AtomicUsize::new(0));
+        engine
+            .register_driver(enclose!(
+                (exec_count) | _ | {
+                    Box::new(BlockingDriver {
+                        exec_count,
+                        outputs: SArc::new(vec![("main".to_string(), "out".to_string())]),
+                    })
+                }
+            ))
+            .expect("driver");
+        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let spec = TargetSpec {
+            addr: addr.clone(),
+            driver: "blocking".to_string(),
+            config: HashMap::new(),
+            labels: vec![],
+            transitive: Default::default(),
+        };
+        engine
+            .register_provider(move |_| Box::new(OneTargetProvider { spec }))
+            .expect("provider");
+        let engine = Arc::new(engine);
+
+        // Cold build: writes the manifest + blob. (Miss path reads happen here;
+        // we only assert on the subsequent hit.)
+        engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("initial build resolves");
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            1,
+            "cold build executes once"
+        );
+
+        // Fresh request → full cache hit. The manifest backing read must happen
+        // exactly once for the whole resolution.
+        manifest_reads.store(0, Ordering::SeqCst);
+        let r = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("warm request hits the cache");
+        assert_eq!(r.artifacts.len(), 1, "the single output is surfaced");
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            1,
+            "warm request must not re-execute"
+        );
+        assert_eq!(
+            manifest_reads.load(Ordering::SeqCst),
+            1,
+            "the manifest must be read + parsed exactly once per cache hit, not twice"
         );
     }
 

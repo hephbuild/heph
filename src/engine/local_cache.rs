@@ -469,78 +469,99 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn artifacts_from_local_cache(
+    /// Async wrapper over the sync [`read_manifest`](Self::read_manifest) for the
+    /// result hot path. The backend `reader` + `borsh::from_slice` is the expensive
+    /// half of a cache lookup, so its result is stashed and reused across the
+    /// presence-probe and the per-caller output read (see `LockedResolution::manifest`).
+    /// See `cache_artifact_locally` for why this is `block_or_inline`, not `spawn_blocking`.
+    pub(crate) async fn read_manifest_blocking(
         &self,
         _ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<Manifest>> {
+        crate::process_supervisor::block_or_inline(move || self.read_manifest(addr, hashin))
+    }
+
+    /// Build this caller's artifact set from an already-parsed `manifest`, gating
+    /// Output groups to `outputs` (SupportFiles always travel). Returns `None`
+    /// when a required blob is missing — treat as a miss. Splitting this from
+    /// [`read_manifest`](Self::read_manifest) lets a confirmed hit reuse the parsed
+    /// manifest instead of re-reading + re-deserializing it for each caller.
+    pub(crate) async fn artifacts_from_manifest(
+        &self,
+        _ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        manifest: &Manifest,
+        outputs: &[String],
+    ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
+        let local_cache = &self.local_cache;
+        crate::process_supervisor::block_or_inline(move || {
+            let mut results: Vec<CacheArtifact> = Vec::with_capacity(manifest.artifacts.len());
+            let mut result_meta: Vec<ArtifactMeta> = Vec::with_capacity(manifest.artifacts.len());
+
+            for artifact in &manifest.artifacts {
+                // Outputs and SupportFiles both flow back to dependents — Output
+                // populates SRC/list, SupportFile only materializes into the
+                // sandbox. Logs and other types are kept in the cache but not
+                // surfaced to callers here.
+                match artifact.r#type {
+                    ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
+                    ManifestArtifactType::Log => continue,
+                }
+
+                result_meta.push(ArtifactMeta {
+                    hashout: artifact.hashout.clone(),
+                });
+
+                // Outputs are gated on the caller's requested output groups.
+                // SupportFiles travel with the target wherever it's referenced.
+                if artifact.r#type == ManifestArtifactType::Output
+                    && !outputs.contains(&artifact.group)
+                {
+                    continue;
+                }
+
+                if !local_cache.exists(addr, hashin, artifact.name.as_ref())? {
+                    return Ok(None);
+                }
+
+                results.push(CacheArtifact {
+                    addr: addr.clone(),
+                    hashin: hashin.to_string(),
+                    name: artifact.name.clone(),
+                    cache: local_cache.clone(),
+                    content_type: match artifact.content_type {
+                        ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                        ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+                    },
+                    r#type: artifact.r#type.clone(),
+                    hashout: artifact.hashout.clone(),
+                    group: artifact.group.clone(),
+                    size: artifact.size,
+                });
+            }
+
+            anyhow::Ok(Some((results, result_meta)))
+        })
+    }
+
+    pub async fn artifacts_from_local_cache(
+        &self,
+        ctoken: &dyn Cancellable,
         def: &LinkedTargetDef,
         hashin: &str,
         outputs: Vec<String>,
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
-        let addr = def.target.addr.clone();
-        let hashin = hashin.to_string();
-        // See `cache_artifact_locally` for why this is `block_or_inline`
-        // and not `spawn_blocking`.
-        crate::process_supervisor::block_or_inline(
-            enclose!((self.local_cache => local_cache) move || {
-                let sized = match local_cache.reader(&addr, &hashin, MANIFEST_V1) {
-                    Err(e) if e.is::<NotFoundError>() => return Ok(None),
-                    Err(e) => return Err(e),
-                    Ok(artifact) => artifact,
-                };
-
-                let mut manifest_artifact = sized.reader;
-                let mut buf = Vec::with_capacity(sized.size as usize);
-                io::Read::read_to_end(&mut manifest_artifact, &mut buf)?;
-                let manifest: Manifest = borsh::from_slice(&buf)?;
-
-                let mut results: Vec<CacheArtifact> = vec![];
-                let mut result_meta: Vec<ArtifactMeta> = vec![];
-
-                for artifact in manifest.artifacts {
-                    // Outputs and SupportFiles both flow back to dependents — Output
-                    // populates SRC/list, SupportFile only materializes into the
-                    // sandbox. Logs and other types are kept in the cache but not
-                    // surfaced to callers here.
-                    match artifact.r#type {
-                        ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
-                        ManifestArtifactType::Log => continue,
-                    }
-
-                    result_meta.push(ArtifactMeta {
-                        hashout: artifact.hashout.clone(),
-                    });
-
-                    // Outputs are gated on the caller's requested output groups.
-                    // SupportFiles travel with the target wherever it's referenced.
-                    if artifact.r#type == ManifestArtifactType::Output
-                        && !outputs.contains(&artifact.group)
-                    {
-                        continue;
-                    }
-
-                    if !local_cache.exists(&addr, &hashin, artifact.name.as_ref())? {
-                        return Ok(None);
-                    }
-
-                    results.push(CacheArtifact {
-                        addr: addr.clone(),
-                        hashin: hashin.clone(),
-                        name: artifact.name.clone(),
-                        cache: local_cache.clone(),
-                        content_type: match artifact.content_type {
-                            ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
-                            ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
-                        },
-                        r#type: artifact.r#type,
-                        hashout: artifact.hashout,
-                        group: artifact.group,
-                        size: artifact.size,
-                    });
-                }
-
-                anyhow::Ok(Some((results, result_meta)))
-            }),
-        )
+        let Some(manifest) = self
+            .read_manifest_blocking(ctoken, &def.target.addr, hashin)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.artifacts_from_manifest(ctoken, &def.target.addr, hashin, &manifest, &outputs)
+            .await
     }
 }
 
