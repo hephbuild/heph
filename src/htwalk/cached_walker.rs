@@ -414,10 +414,21 @@ impl FsWalkStore {
         let write = Connection::open(db_path)
             .with_context(|| format!("opening fswalk db at {db_path:?}"))?;
         write
+            // This db is a pure optimization cache: every row is reconstructable
+            // from disk, so corruption is tolerable (a bad db just re-reads and
+            // rebuilds). We trade crash durability for speed.
+            //   - WAL stays: required so multiple processes read concurrently
+            //     while one writes. busy_timeout handles cross-process write
+            //     contention. Neither is a durability knob, so both are kept.
+            //   - synchronous = OFF (vs NORMAL): drops the remaining checkpoint
+            //     fsyncs. An app crash is still safe (the OS flushes the pages);
+            //     only an OS crash / power loss can corrupt — which we accept.
+            //   synchronous affects only crash durability, never concurrent-access
+            //   correctness, so multi-process behavior is unchanged.
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA busy_timeout = 10000;
-                 PRAGMA synchronous = NORMAL;
+                 PRAGMA synchronous = OFF;
                  PRAGMA temp_store = MEMORY;
                  PRAGMA mmap_size = 268435456;
                  CREATE TABLE IF NOT EXISTS dirs (
