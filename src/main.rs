@@ -1,10 +1,8 @@
-use clap::parser::ValueSource;
-use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{CommandFactory, FromArgMatches, Parser};
 use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
 use std::process::ExitCode;
-use std::time::Duration;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
@@ -81,7 +79,6 @@ fn main() -> ExitCode {
     // spool — is ephemeral, so there is no "next run" to defer to.
     let telemetry_on =
         heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
-    let telemetry_ci = heph::telemetry::is_ci();
     let started_at = std::time::Instant::now();
 
     let pprof_guard = if cli.global.pprof_cpu.is_some() {
@@ -100,33 +97,28 @@ fn main() -> ExitCode {
     };
 
     let exec_result = cli.command.execute(sink, &cli.global);
-    let failure = exec_result.as_ref().err().map(classify_failure);
-    let result = match exec_result {
+    let result = match &exec_result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one
             // (Starlark/Go diagnostics from single-error commands). The TUI is
             // already torn down here, so plain stderr output is safe. Fall back
             // to the one-line log when nothing renderable is found.
-            if !heph::commands::errors::render_anyhow(&e) {
+            if !heph::commands::errors::render_anyhow(e) {
                 error!(error = %format!("{:#}", e), "Failed");
             }
             ExitCode::FAILURE
         }
     };
 
-    // Best-effort, opt-out usage telemetry: spool this invocation's event (one
-    // sqlite insert), then try to send it now. Non-CI gives the send a 500ms
-    // budget past the end of the work and defers the rest to the next run; CI
-    // (ephemeral, no next run) blocks until the send completes. Never changes
-    // the exit code.
+    // Best-effort, opt-out usage telemetry: record this invocation's event and
+    // try to send it (bounded; CI blocks). Never changes the exit code.
     if telemetry_on {
-        spool_telemetry(&matches, failure, started_at.elapsed());
-        if telemetry_ci {
-            heph::telemetry::flush_blocking();
-        } else {
-            heph::telemetry::flush_bounded(Duration::from_millis(500));
-        }
+        heph::telemetry::record_invocation(
+            &matches,
+            exec_result.as_ref().err(),
+            started_at.elapsed(),
+        );
     }
 
     if let (Some(guard), Some(path)) = (pprof_guard, cli.global.pprof_cpu) {
@@ -177,76 +169,6 @@ fn main() -> ExitCode {
     }
 
     result
-}
-
-/// Send one best-effort, personless telemetry event for whichever command ran.
-/// Command path and the set of flags come straight from the clap matches, so
-/// coverage is exhaustive and automatic for every subcommand. Spool-only: one
-/// sqlite insert, no network (a later run's background flush sends it).
-fn spool_telemetry(matches: &ArgMatches, failure: Option<&'static str>, took: Duration) {
-    // Full subcommand path ("inspect deps", "tool gc"), plus the args set at
-    // every nesting level.
-    let mut parts = Vec::new();
-    let mut flags = set_args(matches);
-    let mut level = matches;
-    while let Some((name, sub)) = level.subcommand() {
-        parts.push(name);
-        flags.extend(set_args(sub));
-        level = sub;
-    }
-    let command = if parts.is_empty() {
-        "none".to_string()
-    } else {
-        parts.join(" ")
-    };
-    flags.sort();
-    flags.dedup();
-
-    // Selector shape from the positional args present: two args (`arg1` +
-    // `arg2`) is a label + package matcher; one is a single address. Structure
-    // only — the actual label/address values are never read.
-    let request_shape = if flags.iter().any(|f| f == "arg2") {
-        "label_matcher"
-    } else if flags.iter().any(|f| f == "arg1") {
-        "addr"
-    } else {
-        "none"
-    };
-
-    heph::telemetry::enqueue_invocation(heph::telemetry::ReportContext {
-        command: &command,
-        request_shape,
-        flags: &flags,
-        success: failure.is_none(),
-        failure,
-        duration_ms: took.as_millis() as u64,
-    });
-}
-
-/// Coarse, non-PII failure class for telemetry: user-cancelled vs a target that
-/// genuinely failed vs anything else.
-fn classify_failure(e: &anyhow::Error) -> &'static str {
-    use heph::engine::error::{CancelledError, TargetFailure, UpstreamFailed};
-    use heph::hmemoizer::downcast_chain_ref;
-    if downcast_chain_ref::<CancelledError>(e).is_some() {
-        "cancelled"
-    } else if downcast_chain_ref::<TargetFailure>(e).is_some()
-        || downcast_chain_ref::<UpstreamFailed>(e).is_some()
-    {
-        "target_failure"
-    } else {
-        "error"
-    }
-}
-
-/// Names of the args/flags explicitly set on the command line for one match
-/// level (top-level globals, or a subcommand's args). Names only — never the
-/// values, which can carry addresses/labels.
-fn set_args(m: &ArgMatches) -> Vec<String> {
-    m.ids()
-        .filter(|id| m.value_source(id.as_str()) == Some(ValueSource::CommandLine))
-        .map(|id| id.as_str().to_string())
-        .collect()
 }
 
 /// Detect the hidden `__supervisor --ipc-fd <N>` invocation without dragging

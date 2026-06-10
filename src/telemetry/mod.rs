@@ -29,9 +29,12 @@ mod spool;
 pub use collector::{TelemetryCollector, TelemetrySnapshot};
 
 use crate::engine::event::BuildEventKind;
+use clap::ArgMatches;
+use clap::parser::ValueSource;
 use posthog_rs::{ClientOptionsBuilder, Event};
 use spool::{FLUSH_BATCH, Spool, SpooledEvent};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Process-global counters. The engine bumps these from its hot paths without
 /// threading a handle through every request; the CLI snapshots them once at
@@ -181,35 +184,109 @@ fn distinct_id(dir: &std::path::Path) -> anyhow::Result<String> {
     install_id(dir)
 }
 
+/// Record this invocation and try to send it: build the event from the clap
+/// matches + command result, spool it (one SQLite insert), then flush. Non-CI
+/// flushes within a 500ms post-work budget and defers the rest to the next run;
+/// CI (ephemeral, no next run) blocks to completion. The single entry point the
+/// CLI calls at exit; everything below is best-effort and never affects the
+/// command's outcome.
+pub fn record_invocation(matches: &ArgMatches, error: Option<&anyhow::Error>, took: Duration) {
+    // Full subcommand path ("inspect deps", "tool gc"), plus the args set at
+    // every nesting level.
+    let mut parts = Vec::new();
+    let mut flags = set_args(matches);
+    let mut level = matches;
+    while let Some((name, sub)) = level.subcommand() {
+        parts.push(name);
+        flags.extend(set_args(sub));
+        level = sub;
+    }
+    let command = if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
+    };
+    flags.sort();
+    flags.dedup();
+
+    // Selector shape from the positional args present: two args (`arg1` +
+    // `arg2`) is a label + package matcher; one is a single address. Structure
+    // only — the actual label/address values are never read.
+    let request_shape = if flags.iter().any(|f| f == "arg2") {
+        "label_matcher"
+    } else if flags.iter().any(|f| f == "arg1") {
+        "addr"
+    } else {
+        "none"
+    };
+
+    let failure = error.map(classify_failure);
+
+    if let Err(e) = try_enqueue(ReportContext {
+        command: &command,
+        request_shape,
+        flags: &flags,
+        success: failure.is_none(),
+        failure,
+        duration_ms: took.as_millis() as u64,
+    }) {
+        tracing::debug!(error = %format!("{e:#}"), "telemetry enqueue skipped");
+    }
+
+    // CI has no next run to defer to, so block; otherwise cap the wait.
+    if is_ci() {
+        flush_blocking();
+    } else {
+        flush_bounded(Duration::from_millis(500));
+    }
+}
+
+/// Names of the args/flags explicitly set on the command line for one match
+/// level (top-level globals, or a subcommand's args). Names only — never the
+/// values, which can carry addresses/labels.
+fn set_args(m: &ArgMatches) -> Vec<String> {
+    m.ids()
+        .filter(|id| m.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+        .map(|id| id.as_str().to_string())
+        .collect()
+}
+
+/// Coarse, non-PII failure class: user-cancelled vs a target that genuinely
+/// failed vs anything else.
+fn classify_failure(e: &anyhow::Error) -> &'static str {
+    use crate::engine::error::{CancelledError, TargetFailure, UpstreamFailed};
+    use crate::hmemoizer::downcast_chain_ref;
+    if downcast_chain_ref::<CancelledError>(e).is_some() {
+        "cancelled"
+    } else if downcast_chain_ref::<TargetFailure>(e).is_some()
+        || downcast_chain_ref::<UpstreamFailed>(e).is_some()
+    {
+        "target_failure"
+    } else {
+        "error"
+    }
+}
+
 /// The shape of a CLI invocation, carrying no user-identifying values.
-pub struct ReportContext<'a> {
+struct ReportContext<'a> {
     /// Full subcommand path, e.g. `"run"` or `"inspect deps"` (canonical names
     /// from the clap model).
-    pub command: &'a str,
+    command: &'a str,
     /// Selector shape: `"label_matcher"` (two args — a label + package matcher),
     /// `"addr"` (one arg — a single address), or `"none"`. Structure only, never
     /// the actual label/address value.
-    pub request_shape: &'a str,
+    request_shape: &'a str,
     /// Names of the args/flags that were explicitly set — derived from the clap
     /// matches, so this stays exhaustive for every command without per-command
     /// code. Names only; never the values (an addr/label could be PII).
-    pub flags: &'a [String],
+    flags: &'a [String],
     /// Whether the command ultimately succeeded.
-    pub success: bool,
+    success: bool,
     /// Coarse failure class on error: `"cancelled"`, `"target_failure"`, or
     /// `"error"`. `None` on success.
-    pub failure: Option<&'a str>,
+    failure: Option<&'a str>,
     /// Command wall time, parse-to-exit.
-    pub duration_ms: u64,
-}
-
-/// Append this invocation's event to the local spool. Called once at process
-/// exit — a single SQLite insert, no network. Best-effort: failures are logged
-/// at debug and otherwise ignored.
-pub fn enqueue_invocation(ctx: ReportContext<'_>) {
-    if let Err(e) = try_enqueue(ctx) {
-        tracing::debug!(error = %format!("{e:#}"), "telemetry enqueue skipped");
-    }
+    duration_ms: u64,
 }
 
 fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
@@ -263,7 +340,7 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
 /// Flush the spool synchronously, blocking until sent (or failed). Used on CI,
 /// where the runner — and its spool — is ephemeral: a deferred flush would
 /// never happen, so the exit pays the full POST to get the data out at all.
-pub fn flush_blocking() {
+fn flush_blocking() {
     if let Err(e) = flush_once() {
         tracing::debug!(error = %format!("{e:#}"), "telemetry flush skipped");
     }
@@ -276,7 +353,7 @@ pub fn flush_blocking() {
 /// mid-flight, rows are deleted only after a successful send, so the unsent rows
 /// simply retry on the next run (per-event UUIDs dedupe any row that did reach
 /// PostHog before we gave up).
-pub fn flush_bounded(deadline: std::time::Duration) {
+fn flush_bounded(deadline: Duration) {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("telemetry-flush".to_string())
