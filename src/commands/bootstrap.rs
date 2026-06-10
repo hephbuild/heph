@@ -116,6 +116,11 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
 
     let fuse = file.fuse.unwrap_or_default();
 
+    let spill_threshold_bytes = file
+        .cache
+        .and_then(|c| c.spill_threshold_bytes)
+        .unwrap_or(engine::DEFAULT_SPILL_THRESHOLD_BYTES);
+
     let lock_backend = file
         .lock
         .and_then(|l| l.backend)
@@ -134,6 +139,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         tmp_cache,
         fuse,
         lock_backend,
+        spill_threshold_bytes,
     })?;
 
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the

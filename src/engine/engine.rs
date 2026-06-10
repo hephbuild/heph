@@ -36,7 +36,18 @@ pub struct Config {
     pub fuse: FuseConfig,
     /// Backend serializing the execute phase per addr. Defaults to `Fs`.
     pub lock_backend: LockBackend,
+    /// Durable blobs strictly larger than this spill to plain files under
+    /// `<home>/cache/blobs/` instead of being stored inline in the sqlite DB;
+    /// manifests always stay in sqlite. Keeps the DB / WAL small and lets large
+    /// artifacts stream from the filesystem. See [`DEFAULT_SPILL_THRESHOLD_BYTES`].
+    pub spill_threshold_bytes: u64,
 }
+
+/// Default spill threshold: 8 MiB. Above a few MB the filesystem beats sqlite
+/// blob storage on throughput and big blobs would bloat the single-file DB and
+/// its WAL; below it, artifacts stay in sqlite where small indexed reads and the
+/// mem tier win. Tunable via `cache.spillThresholdBytes`.
+pub const DEFAULT_SPILL_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 impl Default for Config {
     fn default() -> Self {
@@ -49,6 +60,7 @@ impl Default for Config {
             tmp_cache: MemCacheOptions::default_tmp(),
             fuse: FuseConfig::default(),
             lock_backend: LockBackend::default(),
+            spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
         }
     }
 }
@@ -376,11 +388,22 @@ impl Engine {
             cfg.mem_cache.per_entry_bytes,
             2 * parallelism,
         )?);
+        // Durable tier: manifests + small/medium blobs in sqlite, large blobs
+        // spilled to plain files. The mem tier (below) fronts both.
+        let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
+            home.join("cache").join("blobs"),
+        )?);
+        let durable: Arc<dyn LocalCache> =
+            Arc::new(crate::engine::local_cache_spill::LocalCacheSpill::new(
+                sqlite,
+                blobs,
+                usize::try_from(cfg.spill_threshold_bytes).unwrap_or(usize::MAX),
+            ));
         let local_cache: Arc<dyn LocalCache> = if cfg.mem_cache.capacity_bytes == 0 {
-            sqlite
+            durable
         } else {
             Arc::new(LocalCacheMem::new(
-                sqlite,
+                durable,
                 cfg.mem_cache.per_entry_bytes,
                 cfg.mem_cache.capacity_bytes,
             ))

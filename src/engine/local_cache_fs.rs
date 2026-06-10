@@ -81,6 +81,17 @@ impl LocalCache for LocalCacheFS {
             fs::remove_file(&path)
                 .with_context(|| format!("Failed to delete cache file: {:?}", path))?;
         }
+        // Prune now-empty revision then target dir so deleting a revision's last
+        // blob (the common spill-cache case: only large blobs live here) doesn't
+        // leave empty directories accumulating. `remove_dir` only succeeds on an
+        // empty dir, so a still-populated revision is left untouched; errors
+        // (non-empty / already gone) are intentionally ignored.
+        if let Some(rev_dir) = path.parent()
+            && fs::remove_dir(rev_dir).is_ok()
+            && let Some(target_dir) = rev_dir.parent()
+        {
+            drop(fs::remove_dir(target_dir));
+        }
         Ok(())
     }
 
