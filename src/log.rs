@@ -20,7 +20,7 @@ pub fn init() -> LogSink {
     let fmt_layer = fmt::layer()
         .with_target(false)
         .without_time()
-        .with_ansi(crate::color::stderr_color_enabled())
+        .with_ansi(sink.color_enabled())
         .with_writer(MakeLogSink::new(sink.clone()));
 
     tracing_subscriber::registry()
