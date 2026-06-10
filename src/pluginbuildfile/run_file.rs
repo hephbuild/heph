@@ -5,6 +5,7 @@ use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
+use crate::htwalk::{CachedWalker, EntryKind};
 use crate::pluginbuildfile::provider::Provider;
 use anyhow::Context;
 use enclose::enclose;
@@ -570,13 +571,14 @@ impl Provider {
         let dir_cache = self.dir_cache.clone();
         let registry = self.function_registry.get().cloned().unwrap_or_default();
         let globals = self.globals.clone();
+        let walker = self.walker.clone();
         self.pkg_cache
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
                     crate::process_supervisor::block_or_inline(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
-                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals);
+                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
@@ -603,6 +605,9 @@ pub(crate) struct BuildFileLoader {
     /// Lazily-built, provider-lifetime Starlark globals (shared across loaders so
     /// the registry-driven namespace is built at most once).
     globals: Arc<OnceLock<Globals>>,
+    /// Shared cross-run fs-walk cache. `find_build_files` lists each package dir
+    /// through it, so an unchanged dir skips the `readdir` syscall.
+    walker: Arc<CachedWalker>,
 }
 
 impl BuildFileLoader {
@@ -613,6 +618,7 @@ impl BuildFileLoader {
         dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
         registry: Arc<ProviderFunctionRegistry>,
         globals: Arc<OnceLock<Globals>>,
+        walker: Arc<CachedWalker>,
     ) -> Self {
         Self {
             root,
@@ -622,6 +628,7 @@ impl BuildFileLoader {
             in_flight: Mutex::new(HashSet::new()),
             registry,
             globals,
+            walker,
         }
     }
 
@@ -641,7 +648,7 @@ impl BuildFileLoader {
         if !dir.is_dir() {
             return Ok(Arc::new(empty_run_result()?));
         }
-        let files = find_build_files(&dir, &self.patterns)?;
+        let files = find_build_files(&self.walker, &dir, &self.patterns)?;
         if files.is_empty() {
             return Ok(Arc::new(empty_run_result()?));
         }
@@ -658,7 +665,7 @@ impl BuildFileLoader {
             return Ok(cached.clone());
         }
 
-        let files = find_build_files(dir, &self.patterns)?;
+        let files = find_build_files(&self.walker, dir, &self.patterns)?;
         if files.is_empty() {
             let pats: Vec<&str> = self.patterns.iter().map(glob::Pattern::as_str).collect();
             anyhow::bail!(
@@ -839,16 +846,25 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// Enumerate every file in `dir` whose name matches any of `patterns`.
 /// Result is sorted for deterministic ordering across runs. Propagates IO errors,
 /// including "directory does not exist".
-fn find_build_files(dir: &Path, patterns: &[glob::Pattern]) -> anyhow::Result<Vec<PathBuf>> {
-    let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|f| f.is_file()).unwrap_or(false))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| patterns.iter().any(|p| p.matches(n)))
-        .collect();
-    names.sort();
-    Ok(names.into_iter().map(|n| dir.join(n)).collect())
+fn find_build_files(
+    walker: &CachedWalker,
+    dir: &Path,
+    patterns: &[glob::Pattern],
+) -> anyhow::Result<Vec<PathBuf>> {
+    // Read through the shared walker: an unchanged package dir skips `readdir`.
+    // The listing is already sorted by name, and only regular files are matched
+    // (mirroring the prior `file_type().is_file()` — a symlinked BUILD is not a
+    // build file here).
+    let listing = walker
+        .read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?;
+    Ok(listing
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::File)
+        .filter(|e| patterns.iter().any(|p| p.matches(&e.name)))
+        .map(|e| dir.join(&e.name))
+        .collect())
 }
 
 fn eval_file(path: &Path, pkg: &str, loader: &BuildFileLoader) -> anyhow::Result<RunResult> {
@@ -933,6 +949,7 @@ mod tests {
             provider.dir_cache.clone(),
             registry,
             provider.globals.clone(),
+            provider.walker.clone(),
         );
         loader.load_pkg(pkg)
     }
@@ -944,6 +961,29 @@ mod tests {
         let mut reg = ProviderFunctionRegistry::default();
         reg.insert_provider("fs", crate::pluginfs::Provider::default().functions());
         Arc::new(reg)
+    }
+
+    #[test]
+    fn find_build_files_through_enabled_walker_finds_build() {
+        // `find_build_files` now lists each package dir through the shared
+        // CachedWalker. With a real (enabled) walker backing it, package
+        // discovery must still find the BUILD file and evaluate its targets.
+        let tmp = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let pkg = "p";
+        let pkg_dir = tmp.path().join(pkg);
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("BUILD"), "target(name=\"t\", driver=\"d\")\n").unwrap();
+
+        let provider = Provider {
+            root: tmp.path().to_path_buf(),
+            walker: Arc::new(CachedWalker::open(&dbdir.path().join("fswalk.db"))),
+            ..Provider::default()
+        };
+
+        let result = run_pkg_blocking(&provider, pkg).unwrap();
+        assert_eq!(result.targets.len(), 1);
+        assert_eq!(result.targets[0].name, "t");
     }
 
     #[test]

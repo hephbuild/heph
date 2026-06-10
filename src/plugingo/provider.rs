@@ -8,7 +8,7 @@ use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::{Value, parse_strings};
-use crate::htwalk::Ignore;
+use crate::htwalk::{CachedWalker, EntryKind, Ignore};
 use crate::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
@@ -53,6 +53,12 @@ pub struct Config {
     /// correctness crutch — tests that exercise the engine's containment path
     /// turn it off.
     pub foreign_name_guard: bool,
+    /// Shared cross-run filesystem-walk cache. `collect_go_packages` reads each
+    /// directory through it, so an unchanged tree skips `readdir` (package
+    /// identity depends only on the directory layout, which the walker caches by
+    /// mtime). Disabled by default — unit tests that build a bare provider walk
+    /// live; the engine injects the real shared walker via `from_options`.
+    pub walker: Arc<CachedWalker>,
 }
 
 impl Default for Config {
@@ -61,6 +67,7 @@ impl Default for Config {
             go_bin_addr: DEFAULT_GO_BIN_ADDR.to_string(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
+            walker: Arc::new(CachedWalker::disabled()),
         }
     }
 }
@@ -81,6 +88,8 @@ pub(crate) struct ProviderInner {
     go_bin_addr: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
+    /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
+    walker: Arc<CachedWalker>,
     /// See [`Config::foreign_name_guard`].
     foreign_name_guard: bool,
     /// Cache: golist addr → parsed GoPackage. Memoizes the artifact parse only;
@@ -191,6 +200,7 @@ impl Provider {
         skip_dirs: &[PathBuf],
         skip_globs: &[String],
         opts: &crate::engine::config_file::Options,
+        walker: Arc<CachedWalker>,
     ) -> anyhow::Result<Self> {
         crate::engine::config_file::deny_unknown("go provider", opts, &["gotool", "skip"])?;
         let go_bin_addr: String =
@@ -209,6 +219,7 @@ impl Provider {
             Config {
                 go_bin_addr,
                 skip,
+                walker,
                 ..Default::default()
             },
         )
@@ -236,6 +247,7 @@ impl Provider {
                 gocache,
                 go_bin_addr: config.go_bin_addr,
                 skip: config.skip,
+                walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
                 pkg_cache: Memoizer::with_tag("pkg_cache"),
                 pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
@@ -313,6 +325,7 @@ fn resolve_go_env_vars(names: &[&str]) -> anyhow::Result<Vec<String>> {
 /// skip the per-dir `find_go_mod` lookup. The `find_go_mod` cache absorbs the
 /// cost when the flag is unset.
 fn collect_go_packages(
+    walker: &CachedWalker,
     dir: &Path,
     workspace_root: &Path,
     under_gomod: bool,
@@ -328,38 +341,39 @@ fn collect_go_packages(
         }));
     }
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
+    // Read through the shared walker: an unchanged tree skips the `readdir`
+    // syscall entirely (the cached listing is keyed by directory mtime). A
+    // symlinked dir lists as `Symlink`, not `Dir`, so it is not descended —
+    // matching the previous `file_type()` (no-follow) behavior.
+    let listing = match walker.read_dir(dir) {
+        Ok(l) => l,
         Err(e) => {
-            result.push(Err(anyhow::anyhow!("read_dir {}: {}", dir.display(), e)));
+            result.push(Err(e.context(format!("read_dir {}", dir.display()))));
             return;
         }
     };
 
-    use std::os::unix::ffi::OsStrExt;
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
+    for entry in &listing.entries {
+        if entry.kind != EntryKind::Dir {
             continue;
         }
-        let name = entry.file_name();
         // Skip dot/underscore-prefixed dirs and the go-convention non-package
-        // dirs by raw bytes — no `to_string_lossy` Cow per entry. A leading
-        // `.`/`_` is a single ASCII byte and UTF-8 lead/continuation bytes are
-        // all >= 0x80, so a byte compare can't misfire on a multibyte name.
-        let bytes = name.as_bytes();
+        // dirs by raw bytes. A leading `.`/`_` is a single ASCII byte and UTF-8
+        // lead/continuation bytes are all >= 0x80, so a byte compare can't
+        // misfire on a multibyte name.
+        let bytes = entry.name.as_bytes();
         if matches!(bytes.first(), Some(b'.' | b'_')) || bytes == b"vendor" || bytes == b"testdata"
         {
             continue;
         }
-        let entry_path = entry.path();
+        let entry_path = dir.join(&entry.name);
         let rel = entry_path
             .strip_prefix(workspace_root)
             .unwrap_or(&entry_path);
         if skip.prune_dir(&entry_path, rel) {
             continue;
         }
-        collect_go_packages(&entry_path, workspace_root, is_under, skip, result);
+        collect_go_packages(walker, &entry_path, workspace_root, is_under, skip, result);
     }
 }
 
@@ -632,9 +646,9 @@ impl ProviderInner {
             }
 
             let packages = crate::process_supervisor::block_or_inline(
-                enclose!((self.workspace_root => workspace_root, self.skip => skip) move || {
+                enclose!((self.workspace_root => workspace_root, self.skip => skip, self.walker => walker) move || {
                     let mut packages = Vec::new();
-                    collect_go_packages(&search_dir, &workspace_root, false, &skip, &mut packages);
+                    collect_go_packages(&walker, &search_dir, &workspace_root, false, &skip, &mut packages);
                     packages
                 }),
             );
@@ -2641,8 +2655,9 @@ mod tests {
         std::fs::create_dir_all(root.join("testdata")).unwrap();
 
         let skip = Ignore::new(&[home.clone()], &["internal".to_string()]).unwrap();
+        let walker = CachedWalker::disabled();
         let mut out = Vec::new();
-        collect_go_packages(root, root, false, &skip, &mut out);
+        collect_go_packages(&walker, root, root, false, &skip, &mut out);
         let pkgs: Vec<String> = out
             .into_iter()
             .map(|r| r.unwrap().pkg.to_string())
@@ -2661,6 +2676,52 @@ mod tests {
                 "built-in prune rule dropped: {pruned}"
             );
         }
+    }
+
+    #[test]
+    fn collect_go_packages_through_enabled_walker_matches_uncached() {
+        // The package walk reads each dir through the shared CachedWalker. With a
+        // real (enabled) walker backing it the discovered package set must be
+        // identical to a raw, uncached walk — the walker is transparent, it only
+        // caches the `readdir` by directory mtime.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("go.mod"), "module example.com/x\n").unwrap();
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+
+        let skip = Ignore::default();
+        let to_pkgs = |v: Vec<anyhow::Result<ListPackageResponse>>| {
+            let mut s: Vec<String> = v.into_iter().map(|r| r.unwrap().pkg.to_string()).collect();
+            s.sort();
+            s
+        };
+
+        let mut uncached = Vec::new();
+        collect_go_packages(
+            &CachedWalker::disabled(),
+            root,
+            root,
+            false,
+            &skip,
+            &mut uncached,
+        );
+
+        let dbdir = tempfile::tempdir().unwrap();
+        let walker = CachedWalker::open(&dbdir.path().join("fswalk.db"));
+        let mut cached = Vec::new();
+        collect_go_packages(&walker, root, root, false, &skip, &mut cached);
+        // Second walk: now served from the walker's cache; still identical.
+        let mut cached2 = Vec::new();
+        collect_go_packages(&walker, root, root, false, &skip, &mut cached2);
+
+        let expected = to_pkgs(uncached);
+        assert!(expected.contains(&"a".to_string()));
+        assert!(expected.contains(&"a/b".to_string()));
+        assert!(!expected.iter().any(|p| p == "vendor"));
+        assert_eq!(expected, to_pkgs(cached));
+        assert_eq!(expected, to_pkgs(cached2));
     }
 
     #[test]

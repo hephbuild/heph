@@ -167,6 +167,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
             &init.skip_dirs,
             &init.skip_globs,
             opts,
+            init.walker.clone(),
         )?))
     })?;
 
