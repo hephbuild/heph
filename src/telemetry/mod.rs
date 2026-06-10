@@ -9,10 +9,13 @@
 //! machines would otherwise mint a fake install per job); it identifies an
 //! installation, not a person.
 //!
-//! Commands never pay network latency: at exit the event is appended to a local
-//! SQLite spool (one insert), and the *next* invocation flushes pending rows in
-//! a detached background thread while the command does its real work. See
-//! [`spool`].
+//! At exit the event is appended to a local SQLite spool (one insert), then the
+//! command tries to flush the spool (this run's event plus any backlog) on a
+//! worker thread, bounded to 500ms past the end of its real work. Whatever
+//! doesn't make that deadline stays spooled and rides along with the next run's
+//! flush — so the common case sends this call, exit is never blocked for long,
+//! and nothing is lost. On CI (ephemeral runner, no next run) the flush blocks
+//! to completion instead. See [`spool`].
 //!
 //! Disabled by `telemetry.enabled: false` in `.hephconfig2`, or by setting the
 //! `HEPH_DISABLE_TELEMETRY` environment variable (the latter also keeps the
@@ -259,29 +262,34 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
 
 /// Flush the spool synchronously, blocking until sent (or failed). Used on CI,
 /// where the runner — and its spool — is ephemeral: a deferred flush would
-/// never happen, so the exit pays the POST to get the data out at all.
+/// never happen, so the exit pays the full POST to get the data out at all.
 pub fn flush_blocking() {
     if let Err(e) = flush_once() {
         tracing::debug!(error = %format!("{e:#}"), "telemetry flush skipped");
     }
 }
 
-/// Flush previously spooled events to PostHog on a detached background thread.
-/// Called once at startup, *before* the command runs, so the POST overlaps real
-/// work instead of delaying exit. The thread dies with the process if the
-/// command finishes first — rows are deleted only after a successful send, so
-/// an interrupted flush is retried next run, and the per-event UUID lets
-/// PostHog dedupe any row that was sent but not yet deleted.
-pub fn flush_in_background() {
-    std::thread::Builder::new()
+/// Try to flush the spool (this run's event plus any backlog) on a worker
+/// thread, but wait at most `deadline` for it. Called at exit, so the budget is
+/// measured from after the command's real work is done. If the send doesn't
+/// finish in time we return and let the process exit — the thread is abandoned
+/// mid-flight, rows are deleted only after a successful send, so the unsent rows
+/// simply retry on the next run (per-event UUIDs dedupe any row that did reach
+/// PostHog before we gave up).
+pub fn flush_bounded(deadline: std::time::Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
         .name("telemetry-flush".to_string())
-        .spawn(|| {
-            if let Err(e) = flush_once() {
-                tracing::debug!(error = %format!("{e:#}"), "telemetry flush skipped");
-            }
-        })
-        .map(drop)
-        .unwrap_or_else(|e| tracing::debug!(error = %e, "telemetry flush thread not started"));
+        .spawn(move || drop(tx.send(flush_once())));
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "telemetry flush thread not started");
+        return;
+    }
+    match rx.recv_timeout(deadline) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(error = %format!("{e:#}"), "telemetry flush skipped"),
+        Err(_) => tracing::debug!("telemetry flush exceeded deadline; deferring to next run"),
+    }
 }
 
 fn flush_once() -> anyhow::Result<()> {
