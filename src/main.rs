@@ -4,6 +4,7 @@ use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
 use std::process::ExitCode;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
@@ -74,6 +75,16 @@ fn main() -> ExitCode {
         Err(e) => e.exit(),
     };
 
+    // Telemetry: flush events spooled by *previous* runs on a detached thread,
+    // so the POST overlaps the command's real work and exit never waits on the
+    // network. This run's own event is spooled at exit (a single sqlite insert).
+    let telemetry_on =
+        heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
+    if telemetry_on {
+        heph::telemetry::flush_in_background();
+    }
+    let started_at = std::time::Instant::now();
+
     let pprof_guard = if cli.global.pprof_cpu.is_some() {
         match pprof::ProfilerGuardBuilder::default()
             .frequency(1000)
@@ -90,7 +101,7 @@ fn main() -> ExitCode {
     };
 
     let exec_result = cli.command.execute(sink, &cli.global);
-    let success = exec_result.is_ok();
+    let failure = exec_result.as_ref().err().map(classify_failure);
     let result = match exec_result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
@@ -105,9 +116,11 @@ fn main() -> ExitCode {
         }
     };
 
-    // Best-effort, opt-out usage telemetry. Runs once for whichever command
-    // executed, after it (and its TUI) has finished. Never affects the exit.
-    report_telemetry(&matches, success);
+    // Best-effort, opt-out usage telemetry: spool this invocation's event
+    // locally (one sqlite insert, no network). Never affects the exit.
+    if telemetry_on {
+        spool_telemetry(&matches, failure, started_at.elapsed());
+    }
 
     if let (Some(guard), Some(path)) = (pprof_guard, cli.global.pprof_cpu) {
         match guard
@@ -160,20 +173,25 @@ fn main() -> ExitCode {
 }
 
 /// Send one best-effort, personless telemetry event for whichever command ran.
-/// Command name and the set of flags come straight from the clap matches, so
-/// coverage is exhaustive and automatic for every subcommand. Runs on a tiny
-/// throwaway runtime (the command's own runtime is already gone) with a short
-/// timeout, and swallows every failure.
-fn report_telemetry(matches: &ArgMatches, success: bool) {
-    if !heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config()) {
-        return;
-    }
-
-    let command = matches.subcommand_name().unwrap_or("none").to_string();
+/// Command path and the set of flags come straight from the clap matches, so
+/// coverage is exhaustive and automatic for every subcommand. Spool-only: one
+/// sqlite insert, no network (a later run's background flush sends it).
+fn spool_telemetry(matches: &ArgMatches, failure: Option<&'static str>, took: Duration) {
+    // Full subcommand path ("inspect deps", "tool gc"), plus the args set at
+    // every nesting level.
+    let mut parts = Vec::new();
     let mut flags = set_args(matches);
-    if let Some((_, sub)) = matches.subcommand() {
+    let mut level = matches;
+    while let Some((name, sub)) = level.subcommand() {
+        parts.push(name);
         flags.extend(set_args(sub));
+        level = sub;
     }
+    let command = if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
+    };
     flags.sort();
     flags.dedup();
 
@@ -188,22 +206,30 @@ fn report_telemetry(matches: &ArgMatches, success: bool) {
         "none"
     };
 
-    let snapshot = heph::telemetry::snapshot();
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return;
-    };
-    rt.block_on(heph::telemetry::report(
-        heph::telemetry::ReportContext {
-            command: &command,
-            request_shape,
-            flags: &flags,
-            success,
-        },
-        snapshot,
-    ));
+    heph::telemetry::enqueue_invocation(heph::telemetry::ReportContext {
+        command: &command,
+        request_shape,
+        flags: &flags,
+        success: failure.is_none(),
+        failure,
+        duration_ms: took.as_millis() as u64,
+    });
+}
+
+/// Coarse, non-PII failure class for telemetry: user-cancelled vs a target that
+/// genuinely failed vs anything else.
+fn classify_failure(e: &anyhow::Error) -> &'static str {
+    use heph::engine::error::{CancelledError, TargetFailure, UpstreamFailed};
+    use heph::hmemoizer::downcast_chain_ref;
+    if downcast_chain_ref::<CancelledError>(e).is_some() {
+        "cancelled"
+    } else if downcast_chain_ref::<TargetFailure>(e).is_some()
+        || downcast_chain_ref::<UpstreamFailed>(e).is_some()
+    {
+        "target_failure"
+    } else {
+        "error"
+    }
 }
 
 /// Names of the args/flags explicitly set on the command line for one match
