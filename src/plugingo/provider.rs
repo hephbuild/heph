@@ -337,14 +337,13 @@ impl ProviderTrait for Provider {
     }
 }
 
-/// `heph.go.build_addr(pkg, goos, goarch, tags=[], name="build")` — format the heph
+/// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — format the heph
 /// address of a Go target without resolving anything. Takes a heph package (the addr's
 /// package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a thirdparty `@heph/go/thirdparty/…@v`
-/// path), the platform factors, and the target name, and returns the canonical addr
-/// string `//<pkg>:<name>@goos=…,goarch=…[,tags=…]`. Pure string transform — same
+/// path) and the platform factors, and returns the canonical addr
+/// string `//<pkg>:build@goos=…,goarch=…[,tags=…]`. Pure string transform — same
 /// factor encoding the provider uses internally ([`factors_to_args`]), so the result
-/// matches the addr the provider serves for that package. `name` defaults to the
-/// binary `build` target; pass e.g. `"build_lib"` for the library.
+/// matches the addr the provider serves for that package.
 struct BuildAddrFn;
 
 impl BuildAddrFn {
@@ -374,14 +373,6 @@ impl ProviderFn for BuildAddrFn {
         };
         build_tags.sort();
 
-        let name = match args.named.get("name") {
-            Some(Value::String(s)) => s.as_str(),
-            Some(other) => {
-                anyhow::bail!("heph.go.build_addr: `name` must be a string, got {other:?}")
-            }
-            None => "build",
-        };
-
         let factors = Factors {
             goos: goos.to_string(),
             goarch: goarch.to_string(),
@@ -389,7 +380,7 @@ impl ProviderFn for BuildAddrFn {
         };
         let addr = Addr::new(
             PkgBuf::from(pkg),
-            name.to_string(),
+            "build".to_string(),
             factors_to_args(&factors),
         );
         Ok(Value::String(addr.format()))
@@ -2319,7 +2310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_addr_tags_and_name_override() {
+    async fn test_build_addr_tags() {
         let mut named = HashMap::new();
         // Unsorted on input — must come out sorted (bar,foo) in the addr.
         named.insert(
@@ -2329,7 +2320,6 @@ mod tests {
                 Value::String("bar".into()),
             ]),
         );
-        named.insert("name".to_string(), Value::String("build_lib".into()));
         let args = FnArgs {
             positional: vec![
                 Value::String("@heph/go/std/fmt".into()),
@@ -2342,7 +2332,7 @@ mod tests {
         assert_eq!(
             v,
             Value::String(
-                "//@heph/go/std/fmt:build_lib@goarch=arm64,goos=darwin,tags=\"bar,foo\"".into()
+                "//@heph/go/std/fmt:build@goarch=arm64,goos=darwin,tags=\"bar,foo\"".into()
             )
         );
     }
