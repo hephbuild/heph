@@ -300,8 +300,17 @@ pub async fn run<A: App + 'static>(
             }, if !paused => {
                 match maybe_build_evt {
                     // No per-event redraw: fold into the view here, the 80ms
-                    // ticker repaints the pinned progress block.
-                    Some(e) => view.apply(&e),
+                    // ticker repaints the pinned progress block. Greedily drain
+                    // the rest of the buffered backlog in this same wake so an
+                    // emitted burst folds in one pass rather than one event per
+                    // `select!` iteration (which left the fold seconds behind a
+                    // warm run's flood of typed events).
+                    Some(e) => {
+                        view.apply(&e);
+                        if let Some(r) = build_events.as_mut() {
+                            super::fold_buffered(r, &mut view, |v, ev| v.apply(ev));
+                        }
+                    }
                     // Sender dropped (request finished) — stop polling.
                     None => build_events = None,
                 }
@@ -341,9 +350,7 @@ pub async fn run<A: App + 'static>(
     // request state drops). Drain them so the final summary reflects the full
     // stream rather than the snapshot at the last tick.
     if let Some(r) = build_events.as_mut() {
-        while let Ok(e) = r.try_recv() {
-            view.apply(&e);
-        }
+        super::fold_buffered(r, &mut view, |v, e| v.apply(e));
     }
 
     // Persistent final summary, printed straight to stderr below the

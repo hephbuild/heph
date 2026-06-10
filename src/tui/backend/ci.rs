@@ -39,7 +39,15 @@ pub async fn run<A: App>(
                 }
             } => {
                 match maybe_evt {
-                    Some(ev) => view.apply(&ev),
+                    // Greedily drain the rest of the buffered backlog in this
+                    // same wake so an emitted burst folds in one pass instead of
+                    // one event per `select!` iteration.
+                    Some(ev) => {
+                        view.apply(&ev);
+                        if let Some(r) = events.as_mut() {
+                            super::fold_buffered(r, &mut view, |v, e| v.apply(e));
+                        }
+                    }
                     // Sender dropped — stop polling, keep awaiting the app.
                     None => events = None,
                 }
@@ -50,9 +58,7 @@ pub async fn run<A: App>(
     // Drain any events buffered before the sender dropped so the final
     // summary is accurate even if the app future completed first.
     if let Some(r) = events.as_mut() {
-        while let Ok(ev) = r.try_recv() {
-            view.apply(&ev);
-        }
+        super::fold_buffered(r, &mut view, |v, ev| v.apply(ev));
     }
 
     view.finish();
