@@ -5,15 +5,16 @@
 //!   blobs inline in the single `cache.db`, and
 //! - a **blob** store ([`LocalCacheFS`]) holding large blobs as plain files.
 //!
-//! Routing on write:
+//! Routing on write (the writer holds no buffer of its own — see [`SpillWriter`]):
 //! - The manifest ([`MANIFEST_V1`]) *always* goes to the primary regardless of
 //!   size — GC enumerates revisions by manifest presence in the primary, so the
 //!   primary must remain the authoritative index.
-//! - Any other blob is buffered until it exceeds `spill_threshold`; if it does,
-//!   it streams to the FS blob store, otherwise it lands in the primary. Below
+//! - Any other blob streams straight to the primary by default. The moment its
+//!   running size crosses `spill_threshold`, the prefix written so far is
+//!   migrated into the FS blob store and all further bytes stream there. Below
 //!   the threshold most artifacts stay in sqlite (fast indexed access, atomic,
-//!   mem-cacheable); genuinely large artifacts stream to the filesystem where
-//!   throughput wins and they don't bloat the DB / WAL.
+//!   mem-cacheable, and written with zero copies); genuinely large artifacts end
+//!   up on the filesystem where throughput wins and they don't bloat the DB / WAL.
 //!
 //! Routing on read/exists/delete: a given `(addr, hashin, name)` lives in
 //! exactly one backend, so reads try the primary first (manifests + the common
@@ -47,7 +48,7 @@ use crate::engine::local_cache::{
 use crate::engine::local_cache_fs::LocalCacheFS;
 use crate::hartifactcontent;
 use crate::htaddr::Addr;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::io;
 use std::sync::Arc;
 
@@ -93,6 +94,13 @@ impl LocalCache for LocalCacheSpill {
         if Self::is_manifest(name) {
             return self.primary.writer(addr, hashin, name);
         }
+        // Stream to the primary by default; promote to FS on the first byte past
+        // the threshold. Opening the primary writer up front means small blobs
+        // (the common case) hit their final home with no buffering and no copy.
+        let primary_writer = self
+            .primary
+            .writer(addr, hashin, name)
+            .with_context(|| format!("open primary cache writer for {addr} {name}"))?;
         Ok(Box::new(SpillWriter {
             primary: self.primary.clone(),
             blobs: self.blobs.clone(),
@@ -100,9 +108,9 @@ impl LocalCache for LocalCacheSpill {
             hashin: hashin.to_string(),
             name: name.to_string(),
             threshold: self.spill_threshold,
-            buf: Vec::new(),
+            size: 0,
+            primary_writer: Some(primary_writer),
             blob_writer: None,
-            finalized: false,
         }))
     }
 
@@ -141,13 +149,12 @@ impl LocalCache for LocalCacheSpill {
     }
 }
 
-/// Buffers a blob until it crosses `threshold`, then commits it to one backend.
-///
-/// While at-or-below `threshold` the bytes accumulate in `buf` and, on finalize,
-/// are written to the primary in one shot. The moment the running size exceeds
-/// `threshold` the buffered prefix is flushed to a fresh FS writer and all
-/// subsequent bytes stream straight through — so a large blob is written to the
-/// filesystem exactly once, never doubled through a temp file.
+/// Streams a blob to the primary, promoting it to the FS store the moment its
+/// running size crosses `threshold`. Holds no buffer of its own: the in-flight
+/// bytes live in whichever backend writer is currently open. Small blobs (never
+/// cross the threshold) reach their final home in sqlite with zero copies; a
+/// blob that does cross has its primary-staged prefix migrated to a fresh FS
+/// writer once — and only large blobs pay that.
 struct SpillWriter {
     primary: Arc<dyn LocalCache>,
     blobs: Arc<LocalCacheFS>,
@@ -155,78 +162,92 @@ struct SpillWriter {
     hashin: String,
     name: String,
     threshold: usize,
-    buf: Vec<u8>,
+    /// Bytes written so far, used only to detect the threshold crossing.
+    size: usize,
+    /// Open until the blob spills; `None` afterwards.
+    primary_writer: Option<Box<dyn io::Write>>,
     /// `Some` once spilled; further writes stream directly into it.
     blob_writer: Option<Box<dyn io::Write>>,
-    finalized: bool,
 }
 
 impl SpillWriter {
-    /// Commit the blob: stream-finish the FS writer, or write the buffered
-    /// prefix to the primary. Idempotent. Errors here can't propagate through
-    /// `Drop`; only the small/primary path runs in `Drop` (in-memory write,
-    /// negligible failure surface), the large/FS path's IO errors surface
-    /// through `write`.
-    fn finalize(&mut self) -> io::Result<()> {
-        if self.finalized {
-            return Ok(());
-        }
-        self.finalized = true;
+    /// Promote the blob from the primary to the FS store: commit the staged
+    /// prefix, copy it into a fresh FS writer, drop it from the primary, and
+    /// retain the FS writer for the remaining bytes.
+    fn spill(&mut self) -> io::Result<()> {
+        // Commit the staged prefix to the primary so it can be read back. The
+        // sqlite writer persists on drop; its PendingTracker makes the following
+        // reader/delete wait for that write to land.
+        let mut pw = self
+            .primary_writer
+            .take()
+            .expect("spill called without an open primary writer");
+        pw.flush()?;
+        drop(pw);
 
-        if let Some(mut w) = self.blob_writer.take() {
-            w.flush()?;
-            drop(w);
-            return Ok(());
-        }
-
-        // Never spilled → small blob, write the whole buffer to the primary.
-        let mut w = self
-            .primary
+        let mut blob_writer = self
+            .blobs
             .writer(&self.addr, &self.hashin, &self.name)
             .map_err(io::Error::other)?;
-        w.write_all(&self.buf)?;
-        drop(w);
+        let mut prefix = self
+            .primary
+            .reader(&self.addr, &self.hashin, &self.name)
+            .map_err(io::Error::other)?
+            .reader;
+        io::copy(&mut prefix, &mut blob_writer)?;
+        drop(prefix);
+
+        // The blob now lives in the FS store; drop the primary's staged copy so
+        // a reader resolves to exactly one backend.
+        self.primary
+            .delete(&self.addr, &self.hashin, &self.name)
+            .map_err(io::Error::other)?;
+
+        self.blob_writer = Some(blob_writer);
         Ok(())
     }
 }
 
 impl io::Write for SpillWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // Already spilled: stream straight to the FS writer.
         if let Some(w) = self.blob_writer.as_mut() {
-            return w.write(data);
+            let n = w.write(data)?;
+            self.size += n;
+            return Ok(n);
         }
 
-        self.buf.extend_from_slice(data);
-        if self.buf.len() > self.threshold {
-            // Cross the threshold: open the FS writer, flush the buffered prefix,
-            // and switch to streaming.
-            let mut w = self
-                .blobs
-                .writer(&self.addr, &self.hashin, &self.name)
-                .map_err(io::Error::other)?;
-            w.write_all(&self.buf)?;
-            self.buf = Vec::new();
-            self.blob_writer = Some(w);
+        let w = self
+            .primary_writer
+            .as_mut()
+            .expect("primary writer missing before spill");
+        let n = w.write(data)?;
+        self.size += n;
+        if self.size > self.threshold {
+            self.spill()?;
         }
-        Ok(data.len())
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.blob_writer.as_mut() {
-            Some(w) => w.flush(),
-            None => Ok(()),
+        match (self.blob_writer.as_mut(), self.primary_writer.as_mut()) {
+            (Some(w), _) => w.flush(),
+            (None, Some(w)) => w.flush(),
+            (None, None) => Ok(()),
         }
     }
 }
 
 impl Drop for SpillWriter {
     fn drop(&mut self) {
-        if let Err(e) = self.finalize() {
-            tracing::error!(
-                error = %format!("{e:#}"),
-                addr = %self.addr, hashin = %self.hashin, name = %self.name,
-                "spill cache: finalizing blob failed",
-            );
+        // Whichever backend writer is open owns the bytes; flushing + dropping it
+        // persists the blob (the sqlite writer commits on drop, the FS file is
+        // already on disk). Nothing is staged in `self`, so there is no
+        // finalize-time write that could fail here.
+        if let Some(mut w) = self.blob_writer.take() {
+            drop(w.flush());
+        } else if let Some(mut w) = self.primary_writer.take() {
+            drop(w.flush());
         }
     }
 }
