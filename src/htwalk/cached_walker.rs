@@ -43,6 +43,16 @@ use xxhash_rust::xxh3::Xxh3;
 /// dropped by [`CachedWalker::prune`].
 pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
 
+/// Escape hatch: set `HEPH_DEBUG_CACHED_WALKER=0` to bypass caching entirely and
+/// fall back to reading every directory listing and file hash straight from disk
+/// (no in-process front, no durable store). Any other value (or unset) keeps the
+/// cache on. Cached in a `OnceLock` because `std::env::var` takes a global libc
+/// mutex; the value can't change within a run.
+fn cache_bypassed() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| matches!(std::env::var("HEPH_DEBUG_CACHED_WALKER").as_deref(), Ok("0")))
+}
+
 /// The kind of a directory entry, from the platform `d_type` (no extra stat).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum EntryKind {
@@ -141,6 +151,9 @@ fn entry_kind(ft: std::fs::FileType) -> EntryKind {
 
 /// Shared cached filesystem walker. Cheap to clone (`Arc` the whole thing).
 pub struct CachedWalker {
+    /// When set, all caching is skipped: every call reads straight from disk.
+    /// Transparent to consumers — the API is identical, only slower.
+    bypass: bool,
     store: Option<FsWalkStore>,
     /// In-process front for directory listings, validated against live mtime.
     dirs: Mutex<FxHashMap<PathBuf, (i64, Arc<DirListing>)>>,
@@ -157,6 +170,10 @@ impl CachedWalker {
     /// db-open failure the walker still works — it just degrades to always
     /// re-reading from disk (no cross-run cache).
     pub fn open(db_path: &Path) -> Self {
+        if cache_bypassed() {
+            tracing::warn!("cached walker bypassed (HEPH_DEBUG_CACHED_WALKER=0): reading from disk");
+            return Self::bypassing();
+        }
         let store = match FsWalkStore::open(db_path) {
             Ok(s) => Some(s),
             Err(e) => {
@@ -165,6 +182,7 @@ impl CachedWalker {
             }
         };
         Self {
+            bypass: false,
             store,
             dirs: Mutex::new(FxHashMap::default()),
             files: Mutex::new(FxHashMap::default()),
@@ -173,9 +191,24 @@ impl CachedWalker {
         }
     }
 
-    /// A disabled walker (no caching) for tests / contexts without a db.
+    /// A disabled walker (no durable store, in-process front only) for tests /
+    /// contexts without a db.
     pub fn disabled() -> Self {
         Self {
+            bypass: false,
+            store: None,
+            dirs: Mutex::new(FxHashMap::default()),
+            files: Mutex::new(FxHashMap::default()),
+            touched_dirs: Mutex::new(Vec::new()),
+            touched_files: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A fully bypassing walker: no in-process front, no durable store — every
+    /// call reads straight from disk. Used when `HEPH_DEBUG_CACHED_WALKER=0`.
+    pub fn bypassing() -> Self {
+        Self {
+            bypass: true,
             store: None,
             dirs: Mutex::new(FxHashMap::default()),
             files: Mutex::new(FxHashMap::default()),
@@ -187,6 +220,9 @@ impl CachedWalker {
     /// The cached listing of directory `dir` (absolute). A missing directory
     /// lists empty. The caller filters entries and decides whether to recurse.
     pub fn read_dir(&self, dir: &Path) -> Result<Arc<DirListing>> {
+        if self.bypass {
+            return Ok(Arc::new(read_dir_uncached(dir)?));
+        }
         let meta = match std::fs::metadata(dir) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -246,6 +282,15 @@ impl CachedWalker {
         let size = meta.len();
         let live_mtime = mtime_ns(&meta);
         let exec = is_exec(&meta);
+
+        if self.bypass {
+            return Ok(Arc::new(FileHash {
+                size,
+                mtime_ns: live_mtime.unwrap_or(-1),
+                exec,
+                hashout: file_hashout(file, exec)?,
+            }));
+        }
 
         // In-process front.
         if let Some(mt) = live_mtime
@@ -631,5 +676,30 @@ mod tests {
         let w = CachedWalker::disabled();
         let l = w.read_dir(&tmp.path().join("d")).unwrap();
         assert_eq!(l.entries.len(), 1);
+    }
+
+    #[test]
+    fn bypassing_walker_reads_disk_without_caching() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("d")).unwrap();
+        let f = root.join("d").join("x");
+        std::fs::write(&f, b"hello").unwrap();
+
+        let w = CachedWalker::bypassing();
+        // Reads and hashes correctly, matching the uncached primitives.
+        let l = w.read_dir(&root.join("d")).unwrap();
+        assert_eq!(l.entries.len(), 1);
+        let h = w.file_hash(&f).unwrap();
+        assert_eq!(h.hashout, file_hashout(&f, h.exec).unwrap());
+
+        // Bypass keeps no in-process front: a content change is seen immediately,
+        // with no stale cached value (and the dir's mtime is never consulted).
+        std::fs::write(&f, b"a different, longer body").unwrap();
+        let h2 = w.file_hash(&f).unwrap();
+        assert_ne!(h.hashout, h2.hashout);
+
+        // No durable store ⇒ nothing to prune.
+        assert_eq!(w.prune(std::time::Duration::from_secs(0), false).unwrap(), 0);
     }
 }
