@@ -43,6 +43,15 @@ pub struct Config {
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`crate::htwalk::Ignore`].
     pub skip: Arc<Ignore>,
+    /// Reject target names this provider doesn't own *before* the `_golist`
+    /// resolve (see [`is_known_go_target_name`]). On by default: it avoids a
+    /// wasted `go list` for foreign names (e.g. a buildfile codegen target
+    /// sharing a Go package dir) and the cycle that resolve would induce. The
+    /// engine contains that cycle regardless (a cyclic provider attempt falls
+    /// through to the next provider), so this is a perf/clarity guard, not a
+    /// correctness crutch — tests that exercise the engine's containment path
+    /// turn it off.
+    pub foreign_name_guard: bool,
 }
 
 impl Default for Config {
@@ -50,6 +59,7 @@ impl Default for Config {
         Self {
             go_bin_addr: DEFAULT_GO_BIN_ADDR.to_string(),
             skip: Arc::new(Ignore::default()),
+            foreign_name_guard: true,
         }
     }
 }
@@ -70,6 +80,8 @@ pub(crate) struct ProviderInner {
     go_bin_addr: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
+    /// See [`Config::foreign_name_guard`].
+    foreign_name_guard: bool,
     /// Cache: golist addr → parsed GoPackage. Memoizes the artifact parse only;
     /// the underlying `executor.result(golist_addr)` is always called outside
     /// the `once` closure so every caller (owner + waiter) registers the
@@ -153,7 +165,14 @@ impl Provider {
                 .unwrap_or_default();
         globs.extend(user_skip);
         let skip = Arc::new(Ignore::new(skip_dirs, &globs)?);
-        Self::with_config(workspace_root, Config { go_bin_addr, skip })
+        Self::with_config(
+            workspace_root,
+            Config {
+                go_bin_addr,
+                skip,
+                ..Default::default()
+            },
+        )
     }
 
     pub fn go_bin_addr(&self) -> &str {
@@ -174,6 +193,7 @@ impl Provider {
                 gocache,
                 go_bin_addr: config.go_bin_addr,
                 skip: config.skip,
+                foreign_name_guard: config.foreign_name_guard,
                 pkg_cache: Memoizer::with_tag("pkg_cache"),
                 pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
                 libs_cache: Memoizer::with_tag("libs_cache"),
@@ -540,6 +560,23 @@ fn is_test_target_name(name: &str) -> bool {
     TEST_TARGET_NAMES.contains(&name)
 }
 
+/// Targets handled by `handle_get` *before* the `_golist` resolve (no go list
+/// needed): the golist target itself, the go.mod copy, and the module download.
+const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
+
+/// Non-test first-party/thirdparty target names this provider owns and resolves
+/// through `_golist` (see the `match addr.name` arms in `handle_get`).
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed"];
+
+/// Whether this provider owns `name` — the complete set of go targets it can
+/// generate: the pre-golist special targets, the `_golist`-resolved non-test
+/// targets, and every test variant.
+fn is_known_go_target_name(name: &str) -> bool {
+    SPECIAL_TARGET_NAMES.contains(&name)
+        || GOLIST_TARGET_NAMES.contains(&name)
+        || TEST_TARGET_NAMES.contains(&name)
+}
+
 /// Choose which lib variant of P (the current package) to expose in the
 /// xtest_lib compile and the build_xtest link, so both agree.
 ///
@@ -730,6 +767,15 @@ impl ProviderInner {
         // variant before the `_golist` resolve below so a skipped pkg never
         // forces a `go list` round-trip purely to learn there are no tests.
         if is_test_target_name(&addr.name) && pick_test_skip(&req.states) {
+            return Err(GetError::NotFound);
+        }
+
+        // Foreign names this provider doesn't own would otherwise drag `go list`
+        // and its `q@label=go_src` query into resolution, which trips a cycle.
+        // On by default (perf/clarity); the engine contains the cycle regardless
+        // (cyclic provider attempts fall through to the next provider), so tests
+        // exercising that path disable it via `Config::foreign_name_guard`.
+        if self.foreign_name_guard && !is_known_go_target_name(&addr.name) {
             return Err(GetError::NotFound);
         }
 
@@ -2573,6 +2619,67 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             2,
             "every read_golist_package must call executor.result so all \
              callers register the parent → golist edge in DepDag"
+        );
+    }
+
+    // Regression: a target name the go provider doesn't own (e.g. a buildfile
+    // codegen target sharing a Go package dir) must resolve to NotFound WITHOUT
+    // resolving `_golist`. Otherwise the `q@label=go_src` query that `_golist`
+    // pulls in re-enters get_spec for this same addr, trips a false CycleError,
+    // and `Engine::query` silently drops the target — so `q codegen .` misses
+    // targets that `q all .` (addr-only match, no get_spec) finds. No `go`
+    // binary needed: a correct provider bails before any `go list`.
+    #[tokio::test]
+    async fn foreign_target_name_not_found_without_golist_resolve() {
+        // `Provider::new` enables the foreign-name guard by default, so a name
+        // this provider doesn't own resolves to NotFound without touching the
+        // executor (no `go list`, no `q@label=go_src` query).
+        struct BailExecutor {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ProviderExecutor for BailExecutor {
+            fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let a = addr.format();
+                Box::pin(async move { anyhow::bail!("BailExecutor: result called for {a}") })
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a crate::htmatcher::Matcher,
+                _extra_skip: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { anyhow::bail!("BailExecutor: query called") })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        let p = Provider::new(dir.path().to_path_buf()).unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor: Arc<dyn ProviderExecutor> = Arc::new(BailExecutor {
+            calls: Arc::clone(&calls),
+        });
+        let ctoken = StdCancellationToken::new();
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr: make_addr("", "codegen_gen"),
+            states: vec![],
+            executor,
+        };
+
+        let res = p.get(req, &ctoken).await;
+        assert!(
+            matches!(res, Err(GetError::NotFound)),
+            "foreign name must be NotFound, got driver: {:?}",
+            res.map(|r| r.target_spec.driver)
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "go provider must not resolve _golist (or its go_src query) for a \
+             target name it doesn't own — that re-entry is what trips the false cycle"
         );
     }
 

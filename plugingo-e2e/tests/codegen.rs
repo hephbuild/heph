@@ -1,7 +1,9 @@
 mod common;
 
 use anyhow::Context as _;
-use common::{artifact_paths, artifact_string, fixture, make_workspace, require_go};
+use common::{
+    artifact_paths, artifact_string, fixture, make_workspace, make_workspace_go_first, require_go,
+};
 use std::fs;
 
 #[tokio::test]
@@ -93,5 +95,59 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
 
     let stdout = String::from_utf8(output.stdout).context("binary stdout is utf8")?;
     assert_eq!(stdout.trim(), "hello", "binary must print 'hello'");
+    Ok(())
+}
+
+// Regression: with the go provider registered BEFORE the buildfile provider,
+// `q <label> .` must still find a buildfile codegen target (`//:gen`, labeled
+// `go_src`) that lives in a Go package dir. `get_spec(//:gen)` asks the go
+// provider first; it over-claims the name, drags in `go list` + its
+// `q@label=go_src` query, and that closes a cycle. The engine must contain that
+// cycle (fall through to the buildfile provider), not drop the target — `q all`
+// finds it (addr-only match, no get_spec), so `q go_src` must too.
+#[tokio::test]
+async fn test_query_by_label_finds_codegen_target_go_first() -> anyhow::Result<()> {
+    use futures::TryStreamExt as _;
+    use heph::htmatcher::Matcher;
+    use heph::htpkg::PkgBuf;
+
+    require_go!();
+    let dir = fixture("codegen")?;
+    // Guard off: let the go provider over-claim `//:gen` so the engine's
+    // cycle-containment (fall through to the buildfile provider) is what's tested.
+    let ws = make_workspace_go_first(dir, false)?;
+
+    let m = Matcher::And(vec![
+        Matcher::Label("go_src".to_string()),
+        Matcher::Package(PkgBuf::from("")),
+    ]);
+    let rs = ws.engine.new_state();
+    let addrs: Vec<heph::htaddr::Addr> = ws.engine.clone().query(rs, &m).try_collect().await?;
+
+    let formatted: Vec<String> = addrs.iter().map(|a| a.format()).collect();
+    assert!(
+        formatted.iter().any(|a| a == "//:gen"),
+        "q go_src . must find the codegen target //:gen, got: {formatted:?}"
+    );
+
+    Ok(())
+}
+
+// Defect-2 guard: a failed go-provider attempt for `//:gen` must not leave a
+// stale `gen -> _golist` edge in the request DAG, or a later legitimate
+// `build_lib -> _golist -> go_src group -> gen` resolution would close a FALSE
+// cycle. Building `//:build_lib` over the go-first workspace must still succeed.
+#[tokio::test]
+async fn test_build_lib_still_builds_go_first() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("codegen")?;
+    // Guard off: the failed go over-claim of `//:gen` must not leave a stale DAG
+    // edge that false-cycles this legit build.
+    let ws = make_workspace_go_first(dir, false)?;
+    let result = ws.run("//:build_lib").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "build_lib must produce the .a archive even with go registered first"
+    );
     Ok(())
 }

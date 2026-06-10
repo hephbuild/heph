@@ -50,9 +50,49 @@ fn go_bin_path() -> String {
 }
 
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
+    make_workspace_ordered(dir, false, true)
+}
+
+/// Same as [`make_workspace`] but registers the **go provider before** the
+/// buildfile provider. Provider order = registration order, so with go first a
+/// `get_spec` for a buildfile target in a Go package dir asks the go provider
+/// first — exercising the engine's cycle-containment path.
+///
+/// `foreign_name_guard` toggles the go provider's
+/// [`plugingo::Config::foreign_name_guard`]: pass `false` to let the go provider
+/// over-claim foreign names (so the engine's cycle containment is what's tested).
+pub fn make_workspace_go_first(
+    dir: TempDir,
+    foreign_name_guard: bool,
+) -> anyhow::Result<Workspace> {
+    make_workspace_ordered(dir, true, foreign_name_guard)
+}
+
+fn make_workspace_ordered(
+    dir: TempDir,
+    go_first: bool,
+    foreign_name_guard: bool,
+) -> anyhow::Result<Workspace> {
     let go_bin = go_bin_path();
     // `fs` is auto-registered by `Engine::new`.
-    WorkspaceBuilder::from_dir(dir)
+    let mut b = WorkspaceBuilder::from_dir(dir);
+
+    if go_first {
+        b = b.with_provider(move |init| {
+            Box::new(
+                plugingo::Provider::with_config(
+                    init.root.to_path_buf(),
+                    plugingo::Config {
+                        foreign_name_guard,
+                        ..Default::default()
+                    },
+                )
+                .expect("plugingo provider"),
+            )
+        });
+    }
+
+    b = b
         .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
         .with_provider(move |_| {
             Box::new(
@@ -67,11 +107,24 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
                 }])
                 .expect("static provider"),
             )
-        })
-        .with_provider(|init| {
-            Box::new(plugingo::Provider::new(init.root.to_path_buf()).expect("plugingo provider"))
-        })
-        .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+        });
+
+    if !go_first {
+        b = b.with_provider(move |init| {
+            Box::new(
+                plugingo::Provider::with_config(
+                    init.root.to_path_buf(),
+                    plugingo::Config {
+                        foreign_name_guard,
+                        ..Default::default()
+                    },
+                )
+                .expect("plugingo provider"),
+            )
+        });
+    }
+
+    b.with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_sh()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
         .with_managed_driver(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
