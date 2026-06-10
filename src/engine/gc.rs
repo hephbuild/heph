@@ -197,6 +197,10 @@ impl Engine {
     pub async fn gc_all(self: Arc<Self>, rs: Arc<RequestState>) -> Result<GcStats> {
         let decisions = Arc::clone(&self).gc_resolve_decisions(&rs).await;
 
+        // Telemetry: a GC sweep visits every cached target — its whole-graph
+        // view. Recorded alongside the whole-graph query/validate counts.
+        crate::telemetry::record_graph_size(decisions.len() as u64);
+
         // Targets whose resolution failed are left untouched but still counted.
         let mut stats = GcStats {
             errored: decisions

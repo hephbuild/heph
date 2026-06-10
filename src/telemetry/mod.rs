@@ -48,9 +48,14 @@ pub fn record_artifacts(count: u64, bytes: u64) {
     COLLECTOR.record_artifacts(count, bytes);
 }
 
-/// Record the total target count of a whole-graph (`//...`) query.
+/// Record the total target count of a whole-graph (`//...`) enumeration.
 pub fn record_graph_size(total: u64) {
     COLLECTOR.record_graph_size(total);
+}
+
+/// Read the global counters (largest-seen for `graph_size`, sums elsewhere).
+pub fn snapshot() -> TelemetrySnapshot {
+    COLLECTOR.snapshot()
 }
 
 /// Names of the providers + drivers the engine has registered (built-ins plus

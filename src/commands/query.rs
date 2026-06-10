@@ -57,28 +57,17 @@ impl App for QueryApp {
 
         // Output is incremental, so addrs are printed before `finalize` runs; a
         // provider running a target mid-stream records rich failures in `rs`, which
-        // `finalize` renders after the addrs already flushed.
-        // A whole-graph selector (`//...`) is a `PackagePrefix` rooted at the
-        // empty package; its match count is the total graph size. Count as we
-        // stream and report it (telemetry) only for that exact case — an
-        // excluded/narrowed query is not the full graph.
-        let whole_graph = matches!(&self.matcher, Matcher::PackagePrefix(p) if p.is_empty());
-        let mut matched: u64 = 0;
-
+        // `finalize` renders after the addrs already flushed. A whole-graph (`//...`)
+        // query records the total graph size for telemetry inside `Engine::query`.
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
             while let Some(addr) = stream.try_next().await? {
-                matched += 1;
                 out.println(addr.format());
             }
             Ok(())
         }
         .await;
         out.close().await;
-
-        if whole_graph && res.is_ok() {
-            crate::telemetry::record_graph_size(matched);
-        }
 
         crate::commands::errors::finalize!(ctx, rs, res)
     }
