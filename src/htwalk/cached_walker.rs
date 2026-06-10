@@ -50,7 +50,12 @@ pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(14 *
 /// mutex; the value can't change within a run.
 fn cache_bypassed() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| matches!(std::env::var("HEPH_DEBUG_CACHED_WALKER").as_deref(), Ok("0")))
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("HEPH_DEBUG_CACHED_WALKER").as_deref(),
+            Ok("0")
+        )
+    })
 }
 
 /// The kind of a directory entry, from the platform `d_type` (no extra stat).
@@ -171,7 +176,9 @@ impl CachedWalker {
     /// re-reading from disk (no cross-run cache).
     pub fn open(db_path: &Path) -> Self {
         if cache_bypassed() {
-            tracing::warn!("cached walker bypassed (HEPH_DEBUG_CACHED_WALKER=0): reading from disk");
+            tracing::warn!(
+                "cached walker bypassed (HEPH_DEBUG_CACHED_WALKER=0): reading from disk"
+            );
             return Self::bypassing();
         }
         let store = match FsWalkStore::open(db_path) {
@@ -711,6 +718,9 @@ mod tests {
         assert_ne!(h.hashout, h2.hashout);
 
         // No durable store ⇒ nothing to prune.
-        assert_eq!(w.prune(std::time::Duration::from_secs(0), false).unwrap(), 0);
+        assert_eq!(
+            w.prune(std::time::Duration::from_secs(0), false).unwrap(),
+            0
+        );
     }
 }
