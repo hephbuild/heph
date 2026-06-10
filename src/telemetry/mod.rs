@@ -252,6 +252,15 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     Spool::open(&dir.join("telemetry-spool.db"))?.enqueue(&event)
 }
 
+/// Flush the spool synchronously, blocking until sent (or failed). Used on CI,
+/// where the runner — and its spool — is ephemeral: a deferred flush would
+/// never happen, so the exit pays the POST to get the data out at all.
+pub fn flush_blocking() {
+    if let Err(e) = flush_once() {
+        tracing::debug!(error = %format!("{e:#}"), "telemetry flush skipped");
+    }
+}
+
 /// Flush previously spooled events to PostHog on a detached background thread.
 /// Called once at startup, *before* the command runs, so the POST overlaps real
 /// work instead of delaying exit. The thread dies with the process if the

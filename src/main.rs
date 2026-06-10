@@ -78,9 +78,12 @@ fn main() -> ExitCode {
     // Telemetry: flush events spooled by *previous* runs on a detached thread,
     // so the POST overlaps the command's real work and exit never waits on the
     // network. This run's own event is spooled at exit (a single sqlite insert).
+    // On CI the runner (and its spool) is ephemeral, so the deferred flush would
+    // never run — skip it here and flush inline at exit instead.
     let telemetry_on =
         heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
-    if telemetry_on {
+    let telemetry_ci = heph::telemetry::is_ci();
+    if telemetry_on && !telemetry_ci {
         heph::telemetry::flush_in_background();
     }
     let started_at = std::time::Instant::now();
@@ -117,9 +120,14 @@ fn main() -> ExitCode {
     };
 
     // Best-effort, opt-out usage telemetry: spool this invocation's event
-    // locally (one sqlite insert, no network). Never affects the exit.
+    // locally (one sqlite insert, no network). On CI, flush inline right after —
+    // the spool dies with the ephemeral runner, so deferring loses the data.
+    // Never affects the exit.
     if telemetry_on {
         spool_telemetry(&matches, failure, started_at.elapsed());
+        if telemetry_ci {
+            heph::telemetry::flush_blocking();
+        }
     }
 
     if let (Some(guard), Some(path)) = (pprof_guard, cli.global.pprof_cpu) {
