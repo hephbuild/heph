@@ -843,22 +843,36 @@ impl Engine {
                     }
                 }?;
 
-                self.execute_and_cache(
-                    rs.clone(),
-                    &def,
-                    output_names,
-                    &ExecuteOptions {
-                        hashin: &meta.hashin,
-                        spec: &spec,
-                        def: &def,
-                        force: opts.force,
-                        interactive: opts.interactive.clone(),
-                        shell: opts.shell,
-                        frozen: opts.frozen,
-                        is_top,
-                    },
-                )
-                .await
+                let result = self
+                    .execute_and_cache(
+                        rs.clone(),
+                        &def,
+                        output_names,
+                        &ExecuteOptions {
+                            hashin: &meta.hashin,
+                            spec: &spec,
+                            def: &def,
+                            force: opts.force,
+                            interactive: opts.interactive.clone(),
+                            shell: opts.shell,
+                            frozen: opts.frozen,
+                            is_top,
+                        },
+                    )
+                    .await?;
+
+                // Telemetry: artifact count + per-artifact sizes aren't on the
+                // event stream, so record them here once the result is in hand.
+                // Counts every resolved target across the process; the opt-out
+                // only gates whether the snapshot is sent.
+                let sizes: Vec<u64> = result
+                    .artifacts
+                    .iter()
+                    .filter_map(|a| a.byte_size())
+                    .collect();
+                crate::telemetry::record_artifacts(result.artifacts.len() as u64, &sizes);
+
+                Ok(result)
             },
         )
         .await

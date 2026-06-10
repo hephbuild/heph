@@ -28,6 +28,8 @@ pub struct ConfigFile {
     pub fs: Option<FsConfig>,
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
 }
 
 /// Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.
@@ -39,6 +41,36 @@ pub struct CacheConfig {
     /// Manifests always stay in sqlite. Omit to use the engine default.
     #[serde(default)]
     pub spill_threshold_bytes: Option<u64>,
+}
+
+impl ConfigFile {
+    /// Whether anonymous usage telemetry is enabled. Opt-out: enabled unless the
+    /// config explicitly sets `telemetry.enabled: false`.
+    pub fn telemetry_enabled(&self) -> bool {
+        self.telemetry.map(|t| t.enabled).unwrap_or(true)
+    }
+}
+
+/// Anonymous usage telemetry. `telemetry: { enabled: false }` opts out; omitting
+/// the block (or the field) leaves telemetry on. No data here identifies a user
+/// — only os/arch/version and aggregate run counters are ever reported.
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TelemetryConfig {
+    #[serde(default = "default_telemetry_enabled")]
+    pub enabled: bool,
+}
+
+fn default_telemetry_enabled() -> bool {
+    true
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_telemetry_enabled(),
+        }
+    }
 }
 
 /// Filesystem-walk config shared across plugins. `fs: { skip: [dir, ...] }`.
@@ -162,6 +194,16 @@ pub struct PluginEntry {
     pub name: String,
     #[serde(default)]
     pub options: Options,
+}
+
+/// Filename of the per-workspace config, located at the repo root. The single
+/// source of truth for this name — [`load_from_root`] and the root discovery in
+/// [`crate::engine::get_root`] both build on it.
+pub const CONFIG_FILE_NAME: &str = ".hephconfig2";
+
+/// Load the workspace config from `<root>/.hephconfig2`.
+pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigFile> {
+    load(&root.join(CONFIG_FILE_NAME))
 }
 
 pub fn load(path: &Path) -> anyhow::Result<ConfigFile> {
@@ -425,6 +467,35 @@ drivers:
     #[test]
     fn lock_config_rejects_unknown_field() {
         let yaml = "lock:\n  bogus: 1\n";
+        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn telemetry_defaults_enabled_when_omitted() {
+        // Opt-out: no `telemetry:` block means telemetry stays on.
+        let cfg: ConfigFile = serde_yaml::from_str("providers: []\n").expect("parse");
+        assert!(cfg.telemetry.is_none());
+        assert!(cfg.telemetry_enabled());
+    }
+
+    #[test]
+    fn telemetry_can_be_disabled() {
+        let cfg: ConfigFile =
+            serde_yaml::from_str("telemetry:\n  enabled: false\n").expect("parse");
+        assert!(!cfg.telemetry_enabled());
+    }
+
+    #[test]
+    fn telemetry_empty_block_defaults_enabled() {
+        // `telemetry: {}` present but `enabled` omitted → still on.
+        let cfg: ConfigFile = serde_yaml::from_str("telemetry: {}\n").expect("parse");
+        assert!(cfg.telemetry_enabled());
+    }
+
+    #[test]
+    fn telemetry_rejects_unknown_field() {
+        let yaml = "telemetry:\n  bogus: 1\n";
         let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }

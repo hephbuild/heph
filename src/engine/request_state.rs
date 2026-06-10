@@ -284,6 +284,11 @@ impl RequestState {
 
     /// Stamp the server timestamp on `kind` and emit it on the event stream, if any.
     pub fn emit(&self, kind: crate::engine::event::BuildEventKind) {
+        // Fold into the process-global telemetry counters first: this is the
+        // single chokepoint every progress event flows through, so target/cache
+        // tallies stay in lockstep with what the renderer sees. Always counted
+        // (cheap atomics); the opt-out only gates whether the snapshot is sent.
+        crate::telemetry::observe_event(&kind);
         if let Some(tx) = &self.data.events {
             // A closed receiver (consumer gone) is expected; events are
             // best-effort, so dropping the send result is intentional.

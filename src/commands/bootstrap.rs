@@ -83,14 +83,26 @@ impl SuppressionHandle {
     }
 }
 
+/// Read the telemetry opt-out flag straight from `.hephconfig2`, independent of
+/// engine construction, so the top-level CLI reporter can decide whether to send
+/// without holding an `Engine`. Any failure (no repo root, unreadable/invalid
+/// config) defaults to enabled — the env kill switch still applies on top.
+pub fn telemetry_enabled_from_config() -> bool {
+    let Ok(root) = engine::get_root() else {
+        return true;
+    };
+    config_file::load_from_root(&root)
+        .map(|f| f.telemetry_enabled())
+        .unwrap_or(true)
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
         Err(inner) => anyhow::bail!("Error: {}", inner),
     };
 
-    let cfg_path = root.join(".hephconfig2");
-    let file = config_file::load(&cfg_path)?;
+    let file = config_file::load_from_root(&root)?;
 
     let home_dir = file
         .home_dir
@@ -121,6 +133,9 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         .and_then(|c| c.spill_threshold_bytes)
         .unwrap_or(engine::DEFAULT_SPILL_THRESHOLD_BYTES);
 
+    // Read before the struct literal below moves `file.fs`.
+    let telemetry_enabled = file.telemetry_enabled();
+
     let lock_backend = file
         .lock
         .and_then(|l| l.backend)
@@ -140,6 +155,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         fuse,
         lock_backend,
         spill_threshold_bytes,
+        telemetry_enabled,
     })?;
 
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
@@ -196,6 +212,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.apply_config(&file.providers, &file.drivers)?;
 
     let engine = Arc::new(e);
+
+    // Telemetry: record the enabled provider + driver type names (built-ins plus
+    // whatever the config turned on) for the exit reporter. Set-once.
+    crate::telemetry::record_plugins(
+        engine.providers_by_name.keys().cloned().collect(),
+        engine.drivers_by_name.keys().cloned().collect(),
+    );
+
     let (tx, rx) = mpsc::unbounded_channel();
     let trigger = ShutdownTrigger {
         tx,

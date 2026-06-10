@@ -17,6 +17,13 @@ impl Engine {
         rs: Arc<RequestState>,
         m: &'a htmatcher::Matcher,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        // A whole-graph selector (`//...` — a `PackagePrefix` rooted at the empty
+        // package) enumerates every target, so its final match count is the total
+        // graph size. Recorded for telemetry only when the stream is driven to
+        // completion: an early-dropped or errored stream never saw the full graph.
+        // Centralized here so every whole-graph caller (query, unscoped validate)
+        // is covered without per-command code.
+        let whole_graph = matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
         async_stream::try_stream! {
             // Multiple providers can surface the same addr (or the same package
             // from `packages()`), so dedup before yielding.
@@ -82,6 +89,10 @@ impl Engine {
                         }
                     }
                 }
+            }
+
+            if whole_graph {
+                crate::telemetry::record_graph_size(seen.len() as u64);
             }
         }
     }
@@ -253,6 +264,31 @@ mod tests {
         assert_eq!(addrs.len(), 2);
         assert!(addrs.iter().any(|a| a.name == "a"));
         assert!(addrs.iter().any(|a| a.name == "b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whole_graph_query_records_graph_size() -> anyhow::Result<()> {
+        let engine = make_engine(vec![
+            target("foo/bar", "a", &[]),
+            target("foo/bar", "b", &[]),
+            target("other", "c", &[]),
+        ])?;
+
+        let rs = engine.new_state();
+        let addrs: Vec<Addr> = engine
+            .query(rs, &Matcher::PackagePrefix(PkgBuf::from("")))
+            .try_collect()
+            .await?;
+        assert_eq!(addrs.len(), 3);
+
+        // The whole-graph enumeration must land in the telemetry counter. The
+        // collector is process-global and keeps the largest seen value, so with
+        // other tests running in parallel only a lower bound is stable.
+        assert!(
+            crate::telemetry::snapshot().graph_size >= 3,
+            "whole-graph query must record the graph size"
+        );
         Ok(())
     }
 

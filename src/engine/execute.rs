@@ -56,7 +56,10 @@ impl Engine {
             .context("result semaphore closed")?;
 
         let addr_str = addr.format();
-        crate::engine::event::emit_scope(
+        // Telemetry: per-target execute wall time. This path runs only on a real
+        // execution (cache misses), so it captures exactly the executed targets.
+        let exec_started = std::time::Instant::now();
+        let res = crate::engine::event::emit_scope(
             &rs,
             crate::engine::event::BuildEventKind::ExecuteStart {
                 addr: addr_str.clone(),
@@ -146,7 +149,9 @@ impl Engine {
                 Ok((res.artifacts, res.sandbox_cleanup, res.fuse_slot_guards))
             },
         )
-        .await
+        .await;
+        crate::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
+        res
     }
 
     async fn inputs_result_exec(

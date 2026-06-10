@@ -57,7 +57,8 @@ impl App for QueryApp {
 
         // Output is incremental, so addrs are printed before `finalize` runs; a
         // provider running a target mid-stream records rich failures in `rs`, which
-        // `finalize` renders after the addrs already flushed.
+        // `finalize` renders after the addrs already flushed. A whole-graph (`//...`)
+        // query records the total graph size for telemetry inside `Engine::query`.
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
             while let Some(addr) = stream.try_next().await? {

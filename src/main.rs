@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches, Parser};
 use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
@@ -64,7 +64,22 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let cli = Cli::parse();
+    // Parse once into `ArgMatches`, then into the typed `Cli`. Keeping the
+    // matches lets the telemetry reporter enumerate the exact args/flags that
+    // were set — generically, for every command, with no per-command list.
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+
+    // Telemetry decision is taken up front (config read), but the flush happens
+    // at exit: this run's event is spooled, then we try to send it (plus any
+    // backlog) within a short post-work budget. On CI the runner — and its
+    // spool — is ephemeral, so there is no "next run" to defer to.
+    let telemetry_on =
+        heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
+    let started_at = std::time::Instant::now();
 
     let pprof_guard = if cli.global.pprof_cpu.is_some() {
         match pprof::ProfilerGuardBuilder::default()
@@ -81,19 +96,30 @@ fn main() -> ExitCode {
         None
     };
 
-    let result = match cli.command.execute(sink, &cli.global) {
+    let exec_result = cli.command.execute(sink, &cli.global);
+    let result = match &exec_result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one
             // (Starlark/Go diagnostics from single-error commands). The TUI is
             // already torn down here, so plain stderr output is safe. Fall back
             // to the one-line log when nothing renderable is found.
-            if !heph::commands::errors::render_anyhow(&e) {
+            if !heph::commands::errors::render_anyhow(e) {
                 error!(error = %format!("{:#}", e), "Failed");
             }
             ExitCode::FAILURE
         }
     };
+
+    // Best-effort, opt-out usage telemetry: record this invocation's event and
+    // try to send it (bounded; CI blocks). Never changes the exit code.
+    if telemetry_on {
+        heph::telemetry::record_invocation(
+            &matches,
+            exec_result.as_ref().err(),
+            started_at.elapsed(),
+        );
+    }
 
     if let (Some(guard), Some(path)) = (pprof_guard, cli.global.pprof_cpu) {
         match guard
