@@ -315,7 +315,7 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     }
     put("duration_ms", ctx.duration_ms.into());
     // Aggregate run counters.
-    put("targets", stats.targets.into());
+    put("result_targets", stats.targets.into());
     put("local_cache_hits", stats.local_cache_hits.into());
     put("local_cache_misses", stats.local_cache_misses.into());
     put("artifact_count", stats.artifacts.into());
