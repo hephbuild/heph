@@ -26,6 +26,7 @@
 
 extern crate core;
 
+pub mod color;
 pub mod commands;
 pub mod debug_hash;
 pub mod defer;
