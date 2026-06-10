@@ -19,4 +19,4 @@ mod thirdparty;
 pub use driver_embed::GoEmbedDriver;
 pub use driver_golist::GoGolistDriver;
 pub use driver_testmain::GoTestmainDriver;
-pub use provider::Provider;
+pub use provider::{Config, Provider};

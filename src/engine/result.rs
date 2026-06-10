@@ -1913,6 +1913,13 @@ impl Engine {
         addr: &Addr,
     ) -> anyhow::Result<Arc<EngineTargetSpec>> {
         let states = Arc::clone(&self).probe_segments(rs, &addr.package).await?;
+        // A provider whose `get()` cycles doesn't preclude a later provider
+        // resolving the same addr acyclically (e.g. the go provider over-claims a
+        // buildfile codegen target in a Go package dir and drags `go list` into a
+        // cycle; the buildfile provider resolves it cleanly). Skip the cyclic
+        // provider and keep going; surface the cycle only if NO provider succeeds
+        // — never deadlock, never silently drop a resolvable target.
+        let mut pending_cycle: Option<anyhow::Error> = None;
         for provider in self.providers.iter() {
             let provider_rs = rs.with_skip_provider(&provider.name);
             let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
@@ -1941,7 +1948,13 @@ impl Engine {
                 Err(GetError::NotFound) => continue,
                 // Return e directly (not bail!(e)) to preserve typed-error downcast
                 // through the anyhow::Error chain — required for CycleError handling.
-                Err(GetError::Other(e)) => return Err(e),
+                Err(GetError::Other(e)) => {
+                    if downcast_chain_ref::<CycleError>(&e).is_some() {
+                        pending_cycle = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
             };
 
             return anyhow::Ok(Arc::new(EngineTargetSpec {
@@ -1950,6 +1963,11 @@ impl Engine {
             }));
         }
 
+        // No provider produced a spec. If one cycled, that's the meaningful
+        // failure (hard fail, loud); otherwise the addr is genuinely unknown.
+        if let Some(e) = pending_cycle {
+            return Err(e);
+        }
         Err(TargetNotFoundError { addr: addr.clone() }.into())
     }
 }
@@ -2563,6 +2581,138 @@ mod tests {
             .expect("expected cycle error");
         assert!(
             err.downcast_ref::<CycleError>().is_some(),
+            "expected CycleError, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// Provider whose `get` fails with a typed `CycleError` for one addr (and
+    /// `NotFound` otherwise) — models a provider that over-claims a name and
+    /// induces a cycle deep in resolution (like the go provider over-claiming a
+    /// buildfile codegen target). Used to verify the engine *contains* the
+    /// cycle: it falls through to the next provider rather than aborting.
+    struct CyclingProvider {
+        name: String,
+        cycles_for: String,
+    }
+    impl crate::engine::provider::Provider for CyclingProvider {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: self.name.clone(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            let cycles = req.addr.format() == self.cycles_for;
+            let addr = req.addr.clone();
+            Box::pin(async move {
+                if cycles {
+                    Err(GetError::Other(
+                        CycleError {
+                            from: addr.clone(),
+                            to: addr,
+                        }
+                        .into(),
+                    ))
+                } else {
+                    Err(GetError::NotFound)
+                }
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    fn engine_with_cycling(
+        cycles_for: &str,
+        statics: Vec<pluginstatictarget::Target>,
+    ) -> anyhow::Result<Arc<Engine>> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))?;
+        // Cycling provider FIRST, so `get_spec` hits it before the static one.
+        let cycles_for = cycles_for.to_string();
+        engine.register_provider(move |_| {
+            Box::new(CyclingProvider {
+                name: "cyc".to_string(),
+                cycles_for: cycles_for.clone(),
+            })
+        })?;
+        if !statics.is_empty() {
+            let provider = pluginstatictarget::Provider::new(statics)?;
+            engine.register_provider(move |_| Box::new(provider))?;
+        }
+        Ok(Arc::new(engine))
+    }
+
+    // A provider whose `get` cycles must not abort `get_spec`: the engine falls
+    // through to the next provider that resolves the addr acyclically. This is
+    // the engine-level containment that makes `q <label> .` find a buildfile
+    // target even when the go provider (registered first) over-claims it.
+    #[tokio::test]
+    async fn get_spec_falls_through_a_cyclic_provider_to_the_next() -> anyhow::Result<()> {
+        let engine = engine_with_cycling("//pkg:t", vec![static_target("//pkg:t", &["lbl"], &[])])?;
+        let addr = crate::htaddr::parse_addr("//pkg:t")?;
+        let spec = engine.clone().get_spec(engine.new_state(), &addr).await?;
+        assert_eq!(
+            spec.spec.labels,
+            vec!["lbl".to_string()],
+            "must resolve via the non-cyclic provider"
+        );
+        Ok(())
+    }
+
+    // When the ONLY provider serving an addr cycles, `get_spec` hard-fails with
+    // the typed `CycleError` (loud) — never deadlocks, never silently NotFound.
+    #[tokio::test]
+    async fn get_spec_hard_fails_when_every_provider_cycles() -> anyhow::Result<()> {
+        let engine = engine_with_cycling("//pkg:t", vec![])?;
+        let addr = crate::htaddr::parse_addr("//pkg:t")?;
+        let err = engine
+            .clone()
+            .get_spec(engine.new_state(), &addr)
+            .await
+            .err()
+            .expect("expected a cycle error");
+        assert!(
+            crate::hmemoizer::downcast_chain_ref::<CycleError>(&err).is_some(),
             "expected CycleError, got: {err:#}"
         );
         Ok(())
