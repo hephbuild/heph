@@ -26,7 +26,7 @@ impl LogSink {
     /// capability — callers configuring a formatter ask the sink rather than
     /// re-deriving the predicate.
     pub fn color_enabled(&self) -> bool {
-        crate::color::stderr_color_enabled()
+        crate::tui::color::stderr_color_enabled()
     }
 
     pub fn switch_to_buffered(&self) -> mpsc::UnboundedReceiver<Vec<u8>> {

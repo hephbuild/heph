@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
-use crate::color::stderr_color_enabled as color_enabled;
+use crate::tui::color::stderr_color_enabled as color_enabled;
 use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
 use crate::hmemoizer::downcast_chain_ref;
 
