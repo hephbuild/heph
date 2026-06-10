@@ -1,7 +1,7 @@
 use crate::engine::provider::{
-    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait, ProviderExecutor,
-    State,
+    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
+    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
+    ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
 };
 use crate::hasync::Cancellable;
 use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
@@ -29,6 +29,7 @@ use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
 use anyhow::Context;
 use async_recursion::async_recursion;
+use async_trait::async_trait;
 use enclose::enclose;
 use futures::future::{BoxFuture, try_join_all};
 use parking_lot::RwLock;
@@ -326,6 +327,72 @@ impl ProviderTrait for Provider {
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         self.inner.probe(req, ctoken)
+    }
+
+    fn functions(&self) -> Vec<ProviderFunctionDef> {
+        vec![ProviderFunctionDef {
+            name: "build_addr".to_string(),
+            func: Arc::new(BuildAddrFn),
+        }]
+    }
+}
+
+/// `heph.go.build_addr(pkg, goos, goarch, tags=[], name="build")` — format the heph
+/// address of a Go target without resolving anything. Takes a heph package (the addr's
+/// package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a thirdparty `@heph/go/thirdparty/…@v`
+/// path), the platform factors, and the target name, and returns the canonical addr
+/// string `//<pkg>:<name>@goos=…,goarch=…[,tags=…]`. Pure string transform — same
+/// factor encoding the provider uses internally ([`factors_to_args`]), so the result
+/// matches the addr the provider serves for that package. `name` defaults to the
+/// binary `build` target; pass e.g. `"build_lib"` for the library.
+struct BuildAddrFn;
+
+impl BuildAddrFn {
+    fn arg_str<'a>(args: &'a FnArgs, idx: usize, name: &str) -> anyhow::Result<&'a str> {
+        let v = args
+            .named
+            .get(name)
+            .or_else(|| args.positional.get(idx))
+            .ok_or_else(|| anyhow::anyhow!("heph.go.build_addr: missing `{name}` argument"))?;
+        match v {
+            Value::String(s) => Ok(s.as_str()),
+            other => anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}"),
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderFn for BuildAddrFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let pkg = Self::arg_str(&args, 0, "pkg")?;
+        let goos = Self::arg_str(&args, 1, "goos")?;
+        let goarch = Self::arg_str(&args, 2, "goarch")?;
+
+        let mut build_tags = match args.named.get("tags") {
+            Some(v) => parse_strings(v).context("heph.go.build_addr: parsing `tags`")?,
+            None => Vec::new(),
+        };
+        build_tags.sort();
+
+        let name = match args.named.get("name") {
+            Some(Value::String(s)) => s.as_str(),
+            Some(other) => {
+                anyhow::bail!("heph.go.build_addr: `name` must be a string, got {other:?}")
+            }
+            None => "build",
+        };
+
+        let factors = Factors {
+            goos: goos.to_string(),
+            goarch: goarch.to_string(),
+            build_tags,
+        };
+        let addr = Addr::new(
+            PkgBuf::from(pkg),
+            name.to_string(),
+            factors_to_args(&factors),
+        );
+        Ok(Value::String(addr.format()))
     }
 }
 
@@ -2226,6 +2293,83 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn build_addr_ctx() -> FnCallContext<'static> {
+        FnCallContext {
+            pkg: "",
+            root: std::path::Path::new("/"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_basic() {
+        let args = FnArgs {
+            positional: vec![
+                Value::String("mylib".into()),
+                Value::String("linux".into()),
+                Value::String("amd64".into()),
+            ],
+            named: HashMap::new(),
+        };
+        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        assert_eq!(v, Value::String("//mylib:build@goarch=amd64,goos=linux".into()));
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_tags_and_name_override() {
+        let mut named = HashMap::new();
+        // Unsorted on input — must come out sorted (bar,foo) in the addr.
+        named.insert(
+            "tags".to_string(),
+            Value::List(vec![
+                Value::String("foo".into()),
+                Value::String("bar".into()),
+            ]),
+        );
+        named.insert("name".to_string(), Value::String("build_lib".into()));
+        let args = FnArgs {
+            positional: vec![
+                Value::String("@heph/go/std/fmt".into()),
+                Value::String("darwin".into()),
+                Value::String("arm64".into()),
+            ],
+            named,
+        };
+        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        assert_eq!(
+            v,
+            Value::String(
+                "//@heph/go/std/fmt:build_lib@goarch=arm64,goos=darwin,tags=\"bar,foo\"".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_named_args() {
+        let mut named = HashMap::new();
+        named.insert("pkg".to_string(), Value::String("mylib".into()));
+        named.insert("goos".to_string(), Value::String("linux".into()));
+        named.insert("goarch".to_string(), Value::String("amd64".into()));
+        let args = FnArgs {
+            positional: vec![],
+            named,
+        };
+        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        assert_eq!(v, Value::String("//mylib:build@goarch=amd64,goos=linux".into()));
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_missing_goarch_errors() {
+        let args = FnArgs {
+            positional: vec![
+                Value::String("mylib".into()),
+                Value::String("linux".into()),
+            ],
+            named: HashMap::new(),
+        };
+        let err = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap_err();
+        assert!(err.to_string().contains("missing `goarch`"), "{err}");
+    }
 
     fn run_str(spec: &crate::engine::provider::TargetSpec) -> String {
         match spec.config.get("run").unwrap() {
