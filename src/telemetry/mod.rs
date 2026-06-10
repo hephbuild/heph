@@ -49,9 +49,9 @@ pub fn observe_event(kind: &BuildEventKind) {
     COLLECTOR.observe_event(kind);
 }
 
-/// Record one resolved target's artifact count + total byte size.
-pub fn record_artifacts(count: u64, bytes: u64) {
-    COLLECTOR.record_artifacts(count, bytes);
+/// Record one resolved target's artifact count + known per-artifact sizes.
+pub fn record_artifacts(count: u64, sizes: &[u64]) {
+    COLLECTOR.record_artifacts(count, sizes);
 }
 
 /// Record the total target count of a whole-graph (`//...`) enumeration.
@@ -297,6 +297,9 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     let mut put = |k: &str, v: serde_json::Value| drop(props.insert(k.to_string(), v));
     // Personless: never create/update a person profile for this distinct_id.
     put("$process_person_profile", false.into());
+    // A fresh id per invocation, distinct from the install id — lets one event
+    // be correlated/deduped without identifying the machine.
+    put("run_id", uuid::Uuid::new_v4().to_string().into());
     // Environment — coarse and non-identifying.
     put("os", std::env::consts::OS.into());
     put("arch", std::env::consts::ARCH.into());
@@ -315,8 +318,14 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     put("targets", stats.targets.into());
     put("local_cache_hits", stats.local_cache_hits.into());
     put("local_cache_misses", stats.local_cache_misses.into());
-    put("artifacts", stats.artifacts.into());
-    put("artifact_bytes", stats.artifact_bytes.into());
+    put("artifact_count", stats.artifacts.into());
+    put("total_artifact_size_bytes", stats.artifact_bytes.into());
+    // Size distribution — only present when at least one artifact had a known
+    // size, so max/p99 are never a misleading 0.
+    if stats.sized_artifacts > 0 {
+        put("max_artifact_size_bytes", stats.max_artifact_bytes.into());
+        put("p99_artifact_size_bytes", stats.p99_artifact_bytes.into());
+    }
     // Whole-graph (`//...`) query size — only present when one actually ran, so
     // the attr is absent rather than a misleading 0 on every other invocation.
     if stats.graph_size > 0 {
