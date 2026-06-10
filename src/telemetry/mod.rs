@@ -54,6 +54,11 @@ pub fn record_artifacts(count: u64, sizes: &[u64]) {
     COLLECTOR.record_artifacts(count, sizes);
 }
 
+/// Record one target's execute wall time (ms) — cache misses only.
+pub fn record_execute_ms(ms: u64) {
+    COLLECTOR.record_execute_ms(ms);
+}
+
 /// Record the total target count of a whole-graph (`//...`) enumeration.
 pub fn record_graph_size(total: u64) {
     COLLECTOR.record_graph_size(total);
@@ -318,6 +323,11 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     put("result_targets", stats.targets.into());
     put("local_cache_hits", stats.local_cache_hits.into());
     put("local_cache_misses", stats.local_cache_misses.into());
+    put("executes", stats.executes.into());
+    // Approx p99 execute wall time — only when something actually executed.
+    if stats.executes > 0 {
+        put("p99_execute_ms", stats.p99_execute_ms.into());
+    }
     put("artifact_count", stats.artifacts.into());
     put("total_artifact_size_bytes", stats.artifact_bytes.into());
     // Size distribution — only present when at least one artifact had a known

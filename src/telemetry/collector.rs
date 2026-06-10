@@ -19,8 +19,68 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::event::BuildEventKind;
 
 /// One bucket per possible bit-length of a `u64` (0..=64). Bucket `i` (`i >= 1`)
-/// holds sizes in `[2^(i-1), 2^i - 1]`; bucket `0` holds size `0`.
+/// holds values in `[2^(i-1), 2^i - 1]`; bucket `0` holds value `0`.
 const HISTOGRAM_BUCKETS: usize = 65;
+
+/// Histogram bucket for `v`: its bit length (`0` for `v == 0`). Bucket `i >= 1`
+/// covers `[2^(i-1), 2^i - 1]`.
+fn bucket_index(v: u64) -> usize {
+    (u64::BITS - v.leading_zeros()) as usize
+}
+
+/// Inclusive upper edge of bucket `i`, reported as the percentile estimate
+/// (conservative — never undercounts a large tail). Saturates for the top bucket
+/// so `1 << 64` never overflows.
+fn bucket_upper(i: usize) -> u64 {
+    match i {
+        0 => 0,
+        _ => (1u64 << i).wrapping_sub(1),
+    }
+}
+
+/// Fixed-memory, lock-free power-of-two histogram. Records in O(1), reports an
+/// approximate (within a factor of 2) percentile. ~520 bytes regardless of how
+/// many values are recorded — bounds memory on builds with millions of samples.
+#[derive(Debug)]
+struct AtomicHistogram {
+    buckets: [AtomicU64; HISTOGRAM_BUCKETS],
+}
+
+impl AtomicHistogram {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; HISTOGRAM_BUCKETS],
+        }
+    }
+
+    fn record(&self, v: u64) {
+        if let Some(b) = self.buckets.get(bucket_index(v)) {
+            b.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Approximate nearest-rank 99th percentile: walk buckets low→high until the
+    /// cumulative count reaches the 99th-rank threshold, report that bucket's
+    /// upper edge. `0` for an empty histogram.
+    fn percentile_99(&self) -> u64 {
+        let counts: [u64; HISTOGRAM_BUCKETS] =
+            std::array::from_fn(|i| self.buckets.get(i).map_or(0, |b| b.load(Ordering::Relaxed)));
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        // Nearest-rank: rank = ceil(99 * total / 100), integer ceil-div.
+        let rank = (99u128 * total as u128).div_ceil(100) as u64;
+        let mut acc = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            acc = acc.saturating_add(c);
+            if acc >= rank {
+                return bucket_upper(i);
+            }
+        }
+        bucket_upper(HISTOGRAM_BUCKETS - 1)
+    }
+}
 
 /// Counters accumulated over the lifetime of the process. A single `static`
 /// instance backs the free functions in the parent module; the engine bumps it
@@ -43,7 +103,11 @@ pub struct TelemetryCollector {
     /// Largest single known artifact `byte_size()` seen (exact).
     max_artifact_bytes: AtomicU64,
     /// Power-of-two histogram of known artifact sizes, for an approximate p99.
-    size_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+    size_histogram: AtomicHistogram,
+    /// Targets that actually executed (cache misses) this process.
+    executes: AtomicU64,
+    /// Power-of-two histogram of per-target execute wall time (ms), for p99.
+    execute_ms_histogram: AtomicHistogram,
     /// Total target count of a whole-graph (`//...`) query, when one ran. `0`
     /// means no whole-graph query was issued this process.
     graph_size: AtomicU64,
@@ -52,22 +116,6 @@ pub struct TelemetryCollector {
 impl Default for TelemetryCollector {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Histogram bucket for `v`: its bit length (`0` for `v == 0`). Bucket `i >= 1`
-/// covers `[2^(i-1), 2^i - 1]`.
-fn bucket_index(v: u64) -> usize {
-    (u64::BITS - v.leading_zeros()) as usize
-}
-
-/// Inclusive upper edge of bucket `i`, the value reported as the percentile
-/// estimate (conservative — never undercounts a large-artifact tail). Saturates
-/// for the top bucket so `1 << 64` never overflows.
-fn bucket_upper(i: usize) -> u64 {
-    match i {
-        0 => 0,
-        _ => (1u64 << i).wrapping_sub(1),
     }
 }
 
@@ -82,7 +130,9 @@ impl TelemetryCollector {
             sized_artifacts: AtomicU64::new(0),
             artifact_bytes: AtomicU64::new(0),
             max_artifact_bytes: AtomicU64::new(0),
-            size_histogram: [const { AtomicU64::new(0) }; HISTOGRAM_BUCKETS],
+            size_histogram: AtomicHistogram::new(),
+            executes: AtomicU64::new(0),
+            execute_ms_histogram: AtomicHistogram::new(),
             graph_size: AtomicU64::new(0),
         }
     }
@@ -123,10 +173,15 @@ impl TelemetryCollector {
             self.max_artifact_bytes.fetch_max(max, Ordering::Relaxed);
         }
         for &size in sizes {
-            if let Some(bucket) = self.size_histogram.get(bucket_index(size)) {
-                bucket.fetch_add(1, Ordering::Relaxed);
-            }
+            self.size_histogram.record(size);
         }
+    }
+
+    /// Record one target's execute wall time (ms). Called only on a real
+    /// execution (cache miss), so the population is exactly the executed targets.
+    pub fn record_execute_ms(&self, ms: u64) {
+        self.executes.fetch_add(1, Ordering::Relaxed);
+        self.execute_ms_histogram.record(ms);
     }
 
     /// Record the total target count of a whole-graph (`//...`) query. Keeps the
@@ -137,11 +192,6 @@ impl TelemetryCollector {
 
     /// Read the accumulated counters at this instant.
     pub fn snapshot(&self) -> TelemetrySnapshot {
-        let counts: [u64; HISTOGRAM_BUCKETS] = std::array::from_fn(|i| {
-            self.size_histogram
-                .get(i)
-                .map_or(0, |b| b.load(Ordering::Relaxed))
-        });
         TelemetrySnapshot {
             targets: self.targets.load(Ordering::Relaxed),
             local_cache_hits: self.local_cache_hits.load(Ordering::Relaxed),
@@ -149,33 +199,13 @@ impl TelemetryCollector {
             artifacts: self.artifacts.load(Ordering::Relaxed),
             artifact_bytes: self.artifact_bytes.load(Ordering::Relaxed),
             max_artifact_bytes: self.max_artifact_bytes.load(Ordering::Relaxed),
-            p99_artifact_bytes: percentile_99(&counts),
+            p99_artifact_bytes: self.size_histogram.percentile_99(),
             sized_artifacts: self.sized_artifacts.load(Ordering::Relaxed),
+            executes: self.executes.load(Ordering::Relaxed),
+            p99_execute_ms: self.execute_ms_histogram.percentile_99(),
             graph_size: self.graph_size.load(Ordering::Relaxed),
         }
     }
-}
-
-/// Approximate nearest-rank 99th percentile from the power-of-two histogram.
-/// Walks buckets low→high, accumulating until the count reaches the 99th-rank
-/// threshold, and reports that bucket's upper edge. Within a factor of 2 of the
-/// true value; `0` for an empty histogram.
-fn percentile_99(counts: &[u64; HISTOGRAM_BUCKETS]) -> u64 {
-    let total: u64 = counts.iter().sum();
-    if total == 0 {
-        return 0;
-    }
-    // Nearest-rank: rank = ceil(99 * total / 100), integer ceil-div.
-    let rank = (99u128 * total as u128).div_ceil(100) as u64;
-    let mut acc = 0u64;
-    for (i, &c) in counts.iter().enumerate() {
-        acc = acc.saturating_add(c);
-        if acc >= rank {
-            return bucket_upper(i);
-        }
-    }
-    // Unreachable (acc reaches total >= rank); fall back to the largest bucket.
-    bucket_upper(HISTOGRAM_BUCKETS - 1)
 }
 
 /// Immutable read of the counters, taken once at the end of a run.
@@ -192,12 +222,34 @@ pub struct TelemetrySnapshot {
     /// How many artifacts had a known size (the population behind the size
     /// stats); `0` means max/p99 are not meaningful.
     pub sized_artifacts: u64,
+    /// Targets that actually executed (cache misses); population behind the
+    /// execute p99. `0` means `p99_execute_ms` is not meaningful.
+    pub executes: u64,
+    /// Approximate 99th percentile per-target execute wall time (ms).
+    pub p99_execute_ms: u64,
     pub graph_size: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_execute_ms_counts_and_p99() {
+        let c = TelemetryCollector::new();
+        // 99 fast executes (~4ms → bucket 3, [4,7]) + 1 slow (4096ms).
+        for _ in 0..99 {
+            c.record_execute_ms(4);
+        }
+        c.record_execute_ms(4096);
+        let s = c.snapshot();
+        assert_eq!(s.executes, 100);
+        // p99 lands in the fast bucket (upper edge 7), not the slow tail.
+        assert_eq!(s.p99_execute_ms, 7);
+
+        // No executes → p99 is 0.
+        assert_eq!(TelemetryCollector::new().snapshot().p99_execute_ms, 0);
+    }
 
     #[test]
     fn observe_event_tallies_targets_and_cache() {
