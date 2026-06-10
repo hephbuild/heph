@@ -2635,6 +2635,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     // binary needed: a correct provider bails before any `go list`.
     #[tokio::test]
     async fn foreign_target_name_not_found_without_golist_resolve() {
+        // `Provider::new` resolves GOROOT via `go env`, so this needs `go` even
+        // though the guard short-circuits before any go list / query.
+        require_go!();
+
         // `Provider::new` enables the foreign-name guard by default, so a name
         // this provider doesn't own resolves to NotFound without touching the
         // executor (no `go list`, no `q@label=go_src` query).
