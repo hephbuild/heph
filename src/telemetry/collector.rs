@@ -7,20 +7,27 @@
 //! PostHog. Collection is always cheap (relaxed atomics); the opt-out only gates
 //! whether the snapshot is *sent*, never whether it is gathered.
 //!
+//! Artifact sizes feed a fixed power-of-two **histogram** (65 atomic buckets,
+//! constant memory regardless of artifact count) rather than a growing list, so
+//! the p99 is approximate (within a factor of 2) but the collector never holds
+//! more than a few hundred bytes even for a build with millions of artifacts.
+//!
 //! [`RequestState::emit`]: crate::engine::request_state::RequestState::emit
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::event::BuildEventKind;
 
+/// One bucket per possible bit-length of a `u64` (0..=64). Bucket `i` (`i >= 1`)
+/// holds sizes in `[2^(i-1), 2^i - 1]`; bucket `0` holds size `0`.
+const HISTOGRAM_BUCKETS: usize = 65;
+
 /// Counters accumulated over the lifetime of the process. A single `static`
 /// instance backs the free functions in the parent module; the engine bumps it
 /// from `RequestState::emit` and `result_addr`, and the CLI reads a snapshot
-/// once, at exit. Scalar tallies are lock-free atomics; per-artifact sizes are
-/// gathered under a short-held `Mutex` (one append per resolved target) so the
-/// CLI can pre-compute distribution stats (max, p99).
-#[derive(Debug, Default)]
+/// once, at exit. Everything is lock-free atomics — including the artifact-size
+/// histogram, which is fixed-size, so memory never grows with the build.
+#[derive(Debug)]
 pub struct TelemetryCollector {
     /// Targets that passed through `result_addr` — one per non-memoized resolve.
     targets: AtomicU64,
@@ -29,15 +36,39 @@ pub struct TelemetryCollector {
     /// Total output artifacts across every resolved target (incl. those whose
     /// size is unknown).
     artifacts: AtomicU64,
+    /// Count of artifacts with a known size (the population behind the size stats).
+    sized_artifacts: AtomicU64,
     /// Summed known `byte_size()` of those artifacts.
     artifact_bytes: AtomicU64,
-    /// Largest single known artifact `byte_size()` seen.
+    /// Largest single known artifact `byte_size()` seen (exact).
     max_artifact_bytes: AtomicU64,
+    /// Power-of-two histogram of known artifact sizes, for an approximate p99.
+    size_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
     /// Total target count of a whole-graph (`//...`) query, when one ran. `0`
     /// means no whole-graph query was issued this process.
     graph_size: AtomicU64,
-    /// Every known per-artifact `byte_size()`, for percentile pre-computation.
-    artifact_sizes: Mutex<Vec<u64>>,
+}
+
+impl Default for TelemetryCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Histogram bucket for `v`: its bit length (`0` for `v == 0`). Bucket `i >= 1`
+/// covers `[2^(i-1), 2^i - 1]`.
+fn bucket_index(v: u64) -> usize {
+    (u64::BITS - v.leading_zeros()) as usize
+}
+
+/// Inclusive upper edge of bucket `i`, the value reported as the percentile
+/// estimate (conservative — never undercounts a large-artifact tail). Saturates
+/// for the top bucket so `1 << 64` never overflows.
+fn bucket_upper(i: usize) -> u64 {
+    match i {
+        0 => 0,
+        _ => (1u64 << i).wrapping_sub(1),
+    }
 }
 
 impl TelemetryCollector {
@@ -48,10 +79,11 @@ impl TelemetryCollector {
             local_cache_hits: AtomicU64::new(0),
             local_cache_misses: AtomicU64::new(0),
             artifacts: AtomicU64::new(0),
+            sized_artifacts: AtomicU64::new(0),
             artifact_bytes: AtomicU64::new(0),
             max_artifact_bytes: AtomicU64::new(0),
+            size_histogram: [const { AtomicU64::new(0) }; HISTOGRAM_BUCKETS],
             graph_size: AtomicU64::new(0),
-            artifact_sizes: Mutex::new(Vec::new()),
         }
     }
 
@@ -77,18 +109,23 @@ impl TelemetryCollector {
     /// count (including those whose size is unknown); `sizes` are the known
     /// per-artifact `byte_size()`s. Artifact size lives on the result, not the
     /// event stream, so this is recorded explicitly where `result_addr` produces
-    /// the `EResult`. The `sizes` retention feeds the CLI's percentile stats.
+    /// the `EResult`. Sizes fold into the fixed histogram — constant memory.
     pub fn record_artifacts(&self, count: u64, sizes: &[u64]) {
         self.artifacts.fetch_add(count, Ordering::Relaxed);
+        if sizes.is_empty() {
+            return;
+        }
+        self.sized_artifacts
+            .fetch_add(sizes.len() as u64, Ordering::Relaxed);
         let sum: u64 = sizes.iter().sum();
         self.artifact_bytes.fetch_add(sum, Ordering::Relaxed);
         if let Some(&max) = sizes.iter().max() {
             self.max_artifact_bytes.fetch_max(max, Ordering::Relaxed);
         }
-        if !sizes.is_empty()
-            && let Ok(mut v) = self.artifact_sizes.lock()
-        {
-            v.extend_from_slice(sizes);
+        for &size in sizes {
+            if let Some(bucket) = self.size_histogram.get(bucket_index(size)) {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -98,16 +135,13 @@ impl TelemetryCollector {
         self.graph_size.fetch_max(total, Ordering::Relaxed);
     }
 
-    /// Read the accumulated counters at this instant. Computes the artifact-size
-    /// 99th percentile (nearest-rank) from the gathered sizes — done once, at
-    /// exit, so the sort cost is paid off the hot path.
+    /// Read the accumulated counters at this instant.
     pub fn snapshot(&self) -> TelemetrySnapshot {
-        let sizes = self
-            .artifact_sizes
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default();
-        let sized_artifacts = sizes.len() as u64;
+        let counts: [u64; HISTOGRAM_BUCKETS] = std::array::from_fn(|i| {
+            self.size_histogram
+                .get(i)
+                .map_or(0, |b| b.load(Ordering::Relaxed))
+        });
         TelemetrySnapshot {
             targets: self.targets.load(Ordering::Relaxed),
             local_cache_hits: self.local_cache_hits.load(Ordering::Relaxed),
@@ -115,25 +149,33 @@ impl TelemetryCollector {
             artifacts: self.artifacts.load(Ordering::Relaxed),
             artifact_bytes: self.artifact_bytes.load(Ordering::Relaxed),
             max_artifact_bytes: self.max_artifact_bytes.load(Ordering::Relaxed),
-            p99_artifact_bytes: percentile_99(sizes),
-            sized_artifacts,
+            p99_artifact_bytes: percentile_99(&counts),
+            sized_artifacts: self.sized_artifacts.load(Ordering::Relaxed),
             graph_size: self.graph_size.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Nearest-rank 99th percentile of `sizes`. Consumes the vec (sorts in place).
-/// Returns 0 for an empty input.
-fn percentile_99(mut sizes: Vec<u64>) -> u64 {
-    if sizes.is_empty() {
+/// Approximate nearest-rank 99th percentile from the power-of-two histogram.
+/// Walks buckets low→high, accumulating until the count reaches the 99th-rank
+/// threshold, and reports that bucket's upper edge. Within a factor of 2 of the
+/// true value; `0` for an empty histogram.
+fn percentile_99(counts: &[u64; HISTOGRAM_BUCKETS]) -> u64 {
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
         return 0;
     }
-    sizes.sort_unstable();
-    // Nearest-rank: rank = ceil(99 * n / 100) via integer ceil-div, clamped to
-    // [1, n]; index = rank - 1. Integer math avoids any float-cast rounding.
-    let n = sizes.len();
-    let rank = (99 * n).div_ceil(100).clamp(1, n);
-    sizes.get(rank - 1).copied().unwrap_or(0)
+    // Nearest-rank: rank = ceil(99 * total / 100), integer ceil-div.
+    let rank = (99u128 * total as u128).div_ceil(100) as u64;
+    let mut acc = 0u64;
+    for (i, &c) in counts.iter().enumerate() {
+        acc = acc.saturating_add(c);
+        if acc >= rank {
+            return bucket_upper(i);
+        }
+    }
+    // Unreachable (acc reaches total >= rank); fall back to the largest bucket.
+    bucket_upper(HISTOGRAM_BUCKETS - 1)
 }
 
 /// Immutable read of the counters, taken once at the end of a run.
@@ -145,6 +187,7 @@ pub struct TelemetrySnapshot {
     pub artifacts: u64,
     pub artifact_bytes: u64,
     pub max_artifact_bytes: u64,
+    /// Approximate (power-of-two-bucketed) 99th percentile artifact size.
     pub p99_artifact_bytes: u64,
     /// How many artifacts had a known size (the population behind the size
     /// stats); `0` means max/p99 are not meaningful.
@@ -189,18 +232,49 @@ mod tests {
             "total count includes unknown-size artifacts"
         );
         assert_eq!(s.artifact_bytes, 360);
-        assert_eq!(s.max_artifact_bytes, 200);
+        assert_eq!(s.max_artifact_bytes, 200, "max is exact");
         assert_eq!(s.sized_artifacts, 4);
     }
 
     #[test]
-    fn percentile_99_nearest_rank() {
-        assert_eq!(percentile_99(vec![]), 0);
-        assert_eq!(percentile_99(vec![42]), 42);
-        // 100 values 1..=100: ceil(0.99*100)=99 → 99th smallest = 99.
-        let sizes: Vec<u64> = (1..=100).collect();
-        assert_eq!(percentile_99(sizes), 99);
-        // Unsorted input must still work.
-        assert_eq!(percentile_99(vec![9, 1, 5, 3, 7]), 9);
+    fn bucket_index_boundaries() {
+        assert_eq!(bucket_index(0), 0);
+        assert_eq!(bucket_index(1), 1); // [1,1]
+        assert_eq!(bucket_index(2), 2); // [2,3]
+        assert_eq!(bucket_index(3), 2);
+        assert_eq!(bucket_index(4), 3); // [4,7]
+        assert_eq!(bucket_index(255), 8); // [128,255]
+        assert_eq!(bucket_index(256), 9); // [256,511]
+        assert_eq!(bucket_index(u64::MAX), 64);
+    }
+
+    #[test]
+    fn percentile_99_approximate_upper_edge() {
+        let c = TelemetryCollector::new();
+        // 99 small artifacts (size 1 → bucket 1, upper edge 1) and one big one
+        // (size 1<<20 → bucket 21). The 99th-rank value is small.
+        let small = vec![1u64; 99];
+        c.record_artifacts(99, &small);
+        c.record_artifacts(1, &[1 << 20]);
+        let s = c.snapshot();
+        // p99 lands in the small bucket (upper edge 1), not the big one.
+        assert_eq!(s.p99_artifact_bytes, 1);
+        assert_eq!(s.max_artifact_bytes, 1 << 20, "max still catches the tail");
+
+        // Empty histogram → 0.
+        assert_eq!(TelemetryCollector::new().snapshot().p99_artifact_bytes, 0);
+    }
+
+    #[test]
+    fn percentile_99_within_factor_of_two() {
+        let c = TelemetryCollector::new();
+        // All sizes 1000 → bucket 10 ([512,1023], upper edge 1023). True p99 is
+        // 1000; the estimate (1023) is within a factor of 2.
+        c.record_artifacts(100, &vec![1000u64; 100]);
+        let p99 = c.snapshot().p99_artifact_bytes;
+        assert!(
+            (1000..=2000).contains(&p99),
+            "p99 estimate {p99} off by >2x"
+        );
     }
 }
