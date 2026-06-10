@@ -708,6 +708,19 @@ impl ProviderInner {
             return Err(GetError::NotFound);
         }
 
+        // Reject names this provider doesn't own as early as possible — before any
+        // special-case handler or `go list`. A foreign name (e.g. a buildfile
+        // codegen target sharing a Go package dir) would otherwise drag `go list`
+        // and its `q@label=go_src` query into resolution and trip a cycle. On by
+        // default (perf/clarity); the engine contains the cycle regardless (cyclic
+        // provider attempts fall through to the next provider), so tests exercising
+        // that path disable it via `Config::foreign_name_guard`. Owned names —
+        // including the specials handled just below (`_golist`/`_go_mod`/`download`)
+        // — are in `is_known_go_target_name`, so this never rejects a real target.
+        if self.foreign_name_guard && !is_known_go_target_name(&addr.name) {
+            return Err(GetError::NotFound);
+        }
+
         // _golist — generate spec without executing go list (before stdlib check so
         // stdlib packages can also expose a _golist target for cached dep resolution)
         if addr.name == "_golist" {
@@ -767,15 +780,6 @@ impl ProviderInner {
         // variant before the `_golist` resolve below so a skipped pkg never
         // forces a `go list` round-trip purely to learn there are no tests.
         if is_test_target_name(&addr.name) && pick_test_skip(&req.states) {
-            return Err(GetError::NotFound);
-        }
-
-        // Foreign names this provider doesn't own would otherwise drag `go list`
-        // and its `q@label=go_src` query into resolution, which trips a cycle.
-        // On by default (perf/clarity); the engine contains the cycle regardless
-        // (cyclic provider attempts fall through to the next provider), so tests
-        // exercising that path disable it via `Config::foreign_name_guard`.
-        if self.foreign_name_guard && !is_known_go_target_name(&addr.name) {
             return Err(GetError::NotFound);
         }
 
