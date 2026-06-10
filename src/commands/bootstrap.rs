@@ -83,6 +83,19 @@ impl SuppressionHandle {
     }
 }
 
+/// Read the telemetry opt-out flag straight from `.hephconfig2`, independent of
+/// engine construction, so the top-level CLI reporter can decide whether to send
+/// without holding an `Engine`. Any failure (no repo root, unreadable/invalid
+/// config) defaults to enabled — the env kill switch still applies on top.
+pub fn telemetry_enabled_from_config() -> bool {
+    let Ok(root) = engine::get_root() else {
+        return true;
+    };
+    config_file::load(&root.join(".hephconfig2"))
+        .map(|f| f.telemetry_enabled())
+        .unwrap_or(true)
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -200,6 +213,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.apply_config(&file.providers, &file.drivers)?;
 
     let engine = Arc::new(e);
+
+    // Telemetry: record the enabled provider + driver type names (built-ins plus
+    // whatever the config turned on) for the exit reporter. Set-once.
+    crate::telemetry::record_plugins(
+        engine.providers_by_name.keys().cloned().collect(),
+        engine.drivers_by_name.keys().cloned().collect(),
+    );
+
     let (tx, rx) = mpsc::unbounded_channel();
     let trigger = ShutdownTrigger {
         tx,

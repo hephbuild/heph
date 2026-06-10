@@ -16,7 +16,56 @@ mod collector;
 
 pub use collector::{TelemetryCollector, TelemetrySnapshot};
 
+use crate::engine::event::BuildEventKind;
 use posthog_rs::{ClientOptionsBuilder, Event};
+
+/// Process-global counters. The engine bumps these from its hot paths without
+/// threading a handle through every request; the CLI snapshots them once at
+/// exit. Always counted (cheap relaxed atomics) — the opt-out only gates
+/// whether [`snapshot`] is ever *sent*.
+static COLLECTOR: TelemetryCollector = TelemetryCollector::new();
+
+/// Fold one build event into the global counters. Wired into
+/// `RequestState::emit`, so every command that resolves targets is covered with
+/// no per-command code.
+pub fn observe_event(kind: &BuildEventKind) {
+    COLLECTOR.observe_event(kind);
+}
+
+/// Record one resolved target's artifact count + total byte size.
+pub fn record_artifacts(count: u64, bytes: u64) {
+    COLLECTOR.record_artifacts(count, bytes);
+}
+
+/// Record the total target count of a whole-graph (`//...`) query.
+pub fn record_graph_size(total: u64) {
+    COLLECTOR.record_graph_size(total);
+}
+
+/// Read the global counters. Taken once, at process exit, by the CLI reporter.
+pub fn snapshot() -> TelemetrySnapshot {
+    COLLECTOR.snapshot()
+}
+
+/// Names of the providers + drivers the engine has registered (built-ins plus
+/// whatever the config enabled). Plugin *type* names only — never user data.
+#[derive(Debug, Clone, Default)]
+struct Plugins {
+    providers: Vec<String>,
+    drivers: Vec<String>,
+}
+
+/// Set once, at engine construction. Read by the reporter at exit.
+static PLUGINS: std::sync::OnceLock<Plugins> = std::sync::OnceLock::new();
+
+/// Record the enabled provider + driver names. First write wins (a process
+/// builds at most one engine for the command it runs); later calls are ignored.
+pub fn record_plugins(mut providers: Vec<String>, mut drivers: Vec<String>) {
+    providers.sort();
+    drivers.sort();
+    // Best-effort set-once; a second engine in one process keeps the first set.
+    drop(PLUGINS.set(Plugins { providers, drivers }));
+}
 
 /// Public, write-only PostHog project API key. Not a secret — safe to ship in
 /// the binary; it can only ingest events, never read them.
@@ -79,13 +128,13 @@ pub fn is_enabled(config_enabled: bool) -> bool {
 
 /// The shape of a CLI invocation, carrying no user-identifying values.
 pub struct ReportContext<'a> {
-    /// Subcommand name, e.g. `"run"`.
+    /// Subcommand name, e.g. `"run"` (canonical, from the clap model).
     pub command: &'a str,
-    /// Request shape, e.g. `"addr"` or `"label_matcher"` — never the value.
-    pub request_shape: &'a str,
-    /// Boolean flags and whether each was set. Flag *names* only, never values.
-    pub flags: &'a [(&'a str, bool)],
-    /// Whether the run ultimately succeeded.
+    /// Names of the args/flags that were explicitly set — derived from the clap
+    /// matches, so this stays exhaustive for every command without per-command
+    /// code. Names only; never the values (an addr/label could be PII).
+    pub flags: &'a [String],
+    /// Whether the command ultimately succeeded.
     pub success: bool,
 }
 
@@ -115,19 +164,22 @@ async fn try_report(ctx: ReportContext<'_>, stats: TelemetrySnapshot) -> anyhow:
     event.insert_prop("arch", std::env::consts::ARCH)?;
     event.insert_prop("version", crate::version::VERSION)?;
     event.insert_prop("ci", is_ci())?;
-    // Request shape and flags.
+    // Command + the set of flags used (names only, as a queryable array).
     event.insert_prop("command", ctx.command)?;
-    event.insert_prop("request_shape", ctx.request_shape)?;
     event.insert_prop("success", ctx.success)?;
-    for (name, on) in ctx.flags {
-        event.insert_prop(format!("flag_{name}"), *on)?;
-    }
+    event.insert_prop("flags", ctx.flags)?;
     // Aggregate run counters.
     event.insert_prop("targets", stats.targets)?;
     event.insert_prop("local_cache_hits", stats.local_cache_hits)?;
     event.insert_prop("local_cache_misses", stats.local_cache_misses)?;
     event.insert_prop("artifacts", stats.artifacts)?;
     event.insert_prop("artifact_bytes", stats.artifact_bytes)?;
+    // Whole-graph (`//...`) query size, when one ran this process (0 otherwise).
+    event.insert_prop("graph_size", stats.graph_size)?;
+    // Enabled plugins (built-ins + config), as queryable arrays of type names.
+    let plugins = PLUGINS.get().cloned().unwrap_or_default();
+    event.insert_prop("providers", plugins.providers)?;
+    event.insert_prop("drivers", plugins.drivers)?;
 
     tokio::time::timeout(CAPTURE_TIMEOUT, client.capture(event))
         .await
@@ -163,7 +215,7 @@ mod tests {
         assert!(!ci_from(|n| (n == "CI").then(|| "false".to_string())));
         assert!(!ci_from(|n| (n == "CI").then(|| "0".to_string())));
         // A vendor marker present (even empty) signals CI.
-        assert!(ci_from(|n| (n == "GITHUB_ACTIONS").then(|| String::new())));
+        assert!(ci_from(|n| (n == "GITHUB_ACTIONS").then(String::new)));
         assert!(ci_from(|n| (n == "BUILDKITE").then(|| "yes".to_string())));
     }
 }

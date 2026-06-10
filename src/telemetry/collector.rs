@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::event::BuildEventKind;
 
-/// Lock-free counters accumulated over the lifetime of one request.
+/// Lock-free counters accumulated over the lifetime of the process. A single
+/// `static` instance backs the free functions in the parent module; the engine
+/// bumps it from `RequestState::emit` and `result_addr`, and the CLI reads a
+/// snapshot once, at exit.
 #[derive(Debug, Default)]
 pub struct TelemetryCollector {
     /// Targets that passed through `result_addr` — one per non-memoized resolve.
@@ -24,11 +27,22 @@ pub struct TelemetryCollector {
     artifacts: AtomicU64,
     /// Summed `byte_size()` of those artifacts (a target's unknown sizes add 0).
     artifact_bytes: AtomicU64,
+    /// Total target count of a whole-graph (`//...`) query, when one ran. `0`
+    /// means no whole-graph query was issued this process.
+    graph_size: AtomicU64,
 }
 
 impl TelemetryCollector {
-    pub fn new() -> Self {
-        Self::default()
+    /// `const` so a single instance can back a `static` with no initializer.
+    pub const fn new() -> Self {
+        Self {
+            targets: AtomicU64::new(0),
+            local_cache_hits: AtomicU64::new(0),
+            local_cache_misses: AtomicU64::new(0),
+            artifacts: AtomicU64::new(0),
+            artifact_bytes: AtomicU64::new(0),
+            graph_size: AtomicU64::new(0),
+        }
     }
 
     /// Fold one build event into the counters. Called from `RequestState::emit`,
@@ -57,6 +71,12 @@ impl TelemetryCollector {
         self.artifact_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Record the total target count of a whole-graph (`//...`) query. Keeps the
+    /// largest seen value, so repeated/nested whole-graph queries don't shrink it.
+    pub fn record_graph_size(&self, total: u64) {
+        self.graph_size.fetch_max(total, Ordering::Relaxed);
+    }
+
     /// Read the accumulated counters at this instant.
     pub fn snapshot(&self) -> TelemetrySnapshot {
         TelemetrySnapshot {
@@ -65,6 +85,7 @@ impl TelemetryCollector {
             local_cache_misses: self.local_cache_misses.load(Ordering::Relaxed),
             artifacts: self.artifacts.load(Ordering::Relaxed),
             artifact_bytes: self.artifact_bytes.load(Ordering::Relaxed),
+            graph_size: self.graph_size.load(Ordering::Relaxed),
         }
     }
 }
@@ -77,6 +98,7 @@ pub struct TelemetrySnapshot {
     pub local_cache_misses: u64,
     pub artifacts: u64,
     pub artifact_bytes: u64,
+    pub graph_size: u64,
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
-use clap::{CommandFactory, Parser};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
@@ -64,7 +65,14 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let cli = Cli::parse();
+    // Parse once into `ArgMatches`, then into the typed `Cli`. Keeping the
+    // matches lets the telemetry reporter enumerate the exact args/flags that
+    // were set — generically, for every command, with no per-command list.
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
 
     let pprof_guard = if cli.global.pprof_cpu.is_some() {
         match pprof::ProfilerGuardBuilder::default()
@@ -81,7 +89,9 @@ fn main() -> ExitCode {
         None
     };
 
-    let result = match cli.command.execute(sink, &cli.global) {
+    let exec_result = cli.command.execute(sink, &cli.global);
+    let success = exec_result.is_ok();
+    let result = match exec_result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one
@@ -94,6 +104,10 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     };
+
+    // Best-effort, opt-out usage telemetry. Runs once for whichever command
+    // executed, after it (and its TUI) has finished. Never affects the exit.
+    report_telemetry(&matches, success);
 
     if let (Some(guard), Some(path)) = (pprof_guard, cli.global.pprof_cpu) {
         match guard
@@ -143,6 +157,51 @@ fn main() -> ExitCode {
     }
 
     result
+}
+
+/// Send one best-effort, personless telemetry event for whichever command ran.
+/// Command name and the set of flags come straight from the clap matches, so
+/// coverage is exhaustive and automatic for every subcommand. Runs on a tiny
+/// throwaway runtime (the command's own runtime is already gone) with a short
+/// timeout, and swallows every failure.
+fn report_telemetry(matches: &ArgMatches, success: bool) {
+    if !heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config()) {
+        return;
+    }
+
+    let command = matches.subcommand_name().unwrap_or("none").to_string();
+    let mut flags = set_args(matches);
+    if let Some((_, sub)) = matches.subcommand() {
+        flags.extend(set_args(sub));
+    }
+    flags.sort();
+    flags.dedup();
+
+    let snapshot = heph::telemetry::snapshot();
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    rt.block_on(heph::telemetry::report(
+        heph::telemetry::ReportContext {
+            command: &command,
+            flags: &flags,
+            success,
+        },
+        snapshot,
+    ));
+}
+
+/// Names of the args/flags explicitly set on the command line for one match
+/// level (top-level globals, or a subcommand's args). Names only — never the
+/// values, which can carry addresses/labels.
+fn set_args(m: &ArgMatches) -> Vec<String> {
+    m.ids()
+        .filter(|id| m.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+        .map(|id| id.as_str().to_string())
+        .collect()
 }
 
 /// Detect the hidden `__supervisor --ipc-fd <N>` invocation without dragging

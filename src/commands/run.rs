@@ -11,7 +11,6 @@ use crate::commands::completion::complete_target_addr;
 use crate::commands::utils::matcher_from_args;
 use crate::engine::{Engine, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp};
 use crate::htmatcher::Matcher;
-use crate::telemetry::{self, TelemetryCollector};
 use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(Args, Clone)]
@@ -48,8 +47,6 @@ struct RunApp {
     engine: Arc<Engine>,
     matcher: Matcher,
     fail_fast: bool,
-    /// Per-run usage counters, folded by the engine and read once the run ends.
-    telemetry: Arc<TelemetryCollector>,
 }
 
 impl RunApp {
@@ -112,12 +109,9 @@ impl App for RunApp {
             interactive,
             frozen: self.args.frozen,
         };
-        let rs = self.engine.new_state_full(
-            self.fail_fast,
-            ctx.event_sender(),
-            ctx.bg_pending(),
-            Some(Arc::clone(&self.telemetry)),
-        );
+        let rs = self
+            .engine
+            .new_state_full(self.fail_fast, ctx.event_sender(), ctx.bg_pending());
 
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
         // `finalize!` paved road handles rendering and exit uniformly. The engine
@@ -176,52 +170,12 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     let base_pkg = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
-
-    // Snapshot the non-identifying request shape + flag set BEFORE `args` moves
-    // into the app. Two-arg form is a label + package matcher; one-arg is a
-    // single address. Only booleans are recorded — never the actual values.
-    let telemetry_enabled = engine.telemetry_enabled();
-    let request_shape = if args.arg2.is_some() {
-        "label_matcher"
-    } else {
-        "addr"
-    };
-    let flags = [
-        ("force", args.force),
-        ("shell", args.shell.is_some()),
-        ("cat_out", args.cat_out),
-        ("list_out", args.list_out),
-        ("frozen", args.frozen),
-        ("exclude", !args.exclude.is_empty()),
-        ("fail_fast", global.fail_fast),
-        ("no_tui", global.no_tui),
-    ];
-
-    let telemetry = Arc::new(TelemetryCollector::new());
     let app = RunApp {
         args,
         engine,
         matcher: m,
         fail_fast: global.fail_fast,
-        telemetry: Arc::clone(&telemetry),
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    let result = tui::run_app(app, sink, interactive, shutdown).await;
-
-    // Report after the TUI has torn down so the (best-effort, short-timeout)
-    // POST never contends with the render loop. Opt-out skips it entirely.
-    if telemetry::is_enabled(telemetry_enabled) {
-        telemetry::report(
-            telemetry::ReportContext {
-                command: "run",
-                request_shape,
-                flags: &flags,
-                success: result.is_ok(),
-            },
-            telemetry.snapshot(),
-        )
-        .await;
-    }
-
-    result
+    tui::run_app(app, sink, interactive, shutdown).await
 }

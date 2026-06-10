@@ -862,10 +862,11 @@ impl Engine {
                     .await?;
 
                 // Telemetry: artifact count + total size aren't on the event
-                // stream, so record them here once the result is in hand. No-op
-                // unless this request is collecting.
+                // stream, so record them here once the result is in hand. Counts
+                // every resolved target across the process; the opt-out only
+                // gates whether the snapshot is sent.
                 let bytes: u64 = result.artifacts.iter().filter_map(|a| a.byte_size()).sum();
-                rs.record_artifacts(result.artifacts.len() as u64, bytes);
+                crate::telemetry::record_artifacts(result.artifacts.len() as u64, bytes);
 
                 Ok(result)
             },
