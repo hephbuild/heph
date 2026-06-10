@@ -196,6 +196,16 @@ pub struct PluginEntry {
     pub options: Options,
 }
 
+/// Filename of the per-workspace config, located at the repo root. The single
+/// source of truth for this name — [`load_from_root`] and the root discovery in
+/// [`crate::engine::get_root`] both build on it.
+pub const CONFIG_FILE_NAME: &str = ".hephconfig2";
+
+/// Load the workspace config from `<root>/.hephconfig2`.
+pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigFile> {
+    load(&root.join(CONFIG_FILE_NAME))
+}
+
 pub fn load(path: &Path) -> anyhow::Result<ConfigFile> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading config file {}", path.display()))?;

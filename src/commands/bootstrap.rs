@@ -91,7 +91,7 @@ pub fn telemetry_enabled_from_config() -> bool {
     let Ok(root) = engine::get_root() else {
         return true;
     };
-    config_file::load(&root.join(".hephconfig2"))
+    config_file::load_from_root(&root)
         .map(|f| f.telemetry_enabled())
         .unwrap_or(true)
 }
@@ -102,8 +102,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         Err(inner) => anyhow::bail!("Error: {}", inner),
     };
 
-    let cfg_path = root.join(".hephconfig2");
-    let file = config_file::load(&cfg_path)?;
+    let file = config_file::load_from_root(&root)?;
 
     let home_dir = file
         .home_dir
