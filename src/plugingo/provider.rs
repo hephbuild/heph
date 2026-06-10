@@ -2312,7 +2312,10 @@ mod tests {
             named: HashMap::new(),
         };
         let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(v, Value::String("//mylib:build@goarch=amd64,goos=linux".into()));
+        assert_eq!(
+            v,
+            Value::String("//mylib:build@goarch=amd64,goos=linux".into())
+        );
     }
 
     #[tokio::test]
@@ -2355,16 +2358,16 @@ mod tests {
             named,
         };
         let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(v, Value::String("//mylib:build@goarch=amd64,goos=linux".into()));
+        assert_eq!(
+            v,
+            Value::String("//mylib:build@goarch=amd64,goos=linux".into())
+        );
     }
 
     #[tokio::test]
     async fn test_build_addr_missing_goarch_errors() {
         let args = FnArgs {
-            positional: vec![
-                Value::String("mylib".into()),
-                Value::String("linux".into()),
-            ],
+            positional: vec![Value::String("mylib".into()), Value::String("linux".into())],
             named: HashMap::new(),
         };
         let err = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap_err();
