@@ -26,6 +26,19 @@ pub struct ConfigFile {
     pub lock: Option<LockConfig>,
     #[serde(default)]
     pub fs: Option<FsConfig>,
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+}
+
+/// Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CacheConfig {
+    /// Blobs strictly larger than this spill to plain files under
+    /// `<home>/cache/blobs/` instead of being stored inline in the sqlite DB.
+    /// Manifests always stay in sqlite. Omit to use the engine default.
+    #[serde(default)]
+    pub spill_threshold_bytes: Option<u64>,
 }
 
 /// Filesystem-walk config shared across plugins. `fs: { skip: [dir, ...] }`.
@@ -239,6 +252,26 @@ drivers:
             .expect("present");
         assert_eq!(patterns, vec!["BUILD2".to_string(), "*.BUILD2".to_string()]);
         assert_eq!(cfg.drivers.len(), 2);
+    }
+
+    #[test]
+    fn parses_cache_spill_threshold() {
+        let yaml = "cache:\n  spillThresholdBytes: 104857600\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let c = cfg.cache.expect("cache present");
+        assert_eq!(c.spill_threshold_bytes, Some(104857600));
+    }
+
+    #[test]
+    fn cache_config_omitted_is_none() {
+        let cfg: ConfigFile = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        assert!(cfg.cache.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_cache_field() {
+        let err = serde_yaml::from_str::<ConfigFile>("cache:\n  bogus: 1\n").expect_err("reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

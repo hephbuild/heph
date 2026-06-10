@@ -472,6 +472,22 @@ mod tests {
         (Arc::new(engine), dir)
     }
 
+    /// Engine whose durable cache spills any blob over `spill` bytes to the FS
+    /// store, so GC tests can exercise reclaiming filesystem-spilled blobs
+    /// without writing megabytes.
+    fn test_engine_spill(spill: u64) -> (Arc<Engine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            spill_threshold_bytes: spill,
+            ..Default::default()
+        })
+        .expect("engine");
+        (Arc::new(engine), dir)
+    }
+
     fn addr(name: &str) -> Addr {
         Addr::new(PkgBuf::from("pkg"), name.to_string(), BTreeMap::new())
     }
@@ -723,6 +739,59 @@ mod tests {
             !present(&engine, &good, "h1"),
             "healthy orphan reclaimed despite the other target failing"
         );
+    }
+
+    /// End-to-end: a revision whose artifact spilled to the FS blob store is
+    /// fully reclaimed by an orphan sweep — the large blob is no longer readable
+    /// through the cache after GC, proving `delete` reached the FS backend.
+    #[tokio::test]
+    async fn gc_reclaims_fs_spilled_blob() {
+        // Threshold 16B; the artifact below is well over it, so it spills to FS.
+        let (engine, _dir) = test_engine_spill(16);
+        let a = addr("ghost"); // unknown to any provider → orphan on sweep
+        let big = vec![0xABu8; 4096];
+
+        let name = "out_big.tar";
+        {
+            let mut w = engine.local_cache.writer(&a, "h1", name).expect("writer");
+            w.write_all(&big).expect("write blob");
+            drop(w);
+        }
+        let manifest = Manifest {
+            version: "1.0.0".to_string(),
+            target: a.format(),
+            created_at_nanos: 100,
+            hashin: "h1".to_string(),
+            artifacts: vec![ManifestArtifact {
+                hashout: "ho".to_string(),
+                group: String::new(),
+                name: name.to_string(),
+                size: big.len() as u64,
+                r#type: ManifestArtifactType::Output,
+                content_type: ManifestArtifactContentType::Tar,
+                encoding: ManifestArtifactEncoding::None,
+            }],
+        };
+        {
+            let mut w = engine
+                .local_cache
+                .writer(&a, "h1", MANIFEST_V1)
+                .expect("manifest writer");
+            borsh::to_writer(&mut w, &manifest).expect("write manifest");
+            drop(w);
+        }
+        // Barrier + precondition: the spilled blob is present before GC.
+        assert!(engine.local_cache.exists(&a, "h1", name).expect("exists"));
+
+        let rs = engine.new_state();
+        let stats = Arc::clone(&engine).gc_all(rs).await.expect("gc_all");
+
+        assert_eq!(stats.orphan_targets_removed, 1);
+        assert_eq!(stats.revisions_removed, 1);
+        assert_eq!(stats.bytes_removed, big.len() as u64);
+        // The FS-spilled blob and its manifest are gone from the cache.
+        assert!(!engine.local_cache.exists(&a, "h1", name).expect("exists"));
+        assert!(!present(&engine, &a, "h1"));
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 )]
 pub mod engine;
 pub use engine::Config;
+pub use engine::DEFAULT_SPILL_THRESHOLD_BYTES;
 pub use engine::Engine;
 pub use engine::EngineFuse;
 pub use engine::MemCacheOptions;
@@ -20,9 +21,9 @@ pub mod driver;
 pub mod error;
 pub mod event;
 mod local_cache;
-#[cfg(test)]
 mod local_cache_fs;
 mod local_cache_mem;
+mod local_cache_spill;
 mod local_cache_sqlite;
 mod local_cache_tmp;
 mod packages;
