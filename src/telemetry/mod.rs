@@ -130,6 +130,10 @@ pub fn is_enabled(config_enabled: bool) -> bool {
 pub struct ReportContext<'a> {
     /// Subcommand name, e.g. `"run"` (canonical, from the clap model).
     pub command: &'a str,
+    /// Selector shape: `"label_matcher"` (two args — a label + package matcher),
+    /// `"addr"` (one arg — a single address), or `"none"`. Structure only, never
+    /// the actual label/address value.
+    pub request_shape: &'a str,
     /// Names of the args/flags that were explicitly set — derived from the clap
     /// matches, so this stays exhaustive for every command without per-command
     /// code. Names only; never the values (an addr/label could be PII).
@@ -164,8 +168,10 @@ async fn try_report(ctx: ReportContext<'_>, stats: TelemetrySnapshot) -> anyhow:
     event.insert_prop("arch", std::env::consts::ARCH)?;
     event.insert_prop("version", crate::version::VERSION)?;
     event.insert_prop("ci", is_ci())?;
-    // Command + the set of flags used (names only, as a queryable array).
+    // Command + selector shape + the set of flags used (names only, as a
+    // queryable array).
     event.insert_prop("command", ctx.command)?;
+    event.insert_prop("request_shape", ctx.request_shape)?;
     event.insert_prop("success", ctx.success)?;
     event.insert_prop("flags", ctx.flags)?;
     // Aggregate run counters.
@@ -174,8 +180,11 @@ async fn try_report(ctx: ReportContext<'_>, stats: TelemetrySnapshot) -> anyhow:
     event.insert_prop("local_cache_misses", stats.local_cache_misses)?;
     event.insert_prop("artifacts", stats.artifacts)?;
     event.insert_prop("artifact_bytes", stats.artifact_bytes)?;
-    // Whole-graph (`//...`) query size, when one ran this process (0 otherwise).
-    event.insert_prop("graph_size", stats.graph_size)?;
+    // Whole-graph (`//...`) query size — only present when one actually ran, so
+    // the attr is absent rather than a misleading 0 on every other invocation.
+    if stats.graph_size > 0 {
+        event.insert_prop("graph_size", stats.graph_size)?;
+    }
     // Enabled plugins (built-ins + config), as queryable arrays of type names.
     let plugins = PLUGINS.get().cloned().unwrap_or_default();
     event.insert_prop("providers", plugins.providers)?;

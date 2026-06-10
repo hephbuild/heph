@@ -177,6 +177,17 @@ fn report_telemetry(matches: &ArgMatches, success: bool) {
     flags.sort();
     flags.dedup();
 
+    // Selector shape from the positional args present: two args (`arg1` +
+    // `arg2`) is a label + package matcher; one is a single address. Structure
+    // only — the actual label/address values are never read.
+    let request_shape = if flags.iter().any(|f| f == "arg2") {
+        "label_matcher"
+    } else if flags.iter().any(|f| f == "arg1") {
+        "addr"
+    } else {
+        "none"
+    };
+
     let snapshot = heph::telemetry::snapshot();
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -187,6 +198,7 @@ fn report_telemetry(matches: &ArgMatches, success: bool) {
     rt.block_on(heph::telemetry::report(
         heph::telemetry::ReportContext {
             command: &command,
+            request_shape,
             flags: &flags,
             success,
         },
