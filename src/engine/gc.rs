@@ -252,7 +252,7 @@ impl Engine {
         self: Arc<Self>,
         rs: &Arc<RequestState>,
     ) -> Vec<(Addr, Decision)> {
-        let resolve_rs = self.new_state_full(false, rs.events_sender(), rs.bg_pending());
+        let resolve_rs = self.new_state_full(false, rs.events_sender(), rs.bg_pending(), None);
         let targets = match self.local_cache.list_targets() {
             Ok(t) => t,
             Err(e) => {

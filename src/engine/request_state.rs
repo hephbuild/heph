@@ -218,6 +218,11 @@ pub struct RequestStateData {
     /// at the end of execution for rendering. Shared via `Arc<RequestStateData>`,
     /// so `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Addr, Arc<TargetFailure>>>,
+    /// Optional anonymous usage counters. Shared via `Arc<RequestStateData>`, so
+    /// `with_parent` / `with_skip_provider` children fold into the same totals.
+    /// `None` for requests that don't report (everything but the reporting CLI
+    /// command path).
+    pub telemetry: Option<Arc<crate::telemetry::TelemetryCollector>>,
 }
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
@@ -284,6 +289,12 @@ impl RequestState {
 
     /// Stamp the server timestamp on `kind` and emit it on the event stream, if any.
     pub fn emit(&self, kind: crate::engine::event::BuildEventKind) {
+        // Fold into the per-request telemetry counters first: this is the single
+        // chokepoint every progress event flows through, so target/cache tallies
+        // stay in lockstep with what the renderer sees.
+        if let Some(t) = &self.data.telemetry {
+            t.observe_event(&kind);
+        }
         if let Some(tx) = &self.data.events {
             // A closed receiver (consumer gone) is expected; events are
             // best-effort, so dropping the send result is intentional.
@@ -291,6 +302,16 @@ impl RequestState {
                 at_unix_ms: crate::engine::event::now_unix_ms(),
                 kind,
             }));
+        }
+    }
+
+    /// Record one resolved target's artifact count + total byte size into the
+    /// request's telemetry counters. No-op when telemetry isn't collected.
+    /// Artifact size isn't on the event stream, so `result_addr` calls this
+    /// explicitly once the `EResult` is in hand.
+    pub fn record_artifacts(&self, count: u64, bytes: u64) {
+        if let Some(t) = &self.data.telemetry {
+            t.record_artifacts(count, bytes);
         }
     }
 
@@ -373,6 +394,7 @@ impl Engine {
             fail_fast,
             events,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
         )
     }
 
@@ -384,6 +406,7 @@ impl Engine {
         fail_fast: bool,
         events: Option<crate::engine::event::EventSender>,
         bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+        telemetry: Option<Arc<crate::telemetry::TelemetryCollector>>,
     ) -> Arc<RequestState> {
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
@@ -413,6 +436,7 @@ impl Engine {
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending,
             failures: Mutex::new(indexmap::IndexMap::new()),
+            telemetry,
         });
 
         let state = Arc::new(RequestState {

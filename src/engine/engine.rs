@@ -41,6 +41,8 @@ pub struct Config {
     /// manifests always stay in sqlite. Keeps the DB / WAL small and lets large
     /// artifacts stream from the filesystem. See [`DEFAULT_SPILL_THRESHOLD_BYTES`].
     pub spill_threshold_bytes: u64,
+    /// Anonymous usage telemetry. Defaults to `true` (opt-out via config).
+    pub telemetry_enabled: bool,
 }
 
 /// Default spill threshold: 8 MiB. Above a few MB the filesystem beats sqlite
@@ -61,6 +63,7 @@ impl Default for Config {
             fuse: FuseConfig::default(),
             lock_backend: LockBackend::default(),
             spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
+            telemetry_enabled: true,
         }
     }
 }
@@ -690,6 +693,12 @@ impl Engine {
     /// Absolute directories every plugin that walks the tree must prune by exact
     /// path: the engine-owned home (cache/sandboxes/locks — never packages) plus
     /// the literal (non-glob) `fs.skip` entries, resolved relative to the root.
+    /// Whether anonymous usage telemetry is enabled for this engine (config
+    /// `telemetry.enabled`, default `true`).
+    pub fn telemetry_enabled(&self) -> bool {
+        self.cfg.telemetry_enabled
+    }
+
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.home.clone()];
         dirs.extend(

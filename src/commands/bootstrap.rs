@@ -121,6 +121,9 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         .and_then(|c| c.spill_threshold_bytes)
         .unwrap_or(engine::DEFAULT_SPILL_THRESHOLD_BYTES);
 
+    // Read before the struct literal below moves `file.fs`.
+    let telemetry_enabled = file.telemetry_enabled();
+
     let lock_backend = file
         .lock
         .and_then(|l| l.backend)
@@ -140,6 +143,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         fuse,
         lock_backend,
         spill_threshold_bytes,
+        telemetry_enabled,
     })?;
 
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
