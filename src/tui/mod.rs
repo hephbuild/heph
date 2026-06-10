@@ -1,5 +1,6 @@
 pub mod app;
 mod backend;
+pub mod color;
 pub mod log_sink;
 pub mod panic;
 pub mod paused;

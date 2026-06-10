@@ -3,19 +3,13 @@
 //! hand-rolled format: a `×` title, a `╰─▶` cause line, and (when present) the
 //! process log tail in a framed `log` box.
 
-use std::io::IsTerminal;
 use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
 use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
 use crate::hmemoizer::downcast_chain_ref;
-
-/// Whether to emit ANSI color: only when stderr is a terminal and `NO_COLOR`
-/// (https://no-color.org) is unset.
-fn color_enabled() -> bool {
-    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-}
+use crate::tui::color::stderr_color_enabled as color_enabled;
 
 /// Render the cause chain of an `anyhow::Error`, dropping the leading frames that
 /// merely restate the target address (engine boundaries like `execute //addr`,

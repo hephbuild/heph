@@ -14,9 +14,13 @@ pub fn init() -> LogSink {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,fuser=error"));
 
+    // tracing_subscriber defaults ANSI on regardless of where the writer points.
+    // Our writer is stderr, so gate color on stderr's capability — otherwise a
+    // redirected/piped stderr gets raw escape codes like `^[[32m INFO^[[0m`.
     let fmt_layer = fmt::layer()
         .with_target(false)
         .without_time()
+        .with_ansi(sink.color_enabled())
         .with_writer(MakeLogSink::new(sink.clone()));
 
     tracing_subscriber::registry()
