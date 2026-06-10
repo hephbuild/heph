@@ -780,8 +780,13 @@ mod tests {
             borsh::to_writer(&mut w, &manifest).expect("write manifest");
             drop(w);
         }
-        // Barrier + precondition: the spilled blob is present before GC.
+        // Barrier + precondition: both the spilled blob and the manifest must
+        // have landed before GC. `gc_all` enumerates targets via `list_targets`
+        // on a fresh read connection that does *not* wait on in-flight writes, so
+        // without barriering the manifest write the sweep can observe zero
+        // targets and reclaim nothing (raced on linux).
         assert!(engine.local_cache.exists(&a, "h1", name).expect("exists"));
+        assert!(present(&engine, &a, "h1"), "manifest landed before GC");
 
         let rs = engine.new_state();
         let stats = Arc::clone(&engine).gc_all(rs).await.expect("gc_all");
