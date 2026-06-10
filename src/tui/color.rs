@@ -28,7 +28,10 @@ mod tests {
     #[test]
     fn color_only_on_terminal_without_no_color() {
         assert!(color_enabled(true, false));
-        assert!(!color_enabled(true, true), "NO_COLOR set must disable color");
+        assert!(
+            !color_enabled(true, true),
+            "NO_COLOR set must disable color"
+        );
         assert!(!color_enabled(false, false), "non-tty must disable color");
         assert!(!color_enabled(false, true));
     }

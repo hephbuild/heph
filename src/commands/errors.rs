@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
-use crate::tui::color::stderr_color_enabled as color_enabled;
 use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
 use crate::hmemoizer::downcast_chain_ref;
+use crate::tui::color::stderr_color_enabled as color_enabled;
 
 /// Render the cause chain of an `anyhow::Error`, dropping the leading frames that
 /// merely restate the target address (engine boundaries like `execute //addr`,
