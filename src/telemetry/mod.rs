@@ -309,6 +309,19 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     put("os", std::env::consts::OS.into());
     put("arch", std::env::consts::ARCH.into());
     put("version", crate::version::VERSION.into());
+    // Semver segments, broken out for filtering/grouping in PostHog. Absent when
+    // the version doesn't parse (rather than reporting junk).
+    if let Some(v) = crate::version::parse(crate::version::VERSION) {
+        put("version_major", v.major.into());
+        put("version_minor", v.minor.into());
+        put("version_patch", v.patch.into());
+        if let Some(pre) = v.pre_release {
+            put("version_pre_release", pre.into());
+        }
+        if let Some(build) = v.build {
+            put("version_build", build.into());
+        }
+    }
     put("ci", is_ci().into());
     // Command + selector shape + the set of flags used (names only).
     put("command", ctx.command.into());
