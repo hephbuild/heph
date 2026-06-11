@@ -1158,11 +1158,24 @@ impl Engine {
         let (executed, manifest) = match self.probe_cache_manifest(&rs, def, opts).await? {
             Some(manifest) => (None, Some(manifest)),
             None => {
-                let (cached, meta) = self
-                    .clone()
-                    .execute_and_cache_inner(rs.clone(), opts)
-                    .await?;
-                (Some(Arc::new(ExecutedArtifacts { cached, meta })), None)
+                // Local miss under the write lock: try to pull a complete
+                // revision from the remote caches into the local cache before
+                // executing. Safe to write local blobs here — the write lock
+                // excludes GC and other writers. A remote hit means "already
+                // built": skip execution and share the now-local entry.
+                match self
+                    .download_from_remote(ctoken, addr, opts.hashin.as_str())
+                    .await?
+                {
+                    Some(manifest) => (None, Some(Arc::new(manifest))),
+                    None => {
+                        let (cached, meta) = self
+                            .clone()
+                            .execute_and_cache_inner(rs.clone(), opts)
+                            .await?;
+                        (Some(Arc::new(ExecutedArtifacts { cached, meta })), None)
+                    }
+                }
             }
         };
 

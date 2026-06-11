@@ -13,3 +13,13 @@ drivers:
   - name: go_testmain
 #fuse:
 #  enabled: true
+# Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus
+# `read`/`write` flags (both default true). Supported schemes: s3://, gs://
+# (credentials from the environment), and file:// / memory:// for local use.
+# Writes fan out to every writable cache in parallel; reads try caches in
+# measured-latency order and pull a whole revision from the first that has it.
+#caches:
+#  shared:
+#    uri: s3://my-bucket/heph-cache
+#    read: true
+#    write: true
