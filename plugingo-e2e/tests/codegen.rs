@@ -2,7 +2,8 @@ mod common;
 
 use anyhow::Context as _;
 use common::{
-    artifact_paths, artifact_string, fixture, make_workspace, make_workspace_go_first, require_go,
+    artifact_paths, artifact_string, fixture, make_workspace, make_workspace_fs_skip,
+    make_workspace_go_first, require_go,
 };
 use std::fs;
 
@@ -95,6 +96,147 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
 
     let stdout = String::from_utf8(output.stdout).context("binary stdout is utf8")?;
     assert_eq!(stdout.trim(), "hello", "binary must print 'hello'");
+    Ok(())
+}
+
+// Regression for content_buddy `heph3 r build ./go`: with a `go_codegen_root`
+// (provider_state) covering the whole module, building a binary whose package
+// graph spans multiple first-party packages must succeed. Each package's
+// `_golist` issues a broad `q@label=go_src,package_prefix=<root>` query; that
+// query `get_spec`s every sibling `build_lib`/`_golist` to read labels, which
+// re-enters the in-flight computations and (pre-fix) trips a FALSE
+// `build_lib -> _golist` cycle that fails the build.
+#[tokio::test]
+async fn test_codegen_root_build_multi_package() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("codegenroot")?;
+    let ws = make_workspace(dir)?;
+    let result = ws
+        .run("//:build")
+        .await
+        .context("build //:build under a go_codegen_root")?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "build must produce the binary even with a go_codegen_root spanning multiple packages"
+    );
+    Ok(())
+}
+
+// Regression for the exact content_buddy config: the generated Go sub-package
+// (`genpb/`) is the output of a codegen target but ALSO lives under an
+// `fs.skip` subtree (mirroring `go/gen/**`). The go provider prunes first-party
+// packages inside skipped subtrees, so `//genpb:_golist` resolves to
+// `TargetNotFound` — even though it is produced by codegen — and every importer
+// fails. Building `//:build` must still succeed: codegen-produced packages must
+// remain resolvable despite the skip.
+#[tokio::test]
+async fn test_codegen_root_build_with_generated_pkg_skipped() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("codegenroot")?;
+    let ws = make_workspace_fs_skip(dir, &["genpb/**"])?;
+    let result = ws
+        .run("//:build")
+        .await
+        .context("build //:build with the generated sub-package under fs.skip")?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "build must succeed even though the codegen-produced package is under fs.skip"
+    );
+    Ok(())
+}
+
+// Faithful repro of content_buddy `heph3 r build ./go`: a codegen target
+// labelled `"codegen"` (NOT `"go_src"`) writes a generated Go package into a
+// sub-tree that is also under `fs.skip` (`gen/**`, mirroring `go/gen/**`). The
+// go provider prunes the generated package from its walk, so the importer's
+// `go list` cannot resolve `//gen/pb/v1:_golist` — it fails with
+// `target not found` and cascading cyclic-dependency errors.
+//
+// We first build `//:gen` (codegen=copy writes the package to disk, as
+// `heph3 r build ./go` does when it builds the codegen target), then `//:build`
+// — the binary whose import graph reaches the skipped generated package.
+//
+// KNOWN-FAILING: this reproduces the open bug, so it is `#[ignore]`d to keep the
+// suite green. Run it explicitly to see the failure:
+//   cargo test -p plugingo-e2e --test codegen -- --ignored test_codegen_into_skipped_subtree_repro
+// The contrast test `test_codegen_root_build_with_generated_pkg_skipped` shows
+// the working path: labelling the codegen target `go_src` wires it via the go
+// provider's query, so the skip no longer hides the generated package.
+#[ignore = "reproduces open bug: codegen package under fs.skip is unresolvable unless labelled go_src"]
+#[tokio::test]
+async fn test_codegen_into_skipped_subtree_repro() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("codegenskip")?;
+    let ws = make_workspace_fs_skip(dir, &["gen/**"])?;
+
+    // Populate the generated package on disk first, like the codegen target run.
+    ws.run("//:gen").await.context("run //:gen codegen")?;
+
+    let result = ws
+        .run("//:build")
+        .await
+        .context("build //:build importing a codegen package under fs.skip")?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "build must resolve the codegen-produced package even under fs.skip"
+    );
+    Ok(())
+}
+
+// Repro of content_buddy's false-cycle `heph3 r build ./go` (with codegen
+// labelled `go_src`): building the whole graph concurrently trips a FALSE
+// `build_lib -> _golist` self-package cycle. A shared library imported by two
+// binaries has its `build_lib` in-flight while a sibling package's
+// `q@label=go_src,package_prefix=<root>` query (run for its `_golist`)
+// `get_spec`s that same in-flight `build_lib`, closing a cycle on the request
+// DAG. Building the shared lib's `build_lib` directly never overlaps that way
+// and succeeds (see `test_codegencycle_single_target_builds`) — so this is a
+// product bug, not a real cycle in the graph.
+#[ignore = "reproduces open product bug: whole-graph build trips a false build_lib -> _golist cycle"]
+#[tokio::test]
+async fn test_codegencycle_whole_graph_build() -> anyhow::Result<()> {
+    use heph::htmatcher::Matcher;
+    use heph::htpkg::PkgBuf;
+
+    require_go!();
+    let dir = fixture("codegencycle")?;
+    // Whole-graph batch query = the exact content_buddy `heph3 r build ./go` path
+    // (`And[Label(build), Package(...)]`), not a single `result_addr`. The batch
+    // resolves every `build` target concurrently, which is what trips the cycle —
+    // independent of lock backend.
+    let ws = make_workspace(dir)?;
+    let m = Matcher::And(vec![
+        Matcher::Label("build".to_string()),
+        Matcher::Package(PkgBuf::from("")),
+    ]);
+    let results = ws
+        .run_matcher(&m)
+        .await
+        .context("whole-graph `build` query under a go_codegen_root")?;
+    assert!(
+        !results.is_empty() && results.iter().all(|r| !artifact_paths(r).is_empty()),
+        "whole-graph build must succeed without a false build_lib -> _golist cycle"
+    );
+    Ok(())
+}
+
+// Control for the repro above: building the shared library's `build_lib`
+// directly (no concurrent sibling consumer in-flight) must succeed. This is the
+// `heph3 r //go/libs/confmgr:build_lib@...` case the user confirmed works,
+// proving the whole-graph cycle is spurious.
+#[tokio::test]
+async fn test_codegencycle_single_target_builds() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("codegencycle")?;
+    let ws = make_workspace(dir)?;
+    let result = ws
+        .run("//shared:build_lib")
+        .await
+        .context("build //shared:build_lib directly")?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "single-target build_lib must produce the .a archive"
+    );
     Ok(())
 }
 

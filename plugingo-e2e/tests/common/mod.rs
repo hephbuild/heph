@@ -50,7 +50,14 @@ fn go_bin_path() -> String {
 }
 
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true)
+    make_workspace_ordered(dir, false, true, &[])
+}
+
+/// Like [`make_workspace`] but with `fs.skip` entries, mirroring a config file's
+/// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
+/// package lives under a skipped subtree (e.g. content_buddy's `go/gen/**`).
+pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
+    make_workspace_ordered(dir, false, true, skip)
 }
 
 /// Same as [`make_workspace`] but registers the **go provider before** the
@@ -65,17 +72,21 @@ pub fn make_workspace_go_first(
     dir: TempDir,
     foreign_name_guard: bool,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, true, foreign_name_guard)
+    make_workspace_ordered(dir, true, foreign_name_guard, &[], LockBackend::Fs)
 }
 
 fn make_workspace_ordered(
     dir: TempDir,
     go_first: bool,
     foreign_name_guard: bool,
+    fs_skip: &[&str],
+    lock_backend: LockBackend,
 ) -> anyhow::Result<Workspace> {
     let go_bin = go_bin_path();
     // `fs` is auto-registered by `Engine::new`.
-    let mut b = WorkspaceBuilder::from_dir(dir);
+    let mut b = WorkspaceBuilder::from_dir(dir)
+        .with_fs_skip(fs_skip.iter().copied())
+        .with_lock_backend(lock_backend);
 
     if go_first {
         b = b.with_provider(move |init| {
