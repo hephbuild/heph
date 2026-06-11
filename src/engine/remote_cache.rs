@@ -234,7 +234,16 @@ impl RemoteCacheSet {
             .caches
             .get(cache_idx)
             .context("remote cache index out of range")?;
-        cache.backend.get(&key).await
+        // Blobs are stored gzip-compressed on the remote (see `put_revision`);
+        // decompress back to the exact bytes the local cache expects.
+        match cache.backend.get(&key).await? {
+            Some(bytes) => {
+                let raw = gzip_decompress(&bytes)
+                    .with_context(|| format!("decompress remote blob {name}"))?;
+                Ok(Some(raw))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Push a full revision to every writable cache. Within each cache, all
@@ -250,11 +259,16 @@ impl RemoteCacheSet {
     ) {
         let writers = self.caches.iter().filter(|c| c.def.write);
         let per_cache = writers.map(|cache| async move {
-            // Blobs first, in parallel.
+            // Blobs first, in parallel. Each is gzip-compressed before upload —
+            // cache artifacts (tars) compress well, cutting transfer + storage.
             let blob_puts = blobs.iter().map(|(name, data)| {
                 let key = Self::key(addr, hashin, name);
                 let backend = &cache.backend;
-                async move { backend.put(&key, data.clone()).await }
+                async move {
+                    let compressed = gzip_compress(data)
+                        .with_context(|| format!("compress remote blob {name}"))?;
+                    backend.put(&key, compressed).await
+                }
             });
             for res in join_all(blob_puts).await {
                 if let Err(e) = res {
@@ -270,6 +284,25 @@ impl RemoteCacheSet {
         });
         join_all(per_cache).await;
     }
+}
+
+/// Gzip-compress a blob for remote storage. Pure-Rust backend (miniz_oxide), so
+/// it stays cross-compile clean.
+fn gzip_compress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).context("gzip write")?;
+    enc.finish().context("gzip finish")
+}
+
+/// Inverse of [`gzip_compress`]. Errors on a corrupt/non-gzip object, which the
+/// read path treats as a cache miss.
+fn gzip_decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut dec = flate2::read::GzDecoder::new(data);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).context("gzip read")?;
+    Ok(out)
 }
 
 /// Stable hash of the definition set (order-independent) used to invalidate the
@@ -501,6 +534,45 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(blob, b"blob-a");
+    }
+
+    #[tokio::test]
+    async fn blobs_are_stored_compressed_and_restored() {
+        let defs = vec![def("a", "memory:///a", true, true)];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = RemoteCacheSet::new(&defs, dir.path().to_path_buf()).expect("set");
+        let addr = Addr::new(
+            crate::htpkg::PkgBuf::from("p"),
+            "t".to_string(),
+            Default::default(),
+        );
+
+        // Highly compressible payload.
+        let raw = vec![b'x'; 10_000];
+        set.put_revision(&addr, "h1", b"m", &[("o.tar".to_string(), raw.clone())])
+            .await;
+
+        // The object actually stored is gzip (magic 0x1f 0x8b) and much smaller.
+        let stored = set.caches[0]
+            .backend
+            .get(&RemoteCacheSet::key(&addr, "h1", "o.tar"))
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(&stored[..2], &[0x1f, 0x8b], "stored blob must be gzip");
+        assert!(
+            stored.len() < raw.len() / 2,
+            "must shrink: {}",
+            stored.len()
+        );
+
+        // get_blob transparently restores the original bytes.
+        let restored = set
+            .get_blob(0, &addr, "h1", "o.tar")
+            .await
+            .expect("get_blob")
+            .expect("present");
+        assert_eq!(restored, raw);
     }
 
     #[tokio::test]

@@ -1564,6 +1564,7 @@ dependencies = [
  "derivative",
  "enclose",
  "erased-serde 0.4.10",
+ "flate2",
  "fuser",
  "futures",
  "glob",
