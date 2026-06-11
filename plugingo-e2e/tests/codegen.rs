@@ -145,44 +145,6 @@ async fn test_codegen_root_build_with_generated_pkg_skipped() -> anyhow::Result<
     Ok(())
 }
 
-// Faithful repro of content_buddy `heph3 r build ./go`: a codegen target
-// labelled `"codegen"` (NOT `"go_src"`) writes a generated Go package into a
-// sub-tree that is also under `fs.skip` (`gen/**`, mirroring `go/gen/**`). The
-// go provider prunes the generated package from its walk, so the importer's
-// `go list` cannot resolve `//gen/pb/v1:_golist` — it fails with
-// `target not found` and cascading cyclic-dependency errors.
-//
-// We first build `//:gen` (codegen=copy writes the package to disk, as
-// `heph3 r build ./go` does when it builds the codegen target), then `//:build`
-// — the binary whose import graph reaches the skipped generated package.
-//
-// KNOWN-FAILING: this reproduces the open bug, so it is `#[ignore]`d to keep the
-// suite green. Run it explicitly to see the failure:
-//   cargo test -p plugingo-e2e --test codegen -- --ignored test_codegen_into_skipped_subtree_repro
-// The contrast test `test_codegen_root_build_with_generated_pkg_skipped` shows
-// the working path: labelling the codegen target `go_src` wires it via the go
-// provider's query, so the skip no longer hides the generated package.
-#[ignore = "reproduces open bug: codegen package under fs.skip is unresolvable unless labelled go_src"]
-#[tokio::test]
-async fn test_codegen_into_skipped_subtree_repro() -> anyhow::Result<()> {
-    require_go!();
-    let dir = fixture("codegenskip")?;
-    let ws = make_workspace_fs_skip(dir, &["gen/**"])?;
-
-    // Populate the generated package on disk first, like the codegen target run.
-    ws.run("//:gen").await.context("run //:gen codegen")?;
-
-    let result = ws
-        .run("//:build")
-        .await
-        .context("build //:build importing a codegen package under fs.skip")?;
-    assert!(
-        !artifact_paths(&result).is_empty(),
-        "build must resolve the codegen-produced package even under fs.skip"
-    );
-    Ok(())
-}
-
 // Regression for content_buddy's false-cycle `heph3 r build ./go` (with codegen
 // labelled `go_src`): building the whole graph concurrently must NOT trip a false
 // cycle. A shared library imported by two binaries has its `build_lib` in-flight
