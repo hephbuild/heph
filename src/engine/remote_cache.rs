@@ -35,6 +35,7 @@ use futures::future::join_all;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::OnceCell;
@@ -90,10 +91,63 @@ impl RemoteCacheDef {
     }
 }
 
-/// A configured cache: its definition plus the constructed backend.
+/// After this many consecutive failures a cache is circuit-broken for the rest
+/// of the process: skipped without further network calls or log lines. Stops a
+/// down or misconfigured (e.g. auth-failing) cache from slowing every target and
+/// flooding the logs on a wide build.
+const FAILURE_THRESHOLD: usize = 3;
+
+/// Per-cache failure tracking. The first error for a cache is logged once, then
+/// every later error is suppressed; after [`FAILURE_THRESHOLD`] consecutive
+/// failures the cache is disabled for the rest of the process so we stop hitting
+/// it at all. A success resets the consecutive-failure run.
+#[derive(Default)]
+struct CacheHealth {
+    warned: AtomicBool,
+    consecutive_failures: AtomicUsize,
+    disabled: AtomicBool,
+}
+
+/// A configured cache: its definition, the constructed backend, and its health.
 struct ConfiguredCache {
     def: RemoteCacheDef,
     backend: Arc<dyn RemoteCacheBackend>,
+    health: CacheHealth,
+}
+
+impl ConfiguredCache {
+    /// Whether the cache has been circuit-broken and should be skipped.
+    fn broken(&self) -> bool {
+        self.health.disabled.load(Ordering::Relaxed)
+    }
+
+    /// A successful op clears the consecutive-failure run (the breaker stays
+    /// tripped if it already fired — we don't probe a disabled cache anyway).
+    fn note_ok(&self) {
+        self.health.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a failed op: warn exactly once per cache, suppress the rest, and
+    /// trip the breaker after [`FAILURE_THRESHOLD`] consecutive failures.
+    fn note_err(&self, op: &str, e: &anyhow::Error) {
+        if !self.health.warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                cache = %self.def.name, op, error = ?e,
+                "remote cache error; further warnings for this cache are suppressed",
+            );
+        }
+        let n = self
+            .health
+            .consecutive_failures
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if n >= FAILURE_THRESHOLD && !self.health.disabled.swap(true, Ordering::Relaxed) {
+            warn!(
+                cache = %self.def.name,
+                "remote cache disabled for the rest of this run after {n} consecutive failures",
+            );
+        }
+    }
 }
 
 /// Per-cache latency probe result, surfaced by `heph tool cache measure-latency`.
@@ -141,6 +195,7 @@ impl RemoteCacheSet {
             caches.push(ConfiguredCache {
                 def: def.clone(),
                 backend: Arc::new(backend),
+                health: CacheHealth::default(),
             });
         }
         let config_hash = config_hash(defs);
@@ -266,7 +321,9 @@ impl RemoteCacheSet {
                 let lat = match c.backend.exists("__heph_latency_probe__").await {
                     Ok(_) => started.elapsed(),
                     Err(e) => {
-                        warn!(cache = %c.def.name, error = ?e, "remote cache latency probe failed");
+                        // Log-once + breaker via shared health; a probe that fails
+                        // sorts the cache last (and may trip the breaker).
+                        c.note_err("latency probe", &e);
                         UNREACHABLE
                     }
                 };
@@ -318,7 +375,9 @@ impl RemoteCacheSet {
         manifest_bytes: &[u8],
         blobs: &[(String, PathBuf)],
     ) {
-        let writers = self.caches.iter().filter(|c| c.def.write);
+        // Skip caches the breaker has already tripped — no point hitting (or
+        // re-logging) a cache that's down.
+        let writers = self.caches.iter().filter(|c| c.def.write && !c.broken());
         let per_cache = writers.map(|cache| async move {
             let blob_puts = blobs.iter().map(|(name, path)| {
                 let key = Self::key(addr, hashin, name);
@@ -326,14 +385,17 @@ impl RemoteCacheSet {
             });
             for res in join_all(blob_puts).await {
                 if let Err(e) = res {
-                    warn!(cache = %cache.def.name, error = ?e, "remote cache blob upload failed; skipping manifest");
+                    cache.note_err("blob upload", &e);
                     return;
                 }
             }
             // Manifest last: its presence implies every blob is already stored.
             let manifest_key = Self::key(addr, hashin, MANIFEST_V1);
-            if let Err(e) = write_bytes_to_backend(cache.backend.as_ref(), &manifest_key, manifest_bytes).await {
-                warn!(cache = %cache.def.name, error = ?e, "remote cache manifest upload failed");
+            match write_bytes_to_backend(cache.backend.as_ref(), &manifest_key, manifest_bytes)
+                .await
+            {
+                Ok(()) => cache.note_ok(),
+                Err(e) => cache.note_err("manifest upload", &e),
             }
         });
         join_all(per_cache).await;
@@ -354,17 +416,28 @@ impl RemoteCacheSet {
         }
         let manifest_key = Self::key(addr, hashin, MANIFEST_V1);
 
-        // Locate the manifest in the fastest cache that has it.
+        // Locate the manifest in the fastest cache that has it. Skip caches the
+        // breaker has tripped; record success/failure so a flaky cache trips.
         let mut found: Option<(usize, Vec<u8>)> = None;
         for &i in self.read_order().await {
+            let Some(cache) = self.caches.get(i) else {
+                continue;
+            };
+            if cache.broken() {
+                continue;
+            }
             match self.read_small(i, &manifest_key).await {
                 Ok(Some(bytes)) => {
+                    cache.note_ok();
                     found = Some((i, bytes));
                     break;
                 }
-                Ok(None) => continue,
+                Ok(None) => {
+                    cache.note_ok();
+                    continue;
+                }
                 Err(e) => {
-                    warn!(cache = %self.caches.get(i).map(|c| c.def.name.as_str()).unwrap_or(""), error = ?e, "remote cache manifest read failed");
+                    cache.note_err("manifest read", &e);
                     continue;
                 }
             }
@@ -384,32 +457,63 @@ impl RemoteCacheSet {
             .caches
             .get(cache_idx)
             .context("remote cache index out of range")?;
-        let mut blobs = Vec::with_capacity(manifest.artifacts.len());
+        let mut blobs: Vec<(String, PathBuf)> = Vec::with_capacity(manifest.artifacts.len());
         for artifact in &manifest.artifacts {
             let key = Self::key(addr, hashin, &artifact.name);
-            let Some(mut reader) = cache.backend.open_read(&key).await? else {
-                // Manifest names a blob the cache no longer has → incomplete.
-                warn!(%addr, name = %artifact.name, "remote manifest blob missing; treating as miss");
-                return Ok(None);
+            // A backend error here is best-effort: log once (per cache), drop any
+            // partial temps, and treat the whole revision as a miss so the build
+            // executes — never propagate it up as a hard failure.
+            let reader = match cache.backend.open_read(&key).await {
+                Ok(Some(reader)) => reader,
+                Ok(None) => {
+                    // Manifest names a blob the cache no longer has → incomplete.
+                    cleanup_temps(&blobs);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    cache.note_err("blob download", &e);
+                    cleanup_temps(&blobs);
+                    return Ok(None);
+                }
             };
+
             let temp = dest_dir.join(format!("{}.gz", uuid::Uuid::new_v4()));
+            // Temp-file I/O is local and genuinely fatal — propagate.
             let mut file = tokio::fs::File::create(&temp)
                 .await
                 .with_context(|| format!("create temp for remote blob {}", artifact.name))?;
-            tokio::io::copy(&mut reader, &mut file)
-                .await
-                .with_context(|| format!("stream remote blob {} to temp", artifact.name))?;
+            let mut reader = reader;
+            if let Err(e) = tokio::io::copy(&mut reader, &mut file).await {
+                // Mid-stream network error from the cache → best-effort miss.
+                cache.note_err(
+                    "blob download",
+                    &anyhow::Error::new(e).context(format!("stream remote blob {}", artifact.name)),
+                );
+                drop(file);
+                drop(std::fs::remove_file(&temp));
+                cleanup_temps(&blobs);
+                return Ok(None);
+            }
             file.shutdown()
                 .await
                 .with_context(|| format!("flush temp for remote blob {}", artifact.name))?;
             blobs.push((artifact.name.clone(), temp));
         }
 
+        cache.note_ok();
         Ok(Some(FetchedRevision {
             manifest,
             manifest_bytes,
             blobs,
         }))
+    }
+}
+
+/// Best-effort removal of temp files collected during a fetch that ended up a
+/// miss, so a remote failure mid-download doesn't leak.
+fn cleanup_temps(temps: &[(String, PathBuf)]) {
+    for (_, path) in temps {
+        drop(std::fs::remove_file(path));
     }
 }
 
@@ -716,6 +820,91 @@ mod tests {
         assert_eq!(k("file:///tmp/c"), "file");
         assert_eq!(k("memory:///x"), "memory");
         assert_eq!(k("weird:///x"), "other");
+    }
+
+    /// Backend whose every operation fails — stands in for an auth/credential
+    /// failure or an unreachable endpoint.
+    struct FailBackend;
+
+    #[async_trait]
+    impl RemoteCacheBackend for FailBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            anyhow::bail!("auth failed")
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("auth failed")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("auth failed")
+        }
+    }
+
+    fn failing_set(home: PathBuf) -> Arc<RemoteCacheSet> {
+        Arc::new(RemoteCacheSet {
+            caches: vec![ConfiguredCache {
+                def: def("broken", "memory:///broken", true, true),
+                backend: Arc::new(FailBackend),
+                health: CacheHealth::default(),
+            }],
+            home,
+            config_hash: String::new(),
+            read_order: OnceCell::new(),
+        })
+    }
+
+    /// A failing remote is best-effort: reads return a miss (never a hard error
+    /// that would fail the build), and after repeated failures the cache trips
+    /// its breaker and is skipped.
+    #[tokio::test]
+    async fn failing_backend_is_best_effort_and_trips_breaker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = failing_set(dir.path().to_path_buf());
+        let addr = addr();
+
+        for _ in 0..FAILURE_THRESHOLD {
+            assert!(
+                !set.caches.first().expect("cache").broken(),
+                "should not break before the threshold"
+            );
+            let res = set
+                .fetch_revision(&addr, "h", dir.path())
+                .await
+                .expect("fetch must be best-effort (Ok), never a hard error");
+            assert!(res.is_none(), "a failing remote read is a miss");
+        }
+        assert!(
+            set.caches.first().expect("cache").broken(),
+            "cache must be circuit-broken after {FAILURE_THRESHOLD} consecutive failures"
+        );
+    }
+
+    #[test]
+    fn note_ok_resets_consecutive_failures() {
+        let cache = ConfiguredCache {
+            def: def("x", "memory:///x", true, true),
+            backend: Arc::new(FailBackend),
+            health: CacheHealth::default(),
+        };
+        let e = anyhow::anyhow!("boom");
+        // One short of the threshold, then a success → the run resets.
+        for _ in 0..FAILURE_THRESHOLD - 1 {
+            cache.note_err("op", &e);
+        }
+        assert!(!cache.broken());
+        cache.note_ok();
+        // The counter restarts, so it takes a full threshold run again to trip.
+        for _ in 0..FAILURE_THRESHOLD - 1 {
+            cache.note_err("op", &e);
+        }
+        assert!(
+            !cache.broken(),
+            "note_ok must reset the consecutive-failure run"
+        );
+        cache.note_err("op", &e);
+        assert!(cache.broken());
     }
 
     #[tokio::test]
