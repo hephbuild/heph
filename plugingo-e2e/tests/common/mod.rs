@@ -55,7 +55,7 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
 
 /// Like [`make_workspace`] but with `fs.skip` entries, mirroring a config file's
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
-/// package lives under a skipped subtree (e.g. content_buddy's `go/gen/**`).
+/// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, skip)
 }

@@ -1,6 +1,6 @@
-# Mirrors content_buddy's `go/BUILD`: the go provider's codegen *root* lives
-# here, and a codegen target emits generated Go into a *sub*-package (`genpb/`),
-# exactly like `buf generate` writing into `go/gen/...`.
+# The go provider's codegen *root* lives here, and a codegen target emits
+# generated Go into a *sub*-package (`genpb/`), like `buf generate` writing into
+# a `gen/...` tree.
 provider_state(
     provider = "go",
     go_codegen_root = True,

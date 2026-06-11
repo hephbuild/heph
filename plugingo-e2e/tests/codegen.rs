@@ -99,7 +99,7 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Regression for content_buddy `heph3 r build ./go`: with a `go_codegen_root`
+// Regression for whole-graph `heph r build ./...`: with a `go_codegen_root`
 // (provider_state) covering the whole module, building a binary whose package
 // graph spans multiple first-party packages must succeed. Each package's
 // `_golist` issues a broad `q@label=go_src,package_prefix=<root>` query; that
@@ -122,9 +122,9 @@ async fn test_codegen_root_build_multi_package() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Regression for the exact content_buddy config: the generated Go sub-package
-// (`genpb/`) is the output of a codegen target but ALSO lives under an
-// `fs.skip` subtree (mirroring `go/gen/**`). The go provider prunes first-party
+// Regression: the generated Go sub-package (`genpb/`) is the output of a codegen
+// target but ALSO lives under an `fs.skip` subtree (a typical `gen/**` layout).
+// The go provider prunes first-party
 // packages inside skipped subtrees, so `//genpb:_golist` resolves to
 // `TargetNotFound` — even though it is produced by codegen — and every importer
 // fails. Building `//:build` must still succeed: codegen-produced packages must
@@ -145,7 +145,7 @@ async fn test_codegen_root_build_with_generated_pkg_skipped() -> anyhow::Result<
     Ok(())
 }
 
-// Regression for content_buddy's false-cycle `heph3 r build ./go` (with codegen
+// Regression for a whole-graph false cycle (`heph r build ./...` with codegen
 // labelled `go_src`): building the whole graph concurrently must NOT trip a false
 // cycle. A shared library imported by two binaries has its `build_lib` in-flight
 // while a sibling package's `q@label=go_src,package_prefix=<root>` query (run for
@@ -163,7 +163,7 @@ async fn test_codegencycle_whole_graph_build() -> anyhow::Result<()> {
 
     require_go!();
     let dir = fixture("codegencycle")?;
-    // Whole-graph batch query = the exact content_buddy `heph3 r build ./go` path
+    // Whole-graph batch query = the `heph r build ./...` path
     // (`And[Label(build), Package(...)]`), not a single `result_addr`. The batch
     // resolves every `build` target concurrently, which is what trips the cycle —
     // independent of lock backend.

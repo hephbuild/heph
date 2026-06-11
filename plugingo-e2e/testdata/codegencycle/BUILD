@@ -1,5 +1,5 @@
-# Repro of content_buddy's false-cycle `heph3 r build ./go` (after the `go_src`
-# label fix): building the *whole graph* concurrently — not a single target —
+# Repro of a whole-graph false-cycle `heph r build ./...` (codegen labelled
+# `go_src`): building the *whole graph* concurrently — not a single target —
 # trips `build_lib -> _golist` self-package cycles.
 #
 # Mechanism: with `go_codegen_root`, every package's `_golist` issues a broad
@@ -14,8 +14,7 @@ provider_state(
     go_codegen_root = True,
 )
 
-# Codegen target labelled `go_src` (the applied content_buddy fix), emitting a
-# generated Go package one dir down.
+# Codegen target labelled `go_src`, emitting a generated Go package one dir down.
 target(
     name = "gen",
     driver = "bash",
@@ -29,8 +28,8 @@ target(
     codegen = "copy",
 )
 
-# Dist targets labelled `build` (mirroring content_buddy's `*-lambda`/`*-compose`
-# wrappers). `heph r build .` matches `And[Label(build), Package(...)]`, so the
+# Dist targets labelled `build` (like `*-lambda`/`*-compose` release wrappers).
+# `heph r build .` matches `And[Label(build), Package(...)]`, so the
 # whole-graph query selects BOTH of these and builds them concurrently —
 # `shared:build_lib` is in-flight via one while a sibling package's `go_src`
 # query (run for its `_golist`) re-enters it, closing the false cycle.
