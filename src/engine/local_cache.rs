@@ -709,7 +709,10 @@ mod tests {
         // Drains to zero once the detached upload completes.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while bg.load(Ordering::Acquire) > 0 {
-            assert!(std::time::Instant::now() < deadline, "bg_pending never drained");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bg_pending never drained"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 

@@ -158,6 +158,9 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
             concurrency: c.concurrency,
         })
         .collect();
+    // Captured before `remote_caches` is moved into `Config` below; reported via
+    // telemetry (count only — never the URIs).
+    let remote_cache_count = remote_caches.len();
 
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
@@ -229,10 +232,12 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let engine = Arc::new(e);
 
     // Telemetry: record the enabled provider + driver type names (built-ins plus
-    // whatever the config turned on) for the exit reporter. Set-once.
+    // whatever the config turned on) and the remote-cache count for the exit
+    // reporter. Set-once.
     crate::telemetry::record_plugins(
         engine.providers_by_name.keys().cloned().collect(),
         engine.drivers_by_name.keys().cloned().collect(),
+        remote_cache_count,
     );
 
     let (tx, rx) = mpsc::unbounded_channel();

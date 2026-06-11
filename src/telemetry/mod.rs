@@ -69,24 +69,31 @@ pub fn snapshot() -> TelemetrySnapshot {
     COLLECTOR.snapshot()
 }
 
-/// Names of the providers + drivers the engine has registered (built-ins plus
-/// whatever the config enabled). Plugin *type* names only — never user data.
+/// The engine's enabled plugins (built-ins plus whatever the config turned on)
+/// plus how many remote caches are configured. Plugin *type* names and a count
+/// only — never user data (URIs, addresses, …).
 #[derive(Debug, Clone, Default)]
 struct Plugins {
     providers: Vec<String>,
     drivers: Vec<String>,
+    remote_caches: usize,
 }
 
 /// Set once, at engine construction. Read by the reporter at exit.
 static PLUGINS: std::sync::OnceLock<Plugins> = std::sync::OnceLock::new();
 
-/// Record the enabled provider + driver names. First write wins (a process
-/// builds at most one engine for the command it runs); later calls are ignored.
-pub fn record_plugins(mut providers: Vec<String>, mut drivers: Vec<String>) {
+/// Record the enabled provider + driver names and the number of configured
+/// remote caches. First write wins (a process builds at most one engine for the
+/// command it runs); later calls are ignored.
+pub fn record_plugins(mut providers: Vec<String>, mut drivers: Vec<String>, remote_caches: usize) {
     providers.sort();
     drivers.sort();
     // Best-effort set-once; a second engine in one process keeps the first set.
-    drop(PLUGINS.set(Plugins { providers, drivers }));
+    drop(PLUGINS.set(Plugins {
+        providers,
+        drivers,
+        remote_caches,
+    }));
 }
 
 /// Public, write-only PostHog project API key. Not a secret — safe to ship in
@@ -357,6 +364,8 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     // Enabled plugins (built-ins + config), as queryable arrays of type names.
     put("providers", plugins.providers.into());
     put("drivers", plugins.drivers.into());
+    // How many remote (shared) caches are configured. Count only — never URIs.
+    put("remote_cache_count", plugins.remote_caches.into());
 
     let dir = config_dir()?;
     let event = SpooledEvent {
