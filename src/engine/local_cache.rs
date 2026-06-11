@@ -361,24 +361,15 @@ impl Engine {
             artifacts: manifest_artifacts,
         };
 
-        // Scope the writer (a non-`Send` `Box<dyn io::Write>`) so it is dropped
-        // before the remote upload `await` below — otherwise the future is `!Send`.
-        {
-            let mut manifest_writer = cache
-                .writer(addr, &key, MANIFEST_V1)
-                .with_context(|| format!("open manifest writer for {addr}"))?;
-            borsh::to_writer(&mut manifest_writer, &manifest)
-                .with_context(|| format!("write manifest for {addr}"))?;
-        }
+        let mut manifest_writer = cache
+            .writer(addr, &key, MANIFEST_V1)
+            .with_context(|| format!("open manifest writer for {addr}"))?;
+        borsh::to_writer(&mut manifest_writer, &manifest)
+            .with_context(|| format!("write manifest for {addr}"))?;
 
-        // Push to the remote (shared) caches. Skipped for tmp/uncacheable
-        // revisions (they're never read back). Best-effort — a remote failure
-        // logs but never fails the build.
-        if !tmp && !self.remote_caches.is_empty() {
-            let names: Vec<String> = manifest.artifacts.iter().map(|a| a.name.clone()).collect();
-            self.upload_to_remote(addr, &key, &manifest, &names).await;
-        }
-
+        // Remote push happens on a background task driven from the execute path
+        // (see `Engine::spawn_remote_upload`), not here — it must not block the
+        // build's critical path on the network.
         Ok(res_artifacts)
     }
 
@@ -600,9 +591,10 @@ mod tests {
         (engine, dir)
     }
 
-    /// Engine whose `cache_locally` pushes to — and whose miss path pulls from —
-    /// the remote cache at `remote_uri` (a `file://` dir shared across engines).
-    fn engine_with_remote(remote_uri: &str) -> (Engine, tempfile::TempDir) {
+    /// Engine wired to the remote cache at `remote_uri` (a `file://` dir shared
+    /// across engines). Returns an `Arc` so the `self: &Arc<Self>` upload helper
+    /// can be called.
+    fn engine_with_remote(remote_uri: &str) -> (Arc<Engine>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
@@ -613,11 +605,12 @@ mod tests {
                 uri: remote_uri.to_string(),
                 read: true,
                 write: true,
+                concurrency: 10,
             }],
             ..Default::default()
         })
         .expect("engine");
-        (engine, dir)
+        (Arc::new(engine), dir)
     }
 
     /// End-to-end: a revision cached by one engine (with its own local cache) is
@@ -632,7 +625,8 @@ mod tests {
         let addr = test_addr();
         let def = linked_def(&addr);
 
-        // Engine A writes a revision; `cache_locally` uploads it to the remote.
+        // Engine A writes a revision locally, then pushes it to the remote
+        // (the push the background task performs in production).
         let (engine_a, _a) = engine_with_remote(&remote_uri);
         engine_a
             .cache_locally(
@@ -644,6 +638,7 @@ mod tests {
             )
             .await
             .expect("cache_locally");
+        engine_a.upload_to_remote(&addr, "HASHIN1").await;
 
         // Engine B has a cold local cache: a direct local read misses.
         let (engine_b, _b) = engine_with_remote(&remote_uri);
@@ -679,6 +674,55 @@ mod tests {
                 .reader,
         );
         assert!(!bytes.is_empty());
+    }
+
+    /// The background upload bumps the request's `bg_pending` counter and drops
+    /// it back to zero once the push finishes — the signal the CLI/TUI shutdown
+    /// path waits on so it never exits with an upload in flight. The pushed
+    /// revision is then visible to a fresh engine.
+    #[tokio::test]
+    async fn spawn_remote_upload_tracks_bg_pending_and_lands() {
+        use std::sync::atomic::Ordering;
+
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let (engine, _e) = engine_with_remote(&remote_uri);
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHBG",
+                vec![raw_artifact("a", b"bg payload")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        let rs = engine.new_state();
+        let bg = rs.bg_pending();
+        assert_eq!(bg.load(Ordering::Acquire), 0);
+        engine.spawn_remote_upload(&rs, addr.clone(), "HASHBG".to_string());
+
+        // Drains to zero once the detached upload completes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while bg.load(Ordering::Acquire) > 0 {
+            assert!(std::time::Instant::now() < deadline, "bg_pending never drained");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The revision is now on the remote: a cold engine pulls it.
+        let (engine2, _e2) = engine_with_remote(&remote_uri);
+        assert!(
+            engine2
+                .download_from_remote(&ctoken, &addr, "HASHBG")
+                .await
+                .expect("download")
+                .is_some(),
+            "background upload must land on the remote"
+        );
     }
 
     /// A missing remote entry yields `None` (→ execute), not an error.

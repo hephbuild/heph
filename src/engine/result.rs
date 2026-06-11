@@ -1518,8 +1518,13 @@ impl Engine {
                     .await
                     .map(|cached| (cached, artifacts_meta))
                     .with_context(|| format!("cache_locally {addr}"));
-                    // TODO(remote-cache): bracket the remote push with its own
-                    // RemoteCacheWrite{Start,End} events here once it lands.
+
+                    // Remote push: fire-and-forget on a background task (tracked
+                    // by `bg_pending`, so the CLI/TUI stays open until it drains).
+                    // Cacheable revisions only — tmp/uncacheable are never shared.
+                    if out.is_ok() && !use_tmp_cache {
+                        engine.spawn_remote_upload(&rs, addr.clone(), hashin.clone());
+                    }
 
                     // Post-write GC: trim this target's stale revisions in the
                     // background (same lane as sandbox cleanup), skipping

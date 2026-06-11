@@ -85,14 +85,22 @@ pub enum BuildEventKind {
     RemoteCacheRead {
         addr: String,
     },
-    RemoteCacheWrite {
-        addr: String,
-    },
     RemoteCacheHit {
         addr: String,
     },
     RemoteCacheMiss {
         addr: String,
+    },
+    /// Start of pushing a target's artifacts to the remote cache(s). Runs on a
+    /// background task after the build's critical path, so it appears in the
+    /// per-target op timeline (and is surfaced as "slow" if it runs long).
+    /// Paired with `RemoteCacheWriteEnd`.
+    RemoteCacheWriteStart {
+        addr: String,
+    },
+    RemoteCacheWriteEnd {
+        addr: String,
+        error: Option<String>,
     },
     /// One target finished garbage collection: how many cache revisions it
     /// dropped and how many bytes those revisions freed (summed from manifest

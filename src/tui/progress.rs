@@ -322,16 +322,18 @@ impl HeaderItem {
 enum Op {
     Execute,
     LocalCacheWrite,
+    RemoteCacheWrite,
 }
 
 impl Op {
     /// Single glyph shown before the op's elapsed time. Must stay **BMP
-    /// single-width** (plain-text rows; a double-width glyph would clip). Future
-    /// remote ops use `↓`/`↑` (U+2193/2191), never the emoji `⬇`/`⬆`.
+    /// single-width** (plain-text rows; a double-width glyph would clip). Remote
+    /// ops use `↑`/`↓` (U+2191/2193), never the emoji `⬆`/`⬇`.
     fn icon(self) -> char {
         match self {
             Op::Execute => '▶',
             Op::LocalCacheWrite => '⊕',
+            Op::RemoteCacheWrite => '↑',
         }
     }
 
@@ -340,6 +342,7 @@ impl Op {
         match self {
             Op::Execute => 0,
             Op::LocalCacheWrite => 1,
+            Op::RemoteCacheWrite => 2,
         }
     }
 }
@@ -380,6 +383,12 @@ fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
         }
         BuildEventKind::LocalCacheWriteEnd { addr, .. } => {
             Some((addr, Op::LocalCacheWrite, Boundary::End))
+        }
+        BuildEventKind::RemoteCacheWriteStart { addr } => {
+            Some((addr, Op::RemoteCacheWrite, Boundary::Start))
+        }
+        BuildEventKind::RemoteCacheWriteEnd { addr, .. } => {
+            Some((addr, Op::RemoteCacheWrite, Boundary::End))
         }
         _ => None,
     }
@@ -538,7 +547,8 @@ impl BuildState {
             // cache-write span is folded into the op timeline above, so the
             // counter match ignores it here.
             BuildEventKind::RemoteCacheRead { .. }
-            | BuildEventKind::RemoteCacheWrite { .. }
+            | BuildEventKind::RemoteCacheWriteStart { .. }
+            | BuildEventKind::RemoteCacheWriteEnd { .. }
             | BuildEventKind::LocalCacheWriteStart { .. }
             | BuildEventKind::LocalCacheWriteEnd { .. } => {}
             // GC progress is tracked by GcHeader, not the build counters. The

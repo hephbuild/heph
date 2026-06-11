@@ -1,3 +1,4 @@
+mod cache;
 mod completions;
 pub mod gc;
 mod gen_gitignore;
@@ -33,6 +34,12 @@ pub enum ToolCommands {
     /// Example: `heph tool gen-gitignore`
     #[command(name = "gen-gitignore")]
     GenGitignore(gen_gitignore::Args),
+    /// Remote cache maintenance
+    ///
+    /// Subcommands for the shared remote cache(s) configured in `.hephconfig2`.
+    ///
+    /// Example: `heph tool cache measure-latency`
+    Cache(cache::CacheArgs),
     /// Print a shell completion-registration script
     ///
     /// Emits the script that enables dynamic tab-completion of subcommands,
@@ -58,6 +65,7 @@ impl ToolCommands {
         match self {
             ToolCommands::Gc(args) => gc::execute(args, sink, global),
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
+            ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Completions(args) => completions::execute(args),
         }
     }

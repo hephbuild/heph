@@ -51,10 +51,18 @@ pub struct RemoteCacheConfig {
     pub read: bool,
     #[serde(default = "default_true")]
     pub write: bool,
+    /// Max in-flight requests to this cache (object_store `LimitStore`). Caps how
+    /// many connections a wide build fan-out opens at once. Defaults to 10.
+    #[serde(default = "default_cache_concurrency")]
+    pub concurrency: usize,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_cache_concurrency() -> usize {
+    crate::engine::remote_cache::DEFAULT_CACHE_CONCURRENCY
 }
 
 /// Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.
@@ -358,10 +366,18 @@ caches:
         assert_eq!(remote.uri, "s3://my-bucket/heph");
         assert!(remote.read);
         assert!(!remote.write);
-        // read/write default to true when omitted.
+        // read/write/concurrency default when omitted.
         let local = cfg.caches.get("local").expect("local present");
         assert!(local.read);
         assert!(local.write);
+        assert_eq!(local.concurrency, 10);
+    }
+
+    #[test]
+    fn cache_concurrency_is_configurable() {
+        let yaml = "caches:\n  c:\n    uri: s3://b/p\n    concurrency: 32\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.caches.get("c").expect("present").concurrency, 32);
     }
 
     #[test]

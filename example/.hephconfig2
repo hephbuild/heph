@@ -14,12 +14,17 @@ drivers:
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus
-# `read`/`write` flags (both default true). Supported schemes: s3://, gs://
-# (credentials from the environment), and file:// / memory:// for local use.
-# Writes fan out to every writable cache in parallel; reads try caches in
-# measured-latency order and pull a whole revision from the first that has it.
+# `read`/`write` flags (both default true) and a `concurrency` request cap
+# (default 10). Supported schemes: s3://, gs://, az://, http(s):// (credentials
+# from the environment) and file:// / memory:// for local use. Blobs are
+# gzip-compressed and streamed (never held whole in memory). Writes fan out to
+# every writable cache in parallel (on a background task — the CLI stays open
+# until the upload drains); reads try caches in measured-latency order and pull
+# a whole revision from the first that has it. Measure/refresh the order with
+# `heph tool cache measure-latency`.
 #caches:
 #  shared:
 #    uri: s3://my-bucket/heph-cache
 #    read: true
 #    write: true
+#    concurrency: 10

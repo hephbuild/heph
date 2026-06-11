@@ -155,6 +155,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
             uri: c.uri.clone(),
             read: c.read,
             write: c.write,
+            concurrency: c.concurrency,
         })
         .collect();
 
