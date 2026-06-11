@@ -57,7 +57,12 @@ impl Engine {
                             }
                             MatchResult::MatchNo => {}
                             MatchResult::MatchShrug => {
-                                let spec = match Arc::clone(&self).get_spec(rs.clone(), &addr).await {
+                                // Speculative inspection: resolve the candidate's spec/def only
+                                // to evaluate the matcher, on a speculative rs so a rejected
+                                // candidate records no edge in the shared dep DAG (which would
+                                // otherwise close a false cycle later).
+                                let spec_rs = rs.speculative();
+                                let spec = match Arc::clone(&self).get_spec(spec_rs.clone(), &addr).await {
                                     Ok(spec) => Ok(spec),
                                     Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => continue,
                                     Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => continue,
@@ -70,7 +75,7 @@ impl Engine {
                                     }
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
-                                        let def = match Arc::clone(&self).get_def(rs.clone(), &addr).await {
+                                        let def = match Arc::clone(&self).get_def(spec_rs.clone(), &addr).await {
                                             Ok(def) => def,
                                             // Cycle means this candidate transitively depends on the
                                             // query caller — it cannot be a result. Skip it.

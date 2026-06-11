@@ -15,6 +15,7 @@ type SetupFn = Box<dyn FnOnce(&mut Engine) -> anyhow::Result<()>>;
 pub struct WorkspaceBuilder {
     dir: TempDir,
     parallelism: Option<usize>,
+    fs_skip: Vec<String>,
     setups: Vec<SetupFn>,
 }
 
@@ -23,6 +24,7 @@ impl WorkspaceBuilder {
         Ok(Self {
             dir: tempfile::tempdir().context("create workspace tempdir")?,
             parallelism: None,
+            fs_skip: vec![],
             setups: vec![],
         })
     }
@@ -31,12 +33,20 @@ impl WorkspaceBuilder {
         Self {
             dir,
             parallelism: None,
+            fs_skip: vec![],
             setups: vec![],
         }
     }
 
     pub fn with_parallelism(mut self, p: usize) -> Self {
         self.parallelism = Some(p);
+        self
+    }
+
+    /// Mirrors the config file's `fs.skip`: directories/globs every tree-walking
+    /// plugin prunes. The engine splits these into literal dirs and globs.
+    pub fn with_fs_skip(mut self, skip: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.fs_skip = skip.into_iter().map(Into::into).collect();
         self
     }
 
@@ -68,6 +78,7 @@ impl WorkspaceBuilder {
             root: self.dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
+            fs_skip: self.fs_skip,
             ..Default::default()
         })?;
         for setup in self.setups {
@@ -140,6 +151,28 @@ impl Workspace {
                 Err(anyhow::anyhow!("{}", msg.trim_end()))
             }
         }
+    }
+
+    /// Build every target matching `matcher` as one batch — the exact path the
+    /// `run` CLI takes for `heph r build ./pkg` (a Label/Package query, not a
+    /// single addr). Concurrent whole-graph resolution; surfaces per-addr
+    /// failures as an aggregated error so cycle bugs that only appear under
+    /// fan-out are visible. Returns the successful results on full success.
+    pub async fn run_matcher(
+        &self,
+        matcher: &heph::htmatcher::Matcher,
+    ) -> anyhow::Result<Vec<Arc<EResult>>> {
+        let e = self.engine.clone();
+        let rs = e.new_state();
+        let batch = e.result(rs, matcher, &ResultOptions::default()).await?;
+        if !batch.errors.is_empty() {
+            let mut msg = String::new();
+            for (addr, err) in &batch.errors {
+                msg.push_str(&format!("{}: {:#}\n", addr.format(), err));
+            }
+            return Err(anyhow::anyhow!("{}", msg.trim_end()));
+        }
+        Ok(batch.ok)
     }
 
     pub async fn get_spec(&self, addr_str: &str) -> anyhow::Result<Arc<EngineTargetSpec>> {

@@ -220,6 +220,15 @@ pub struct RequestStateData {
     pub failures: Mutex<indexmap::IndexMap<Addr, Arc<TargetFailure>>>,
 }
 
+/// One frame of the live resolution path (the breadcrumb chain). Built as an
+/// `Arc` cons-list so `with_parent` forks it with a single allocation and child
+/// subtrees share ancestors without copying. Used for cycle detection on the
+/// *speculative* path (see [`RequestState::speculative`] / [`RequestState::track_dep`]).
+struct Crumb {
+    addr: Addr,
+    parent: Option<Arc<Crumb>>,
+}
+
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
 pub struct RequestState {
     pub data: Arc<RequestStateData>,
@@ -227,6 +236,21 @@ pub struct RequestState {
     pub parent: Option<Addr>,
     /// Provider names excluded from query iteration for this request subtree.
     pub skip_providers: Arc<HashSet<String>>,
+    /// The ancestor chain of this invocation (parent first), mirroring the
+    /// `with_parent` stack. Always maintained so a [`speculative`] fork can seed
+    /// its cycle check from the real ancestors at the fork point.
+    ///
+    /// [`speculative`]: RequestState::speculative
+    crumbs: Option<Arc<Crumb>>,
+    /// When `true`, this subtree is a *speculative* inspection — a query
+    /// resolving a candidate's spec/def only to evaluate its matcher, not as a
+    /// real dependency. [`track_dep`] then checks the breadcrumb for ancestor
+    /// reentry (so the query can skip cycle-inducing candidates) but does **not**
+    /// commit edges to the shared [`DepDag`], which would otherwise retain a
+    /// phantom dependency and close a false cycle later.
+    ///
+    /// [`track_dep`]: RequestState::track_dep
+    speculative: bool,
 }
 
 impl RequestState {
@@ -330,10 +354,16 @@ impl RequestState {
 
     /// Returns a child RequestState sharing the same data but with a new parent.
     pub fn with_parent(&self, parent: Addr) -> Arc<RequestState> {
+        let crumbs = Some(Arc::new(Crumb {
+            addr: parent.clone(),
+            parent: self.crumbs.clone(),
+        }));
         Arc::new(RequestState {
             data: Arc::clone(&self.data),
             parent: Some(parent),
             skip_providers: Arc::clone(&self.skip_providers),
+            crumbs,
+            speculative: self.speculative,
         })
     }
 
@@ -345,7 +375,56 @@ impl RequestState {
             data: Arc::clone(&self.data),
             parent: self.parent.clone(),
             skip_providers: Arc::new(set),
+            crumbs: self.crumbs.clone(),
+            speculative: self.speculative,
         })
+    }
+
+    /// Forks this state into a *speculative* inspection subtree: same ancestors
+    /// and parent, but resolutions under it check the breadcrumb for cycles
+    /// instead of recording edges into the shared [`DepDag`]. Used by query
+    /// matching, which `get_spec`/`get_def`s candidates only to evaluate the
+    /// matcher — a non-matching candidate must leave no trace, or its phantom
+    /// edge would later close a false cycle (see [`track_dep`]).
+    ///
+    /// [`track_dep`]: RequestState::track_dep
+    pub fn speculative(&self) -> Arc<RequestState> {
+        Arc::new(RequestState {
+            data: Arc::clone(&self.data),
+            parent: self.parent.clone(),
+            skip_providers: Arc::clone(&self.skip_providers),
+            crumbs: self.crumbs.clone(),
+            speculative: true,
+        })
+    }
+
+    /// Record that the current `parent` depends on `addr`, returning a
+    /// [`CycleError`] if that closes a cycle.
+    ///
+    /// Real (non-speculative) resolution commits `parent → addr` to the shared
+    /// [`DepDag`] — the always-on graph that catches cross-task cycles before the
+    /// memoizer would deadlock. A speculative inspection instead walks the
+    /// breadcrumb chain: if `addr` is already an ancestor it's a cycle (skip the
+    /// candidate), otherwise it proceeds without touching the shared graph, so a
+    /// rejected candidate never pollutes it.
+    pub fn track_dep(&self, addr: &Addr) -> Result<(), CycleError> {
+        if self.speculative {
+            let mut cur = self.crumbs.as_deref();
+            while let Some(crumb) = cur {
+                if crumb.addr == *addr {
+                    return Err(CycleError {
+                        from: crumb.addr.clone(),
+                        to: addr.clone(),
+                    });
+                }
+                cur = crumb.parent.as_deref();
+            }
+            Ok(())
+        } else if let Some(parent) = &self.parent {
+            self.data.dep_dag.lock().add_dep(parent, addr)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -424,6 +503,8 @@ impl Engine {
             data: Arc::clone(&data),
             parent: None,
             skip_providers: Arc::new(HashSet::new()),
+            crumbs: None,
+            speculative: false,
         });
 
         if let Ok(mut requests) = self.requests.lock() {
