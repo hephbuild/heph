@@ -67,6 +67,29 @@ pub struct RemoteCacheDef {
     pub concurrency: usize,
 }
 
+impl RemoteCacheDef {
+    /// Coarse backend kind from the URI scheme — `s3`, `gcs`, `azure`, `http`,
+    /// `file`, `memory`, or `other`. The bucket/host/path is dropped, so this is
+    /// non-PII and safe to report in telemetry.
+    pub fn backend_kind(&self) -> &'static str {
+        let scheme = self
+            .uri
+            .split("://")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match scheme.as_str() {
+            "s3" | "s3a" => "s3",
+            "gs" => "gcs",
+            "az" | "adl" | "azure" | "abfs" | "abfss" => "azure",
+            "http" | "https" => "http",
+            "file" => "file",
+            "memory" => "memory",
+            _ => "other",
+        }
+    }
+}
+
 /// A configured cache: its definition plus the constructed backend.
 struct ConfiguredCache {
     def: RemoteCacheDef,
@@ -680,6 +703,19 @@ mod tests {
             def("y", "memory:///CHANGED", true, false),
         ];
         assert_ne!(config_hash(&a), config_hash(&c), "uri change must matter");
+    }
+
+    #[test]
+    fn backend_kind_maps_scheme() {
+        let k = |uri: &str| def("c", uri, true, true).backend_kind();
+        assert_eq!(k("s3://bucket/p"), "s3");
+        assert_eq!(k("s3a://bucket/p"), "s3");
+        assert_eq!(k("gs://bucket/p"), "gcs");
+        assert_eq!(k("abfs://c@acct.dfs.core.windows.net/p"), "azure");
+        assert_eq!(k("https://example.com/cache"), "http");
+        assert_eq!(k("file:///tmp/c"), "file");
+        assert_eq!(k("memory:///x"), "memory");
+        assert_eq!(k("weird:///x"), "other");
     }
 
     #[tokio::test]

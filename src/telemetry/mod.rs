@@ -76,23 +76,35 @@ pub fn snapshot() -> TelemetrySnapshot {
 struct Plugins {
     providers: Vec<String>,
     drivers: Vec<String>,
-    remote_caches: usize,
+    remote_cache_count: usize,
+    /// Distinct remote cache backend kinds (`s3`, `gcs`, `azure`, `http`,
+    /// `file`, `memory`, `other`) — scheme only, never the URI.
+    remote_cache_backends: Vec<String>,
 }
 
 /// Set once, at engine construction. Read by the reporter at exit.
 static PLUGINS: std::sync::OnceLock<Plugins> = std::sync::OnceLock::new();
 
-/// Record the enabled provider + driver names and the number of configured
-/// remote caches. First write wins (a process builds at most one engine for the
+/// Record the enabled provider + driver names plus the remote cache backend
+/// kinds (one entry per configured cache; the count and the distinct set are
+/// derived here). First write wins (a process builds at most one engine for the
 /// command it runs); later calls are ignored.
-pub fn record_plugins(mut providers: Vec<String>, mut drivers: Vec<String>, remote_caches: usize) {
+pub fn record_plugins(
+    mut providers: Vec<String>,
+    mut drivers: Vec<String>,
+    mut remote_cache_backends: Vec<String>,
+) {
     providers.sort();
     drivers.sort();
+    let remote_cache_count = remote_cache_backends.len();
+    remote_cache_backends.sort();
+    remote_cache_backends.dedup();
     // Best-effort set-once; a second engine in one process keeps the first set.
     drop(PLUGINS.set(Plugins {
         providers,
         drivers,
-        remote_caches,
+        remote_cache_count,
+        remote_cache_backends,
     }));
 }
 
@@ -364,8 +376,13 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     // Enabled plugins (built-ins + config), as queryable arrays of type names.
     put("providers", plugins.providers.into());
     put("drivers", plugins.drivers.into());
-    // How many remote (shared) caches are configured. Count only — never URIs.
-    put("remote_cache_count", plugins.remote_caches.into());
+    // Remote (shared) cache shape: how many are configured and which backend
+    // kinds they use (scheme only — never URIs).
+    put("remote_cache_count", plugins.remote_cache_count.into());
+    put(
+        "remote_cache_backends",
+        plugins.remote_cache_backends.into(),
+    );
 
     let dir = config_dir()?;
     let event = SpooledEvent {

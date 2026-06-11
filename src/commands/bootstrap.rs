@@ -159,8 +159,11 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         })
         .collect();
     // Captured before `remote_caches` is moved into `Config` below; reported via
-    // telemetry (count only — never the URIs).
-    let remote_cache_count = remote_caches.len();
+    // telemetry (backend kind/scheme only — never the URIs).
+    let remote_cache_backends: Vec<String> = remote_caches
+        .iter()
+        .map(|d| d.backend_kind().to_string())
+        .collect();
 
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
@@ -237,7 +240,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     crate::telemetry::record_plugins(
         engine.providers_by_name.keys().cloned().collect(),
         engine.drivers_by_name.keys().cloned().collect(),
-        remote_cache_count,
+        remote_cache_backends,
     );
 
     let (tx, rx) = mpsc::unbounded_channel();
