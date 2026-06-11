@@ -1,5 +1,4 @@
 use anyhow::Context as _;
-pub use heph::engine::LockBackend;
 use heph::engine::driver::Driver as SDKDriver;
 use heph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use heph::engine::provider::Provider as SDKProvider;
@@ -17,7 +16,6 @@ pub struct WorkspaceBuilder {
     dir: TempDir,
     parallelism: Option<usize>,
     fs_skip: Vec<String>,
-    lock_backend: LockBackend,
     setups: Vec<SetupFn>,
 }
 
@@ -27,7 +25,6 @@ impl WorkspaceBuilder {
             dir: tempfile::tempdir().context("create workspace tempdir")?,
             parallelism: None,
             fs_skip: vec![],
-            lock_backend: LockBackend::default(),
             setups: vec![],
         })
     }
@@ -37,15 +34,8 @@ impl WorkspaceBuilder {
             dir,
             parallelism: None,
             fs_skip: vec![],
-            lock_backend: LockBackend::default(),
             setups: vec![],
         }
-    }
-
-    /// Mirrors the config file's `lock: { backend: ... }`. Defaults to `Fs`.
-    pub fn with_lock_backend(mut self, backend: LockBackend) -> Self {
-        self.lock_backend = backend;
-        self
     }
 
     pub fn with_parallelism(mut self, p: usize) -> Self {
@@ -89,7 +79,6 @@ impl WorkspaceBuilder {
             home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
             fs_skip: self.fs_skip,
-            lock_backend: self.lock_backend,
             ..Default::default()
         })?;
         for setup in self.setups {

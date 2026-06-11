@@ -72,7 +72,7 @@ pub fn make_workspace_go_first(
     dir: TempDir,
     foreign_name_guard: bool,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, true, foreign_name_guard, &[], LockBackend::Fs)
+    make_workspace_ordered(dir, true, foreign_name_guard, &[])
 }
 
 fn make_workspace_ordered(
@@ -80,13 +80,10 @@ fn make_workspace_ordered(
     go_first: bool,
     foreign_name_guard: bool,
     fs_skip: &[&str],
-    lock_backend: LockBackend,
 ) -> anyhow::Result<Workspace> {
     let go_bin = go_bin_path();
     // `fs` is auto-registered by `Engine::new`.
-    let mut b = WorkspaceBuilder::from_dir(dir)
-        .with_fs_skip(fs_skip.iter().copied())
-        .with_lock_backend(lock_backend);
+    let mut b = WorkspaceBuilder::from_dir(dir).with_fs_skip(fs_skip.iter().copied());
 
     if go_first {
         b = b.with_provider(move |init| {

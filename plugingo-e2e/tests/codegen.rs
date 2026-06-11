@@ -183,16 +183,17 @@ async fn test_codegen_into_skipped_subtree_repro() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Repro of content_buddy's false-cycle `heph3 r build ./go` (with codegen
-// labelled `go_src`): building the whole graph concurrently trips a FALSE
-// `build_lib -> _golist` self-package cycle. A shared library imported by two
-// binaries has its `build_lib` in-flight while a sibling package's
-// `q@label=go_src,package_prefix=<root>` query (run for its `_golist`)
-// `get_spec`s that same in-flight `build_lib`, closing a cycle on the request
-// DAG. Building the shared lib's `build_lib` directly never overlaps that way
-// and succeeds (see `test_codegencycle_single_target_builds`) — so this is a
-// product bug, not a real cycle in the graph.
-#[ignore = "reproduces open product bug: whole-graph build trips a false build_lib -> _golist cycle"]
+// Regression for content_buddy's false-cycle `heph3 r build ./go` (with codegen
+// labelled `go_src`): building the whole graph concurrently must NOT trip a false
+// cycle. A shared library imported by two binaries has its `build_lib` in-flight
+// while a sibling package's `q@label=go_src,package_prefix=<root>` query (run for
+// its `_golist`) `get_spec`s candidate targets to evaluate the matcher. A
+// rejected candidate (e.g. a `build`-labelled dist target) must leave no edge in
+// the request DAG — otherwise that phantom edge closes a false cycle. Fixed by
+// resolving query candidates on a *speculative* request state
+// (`RequestState::speculative`) that checks the breadcrumb chain for reentry but
+// records no DAG edges. Building the lib directly always worked (see
+// `test_codegencycle_single_target_builds`), confirming the cycle was spurious.
 #[tokio::test]
 async fn test_codegencycle_whole_graph_build() -> anyhow::Result<()> {
     use heph::htmatcher::Matcher;

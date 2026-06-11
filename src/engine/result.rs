@@ -129,8 +129,13 @@ impl ProviderExecutor for EngineProviderExecutor {
                             MatchResult::MatchYes => result.push(addr),
                             MatchResult::MatchNo => {}
                             MatchResult::MatchShrug => {
+                                // Resolve the candidate's spec/def only to evaluate the
+                                // matcher — a speculative inspection, not a dependency. Use a
+                                // speculative rs so a rejected candidate leaves no edge in the
+                                // shared dep DAG (an edge would close a false cycle later).
+                                let spec_rs = rs.speculative();
                                 let spec = match Arc::clone(&engine)
-                                    .get_spec(rs.clone(), &addr)
+                                    .get_spec(spec_rs.clone(), &addr)
                                     .await
                                 {
                                     Ok(spec) => Ok(spec),
@@ -153,8 +158,9 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     MatchResult::MatchYes => result.push(addr),
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
-                                        let def_res =
-                                            Arc::clone(&engine).get_def(rs.clone(), &addr).await;
+                                        let def_res = Arc::clone(&engine)
+                                            .get_def(spec_rs.clone(), &addr)
+                                            .await;
                                         let def = match def_res {
                                             Ok(def) => def,
                                             // Same as the get_spec branch: cycle means this
@@ -562,10 +568,7 @@ impl Engine {
 
         // Cycle check: fires for every caller (including those awaiting an in-flight future)
         // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
-        if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock();
-            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
-        }
+        rs.track_dep(addr).map_err(anyhow::Error::new)?;
 
         // Set addr as parent so all sub-calls carry the right context for cycle detection.
         // Done outside the memoizer so context setup isn't buried in the deduplication boundary.
@@ -1670,10 +1673,7 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
-        if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock();
-            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
-        }
+        rs.track_dep(addr).map_err(anyhow::Error::new)?;
         let rs = rs.with_parent(addr.clone());
         self.get_def_no_track(rs, addr).await
     }
@@ -1700,10 +1700,7 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
-        if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock();
-            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
-        }
+        rs.track_dep(addr).map_err(anyhow::Error::new)?;
         let rs = rs.with_parent(addr.clone());
         self.get_def_inner(rs, addr, false)
             .await
@@ -1872,10 +1869,7 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<EngineTargetSpec>> {
-        if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock();
-            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
-        }
+        rs.track_dep(addr).map_err(anyhow::Error::new)?;
         let rs = rs.with_parent(addr.clone());
         self.get_spec_no_track(rs, addr).await
     }
