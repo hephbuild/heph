@@ -320,6 +320,7 @@ impl HeaderItem {
 /// breakdown — e.g. remote read/write once their events land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Op {
+    RemoteCacheRead,
     Execute,
     LocalCacheWrite,
     RemoteCacheWrite,
@@ -328,21 +329,24 @@ enum Op {
 impl Op {
     /// Single glyph shown before the op's elapsed time. Must stay **BMP
     /// single-width** (plain-text rows; a double-width glyph would clip). Remote
-    /// ops use `↑`/`↓` (U+2191/2193), never the emoji `⬆`/`⬇`.
+    /// ops use `↓`/`↑` (U+2193/2191), never the emoji `⬇`/`⬆`.
     fn icon(self) -> char {
         match self {
+            Op::RemoteCacheRead => '↓',
             Op::Execute => '▶',
             Op::LocalCacheWrite => '⊕',
             Op::RemoteCacheWrite => '↑',
         }
     }
 
-    /// Pipeline ordinal for stable left-to-right ordering of the breakdown.
+    /// Pipeline ordinal for stable left-to-right ordering of the breakdown:
+    /// remote download → execute → local-cache write → remote upload.
     fn order(self) -> u8 {
         match self {
-            Op::Execute => 0,
-            Op::LocalCacheWrite => 1,
-            Op::RemoteCacheWrite => 2,
+            Op::RemoteCacheRead => 0,
+            Op::Execute => 1,
+            Op::LocalCacheWrite => 2,
+            Op::RemoteCacheWrite => 3,
         }
     }
 }
@@ -389,6 +393,12 @@ fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
         }
         BuildEventKind::RemoteCacheWriteEnd { addr, .. } => {
             Some((addr, Op::RemoteCacheWrite, Boundary::End))
+        }
+        BuildEventKind::RemoteCacheReadStart { addr } => {
+            Some((addr, Op::RemoteCacheRead, Boundary::Start))
+        }
+        BuildEventKind::RemoteCacheReadEnd { addr, .. } => {
+            Some((addr, Op::RemoteCacheRead, Boundary::End))
         }
         _ => None,
     }
@@ -546,7 +556,8 @@ impl BuildState {
             // Read/Write markers are not aggregated into counters. The local
             // cache-write span is folded into the op timeline above, so the
             // counter match ignores it here.
-            BuildEventKind::RemoteCacheRead { .. }
+            BuildEventKind::RemoteCacheReadStart { .. }
+            | BuildEventKind::RemoteCacheReadEnd { .. }
             | BuildEventKind::RemoteCacheWriteStart { .. }
             | BuildEventKind::RemoteCacheWriteEnd { .. }
             | BuildEventKind::LocalCacheWriteStart { .. }

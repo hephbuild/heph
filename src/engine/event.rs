@@ -81,15 +81,22 @@ pub enum BuildEventKind {
     ResultLockWaitEnd {
         addr: String,
     },
-    // Defined for the future process-split / remote cache work; NOT emitted yet.
-    RemoteCacheRead {
-        addr: String,
-    },
     RemoteCacheHit {
         addr: String,
     },
     RemoteCacheMiss {
         addr: String,
+    },
+    /// Start of pulling a target's revision from the remote cache(s) into the
+    /// local cache (one span per target, covering all of its blobs from the one
+    /// cache that had the manifest). Surfaced as one `↓` op in the per-target
+    /// timeline, marked slow if it runs long. Paired with `RemoteCacheReadEnd`.
+    RemoteCacheReadStart {
+        addr: String,
+    },
+    RemoteCacheReadEnd {
+        addr: String,
+        error: Option<String>,
     },
     /// Start of pushing a target's artifacts to the remote cache(s). Runs on a
     /// background task after the build's critical path, so it appears in the

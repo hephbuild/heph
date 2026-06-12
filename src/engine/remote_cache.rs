@@ -221,8 +221,13 @@ impl RemoteCacheSet {
         self.caches.is_empty()
     }
 
-    fn has_writable(&self) -> bool {
+    pub(crate) fn has_writable(&self) -> bool {
         self.caches.iter().any(|c| c.def.write)
+    }
+
+    /// Whether any cache is readable — the gate for the download/read path.
+    pub(crate) fn has_readable(&self) -> bool {
+        self.caches.iter().any(|c| c.def.read)
     }
 
     /// Object key for a cached blob, namespaced by a stable hash of the target
@@ -411,7 +416,7 @@ impl RemoteCacheSet {
         hashin: &str,
         dest_dir: &Path,
     ) -> anyhow::Result<Option<FetchedRevision>> {
-        if self.caches.is_empty() {
+        if !self.has_readable() {
             return Ok(None);
         }
         let manifest_key = Self::key(addr, hashin, MANIFEST_V1);
@@ -718,7 +723,7 @@ impl Engine {
         addr: &Addr,
         hashin: &str,
     ) -> anyhow::Result<Option<Manifest>> {
-        if self.remote_caches.is_empty() {
+        if !self.remote_caches.has_readable() {
             return Ok(None);
         }
 

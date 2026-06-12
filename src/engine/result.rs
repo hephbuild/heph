@@ -1163,10 +1163,29 @@ impl Engine {
                 // executing. Safe to write local blobs here — the write lock
                 // excludes GC and other writers. A remote hit means "already
                 // built": skip execution and share the now-local entry.
-                match self
-                    .download_from_remote(ctoken, addr, opts.hashin.as_str())
+                //
+                // Bracket the pull with one `RemoteCacheRead` span per target
+                // (only when a readable cache exists) so a slow download shows as
+                // a single `↓` op in the per-target timeline — never one per
+                // blob/cache.
+                let downloaded = if self.remote_caches.has_readable() {
+                    let addr_s = addr.format();
+                    crate::engine::event::emit_scope(
+                        &rs,
+                        crate::engine::event::BuildEventKind::RemoteCacheReadStart {
+                            addr: addr_s.clone(),
+                        },
+                        move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
+                            addr: addr_s,
+                            error,
+                        },
+                        self.download_from_remote(ctoken, addr, opts.hashin.as_str()),
+                    )
                     .await?
-                {
+                } else {
+                    None
+                };
+                match downloaded {
                     Some(manifest) => (None, Some(Arc::new(manifest))),
                     None => {
                         let (cached, meta) = self
