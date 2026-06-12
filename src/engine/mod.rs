@@ -3,14 +3,15 @@
     reason = "module and struct share name by design"
 )]
 pub mod engine;
-pub use engine::Config;
-pub use engine::DEFAULT_SPILL_THRESHOLD_BYTES;
 pub use engine::Engine;
 pub use engine::EngineFuse;
-pub use engine::MemCacheOptions;
 pub use engine::PluginInit;
-pub mod config_file;
-pub use config_file::{FuseConfig, FuseMode};
+pub mod config;
+pub use config::Config;
+pub use config::DEFAULT_SPILL_THRESHOLD_BYTES;
+pub use config::MemCacheOptions;
+pub mod config_yaml;
+pub use config_yaml::{FuseConfig, FuseMode};
 mod cwd;
 mod result;
 pub use cwd::get_cwd;

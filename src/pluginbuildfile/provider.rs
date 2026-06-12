@@ -103,15 +103,15 @@ impl Provider {
         root: std::path::PathBuf,
         skip_dirs: &[std::path::PathBuf],
         skip_globs: &[String],
-        opts: &crate::engine::config_file::Options,
+        opts: &crate::engine::config_yaml::Options,
     ) -> anyhow::Result<Self> {
-        crate::engine::config_file::deny_unknown(
+        crate::engine::config_yaml::deny_unknown(
             "buildfile provider",
             opts,
             &["patterns", "skip", "defaultDriver"],
         )?;
         let patterns: Vec<String> =
-            crate::engine::config_file::decode_opt(opts, "buildfile provider", "patterns")?
+            crate::engine::config_yaml::decode_opt(opts, "buildfile provider", "patterns")?
                 .unwrap_or_else(|| vec!["BUILD".to_string()]);
         let compiled = patterns
             .into_iter()
@@ -123,12 +123,12 @@ impl Provider {
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
         let user_skip: Vec<String> =
-            crate::engine::config_file::decode_opt(opts, "buildfile provider", "skip")?
+            crate::engine::config_yaml::decode_opt(opts, "buildfile provider", "skip")?
                 .unwrap_or_default();
         globs.extend(user_skip);
         let skip = Ignore::new(skip_dirs, &globs)?;
         let default_driver: Option<String> =
-            crate::engine::config_file::decode_opt(opts, "buildfile provider", "defaultDriver")?;
+            crate::engine::config_yaml::decode_opt(opts, "buildfile provider", "defaultDriver")?;
         Ok(Self {
             root,
             build_file_patterns: compiled,
@@ -355,7 +355,7 @@ impl EProvider for Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::config_file::Options;
+    use crate::engine::config_yaml::Options;
     use crate::hasync::StdCancellationToken;
     use std::fs;
     use tempfile::tempdir;

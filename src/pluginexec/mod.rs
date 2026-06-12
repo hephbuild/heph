@@ -267,21 +267,21 @@ impl Driver {
         }
     }
 
-    pub fn from_options_exec(opts: &crate::engine::config_file::Options) -> anyhow::Result<Self> {
+    pub fn from_options_exec(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
             ..Self::new_exec()
         })
     }
 
-    pub fn from_options_bash(opts: &crate::engine::config_file::Options) -> anyhow::Result<Self> {
+    pub fn from_options_bash(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
             ..Self::new_bash()
         })
     }
 
-    pub fn from_options_sh(opts: &crate::engine::config_file::Options) -> anyhow::Result<Self> {
+    pub fn from_options_sh(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
             ..Self::new_sh()
@@ -309,10 +309,10 @@ fn spec_path_to_target_path(raw: &str, pkg: &crate::htpkg::PkgBuf, codegen: &Cod
     }
 }
 
-fn decode_path(opts: &crate::engine::config_file::Options) -> anyhow::Result<Vec<String>> {
-    crate::engine::config_file::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
+fn decode_path(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Vec<String>> {
+    crate::engine::config_yaml::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
     Ok(
-        crate::engine::config_file::decode_opt(opts, "exec/bash/sh driver", "path")?
+        crate::engine::config_yaml::decode_opt(opts, "exec/bash/sh driver", "path")?
             .unwrap_or_default(),
     )
 }
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[test]
     fn from_options_sh_no_path() {
-        let opts = crate::engine::config_file::Options::new();
+        let opts = crate::engine::config_yaml::Options::new();
         let d = Driver::from_options_sh(&opts).expect("from_options");
         assert_eq!(d.name, "sh");
         assert!(d.search_path.is_empty());
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[test]
     fn from_options_exec_no_path() {
-        let opts = crate::engine::config_file::Options::new();
+        let opts = crate::engine::config_yaml::Options::new();
         let d = Driver::from_options_exec(&opts).expect("from_options");
         assert_eq!(d.name, "exec");
         assert!(d.search_path.is_empty());
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn from_options_exec_reads_path() {
-        let mut opts = crate::engine::config_file::Options::new();
+        let mut opts = crate::engine::config_yaml::Options::new();
         opts.insert(
             "path".to_string(),
             serde_yaml::from_str("[/usr/bin, /bin]").expect("yaml"),
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn from_options_bash_rejects_unknown_key() {
-        let mut opts = crate::engine::config_file::Options::new();
+        let mut opts = crate::engine::config_yaml::Options::new();
         opts.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
         let err = Driver::from_options_bash(&opts).err().expect("must error");
         assert!(err.to_string().contains("bogus"), "{err}");

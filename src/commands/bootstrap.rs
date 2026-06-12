@@ -6,7 +6,7 @@ use anyhow::Context;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
-use crate::engine::config_file;
+use crate::engine::config_yaml;
 use crate::{
     engine, pluginbuildfile, pluginexec, plugingo, pluginhostbin, pluginnix, plugintextfile,
 };
@@ -91,7 +91,7 @@ pub fn telemetry_enabled_from_config() -> bool {
     let Ok(root) = engine::get_root() else {
         return true;
     };
-    config_file::load_from_root(&root)
+    config_yaml::load_from_root(&root)
         .map(|f| f.telemetry_enabled())
         .unwrap_or(true)
 }
@@ -102,82 +102,22 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         Err(inner) => anyhow::bail!("Error: {}", inner),
     };
 
-    let file = config_file::load_from_root(&root)?;
+    // The config file is the all-optional, profile-layered YAML; `resolve`
+    // applies every default in one place and yields the engine's runtime config.
+    let file = config_yaml::load_from_root(&root)?;
+    let config = file.resolve(&root)?;
 
-    let home_dir = file
-        .home_dir
-        .as_ref()
-        .map(|p| root.join(p))
-        .unwrap_or_else(|| root.join(".heph3"));
-
-    let mem_cache = file
-        .mem_cache
-        .map(|c| engine::MemCacheOptions {
-            per_entry_bytes: c.per_entry_bytes,
-            capacity_bytes: c.capacity_bytes,
-        })
-        .unwrap_or_default();
-
-    let tmp_cache = file
-        .tmp_cache
-        .map(|c| engine::MemCacheOptions {
-            per_entry_bytes: c.per_entry_bytes,
-            capacity_bytes: c.capacity_bytes,
-        })
-        .unwrap_or_else(engine::MemCacheOptions::default_tmp);
-
-    let fuse = file.fuse.unwrap_or_default();
-
-    let spill_threshold_bytes = file
-        .cache
-        .and_then(|c| c.spill_threshold_bytes)
-        .unwrap_or(engine::DEFAULT_SPILL_THRESHOLD_BYTES);
-
-    // Read before the struct literal below moves `file.fs`.
-    let telemetry_enabled = file.telemetry_enabled();
-
-    let lock_backend = file
-        .lock
-        .and_then(|l| l.backend)
-        .map(|b| match b {
-            config_file::LockBackendConfig::Fs => engine::LockBackend::Fs,
-            config_file::LockBackendConfig::Mem => engine::LockBackend::Mem,
-        })
-        .unwrap_or_default();
-
-    // `caches:` is a name→config map; flatten into ordered defs (BTreeMap keeps
-    // a stable, name-sorted order). The engine measures latency to reorder reads.
-    let remote_caches: Vec<engine::RemoteCacheDef> = file
-        .caches
-        .iter()
-        .map(|(name, c)| engine::RemoteCacheDef {
-            name: name.clone(),
-            uri: c.uri.clone(),
-            read: c.read,
-            write: c.write,
-            concurrency: c.concurrency,
-        })
-        .collect();
-    // Captured before `remote_caches` is moved into `Config` below; reported via
-    // telemetry (backend kind/scheme only — never the URIs).
-    let remote_cache_backends: Vec<String> = remote_caches
+    // Captured before `config` is moved into the engine: the nix driver's state
+    // dir hangs off `home_dir`, and telemetry reports the remote-cache backend
+    // kinds (scheme only — never the URIs).
+    let home_dir = config.home_dir.clone();
+    let remote_cache_backends: Vec<String> = config
+        .remote_caches
         .iter()
         .map(|d| d.backend_kind().to_string())
         .collect();
 
-    let mut e = engine::Engine::new(engine::Config {
-        root: root.clone(),
-        home_dir: home_dir.clone(),
-        fs_skip: file.fs.map(|f| f.skip).unwrap_or_default(),
-        parallelism: None,
-        mem_cache,
-        tmp_cache,
-        fuse,
-        lock_backend,
-        spill_threshold_bytes,
-        telemetry_enabled,
-        remote_caches,
-    })?;
+    let mut e = engine::Engine::new(config)?;
 
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
     // engine's own skip dirs. The remaining built-ins have no config.
@@ -218,15 +158,15 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
     })?;
     e.register_managed_driver_factory("go_golist", |_init, opts| {
-        config_file::deny_unknown("go_golist driver", opts, &[])?;
+        config_yaml::deny_unknown("go_golist driver", opts, &[])?;
         Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
     })?;
     e.register_managed_driver_factory("go_embed", |_init, opts| {
-        config_file::deny_unknown("go_embed driver", opts, &[])?;
+        config_yaml::deny_unknown("go_embed driver", opts, &[])?;
         Ok(Box::new(plugingo::GoEmbedDriver))
     })?;
     e.register_managed_driver_factory("go_testmain", |_init, opts| {
-        config_file::deny_unknown("go_testmain driver", opts, &[])?;
+        config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
         Ok(Box::new(plugingo::GoTestmainDriver))
     })?;
 
@@ -300,7 +240,7 @@ mod tests {
     use super::*;
 
     fn build_engine_from_yaml(yaml: &str) -> anyhow::Result<(tempfile::TempDir, engine::Engine)> {
-        let file: config_file::ConfigFile = serde_yaml::from_str(yaml)?;
+        let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml)?;
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
         let home_dir = file

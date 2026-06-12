@@ -1,7 +1,7 @@
 use crate::engine::Engine;
 #[cfg(test)]
-use crate::engine::config_file::FuseEnabled;
-use crate::engine::config_file::{FuseConfig, FuseMode};
+use crate::engine::config_yaml::FuseEnabled;
+use crate::engine::config_yaml::{FuseConfig, FuseMode};
 use crate::engine::driver::inputartifact;
 use crate::engine::driver::outputartifact::Content::TarPath;
 use crate::engine::driver::targetdef::path::{self, Content};
