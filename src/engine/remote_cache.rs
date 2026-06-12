@@ -10,11 +10,18 @@
 //!   cache whose manifest is present serves the *whole* revision: every blob is
 //!   pulled from that same cache, never spliced across caches.
 //!
-//! **Streaming.** No blob is ever held whole in memory. Each blob moves through
-//! a temp file: on upload the engine gzip-compresses the local blob into a temp
-//! file (synchronous, on the cache thread) and the set streams that file to the
+//! **Separate manifest.** The remote uses its own [`RemoteManifest`], distinct
+//! from the local [`Manifest`], so the two layers can store artifacts
+//! differently. Each remote artifact records its `encoding` (`Gzip` or `None`):
+//! artifacts worth compressing are gzipped, small ones are stored verbatim (see
+//! [`compression_for`]). The engine converts remote↔local on upload/download;
+//! the local manifest always describes decoded bytes.
+//!
+//! **Streaming.** No blob is ever held whole in memory. Each blob moves through a
+//! temp file: on upload the engine encodes the local blob into a temp file
+//! (synchronous, on the cache thread) and the set streams that file to the
 //! backend via object_store multipart; on download the set streams the backend
-//! object into a temp file and the engine gunzips it into the local cache. The
+//! object into a temp file and the engine decodes it into the local cache. The
 //! async path only ever touches `Send` temp files and backend streams, so the
 //! synchronous (and partly non-`Send`) local-cache I/O never crosses an `await`.
 //!
@@ -24,13 +31,18 @@
 //! critical path doesn't wait on the network.
 
 use crate::engine::Engine;
-use crate::engine::local_cache::{MANIFEST_V1, Manifest};
+use crate::engine::local_cache::{
+    MANIFEST_V1, Manifest, ManifestArtifact, ManifestArtifactContentType, ManifestArtifactEncoding,
+    ManifestArtifactType,
+};
 use crate::engine::remote_cache_latency::{UNREACHABLE, load_order, store_order};
 use crate::engine::remote_cache_objstore::ObjStoreBackend;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use anyhow::Context;
 use async_trait::async_trait;
+use borsh::{BorshDeserialize, BorshSerialize};
+use chrono::Utc;
 use futures::future::join_all;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -161,12 +173,61 @@ pub struct CacheLatency {
     pub latency: Option<Duration>,
 }
 
-/// A revision fetched from one remote cache: the manifest plus the local temp
-/// files (still gzip-compressed) each blob was streamed into.
+/// The remote cache's own manifest — deliberately distinct from the local
+/// [`Manifest`]. The remote layer may store an artifact's bytes differently from
+/// the local cache (gzip-compressed, or not, decided per artifact), so each
+/// entry records its on-remote [`encoding`](RemoteManifestArtifact::encoding).
+/// The local manifest always describes *decoded* bytes; the engine converts
+/// between the two on upload/download.
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub(crate) struct RemoteManifest {
+    pub version: String,
+    pub target: String,
+    pub hashin: String,
+    pub artifacts: Vec<RemoteManifestArtifact>,
+}
+
+/// One artifact as stored on the remote, including how its bytes are encoded.
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub(crate) struct RemoteManifestArtifact {
+    pub hashout: String,
+    pub group: String,
+    pub name: String,
+    /// Decoded (local) byte size — what the artifact unpacks to.
+    pub size: u64,
+    pub r#type: ManifestArtifactType,
+    pub content_type: ManifestArtifactContentType,
+    /// How this artifact's object is stored on the remote (`None` or `Gzip`).
+    pub encoding: ManifestArtifactEncoding,
+}
+
+/// Remote manifest format version — independent of the local manifest's, so the
+/// two can evolve separately.
+const REMOTE_MANIFEST_VERSION: &str = "remote-1.0.0";
+
+/// Below this size, gzip overhead isn't worth it (tiny artifacts barely shrink,
+/// and the header/footer can make them *grow*), so they're stored uncompressed.
+/// The decision is recorded per artifact in the remote manifest, so this policy
+/// can change without invalidating existing entries.
+const MIN_COMPRESS_BYTES: u64 = 1024;
+
+/// Whether an artifact of `size` decoded bytes is worth compressing for the
+/// remote. Per-artifact so "some artifacts aren't worth compressing" is a policy
+/// knob, not a global on/off.
+fn compression_for(size: u64) -> ManifestArtifactEncoding {
+    if size >= MIN_COMPRESS_BYTES {
+        ManifestArtifactEncoding::Gzip
+    } else {
+        ManifestArtifactEncoding::None
+    }
+}
+
+/// A revision fetched from one remote cache: the remote manifest plus the local
+/// temp files each blob was streamed into (still in their on-remote encoding —
+/// the engine decodes them per [`RemoteManifestArtifact::encoding`]).
 pub(crate) struct FetchedRevision {
-    pub manifest: Manifest,
-    pub manifest_bytes: Vec<u8>,
-    /// `(artifact name, temp file holding its compressed bytes)`.
+    pub manifest: RemoteManifest,
+    /// `(artifact name, temp file holding its on-remote bytes)`.
     pub blobs: Vec<(String, PathBuf)>,
 }
 
@@ -450,7 +511,7 @@ impl RemoteCacheSet {
         let Some((cache_idx, manifest_bytes)) = found else {
             return Ok(None);
         };
-        let manifest = match borsh::from_slice::<Manifest>(&manifest_bytes) {
+        let manifest = match borsh::from_slice::<RemoteManifest>(&manifest_bytes) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = ?e, %addr, "deserialize remote manifest; treating as miss");
@@ -506,11 +567,7 @@ impl RemoteCacheSet {
         }
 
         cache.note_ok();
-        Ok(Some(FetchedRevision {
-            manifest,
-            manifest_bytes,
-            blobs,
-        }))
+        Ok(Some(FetchedRevision { manifest, blobs }))
     }
 }
 
@@ -573,6 +630,22 @@ fn gunzip_from_file(src: &Path, mut writer: impl std::io::Write) -> anyhow::Resu
     let file = std::fs::File::open(src).with_context(|| format!("open temp {}", src.display()))?;
     let mut dec = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
     std::io::copy(&mut dec, &mut writer).context("gunzip copy")?;
+    Ok(())
+}
+
+/// Copy `reader` verbatim into a new file at `dest` (the uncompressed path).
+fn copy_to_file(mut reader: impl std::io::Read, dest: &Path) -> anyhow::Result<()> {
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("create temp {}", dest.display()))?;
+    std::io::copy(&mut reader, &mut file).context("copy")?;
+    Ok(())
+}
+
+/// Copy the file at `src` verbatim into `writer` (the uncompressed path).
+fn copy_file_to(src: &Path, mut writer: impl std::io::Write) -> anyhow::Result<()> {
+    let mut file =
+        std::fs::File::open(src).with_context(|| format!("open temp {}", src.display()))?;
+    std::io::copy(&mut file, &mut writer).context("copy")?;
     Ok(())
 }
 
@@ -668,42 +741,77 @@ impl Engine {
         let Some(manifest) = self.read_manifest(addr, hashin)? else {
             return Ok(());
         };
-        let manifest_bytes = borsh::to_vec(&manifest).context("serialize manifest")?;
 
         let tmp_dir = self.remote_tmp_dir();
         std::fs::create_dir_all(&tmp_dir)
             .with_context(|| format!("create remote temp dir {}", tmp_dir.display()))?;
 
-        // Compress every blob to a temp file (synchronous local I/O, off the
+        // Encode every blob to a temp file (synchronous local I/O, off the
         // runtime worker via block_or_inline; the non-`Send` local reader stays
-        // on this thread and never crosses an await).
-        let names: Vec<String> = manifest.artifacts.iter().map(|a| a.name.clone()).collect();
+        // on this thread and never crosses an await). Each artifact is gzipped or
+        // copied verbatim per `compression_for`, and the chosen encoding is
+        // recorded so the remote manifest is self-describing.
         let local_cache = self.local_cache.clone();
-        let temps: Vec<(String, PathBuf)> = {
+        let artifacts = manifest.artifacts.clone();
+        let prepared: Vec<(String, PathBuf, ManifestArtifactEncoding)> = {
             let addr = addr.clone();
             let hashin = hashin.to_string();
             let tmp_dir = tmp_dir.clone();
             crate::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
                 use std::io::Read;
-                let mut out = Vec::with_capacity(names.len());
-                for name in &names {
+                let mut out = Vec::with_capacity(artifacts.len());
+                for a in &artifacts {
                     let sized = local_cache
-                        .reader(&addr, &hashin, name)
-                        .with_context(|| format!("open local blob {name}"))?;
-                    let temp = tmp_dir.join(format!("{}.gz", uuid::Uuid::new_v4()));
-                    gzip_to_file(sized.reader.take(sized.size), &temp)
-                        .with_context(|| format!("compress local blob {name}"))?;
-                    out.push((name.clone(), temp));
+                        .reader(&addr, &hashin, &a.name)
+                        .with_context(|| format!("open local blob {}", a.name))?;
+                    let encoding = compression_for(a.size);
+                    let temp = tmp_dir.join(format!("{}.blob", uuid::Uuid::new_v4()));
+                    let reader = sized.reader.take(sized.size);
+                    match encoding {
+                        ManifestArtifactEncoding::Gzip => gzip_to_file(reader, &temp)
+                            .with_context(|| format!("compress local blob {}", a.name))?,
+                        _ => copy_to_file(reader, &temp)
+                            .with_context(|| format!("copy local blob {}", a.name))?,
+                    }
+                    out.push((a.name.clone(), temp, encoding));
                 }
                 Ok(out)
             })?
         };
 
+        // Build the remote manifest from the local one plus the per-artifact
+        // encodings just chosen.
+        let remote_manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: manifest.target.clone(),
+            hashin: hashin.to_string(),
+            artifacts: manifest
+                .artifacts
+                .iter()
+                .zip(prepared.iter())
+                .map(|(a, (_, _, encoding))| RemoteManifestArtifact {
+                    hashout: a.hashout.clone(),
+                    group: a.group.clone(),
+                    name: a.name.clone(),
+                    size: a.size,
+                    r#type: a.r#type.clone(),
+                    content_type: a.content_type.clone(),
+                    encoding: encoding.clone(),
+                })
+                .collect(),
+        };
+        let manifest_bytes =
+            borsh::to_vec(&remote_manifest).context("serialize remote manifest")?;
+
+        let temps: Vec<(String, PathBuf)> = prepared
+            .iter()
+            .map(|(name, path, _)| (name.clone(), path.clone()))
+            .collect();
         self.remote_caches
             .put_revision(addr, hashin, &manifest_bytes, &temps)
             .await;
 
-        for (_, path) in &temps {
+        for (_, path, _) in &prepared {
             drop(std::fs::remove_file(path));
         }
         Ok(())
@@ -739,37 +847,66 @@ impl Engine {
             return Ok(None);
         };
 
-        // Gunzip each temp file into the local cache (synchronous; non-`Send`
-        // local writer stays on this thread), blobs first then manifest last.
+        // Decode each temp file into the local cache per its on-remote encoding
+        // (synchronous; the non-`Send` local writer stays on this thread). Then
+        // build the *local* manifest — which always describes decoded bytes
+        // (`encoding = None`) — and write it last, mirroring `cache_locally`.
         let local_cache = self.local_cache.clone();
         let addr_owned = addr.clone();
         let hashin_owned = hashin.to_string();
-        let blobs = fetched.blobs.clone();
-        let manifest_bytes = fetched.manifest_bytes.clone();
-        let res = crate::process_supervisor::block_or_inline(move || -> anyhow::Result<()> {
-            use std::io::Write;
-            for (name, path) in &blobs {
-                let mut w = local_cache
-                    .writer(&addr_owned, &hashin_owned, name)
-                    .with_context(|| format!("open local writer for downloaded blob {name}"))?;
-                gunzip_from_file(path, &mut w)
-                    .with_context(|| format!("decompress downloaded blob {name}"))?;
-            }
-            let mut mw = local_cache
-                .writer(&addr_owned, &hashin_owned, MANIFEST_V1)
-                .context("open local writer for downloaded manifest")?;
-            mw.write_all(&manifest_bytes)
-                .context("write downloaded manifest")?;
-            Ok(())
-        });
+        let temp_paths: Vec<PathBuf> = fetched.blobs.iter().map(|(_, p)| p.clone()).collect();
+        let RemoteManifest {
+            target, artifacts, ..
+        } = fetched.manifest;
+        let blobs = fetched.blobs;
+        let res =
+            crate::process_supervisor::block_or_inline(move || -> anyhow::Result<Manifest> {
+                use std::io::Write;
+                for (artifact, (name, path)) in artifacts.iter().zip(blobs.iter()) {
+                    let mut w = local_cache
+                        .writer(&addr_owned, &hashin_owned, name)
+                        .with_context(|| format!("open local writer for downloaded blob {name}"))?;
+                    match artifact.encoding {
+                        ManifestArtifactEncoding::Gzip => gunzip_from_file(path, &mut w)
+                            .with_context(|| format!("decompress downloaded blob {name}"))?,
+                        _ => copy_file_to(path, &mut w)
+                            .with_context(|| format!("write downloaded blob {name}"))?,
+                    }
+                }
+
+                let local_manifest = Manifest {
+                    version: "1.0.0".to_string(),
+                    target,
+                    created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                    hashin: hashin_owned.clone(),
+                    artifacts: artifacts
+                        .iter()
+                        .map(|a| ManifestArtifact {
+                            hashout: a.hashout.clone(),
+                            group: a.group.clone(),
+                            name: a.name.clone(),
+                            size: a.size,
+                            r#type: a.r#type.clone(),
+                            content_type: a.content_type.clone(),
+                            // Local cache stores decoded bytes.
+                            encoding: ManifestArtifactEncoding::None,
+                        })
+                        .collect(),
+                };
+                let bytes = borsh::to_vec(&local_manifest).context("serialize local manifest")?;
+                let mut mw = local_cache
+                    .writer(&addr_owned, &hashin_owned, MANIFEST_V1)
+                    .context("open local writer for downloaded manifest")?;
+                mw.write_all(&bytes).context("write downloaded manifest")?;
+                Ok(local_manifest)
+            });
 
         // Always drop the temp files, success or failure.
-        for (_, path) in &fetched.blobs {
+        for path in &temp_paths {
             drop(std::fs::remove_file(path));
         }
-        res?;
 
-        Ok(Some(fetched.manifest))
+        Ok(Some(res?))
     }
 }
 
@@ -936,30 +1073,44 @@ mod tests {
         let set = RemoteCacheSet::new(&defs, dir.path().to_path_buf()).expect("set");
         let addr = addr();
 
-        // Build a gzip temp file for one blob (compressible payload).
-        let raw = vec![b'x'; 5000];
-        let blob_tmp = dir.path().join("blob.gz");
-        gzip_to_file(&raw[..], &blob_tmp).expect("gzip");
+        // One gzip-encoded artifact (compressible) and one stored verbatim — the
+        // remote manifest records the per-artifact encoding.
+        let raw_gz = vec![b'x'; 5000];
+        let gz_tmp = dir.path().join("gz.blob");
+        gzip_to_file(&raw_gz[..], &gz_tmp).expect("gzip");
         assert!(
-            std::fs::metadata(&blob_tmp).expect("stat").len() < raw.len() as u64 / 2,
-            "stored blob must be compressed"
+            std::fs::metadata(&gz_tmp).expect("stat").len() < raw_gz.len() as u64 / 2,
+            "gzip artifact must be compressed"
         );
 
-        // A minimal manifest naming that one blob.
-        let manifest = Manifest {
-            version: "1.0.0".to_string(),
+        let raw_plain = b"tiny".to_vec();
+        let plain_tmp = dir.path().join("plain.blob");
+        copy_to_file(&raw_plain[..], &plain_tmp).expect("copy");
+
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
             target: addr.format(),
-            created_at_nanos: 0,
             hashin: "h1".to_string(),
-            artifacts: vec![crate::engine::local_cache::ManifestArtifact {
-                hashout: "ho".to_string(),
-                group: "out".to_string(),
-                name: "o.tar".to_string(),
-                size: raw.len() as u64,
-                r#type: crate::engine::local_cache::ManifestArtifactType::Output,
-                content_type: crate::engine::local_cache::ManifestArtifactContentType::Tar,
-                encoding: crate::engine::local_cache::ManifestArtifactEncoding::None,
-            }],
+            artifacts: vec![
+                RemoteManifestArtifact {
+                    hashout: "ho-gz".to_string(),
+                    group: "out".to_string(),
+                    name: "gz.tar".to_string(),
+                    size: raw_gz.len() as u64,
+                    r#type: ManifestArtifactType::Output,
+                    content_type: ManifestArtifactContentType::Tar,
+                    encoding: ManifestArtifactEncoding::Gzip,
+                },
+                RemoteManifestArtifact {
+                    hashout: "ho-plain".to_string(),
+                    group: "out".to_string(),
+                    name: "plain.tar".to_string(),
+                    size: raw_plain.len() as u64,
+                    r#type: ManifestArtifactType::Output,
+                    content_type: ManifestArtifactContentType::Tar,
+                    encoding: ManifestArtifactEncoding::None,
+                },
+            ],
         };
         let manifest_bytes = borsh::to_vec(&manifest).expect("borsh");
 
@@ -967,11 +1118,15 @@ mod tests {
             &addr,
             "h1",
             &manifest_bytes,
-            &[("o.tar".to_string(), blob_tmp)],
+            &[
+                ("gz.tar".to_string(), gz_tmp),
+                ("plain.tar".to_string(), plain_tmp),
+            ],
         )
         .await;
 
-        // Fetch back; manifest parses and the blob temp gunzips to the original.
+        // Fetch back; the manifest parses with both encodings, and each blob temp
+        // decodes per its recorded encoding.
         let fetch_dir = dir.path().join("fetched");
         std::fs::create_dir_all(&fetch_dir).expect("mkdir");
         let fetched = set
@@ -979,11 +1134,38 @@ mod tests {
             .await
             .expect("fetch")
             .expect("present");
-        assert_eq!(fetched.manifest.artifacts.len(), 1);
-        assert_eq!(fetched.blobs.len(), 1);
-        let mut restored = Vec::new();
-        gunzip_from_file(&fetched.blobs[0].1, &mut restored).expect("gunzip");
-        assert_eq!(restored, raw);
+        assert_eq!(fetched.manifest.artifacts.len(), 2);
+        assert_eq!(
+            fetched.manifest.artifacts[0].encoding,
+            ManifestArtifactEncoding::Gzip
+        );
+        assert_eq!(
+            fetched.manifest.artifacts[1].encoding,
+            ManifestArtifactEncoding::None
+        );
+
+        let mut restored_gz = Vec::new();
+        gunzip_from_file(&fetched.blobs[0].1, &mut restored_gz).expect("gunzip");
+        assert_eq!(restored_gz, raw_gz);
+
+        let restored_plain = std::fs::read(&fetched.blobs[1].1).expect("read plain");
+        assert_eq!(
+            restored_plain, raw_plain,
+            "None-encoded artifact is stored verbatim"
+        );
+    }
+
+    #[test]
+    fn compression_for_respects_threshold() {
+        assert_eq!(compression_for(0), ManifestArtifactEncoding::None);
+        assert_eq!(
+            compression_for(MIN_COMPRESS_BYTES - 1),
+            ManifestArtifactEncoding::None
+        );
+        assert_eq!(
+            compression_for(MIN_COMPRESS_BYTES),
+            ManifestArtifactEncoding::Gzip
+        );
     }
 
     /// Backend whose blob writes block on a shared barrier, so the upload only
