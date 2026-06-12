@@ -31,6 +31,9 @@ pub(crate) struct HephLspContext {
     doc_globals: DocModule,
     /// Lazily-built Starlark globals, shared across per-buffer evaluations.
     globals: Arc<OnceLock<Globals>>,
+    /// BUILD-file name patterns, from the buildfile provider's `patterns` config
+    /// option (defaulting to `BUILD`). Used for both listing and load resolution.
+    patterns: Vec<glob::Pattern>,
     /// Buildfile provider used only for package/target listing during completion.
     provider: Provider,
     pub(crate) shared: Arc<SharedState>,
@@ -41,13 +44,21 @@ impl HephLspContext {
         let root = engine.root().to_path_buf();
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();
-        let provider = Provider::new(root.clone());
+        let patterns = buildfile_patterns(&root);
+        // Listing provider configured with the same patterns the engine's
+        // buildfile provider uses, so completion sees the right BUILD files.
+        let provider = Provider {
+            root: root.clone(),
+            build_file_patterns: patterns.clone(),
+            ..Provider::default()
+        };
         provider.set_function_registry(Arc::clone(&registry));
         HephLspContext {
             root,
             registry,
             doc_globals,
             globals: Arc::new(OnceLock::new()),
+            patterns,
             provider,
             shared: SharedState::new(engine),
         }
@@ -64,7 +75,7 @@ impl HephLspContext {
     fn loader(&self) -> BuildFileLoader {
         BuildFileLoader::new(
             self.root.clone(),
-            vec![glob::Pattern::new("BUILD").expect("BUILD literal")],
+            self.patterns.clone(),
             // Fresh per-call caches: the open buffer may differ from disk, so the
             // main file must never be served from a stale cache.
             Arc::new(Mutex::new(HashMap::new())),
@@ -114,16 +125,53 @@ impl HephLspContext {
         }
     }
 
-    /// The on-disk BUILD file URL for a package, if it has one.
+    /// The on-disk BUILD file URL for a package: the first file in the package
+    /// dir whose name matches a configured pattern (handles literal names like
+    /// `BUILD` and globs like `*.BUILD` alike).
     fn build_file_url(&self, package: &str) -> Option<LspUrl> {
-        let path = self.root.join(package).join("BUILD");
-        if path.exists() {
-            lsp_types::Url::from_file_path(&path)
-                .ok()
-                .and_then(|u| LspUrl::try_from(u).ok())
-        } else {
-            None
-        }
+        let dir = self.root.join(package);
+        let entry = std::fs::read_dir(&dir).ok()?.flatten().find(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && self.patterns.iter().any(|p| p.matches(&name))
+        })?;
+        lsp_types::Url::from_file_path(entry.path())
+            .ok()
+            .and_then(|u| LspUrl::try_from(u).ok())
+    }
+}
+
+/// BUILD-file name patterns from the workspace's buildfile-provider config,
+/// mirroring what the engine's provider uses. Falls back to `["BUILD"]` when the
+/// config is absent, lists no patterns, or none compile.
+fn buildfile_patterns(root: &Path) -> Vec<glob::Pattern> {
+    use crate::engine::config_yaml;
+    let names: Vec<String> = config_yaml::load_from_root(root)
+        .ok()
+        .and_then(|cfg| {
+            cfg.providers
+                .iter()
+                .find(|p| p.name == "buildfile")
+                .and_then(|p| {
+                    config_yaml::decode_opt::<Vec<String>>(
+                        &p.options,
+                        "buildfile provider",
+                        "patterns",
+                    )
+                    .ok()
+                    .flatten()
+                })
+        })
+        .unwrap_or_default();
+    let compiled: Vec<glob::Pattern> = names
+        .iter()
+        .filter_map(|n| glob::Pattern::new(n).ok())
+        .collect();
+    if compiled.is_empty() {
+        vec![glob::Pattern::new("BUILD").expect("BUILD literal")]
+    } else {
+        compiled
     }
 }
 
