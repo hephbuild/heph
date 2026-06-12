@@ -63,12 +63,19 @@ pub(crate) struct TargetCall {
 pub(crate) struct DocIndex {
     pub call_targets: Vec<CallTargets>,
     pub target_calls: Vec<TargetCall>,
+    /// Rendered hover doc for each top-level function binding (`def` in this file
+    /// or imported via `load`), keyed by name. Used to synthesize a signature
+    /// tooltip for undocumented functions, which the stock server skips.
+    pub defs: std::collections::HashMap<String, String>,
+    /// The buffer's source text, for extracting the identifier under the cursor.
+    pub source: String,
 }
 
 impl DocIndex {
     /// Build the index from an evaluated buffer. `pkg` is the buffer's package
-    /// (used to format `//pkg:name` addresses).
-    pub(crate) fn build(result: &RunResult, pkg: &str) -> DocIndex {
+    /// (used to format `//pkg:name` addresses); `source` is the buffer text.
+    pub(crate) fn build(result: &RunResult, pkg: &str, source: String) -> DocIndex {
+        let defs = function_docs(result);
         // Aggregate addresses per unique call-site span. BTreeMap keeps a stable
         // order and dedups identical spans (e.g. a loop body line that produced
         // several targets).
@@ -106,7 +113,16 @@ impl DocIndex {
         DocIndex {
             call_targets,
             target_calls,
+            defs,
+            source,
         }
+    }
+
+    /// Rendered hover for the function named by the identifier at the 1-based
+    /// position, if that identifier resolves to a known `def`.
+    pub(crate) fn def_hover_at(&self, line: u32, col: u32) -> Option<&str> {
+        let word = word_at(&self.source, line, col)?;
+        self.defs.get(word).map(String::as_str)
     }
 
     /// The most specific (smallest) call site covering the 1-based position and
@@ -132,6 +148,50 @@ impl DocIndex {
             .find(|tc| tc.span.covers(line, col))
             .map(|tc| tc.driver.as_str())
     }
+}
+
+/// Render a hover doc for every top-level function binding in the evaluated
+/// module — `def`s in this file and functions pulled in via `load`. Non-function
+/// bindings (constants, target addresses) are skipped.
+fn function_docs(result: &RunResult) -> HashMap<String, String> {
+    use starlark::docs::{DocItem, DocMember};
+    let mut out = HashMap::new();
+    for name in result.module.names() {
+        let name = name.as_str();
+        let Ok(value) = result.module.get(name) else {
+            continue;
+        };
+        let doc = value.value().documentation();
+        if matches!(doc, DocItem::Member(DocMember::Function(_))) {
+            out.insert(
+                name.to_string(),
+                starlark::docs::markdown::render_doc_item_no_link(name, &doc),
+            );
+        }
+    }
+    out
+}
+
+/// The identifier (ASCII alphanumeric + `_`) under the 1-based `(line, col)` in
+/// `source`. Returns `None` when the cursor isn't on an identifier character —
+/// Starlark identifiers are ASCII, so byte indexing is safe here.
+fn word_at(source: &str, line: u32, col: u32) -> Option<&str> {
+    let line_str = source.lines().nth((line.checked_sub(1)?) as usize)?;
+    let col0 = col.checked_sub(1)? as usize;
+    let b = line_str.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    if !b.get(col0).copied().is_some_and(is_ident) {
+        return None;
+    }
+    let mut start = col0;
+    while start > 0 && b.get(start - 1).copied().is_some_and(is_ident) {
+        start -= 1;
+    }
+    let mut end = col0 + 1;
+    while b.get(end).copied().is_some_and(is_ident) {
+        end += 1;
+    }
+    line_str.get(start..end)
 }
 
 /// State shared between the [`super::context::HephLspContext`] (writer) and the
@@ -177,7 +237,7 @@ mod tests {
             Arc::new(crate::htwalk::CachedWalker::disabled()),
         );
         let result = eval_source("BUILD", content.to_string(), "pkg", &loader).unwrap();
-        DocIndex::build(&result, "pkg")
+        DocIndex::build(&result, "pkg", content.to_string())
     }
 
     #[test]
@@ -215,5 +275,29 @@ target(name = \"direct\", driver = \"exec\")
         // The target() call is on line 1.
         assert_eq!(index.driver_at(1, 1), Some("exec"));
         assert!(index.driver_at(50, 1).is_none());
+    }
+
+    #[test]
+    fn def_hover_renders_signature_for_undocumented_function() {
+        // No docstring — the stock server gives no hover; we synthesize one.
+        let content = "def my_fn(a, b):\n    return a\n\nmy_fn(1, 2)\n";
+        let index = index_for(content);
+        // Hover the usage `my_fn(1, 2)` on line 4.
+        let doc = index.def_hover_at(4, 1).expect("def hover");
+        assert!(
+            doc.contains("my_fn"),
+            "hover should name the function: {doc}"
+        );
+        assert!(doc.contains('a') && doc.contains('b'), "params: {doc}");
+        // A non-identifier / unknown word yields nothing.
+        assert!(index.def_hover_at(2, 1).is_none() || !index.defs.contains_key("return"));
+    }
+
+    #[test]
+    fn word_at_extracts_identifier_under_cursor() {
+        let src = "foo bar_baz qux\n";
+        assert_eq!(super::word_at(src, 1, 6), Some("bar_baz")); // inside bar_baz
+        assert_eq!(super::word_at(src, 1, 1), Some("foo"));
+        assert_eq!(super::word_at(src, 1, 4), None); // the space
     }
 }

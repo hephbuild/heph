@@ -207,9 +207,10 @@ impl LspContext for HephLspContext {
         // half-typed buffer that fails to evaluate simply yields no index — we do
         // not surface eval errors as diagnostics (they would be noisy while typing).
         let pkg = self.path_to_pkg(&path);
+        let source = content.clone();
         if let Ok(result) = eval_source(&filename, content, &pkg, &self.loader()) {
             self.shared
-                .set_index(uri.clone(), DocIndex::build(&result, &pkg));
+                .set_index(uri.clone(), DocIndex::build(&result, &pkg, source));
         } else {
             self.shared.set_index(uri.clone(), DocIndex::default());
         }

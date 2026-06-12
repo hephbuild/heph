@@ -98,24 +98,37 @@ fn enrich_hover(
     let Some(index) = shared.index(uri) else {
         return;
     };
+
     // Index positions are 1-based.
-    let Some(addrs) = index.targets_at(line + 1, col + 1) else {
-        return;
-    };
-    if addrs.is_empty() {
-        return;
+    let mut md = existing_hover_markdown(resp);
+
+    // If the stock server produced no hover (e.g. an undocumented `def`), fall
+    // back to the function's rendered signature.
+    if md.is_empty()
+        && let Some(doc) = index.def_hover_at(line + 1, col + 1)
+    {
+        md.push_str(doc);
     }
 
-    let mut md = existing_hover_markdown(resp);
-    if !md.is_empty() {
-        md.push_str("\n\n---\n\n");
+    // Append the targets this call site produced, if any.
+    let targets = index.targets_at(line + 1, col + 1).unwrap_or(&[]);
+    if md.is_empty() && targets.is_empty() {
+        return;
     }
-    md.push_str(&format!("**Generated targets ({})**\n\n```\n", addrs.len()));
-    for a in addrs {
-        md.push_str(a);
-        md.push('\n');
+    if !targets.is_empty() {
+        if !md.is_empty() {
+            md.push_str("\n\n---\n\n");
+        }
+        md.push_str(&format!(
+            "**Generated targets ({})**\n\n```\n",
+            targets.len()
+        ));
+        for a in targets {
+            md.push_str(a);
+            md.push('\n');
+        }
+        md.push_str("```\n");
     }
-    md.push_str("```\n");
 
     let hover = Hover {
         contents: HoverContents::Markup(MarkupContent {
