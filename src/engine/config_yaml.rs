@@ -9,7 +9,7 @@ pub type Options = BTreeMap<String, serde_yaml::Value>;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ConfigFile {
+pub struct ConfigYaml {
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     #[serde(default)]
@@ -29,36 +29,84 @@ pub struct ConfigFile {
     #[serde(default)]
     pub cache: Option<CacheConfig>,
     /// Named remote (shared) caches. Each entry is keyed by a name and carries a
-    /// `uri` plus `read`/`write` permissions. See [`RemoteCacheConfig`].
+    /// `uri` plus `read`/`write` permissions. Parsed as patches so a profile can
+    /// override individual fields; resolve with [`ConfigYaml::resolved_caches`].
     #[serde(default)]
-    pub caches: BTreeMap<String, RemoteCacheConfig>,
+    pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
 }
 
-/// One named remote cache: `caches: { name: { uri, read, write } }`.
+/// One resolved named remote cache: `caches: { name: { uri, read, write } }`.
 ///
 /// `uri` selects the backend by scheme — `s3://bucket/prefix`,
 /// `gs://bucket/prefix` (credentials come from the environment, e.g.
 /// `AWS_ACCESS_KEY_ID` / `GOOGLE_SERVICE_ACCOUNT`), plus `memory://` and
 /// `file://` for tests/local use. `read`/`write` gate whether the cache is
 /// consulted on lookups and pushed to on writes; both default to `true`.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+///
+/// Produced from one or more layered [`RemoteCacheConfigPatch`]es — see
+/// [`ConfigYaml::resolved_caches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteCacheConfig {
     pub uri: String,
-    #[serde(default = "default_true")]
     pub read: bool,
-    #[serde(default = "default_true")]
     pub write: bool,
     /// Max in-flight requests to this cache (object_store `LimitStore`). Caps how
     /// many connections a wide build fan-out opens at once. Defaults to 10.
-    #[serde(default = "default_cache_concurrency")]
     pub concurrency: usize,
 }
 
-fn default_true() -> bool {
-    true
+/// Parse/overlay shape for one named cache. Every field is optional so a profile
+/// can patch a single setting (e.g. flip `write`) without restating `uri`.
+/// Layered patches are deep-merged by [`merge`](Self::merge), then finalized into
+/// a [`RemoteCacheConfig`] by [`resolve`](Self::resolve).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteCacheConfigPatch {
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub read: Option<bool>,
+    #[serde(default)]
+    pub write: Option<bool>,
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+}
+
+impl RemoteCacheConfigPatch {
+    /// Apply `other` on top of self — each field present in `other` wins, the
+    /// rest are left untouched. This is what lets a profile flip `read`/`write`
+    /// while inheriting the base `uri`.
+    fn merge(&mut self, other: RemoteCacheConfigPatch) {
+        if other.uri.is_some() {
+            self.uri = other.uri;
+        }
+        if other.read.is_some() {
+            self.read = other.read;
+        }
+        if other.write.is_some() {
+            self.write = other.write;
+        }
+        if other.concurrency.is_some() {
+            self.concurrency = other.concurrency;
+        }
+    }
+
+    /// Finalize into a [`RemoteCacheConfig`], applying defaults for omitted
+    /// fields. Errors if `uri` was never set across the base + any profiles.
+    fn resolve(&self, name: &str) -> anyhow::Result<RemoteCacheConfig> {
+        let uri = self
+            .uri
+            .clone()
+            .with_context(|| format!("cache `{name}` is missing required `uri`"))?;
+        Ok(RemoteCacheConfig {
+            uri,
+            read: self.read.unwrap_or(true),
+            write: self.write.unwrap_or(true),
+            concurrency: self.concurrency.unwrap_or_else(default_cache_concurrency),
+        })
+    }
 }
 
 fn default_cache_concurrency() -> usize {
@@ -76,22 +124,31 @@ pub struct CacheConfig {
     pub spill_threshold_bytes: Option<u64>,
 }
 
-impl ConfigFile {
+impl ConfigYaml {
     /// Whether anonymous usage telemetry is enabled. Opt-out: enabled unless the
     /// config explicitly sets `telemetry.enabled: false`.
     pub fn telemetry_enabled(&self) -> bool {
         self.telemetry.map(|t| t.enabled).unwrap_or(true)
     }
 
+    /// Finalize the layered cache patches into resolved configs, applying field
+    /// defaults. Errors if any cache never had its required `uri` set.
+    pub fn resolved_caches(&self) -> anyhow::Result<BTreeMap<String, RemoteCacheConfig>> {
+        self.caches
+            .iter()
+            .map(|(name, patch)| Ok((name.clone(), patch.resolve(name)?)))
+            .collect()
+    }
+
     /// Apply `other` on top of `self`, mutating in place. Used to layer profile
     /// configs over the base `.hephconfig2` (see [`load_from_root`]).
     ///
     /// Optional/scalar fields override only when present in `other` — a profile
-    /// that omits a field leaves the base value untouched. `caches` merge by key
-    /// (a later entry replaces the whole entry under that name), and
-    /// `providers`/`drivers` merge by name (matching entry replaced, new ones
-    /// appended in order).
-    pub fn merge(&mut self, other: ConfigFile) {
+    /// that omits a field leaves the base value untouched. `caches` deep-merge by
+    /// key (each cache's fields are patched individually, so a profile can flip
+    /// `read`/`write` while inheriting the base `uri`), and `providers`/`drivers`
+    /// merge by name (matching entry replaced, new ones appended in order).
+    pub fn merge(&mut self, other: ConfigYaml) {
         if other.home_dir.is_some() {
             self.home_dir = other.home_dir;
         }
@@ -117,8 +174,11 @@ impl ConfigFile {
             self.telemetry = other.telemetry;
         }
 
-        // Caches override by key: extend replaces matching names, keeps the rest.
-        self.caches.extend(other.caches);
+        // Caches deep-merge by key: a profile patches individual fields (e.g.
+        // flips read/write) while inheriting the rest of the base entry.
+        for (name, patch) in other.caches {
+            self.caches.entry(name).or_default().merge(patch);
+        }
 
         merge_plugins(&mut self.providers, other.providers);
         merge_plugins(&mut self.drivers, other.drivers);
@@ -310,16 +370,16 @@ fn profiles_from_env() -> Vec<String> {
 ///
 /// Profiles apply in the order listed: `HEPH_PROFILES=a,b` loads the base
 /// `.hephconfig2`, then applies `a.hephconfig2`, then `b.hephconfig2`, each
-/// merged over the accumulated config via [`ConfigFile::merge`] (so e.g. a cache
+/// merged over the accumulated config via [`ConfigYaml::merge`] (so e.g. a cache
 /// entry is overridden by its key). A named profile file that is missing or
 /// invalid is a hard error.
-pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigFile> {
+pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigYaml> {
     load_with_profiles(root, &profiles_from_env())
 }
 
 /// Core of [`load_from_root`], with the profile list passed in so it can be
 /// exercised without touching the process environment.
-fn load_with_profiles(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<ConfigFile> {
+fn load_with_profiles(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<ConfigYaml> {
     let mut cfg = load(&root.join(CONFIG_FILE_NAME))?;
     for profile in profiles {
         let profile = profile.as_ref();
@@ -333,13 +393,13 @@ fn load_with_profiles(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Resu
     Ok(cfg)
 }
 
-pub fn load(path: &Path) -> anyhow::Result<ConfigFile> {
+pub fn load(path: &Path) -> anyhow::Result<ConfigYaml> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading config file {}", path.display()))?;
     if bytes.is_empty() {
-        return Ok(ConfigFile::default());
+        return Ok(ConfigYaml::default());
     }
-    let cfg: ConfigFile = serde_yaml::from_slice(&bytes)
+    let cfg: ConfigYaml = serde_yaml::from_slice(&bytes)
         .with_context(|| format!("parsing YAML config {}", path.display()))?;
     Ok(cfg)
 }
@@ -406,7 +466,7 @@ drivers:
     options:
       path: [/usr/bin]
 "#;
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".heph2")));
         let mc = cfg.mem_cache.expect("mem_cache present");
         assert_eq!(mc.per_entry_bytes, 16384);
@@ -426,20 +486,20 @@ drivers:
     #[test]
     fn parses_cache_spill_threshold() {
         let yaml = "cache:\n  spillThresholdBytes: 104857600\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let c = cfg.cache.expect("cache present");
         assert_eq!(c.spill_threshold_bytes, Some(104857600));
     }
 
     #[test]
     fn cache_config_omitted_is_none() {
-        let cfg: ConfigFile = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
         assert!(cfg.cache.is_none());
     }
 
     #[test]
     fn rejects_unknown_cache_field() {
-        let err = serde_yaml::from_str::<ConfigFile>("cache:\n  bogus: 1\n").expect_err("reject");
+        let err = serde_yaml::from_str::<ConfigYaml>("cache:\n  bogus: 1\n").expect_err("reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
@@ -454,14 +514,15 @@ caches:
   local:
     uri: file:///tmp/heph-cache
 "#;
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(cfg.caches.len(), 2);
-        let remote = cfg.caches.get("remote").expect("remote present");
+        let caches = cfg.resolved_caches().expect("resolve");
+        let remote = caches.get("remote").expect("remote present");
         assert_eq!(remote.uri, "s3://my-bucket/heph");
         assert!(remote.read);
         assert!(!remote.write);
         // read/write/concurrency default when omitted.
-        let local = cfg.caches.get("local").expect("local present");
+        let local = caches.get("local").expect("local present");
         assert!(local.read);
         assert!(local.write);
         assert_eq!(local.concurrency, 10);
@@ -470,20 +531,31 @@ caches:
     #[test]
     fn cache_concurrency_is_configurable() {
         let yaml = "caches:\n  c:\n    uri: s3://b/p\n    concurrency: 32\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
-        assert_eq!(cfg.caches.get("c").expect("present").concurrency, 32);
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let caches = cfg.resolved_caches().expect("resolve");
+        assert_eq!(caches.get("c").expect("present").concurrency, 32);
+    }
+
+    #[test]
+    fn resolved_caches_errors_on_missing_uri() {
+        // A cache that only ever sets read/write (no base uri) cannot resolve.
+        let cfg: ConfigYaml =
+            serde_yaml::from_str("caches:\n  c:\n    read: false\n").expect("parse");
+        let err = cfg.resolved_caches().expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`c`") && msg.contains("uri"), "{msg}");
     }
 
     #[test]
     fn caches_omitted_is_empty() {
-        let cfg: ConfigFile = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
         assert!(cfg.caches.is_empty());
     }
 
     #[test]
     fn rejects_unknown_cache_entry_field() {
         let yaml = "caches:\n  r:\n    uri: memory:///r\n    bogus: 1\n";
-        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
@@ -491,7 +563,7 @@ caches:
     fn parses_fs_skip() {
         // `skip` mixes literal dirs and glob patterns.
         let yaml = "fs:\n  skip: [vendor, \"**/node_modules/**\"]\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let fs = cfg.fs.expect("fs config present");
         assert_eq!(
             fs.skip,
@@ -501,13 +573,13 @@ caches:
 
     #[test]
     fn fs_config_defaults_absent() {
-        let cfg: ConfigFile = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
         assert!(cfg.fs.is_none());
     }
 
     #[test]
     fn rejects_unknown_fs_field() {
-        let err = serde_yaml::from_str::<ConfigFile>("fs:\n  bogus: 1\n").expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>("fs:\n  bogus: 1\n").expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
@@ -525,7 +597,7 @@ caches:
     #[test]
     fn rejects_unknown_top_level_field() {
         let yaml = "bogus: 1\n";
-        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
@@ -549,7 +621,7 @@ caches:
     #[test]
     fn fuse_config_enabled_true() {
         let yaml = "fuse:\n  enabled: true\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let f = cfg.fuse.expect("fuse present");
         assert_eq!(f.mode(), FuseMode::On);
     }
@@ -557,7 +629,7 @@ caches:
     #[test]
     fn fuse_config_enabled_false() {
         let yaml = "fuse:\n  enabled: false\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let f = cfg.fuse.expect("fuse present");
         assert_eq!(f.mode(), FuseMode::Off);
     }
@@ -565,7 +637,7 @@ caches:
     #[test]
     fn fuse_config_defaults_when_omitted() {
         let yaml = "fuse: {}\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let f = cfg.fuse.expect("fuse present");
         assert_eq!(f.mode(), FuseMode::Off);
         assert!(f.is_off());
@@ -575,14 +647,14 @@ caches:
     #[test]
     fn fuse_config_rejects_unknown_field() {
         let yaml = "fuse:\n  bogus: 1\n";
-        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]
     fn fuse_config_enabled_auto() {
         let yaml = "fuse:\n  enabled: auto\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let f = cfg.fuse.expect("fuse present");
         assert_eq!(f.mode(), FuseMode::Auto);
         assert!(!f.is_off());
@@ -592,7 +664,7 @@ caches:
     #[test]
     fn fuse_config_enabled_rejects_unknown_string() {
         let yaml = "fuse:\n  enabled: maybe\n";
-        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("maybe"), "{err}");
     }
 
@@ -606,7 +678,7 @@ caches:
     #[test]
     fn lock_config_backend_mem() {
         let yaml = "lock:\n  backend: mem\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let l = cfg.lock.expect("lock present");
         assert_eq!(l.backend, Some(LockBackendConfig::Mem));
     }
@@ -614,7 +686,7 @@ caches:
     #[test]
     fn lock_config_backend_fs() {
         let yaml = "lock:\n  backend: fs\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(
             cfg.lock.expect("lock present").backend,
             Some(LockBackendConfig::Fs)
@@ -624,35 +696,35 @@ caches:
     #[test]
     fn lock_config_omitted_is_none() {
         let yaml = "providers: []\n";
-        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         assert!(cfg.lock.is_none());
     }
 
     #[test]
     fn lock_config_rejects_unknown_backend() {
         let yaml = "lock:\n  backend: sqlite\n";
-        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("sqlite"), "{err}");
     }
 
     #[test]
     fn lock_config_rejects_unknown_field() {
         let yaml = "lock:\n  bogus: 1\n";
-        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]
     fn telemetry_defaults_enabled_when_omitted() {
         // Opt-out: no `telemetry:` block means telemetry stays on.
-        let cfg: ConfigFile = serde_yaml::from_str("providers: []\n").expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str("providers: []\n").expect("parse");
         assert!(cfg.telemetry.is_none());
         assert!(cfg.telemetry_enabled());
     }
 
     #[test]
     fn telemetry_can_be_disabled() {
-        let cfg: ConfigFile =
+        let cfg: ConfigYaml =
             serde_yaml::from_str("telemetry:\n  enabled: false\n").expect("parse");
         assert!(!cfg.telemetry_enabled());
     }
@@ -660,45 +732,68 @@ caches:
     #[test]
     fn telemetry_empty_block_defaults_enabled() {
         // `telemetry: {}` present but `enabled` omitted → still on.
-        let cfg: ConfigFile = serde_yaml::from_str("telemetry: {}\n").expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str("telemetry: {}\n").expect("parse");
         assert!(cfg.telemetry_enabled());
     }
 
     #[test]
     fn telemetry_rejects_unknown_field() {
         let yaml = "telemetry:\n  bogus: 1\n";
-        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]
     fn merge_overrides_caches_by_key() {
-        let mut base: ConfigFile = serde_yaml::from_str(
+        let mut base: ConfigYaml = serde_yaml::from_str(
             "caches:\n  a:\n    uri: s3://base/a\n  b:\n    uri: s3://base/b\n",
         )
         .expect("parse base");
-        let overlay: ConfigFile = serde_yaml::from_str(
+        let overlay: ConfigYaml = serde_yaml::from_str(
             "caches:\n  b:\n    uri: s3://prof/b\n  c:\n    uri: s3://prof/c\n",
         )
         .expect("parse overlay");
 
         base.merge(overlay);
 
-        assert_eq!(base.caches.len(), 3);
+        let caches = base.resolved_caches().expect("resolve");
+        assert_eq!(caches.len(), 3);
         // Untouched key keeps its base value.
-        assert_eq!(base.caches.get("a").expect("a").uri, "s3://base/a");
-        // Shared key is overridden by the overlay.
-        assert_eq!(base.caches.get("b").expect("b").uri, "s3://prof/b");
+        assert_eq!(caches.get("a").expect("a").uri, "s3://base/a");
+        // Shared key's uri is overridden by the overlay.
+        assert_eq!(caches.get("b").expect("b").uri, "s3://prof/b");
         // New key is added.
-        assert_eq!(base.caches.get("c").expect("c").uri, "s3://prof/c");
+        assert_eq!(caches.get("c").expect("c").uri, "s3://prof/c");
+    }
+
+    #[test]
+    fn merge_deep_merges_cache_fields() {
+        // Base defines uri (+ default read/write); profile flips write only.
+        let mut base: ConfigYaml =
+            serde_yaml::from_str("caches:\n  remote:\n    uri: s3://base/remote\n")
+                .expect("parse base");
+        let overlay: ConfigYaml =
+            serde_yaml::from_str("caches:\n  remote:\n    write: false\n").expect("parse overlay");
+
+        base.merge(overlay);
+
+        let remote = base
+            .resolved_caches()
+            .expect("resolve")
+            .remove("remote")
+            .expect("remote present");
+        // uri inherited from base, write patched by profile, read still default.
+        assert_eq!(remote.uri, "s3://base/remote");
+        assert!(remote.read);
+        assert!(!remote.write);
     }
 
     #[test]
     fn merge_overrides_scalars_only_when_present() {
-        let mut base: ConfigFile =
+        let mut base: ConfigYaml =
             serde_yaml::from_str("homeDir: .base\nlock:\n  backend: fs\n").expect("parse base");
         // Overlay sets homeDir but omits lock — lock must survive.
-        let overlay: ConfigFile = serde_yaml::from_str("homeDir: .prof\n").expect("parse overlay");
+        let overlay: ConfigYaml = serde_yaml::from_str("homeDir: .prof\n").expect("parse overlay");
 
         base.merge(overlay);
 
@@ -711,11 +806,11 @@ caches:
 
     #[test]
     fn merge_providers_by_name() {
-        let mut base: ConfigFile = serde_yaml::from_str(
+        let mut base: ConfigYaml = serde_yaml::from_str(
             "providers:\n  - name: buildfile\n    options:\n      patterns: [BUILD]\n  - name: go\n",
         )
         .expect("parse base");
-        let overlay: ConfigFile = serde_yaml::from_str(
+        let overlay: ConfigYaml = serde_yaml::from_str(
             "providers:\n  - name: buildfile\n    options:\n      patterns: [BUILD2]\n  - name: rust\n",
         )
         .expect("parse overlay");
@@ -755,10 +850,8 @@ caches:
 
         // Last profile wins per key / scalar.
         assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".b")));
-        assert_eq!(
-            cfg.caches.get("shared").expect("shared").uri,
-            "s3://b/shared"
-        );
+        let caches = cfg.resolved_caches().expect("resolve");
+        assert_eq!(caches.get("shared").expect("shared").uri, "s3://b/shared");
     }
 
     #[test]
@@ -780,5 +873,50 @@ caches:
         let err = load_with_profiles(root, &["missing"]).expect_err("must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("missing.hephconfig2"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_applies_defaults_for_empty_yaml() {
+        // An empty config resolves to the engine defaults, with home_dir
+        // root-joined to `.heph3`.
+        let yaml = ConfigYaml::default();
+        let root = Path::new("/repo");
+        let cfg = yaml.resolve(root).expect("resolve");
+
+        let defaults = crate::engine::Config::default();
+        assert_eq!(cfg.root, root);
+        assert_eq!(cfg.home_dir, root.join(".heph3"));
+        assert_eq!(cfg.mem_cache, defaults.mem_cache);
+        assert_eq!(cfg.tmp_cache, defaults.tmp_cache);
+        assert_eq!(cfg.lock_backend, defaults.lock_backend);
+        assert_eq!(cfg.spill_threshold_bytes, defaults.spill_threshold_bytes);
+        assert!(cfg.telemetry_enabled);
+        assert!(cfg.remote_caches.is_empty());
+    }
+
+    #[test]
+    fn resolve_overrides_present_fields() {
+        let yaml: ConfigYaml = serde_yaml::from_str(
+            "homeDir: .custom\nlock:\n  backend: mem\ntelemetry:\n  enabled: false\ncaches:\n  r:\n    uri: s3://b/p\n    write: false\n",
+        )
+        .expect("parse");
+        let cfg = yaml.resolve(Path::new("/repo")).expect("resolve");
+
+        assert_eq!(cfg.home_dir, Path::new("/repo/.custom"));
+        assert_eq!(cfg.lock_backend, crate::engine::LockBackend::Mem);
+        assert!(!cfg.telemetry_enabled);
+        assert_eq!(cfg.remote_caches.len(), 1);
+        let r = &cfg.remote_caches[0];
+        assert_eq!(r.uri, "s3://b/p");
+        assert!(r.read);
+        assert!(!r.write);
+    }
+
+    #[test]
+    fn resolve_errors_on_cache_missing_uri() {
+        let yaml: ConfigYaml =
+            serde_yaml::from_str("caches:\n  r:\n    write: false\n").expect("parse");
+        let err = yaml.resolve(Path::new("/repo")).expect_err("must error");
+        assert!(format!("{err:#}").contains("uri"), "{err}");
     }
 }

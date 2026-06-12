@@ -1,4 +1,5 @@
-use crate::engine::config_file::{FuseConfig, Options, PluginEntry};
+use crate::engine::config::Config;
+use crate::engine::config_yaml::{FuseConfig, Options, PluginEntry};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::local_cache::LocalCache;
@@ -6,7 +7,7 @@ use crate::engine::local_cache_mem::LocalCacheMem;
 use crate::engine::local_cache_sqlite::LocalCacheSQLite;
 use crate::engine::provider::Provider as SDKProvider;
 use crate::engine::request_state::RequestState;
-use crate::engine::result_lock::{LockBackend, ResultLock};
+use crate::engine::result_lock::ResultLock;
 use crate::engine::{driver, provider};
 use crate::sandboxfuse;
 use anyhow::Context;
@@ -15,94 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Semaphore;
 use tracing::warn;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Config {
-    pub root: PathBuf,
-    /// Workspace state/cache directory. If empty, defaults to `root/.heph3`.
-    pub home_dir: PathBuf,
-    /// Repo-root-relative directories from the config file's `fs.skip`, pruned by
-    /// every plugin that walks the tree. See [`Engine::skip_dirs`].
-    pub fs_skip: Vec<String>,
-    pub parallelism: Option<usize>,
-    /// In-memory tier fronting the durable (SQLite) local cache.
-    pub mem_cache: MemCacheOptions,
-    /// Mem-only store for tmp/uncacheable revisions ([`LocalCacheTmp`]).
-    /// Entries over `per_entry_bytes`, or that would push the store past
-    /// `capacity_bytes`, spill to the durable cache.
-    ///
-    /// [`LocalCacheTmp`]: crate::engine::local_cache_tmp::LocalCacheTmp
-    pub tmp_cache: MemCacheOptions,
-    pub fuse: FuseConfig,
-    /// Backend serializing the execute phase per addr. Defaults to `Fs`.
-    pub lock_backend: LockBackend,
-    /// Durable blobs strictly larger than this spill to plain files under
-    /// `<home>/cache/blobs/` instead of being stored inline in the sqlite DB;
-    /// manifests always stay in sqlite. Keeps the DB / WAL small and lets large
-    /// artifacts stream from the filesystem. See [`DEFAULT_SPILL_THRESHOLD_BYTES`].
-    pub spill_threshold_bytes: u64,
-    /// Anonymous usage telemetry. Defaults to `true` (opt-out via config).
-    pub telemetry_enabled: bool,
-    /// Named remote (shared) caches from the config's `caches:` map. Empty
-    /// disables the remote-cache layer entirely. See [`RemoteCacheSet`].
-    pub remote_caches: Vec<crate::engine::RemoteCacheDef>,
-}
-
-/// Default spill threshold: 8 MiB. Above a few MB the filesystem beats sqlite
-/// blob storage on throughput and big blobs would bloat the single-file DB and
-/// its WAL; below it, artifacts stay in sqlite where small indexed reads and the
-/// mem tier win. Tunable via `cache.spillThresholdBytes`.
-pub const DEFAULT_SPILL_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            root: PathBuf::new(),
-            home_dir: PathBuf::new(),
-            fs_skip: Vec::new(),
-            parallelism: None,
-            mem_cache: MemCacheOptions::default(),
-            tmp_cache: MemCacheOptions::default_tmp(),
-            fuse: FuseConfig::default(),
-            lock_backend: LockBackend::default(),
-            spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
-            telemetry_enabled: true,
-            remote_caches: Vec::new(),
-        }
-    }
-}
-
-/// Byte limits for one in-memory cache store. Used for both the local-cache mem
-/// tier (`mem_cache`) and the tmp store (`tmp_cache`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemCacheOptions {
-    /// Per-entry size cap. For `mem_cache`, larger entries pass through
-    /// uncached; for `tmp_cache`, larger entries spill to the durable cache.
-    pub per_entry_bytes: usize,
-    /// Total byte budget. For `mem_cache`, `0` disables the in-memory layer
-    /// entirely; for `tmp_cache`, entries that would exceed it spill to durable.
-    pub capacity_bytes: u64,
-}
-
-impl Default for MemCacheOptions {
-    /// Defaults for the local-cache mem tier.
-    fn default() -> Self {
-        Self {
-            per_entry_bytes: 16 * 1024,
-            capacity_bytes: 64 * 1024 * 1024,
-        }
-    }
-}
-
-impl MemCacheOptions {
-    /// Defaults for the tmp store: 1 MiB per entry, 64 MiB total budget.
-    pub fn default_tmp() -> Self {
-        Self {
-            per_entry_bytes: 1024 * 1024,
-            capacity_bytes: 64 * 1024 * 1024,
-        }
-    }
-}
 
 /// Context the engine injects when constructing any plugin (provider, driver, or
 /// managed driver — whether registered directly or through a factory): the

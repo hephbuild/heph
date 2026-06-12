@@ -232,7 +232,7 @@ mod tests {
         })
         .expect("register buildfile");
 
-        let file: crate::engine::config_file::ConfigFile =
+        let file: crate::engine::config_yaml::ConfigYaml =
             serde_yaml::from_str("providers:\n  - name: buildfile\n").expect("yaml");
         e.apply_config(&file.providers, &file.drivers)
             .expect("apply_config");
