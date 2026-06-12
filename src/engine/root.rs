@@ -28,6 +28,6 @@ pub fn get_root_inner() -> Result<PathBuf, String> {
 
     Err(format!(
         "Could not find {} file in any parent directory",
-        crate::engine::config_yaml::CONFIG_FILE_NAMES.join(" or ")
+        crate::engine::config_yaml::CONFIG_FILE_NAME
     ))
 }
