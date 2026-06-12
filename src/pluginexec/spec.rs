@@ -1,4 +1,6 @@
 use crate::engine::driver::targetdef::path::CodegenMode;
+use crate::engine::driver::{DriverField, DriverSchema};
+use crate::htvalue::signature::ParamType;
 use crate::htvalue::{
     Value, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
     parse_strings,
@@ -168,6 +170,88 @@ impl TargetSpec {
 
         Ok(spec)
     }
+
+    /// Declarative schema of the config fields exec accepts, for the BUILD-file
+    /// LSP. Kept in this file alongside [`TargetSpec::from`] so the two field
+    /// lists are edited together and don't drift.
+    pub(crate) fn schema() -> DriverSchema {
+        use ParamType::String as Str;
+        let field = |name: &str, ty: ParamType, doc: &str| DriverField {
+            name: name.to_string(),
+            ty,
+            doc: doc.to_string(),
+            required: false,
+        };
+        DriverSchema {
+            fields: vec![
+                field(
+                    "run",
+                    ParamType::list(Str),
+                    "Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.",
+                ),
+                field(
+                    "out",
+                    ParamType::map(ParamType::list(Str)),
+                    "Declared outputs, grouped by name → list of output paths the target writes.",
+                ),
+                field(
+                    "cache",
+                    ParamType::Bool,
+                    "Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.",
+                ),
+                field(
+                    "support_files",
+                    ParamType::list(Str),
+                    "Extra files materialized into the sandbox but not hashed as deps.",
+                ),
+                field(
+                    "codegen",
+                    Str,
+                    "Codegen mode: `copy` or `in_place`. Omit for a normal (non-codegen) target.",
+                ),
+                field(
+                    "deps",
+                    ParamType::map(ParamType::list(Str)),
+                    "Hashed + runtime dependencies, grouped by name → list of target addresses.",
+                ),
+                field(
+                    "hash_deps",
+                    ParamType::map(ParamType::list(Str)),
+                    "Dependencies that contribute to the input hash but are not materialized at runtime.",
+                ),
+                field(
+                    "runtime_deps",
+                    ParamType::map(ParamType::list(Str)),
+                    "Dependencies materialized at runtime but excluded from the input hash.",
+                ),
+                field(
+                    "tools",
+                    ParamType::map(ParamType::list(Str)),
+                    "Build tools, grouped by name → list of target addresses; symlinked under `tools/`.",
+                ),
+                field(
+                    "env",
+                    ParamType::map(Str),
+                    "Environment variables set for the command.",
+                ),
+                field(
+                    "pass_env",
+                    ParamType::list(Str),
+                    "Names of host environment variables passed through (hashed).",
+                ),
+                field(
+                    "runtime_pass_env",
+                    ParamType::list(Str),
+                    "Host environment variables passed through at runtime only (not hashed).",
+                ),
+                field(
+                    "runtime_env",
+                    ParamType::map(Str),
+                    "Environment variables set at runtime only (not hashed).",
+                ),
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +265,39 @@ mod tests {
         let mut m = HashMap::from([("run".to_string(), Value::String("echo".to_string()))]);
         m.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
         TargetSpec::from(m)
+    }
+
+    #[test]
+    fn test_schema_lists_known_fields_with_types() {
+        let schema = TargetSpec::schema();
+        let by_name: HashMap<&str, &DriverField> =
+            schema.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+        // Every config key TargetSpec::from understands must appear in the schema,
+        // so the two lists are caught drifting apart.
+        for key in [
+            "run",
+            "out",
+            "cache",
+            "support_files",
+            "codegen",
+            "deps",
+            "hash_deps",
+            "runtime_deps",
+            "tools",
+            "env",
+            "pass_env",
+            "runtime_pass_env",
+            "runtime_env",
+        ] {
+            assert!(by_name.contains_key(key), "schema missing field `{key}`");
+        }
+        assert_eq!(by_name["run"].ty, ParamType::list(ParamType::String));
+        assert_eq!(
+            by_name["deps"].ty,
+            ParamType::map(ParamType::list(ParamType::String))
+        );
+        assert_eq!(by_name["env"].ty, ParamType::map(ParamType::String));
+        assert!(!by_name["run"].doc.is_empty());
     }
 
     #[test]

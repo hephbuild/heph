@@ -1573,6 +1573,8 @@ dependencies = [
  "indexmap",
  "itertools 0.13.0",
  "libc",
+ "lsp-server",
+ "lsp-types",
  "memoize",
  "minijinja",
  "nom 7.1.3",
@@ -1595,6 +1597,7 @@ dependencies = [
  "smart-default",
  "stacker",
  "starlark",
+ "starlark_lsp",
  "tar",
  "tempfile",
  "thiserror 1.0.69",
@@ -2274,6 +2277,19 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lsp-server"
+version = "0.7.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6ada348dbc2703cbe7637b2dda05cff84d3da2819c24abcb305dd613e0ba2e"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+]
 
 [[package]]
 name = "lsp-types"
@@ -4120,6 +4136,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "starlark_lsp"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b9deaaf246230eb4d562069f526960c79936de9a1c2e83b10c1d4b05e74d653"
+dependencies = [
+ "anyhow",
+ "derivative",
+ "derive_more 1.0.0",
+ "dupe",
+ "itertools 0.13.0",
+ "lsp-server",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "starlark",
+ "starlark_syntax",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

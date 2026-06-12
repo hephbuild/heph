@@ -727,9 +727,36 @@ pub struct RunResponse {
     pub fuse_slot_guards: Vec<crate::sandboxfuse::SlotGuard>,
 }
 
+/// One config field a driver accepts in a `target(...)` call, with its type and
+/// documentation. Consumed by the BUILD-file LSP to offer completion and hover for
+/// a target's driver-specific keyword arguments.
+#[derive(Clone, Debug)]
+pub struct DriverField {
+    pub name: String,
+    pub ty: crate::htvalue::signature::ParamType,
+    pub doc: String,
+    pub required: bool,
+}
+
+/// Declarative description of the config a driver understands. Returned by
+/// [`Driver::schema`]; `None` means the driver exposes no schema (the default).
+#[derive(Clone, Debug, Default)]
+pub struct DriverSchema {
+    pub fields: Vec<DriverField>,
+}
+
 #[async_trait]
 pub trait Driver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
+
+    /// Optional: describe the config fields this driver accepts on a target, so
+    /// tooling (the BUILD-file LSP) can complete and document them. Drivers that
+    /// don't implement this return `None` and the LSP simply offers no
+    /// driver-specific field hints.
+    fn schema(&self) -> Option<DriverSchema> {
+        None
+    }
+
     async fn parse(
         &self,
         req: ParseRequest,

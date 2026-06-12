@@ -42,6 +42,23 @@ pub struct State {
     pub state: HashMap<String, Value>,
 }
 
+/// One frame of a target's source provenance: a call site on the Starlark call
+/// stack at the moment `target(...)` ran. The innermost frame is the `target()`
+/// call itself; outer frames are the user macros / loops that led to it. Lets
+/// tooling (the BUILD-file LSP) map a source position back to every target that
+/// originated from the symbol at that position. Lines/columns are 1-based.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceFrame {
+    /// Name of the function whose body this call site is in (`<module>` at top level).
+    pub fn_name: String,
+    /// Absolute path of the BUILD/.bzl file containing the call site.
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub col_start: u32,
+    pub col_end: u32,
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub addr: Addr,
