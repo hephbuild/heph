@@ -237,12 +237,12 @@ impl TargetSpec {
                 field(
                     "pass_env",
                     ParamType::list(Str),
-                    "Names of host environment variables passed through (hashed).",
+                    "Names of host environment variables passed through (hashed). `\"*\"` passes all.",
                 ),
                 field(
                     "runtime_pass_env",
                     ParamType::list(Str),
-                    "Host environment variables passed through at runtime only (not hashed).",
+                    "Host env vars passed through at runtime only (not hashed). `\"*\"` passes all.",
                 ),
                 field(
                     "runtime_env",

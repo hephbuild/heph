@@ -45,6 +45,12 @@ fn synth_lsp_spec(addr: Addr) -> TargetSpec {
     );
     // Long-running server: never cache.
     config.insert("cache".to_string(), Value::Bool(false));
+    // Pass the editor's full environment through to the server at run time
+    // (PATH, locale, tool config, …); `"*"` is the exec wildcard. Not hashed.
+    config.insert(
+        "runtime_pass_env".to_string(),
+        Value::List(vec![Value::String("*".to_string())]),
+    );
     TargetSpec {
         addr,
         driver: "exec".to_string(),
@@ -464,6 +470,13 @@ mod tests {
             })
             .collect();
         assert_eq!(&run_strs[run_strs.len() - 2..], &["tool", "build-lsp"]);
+        // Server inherits the editor's full environment at runtime.
+        assert_eq!(
+            spec.config.get("runtime_pass_env"),
+            Some(&crate::htvalue::Value::List(vec![
+                crate::htvalue::Value::String("*".to_string())
+            ]))
+        );
 
         // Wrong name in the synthetic package is NotFound.
         let miss = provider
