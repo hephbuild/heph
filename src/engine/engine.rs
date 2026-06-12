@@ -435,17 +435,18 @@ impl Engine {
         &self.result_lock
     }
 
-    /// Every `(provider name, function name)` pair exposed across all registered
-    /// providers, sorted. Surfaced via `heph inspect functions`.
-    pub fn provider_functions(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
+    /// Every `(provider name, function name, rendered signature)` exposed across
+    /// all registered providers, sorted. The rendered signature looks like
+    /// `glob(pattern: string) -> list[string]`. Surfaced via `heph inspect functions`.
+    pub fn provider_functions(&self) -> Vec<(String, String, String)> {
+        let mut out: Vec<(String, String, String)> = self
             .providers
             .iter()
             .flat_map(|p| {
-                p.provider
-                    .functions()
-                    .into_iter()
-                    .map(move |def| (p.name.clone(), def.name))
+                p.provider.functions().into_iter().map(move |def| {
+                    let rendered = def.signature.render(&def.name);
+                    (p.name.clone(), def.name, rendered)
+                })
             })
             .collect();
         out.sort();

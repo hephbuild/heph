@@ -7,6 +7,7 @@ use crate::hasync::Cancellable;
 use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::htvalue::signature::{FnSignature, Param, ParamType};
 use crate::htvalue::{Value, parse_strings};
 use crate::htwalk::{CachedWalker, EntryKind, Ignore};
 use crate::pluginfs;
@@ -422,6 +423,20 @@ impl ProviderTrait for Provider {
     fn functions(&self) -> Vec<ProviderFunctionDef> {
         vec![ProviderFunctionDef {
             name: "build_addr".to_string(),
+            signature: FnSignature {
+                positional: vec![
+                    Param::required("pkg", ParamType::String),
+                    Param::required("goos", ParamType::String),
+                    Param::required("goarch", ParamType::String),
+                ],
+                named: vec![Param::optional(
+                    "tags",
+                    ParamType::list(ParamType::String),
+                    Value::List(vec![]),
+                )],
+                variadic: None,
+                returns: ParamType::String,
+            },
             func: Arc::new(BuildAddrFn),
         }]
     }

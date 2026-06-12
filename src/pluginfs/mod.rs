@@ -17,6 +17,7 @@ use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::htvalue::Value;
+use crate::htvalue::signature::{FnSignature, Param, ParamType};
 use crate::htwalk::{CachedWalker, Ignore};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -173,9 +174,22 @@ impl EProvider for Provider {
     }
 
     fn functions(&self) -> Vec<ProviderFunctionDef> {
+        // A single required string positional, returning a string.
+        let one_path = || FnSignature {
+            positional: vec![Param::required("path", ParamType::String)],
+            named: vec![],
+            variadic: None,
+            returns: ParamType::String,
+        };
         vec![
             ProviderFunctionDef {
                 name: "glob".to_string(),
+                signature: FnSignature {
+                    positional: vec![Param::required("pattern", ParamType::String)],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::list(ParamType::String),
+                },
                 func: Arc::new(GlobFn {
                     skip: self.skip.clone(),
                     walker: self.walker.clone(),
@@ -183,14 +197,23 @@ impl EProvider for Provider {
             },
             ProviderFunctionDef {
                 name: "join".to_string(),
+                // Variadic `join(a, b, c)` — Go `path.Join` style.
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![],
+                    variadic: Some(Param::required("elems", ParamType::String)),
+                    returns: ParamType::String,
+                },
                 func: Arc::new(JoinFn),
             },
             ProviderFunctionDef {
                 name: "dir".to_string(),
+                signature: one_path(),
                 func: Arc::new(DirFn),
             },
             ProviderFunctionDef {
                 name: "base".to_string(),
+                signature: one_path(),
                 func: Arc::new(BaseFn),
             },
         ]
@@ -213,11 +236,8 @@ struct GlobFn {
 #[async_trait]
 impl ProviderFn for GlobFn {
     async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        let pattern = match args.positional.first() {
-            Some(Value::String(s)) => s.as_str(),
-            Some(other) => anyhow::bail!("heph.fs.glob: pattern must be a string, got {:?}", other),
-            None => anyhow::bail!("heph.fs.glob: missing pattern argument"),
-        };
+        // Arg shape is enforced by the declared signature before we get here.
+        let pattern = str_arg("heph.fs.glob", &args)?;
 
         let resolved = if ctx.pkg.is_empty() {
             pattern.to_string()
@@ -285,8 +305,9 @@ fn path_clean(path: &str) -> String {
     }
 }
 
-/// `heph.fs.join(*elems)` — join path elements with `/` and clean the result
-/// (Go `path.Join` semantics). Empty elements are skipped; all-empty yields "".
+/// `heph.fs.join(*elems)` — join path elements (variadic strings) with `/` and
+/// clean the result (Go `path.Join` semantics). Empty elements are skipped;
+/// all-empty yields "".
 fn path_join(elems: &[&str]) -> String {
     let non_empty: Vec<&str> = elems.iter().copied().filter(|e| !e.is_empty()).collect();
     if non_empty.is_empty() {
@@ -336,11 +357,14 @@ struct JoinFn;
 #[async_trait]
 impl ProviderFn for JoinFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        // Signature: `join(*elems: string) -> string`. The variadic shape (each
+        // element a string) is enforced by the declared signature before we get
+        // here, so every positional is a string.
         let mut elems: Vec<&str> = Vec::with_capacity(args.positional.len());
         for v in &args.positional {
             match v {
                 Value::String(s) => elems.push(s.as_str()),
-                other => anyhow::bail!("heph.fs.join: arguments must be strings, got {other:?}"),
+                other => anyhow::bail!("heph.fs.join: elems must be strings, got {other:?}"),
             }
         }
         Ok(Value::String(path_join(&elems)))
@@ -1086,17 +1110,34 @@ mod tests {
         }
     }
 
+    /// `join` is variadic — each element is its own string positional.
+    fn call_join(elems: Vec<&str>) -> String {
+        let root = std::path::Path::new("/");
+        let ctx = FnCallContext { pkg: "", root };
+        let args = FnArgs {
+            positional: elems
+                .into_iter()
+                .map(|s| Value::String(s.to_string()))
+                .collect(),
+            named: Default::default(),
+        };
+        match futures::executor::block_on(JoinFn.call(&ctx, args)).unwrap() {
+            Value::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_join_fn() {
-        assert_eq!(call_path_fn(&JoinFn, vec!["a", "b", "c"]), "a/b/c");
+        assert_eq!(call_join(vec!["a", "b", "c"]), "a/b/c");
         // Cleans embedded `.`/`..` and redundant separators.
-        assert_eq!(call_path_fn(&JoinFn, vec!["a/", "b"]), "a/b");
-        assert_eq!(call_path_fn(&JoinFn, vec!["a", "..", "b"]), "b");
-        assert_eq!(call_path_fn(&JoinFn, vec!["a", ".", "b"]), "a/b");
+        assert_eq!(call_join(vec!["a/", "b"]), "a/b");
+        assert_eq!(call_join(vec!["a", "..", "b"]), "b");
+        assert_eq!(call_join(vec!["a", ".", "b"]), "a/b");
         // Empty elements are skipped; all-empty yields "".
-        assert_eq!(call_path_fn(&JoinFn, vec!["", "a", ""]), "a");
-        assert_eq!(call_path_fn(&JoinFn, vec!["", ""]), "");
-        assert_eq!(call_path_fn(&JoinFn, vec![]), "");
+        assert_eq!(call_join(vec!["", "a", ""]), "a");
+        assert_eq!(call_join(vec!["", ""]), "");
+        assert_eq!(call_join(vec![]), "");
     }
 
     #[test]
