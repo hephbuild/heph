@@ -13,8 +13,10 @@ pub fn get_root_inner() -> Result<PathBuf, String> {
     let mut current = Path::new(&cwd).to_path_buf();
 
     loop {
-        let config_file = current.join(crate::engine::config_yaml::CONFIG_FILE_NAME);
-        if config_file.exists() {
+        let found = crate::engine::config_yaml::CONFIG_FILE_NAMES
+            .iter()
+            .any(|name| current.join(name).exists());
+        if found {
             return Ok(current);
         }
 
