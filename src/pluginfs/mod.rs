@@ -178,6 +178,7 @@ impl EProvider for Provider {
         let one_path = || FnSignature {
             positional: vec![Param::required("path", ParamType::String)],
             named: vec![],
+            variadic: None,
             returns: ParamType::String,
         };
         vec![
@@ -186,6 +187,7 @@ impl EProvider for Provider {
                 signature: FnSignature {
                     positional: vec![Param::required("pattern", ParamType::String)],
                     named: vec![],
+                    variadic: None,
                     returns: ParamType::list(ParamType::String),
                 },
                 func: Arc::new(GlobFn {
@@ -195,9 +197,11 @@ impl EProvider for Provider {
             },
             ProviderFunctionDef {
                 name: "join".to_string(),
+                // Variadic `join(a, b, c)` — Go `path.Join` style.
                 signature: FnSignature {
-                    positional: vec![Param::required("elems", ParamType::list(ParamType::String))],
+                    positional: vec![],
                     named: vec![],
+                    variadic: Some(Param::required("elems", ParamType::String)),
                     returns: ParamType::String,
                 },
                 func: Arc::new(JoinFn),
@@ -301,7 +305,7 @@ fn path_clean(path: &str) -> String {
     }
 }
 
-/// `heph.fs.join(elems)` — join path elements (a `list[string]`) with `/` and
+/// `heph.fs.join(*elems)` — join path elements (variadic strings) with `/` and
 /// clean the result (Go `path.Join` semantics). Empty elements are skipped;
 /// all-empty yields "".
 fn path_join(elems: &[&str]) -> String {
@@ -353,14 +357,11 @@ struct JoinFn;
 #[async_trait]
 impl ProviderFn for JoinFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        // Signature: `join(elems: list[string]) -> string`. The list-of-strings
-        // shape is enforced by the declared signature before we get here.
-        let items = match args.positional.first() {
-            Some(Value::List(items)) => items,
-            other => anyhow::bail!("heph.fs.join: elems must be a list of strings, got {other:?}"),
-        };
-        let mut elems: Vec<&str> = Vec::with_capacity(items.len());
-        for v in items {
+        // Signature: `join(*elems: string) -> string`. The variadic shape (each
+        // element a string) is enforced by the declared signature before we get
+        // here, so every positional is a string.
+        let mut elems: Vec<&str> = Vec::with_capacity(args.positional.len());
+        for v in &args.positional {
             match v {
                 Value::String(s) => elems.push(s.as_str()),
                 other => anyhow::bail!("heph.fs.join: elems must be strings, got {other:?}"),
@@ -1109,19 +1110,15 @@ mod tests {
         }
     }
 
-    /// `join` takes a single `list[string]` positional — wrap the elements in a
-    /// list before calling the handler directly.
+    /// `join` is variadic — each element is its own string positional.
     fn call_join(elems: Vec<&str>) -> String {
         let root = std::path::Path::new("/");
         let ctx = FnCallContext { pkg: "", root };
-        let list = Value::List(
-            elems
+        let args = FnArgs {
+            positional: elems
                 .into_iter()
                 .map(|s| Value::String(s.to_string()))
                 .collect(),
-        );
-        let args = FnArgs {
-            positional: vec![list],
             named: Default::default(),
         };
         match futures::executor::block_on(JoinFn.call(&ctx, args)).unwrap() {

@@ -434,6 +434,7 @@ impl ProviderTrait for Provider {
                     ParamType::list(ParamType::String),
                     Value::List(vec![]),
                 )],
+                variadic: None,
                 returns: ParamType::String,
             },
             func: Arc::new(BuildAddrFn),

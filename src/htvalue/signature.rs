@@ -111,21 +111,36 @@ impl Param {
 }
 
 /// The declarative signature of a provider-exposed function.
+///
+/// `variadic`, when set, collects any positional arguments beyond the declared
+/// `positional` ones — each is type-checked against the variadic param's type
+/// and passed through as an individual positional (Go `path.Join`-style
+/// `f(a, b, c)`). With no variadic, surplus positionals are an arity error.
 #[derive(Clone, Debug)]
 pub struct FnSignature {
     pub positional: Vec<Param>,
     pub named: Vec<Param>,
+    pub variadic: Option<Param>,
     pub returns: ParamType,
 }
 
 impl FnSignature {
-    /// Render as `name(p1: type, k1: type) -> ret` for `inspect functions`.
+    /// Render as `name(p1: type, *rest: type, k1: type) -> ret` for `inspect functions`.
     pub fn render(&self, name: &str) -> String {
         let params = self
             .positional
             .iter()
-            .chain(self.named.iter())
             .map(|p| format!("{}: {}", p.name, p.ty.render()))
+            .chain(
+                self.variadic
+                    .iter()
+                    .map(|p| format!("*{}: {}", p.name, p.ty.render())),
+            )
+            .chain(
+                self.named
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, p.ty.render())),
+            )
             .collect::<Vec<_>>()
             .join(", ");
         format!("{name}({params}) -> {}", self.returns.render())
@@ -141,7 +156,7 @@ impl FnSignature {
         positional: Vec<Value>,
         mut named: HashMap<String, Value>,
     ) -> anyhow::Result<(Vec<Value>, HashMap<String, Value>)> {
-        if positional.len() > self.positional.len() {
+        if self.variadic.is_none() && positional.len() > self.positional.len() {
             anyhow::bail!(
                 "{fn_display}: expected at most {} positional argument(s), got {}",
                 self.positional.len(),
@@ -171,6 +186,22 @@ impl FnSignature {
                         param.name
                     ),
                 },
+            }
+        }
+
+        // Surplus positionals flow into the variadic param (type-checked
+        // individually) and pass through as individual positionals.
+        if let Some(var) = &self.variadic {
+            for v in pos {
+                if !var.ty.matches(&v) {
+                    anyhow::bail!(
+                        "{fn_display}: variadic argument `{}` expected {}, got {}",
+                        var.name,
+                        var.ty.render(),
+                        value_kind(&v)
+                    );
+                }
+                out_positional.push(v);
             }
         }
 
@@ -227,6 +258,7 @@ mod tests {
         FnSignature {
             positional: vec![Param::required("pattern", ParamType::String)],
             named: vec![],
+            variadic: None,
             returns: ParamType::list(ParamType::String),
         }
     }
@@ -281,6 +313,7 @@ mod tests {
         let sig = FnSignature {
             positional: vec![],
             named: vec![Param::required("provider", ParamType::String)],
+            variadic: None,
             returns: ParamType::Null,
         };
         let err = sig.validate_args("ps", vec![], HashMap::new()).unwrap_err();
@@ -292,6 +325,7 @@ mod tests {
         let sig = FnSignature {
             positional: vec![],
             named: vec![Param::optional("abs", ParamType::Bool, Value::Bool(false))],
+            variadic: None,
             returns: ParamType::Null,
         };
         let (_, named) = sig.validate_args("f", vec![], HashMap::new()).unwrap();
@@ -303,6 +337,7 @@ mod tests {
         let sig = FnSignature {
             positional: vec![Param::required("elems", ParamType::list(ParamType::String))],
             named: vec![],
+            variadic: None,
             returns: ParamType::String,
         };
         // Mixed-type list rejected.
@@ -326,6 +361,50 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn variadic_collects_surplus_positionals() {
+        let sig = FnSignature {
+            positional: vec![],
+            named: vec![],
+            variadic: Some(Param::required("elems", ParamType::String)),
+            returns: ParamType::String,
+        };
+        // Any number of positionals accepted, passed through individually.
+        let (pos, _) = sig
+            .validate_args(
+                "fs.join",
+                vec![
+                    Value::String("a".into()),
+                    Value::String("b".into()),
+                    Value::String("c".into()),
+                ],
+                HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(pos.len(), 3);
+        // Zero positionals is fine.
+        assert!(
+            sig.validate_args("fs.join", vec![], HashMap::new())
+                .is_ok()
+        );
+        // Each variadic element is type-checked.
+        let err = sig
+            .validate_args("fs.join", vec![Value::Int(1)], HashMap::new())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("expected string"), "{err:#}");
+    }
+
+    #[test]
+    fn variadic_renders_with_star() {
+        let sig = FnSignature {
+            positional: vec![],
+            named: vec![],
+            variadic: Some(Param::required("elems", ParamType::String)),
+            returns: ParamType::String,
+        };
+        assert_eq!(sig.render("join"), "join(*elems: string) -> string");
     }
 
     #[test]

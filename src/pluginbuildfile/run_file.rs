@@ -84,7 +84,8 @@ fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
 }
 
 /// Build a native param spec from a declared signature: positional params as
-/// pos-or-named, named params as named-only, no `*args`/`**kwargs` (no variadic).
+/// pos-or-named, an optional variadic as `*args`, named params as named-only;
+/// never `**kwargs`.
 fn build_param_spec(
     sig: &FnSignature,
 ) -> starlark::__derive_refs::param_spec::NativeCallableParamSpec {
@@ -103,7 +104,12 @@ fn build_param_spec(
     NativeCallableParamSpec {
         pos_only: Vec::new(),
         pos_or_named: sig.positional.iter().map(to_param).collect(),
-        args: None,
+        // `*args`: each element typed as the variadic param's element type.
+        args: sig.variadic.as_ref().map(|p| NativeCallableParam {
+            name: p.name,
+            ty: param_type_to_ty(&p.ty),
+            required: None,
+        }),
         named_only: sig.named.iter().map(to_param).collect(),
         kwargs: None,
     }
@@ -2171,6 +2177,7 @@ target(name = "t_in_app", driver = SHARED)
                 signature: FnSignature {
                     positional: vec![Param::required("v", ParamType::String)],
                     named: vec![],
+                    variadic: None,
                     returns: ParamType::String,
                 },
                 func: Arc::new(EchoFn),
@@ -2251,20 +2258,20 @@ target(name = "t_in_app", driver = SHARED)
     }
 
     #[test]
-    fn provider_fn_join_requires_list() {
-        // `join` now takes a single `list[string]`; a bare string is rejected.
-        let msg = eval_expr_err(r#"heph.fs.join("a")"#);
-        assert!(msg.contains("expected list[string]"), "{msg}");
+    fn provider_fn_join_rejects_non_string_variadic() {
+        // `join` is variadic over strings; a non-string element is rejected.
+        let msg = eval_expr_err(r#"heph.fs.join("a", 1)"#);
+        assert!(msg.contains("expected string"), "{msg}");
     }
 
     #[test]
-    fn provider_fn_join_accepts_list() {
+    fn provider_fn_join_accepts_variadic() {
         let tmp_dir = tempdir().unwrap();
         let pkg = tmp_dir.path().join("mypkg");
         fs::create_dir_all(&pkg).unwrap();
         fs::write(
             pkg.join("BUILD"),
-            r#"target(name = "t", driver = "d", v = heph.fs.join(["a", "b", "c"]))"#,
+            r#"target(name = "t", driver = "d", v = heph.fs.join("a", "b", "c"))"#,
         )
         .unwrap();
         let provider = make_provider(&tmp_dir);
