@@ -203,7 +203,7 @@ pub(crate) struct RemoteManifestArtifact {
 
 /// Remote manifest format version — independent of the local manifest's, so the
 /// two can evolve separately.
-const REMOTE_MANIFEST_VERSION: &str = "remote-1.0.0";
+const REMOTE_MANIFEST_VERSION: &str = "1.0.0";
 
 /// Below this size, gzip overhead isn't worth it (tiny artifacts barely shrink,
 /// and the header/footer can make them *grow*), so they're stored uncompressed.
