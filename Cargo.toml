@@ -138,6 +138,9 @@ quick_cache = "0.6"
 indexmap = "2"
 posthog-rs = "0.10.0"
 uuid = { version = "1.23.3", features = ["v4"] }
+object_store = { version = "0.13.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
+url = "2.5.8"
+flate2 = "1.1.9"
 
 # Linux uses fuser's pure-Rust backend (no `libfuse` feature): mounting shells
 # out to `fusermount3` at runtime, so there is NO build-time/link-time libfuse

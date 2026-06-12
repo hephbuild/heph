@@ -69,24 +69,43 @@ pub fn snapshot() -> TelemetrySnapshot {
     COLLECTOR.snapshot()
 }
 
-/// Names of the providers + drivers the engine has registered (built-ins plus
-/// whatever the config enabled). Plugin *type* names only — never user data.
+/// The engine's enabled plugins (built-ins plus whatever the config turned on)
+/// plus how many remote caches are configured. Plugin *type* names and a count
+/// only — never user data (URIs, addresses, …).
 #[derive(Debug, Clone, Default)]
 struct Plugins {
     providers: Vec<String>,
     drivers: Vec<String>,
+    remote_cache_count: usize,
+    /// Distinct remote cache backend kinds (`s3`, `gcs`, `azure`, `http`,
+    /// `file`, `memory`, `other`) — scheme only, never the URI.
+    remote_cache_backends: Vec<String>,
 }
 
 /// Set once, at engine construction. Read by the reporter at exit.
 static PLUGINS: std::sync::OnceLock<Plugins> = std::sync::OnceLock::new();
 
-/// Record the enabled provider + driver names. First write wins (a process
-/// builds at most one engine for the command it runs); later calls are ignored.
-pub fn record_plugins(mut providers: Vec<String>, mut drivers: Vec<String>) {
+/// Record the enabled provider + driver names plus the remote cache backend
+/// kinds (one entry per configured cache; the count and the distinct set are
+/// derived here). First write wins (a process builds at most one engine for the
+/// command it runs); later calls are ignored.
+pub fn record_plugins(
+    mut providers: Vec<String>,
+    mut drivers: Vec<String>,
+    mut remote_cache_backends: Vec<String>,
+) {
     providers.sort();
     drivers.sort();
+    let remote_cache_count = remote_cache_backends.len();
+    remote_cache_backends.sort();
+    remote_cache_backends.dedup();
     // Best-effort set-once; a second engine in one process keeps the first set.
-    drop(PLUGINS.set(Plugins { providers, drivers }));
+    drop(PLUGINS.set(Plugins {
+        providers,
+        drivers,
+        remote_cache_count,
+        remote_cache_backends,
+    }));
 }
 
 /// Public, write-only PostHog project API key. Not a secret — safe to ship in
@@ -357,6 +376,13 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     // Enabled plugins (built-ins + config), as queryable arrays of type names.
     put("providers", plugins.providers.into());
     put("drivers", plugins.drivers.into());
+    // Remote (shared) cache shape: how many are configured and which backend
+    // kinds they use (scheme only — never URIs).
+    put("remote_cache_count", plugins.remote_cache_count.into());
+    put(
+        "remote_cache_backends",
+        plugins.remote_cache_backends.into(),
+    );
 
     let dir = config_dir()?;
     let event = SpooledEvent {

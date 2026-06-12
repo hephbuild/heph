@@ -367,6 +367,9 @@ impl Engine {
         borsh::to_writer(&mut manifest_writer, &manifest)
             .with_context(|| format!("write manifest for {addr}"))?;
 
+        // Remote push happens on a background task driven from the execute path
+        // (see `Engine::spawn_remote_upload`), not here — it must not block the
+        // build's critical path on the network.
         Ok(res_artifacts)
     }
 
@@ -586,6 +589,160 @@ mod tests {
         })
         .expect("engine");
         (engine, dir)
+    }
+
+    /// Engine wired to the remote cache at `remote_uri` (a `file://` dir shared
+    /// across engines). Returns an `Arc` so the `self: &Arc<Self>` upload helper
+    /// can be called.
+    fn engine_with_remote(remote_uri: &str) -> (Arc<Engine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            remote_caches: vec![crate::engine::RemoteCacheDef {
+                name: "shared".to_string(),
+                uri: remote_uri.to_string(),
+                read: true,
+                write: true,
+                concurrency: 10,
+            }],
+            ..Default::default()
+        })
+        .expect("engine");
+        (Arc::new(engine), dir)
+    }
+
+    /// End-to-end: a revision cached by one engine (with its own local cache) is
+    /// pushed to a shared remote, then pulled into a *second* engine's local
+    /// cache on a miss — proving upload-on-write and download-on-miss, with the
+    /// whole revision (manifest + blob) coming from the one remote.
+    #[tokio::test]
+    async fn remote_cache_round_trips_between_engines() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+
+        // Engine A writes a revision locally, then pushes it to the remote
+        // (the push the background task performs in production).
+        let (engine_a, _a) = engine_with_remote(&remote_uri);
+        engine_a
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN1",
+                vec![raw_artifact("a", b"shared payload")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        engine_a.upload_to_remote(&addr, "HASHIN1").await;
+
+        // Engine B has a cold local cache: a direct local read misses.
+        let (engine_b, _b) = engine_with_remote(&remote_uri);
+        assert!(
+            engine_b
+                .read_manifest_blocking(&ctoken, &addr, "HASHIN1")
+                .await
+                .expect("read")
+                .is_none(),
+            "engine B local cache must start cold"
+        );
+
+        // Pulling from the remote populates B's local cache and returns the manifest.
+        let manifest = engine_b
+            .download_from_remote(&ctoken, &addr, "HASHIN1")
+            .await
+            .expect("download")
+            .expect("remote hit");
+        assert_eq!(manifest.artifacts.len(), 1);
+
+        // The blob is now served from B's *local* cache, byte-identical.
+        let (arts, _) = engine_b
+            .artifacts_from_local_cache(&ctoken, &def, "HASHIN1", vec!["out".to_string()])
+            .await
+            .expect("read")
+            .expect("present locally after download");
+        assert_eq!(arts.len(), 1);
+        let bytes = drain_reader(
+            engine_b
+                .local_cache
+                .reader(&addr, "HASHIN1", &arts[0].name)
+                .expect("local blob")
+                .reader,
+        );
+        assert!(!bytes.is_empty());
+    }
+
+    /// The background upload bumps the request's `bg_pending` counter and drops
+    /// it back to zero once the push finishes — the signal the CLI/TUI shutdown
+    /// path waits on so it never exits with an upload in flight. The pushed
+    /// revision is then visible to a fresh engine.
+    #[tokio::test]
+    async fn spawn_remote_upload_tracks_bg_pending_and_lands() {
+        use std::sync::atomic::Ordering;
+
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let (engine, _e) = engine_with_remote(&remote_uri);
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHBG",
+                vec![raw_artifact("a", b"bg payload")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        let rs = engine.new_state();
+        let bg = rs.bg_pending();
+        assert_eq!(bg.load(Ordering::Acquire), 0);
+        engine.spawn_remote_upload(&rs, addr.clone(), "HASHBG".to_string());
+
+        // Drains to zero once the detached upload completes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while bg.load(Ordering::Acquire) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bg_pending never drained"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The revision is now on the remote: a cold engine pulls it.
+        let (engine2, _e2) = engine_with_remote(&remote_uri);
+        assert!(
+            engine2
+                .download_from_remote(&ctoken, &addr, "HASHBG")
+                .await
+                .expect("download")
+                .is_some(),
+            "background upload must land on the remote"
+        );
+    }
+
+    /// A missing remote entry yields `None` (→ execute), not an error.
+    #[tokio::test]
+    async fn remote_download_miss_is_none() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let (engine, _d) = engine_with_remote(&remote_uri);
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        assert!(
+            engine
+                .download_from_remote(&ctoken, &addr, "NOPE")
+                .await
+                .expect("download")
+                .is_none()
+        );
     }
 
     fn test_addr() -> Addr {

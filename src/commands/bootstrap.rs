@@ -145,6 +145,26 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         })
         .unwrap_or_default();
 
+    // `caches:` is a name→config map; flatten into ordered defs (BTreeMap keeps
+    // a stable, name-sorted order). The engine measures latency to reorder reads.
+    let remote_caches: Vec<engine::RemoteCacheDef> = file
+        .caches
+        .iter()
+        .map(|(name, c)| engine::RemoteCacheDef {
+            name: name.clone(),
+            uri: c.uri.clone(),
+            read: c.read,
+            write: c.write,
+            concurrency: c.concurrency,
+        })
+        .collect();
+    // Captured before `remote_caches` is moved into `Config` below; reported via
+    // telemetry (backend kind/scheme only — never the URIs).
+    let remote_cache_backends: Vec<String> = remote_caches
+        .iter()
+        .map(|d| d.backend_kind().to_string())
+        .collect();
+
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
         home_dir: home_dir.clone(),
@@ -156,6 +176,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         lock_backend,
         spill_threshold_bytes,
         telemetry_enabled,
+        remote_caches,
     })?;
 
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
@@ -214,10 +235,12 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let engine = Arc::new(e);
 
     // Telemetry: record the enabled provider + driver type names (built-ins plus
-    // whatever the config turned on) for the exit reporter. Set-once.
+    // whatever the config turned on) and the remote-cache count for the exit
+    // reporter. Set-once.
     crate::telemetry::record_plugins(
         engine.providers_by_name.keys().cloned().collect(),
         engine.drivers_by_name.keys().cloned().collect(),
+        remote_cache_backends,
     );
 
     let (tx, rx) = mpsc::unbounded_channel();

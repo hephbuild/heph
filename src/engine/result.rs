@@ -1158,11 +1158,43 @@ impl Engine {
         let (executed, manifest) = match self.probe_cache_manifest(&rs, def, opts).await? {
             Some(manifest) => (None, Some(manifest)),
             None => {
-                let (cached, meta) = self
-                    .clone()
-                    .execute_and_cache_inner(rs.clone(), opts)
-                    .await?;
-                (Some(Arc::new(ExecutedArtifacts { cached, meta })), None)
+                // Local miss under the write lock: try to pull a complete
+                // revision from the remote caches into the local cache before
+                // executing. Safe to write local blobs here — the write lock
+                // excludes GC and other writers. A remote hit means "already
+                // built": skip execution and share the now-local entry.
+                //
+                // Bracket the pull with one `RemoteCacheRead` span per target
+                // (only when a readable cache exists) so a slow download shows as
+                // a single `↓` op in the per-target timeline — never one per
+                // blob/cache.
+                let downloaded = if self.remote_caches.has_readable() {
+                    let addr_s = addr.format();
+                    crate::engine::event::emit_scope(
+                        &rs,
+                        crate::engine::event::BuildEventKind::RemoteCacheReadStart {
+                            addr: addr_s.clone(),
+                        },
+                        move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
+                            addr: addr_s,
+                            error,
+                        },
+                        self.download_from_remote(ctoken, addr, opts.hashin.as_str()),
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                match downloaded {
+                    Some(manifest) => (None, Some(Arc::new(manifest))),
+                    None => {
+                        let (cached, meta) = self
+                            .clone()
+                            .execute_and_cache_inner(rs.clone(), opts)
+                            .await?;
+                        (Some(Arc::new(ExecutedArtifacts { cached, meta })), None)
+                    }
+                }
             }
         };
 
@@ -1505,8 +1537,13 @@ impl Engine {
                     .await
                     .map(|cached| (cached, artifacts_meta))
                     .with_context(|| format!("cache_locally {addr}"));
-                    // TODO(remote-cache): bracket the remote push with its own
-                    // RemoteCacheWrite{Start,End} events here once it lands.
+
+                    // Remote push: fire-and-forget on a background task (tracked
+                    // by `bg_pending`, so the CLI/TUI stays open until it drains).
+                    // Cacheable revisions only — tmp/uncacheable are never shared.
+                    if out.is_ok() && !use_tmp_cache {
+                        engine.spawn_remote_upload(&rs, addr.clone(), hashin.clone());
+                    }
 
                     // Post-write GC: trim this target's stale revisions in the
                     // background (same lane as sandbox cleanup), skipping

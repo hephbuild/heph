@@ -43,6 +43,9 @@ pub struct Config {
     pub spill_threshold_bytes: u64,
     /// Anonymous usage telemetry. Defaults to `true` (opt-out via config).
     pub telemetry_enabled: bool,
+    /// Named remote (shared) caches from the config's `caches:` map. Empty
+    /// disables the remote-cache layer entirely. See [`RemoteCacheSet`].
+    pub remote_caches: Vec<crate::engine::RemoteCacheDef>,
 }
 
 /// Default spill threshold: 8 MiB. Above a few MB the filesystem beats sqlite
@@ -64,6 +67,7 @@ impl Default for Config {
             lock_backend: LockBackend::default(),
             spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
             telemetry_enabled: true,
+            remote_caches: Vec::new(),
         }
     }
 }
@@ -179,6 +183,10 @@ pub struct Engine {
     /// Guards the execute phase so at most one execute runs per target addr at
     /// a time (cross-process with the filesystem backend, in-process with mem).
     pub(crate) result_lock: ResultLock,
+
+    /// Ordered set of remote (shared) caches fronting the local cache. Empty
+    /// (a cheap no-op on every path) unless `caches:` is configured.
+    pub(crate) remote_caches: Arc<crate::engine::RemoteCacheSet>,
 
     /// Aggregates every provider's exposed functions and injects the registry
     /// into consumers (the buildfile provider) exactly once, lazily on the first
@@ -431,6 +439,11 @@ impl Engine {
             .with_context(|| format!("create lock dir {lock_dir:?}"))?;
         let result_lock = ResultLock::new(cfg.lock_backend, lock_dir);
 
+        // Remote caches: backends are constructed synchronously here (no
+        // network); latency ordering is measured lazily on first use.
+        let remote_caches = crate::engine::RemoteCacheSet::new(&cfg.remote_caches, home.clone())
+            .context("configure remote caches")?;
+
         // Shared cross-run filesystem-walk cache, handed to tree-walking plugins
         // via `PluginInit`. Its own sqlite db so it can be pruned independently.
         let walker = Arc::new(crate::htwalk::CachedWalker::open(
@@ -457,6 +470,7 @@ impl Engine {
             managed_driver_factories: HashMap::new(),
             fuse,
             result_lock,
+            remote_caches,
             provider_functions_wired: std::sync::Once::new(),
         };
         engine.register_driver(|_| Box::new(crate::plugingroup::Driver))?;
