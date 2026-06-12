@@ -981,6 +981,77 @@ mod tests {
         assert_eq!(restored, raw);
     }
 
+    /// Backend whose blob writes block on a shared barrier, so the upload only
+    /// completes if every blob across every cache is in flight at the same time.
+    struct BarrierBackend {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for BarrierBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            Ok(None)
+        }
+        async fn open_write(&self, key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            // Manifests are written after their cache's blobs, so they must not
+            // join the blob rendezvous — only blob writes do.
+            if !key.ends_with(MANIFEST_V1) {
+                self.barrier.wait().await;
+            }
+            Ok(Box::pin(tokio::io::sink()))
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Proves every artifact is uploaded to every cache in parallel: the barrier
+    /// only releases when all `caches × blobs` blob writes are concurrently in
+    /// flight. Any serialization (blobs within a cache, or caches between each
+    /// other) would leave fewer than that at the barrier, so it never releases
+    /// and the bounded wait fails the test.
+    #[tokio::test]
+    async fn uploads_every_blob_to_every_cache_in_parallel() {
+        const CACHES: usize = 3;
+        const BLOBS: usize = 4;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let barrier = Arc::new(tokio::sync::Barrier::new(CACHES * BLOBS));
+        let caches = (0..CACHES)
+            .map(|i| ConfiguredCache {
+                def: def(&format!("c{i}"), &format!("memory:///c{i}"), true, true),
+                backend: Arc::new(BarrierBackend {
+                    barrier: barrier.clone(),
+                }),
+                health: CacheHealth::default(),
+            })
+            .collect();
+        let set = RemoteCacheSet {
+            caches,
+            home: dir.path().to_path_buf(),
+            config_hash: String::new(),
+            read_order: OnceCell::new(),
+        };
+
+        let blobs: Vec<(String, PathBuf)> = (0..BLOBS)
+            .map(|i| {
+                let path = dir.path().join(format!("b{i}.gz"));
+                gzip_to_file(&b"x"[..], &path).expect("gzip");
+                (format!("o{i}.tar"), path)
+            })
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            set.put_revision(&addr(), "h1", b"m", &blobs),
+        )
+        .await
+        .expect("all blob uploads across all caches must be in flight together");
+    }
+
     #[tokio::test]
     async fn read_only_cache_is_not_written() {
         let defs = vec![def("ro", "memory:///ro", true, false)];
