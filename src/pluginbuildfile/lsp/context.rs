@@ -12,7 +12,9 @@ use crate::engine::provider::{
 use crate::hasync::StdCancellationToken;
 use crate::htpkg::PkgBuf;
 use crate::pluginbuildfile::Provider;
-use crate::pluginbuildfile::run_file::{BuildFileLoader, build_globals, eval_source};
+use crate::pluginbuildfile::run_file::{
+    BuildFileLoader, build_globals, eval_source, resolve_load_target,
+};
 use starlark::docs::DocModule;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
@@ -125,21 +127,25 @@ impl HephLspContext {
         }
     }
 
-    /// The on-disk BUILD file URL for a package: the first file in the package
-    /// dir whose name matches a configured pattern (handles literal names like
-    /// `BUILD` and globs like `*.BUILD` alike).
+    /// The on-disk BUILD file URL for a package.
     fn build_file_url(&self, package: &str) -> Option<LspUrl> {
-        let dir = self.root.join(package);
-        let entry = std::fs::read_dir(&dir).ok()?.flatten().find(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                && self.patterns.iter().any(|p| p.matches(&name))
-        })?;
-        lsp_types::Url::from_file_path(entry.path())
+        let path = first_build_file(&self.root.join(package), &self.patterns)?;
+        lsp_types::Url::from_file_path(path)
             .ok()
             .and_then(|u| LspUrl::try_from(u).ok())
     }
+}
+
+/// First file in `dir` whose name matches one of `patterns` (handles literal
+/// names like `BUILD` and globs like `*.BUILD`). Used to resolve a package /
+/// `load("//pkg", …)` directory to its actual BUILD file.
+fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let name = e.file_name();
+        let matches = e.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && patterns.iter().any(|p| p.matches(&name.to_string_lossy()));
+        matches.then(|| e.path())
+    })
 }
 
 /// BUILD-file name patterns from the workspace's buildfile-provider config,
@@ -220,19 +226,23 @@ impl LspContext for HephLspContext {
         current_file: &LspUrl,
         _workspace_root: Option<&Path>,
     ) -> anyhow::Result<LspUrl> {
-        // `//pkg:file` → <root>/pkg/file ; `:file` or relative → next to current.
-        let resolved = if let Some(rest) = path.strip_prefix("//") {
-            let (pkg, file) = rest.split_once(':').unwrap_or((rest, ""));
-            self.root.join(pkg).join(file)
+        // Resolve exactly as the buildfile loader does (`//pkg`, `//pkg/x.BUILD`,
+        // `./rel`, `../rel`), so loaded symbols point at the same file heph reads.
+        let current_pkg = match current_file {
+            LspUrl::File(p) => self.path_to_pkg(p),
+            _ => String::new(),
+        };
+        let resolved = resolve_load_target(&self.root, &current_pkg, path)?;
+        // `load("//pkg", …)` targets a directory: resolve to its BUILD file so the
+        // file can be parsed for its exported symbols.
+        let file = if resolved.is_dir() {
+            first_build_file(&resolved, &self.patterns)
+                .ok_or_else(|| anyhow::anyhow!("no BUILD file in {}", resolved.display()))?
         } else {
-            let rel = path.strip_prefix(':').unwrap_or(path);
-            match current_file {
-                LspUrl::File(p) => p.parent().unwrap_or(Path::new("")).join(rel),
-                _ => PathBuf::from(rel),
-            }
+            resolved
         };
         Ok(LspUrl::try_from(
-            lsp_types::Url::from_file_path(&resolved)
+            lsp_types::Url::from_file_path(&file)
                 .map_err(|()| anyhow::anyhow!("non-file load path"))?,
         )?)
     }
@@ -310,11 +320,23 @@ impl LspContext for HephLspContext {
         current_value: &str,
         _workspace_root: Option<&Path>,
     ) -> anyhow::Result<Vec<StringCompletionResult>> {
-        // Only complete target-address-looking strings (skip load-path strings,
-        // which starlark_lsp handles via resolve_load).
-        if !matches!(kind, StringCompletionType::String) {
-            return Ok(vec![]);
+        // The first argument of a `load(...)`: complete package paths (`//pkg`),
+        // which heph resolves to that package's BUILD file.
+        if matches!(kind, StringCompletionType::LoadPath) {
+            let prefix = current_value.strip_prefix("//").unwrap_or("");
+            return Ok(self
+                .list_packages(prefix)
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .map(|pkg| StringCompletionResult {
+                    value: format!("//{pkg}"),
+                    insert_text: None,
+                    insert_text_offset: 0,
+                    kind: lsp_types::CompletionItemKind::MODULE,
+                })
+                .collect());
         }
+
         let Some(rest) = current_value.strip_prefix("//") else {
             return Ok(vec![]);
         };
@@ -345,5 +367,29 @@ impl LspContext for HephLspContext {
                 .collect(),
         };
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_build_file;
+
+    #[test]
+    fn first_build_file_matches_literal_and_glob_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+        std::fs::write(dir.path().join("pkg.BUILD"), "").unwrap();
+
+        // Glob pattern resolves the `*.BUILD` file (not the .txt).
+        let glob = vec![glob::Pattern::new("*.BUILD").unwrap()];
+        let found = first_build_file(dir.path(), &glob).unwrap();
+        assert_eq!(found.file_name().unwrap(), "pkg.BUILD");
+
+        // A literal pattern that doesn't match anything → None.
+        let literal = vec![glob::Pattern::new("BUILD").unwrap()];
+        assert!(first_build_file(dir.path(), &literal).is_none());
+
+        // Missing directory → None, not a panic.
+        assert!(first_build_file(&dir.path().join("nope"), &glob).is_none());
     }
 }

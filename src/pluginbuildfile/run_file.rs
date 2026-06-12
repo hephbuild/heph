@@ -932,7 +932,11 @@ impl BuildFileLoader {
 ///   `//pkg/...`     absolute, relative to workspace root
 ///   `./rel/...`     relative to `current_pkg`'s directory
 ///   `../rel/...`    relative to `current_pkg`'s directory (walks up via `..`)
-fn resolve_load_target(root: &Path, current_pkg: &str, path: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_load_target(
+    root: &Path,
+    current_pkg: &str,
+    path: &str,
+) -> anyhow::Result<PathBuf> {
     let raw = if let Some(rel) = path.strip_prefix("//") {
         if rel.is_empty() {
             anyhow::bail!("load() path must not be empty after `//`");
