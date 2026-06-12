@@ -385,10 +385,7 @@ mod tests {
             .unwrap();
         assert_eq!(pos.len(), 3);
         // Zero positionals is fine.
-        assert!(
-            sig.validate_args("fs.join", vec![], HashMap::new())
-                .is_ok()
-        );
+        assert!(sig.validate_args("fs.join", vec![], HashMap::new()).is_ok());
         // Each variadic element is type-checked.
         let err = sig
             .validate_args("fs.join", vec![Value::Int(1)], HashMap::new())
