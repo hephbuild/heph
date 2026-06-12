@@ -82,6 +82,58 @@ impl ConfigFile {
     pub fn telemetry_enabled(&self) -> bool {
         self.telemetry.map(|t| t.enabled).unwrap_or(true)
     }
+
+    /// Apply `other` on top of `self`, mutating in place. Used to layer profile
+    /// configs over the base `.hephconfig2` (see [`load_from_root`]).
+    ///
+    /// Optional/scalar fields override only when present in `other` — a profile
+    /// that omits a field leaves the base value untouched. `caches` merge by key
+    /// (a later entry replaces the whole entry under that name), and
+    /// `providers`/`drivers` merge by name (matching entry replaced, new ones
+    /// appended in order).
+    pub fn merge(&mut self, other: ConfigFile) {
+        if other.home_dir.is_some() {
+            self.home_dir = other.home_dir;
+        }
+        if other.mem_cache.is_some() {
+            self.mem_cache = other.mem_cache;
+        }
+        if other.tmp_cache.is_some() {
+            self.tmp_cache = other.tmp_cache;
+        }
+        if other.fuse.is_some() {
+            self.fuse = other.fuse;
+        }
+        if other.lock.is_some() {
+            self.lock = other.lock;
+        }
+        if other.fs.is_some() {
+            self.fs = other.fs;
+        }
+        if other.cache.is_some() {
+            self.cache = other.cache;
+        }
+        if other.telemetry.is_some() {
+            self.telemetry = other.telemetry;
+        }
+
+        // Caches override by key: extend replaces matching names, keeps the rest.
+        self.caches.extend(other.caches);
+
+        merge_plugins(&mut self.providers, other.providers);
+        merge_plugins(&mut self.drivers, other.drivers);
+    }
+}
+
+/// Merge `inc` plugin entries into `base` by name: an entry whose name already
+/// exists replaces it in place; a new name is appended, preserving order.
+fn merge_plugins(base: &mut Vec<PluginEntry>, inc: Vec<PluginEntry>) {
+    for entry in inc {
+        match base.iter_mut().find(|e| e.name == entry.name) {
+            Some(existing) => *existing = entry,
+            None => base.push(entry),
+        }
+    }
 }
 
 /// Anonymous usage telemetry. `telemetry: { enabled: false }` opts out; omitting
@@ -234,9 +286,51 @@ pub struct PluginEntry {
 /// [`crate::engine::get_root`] both build on it.
 pub const CONFIG_FILE_NAME: &str = ".hephconfig2";
 
-/// Load the workspace config from `<root>/.hephconfig2`.
+/// Env var naming the comma-separated list of config profiles to layer on top of
+/// the base config, in order. See [`load_from_root`].
+pub const PROFILES_ENV: &str = "HEPH_PROFILES";
+
+/// Profiles requested via `HEPH_PROFILES`, in order. Empty/whitespace entries are
+/// dropped, so `HEPH_PROFILES=a,,b ` yields `["a", "b"]`.
+fn profiles_from_env() -> Vec<String> {
+    std::env::var(PROFILES_ENV)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Load the workspace config from `<root>/.hephconfig2`, then layer each profile
+/// named in `HEPH_PROFILES` on top.
+///
+/// Profiles apply in the order listed: `HEPH_PROFILES=a,b` loads the base
+/// `.hephconfig2`, then applies `a.hephconfig2`, then `b.hephconfig2`, each
+/// merged over the accumulated config via [`ConfigFile::merge`] (so e.g. a cache
+/// entry is overridden by its key). A named profile file that is missing or
+/// invalid is a hard error.
 pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigFile> {
-    load(&root.join(CONFIG_FILE_NAME))
+    load_with_profiles(root, &profiles_from_env())
+}
+
+/// Core of [`load_from_root`], with the profile list passed in so it can be
+/// exercised without touching the process environment.
+fn load_with_profiles(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<ConfigFile> {
+    let mut cfg = load(&root.join(CONFIG_FILE_NAME))?;
+    for profile in profiles {
+        let profile = profile.as_ref();
+        // CONFIG_FILE_NAME carries the leading dot, so this is `<profile>.hephconfig2`.
+        let file_name = format!("{profile}{CONFIG_FILE_NAME}");
+        tracing::debug!(profile, file = %file_name, "applying config profile");
+        let overlay = load(&root.join(&file_name))
+            .with_context(|| format!("loading config profile {file_name}"))?;
+        cfg.merge(overlay);
+    }
+    Ok(cfg)
 }
 
 pub fn load(path: &Path) -> anyhow::Result<ConfigFile> {
@@ -575,5 +669,116 @@ caches:
         let yaml = "telemetry:\n  bogus: 1\n";
         let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn merge_overrides_caches_by_key() {
+        let mut base: ConfigFile = serde_yaml::from_str(
+            "caches:\n  a:\n    uri: s3://base/a\n  b:\n    uri: s3://base/b\n",
+        )
+        .expect("parse base");
+        let overlay: ConfigFile = serde_yaml::from_str(
+            "caches:\n  b:\n    uri: s3://prof/b\n  c:\n    uri: s3://prof/c\n",
+        )
+        .expect("parse overlay");
+
+        base.merge(overlay);
+
+        assert_eq!(base.caches.len(), 3);
+        // Untouched key keeps its base value.
+        assert_eq!(base.caches.get("a").expect("a").uri, "s3://base/a");
+        // Shared key is overridden by the overlay.
+        assert_eq!(base.caches.get("b").expect("b").uri, "s3://prof/b");
+        // New key is added.
+        assert_eq!(base.caches.get("c").expect("c").uri, "s3://prof/c");
+    }
+
+    #[test]
+    fn merge_overrides_scalars_only_when_present() {
+        let mut base: ConfigFile =
+            serde_yaml::from_str("homeDir: .base\nlock:\n  backend: fs\n").expect("parse base");
+        // Overlay sets homeDir but omits lock — lock must survive.
+        let overlay: ConfigFile = serde_yaml::from_str("homeDir: .prof\n").expect("parse overlay");
+
+        base.merge(overlay);
+
+        assert_eq!(base.home_dir.as_deref(), Some(Path::new(".prof")));
+        assert_eq!(
+            base.lock.expect("lock survives").backend,
+            Some(LockBackendConfig::Fs)
+        );
+    }
+
+    #[test]
+    fn merge_providers_by_name() {
+        let mut base: ConfigFile = serde_yaml::from_str(
+            "providers:\n  - name: buildfile\n    options:\n      patterns: [BUILD]\n  - name: go\n",
+        )
+        .expect("parse base");
+        let overlay: ConfigFile = serde_yaml::from_str(
+            "providers:\n  - name: buildfile\n    options:\n      patterns: [BUILD2]\n  - name: rust\n",
+        )
+        .expect("parse overlay");
+
+        base.merge(overlay);
+
+        // buildfile replaced, go kept, rust appended — order preserved.
+        let names: Vec<&str> = base.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["buildfile", "go", "rust"]);
+        let patterns: Vec<String> = decode_opt(&base.providers[0].options, "buildfile", "patterns")
+            .expect("decode")
+            .expect("present");
+        assert_eq!(patterns, vec!["BUILD2".to_string()]);
+    }
+
+    #[test]
+    fn load_with_profiles_layers_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join(".hephconfig2"),
+            "homeDir: .base\ncaches:\n  shared:\n    uri: s3://base/shared\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            root.join("a.hephconfig2"),
+            "caches:\n  shared:\n    uri: s3://a/shared\n",
+        )
+        .expect("write a");
+        std::fs::write(
+            root.join("b.hephconfig2"),
+            "homeDir: .b\ncaches:\n  shared:\n    uri: s3://b/shared\n",
+        )
+        .expect("write b");
+
+        let cfg = load_with_profiles(root, &["a", "b"]).expect("load");
+
+        // Last profile wins per key / scalar.
+        assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".b")));
+        assert_eq!(
+            cfg.caches.get("shared").expect("shared").uri,
+            "s3://b/shared"
+        );
+    }
+
+    #[test]
+    fn load_with_profiles_no_profiles_is_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig2"), "homeDir: .base\n").expect("write base");
+
+        let cfg = load_with_profiles(root, &[] as &[&str]).expect("load");
+        assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".base")));
+    }
+
+    #[test]
+    fn load_with_profiles_missing_profile_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig2"), "homeDir: .base\n").expect("write base");
+
+        let err = load_with_profiles(root, &["missing"]).expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing.hephconfig2"), "{msg}");
     }
 }
