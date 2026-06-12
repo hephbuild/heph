@@ -341,10 +341,34 @@ pub struct PluginEntry {
     pub options: Options,
 }
 
-/// Filename of the per-workspace config, located at the repo root. The single
-/// source of truth for this name — [`load_from_root`] and the root discovery in
-/// [`crate::engine::get_root`] both build on it.
-pub const CONFIG_FILE_NAME: &str = ".hephconfig2";
+/// Canonical filename of the per-workspace config, located at the repo root.
+/// New workspaces should use this name.
+pub const CONFIG_FILE_NAME: &str = ".hephconfig";
+
+/// Migration filename written when porting a legacy repo into this version of
+/// heph. While present it takes precedence over [`CONFIG_FILE_NAME`], so a repo
+/// mid-migration runs against the ported config until the legacy file is removed.
+pub const CONFIG_FILE_NAME_LEGACY: &str = ".hephconfig2";
+
+/// Candidate config filenames in priority order. The single source of truth for
+/// these names — [`load_from_root`] and the root discovery in
+/// [`crate::engine::get_root`] both build on it. The migration `.hephconfig2`
+/// wins when both exist; the canonical `.hephconfig` is read only when no
+/// `.hephconfig2` is present. The chosen name also drives the profile filenames
+/// (see [`load_with_profiles`]).
+pub const CONFIG_FILE_NAMES: &[&str] = &[CONFIG_FILE_NAME_LEGACY, CONFIG_FILE_NAME];
+
+/// Pick the config filename present at `root`, preferring the migration
+/// [`CONFIG_FILE_NAME_LEGACY`] over the canonical [`CONFIG_FILE_NAME`]. Falls back
+/// to [`CONFIG_FILE_NAME`] when neither exists so callers still get a sensible
+/// path for error messages.
+pub fn config_file_name_at(root: &Path) -> &'static str {
+    CONFIG_FILE_NAMES
+        .iter()
+        .copied()
+        .find(|name| root.join(name).exists())
+        .unwrap_or(CONFIG_FILE_NAME)
+}
 
 /// Env var naming the comma-separated list of config profiles to layer on top of
 /// the base config, in order. See [`load_from_root`].
@@ -365,14 +389,16 @@ fn profiles_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Load the workspace config from `<root>/.hephconfig2`, then layer each profile
-/// named in `HEPH_PROFILES` on top.
+/// Load the workspace config from `<root>/.hephconfig2` when present (the
+/// migration file), otherwise the canonical `<root>/.hephconfig`, then layer each
+/// profile named in `HEPH_PROFILES` on top.
 ///
-/// Profiles apply in the order listed: `HEPH_PROFILES=a,b` loads the base
-/// `.hephconfig2`, then applies `a.hephconfig2`, then `b.hephconfig2`, each
-/// merged over the accumulated config via [`ConfigYaml::merge`] (so e.g. a cache
-/// entry is overridden by its key). A named profile file that is missing or
-/// invalid is a hard error.
+/// Profiles apply in the order listed: `HEPH_PROFILES=a,b` loads the base config,
+/// then applies `a<suffix>`, then `b<suffix>`, each merged over the accumulated
+/// config via [`ConfigYaml::merge`] (so e.g. a cache entry is overridden by its
+/// key). The profile suffix tracks the base file actually chosen, so a legacy
+/// `.hephconfig2` workspace gets `a.hephconfig2` profiles. A named profile file
+/// that is missing or invalid is a hard error.
 pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigYaml> {
     load_with_profiles(root, &profiles_from_env())
 }
@@ -380,11 +406,13 @@ pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigYaml> {
 /// Core of [`load_from_root`], with the profile list passed in so it can be
 /// exercised without touching the process environment.
 fn load_with_profiles(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<ConfigYaml> {
-    let mut cfg = load(&root.join(CONFIG_FILE_NAME))?;
+    let base_name = config_file_name_at(root);
+    let mut cfg = load(&root.join(base_name))?;
     for profile in profiles {
         let profile = profile.as_ref();
-        // CONFIG_FILE_NAME carries the leading dot, so this is `<profile>.hephconfig2`.
-        let file_name = format!("{profile}{CONFIG_FILE_NAME}");
+        // base_name carries the leading dot, so this is `<profile>.hephconfig`
+        // (or `<profile>.hephconfig2` for a legacy workspace).
+        let file_name = format!("{profile}{base_name}");
         tracing::debug!(profile, file = %file_name, "applying config profile");
         let overlay = load(&root.join(&file_name))
             .with_context(|| format!("loading config profile {file_name}"))?;
@@ -831,17 +859,17 @@ caches:
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::write(
-            root.join(".hephconfig2"),
+            root.join(".hephconfig"),
             "homeDir: .base\ncaches:\n  shared:\n    uri: s3://base/shared\n",
         )
         .expect("write base");
         std::fs::write(
-            root.join("a.hephconfig2"),
+            root.join("a.hephconfig"),
             "caches:\n  shared:\n    uri: s3://a/shared\n",
         )
         .expect("write a");
         std::fs::write(
-            root.join("b.hephconfig2"),
+            root.join("b.hephconfig"),
             "homeDir: .b\ncaches:\n  shared:\n    uri: s3://b/shared\n",
         )
         .expect("write b");
@@ -858,7 +886,7 @@ caches:
     fn load_with_profiles_no_profiles_is_base() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        std::fs::write(root.join(".hephconfig2"), "homeDir: .base\n").expect("write base");
+        std::fs::write(root.join(".hephconfig"), "homeDir: .base\n").expect("write base");
 
         let cfg = load_with_profiles(root, &[] as &[&str]).expect("load");
         assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".base")));
@@ -868,11 +896,61 @@ caches:
     fn load_with_profiles_missing_profile_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        std::fs::write(root.join(".hephconfig2"), "homeDir: .base\n").expect("write base");
+        std::fs::write(root.join(".hephconfig"), "homeDir: .base\n").expect("write base");
 
         let err = load_with_profiles(root, &["missing"]).expect_err("must error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("missing.hephconfig2"), "{msg}");
+        assert!(msg.contains("missing.hephconfig"), "{msg}");
+    }
+
+    #[test]
+    fn config_file_name_prefers_legacy_then_canonical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Neither present: fall back to the canonical name for error paths.
+        assert_eq!(config_file_name_at(root), ".hephconfig");
+
+        // Only canonical present: pick it.
+        std::fs::write(root.join(".hephconfig"), "homeDir: .canonical\n").expect("write canonical");
+        assert_eq!(config_file_name_at(root), ".hephconfig");
+
+        // Both present: the migration `.hephconfig2` wins.
+        std::fs::write(root.join(".hephconfig2"), "homeDir: .legacy\n").expect("write legacy");
+        assert_eq!(config_file_name_at(root), ".hephconfig2");
+    }
+
+    #[test]
+    fn load_from_canonical_config_when_legacy_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig"), "homeDir: .canonical\n").expect("write canonical");
+
+        let cfg = load_with_profiles(root, &[] as &[&str]).expect("load");
+        assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".canonical")));
+    }
+
+    #[test]
+    fn load_prefers_legacy_when_both_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig"), "homeDir: .canonical\n").expect("write canonical");
+        std::fs::write(root.join(".hephconfig2"), "homeDir: .legacy\n").expect("write legacy");
+
+        let cfg = load_with_profiles(root, &[] as &[&str]).expect("load");
+        assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".legacy")));
+    }
+
+    #[test]
+    fn legacy_base_uses_legacy_profile_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig2"), "homeDir: .base\n").expect("write base");
+        // Profile must follow the chosen base name: `.hephconfig2`, not `.hephconfig`.
+        std::fs::write(root.join("a.hephconfig2"), "homeDir: .a\n").expect("write a");
+
+        let cfg = load_with_profiles(root, &["a"]).expect("load");
+        assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".a")));
     }
 
     #[test]
