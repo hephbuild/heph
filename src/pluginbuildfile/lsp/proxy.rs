@@ -10,7 +10,7 @@
 
 use super::index::SharedState;
 use crate::pluginbuildfile::run_file::resolve_load_target;
-use lsp_server::{Connection, Message, RequestId};
+use lsp_server::{Connection, Message, Notification, RequestId};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, Hover, HoverContents, LocationLink,
     MarkedString, MarkupContent, MarkupKind, Position, Range,
@@ -47,6 +47,15 @@ pub(crate) fn run(client: &Connection, server: &Connection, shared: Arc<SharedSt
                     break;
                 }
             }
+            // The client side ended — either an `exit` notification, or stdin
+            // closed (the editor disconnected without the shutdown/exit handshake).
+            // Tell the inner server to exit so its main loop returns and the
+            // server→client thread unblocks; otherwise the process would hang.
+            // Ignore the result: the inner server may already be gone.
+            let _sent = server.sender.send(Message::Notification(Notification {
+                method: "exit".to_string(),
+                params: serde_json::Value::Null,
+            }));
         });
 
         // server → client: forward, enriching recorded responses.
