@@ -295,36 +295,83 @@ fn enrich_hover(
 
 /// Hover markdown for a provider-function reference under the cursor, or `None`
 /// if the cursor is not on a `heph.<provider>.<fn>` whose function is registered.
-/// Renders the canonical signature plus the function's doc string.
 ///
 /// This can't be left to the stock `starlark_lsp`: its hover resolves top-level
 /// globals and `load()`-ed symbols, but not a member of a *global namespace*
-/// (`heph` → `fs` → `join`). The native registration already supplies these
-/// functions' signature/param types (see `run_file::build_globals`) yet the
-/// stock server still produces no hover for them — so we render it here from the
-/// function registry.
+/// (`heph` → `fs` → `join`) — hovering one resolves only as far as the top-level
+/// `heph` value (even for the `heph.core` builtins). The native registration
+/// already supplies these functions' signature/param types (see
+/// `run_file::build_globals`) yet the stock server still produces no member
+/// hover, so we render it here from the function registry.
+///
+/// To look and color identically to a local `def`, build a starlark
+/// [`DocFunction`] from the declared signature and run it through the same
+/// `render_doc_item_no_link` the stock server uses — yielding a
+/// `def name(p: str) -> str` prototype with Starlark type names.
 fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) -> Option<String> {
+    use crate::htvalue::signature::Param;
+    use starlark::docs::markdown::render_doc_item_no_link;
+    use starlark::docs::{
+        DocFunction, DocItem, DocMember, DocParam, DocParams, DocReturn, DocString, DocStringKind,
+    };
+
     let line_text = source.lines().nth(line as usize)?;
     let (provider, func) = provider_fn_at(line_text, col as usize)?;
     let registry = shared.engine.provider_function_registry();
     let rf = registry.get(&provider, &func)?;
-    // Match the shape `starlark`'s own `render_doc_item` produces for local
-    // `def`s / builtins (what other hovers use): a `## name` header, a
-    // ```python prototype block, then the doc. `render` yields
-    // `join(*elems: string) -> string`; prefix the namespace so the prototype
-    // reads as the call site does. Underscores are escaped in the header (it's
-    // outside the code fence, where markdown would italicize them).
-    let path = format!("heph.{provider}.{func}");
-    let prototype = format!("heph.{provider}.{}", rf.signature.render(&func));
-    let mut md = format!(
-        "## {}\n\n```python\n{prototype}\n```",
-        path.replace('_', "\\_")
-    );
-    if !rf.doc.is_empty() {
-        md.push_str("\n\n");
-        md.push_str(&rf.doc);
+    let sig = &rf.signature;
+
+    let ty = |p: &Param| crate::pluginbuildfile::run_file::param_type_to_ty(&p.ty);
+    let to_param = |p: &Param| DocParam {
+        name: p.name.to_string(),
+        docs: None,
+        typ: ty(p),
+        default_value: p.default.as_ref().map(default_repr),
+    };
+    let params = DocParams {
+        pos_only: Vec::new(),
+        pos_or_named: sig.positional.iter().map(to_param).collect(),
+        // A `*args`-style variadic: each element typed as the variadic's type.
+        args: sig.variadic.as_ref().map(|p| DocParam {
+            name: p.name.to_string(),
+            docs: None,
+            typ: ty(p),
+            default_value: None,
+        }),
+        named_only: sig.named.iter().map(to_param).collect(),
+        kwargs: None,
+    };
+    let item = DocItem::Member(DocMember::Function(DocFunction {
+        docs: DocString::from_docstring(DocStringKind::Starlark, &rf.doc),
+        params,
+        ret: DocReturn {
+            docs: None,
+            typ: crate::pluginbuildfile::run_file::param_type_to_ty(&sig.returns),
+        },
+    }));
+    Some(render_doc_item_no_link(
+        &format!("heph.{provider}.{func}"),
+        &item,
+    ))
+}
+
+/// Render an htvalue default as a Starlark literal for the hover prototype
+/// (`name: ty = <repr>`). Best-effort: containers collapse to `[]`/`[...]` etc.
+fn default_repr(v: &crate::htvalue::Value) -> String {
+    use crate::htvalue::Value;
+    match v {
+        Value::Null() => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Uint(u) => u.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => format!("{s:?}"),
+        Value::List(xs) if xs.is_empty() => "[]".to_string(),
+        Value::List(_) => "[...]".to_string(),
+        Value::Map(m) if m.is_empty() => "{}".to_string(),
+        Value::Map(_) => "{...}".to_string(),
     }
-    Some(md)
 }
 
 /// If the identifier at byte offset `col` on `line` is the final segment of a

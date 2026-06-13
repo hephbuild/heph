@@ -82,8 +82,9 @@ pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
         .build()
 }
 
-/// Map a [`ParamType`] to the Starlark `Ty` used for native param/return typing.
-fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
+/// Map a [`ParamType`] to the Starlark `Ty` used for native param/return typing
+/// (and, for the LSP, to render hover signatures with Starlark type names).
+pub(crate) fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
     use starlark::typing::Ty;
     match t {
         ParamType::String => Ty::string(),
