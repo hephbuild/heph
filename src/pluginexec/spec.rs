@@ -196,7 +196,7 @@ impl TargetSpec {
                 ),
                 field(
                     "cache",
-                    ParamType::Bool,
+                    ParamType::union(vec![ParamType::Bool, ParamType::map(ParamType::Bool)]),
                     "Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.",
                 ),
                 field(

@@ -24,6 +24,9 @@ pub enum ParamType {
     List(Box<ParamType>),
     /// String-keyed map; value type boxed.
     Map(Box<ParamType>),
+    /// Accepts any one of several types, e.g. `cache` being `bool | map[bool]`.
+    /// Rendered as the members joined by ` | `; matches if any member matches.
+    Union(Vec<ParamType>),
 }
 
 impl ParamType {
@@ -37,6 +40,11 @@ impl ParamType {
         ParamType::Map(Box::new(value))
     }
 
+    /// Convenience: a union accepting any of `types`.
+    pub fn union(types: Vec<ParamType>) -> ParamType {
+        ParamType::Union(types)
+    }
+
     /// Human-readable name used in rendered signatures and error messages.
     pub fn render(&self) -> String {
         match self {
@@ -48,12 +56,20 @@ impl ParamType {
             ParamType::Null => "null".to_string(),
             ParamType::List(inner) => format!("list[{}]", inner.render()),
             ParamType::Map(value) => format!("map[{}]", value.render()),
+            ParamType::Union(types) => types
+                .iter()
+                .map(ParamType::render)
+                .collect::<Vec<_>>()
+                .join(" | "),
         }
     }
 
     /// Whether `v` structurally matches this type. Recurses into `List`/`Map`
     /// element types; an empty list/map trivially matches.
     pub fn matches(&self, v: &Value) -> bool {
+        if let ParamType::Union(types) = self {
+            return types.iter().any(|t| t.matches(v));
+        }
         match (self, v) {
             (ParamType::String, Value::String(_)) => true,
             (ParamType::Bool, Value::Bool(_)) => true,
@@ -261,6 +277,18 @@ mod tests {
             variadic: None,
             returns: ParamType::list(ParamType::String),
         }
+    }
+
+    #[test]
+    fn union_renders_and_matches_any_member() {
+        let ty = ParamType::union(vec![ParamType::Bool, ParamType::map(ParamType::Bool)]);
+        assert_eq!(ty.render(), "bool | map[bool]");
+        assert!(ty.matches(&Value::Bool(true)));
+        assert!(ty.matches(&Value::Map(std::collections::HashMap::from([(
+            "skip".to_string(),
+            Value::Bool(true)
+        )]))));
+        assert!(!ty.matches(&Value::Int(3)));
     }
 
     #[test]

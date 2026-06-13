@@ -82,6 +82,7 @@ fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
         ParamType::Null => Ty::none(),
         ParamType::List(inner) => Ty::list(param_type_to_ty(inner)),
         ParamType::Map(value) => Ty::dict(Ty::string(), param_type_to_ty(value)),
+        ParamType::Union(types) => Ty::unions(types.iter().map(param_type_to_ty).collect()),
     }
 }
 
