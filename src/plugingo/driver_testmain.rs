@@ -127,16 +127,13 @@ impl ManagedDriver for GoTestmainDriver {
             }
         }
 
-        let mode = spec.mode;
-
         let def = GoTestmainDef {
             golist_origin_id,
-            mode,
+            mode: spec.mode,
         };
 
-        let out_strings = spec.out;
-
-        let outputs = out_strings
+        let outputs = spec
+            .out
             .iter()
             .map(|(group, paths)| Output {
                 group: group.clone(),

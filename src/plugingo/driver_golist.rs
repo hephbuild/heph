@@ -120,12 +120,6 @@ impl ManagedDriver for GoGolistDriver {
 
         let spec =
             GoGolistSpec::from(req.target_spec.config.clone()).context("parse go_golist config")?;
-        let import_path = spec.import_path;
-        let goos = spec.goos;
-        let goarch = spec.goarch;
-        let goroot = spec.goroot;
-        let build_tags = spec.build_tags;
-        let thirdparty_download_addr = spec.thirdparty_download_addr;
 
         // Parse deps (srcfiles, modfiles) — no go_bin here
         let dep_strings = spec.deps;
@@ -169,13 +163,13 @@ impl ManagedDriver for GoGolistDriver {
         };
 
         let def = GoGolistDef {
-            import_path,
-            goos,
-            goarch,
-            goroot,
-            build_tags,
+            import_path: spec.import_path,
+            goos: spec.goos,
+            goarch: spec.goarch,
+            goroot: spec.goroot,
+            build_tags: spec.build_tags,
             dep_inputs: dep_inputs.clone(),
-            thirdparty_download_addr,
+            thirdparty_download_addr: spec.thirdparty_download_addr,
         };
 
         let hash = {
@@ -187,9 +181,8 @@ impl ManagedDriver for GoGolistDriver {
         };
 
         // Parse outputs from spec, prepend package path
-        let out_strings = spec.out;
-
-        let outputs = out_strings
+        let outputs = spec
+            .out
             .iter()
             .map(|(group, paths)| Output {
                 group: group.clone(),

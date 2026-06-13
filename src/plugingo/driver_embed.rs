@@ -93,12 +93,9 @@ impl ManagedDriver for GoEmbedDriver {
 
         let spec =
             GoEmbedSpec::from(req.target_spec.config.clone()).context("parse go_embed config")?;
-        let variant = spec.variant;
 
-        // Parse deps.golist
-        let deps = spec.deps;
-
-        let golist_addrs = deps
+        let golist_addrs = spec
+            .deps
             .get("golist")
             .ok_or_else(|| anyhow::anyhow!("go_embed: missing deps.golist"))?;
 
@@ -127,14 +124,13 @@ impl ManagedDriver for GoEmbedDriver {
         // (`build_lib` / `build_test_lib`) declares them in its own deps.
 
         let def = GoEmbedDef {
-            variant,
+            variant: spec.variant,
             golist_origin_id,
         };
 
         // Parse outputs
-        let out_strings = spec.out;
-
-        let outputs = out_strings
+        let outputs = spec
+            .out
             .iter()
             .map(|(group, paths)| Output {
                 group: group.clone(),
