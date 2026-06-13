@@ -51,7 +51,7 @@ pub struct State {
 pub struct ProvenanceFrame {
     /// Name of the function whose body this call site is in (`<module>` at top level).
     pub fn_name: String,
-    /// Absolute path of the BUILD/.bzl file containing the call site.
+    /// Absolute path of the BUILD file containing the call site.
     pub file: String,
     pub line_start: u32,
     pub line_end: u32,
