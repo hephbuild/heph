@@ -349,10 +349,10 @@ fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) ->
             typ: crate::pluginbuildfile::run_file::param_type_to_ty(&sig.returns),
         },
     }));
-    Some(render_doc_item_no_link(
-        &format!("heph.{provider}.{func}"),
-        &item,
-    ))
+    // Render under the bare function name so the prototype reads `def join(...)`
+    // — identical to a local `def` — rather than `def heph.fs.join(...)`. The
+    // namespace is evident from the call site being hovered.
+    Some(render_doc_item_no_link(&func, &item))
 }
 
 /// Render an htvalue default as a Starlark literal for the hover prototype
