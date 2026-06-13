@@ -349,18 +349,27 @@ fn in_driver_value(prefix: &str) -> bool {
         .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
 }
 
-fn field_item(name: &str, ty: &str, doc: String, ctx: &str) -> CompletionItem {
+fn field_item(name: &str, ty: &str, doc: String, ctx: &str, required: bool) -> CompletionItem {
+    // Target config fields are mostly optional, so mark the minority — the
+    // required ones — explicitly (Bazel `mandatory` / JSON-Schema `required`
+    // convention), rather than `?`-marking every optional field.
+    let detail = if required {
+        format!("{ctx}: {ty} (required)")
+    } else {
+        format!("{ctx}: {ty}")
+    };
     CompletionItem {
         label: name.to_string(),
         kind: Some(CompletionItemKind::FIELD),
-        detail: Some(format!("{ctx}: {ty}")),
+        detail: Some(detail),
         documentation: Some(lsp_types::Documentation::String(doc)),
         // Insert as `name = ` to match the keyword-argument call site.
         insert_text: Some(format!("{name} = ")),
         // Editors rank by `sort_text` (falling back to the label), ignoring list
         // order. The `0_` prefix sorts these schema fields ahead of every
-        // stock/builtin item (whose effective sort key starts with a letter).
-        sort_text: Some(format!("0_{name}")),
+        // stock/builtin item (whose effective sort key starts with a letter);
+        // the nested `0_`/`1_` floats required fields above optional ones.
+        sort_text: Some(format!("0_{}_{name}", if required { 0 } else { 1 })),
         ..Default::default()
     }
 }
@@ -406,7 +415,7 @@ fn enrich_completion(
     } else if let Some(driver) = index.driver_at(l, c) {
         let mut items: Vec<CompletionItem> = crate::pluginbuildfile::run_file::target_base_fields()
             .into_iter()
-            .map(|f| field_item(&f.name, &f.ty.render(), f.doc, "target"))
+            .map(|f| field_item(&f.name, &f.ty.render(), f.doc, "target", f.required))
             .collect();
         if !driver.is_empty()
             && let Some(schema) = shared.engine.driver_schema(driver)
@@ -415,7 +424,7 @@ fn enrich_completion(
                 schema
                     .fields
                     .into_iter()
-                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, driver)),
+                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, driver, f.required)),
             );
         }
         items
@@ -426,7 +435,7 @@ fn enrich_completion(
             .map(|s| {
                 s.fields
                     .into_iter()
-                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, provider))
+                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, provider, f.required))
                     .collect()
             })
             .unwrap_or_default()

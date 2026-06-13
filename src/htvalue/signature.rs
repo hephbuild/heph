@@ -141,22 +141,27 @@ pub struct FnSignature {
 }
 
 impl FnSignature {
-    /// Render as `name(p1: type, *rest: type, k1: type) -> ret` for `inspect functions`.
+    /// Render as `name(p1: type, opt?: type, *rest: type, k1: type) -> ret` for
+    /// `inspect functions`. Optional params (those with a default) are marked
+    /// with a trailing `?` on the name — the TypeScript / LSP convention — so
+    /// required vs optional is visible without spelling out each default.
     pub fn render(&self, name: &str) -> String {
+        let render_param = |p: &Param| {
+            let opt = if p.default.is_some() { "?" } else { "" };
+            format!("{}{}: {}", p.name, opt, p.ty.render())
+        };
         let params = self
             .positional
             .iter()
-            .map(|p| format!("{}: {}", p.name, p.ty.render()))
+            .map(render_param)
+            // A variadic param is inherently zero-or-more; `*name` already
+            // conveys that, so it is never additionally `?`-marked.
             .chain(
                 self.variadic
                     .iter()
                     .map(|p| format!("*{}: {}", p.name, p.ty.render())),
             )
-            .chain(
-                self.named
-                    .iter()
-                    .map(|p| format!("{}: {}", p.name, p.ty.render())),
-            )
+            .chain(self.named.iter().map(render_param))
             .collect::<Vec<_>>()
             .join(", ");
         format!("{name}({params}) -> {}", self.returns.render())
@@ -453,6 +458,29 @@ mod tests {
         assert_eq!(
             sig_one_string().render("glob"),
             "glob(pattern: string) -> list[string]"
+        );
+    }
+
+    #[test]
+    fn optional_params_render_with_question_mark() {
+        // Optional (defaulted) params get a trailing `?`; required ones don't,
+        // and a variadic stays `*name` without an extra `?`.
+        let sig = FnSignature {
+            positional: vec![
+                Param::required("src", ParamType::String),
+                Param::optional("abs", ParamType::Bool, Value::Bool(false)),
+            ],
+            named: vec![Param::optional(
+                "sep",
+                ParamType::String,
+                Value::String("/".into()),
+            )],
+            variadic: None,
+            returns: ParamType::String,
+        };
+        assert_eq!(
+            sig.render("join"),
+            "join(src: string, abs?: bool, sep?: string) -> string"
         );
     }
 }
