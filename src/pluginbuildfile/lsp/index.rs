@@ -4,7 +4,7 @@
 //! Two things are indexed from a successful evaluation:
 //! - **call → targets**: every source call site (the `target()` call and the
 //!   macros/loops above it) mapped to the addresses it produced. Drives the
-//!   "Generated targets" hover.
+//!   "Targets" hover.
 //! - **target-call → driver**: each `target()` call's source span and its
 //!   `driver`, so completion inside that call can offer the driver's config
 //!   fields.

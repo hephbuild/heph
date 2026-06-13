@@ -3,7 +3,7 @@
 //! untouched except `textDocument/hover` and `textDocument/completion`: those are
 //! forwarded too, but their responses are enriched on the way back with heph
 //! specifics the stock server can't know about —
-//! - hover gains a "Generated targets" block (the addresses produced by the
+//! - hover gains a "Targets" block (the addresses produced by the
 //!   symbol under the cursor), and
 //! - completion gains the config fields of the target's `driver` (from the
 //!   driver's [`schema`](crate::engine::driver::Driver::schema)).
@@ -268,10 +268,7 @@ fn enrich_hover(
         if !md.is_empty() {
             md.push_str("\n\n---\n\n");
         }
-        md.push_str(&format!(
-            "**Generated targets ({})**\n\n```\n",
-            targets.len()
-        ));
+        md.push_str(&format!("**Targets ({})**\n\n```\n", targets.len()));
         for a in targets {
             md.push_str(a);
             md.push('\n');
