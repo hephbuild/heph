@@ -1,7 +1,7 @@
 use crate::engine::driver::targetdef::path::CodegenMode;
 use crate::htspec::{FromSpecValue, Spec};
 use crate::htvalue::signature::ParamType;
-use crate::htvalue::{Value, parse_bool, parse_string};
+use crate::htvalue::{Value, parse_bool};
 use anyhow::Context;
 use std::collections::HashMap;
 
@@ -94,24 +94,6 @@ impl FromSpecValue for TargetSpecCache {
             ParamType::Bool,
             ParamType::map(ParamType::union(vec![ParamType::Bool, ParamType::Int])),
         ])
-    }
-}
-
-/// Codegen mode: a bare string (`copy` / `in_place`) or absent → `None`.
-impl FromSpecValue for CodegenMode {
-    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
-        match parse_string(v)? {
-            Some(s) => match s.as_str() {
-                "copy" => Ok(CodegenMode::Copy),
-                "in_place" => Ok(CodegenMode::InPlace),
-                _ => Err(anyhow::anyhow!("invalid codegen mode: {}", s)),
-            },
-            None => Ok(CodegenMode::None),
-        }
-    }
-
-    fn spec_param_type() -> ParamType {
-        ParamType::String
     }
 }
 
@@ -414,10 +396,12 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
-        assert!(
-            format!("{err:#}").contains("invalid codegen mode: link"),
-            "{err:#}"
-        );
+        // `codegen` is now a `SpecEnum`: an unknown string lists the valid
+        // variants and the field name (from the `parse \`codegen\`` context).
+        let msg = format!("{err:#}");
+        assert!(msg.contains("codegen"), "{msg}");
+        assert!(msg.contains("expected one of"), "{msg}");
+        assert!(msg.contains("link"), "{msg}");
     }
 
     #[test]

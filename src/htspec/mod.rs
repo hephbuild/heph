@@ -1,16 +1,22 @@
-//! Runtime support for `#[derive(Spec)]` / `#[derive(SpecUnion)]`.
+//! Runtime support for the spec derives (`Spec`, `SpecStruct`, `SpecEnum`,
+//! `SpecUnion`).
 //!
 //! A target config spec is a struct whose fields are parsed out of a raw
 //! BUILD-file config map (`HashMap<String, Value>`). [`FromSpecValue`] is the
 //! single source of truth pairing *how a field parses* with *what shape it
-//! accepts* (its [`ParamType`]); the derive macro reads both off the field
-//! type so the parser and the LSP schema cannot drift.
+//! accepts* (its [`ParamType`]); the derive reads both off the field type so
+//! the parser and the LSP schema cannot drift.
 //!
-//! Container impls below (`Vec<String>`, the two `HashMap` shapes) are
-//! themselves unions — they accept e.g. `string | list[string]` — reusing the
-//! existing `crate::htvalue::parse_*` helpers. A field that accepts a bespoke
-//! union of shapes either implements `FromSpecValue` by hand (see
-//! `TargetSpecCache` in `pluginexec::spec`) or derives [`SpecUnion`] on an enum.
+//! Field/value types implement [`FromSpecValue`] in one of four ways:
+//!   * the primitive + container impls below (`String`, `bool`, `u32`,
+//!     `Vec<String>`, the two `HashMap` shapes) — several are themselves unions
+//!     (e.g. `string | list[string]`), reusing `crate::htvalue::parse_*`;
+//!   * `#[derive(SpecStruct)]` — a nested object with well-known keys
+//!     (`map[...]`);
+//!   * `#[derive(SpecEnum)]` — a string-valued enum;
+//!   * `#[derive(SpecUnion)]` — a value accepting one of several shapes; or a
+//!     hand-written impl for a bespoke shape (see `TargetSpecCache` in
+//!     `pluginexec::spec`).
 
 use crate::htvalue::signature::ParamType;
 use crate::htvalue::{
@@ -18,7 +24,7 @@ use crate::htvalue::{
     parse_strings,
 };
 
-pub use htspec_derive::{Spec, SpecUnion};
+pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
 
 /// A type parsable from a BUILD-file [`Value`] that also describes its own
 /// accepted shape. Implemented for the primitive + container shapes specs use;
@@ -86,6 +92,23 @@ impl FromSpecValue for bool {
 
     fn spec_param_type() -> ParamType {
         ParamType::Bool
+    }
+}
+
+impl FromSpecValue for u32 {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        let n: i64 = match v {
+            Value::Int(i) => *i,
+            Value::Uint(u) => {
+                i64::try_from(*u).map_err(|_e| anyhow::anyhow!("integer too large"))?
+            }
+            _ => anyhow::bail!("invalid: expected int, got: {:?}", v),
+        };
+        u32::try_from(n).map_err(|_e| anyhow::anyhow!("invalid: expected u32, got: {n}"))
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::Int
     }
 }
 
@@ -266,5 +289,109 @@ mod tests {
         // Flat = string | list[string]; Grouped adds map[...]; dups collapse.
         let r = Strings::spec_param_type().render();
         assert_eq!(r, "string | list[string] | map[string | list[string]]");
+    }
+
+    // --- SpecEnum ---
+
+    #[derive(SpecEnum, Debug, PartialEq, Default)]
+    enum Codegen {
+        #[default]
+        #[spec(skip)]
+        None,
+        Copy,
+        InPlace,
+        #[spec(rename = "in-place-v2")]
+        InPlaceV2,
+    }
+
+    #[test]
+    fn enum_parses_snake_case_and_rename() {
+        assert_eq!(
+            Codegen::from_spec_value(&Value::String("copy".to_string())).unwrap(),
+            Codegen::Copy
+        );
+        // CamelCase ident lowers to snake_case by default.
+        assert_eq!(
+            Codegen::from_spec_value(&Value::String("in_place".to_string())).unwrap(),
+            Codegen::InPlace
+        );
+        // `rename` overrides the spelling.
+        assert_eq!(
+            Codegen::from_spec_value(&Value::String("in-place-v2".to_string())).unwrap(),
+            Codegen::InPlaceV2
+        );
+    }
+
+    #[test]
+    fn enum_default_variant_accepts_null_but_not_its_name() {
+        // A `#[default]` variant maps null → default.
+        assert_eq!(
+            Codegen::from_spec_value(&Value::Null()).unwrap(),
+            Codegen::None
+        );
+        // `#[spec(skip)]` means the string "none" is *not* a valid variant.
+        let err = Codegen::from_spec_value(&Value::String("none".to_string())).unwrap_err();
+        assert!(format!("{err:#}").contains("expected one of"), "{err:#}");
+    }
+
+    #[test]
+    fn enum_param_type_is_string() {
+        assert_eq!(Codegen::spec_param_type(), ParamType::String);
+    }
+
+    // --- SpecStruct ---
+
+    /// A nested object: `{enabled, remote, history}` with per-key defaults.
+    #[derive(SpecStruct, Debug, PartialEq)]
+    struct CacheCfg {
+        #[spec(rename = "enabled", default = true)]
+        local: bool,
+        #[spec(default = true)]
+        remote: bool,
+        #[spec(default = 1u32, parse = parse_count)]
+        history: u32,
+    }
+
+    fn cache_map(entries: &[(&str, Value)]) -> Value {
+        Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn struct_parses_known_keys_with_defaults() {
+        let cfg = CacheCfg::from_spec_value(&cache_map(&[("remote", Value::Bool(false))])).unwrap();
+        assert_eq!(
+            cfg,
+            CacheCfg {
+                local: true,
+                remote: false,
+                history: 1
+            }
+        );
+    }
+
+    #[test]
+    fn struct_rejects_unknown_key_and_non_map() {
+        let unknown =
+            CacheCfg::from_spec_value(&cache_map(&[("bogus", Value::Bool(true))])).unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("unknown entries"),
+            "{unknown:#}"
+        );
+        let not_map = CacheCfg::from_spec_value(&Value::Bool(true)).unwrap_err();
+        assert!(
+            format!("{not_map:#}").contains("expected a map"),
+            "{not_map:#}"
+        );
+    }
+
+    #[test]
+    fn struct_param_type_is_map_of_value_union() {
+        // Heterogeneous field types collapse to map[bool | int].
+        assert_eq!(CacheCfg::spec_param_type().render(), "map[bool | int]");
     }
 }

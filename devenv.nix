@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p heph-testkit -p plugingo-e2e";
+  qualityCrates = "-p heph -p e2e -p heph-testkit -p plugingo-e2e -p htspec-derive";
 in
 {
   # https://devenv.sh/basics/

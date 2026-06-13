@@ -565,9 +565,16 @@ pub mod targetdef {
             }
         }
 
-        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+        /// Codegen mode parsed from the BUILD-file `codegen` attribute. A bare
+        /// string (`copy` / `in_place`) or absent/null → `None`. `#[derive(SpecEnum)]`
+        /// supplies the [`FromSpecValue`] impl (string → variant); `None` is
+        /// `#[spec(skip)]` so it is only the absent/null default, never a string.
+        ///
+        /// [`FromSpecValue`]: crate::htspec::FromSpecValue
+        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, crate::htspec::SpecEnum)]
         pub enum CodegenMode {
             #[default]
+            #[spec(skip)]
             None,
             Copy,
             InPlace,
