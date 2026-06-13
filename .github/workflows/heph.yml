@@ -31,6 +31,18 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
+      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
+      # Cold runners otherwise re-realize the whole toolchain every job, which
+      # intermittently fails to fetch/realize a rust-overlay patch
+      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
+      # Keyed on the devenv lock so a toolchain bump busts the cache.
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5368709120
+          gc-max-store-size-macos: 5368709120
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -99,6 +111,18 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
+      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
+      # Cold runners otherwise re-realize the whole toolchain every job, which
+      # intermittently fails to fetch/realize a rust-overlay patch
+      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
+      # Keyed on the devenv lock so a toolchain bump busts the cache.
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5368709120
+          gc-max-store-size-macos: 5368709120
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -215,6 +239,18 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
+      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
+      # Cold runners otherwise re-realize the whole toolchain every job, which
+      # intermittently fails to fetch/realize a rust-overlay patch
+      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
+      # Keyed on the devenv lock so a toolchain bump busts the cache.
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5368709120
+          gc-max-store-size-macos: 5368709120
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -276,6 +312,18 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: fallback = true
+      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
+      # Cold runners otherwise re-realize the whole toolchain every job, which
+      # intermittently fails to fetch/realize a rust-overlay patch
+      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
+      # Keyed on the devenv lock so a toolchain bump busts the cache.
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5368709120
+          gc-max-store-size-macos: 5368709120
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
