@@ -65,6 +65,11 @@ pub struct ManagedRunResponse {
 #[async_trait]
 pub trait ManagedDriver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
+    /// Optional config schema, forwarded by the bridge's [`Driver::schema`]. See
+    /// [`crate::engine::driver::Driver::schema`].
+    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
+        None
+    }
     async fn parse(
         &self,
         req: ParseRequest,
@@ -196,6 +201,10 @@ impl ManagedDriverBridge {
 impl Driver for ManagedDriverBridge {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         self.os.driver.config(req)
+    }
+
+    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
+        self.os.driver.schema()
     }
 
     async fn parse(

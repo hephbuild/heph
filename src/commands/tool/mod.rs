@@ -1,3 +1,4 @@
+mod build_lsp;
 mod cache;
 mod completions;
 pub mod gc;
@@ -48,6 +49,9 @@ pub enum ToolCommands {
     ///
     /// Example: `heph tool completions bash`
     Completions(completions::Args),
+    /// Run the BUILD-file language server over stdio (used by editors).
+    #[command(name = "build-lsp", hide = true)]
+    BuildLsp(build_lsp::Args),
 }
 
 impl ToolArgs {
@@ -67,6 +71,7 @@ impl ToolCommands {
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
             ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Completions(args) => completions::execute(args),
+            ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),
         }
     }
 }

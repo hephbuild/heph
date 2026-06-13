@@ -445,6 +445,10 @@ impl engine::driver_managed::ManagedDriver for Driver {
         })
     }
 
+    fn schema(&self) -> Option<engine::driver::DriverSchema> {
+        Some(spec::TargetSpec::schema())
+    }
+
     async fn parse(
         &self,
         req: ParseRequest,
@@ -535,11 +539,17 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 .push(input.clone());
         }
 
-        let pass_env: BTreeMap<String, String> = spec
-            .pass_env
-            .into_iter()
-            .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
-            .collect();
+        // `"*"` is a wildcard: pass through every host env var. Snapshotted at
+        // parse time and hashed like any other pass_env (so the input hash
+        // captures the whole environment — only use it on uncached targets).
+        let pass_env: BTreeMap<String, String> = if spec.pass_env.iter().any(|n| n == "*") {
+            std::env::vars().collect()
+        } else {
+            spec.pass_env
+                .into_iter()
+                .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
+                .collect()
+        };
 
         let def = TargetDef {
             run: spec.run,
@@ -969,9 +979,14 @@ impl Driver {
 
         env.extend(def.pass_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-        for name in &def.runtime_pass_env {
-            if let Ok(value) = std::env::var(name) {
-                env.insert(name.clone(), value);
+        // `"*"` passes through every host env var at run time (not hashed).
+        if def.runtime_pass_env.iter().any(|n| n == "*") {
+            env.extend(std::env::vars());
+        } else {
+            for name in &def.runtime_pass_env {
+                if let Ok(value) = std::env::var(name) {
+                    env.insert(name.clone(), value);
+                }
             }
         }
 
@@ -1920,6 +1935,23 @@ mod tests {
         )
         .await?;
         assert_eq!(out, "runtime_pass_value");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_runtime_pass_env_wildcard_passes_all() -> anyhow::Result<()> {
+        unsafe {
+            std::env::set_var("heph_TEST_WILDCARD_VAR", "wildcard_value");
+        }
+        // `"*"` passes every host var through without naming it.
+        let out = run_bash_env(
+            "echo $heph_TEST_WILDCARD_VAR",
+            BTreeMap::new(),
+            vec!["*".to_string()],
+            HashMap::new(),
+        )
+        .await?;
+        assert_eq!(out, "wildcard_value");
         Ok(())
     }
 

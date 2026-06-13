@@ -1,6 +1,8 @@
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
-use crate::engine::provider::{FnArgs, FnCallContext, ProviderFn, ProviderFunctionRegistry};
+use crate::engine::provider::{
+    FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
+};
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
@@ -27,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `heph.core` host/platform namespace, plus a dynamic `heph.<provider>.<fn>`
 /// namespace for every function the providers expose. Built once per
 /// buildfile-provider lifetime (the registry is fixed after the engine injects it).
-fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
+pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
     let mut builder = GlobalsBuilder::standard();
     builder = builder.with(starlark_module);
     builder
@@ -80,6 +82,7 @@ fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
         ParamType::Null => Ty::none(),
         ParamType::List(inner) => Ty::list(param_type_to_ty(inner)),
         ParamType::Map(value) => Ty::dict(Ty::string(), param_type_to_ty(value)),
+        ParamType::Union(types) => Ty::unions(types.iter().map(param_type_to_ty).collect()),
     }
 }
 
@@ -206,6 +209,9 @@ pub(crate) struct OnTargetPayload {
     pub labels: Vec<String>,
     pub transitive: Sandbox,
     pub config: HashMap<String, htvalue::Value>,
+    /// Source call sites that produced this target (innermost `target()` call
+    /// first). See [`crate::engine::provider::ProvenanceFrame`].
+    pub provenance: Vec<ProvenanceFrame>,
 }
 
 impl Sandbox {
@@ -312,6 +318,9 @@ impl Sandbox {
 pub(crate) struct OnStatePayload {
     pub provider: String,
     pub args: HashMap<String, htvalue::Value>,
+    /// Source call sites of the `provider_state()` call (innermost first). Only
+    /// captured for the LSP; empty on the normal build path. See [`ProvenanceFrame`].
+    pub provenance: Vec<ProvenanceFrame>,
 }
 
 #[derive(Debug)]
@@ -369,6 +378,11 @@ pub(crate) struct Extra<'a> {
     pub root: &'a Path,
     pub on_state: Box<dyn Fn(OnStatePayload) -> anyhow::Result<()>>,
     pub on_target: Box<dyn Fn(OnTargetPayload) -> anyhow::Result<()>>,
+    /// Capture each target's source call-stack provenance. Off on the normal
+    /// build path (walking `eval.call_stack()` per `target()` call is needless
+    /// overhead there); on only for the LSP, which needs it to map a source
+    /// position back to the targets a symbol produced.
+    pub capture_provenance: bool,
 }
 
 // Unsupported starlark value types (not str/bool/int/float/list/dict) are a programming error
@@ -437,8 +451,76 @@ fn resolve_fs_path(eval: &Evaluator, path: &str, abs: bool) -> String {
     }
 }
 
+/// Snapshot the Starlark call stack at the moment `target()` runs into a chain of
+/// [`ProvenanceFrame`]s — the innermost frame is the `target()` call site, outer
+/// frames are the macro/loop call sites that led there. Frames without a source
+/// location (native-only calls) are dropped. Lines/columns are converted from
+/// starlark's 0-based positions to 1-based.
+fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
+    eval.call_stack()
+        .frames
+        .iter()
+        .filter_map(|frame| {
+            let span = frame.location.as_ref()?;
+            let rs = span.resolve_span();
+            Some(ProvenanceFrame {
+                fn_name: frame.name.clone(),
+                file: span.filename().to_string(),
+                line_start: rs.begin.line as u32 + 1,
+                col_start: rs.begin.column as u32 + 1,
+                line_end: rs.end.line as u32 + 1,
+                col_end: rs.end.column as u32 + 1,
+            })
+        })
+        .collect()
+}
+
+/// The driver-independent keyword arguments the `target()` builtin always
+/// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
+/// (below) so the two don't drift. Driver-specific config args come from the
+/// driver's own schema and are merged in by the LSP.
+pub(crate) fn target_base_fields() -> Vec<crate::engine::driver::DriverField> {
+    use crate::engine::driver::DriverField;
+    let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
+        name: name.to_string(),
+        ty,
+        doc: doc.to_string(),
+        required,
+    };
+    vec![
+        f("name", ParamType::String, "Target name (required).", true),
+        f(
+            "driver",
+            ParamType::String,
+            "Driver that builds this target; falls back to the provider's `defaultDriver`.",
+            false,
+        ),
+        f(
+            "labels",
+            ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]),
+            "Labels for querying/filtering this target.",
+            false,
+        ),
+        f(
+            "transitive",
+            ParamType::map(ParamType::union(vec![
+                ParamType::list(ParamType::String),
+                ParamType::map(ParamType::list(ParamType::String)),
+            ])),
+            "Sandbox applied transitively: `deps`, `tools`, `env`, `pass_env`, `runtime_pass_env`, `runtime_env`.",
+            false,
+        ),
+    ]
+}
+
 #[starlark_module]
 fn starlark_module(builder: &mut GlobalsBuilder) {
+    /// Declare a build target.
+    ///
+    /// `name` is required. `driver` selects which driver builds it (falls back to
+    /// the provider's `defaultDriver` when omitted). `labels` and `transitive`
+    /// (sandbox `deps`/`tools`/`env`) are recognized; every other keyword argument
+    /// becomes driver-specific config. Returns the target's `//pkg:name` address.
     fn target<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         args: &Arguments<'v, '_>,
@@ -503,12 +585,19 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         // An empty driver is allowed here: the provider resolves it against the
         // configured `defaultDriver` (and errors if neither is set).
 
+        let provenance = if extra.capture_provenance {
+            capture_provenance(eval)
+        } else {
+            Vec::new()
+        };
+
         let p = OnTargetPayload {
             name: name.clone(),
             driver,
             labels,
             transitive,
             config,
+            provenance,
         };
 
         (extra.on_target)(p)?;
@@ -516,6 +605,8 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         Ok(htaddr::Addr::new(PkgBuf::from(extra.pkg), name, Default::default()).format())
     }
 
+    /// Reference a single file as a dependency address. Resolved relative to the
+    /// current package unless `abs = True`. Returns an `fs` provider address.
     fn file<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         path: &str,
@@ -525,6 +616,9 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         Ok(crate::pluginfs::file_addr(&resolved).format())
     }
 
+    /// Reference files matching a glob `pattern` (with optional `exclude`) as a
+    /// dependency address. Package-relative unless `abs = True`. Returns an `fs`
+    /// provider address.
     fn glob<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         pattern: &str,
@@ -548,6 +642,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         Ok(crate::pluginfs::glob_addr(&resolved, &excludes_ref).format())
     }
 
+    /// Build a struct (dict) from keyword arguments, for nested target config.
     fn r#struct<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         args: &Arguments<'v, '_>,
@@ -558,6 +653,8 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         Ok(eval.heap().alloc(starlark::values::dict::AllocDict(pairs)))
     }
 
+    /// Declare package-level provider state, read by the named `provider` when it
+    /// resolves targets in this package. Remaining keyword arguments form the state.
     fn provider_state<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         args: &Arguments<'v, '_>,
@@ -591,9 +688,16 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             )));
         }
 
+        let provenance = if extra.capture_provenance {
+            capture_provenance(eval)
+        } else {
+            Vec::new()
+        };
+
         (extra.on_state)(OnStatePayload {
             provider,
             args: kwargs,
+            provenance,
         })?;
 
         Ok(starlark::values::none::NoneType)
@@ -682,7 +786,7 @@ pub(crate) struct BuildFileLoader {
 }
 
 impl BuildFileLoader {
-    fn new(
+    pub(crate) fn new(
         root: PathBuf,
         patterns: Vec<glob::Pattern>,
         file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
@@ -877,7 +981,11 @@ impl BuildFileLoader {
 ///   `//pkg/...`     absolute, relative to workspace root
 ///   `./rel/...`     relative to `current_pkg`'s directory
 ///   `../rel/...`    relative to `current_pkg`'s directory (walks up via `..`)
-fn resolve_load_target(root: &Path, current_pkg: &str, path: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_load_target(
+    root: &Path,
+    current_pkg: &str,
+    path: &str,
+) -> anyhow::Result<PathBuf> {
     let raw = if let Some(rel) = path.strip_prefix("//") {
         if rel.is_empty() {
             anyhow::bail!("load() path must not be empty after `//`");
@@ -941,7 +1049,31 @@ fn find_build_files(
 fn eval_file(path: &Path, pkg: &str, loader: &BuildFileLoader) -> anyhow::Result<RunResult> {
     let ast: AstModule =
         AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)?;
+    // Normal build path: provenance capture off (walking the call stack per
+    // target() is needless overhead unless tooling asks for it).
+    eval_ast(ast, pkg, loader, false)
+}
 
+/// Parse `content` as a BUILD file named `filename` and evaluate it. Used by the
+/// LSP to evaluate in-editor (possibly unsaved) buffers; `capture_provenance` is
+/// enabled so each target records its source call sites.
+pub(crate) fn eval_source(
+    filename: &str,
+    content: String,
+    pkg: &str,
+    loader: &BuildFileLoader,
+) -> anyhow::Result<RunResult> {
+    let ast: AstModule = AstModule::parse(filename, content, &Dialect::Extended)
+        .map_err(starlark::Error::into_anyhow)?;
+    eval_ast(ast, pkg, loader, true)
+}
+
+fn eval_ast(
+    ast: AstModule,
+    pkg: &str,
+    loader: &BuildFileLoader,
+    capture_provenance: bool,
+) -> anyhow::Result<RunResult> {
     let globals = loader.globals();
 
     let module = Module::new();
@@ -953,6 +1085,7 @@ fn eval_file(path: &Path, pkg: &str, loader: &BuildFileLoader) -> anyhow::Result
         let extra = Extra {
             pkg,
             root: &loader.root,
+            capture_provenance,
             on_target: {
                 let targets = targets.clone();
                 Box::new(move |p| {
@@ -1032,6 +1165,91 @@ mod tests {
         let mut reg = ProviderFunctionRegistry::default();
         reg.insert_provider("fs", crate::pluginfs::Provider::default().functions());
         Arc::new(reg)
+    }
+
+    fn source_loader(root: PathBuf) -> BuildFileLoader {
+        BuildFileLoader::new(
+            root,
+            vec![glob::Pattern::new("BUILD").unwrap()],
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(ProviderFunctionRegistry::default()),
+            Arc::new(OnceLock::new()),
+            Arc::new(CachedWalker::disabled()),
+        )
+    }
+
+    #[test]
+    fn test_provenance_captures_macro_and_target_call_sites() {
+        // A user macro that emits two targets, plus one direct target(). Each
+        // produced target must record the chain of call sites that led to it:
+        // the inner target() call and (for the macro ones) the macro call site.
+        let tmp = tempdir().unwrap();
+        let loader = source_loader(tmp.path().to_path_buf());
+        let content = r#"
+def my_macro(prefix):
+    target(name = prefix + "_a", driver = "exec")
+    target(name = prefix + "_b", driver = "exec")
+
+my_macro("m")
+target(name = "direct", driver = "exec")
+"#;
+        let result =
+            eval_source("BUILD", content.to_string(), "pkg", &loader).expect("eval_source");
+
+        let by_name: HashMap<&str, &OnTargetPayload> = result
+            .targets
+            .iter()
+            .map(|t| (t.name.as_str(), t))
+            .collect();
+        assert_eq!(by_name.len(), 3);
+
+        // Each target carries at least one provenance frame, all pointing at this BUILD.
+        for t in &result.targets {
+            assert!(
+                !t.provenance.is_empty(),
+                "target {} has no provenance",
+                t.name
+            );
+            assert!(t.provenance.iter().all(|f| f.file == "BUILD"));
+        }
+
+        // The macro-produced targets carry a frame inside `my_macro` (the target()
+        // call) AND a frame at module level (the `my_macro("m")` call site, line 6).
+        let m_a = by_name["m_a"];
+        assert!(
+            m_a.provenance.iter().any(|f| f.fn_name == "my_macro"),
+            "m_a missing my_macro frame: {:?}",
+            m_a.provenance
+        );
+        assert!(
+            m_a.provenance.iter().any(|f| f.line_start == 6),
+            "m_a missing macro call site at line 6: {:?}",
+            m_a.provenance
+        );
+
+        // The direct target's innermost frame is its own call site (line 7), and it
+        // is NOT attributed to my_macro.
+        let direct = by_name["direct"];
+        assert!(direct.provenance.iter().any(|f| f.line_start == 7));
+        assert!(direct.provenance.iter().all(|f| f.fn_name != "my_macro"));
+    }
+
+    #[test]
+    fn test_provenance_off_on_normal_eval() {
+        // eval_file (normal build path) must not pay for provenance capture.
+        let tmp = tempdir().unwrap();
+        let pkg_dir = tmp.path().join("p");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("BUILD"),
+            "target(name=\"t\", driver=\"exec\")\n",
+        )
+        .unwrap();
+        let loader = source_loader(tmp.path().to_path_buf());
+        let result = loader.load_pkg("p").unwrap();
+        assert_eq!(result.targets.len(), 1);
+        assert!(result.targets[0].provenance.is_empty());
     }
 
     #[test]

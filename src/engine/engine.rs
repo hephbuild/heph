@@ -435,6 +435,48 @@ impl Engine {
         &self.result_lock
     }
 
+    /// Workspace root.
+    pub fn root(&self) -> &std::path::Path {
+        &self.cfg.root
+    }
+
+    /// The aggregate provider-function registry (every provider's `heph.<p>.<fn>`
+    /// functions), built fresh. Used by the BUILD-file LSP to assemble the same
+    /// Starlark globals BUILD evaluation sees, for symbol completion/hover.
+    pub fn provider_function_registry(&self) -> Arc<provider::ProviderFunctionRegistry> {
+        let mut registry = provider::ProviderFunctionRegistry::default();
+        for provider in &self.providers {
+            registry.insert_provider(&provider.name, provider.provider.functions());
+        }
+        Arc::new(registry)
+    }
+
+    /// The config schema a registered driver exposes, if any. Used by the
+    /// BUILD-file LSP to complete and document a target's driver-specific config
+    /// fields. Returns `None` for unknown drivers or drivers without a schema.
+    pub fn driver_schema(&self, name: &str) -> Option<crate::engine::driver::DriverSchema> {
+        self.drivers_by_name
+            .get(name)
+            .and_then(|d| d.driver.schema())
+    }
+
+    /// Names of all registered drivers, sorted. Used by the BUILD-file LSP to
+    /// complete the `driver =` argument of a `target(...)` call.
+    pub fn driver_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.drivers_by_name.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The state schema a registered provider exposes, if any. Used by the
+    /// BUILD-file LSP to complete and document `provider_state(provider="<name>", …)`
+    /// args. Returns `None` for unknown providers or providers without a schema.
+    pub fn provider_state_schema(&self, name: &str) -> Option<provider::StateSchema> {
+        self.providers_by_name
+            .get(name)
+            .and_then(|p| p.provider.state_schema())
+    }
+
     /// Every `(provider name, function name, rendered signature)` exposed across
     /// all registered providers, sorted. The rendered signature looks like
     /// `glob(pattern: string) -> list[string]`. Surfaced via `heph inspect functions`.

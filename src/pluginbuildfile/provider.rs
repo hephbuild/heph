@@ -356,10 +356,11 @@ impl EProvider for Provider {
 mod tests {
     use super::*;
     use crate::engine::config_yaml::Options;
+    use crate::engine::provider::GetRequest;
     use crate::hasync::StdCancellationToken;
+    use crate::htaddr::parse_addr;
     use std::fs;
     use tempfile::tempdir;
-
     /// Package discovery is cached across runs through the shared walker: a fresh
     /// provider sharing the fswalk db reuses the discovered set for an unchanged
     /// tree, and a newly-added package (which bumps a recorded dir's mtime) is
@@ -388,6 +389,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            // Drop the always-present synthetic LSP package; this test covers the
+            // filesystem walk.
             let mut v: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
             v.sort();
             v

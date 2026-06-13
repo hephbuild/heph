@@ -42,6 +42,23 @@ pub struct State {
     pub state: HashMap<String, Value>,
 }
 
+/// One frame of a target's source provenance: a call site on the Starlark call
+/// stack at the moment `target(...)` ran. The innermost frame is the `target()`
+/// call itself; outer frames are the user macros / loops that led to it. Lets
+/// tooling (the BUILD-file LSP) map a source position back to every target that
+/// originated from the symbol at that position. Lines/columns are 1-based.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceFrame {
+    /// Name of the function whose body this call site is in (`<module>` at top level).
+    pub fn_name: String,
+    /// Absolute path of the BUILD file containing the call site.
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub col_start: u32,
+    pub col_end: u32,
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub addr: Addr,
@@ -206,6 +223,24 @@ impl std::fmt::Debug for GetError {
     }
 }
 
+/// One keyword argument a provider accepts in a `provider_state(provider="X", …)`
+/// call, with its type and docs. Consumed by the BUILD-file LSP for completion and
+/// hover of provider-state args.
+#[derive(Clone, Debug)]
+pub struct StateField {
+    pub name: String,
+    pub ty: crate::htvalue::signature::ParamType,
+    pub doc: String,
+    pub required: bool,
+}
+
+/// Declarative description of the state a provider accepts. Returned by
+/// [`Provider::state_schema`]; `None` means the provider declares no state schema.
+#[derive(Clone, Debug, Default)]
+pub struct StateSchema {
+    pub fields: Vec<StateField>,
+}
+
 pub trait Provider: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
     fn list<'a>(
@@ -236,6 +271,13 @@ pub trait Provider: Send + Sync {
     /// Default: none.
     fn functions(&self) -> Vec<ProviderFunctionDef> {
         vec![]
+    }
+
+    /// Optional: the keyword args this provider accepts in a
+    /// `provider_state(provider="<name>", …)` call, so the BUILD-file LSP can
+    /// complete and document them. Default: none.
+    fn state_schema(&self) -> Option<StateSchema> {
+        None
     }
 
     /// Hand this provider the aggregated registry of every provider's functions.

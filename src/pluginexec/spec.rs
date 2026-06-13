@@ -1,4 +1,6 @@
 use crate::engine::driver::targetdef::path::CodegenMode;
+use crate::engine::driver::{DriverField, DriverSchema};
+use crate::htvalue::signature::ParamType;
 use crate::htvalue::{
     Value, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
     parse_strings,
@@ -168,6 +170,105 @@ impl TargetSpec {
 
         Ok(spec)
     }
+
+    /// Declarative schema of the config fields exec accepts, for the BUILD-file
+    /// LSP. Kept in this file alongside [`TargetSpec::from`] so the two field
+    /// lists are edited together and don't drift.
+    pub(crate) fn schema() -> DriverSchema {
+        use ParamType::String as Str;
+        let field = |name: &str, ty: ParamType, doc: &str| DriverField {
+            name: name.to_string(),
+            ty,
+            doc: doc.to_string(),
+            required: false,
+        };
+        // Types mirror exactly what the `parse_*` helpers accept (see
+        // `TargetSpec::from`), each of which is effectively a union:
+        //   parse_strings           → string | list[string]
+        //   parse_map_string_strings→ string | list[string] | map[string | list[string]]
+        //   parse_map_string_string → string | map[string]
+        let str_or_list = || ParamType::union(vec![Str, ParamType::list(Str)]);
+        let group_strings = || {
+            ParamType::union(vec![
+                Str,
+                ParamType::list(Str),
+                ParamType::map(str_or_list()),
+            ])
+        };
+        let str_or_map = || ParamType::union(vec![Str, ParamType::map(Str)]);
+        DriverSchema {
+            fields: vec![
+                field(
+                    "run",
+                    str_or_list(),
+                    "Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.",
+                ),
+                field(
+                    "out",
+                    group_strings(),
+                    "Declared outputs, grouped by name → list of output paths the target writes.",
+                ),
+                field(
+                    "cache",
+                    ParamType::union(vec![
+                        ParamType::Bool,
+                        ParamType::map(ParamType::union(vec![ParamType::Bool, ParamType::Int])),
+                    ]),
+                    "Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.",
+                ),
+                field(
+                    "support_files",
+                    str_or_list(),
+                    "Extra files materialized into the sandbox but not hashed as deps.",
+                ),
+                field(
+                    "codegen",
+                    Str,
+                    "Codegen mode: `copy` or `in_place`. Omit for a normal (non-codegen) target.",
+                ),
+                field(
+                    "deps",
+                    group_strings(),
+                    "Hashed + runtime dependencies, grouped by name → list of target addresses.",
+                ),
+                field(
+                    "hash_deps",
+                    group_strings(),
+                    "Dependencies that contribute to the input hash but are not materialized at runtime.",
+                ),
+                field(
+                    "runtime_deps",
+                    group_strings(),
+                    "Dependencies materialized at runtime but excluded from the input hash.",
+                ),
+                field(
+                    "tools",
+                    group_strings(),
+                    "Build tools, grouped by name → list of target addresses; symlinked under `tools/`.",
+                ),
+                field(
+                    "env",
+                    str_or_map(),
+                    "Environment variables set for the command.",
+                ),
+                field(
+                    "pass_env",
+                    str_or_list(),
+                    "Names of host environment variables passed through (hashed). `\"*\"` passes all.",
+                ),
+                field(
+                    "runtime_pass_env",
+                    str_or_list(),
+                    "Host env vars passed through at runtime only (not hashed). `\"*\"` passes all.",
+                ),
+                field(
+                    "runtime_env",
+                    str_or_map(),
+                    "Environment variables set at runtime only (not hashed).",
+                ),
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +282,50 @@ mod tests {
         let mut m = HashMap::from([("run".to_string(), Value::String("echo".to_string()))]);
         m.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
         TargetSpec::from(m)
+    }
+
+    #[test]
+    fn test_schema_lists_known_fields_with_types() {
+        let schema = TargetSpec::schema();
+        let by_name: HashMap<&str, &DriverField> =
+            schema.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+        // Every config key TargetSpec::from understands must appear in the schema,
+        // so the two lists are caught drifting apart.
+        for key in [
+            "run",
+            "out",
+            "cache",
+            "support_files",
+            "codegen",
+            "deps",
+            "hash_deps",
+            "runtime_deps",
+            "tools",
+            "env",
+            "pass_env",
+            "runtime_pass_env",
+            "runtime_env",
+        ] {
+            assert!(by_name.contains_key(key), "schema missing field `{key}`");
+        }
+        // Types are unions mirroring the `parse_*` helpers.
+        let str_or_list =
+            ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
+        assert_eq!(by_name["run"].ty, str_or_list);
+        assert_eq!(by_name["run"].ty.render(), "string | list[string]");
+        assert_eq!(
+            by_name["deps"].ty,
+            ParamType::union(vec![
+                ParamType::String,
+                ParamType::list(ParamType::String),
+                ParamType::map(str_or_list.clone()),
+            ])
+        );
+        assert_eq!(
+            by_name["env"].ty,
+            ParamType::union(vec![ParamType::String, ParamType::map(ParamType::String)])
+        );
+        assert!(!by_name["run"].doc.is_empty());
     }
 
     #[test]

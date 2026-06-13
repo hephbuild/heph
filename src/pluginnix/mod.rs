@@ -222,6 +222,47 @@ impl ManagedDriver for Driver {
         })
     }
 
+    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
+        use crate::engine::driver::{DriverField, DriverSchema};
+        use crate::htvalue::signature::ParamType;
+        let str_or_list =
+            || ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
+        let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
+            name: name.to_string(),
+            ty,
+            doc: doc.to_string(),
+            required,
+        };
+        Some(DriverSchema {
+            fields: vec![
+                f(
+                    "nixpkgs",
+                    ParamType::String,
+                    "nixpkgs reference (required).",
+                    true,
+                ),
+                f(
+                    "packages",
+                    str_or_list(),
+                    "Nix packages to provide (required, non-empty).",
+                    true,
+                ),
+                f(
+                    "programs",
+                    str_or_list(),
+                    "Programs to expose from the packages (required, non-empty).",
+                    true,
+                ),
+                f(
+                    "system",
+                    ParamType::String,
+                    "Nix system (e.g. `aarch64-darwin`); defaults to the host.",
+                    false,
+                ),
+            ],
+        })
+    }
+
     async fn parse(
         &self,
         req: ParseRequest,

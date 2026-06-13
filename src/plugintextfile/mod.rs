@@ -49,6 +49,39 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
+    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
+        use crate::engine::driver::{DriverField, DriverSchema};
+        use crate::htvalue::signature::ParamType;
+        let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
+            name: name.to_string(),
+            ty,
+            doc: doc.to_string(),
+            required,
+        };
+        Some(DriverSchema {
+            fields: vec![
+                f(
+                    "text",
+                    ParamType::String,
+                    "File contents to write (required, trimmed).",
+                    true,
+                ),
+                f(
+                    "out",
+                    ParamType::String,
+                    "Output filename; defaults to the target name.",
+                    false,
+                ),
+                f(
+                    "executable",
+                    ParamType::Bool,
+                    "Mark the written file executable.",
+                    false,
+                ),
+            ],
+        })
+    }
+
     async fn parse(
         &self,
         req: ParseRequest,
