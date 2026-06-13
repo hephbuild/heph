@@ -97,8 +97,16 @@ in
 
   scripts.install-release-build.exec = ''
     cargo build --release
+    bin="$CARGO_TARGET_DIR/release/heph"
+    if [ "$(uname -s)" = "Darwin" ]; then
+      # The nix toolchain hard-links libiconv against its /nix/store path, which
+      # dyld aborts on once that store path is GC'd ("Killed"). Rewrite to the
+      # OS /usr/lib copy and re-sign ad-hoc so the installed binary keeps
+      # launching — same treatment the shipped CI artifact gets.
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$bin"
+    fi
     mkdir -p $(dirname "${binLocation}")
-    cp $CARGO_TARGET_DIR/release/heph "${binLocation}"
+    cp "$bin" "${binLocation}"
   '';
 
 
