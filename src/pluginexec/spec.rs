@@ -1,14 +1,15 @@
 use crate::engine::driver::targetdef::path::CodegenMode;
-use crate::htspec::{FromSpecValue, Spec};
+use crate::htspec::{FromSpecValue, Spec, SpecStruct};
+use crate::htvalue::Value;
 use crate::htvalue::signature::ParamType;
-use crate::htvalue::{Value, parse_bool};
 use anyhow::Context;
 use std::collections::HashMap;
 
 /// Exec-driver target config. `#[derive(Spec)]` generates `TargetSpec::from`
 /// (parser) and `TargetSpec::schema` (LSP schema) from these fields, so the two
-/// can never drift; doc comments below become the schema docs. Bespoke union
-/// shapes (`cache`, `codegen`) live in hand-written [`FromSpecValue`] impls.
+/// can never drift; doc comments below become the schema docs. `codegen` is a
+/// [`SpecEnum`](crate::htspec::SpecEnum); `cache` is a bool shorthand or a
+/// [`SpecStruct`] dict ([`CacheDict`]).
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
     /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
@@ -57,43 +58,50 @@ impl Default for TargetSpecCache {
     }
 }
 
+/// The dict form of `cache`: `{"enabled": bool, "remote": bool, "history": int}`,
+/// each key optional and defaulting (enabled/remote true, history 1). The
+/// `SpecStruct` derive parses the map and rejects unknown keys.
+#[derive(SpecStruct)]
+struct CacheDict {
+    #[spec(rename = "enabled", default = true)]
+    local: bool,
+    #[spec(default = true)]
+    remote: bool,
+    #[spec(default = 1u32, parse = parse_cache_history)]
+    history: u32,
+}
+
+impl From<CacheDict> for TargetSpecCache {
+    fn from(d: CacheDict) -> Self {
+        TargetSpecCache {
+            local: d.local,
+            remote: d.remote,
+            history: d.history,
+        }
+    }
+}
+
 /// The `cache` attribute accepts either a bare bool (legacy: `cache =
-/// True/False` toggles both local and remote, history 1) or a dict `cache =
-/// {"enabled": bool, "remote": bool, "history": int}` where any unset key falls
-/// back to its default (enabled/remote true, history 1).
+/// True/False` toggles both local and remote, history 1) or the [`CacheDict`]
+/// form. This is shape-dispatch (not `SpecUnion`): a map *commits* to the dict
+/// arm so its specific parse errors (unknown key, bad `history`) surface,
+/// rather than being masked by a generic "expected bool | map" union error.
 impl FromSpecValue for TargetSpecCache {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
         match v {
+            // A bare bool toggles both local and remote; history stays at 1.
             Value::Bool(b) => Ok(TargetSpecCache {
                 local: *b,
                 remote: *b,
                 history: 1,
             }),
-            Value::Map(m) => {
-                let mut c = TargetSpecCache::default();
-                for (k, val) in m {
-                    match k.as_str() {
-                        "enabled" => {
-                            c.local = parse_bool(val).with_context(|| "parse `cache.enabled`")?
-                        }
-                        "remote" => {
-                            c.remote = parse_bool(val).with_context(|| "parse `cache.remote`")?
-                        }
-                        "history" => c.history = parse_cache_history(val)?,
-                        other => anyhow::bail!("unknown `cache` entry: {other:?}"),
-                    }
-                }
-                Ok(c)
-            }
+            Value::Map(_) => CacheDict::from_spec_value(v).map(TargetSpecCache::from),
             _ => anyhow::bail!("`cache` must be a bool or a dict"),
         }
     }
 
     fn spec_param_type() -> ParamType {
-        ParamType::union(vec![
-            ParamType::Bool,
-            ParamType::map(ParamType::union(vec![ParamType::Bool, ParamType::Int])),
-        ])
+        ParamType::union(vec![ParamType::Bool, CacheDict::spec_param_type()])
     }
 }
 
@@ -225,8 +233,10 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
+        // `cache` dict is a `SpecStruct`: unknown keys are rejected with the
+        // generic "unknown entries found" message.
         assert!(
-            format!("{err:#}").contains("unknown `cache` entry"),
+            format!("{err:#}").contains("unknown entries found"),
             "{err:#}"
         );
     }
