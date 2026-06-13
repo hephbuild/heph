@@ -6,7 +6,7 @@ use crate::engine::provider::{
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
-use crate::htvalue::signature::{FnSignature, Param, ParamType};
+use crate::htvalue::signature::{FnSignature, ParamType};
 use crate::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use crate::htwalk::{CachedWalker, EntryKind};
 use crate::pluginbuildfile::provider::Provider;
@@ -41,34 +41,15 @@ pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
             for (provider, fns) in registry.providers() {
                 hb.namespace(provider, |nb| {
                     for (name, rf) in fns {
-                        nb.set_function(
+                        // Each provider function carries per-fn state (its async
+                        // `ProviderFn` + declared signature), so it's registered as a
+                        // custom callable value rather than `set_function` (whose
+                        // 0.14 `NativeFuncFn` is a stateless `fn` pointer). The
+                        // engine-side validator in `invoke` is the canonical guard
+                        // for arity/types/return; the LSP proxy renders hover and
+                        // completion for these from the registry.
+                        nb.set(
                             name.as_str(),
-                            starlark::__derive_refs::components::NativeCallableComponents {
-                                speculative_exec_safe: false,
-                                // The hover doc (`rf.doc`) is intentionally NOT
-                                // threaded here. `rust_docstring` is `&'static str`,
-                                // but provider docs are runtime-built `String`s in
-                                // the registry — and it would buy nothing: the stock
-                                // `starlark_lsp` doesn't resolve hover/completion for
-                                // a *member of a global namespace* like
-                                // `heph.fs.join` (only top-level globals + loaded
-                                // symbols). The `param_spec`/`return_type` below are
-                                // already wired yet produce no hover, which is why
-                                // the LSP proxy (`lsp/proxy.rs::provider_fn_hover`)
-                                // renders hover for these functions from the registry
-                                // instead.
-                                rust_docstring: None,
-                                // Drive Starlark's native typing from the declared
-                                // signature so BUILD-time gets arity/type errors. The
-                                // engine-side validator in `invoke` is the canonical
-                                // guard (and the only one that checks the return value
-                                // at runtime).
-                                param_spec: build_param_spec(&rf.signature),
-                                return_type: param_type_to_ty(&rf.signature.returns),
-                            },
-                            None,
-                            None,
-                            None,
                             ProviderNativeFn {
                                 display: format!("heph.{provider}.{name}"),
                                 signature: Arc::clone(&rf.signature),
@@ -99,55 +80,45 @@ pub(crate) fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
     }
 }
 
-/// Build a native param spec from a declared signature: positional params as
-/// pos-or-named, an optional variadic as `*args`, named params as named-only;
-/// never `**kwargs`.
-fn build_param_spec(
-    sig: &FnSignature,
-) -> starlark::__derive_refs::param_spec::NativeCallableParamSpec {
-    use starlark::__derive_refs::param_spec::{
-        NativeCallableParam, NativeCallableParamDefaultValue, NativeCallableParamSpec,
-    };
-    let to_param = |p: &Param| NativeCallableParam {
-        name: p.name,
-        ty: param_type_to_ty(&p.ty),
-        // Documentation-only; the engine validator substitutes the real default.
-        required: p
-            .default
-            .as_ref()
-            .map(|_| NativeCallableParamDefaultValue::Optional),
-    };
-    NativeCallableParamSpec {
-        pos_only: Vec::new(),
-        pos_or_named: sig.positional.iter().map(to_param).collect(),
-        // `*args`: each element typed as the variadic param's element type.
-        args: sig.variadic.as_ref().map(|p| NativeCallableParam {
-            name: p.name,
-            ty: param_type_to_ty(&p.ty),
-            required: None,
-        }),
-        named_only: sig.named.iter().map(to_param).collect(),
-        kwargs: None,
-    }
-}
-
-/// Native Starlark function bridging a `heph.<provider>.<fn>` call to the
-/// provider's async [`ProviderFn`]. The Starlark eval is synchronous (it runs
-/// inside `block_or_inline`), so the async handler is driven with
-/// `futures::executor::block_on` — runtime-agnostic, works under `#[test]`,
-/// inline eval, and `block_in_place`.
+/// A `heph.<provider>.<fn>` callable: a custom Starlark value holding the
+/// provider's async [`ProviderFn`] and declared signature. Registered via
+/// `GlobalsBuilder::set` — 0.14's `set_function` takes a stateless `fn` pointer
+/// that can't carry this per-function state. The Starlark eval is synchronous,
+/// so the async handler is driven with `futures::executor::block_on` —
+/// runtime-agnostic, works under `#[test]`, inline eval, and `block_in_place`.
+#[derive(ProvidesStaticType, starlark::values::NoSerialize, allocative::Allocative)]
 struct ProviderNativeFn {
     /// `heph.<provider>.<fn>`, used in validation error messages.
     display: String,
+    #[allocative(skip)]
     signature: Arc<FnSignature>,
+    #[allocative(skip)]
     func: Arc<dyn ProviderFn>,
 }
 
-impl starlark::values::function::NativeFunc for ProviderNativeFn {
-    fn invoke<'v>(
+impl std::fmt::Debug for ProviderNativeFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderNativeFn")
+            .field("display", &self.display)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ProviderNativeFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display)
+    }
+}
+
+starlark::starlark_simple_value!(ProviderNativeFn);
+
+#[starlark::values::starlark_value(type = "provider_function")]
+impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
+    fn invoke(
         &self,
-        eval: &mut Evaluator<'v, '_, '_>,
+        _me: Value<'v>,
         args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         let extra = eval
             .extra
@@ -197,7 +168,7 @@ impl starlark::values::function::NativeFunc for ProviderNativeFn {
 
 /// Convert a [`htvalue::Value`] back into a Starlark value — the inverse of
 /// [`starlark_to_rust`].
-fn rust_to_starlark<'v>(heap: &'v starlark::values::Heap, v: &htvalue::Value) -> Value<'v> {
+fn rust_to_starlark<'v>(heap: starlark::values::Heap<'v>, v: &htvalue::Value) -> Value<'v> {
     match v {
         htvalue::Value::Null() => Value::new_none(),
         htvalue::Value::String(s) => heap.alloc(s.as_str()),
@@ -347,7 +318,7 @@ pub(crate) struct RunResult {
 }
 
 fn empty_run_result() -> anyhow::Result<RunResult> {
-    let module = Module::new().freeze().map_err(anyhow::Error::from)?;
+    let module = Module::with_temp_heap(|m| m.freeze()).map_err(anyhow::Error::from)?;
     Ok(RunResult {
         targets: vec![],
         states: vec![],
@@ -358,26 +329,38 @@ fn empty_run_result() -> anyhow::Result<RunResult> {
 fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
     let mut targets = vec![];
     let mut states = vec![];
-    let module = Module::new();
     for part in parts {
-        module
-            .frozen_heap()
-            .add_reference(part.module.frozen_heap());
-        for name in part.module.names() {
-            let name_str = name.as_str();
-            // Skip underscore-prefixed (private) symbols — they're never re-exportable.
-            if name_str.starts_with('_') {
-                continue;
-            }
-            if let Some(owned) = part.module.get_option(name_str)? {
-                let value = owned.owned_value(module.frozen_heap());
-                module.set(name_str, value);
-            }
-        }
         targets.extend(part.targets.iter().cloned());
         states.extend(part.states.iter().cloned());
     }
-    let frozen = module.freeze().map_err(anyhow::Error::from)?;
+    let frozen = Module::with_temp_heap(|module| -> anyhow::Result<FrozenModule> {
+        // Re-export every public symbol of each frozen part so `load("//pkg", sym)`
+        // sees the whole package's symbols. `import_public_symbols` can't be used —
+        // it imports them *private* (not re-exported). The safe `owned_value` ties
+        // the value to a borrow of `module`, which would block the later freeze, so
+        // we reference the part's heap into this module's heap and take the owned
+        // `FrozenValue` directly.
+        for part in parts {
+            module
+                .frozen_heap()
+                .add_reference(part.module.frozen_heap());
+            for name in part.module.names() {
+                let name_str = name.as_str();
+                // Skip underscore-prefixed (private) symbols — never re-exportable.
+                if name_str.starts_with('_') {
+                    continue;
+                }
+                if let Some(owned) = part.module.get_option(name_str)? {
+                    // SAFETY: the part's frozen heap is referenced into `module`'s
+                    // frozen heap just above, so the value stays alive for the
+                    // module's lifetime (and the resulting frozen module's).
+                    let frozen_value = unsafe { owned.unchecked_frozen_value() };
+                    module.set(name_str, frozen_value.to_value());
+                }
+            }
+        }
+        module.freeze().map_err(anyhow::Error::from)
+    })?;
     Ok(RunResult {
         targets,
         states,
@@ -1089,12 +1072,13 @@ fn eval_ast(
 ) -> anyhow::Result<RunResult> {
     let globals = loader.globals();
 
-    let module = Module::new();
-
     let targets = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     let states = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
 
-    {
+    // 0.14 modules are scoped to a temp heap: eval into the module and freeze it
+    // inside the closure, returning the frozen result. The `targets`/`states`
+    // sinks are owned outside so they survive after the closure drops `extra`.
+    let frozen = Module::with_temp_heap(|module| -> anyhow::Result<FrozenModule> {
         let extra = Extra {
             pkg,
             root: &loader.root,
@@ -1126,7 +1110,13 @@ fn eval_ast(
 
         eval.eval_module(ast, globals)
             .map_err(starlark::Error::into_anyhow)?;
-    }
+        // Drop the evaluator (and its borrow of `module`) before freezing.
+        drop(eval);
+        module
+            .freeze()
+            .map_err(anyhow::Error::from)
+            .context("freezing starlark module")
+    })?;
 
     let targets = std::rc::Rc::try_unwrap(targets)
         .map_err(|_rc| anyhow::anyhow!("targets Rc still has outstanding references after eval"))?
@@ -1134,11 +1124,6 @@ fn eval_ast(
     let states = std::rc::Rc::try_unwrap(states)
         .map_err(|_rc| anyhow::anyhow!("states Rc still has outstanding references after eval"))?
         .into_inner();
-
-    let frozen = module
-        .freeze()
-        .map_err(anyhow::Error::from)
-        .context("freezing starlark module")?;
 
     Ok(RunResult {
         targets,
@@ -1150,6 +1135,7 @@ fn eval_ast(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::htvalue::signature::Param;
     use std::fs;
     use tempfile::tempdir;
 

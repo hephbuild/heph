@@ -12,7 +12,7 @@
 use crate::engine::engine::Engine;
 use crate::engine::provider::ProvenanceFrame;
 use crate::pluginbuildfile::run_file::RunResult;
-use starlark_lsp::server::LspUrl;
+use starlark_lsp::server::LspUri;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -325,7 +325,7 @@ pub(crate) struct SharedState {
     /// symbol's package directory and scan its files for the definition.
     pub root: std::path::PathBuf,
     pub patterns: Vec<glob::Pattern>,
-    docs: Mutex<HashMap<LspUrl, DocIndex>>,
+    docs: Mutex<HashMap<LspUri, DocIndex>>,
 }
 
 impl SharedState {
@@ -342,11 +342,11 @@ impl SharedState {
         })
     }
 
-    pub(crate) fn set_index(&self, uri: LspUrl, index: DocIndex) {
+    pub(crate) fn set_index(&self, uri: LspUri, index: DocIndex) {
         self.docs.lock().expect("docs lock").insert(uri, index);
     }
 
-    pub(crate) fn index(&self, uri: &LspUrl) -> Option<DocIndex> {
+    pub(crate) fn index(&self, uri: &LspUri) -> Option<DocIndex> {
         self.docs.lock().expect("docs lock").get(uri).cloned()
     }
 }

@@ -471,8 +471,12 @@ pub mod targetdef {
 
     impl TargetDef {
         pub fn def<T: 'static>(&self) -> &T {
-            self.raw_def
-                .as_any()
+            // Deref to `&dyn RawDef` before `as_any`: on a bare `self.raw_def`
+            // (an `Arc<dyn RawDef>`), method resolution would pick the blanket
+            // `RawDef` impl for `Arc<dyn RawDef>` itself (which now matches, since
+            // `dyn RawDef: Serialize`), returning the Arc's own type rather than
+            // dynamically dispatching to the stored value.
+            RawDef::as_any(self.raw_def.as_ref())
                 .downcast_ref::<T>()
                 .expect("TargetDef raw_def type mismatch: wrong type T requested")
         }

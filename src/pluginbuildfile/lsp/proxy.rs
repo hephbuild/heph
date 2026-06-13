@@ -15,26 +15,27 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, Hover, HoverContents, LocationLink,
     MarkedString, MarkupContent, MarkupKind, Position, Range,
 };
-use starlark_lsp::server::LspUrl;
+use starlark_lsp::server::LspUri;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tower_lsp_server::UriExt as _;
 
 /// What an intercepted request was, so its response can be enriched.
 #[derive(Clone)]
 enum Pending {
     Hover {
-        uri: LspUrl,
+        uri: LspUri,
         line: u32,
         col: u32,
     },
     Completion {
-        uri: LspUrl,
+        uri: LspUri,
         line: u32,
         col: u32,
     },
     Definition {
-        uri: LspUrl,
+        uri: LspUri,
         line: u32,
         col: u32,
     },
@@ -104,7 +105,7 @@ fn classify(method: &str, params: &serde_json::Value) -> Option<Pending> {
     let line = pos.get("line")?.as_u64()? as u32;
     let col = pos.get("character")?.as_u64()? as u32;
     let uri_str = params.get("textDocument")?.get("uri")?.as_str()?;
-    let uri = LspUrl::try_from(lsp_types::Url::parse(uri_str).ok()?).ok()?;
+    let uri = LspUri::try_from(uri_str.parse::<lsp_types::Uri>().ok()?).ok()?;
     match method {
         "textDocument/hover" => Some(Pending::Hover { uri, line, col }),
         "textDocument/completion" => Some(Pending::Completion { uri, line, col }),
@@ -149,12 +150,12 @@ fn enrich_initialize(resp: &mut lsp_server::Response) {
 /// scan the whole package and point at the real definition.
 fn enrich_definition(
     resp: &mut lsp_server::Response,
-    uri: &LspUrl,
+    uri: &LspUri,
     line: u32,
     col: u32,
     shared: &SharedState,
 ) {
-    let LspUrl::File(doc_path) = uri else {
+    let LspUri::File(doc_path) = uri else {
         return;
     };
     let Some(index) = shared.index(uri) else {
@@ -182,7 +183,7 @@ fn enrich_definition(
 
     for file in files {
         if let Some((dl, c0, c1)) = find_symbol_def(&file, exported) {
-            let Ok(url) = lsp_types::Url::from_file_path(&file) else {
+            let Some(uri) = lsp_types::Uri::from_file_path(&file) else {
                 continue;
             };
             let target_range = Range {
@@ -191,7 +192,7 @@ fn enrich_definition(
             };
             let link = LocationLink {
                 origin_selection_range: None,
-                target_uri: url,
+                target_uri: uri,
                 target_range,
                 target_selection_range: target_range,
             };
@@ -206,7 +207,7 @@ fn enrich_definition(
 /// the stock server resolved it cross-file and we should not override).
 fn result_points_to_other_file(result: Option<&serde_json::Value>, doc_path: &Path) -> bool {
     let Some(value) = result else { return false };
-    let doc = lsp_types::Url::from_file_path(doc_path).ok();
+    let doc = lsp_types::Uri::from_file_path(doc_path);
     let targets = match value {
         serde_json::Value::Array(a) => a.clone(),
         serde_json::Value::Object(_) => vec![value.clone()],
@@ -280,7 +281,7 @@ fn pkg_of(root: &Path, path: &Path) -> String {
 
 fn enrich_hover(
     resp: &mut lsp_server::Response,
-    uri: &LspUrl,
+    uri: &LspUri,
     line: u32,
     col: u32,
     shared: &SharedState,
@@ -641,7 +642,7 @@ fn field_item(name: &str, ty: &str, doc: String, ctx: &str, required: bool) -> C
 
 fn enrich_completion(
     resp: &mut lsp_server::Response,
-    uri: &LspUrl,
+    uri: &LspUri,
     line: u32,
     col: u32,
     shared: &SharedState,
