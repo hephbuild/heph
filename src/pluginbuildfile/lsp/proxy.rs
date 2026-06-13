@@ -327,20 +327,26 @@ fn in_driver_value(prefix: &str) -> bool {
     let Some(q) = prefix.rfind('"') else {
         return false;
     };
+    // A `"` is ASCII, so `q` is a char boundary.
+    let (before, value) = (prefix.get(..q), prefix.get(q + 1..));
+    let (Some(before), Some(value)) = (before, value) else {
+        return false;
+    };
     // No further quote after the last one → still inside the string.
-    let value = &prefix[q + 1..];
     if value.contains('"') {
         return false;
     }
-    let Some(head) = prefix[..q].trim_end().strip_suffix('=') else {
+    let Some(head) = before.trim_end().strip_suffix('=') else {
         return false;
     };
     let head = head.trim_end();
-    head.ends_with("driver")
-        && head[..head.len() - "driver".len()]
-            .chars()
-            .last()
-            .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+    let Some(stem) = head.strip_suffix("driver") else {
+        return false;
+    };
+    // The token must be exactly `driver`, not a suffix of a longer identifier.
+    stem.chars()
+        .last()
+        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
 }
 
 fn field_item(name: &str, ty: &str, doc: String, ctx: &str) -> CompletionItem {

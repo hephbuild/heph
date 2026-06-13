@@ -26,6 +26,20 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
+    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
+        use crate::engine::driver::{DriverField, DriverSchema};
+        use crate::htvalue::signature::ParamType;
+        Some(DriverSchema {
+            fields: vec![DriverField {
+                name: "deps".to_string(),
+                ty: ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]),
+                doc: "Target addresses this group aggregates; the group re-exports their outputs."
+                    .to_string(),
+                required: false,
+            }],
+        })
+    }
+
     async fn parse(
         &self,
         req: ParseRequest,
@@ -145,6 +159,21 @@ mod tests {
                 transitive: Default::default(),
             }),
         }
+    }
+
+    #[test]
+    fn test_schema_lists_deps() {
+        use crate::engine::driver::Driver as _;
+        use crate::htvalue::signature::ParamType;
+        let schema = Driver.schema().expect("group exposes a schema");
+        assert_eq!(schema.fields.len(), 1);
+        let f = &schema.fields[0];
+        assert_eq!(f.name, "deps");
+        assert_eq!(
+            f.ty,
+            ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)])
+        );
+        assert!(!f.doc.is_empty());
     }
 
     #[tokio::test]
