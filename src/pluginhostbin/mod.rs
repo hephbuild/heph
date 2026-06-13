@@ -116,6 +116,11 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
+    /// The hostbin driver takes no target config (it keys off the target name).
+    fn schema(&self) -> crate::engine::driver::DriverSchema {
+        crate::engine::driver::DriverSchema::default()
+    }
+
     async fn parse(
         &self,
         req: ParseRequest,

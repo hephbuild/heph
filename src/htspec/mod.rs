@@ -253,6 +253,35 @@ mod tests {
         assert!(format!("{err:#}").contains("parse `count`"), "{err:#}");
     }
 
+    #[derive(Spec, Debug)]
+    struct ReqSpec {
+        #[spec(required)]
+        name: String,
+        tags: Vec<String>,
+    }
+
+    #[test]
+    fn required_field_absent_is_an_error() {
+        // A required field that is absent fails the parse and is flagged in the
+        // schema; an optional one still defaults.
+        let err = ReqSpec::from(HashMap::new()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing required `name`"),
+            "{err:#}"
+        );
+        let spec = ReqSpec::from(HashMap::from([(
+            "name".to_string(),
+            Value::String("x".into()),
+        )]))
+        .unwrap();
+        assert_eq!(spec.name, "x");
+        assert!(spec.tags.is_empty());
+        let schema = ReqSpec::schema();
+        let by = by_name(&schema.fields);
+        assert!(by["name"].required);
+        assert!(!by["tags"].required);
+    }
+
     #[test]
     fn schema_mirrors_field_types_and_overrides() {
         let schema = DemoSpec::schema();

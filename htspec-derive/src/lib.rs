@@ -190,13 +190,24 @@ fn field_codegen(
             quote! { <#fty as crate::htspec::FromSpecValue>::spec_param_type() }
         };
 
+        // A required field with no value is a hard error; otherwise the
+        // absent value falls back to its default.
+        let absent_arm = if required {
+            quote! {
+                ::core::option::Option::None =>
+                    ::anyhow::bail!("missing required `{}`", #key),
+            }
+        } else {
+            quote! { ::core::option::Option::None => #default_expr, }
+        };
+
         let var = quote::format_ident!("__field_{}", ident);
         out.parse_stmts.push(quote! {
             let #var: #fty = match __m.remove(#key) {
                 ::core::option::Option::Some(__v) => {
                     (#parse_call).with_context(|| ::std::format!("parse `{}`", #key))?
                 }
-                ::core::option::Option::None => #default_expr,
+                #absent_arm
             };
         });
         out.field_inits.push(quote! { #ident: #var });

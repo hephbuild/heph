@@ -3860,6 +3860,9 @@ mod tests {
                 name: "blocking".to_string(),
             })
         }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
         async fn parse(
             &self,
             req: ParseRequest,

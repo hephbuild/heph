@@ -451,13 +451,12 @@ impl Engine {
         Arc::new(registry)
     }
 
-    /// The config schema a registered driver exposes, if any. Used by the
-    /// BUILD-file LSP to complete and document a target's driver-specific config
-    /// fields. Returns `None` for unknown drivers or drivers without a schema.
+    /// The config schema a registered driver exposes. Used by the BUILD-file LSP
+    /// to complete and document a target's driver-specific config fields. Returns
+    /// `None` only for an unknown driver name; a known config-less driver returns
+    /// `Some(DriverSchema::default())` (no fields).
     pub fn driver_schema(&self, name: &str) -> Option<crate::engine::driver::DriverSchema> {
-        self.drivers_by_name
-            .get(name)
-            .and_then(|d| d.driver.schema())
+        self.drivers_by_name.get(name).map(|d| d.driver.schema())
     }
 
     /// Names of all registered drivers, sorted. Used by the BUILD-file LSP to

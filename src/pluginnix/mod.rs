@@ -7,11 +7,11 @@ use crate::engine::driver::{
 use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
-use crate::htvalue::{Value, parse_string, parse_strings};
+use crate::htspec::Spec;
+use crate::htvalue::signature::ParamType;
 use crate::proc_exec;
 use anyhow::Context as _;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -61,18 +61,23 @@ impl Hash for NixDef {
     }
 }
 
-fn take_string(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Option<String>> {
-    match m.remove(key) {
-        Some(v) => parse_string(v).with_context(|| format!("parse `{key}`")),
-        None => Ok(None),
-    }
-}
-
-fn take_strings(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Vec<String>> {
-    match m.remove(key) {
-        Some(v) => parse_strings(v).with_context(|| format!("parse `{key}`")),
-        None => Ok(vec![]),
-    }
+/// Config for a `nix` target. `#[derive(Spec)]` provides the parser and the LSP
+/// schema. `packages`/`programs` presence is enforced by `required`; their
+/// non-emptiness is checked in `parse` (a present empty list is still invalid).
+#[derive(Spec)]
+struct NixSpec {
+    /// nixpkgs reference (required).
+    #[spec(required)]
+    nixpkgs: String,
+    /// Nix packages to provide (required, non-empty).
+    #[spec(required)]
+    packages: Vec<String>,
+    /// Programs to expose from the packages (required, non-empty).
+    #[spec(required)]
+    programs: Vec<String>,
+    /// Nix system (e.g. `aarch64-darwin`); defaults to the host.
+    #[spec(ty = ParamType::String)]
+    system: Option<String>,
 }
 
 /// Map host (ARCH, OS) to nix system triple. Unknown combos bail loudly so
@@ -222,45 +227,8 @@ impl ManagedDriver for Driver {
         })
     }
 
-    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
-        use crate::engine::driver::{DriverField, DriverSchema};
-        use crate::htvalue::signature::ParamType;
-        let str_or_list =
-            || ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
-        let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
-            name: name.to_string(),
-            ty,
-            doc: doc.to_string(),
-            required,
-        };
-        Some(DriverSchema {
-            fields: vec![
-                f(
-                    "nixpkgs",
-                    ParamType::String,
-                    "nixpkgs reference (required).",
-                    true,
-                ),
-                f(
-                    "packages",
-                    str_or_list(),
-                    "Nix packages to provide (required, non-empty).",
-                    true,
-                ),
-                f(
-                    "programs",
-                    str_or_list(),
-                    "Programs to expose from the packages (required, non-empty).",
-                    true,
-                ),
-                f(
-                    "system",
-                    ParamType::String,
-                    "Nix system (e.g. `aarch64-darwin`); defaults to the host.",
-                    false,
-                ),
-            ],
-        })
+    fn schema(&self) -> crate::engine::driver::DriverSchema {
+        NixSpec::schema()
     }
 
     async fn parse(
@@ -268,18 +236,11 @@ impl ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let mut m: HashMap<&str, &Value> = req
-            .target_spec
-            .config
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
-
-        let nixpkgs = take_string(&mut m, "nixpkgs")?
-            .ok_or_else(|| anyhow::anyhow!("nix driver requires `nixpkgs`"))?;
-        let mut packages = take_strings(&mut m, "packages")?;
-        let mut programs = take_strings(&mut m, "programs")?;
-        let system = match take_string(&mut m, "system")? {
+        let spec = NixSpec::from(req.target_spec.config.clone())?;
+        let nixpkgs = spec.nixpkgs;
+        let mut packages = spec.packages;
+        let mut programs = spec.programs;
+        let system = match spec.system {
             Some(s) => s,
             None => host_nix_system()?,
         };
@@ -289,11 +250,6 @@ impl ManagedDriver for Driver {
         }
         if programs.is_empty() {
             anyhow::bail!("nix driver requires `programs` (non-empty list)");
-        }
-
-        if !m.is_empty() {
-            let unknown: Vec<&str> = m.into_keys().collect();
-            anyhow::bail!("nix driver does not support config keys: {:?}", unknown);
         }
 
         // Sort so hash is order-independent. Sorting also keeps the generated
@@ -520,6 +476,7 @@ mod tests {
     use crate::engine::provider::TargetSpec;
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::parse_addr;
+    use crate::htvalue::Value;
     use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {

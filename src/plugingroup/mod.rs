@@ -5,13 +5,21 @@ use crate::engine::driver::{
     targetdef::{CacheConfig, Input, InputMode, TargetDef},
 };
 use crate::hasync::Cancellable;
-use crate::htvalue::parse_strings;
+use crate::htspec::Spec;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
 pub const DRIVER_NAME: &str = "group";
+
+/// Config for a `group` target. `#[derive(Spec)]` provides the parser and the
+/// LSP schema.
+#[derive(Spec)]
+struct GroupSpec {
+    /// Target addresses this group aggregates; the group re-exports their outputs.
+    deps: Vec<String>,
+}
 
 #[derive(serde::Serialize)]
 struct GroupDef;
@@ -26,18 +34,8 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
-    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
-        use crate::engine::driver::{DriverField, DriverSchema};
-        use crate::htvalue::signature::ParamType;
-        Some(DriverSchema {
-            fields: vec![DriverField {
-                name: "deps".to_string(),
-                ty: ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]),
-                doc: "Target addresses this group aggregates; the group re-exports their outputs."
-                    .to_string(),
-                required: false,
-            }],
-        })
+    fn schema(&self) -> crate::engine::driver::DriverSchema {
+        GroupSpec::schema()
     }
 
     async fn parse(
@@ -45,24 +43,9 @@ impl crate::engine::driver::Driver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let unknown: Vec<&String> = req
-            .target_spec
-            .config
-            .keys()
-            .filter(|k| k.as_str() != "deps")
-            .collect();
-        if !unknown.is_empty() {
-            anyhow::bail!("group driver does not support config keys: {:?}", unknown);
-        }
-
-        let deps = req
-            .target_spec
-            .config
-            .get("deps")
-            .map(parse_strings)
-            .transpose()
-            .context("parse `deps`")?
-            .unwrap_or_default();
+        let deps = GroupSpec::from(req.target_spec.config.clone())
+            .context("parse group config")?
+            .deps;
 
         let pkg = req.target_spec.addr.package.clone();
         let inputs = deps
@@ -165,7 +148,7 @@ mod tests {
     fn test_schema_lists_deps() {
         use crate::engine::driver::Driver as _;
         use crate::htvalue::signature::ParamType;
-        let schema = Driver.schema().expect("group exposes a schema");
+        let schema = Driver.schema();
         assert_eq!(schema.fields.len(), 1);
         let f = &schema.fields[0];
         assert_eq!(f.name, "deps");
@@ -219,8 +202,8 @@ mod tests {
             panic!("expected error, got Ok");
         };
         assert!(
-            err.to_string().contains("foo"),
-            "error should mention unknown key: {err}"
+            format!("{err:#}").contains("foo"),
+            "error should mention unknown key: {err:#}"
         );
     }
 

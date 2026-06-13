@@ -445,8 +445,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
         })
     }
 
-    fn schema(&self) -> Option<engine::driver::DriverSchema> {
-        Some(spec::TargetSpec::schema())
+    fn schema(&self) -> engine::driver::DriverSchema {
+        spec::TargetSpec::schema()
     }
 
     async fn parse(

@@ -16,6 +16,7 @@ use crate::engine::provider::{
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::htspec::Spec;
 use crate::htvalue::Value;
 use crate::htvalue::signature::{FnSignature, Param, ParamType};
 use crate::htwalk::{CachedWalker, Ignore};
@@ -761,6 +762,22 @@ impl Driver {
     }
 }
 
+/// Config for an `fs` target: exactly the `f` / `p` / `e` keys the fs provider
+/// emits. `#[derive(Spec)]` provides the parser and the LSP schema. `f` takes
+/// precedence over `p`; with neither, `parse` errors.
+#[derive(Spec)]
+struct FsSpec {
+    /// File path to expose as the single output.
+    #[spec(ty = ParamType::String)]
+    f: Option<String>,
+    /// Glob pattern selecting outputs.
+    #[spec(ty = ParamType::String)]
+    p: Option<String>,
+    /// Comma-separated glob patterns to exclude (glob mode only).
+    #[spec(ty = ParamType::String)]
+    e: Option<String>,
+}
+
 #[async_trait]
 impl crate::engine::driver::Driver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -769,28 +786,28 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
+    fn schema(&self) -> crate::engine::driver::DriverSchema {
+        FsSpec::schema()
+    }
+
     async fn parse(
         &self,
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let get_str = |key: &str| -> anyhow::Result<Option<String>> {
-            match req.target_spec.config.get(key) {
-                None => Ok(None),
-                Some(Value::String(s)) => Ok(Some(s.clone())),
-                Some(v) => anyhow::bail!("fs driver: '{}' must be a string, got {:?}", key, v),
-            }
-        };
+        let spec = FsSpec::from(req.target_spec.config.clone()).context("parse fs config")?;
 
-        let file_path = get_str("f")?
+        let file_path = spec
+            .f
             .map(|p| normalize_path(&p))
             .transpose()
             .context("normalizing fs file path")?;
-        let glob_pattern = get_str("p")?
+        let glob_pattern = spec
+            .p
             .map(|p| normalize_path(&p))
             .transpose()
             .context("normalizing fs glob pattern")?;
-        let exclude_raw = get_str("e")?.unwrap_or_default();
+        let exclude_raw = spec.e.unwrap_or_default();
 
         // "e" arg is comma-separated glob patterns.
         let exclude: Vec<String> = if exclude_raw.is_empty() {

@@ -7,14 +7,28 @@ use crate::engine::driver::{
     },
 };
 use crate::hasync::Cancellable;
-use crate::htvalue::{Value, parse_bool, parse_string};
+use crate::htspec::Spec;
+use crate::htvalue::signature::ParamType;
 use anyhow::Context as _;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
 pub const DRIVER_NAME: &str = "textfile";
+
+/// Config for a `textfile` target. `#[derive(Spec)]` provides the parser and
+/// the LSP schema.
+#[derive(Spec)]
+struct TextFileSpec {
+    /// File contents to write (required, trimmed).
+    #[spec(required)]
+    text: String,
+    /// Output filename; defaults to the target name.
+    #[spec(ty = ParamType::String)]
+    out: Option<String>,
+    /// Mark the written file executable.
+    executable: bool,
+}
 
 #[derive(serde::Serialize)]
 struct TextFileDef {
@@ -25,22 +39,6 @@ struct TextFileDef {
 
 pub struct Driver;
 
-fn take_string(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Option<String>> {
-    match m.remove(key) {
-        Some(v) => parse_string(v).with_context(|| format!("parse `{key}`")),
-        None => Ok(None),
-    }
-}
-
-fn take_bool(m: &mut HashMap<&str, &Value>, key: &str) -> anyhow::Result<Option<bool>> {
-    match m.remove(key) {
-        Some(v) => parse_bool(v)
-            .with_context(|| format!("parse `{key}`"))
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
 #[async_trait]
 impl crate::engine::driver::Driver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -49,37 +47,8 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
-    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
-        use crate::engine::driver::{DriverField, DriverSchema};
-        use crate::htvalue::signature::ParamType;
-        let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
-            name: name.to_string(),
-            ty,
-            doc: doc.to_string(),
-            required,
-        };
-        Some(DriverSchema {
-            fields: vec![
-                f(
-                    "text",
-                    ParamType::String,
-                    "File contents to write (required, trimmed).",
-                    true,
-                ),
-                f(
-                    "out",
-                    ParamType::String,
-                    "Output filename; defaults to the target name.",
-                    false,
-                ),
-                f(
-                    "executable",
-                    ParamType::Bool,
-                    "Mark the written file executable.",
-                    false,
-                ),
-            ],
-        })
+    fn schema(&self) -> crate::engine::driver::DriverSchema {
+        TextFileSpec::schema()
     }
 
     async fn parse(
@@ -87,28 +56,13 @@ impl crate::engine::driver::Driver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let mut m: HashMap<&str, &Value> = req
-            .target_spec
-            .config
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
-
-        let text = take_string(&mut m, "text")?
-            .ok_or_else(|| anyhow::anyhow!("textfile driver requires `text`"))?
-            .trim()
-            .to_string();
-        let out_rel =
-            take_string(&mut m, "out")?.unwrap_or_else(|| req.target_spec.addr.name.clone());
-        let executable = take_bool(&mut m, "executable")?.unwrap_or(false);
-
-        if !m.is_empty() {
-            let unknown: Vec<&str> = m.into_keys().collect();
-            anyhow::bail!(
-                "textfile driver does not support config keys: {:?}",
-                unknown
-            );
-        }
+        let spec =
+            TextFileSpec::from(req.target_spec.config.clone()).context("parse textfile config")?;
+        let text = spec.text.trim().to_string();
+        let out_rel = spec
+            .out
+            .unwrap_or_else(|| req.target_spec.addr.name.clone());
+        let executable = spec.executable;
 
         let pkg = req.target_spec.addr.package.as_str();
         let out = if pkg.is_empty() {
@@ -212,6 +166,8 @@ mod tests {
     use crate::engine::provider::TargetSpec;
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::parse_addr;
+    use crate::htvalue::Value;
+    use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
@@ -294,7 +250,7 @@ mod tests {
             .await
             .err()
             .expect("must error");
-        assert!(err.to_string().contains("bogus"), "{err}");
+        assert!(format!("{err:#}").contains("bogus"), "{err:#}");
     }
 
     #[tokio::test]
