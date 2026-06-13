@@ -251,11 +251,17 @@ fn enrich_hover(
     // Index positions are 1-based.
     let mut md = existing_hover_markdown(resp);
 
-    // If the stock server produced no hover (e.g. an undocumented `def`), fall
-    // back to the function's rendered signature.
-    if md.is_empty()
+    // Hovering a provider function reference (`heph.<provider>.<fn>`, e.g.
+    // `heph.fs.join`) → its rendered signature + doc, pulled from the function
+    // registry. Authoritative for these, so it replaces any stock hover (the
+    // stock server has no docs for the engine-injected native functions).
+    if let Some(fn_md) = provider_fn_hover(&index.source, line, col, shared) {
+        md = fn_md;
+    } else if md.is_empty()
         && let Some(doc) = index.def_hover_at(line + 1, col + 1)
     {
+        // Otherwise, if the stock server produced no hover (e.g. an undocumented
+        // `def`), fall back to the local function's rendered signature.
         md.push_str(doc);
     }
 
@@ -285,6 +291,72 @@ fn enrich_hover(
     };
     resp.result = Some(serde_json::to_value(hover).expect("serialize hover"));
     resp.error = None;
+}
+
+/// Hover markdown for a provider-function reference under the cursor, or `None`
+/// if the cursor is not on a `heph.<provider>.<fn>` whose function is registered.
+/// Renders the canonical signature plus the function's doc string.
+fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) -> Option<String> {
+    let line_text = source.lines().nth(line as usize)?;
+    let (provider, func) = provider_fn_at(line_text, col as usize)?;
+    let registry = shared.engine.provider_function_registry();
+    let rf = registry.get(&provider, &func)?;
+    // `render` yields `join(*elems: string) -> string`; prefix the namespace so
+    // the hover reads as the call site does: `heph.fs.join(...) -> ...`.
+    let signature = rf.signature.render(&func);
+    let mut md = format!("```python\nheph.{provider}.{signature}\n```");
+    if !rf.doc.is_empty() {
+        md.push_str("\n\n");
+        md.push_str(&rf.doc);
+    }
+    Some(md)
+}
+
+/// If the identifier at byte offset `col` on `line` is the final segment of a
+/// `heph.<provider>.<fn>` dotted path, return `(provider, fn)`. The cursor may
+/// sit anywhere within the function identifier. Only ASCII identifiers (the
+/// namespace/provider/function names) and `.` separators are walked.
+fn provider_fn_at(line: &str, col: usize) -> Option<(String, String)> {
+    let b = line.as_bytes();
+    let is_ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    let col = col.min(b.len());
+
+    // Identifier containing the cursor (cursor may be at either edge of the word).
+    let mut end = col;
+    while b.get(end).is_some_and(is_ident) {
+        end += 1;
+    }
+    let mut start = col;
+    while start > 0 && b.get(start - 1).is_some_and(is_ident) {
+        start -= 1;
+    }
+    if start == end {
+        return None; // cursor is not on an identifier
+    }
+
+    // Walk left across `.ident` segments preceding the cursor's identifier.
+    let mut segments = vec![line.get(start..end)?];
+    let mut i = start;
+    while i > 0 && b.get(i - 1) == Some(&b'.') {
+        let dot = i - 1;
+        let mut s = dot;
+        while s > 0 && b.get(s - 1).is_some_and(is_ident) {
+            s -= 1;
+        }
+        if s == dot {
+            break; // a `.` with no identifier before it
+        }
+        segments.push(line.get(s..dot)?);
+        i = s;
+    }
+    segments.reverse();
+
+    // Exactly `heph.<provider>.<fn>`; the `heph.core.*` builtins live in a
+    // different namespace and aren't in the provider registry.
+    match segments.as_slice() {
+        ["heph", provider, func] => Some((provider.to_string(), func.to_string())),
+        _ => None,
+    }
 }
 
 /// Pull whatever markdown/plain text the stock server already produced for hover.
@@ -499,6 +571,34 @@ mod tests {
         // in_string sanity.
         assert!(in_string(r#"name = "t"#));
         assert!(!in_string(r#"name = "t", "#));
+    }
+
+    #[test]
+    fn provider_fn_at_resolves_heph_namespace_path() {
+        use super::provider_fn_at;
+        let line = r#"    srcs = heph.fs.join("a", "b"),"#;
+        // `heph.fs.join` starts at col 11; `join` spans cols 19..23.
+        let join_col = line.find("join").unwrap();
+        // Cursor anywhere within `join` resolves to (provider, fn).
+        for c in join_col..=join_col + "join".len() {
+            assert_eq!(
+                provider_fn_at(line, c),
+                Some(("fs".to_string(), "join".to_string())),
+                "col {c}"
+            );
+        }
+        // The go namespace resolves too.
+        let go = r#"deps = {"golist": [heph.go.build_addr("p", "linux", "amd64")]}"#;
+        let c = go.find("build_addr").unwrap() + 2;
+        assert_eq!(
+            provider_fn_at(go, c),
+            Some(("go".to_string(), "build_addr".to_string()))
+        );
+        // Hovering the namespace segment (`fs`), a bare identifier, or a
+        // non-`heph` path yields nothing.
+        assert_eq!(provider_fn_at(line, line.find("fs").unwrap()), None);
+        assert_eq!(provider_fn_at("    x = join(a, b)", 9), None);
+        assert_eq!(provider_fn_at(r#"  y = os.path.join("a")"#, 14), None);
     }
 
     #[test]

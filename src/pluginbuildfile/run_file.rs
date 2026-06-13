@@ -2398,6 +2398,7 @@ target(name = "t_in_app", driver = SHARED)
                     variadic: None,
                     returns: ParamType::String,
                 },
+                doc: String::new(),
                 func: Arc::new(EchoFn),
             }],
         );

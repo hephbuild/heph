@@ -191,6 +191,10 @@ impl EProvider for Provider {
                     variadic: None,
                     returns: ParamType::list(ParamType::String),
                 },
+                doc: "Expand a glob pattern (relative to the current package) into \
+                      the list of matching source-file target addresses. Engine- and \
+                      build-managed directories are skipped."
+                    .to_string(),
                 func: Arc::new(GlobFn {
                     skip: self.skip.clone(),
                     walker: self.walker.clone(),
@@ -205,16 +209,26 @@ impl EProvider for Provider {
                     variadic: Some(Param::required("elems", ParamType::String)),
                     returns: ParamType::String,
                 },
+                doc: "Join path segments into a single `/`-separated path, cleaning \
+                      `.`/`..` and redundant separators — Go `path.Join` style. \
+                      Example: `heph.fs.join(\"a\", \"b/\", \"c\")` → `\"a/b/c\"`."
+                    .to_string(),
                 func: Arc::new(JoinFn),
             },
             ProviderFunctionDef {
                 name: "dir".to_string(),
                 signature: one_path(),
+                doc: "The directory portion of `path` (everything up to the last \
+                      `/`), Go `path.Dir` style."
+                    .to_string(),
                 func: Arc::new(DirFn),
             },
             ProviderFunctionDef {
                 name: "base".to_string(),
                 signature: one_path(),
+                doc: "The final element of `path` (everything after the last `/`), \
+                      Go `path.Base` style."
+                    .to_string(),
                 func: Arc::new(BaseFn),
             },
         ]
