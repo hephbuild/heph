@@ -296,6 +296,13 @@ fn enrich_hover(
 /// Hover markdown for a provider-function reference under the cursor, or `None`
 /// if the cursor is not on a `heph.<provider>.<fn>` whose function is registered.
 /// Renders the canonical signature plus the function's doc string.
+///
+/// This can't be left to the stock `starlark_lsp`: its hover resolves top-level
+/// globals and `load()`-ed symbols, but not a member of a *global namespace*
+/// (`heph` → `fs` → `join`). The native registration already supplies these
+/// functions' signature/param types (see `run_file::build_globals`) yet the
+/// stock server still produces no hover for them — so we render it here from the
+/// function registry.
 fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) -> Option<String> {
     let line_text = source.lines().nth(line as usize)?;
     let (provider, func) = provider_fn_at(line_text, col as usize)?;

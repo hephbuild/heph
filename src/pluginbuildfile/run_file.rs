@@ -45,12 +45,24 @@ pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
                             name.as_str(),
                             starlark::__derive_refs::components::NativeCallableComponents {
                                 speculative_exec_safe: false,
+                                // The hover doc (`rf.doc`) is intentionally NOT
+                                // threaded here. `rust_docstring` is `&'static str`,
+                                // but provider docs are runtime-built `String`s in
+                                // the registry — and it would buy nothing: the stock
+                                // `starlark_lsp` doesn't resolve hover/completion for
+                                // a *member of a global namespace* like
+                                // `heph.fs.join` (only top-level globals + loaded
+                                // symbols). The `param_spec`/`return_type` below are
+                                // already wired yet produce no hover, which is why
+                                // the LSP proxy (`lsp/proxy.rs::provider_fn_hover`)
+                                // renders hover for these functions from the registry
+                                // instead.
                                 rust_docstring: None,
                                 // Drive Starlark's native typing from the declared
-                                // signature so BUILD-time gets arity/type errors and
-                                // docs. The engine-side validator in `invoke` is the
-                                // canonical guard (and the only one that checks the
-                                // return value at runtime).
+                                // signature so BUILD-time gets arity/type errors. The
+                                // engine-side validator in `invoke` is the canonical
+                                // guard (and the only one that checks the return value
+                                // at runtime).
                                 param_spec: build_param_spec(&rf.signature),
                                 return_type: param_type_to_ty(&rf.signature.returns),
                             },
