@@ -182,26 +182,43 @@ impl TargetSpec {
             doc: doc.to_string(),
             required: false,
         };
+        // Types mirror exactly what the `parse_*` helpers accept (see
+        // `TargetSpec::from`), each of which is effectively a union:
+        //   parse_strings           → string | list[string]
+        //   parse_map_string_strings→ string | list[string] | map[string | list[string]]
+        //   parse_map_string_string → string | map[string]
+        let str_or_list = || ParamType::union(vec![Str, ParamType::list(Str)]);
+        let group_strings = || {
+            ParamType::union(vec![
+                Str,
+                ParamType::list(Str),
+                ParamType::map(str_or_list()),
+            ])
+        };
+        let str_or_map = || ParamType::union(vec![Str, ParamType::map(Str)]);
         DriverSchema {
             fields: vec![
                 field(
                     "run",
-                    ParamType::list(Str),
+                    str_or_list(),
                     "Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.",
                 ),
                 field(
                     "out",
-                    ParamType::map(ParamType::list(Str)),
+                    group_strings(),
                     "Declared outputs, grouped by name → list of output paths the target writes.",
                 ),
                 field(
                     "cache",
-                    ParamType::union(vec![ParamType::Bool, ParamType::map(ParamType::Bool)]),
+                    ParamType::union(vec![
+                        ParamType::Bool,
+                        ParamType::map(ParamType::union(vec![ParamType::Bool, ParamType::Int])),
+                    ]),
                     "Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.",
                 ),
                 field(
                     "support_files",
-                    ParamType::list(Str),
+                    str_or_list(),
                     "Extra files materialized into the sandbox but not hashed as deps.",
                 ),
                 field(
@@ -211,42 +228,42 @@ impl TargetSpec {
                 ),
                 field(
                     "deps",
-                    ParamType::map(ParamType::list(Str)),
+                    group_strings(),
                     "Hashed + runtime dependencies, grouped by name → list of target addresses.",
                 ),
                 field(
                     "hash_deps",
-                    ParamType::map(ParamType::list(Str)),
+                    group_strings(),
                     "Dependencies that contribute to the input hash but are not materialized at runtime.",
                 ),
                 field(
                     "runtime_deps",
-                    ParamType::map(ParamType::list(Str)),
+                    group_strings(),
                     "Dependencies materialized at runtime but excluded from the input hash.",
                 ),
                 field(
                     "tools",
-                    ParamType::map(ParamType::list(Str)),
+                    group_strings(),
                     "Build tools, grouped by name → list of target addresses; symlinked under `tools/`.",
                 ),
                 field(
                     "env",
-                    ParamType::map(Str),
+                    str_or_map(),
                     "Environment variables set for the command.",
                 ),
                 field(
                     "pass_env",
-                    ParamType::list(Str),
+                    str_or_list(),
                     "Names of host environment variables passed through (hashed). `\"*\"` passes all.",
                 ),
                 field(
                     "runtime_pass_env",
-                    ParamType::list(Str),
+                    str_or_list(),
                     "Host env vars passed through at runtime only (not hashed). `\"*\"` passes all.",
                 ),
                 field(
                     "runtime_env",
-                    ParamType::map(Str),
+                    str_or_map(),
                     "Environment variables set at runtime only (not hashed).",
                 ),
             ],
@@ -291,12 +308,23 @@ mod tests {
         ] {
             assert!(by_name.contains_key(key), "schema missing field `{key}`");
         }
-        assert_eq!(by_name["run"].ty, ParamType::list(ParamType::String));
+        // Types are unions mirroring the `parse_*` helpers.
+        let str_or_list =
+            ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
+        assert_eq!(by_name["run"].ty, str_or_list);
+        assert_eq!(by_name["run"].ty.render(), "string | list[string]");
         assert_eq!(
             by_name["deps"].ty,
-            ParamType::map(ParamType::list(ParamType::String))
+            ParamType::union(vec![
+                ParamType::String,
+                ParamType::list(ParamType::String),
+                ParamType::map(str_or_list.clone()),
+            ])
         );
-        assert_eq!(by_name["env"].ty, ParamType::map(ParamType::String));
+        assert_eq!(
+            by_name["env"].ty,
+            ParamType::union(vec![ParamType::String, ParamType::map(ParamType::String)])
+        );
         assert!(!by_name["run"].doc.is_empty());
     }
 
