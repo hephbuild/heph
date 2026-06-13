@@ -25,6 +25,13 @@ use starlark_lsp::server::{LspContext, LspEvalResult, LspUrl, StringLiteralResul
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long a listing provider (and its internal package/target memoization) is
+/// reused before being rebuilt. Bursts of completion requests (keystrokes) within
+/// the window are served from its cache; after it, a fresh provider re-walks the
+/// workspace so newly-added packages/targets show up without restarting the LSP.
+const LISTING_TTL: Duration = Duration::from_secs(2);
 
 pub(crate) struct HephLspContext {
     root: PathBuf,
@@ -36,8 +43,9 @@ pub(crate) struct HephLspContext {
     /// BUILD-file name patterns, from the buildfile provider's `patterns` config
     /// option (defaulting to `BUILD`). Used for both listing and load resolution.
     patterns: Vec<glob::Pattern>,
-    /// Buildfile provider used only for package/target listing during completion.
-    provider: Provider,
+    /// Buildfile provider used only for package/target listing during completion,
+    /// with its build timestamp. Rebuilt after [`LISTING_TTL`] (see [`Self::provider`]).
+    provider: Mutex<(Instant, Arc<Provider>)>,
     pub(crate) shared: Arc<SharedState>,
 }
 
@@ -47,14 +55,7 @@ impl HephLspContext {
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();
         let patterns = buildfile_patterns(&root);
-        // Listing provider configured with the same patterns the engine's
-        // buildfile provider uses, so completion sees the right BUILD files.
-        let provider = Provider {
-            root: root.clone(),
-            build_file_patterns: patterns.clone(),
-            ..Provider::default()
-        };
-        provider.set_function_registry(Arc::clone(&registry));
+        let provider = build_listing_provider(&root, &patterns, &registry);
         let shared = SharedState::new(engine, root.clone(), patterns.clone());
         HephLspContext {
             root,
@@ -62,9 +63,24 @@ impl HephLspContext {
             doc_globals,
             globals: Arc::new(OnceLock::new()),
             patterns,
-            provider,
+            provider: Mutex::new((Instant::now(), provider)),
             shared,
         }
+    }
+
+    /// The listing provider, rebuilt if older than [`LISTING_TTL`]. Reuse within
+    /// the window keeps repeated completion requests fast (served from the
+    /// provider's own memoization); a rebuild drops that cache so the next walk
+    /// reflects the current workspace.
+    fn provider(&self) -> Arc<Provider> {
+        let mut cell = self.provider.lock().expect("provider lock");
+        if cell.0.elapsed() >= LISTING_TTL {
+            *cell = (
+                Instant::now(),
+                build_listing_provider(&self.root, &self.patterns, &self.registry),
+            );
+        }
+        Arc::clone(&cell.1)
     }
 
     /// Package name for a BUILD file path (its parent dir, workspace-relative,
@@ -91,8 +107,9 @@ impl HephLspContext {
 
     /// List package names beginning with `prefix` (no leading `//`).
     fn list_packages(&self, prefix: &str) -> Vec<String> {
+        let provider = self.provider();
         let ctoken = StdCancellationToken::new();
-        let fut = self.provider.list_packages(
+        let fut = provider.list_packages(
             ListPackagesRequest {
                 prefix: PkgBuf::from(prefix),
             },
@@ -110,8 +127,9 @@ impl HephLspContext {
 
     /// List target names in `package`.
     fn list_targets(&self, package: &str) -> Vec<String> {
+        let provider = self.provider();
         let ctoken = StdCancellationToken::new();
-        let fut = self.provider.list(
+        let fut = provider.list(
             ListRequest {
                 request_id: "lsp".to_string(),
                 package: PkgBuf::from(package),
@@ -147,6 +165,23 @@ fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
             && patterns.iter().any(|p| p.matches(&name.to_string_lossy()));
         matches.then(|| e.path())
     })
+}
+
+/// Build a fresh buildfile provider for package/target listing, configured with
+/// the same patterns the engine's provider uses and the aggregated function
+/// registry (so `list(pkg)` can evaluate BUILD files).
+fn build_listing_provider(
+    root: &Path,
+    patterns: &[glob::Pattern],
+    registry: &Arc<ProviderFunctionRegistry>,
+) -> Arc<Provider> {
+    let provider = Provider {
+        root: root.to_path_buf(),
+        build_file_patterns: patterns.to_vec(),
+        ..Provider::default()
+    };
+    provider.set_function_registry(Arc::clone(registry));
+    Arc::new(provider)
 }
 
 /// BUILD-file name patterns from the workspace's buildfile-provider config,
