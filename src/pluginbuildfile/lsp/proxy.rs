@@ -23,9 +23,24 @@ use std::sync::{Arc, Mutex};
 /// What an intercepted request was, so its response can be enriched.
 #[derive(Clone)]
 enum Pending {
-    Hover { uri: LspUrl, line: u32, col: u32 },
-    Completion { uri: LspUrl, line: u32, col: u32 },
-    Definition { uri: LspUrl, line: u32, col: u32 },
+    Hover {
+        uri: LspUrl,
+        line: u32,
+        col: u32,
+    },
+    Completion {
+        uri: LspUrl,
+        line: u32,
+        col: u32,
+    },
+    Definition {
+        uri: LspUrl,
+        line: u32,
+        col: u32,
+    },
+    /// The `initialize` handshake: its response's capabilities are patched so
+    /// the editor fires completion after `.` (member completion).
+    Initialize,
 }
 
 /// Pump messages between `client` (editor stdio) and `server` (starlark_lsp),
@@ -81,6 +96,10 @@ pub(crate) fn run(client: &Connection, server: &Connection, shared: Arc<SharedSt
 /// Extract `(uri, line, col)` for the requests we enrich. Positions are 0-based,
 /// as sent by the client.
 fn classify(method: &str, params: &serde_json::Value) -> Option<Pending> {
+    // `initialize` carries no position; handle it before the position extraction.
+    if method == "initialize" {
+        return Some(Pending::Initialize);
+    }
     let pos = params.get("position")?;
     let line = pos.get("line")?.as_u64()? as u32;
     let col = pos.get("character")?.as_u64()? as u32;
@@ -99,6 +118,28 @@ fn enrich(resp: &mut lsp_server::Response, pending: &Pending, shared: &SharedSta
         Pending::Hover { uri, line, col } => enrich_hover(resp, uri, *line, *col, shared),
         Pending::Completion { uri, line, col } => enrich_completion(resp, uri, *line, *col, shared),
         Pending::Definition { uri, line, col } => enrich_definition(resp, uri, *line, *col, shared),
+        Pending::Initialize => enrich_initialize(resp),
+    }
+}
+
+/// Advertise `.` as a completion trigger character so editors request completion
+/// right after a member access (`heph.`, `heph.fs.`). The stock server sends an
+/// empty `completionProvider`, so nothing would fire on `.` otherwise.
+fn enrich_initialize(resp: &mut lsp_server::Response) {
+    let Some(serde_json::Value::Object(result)) = resp.result.as_mut() else {
+        return;
+    };
+    let caps = result
+        .entry("capabilities")
+        .or_insert_with(|| serde_json::json!({}));
+    let serde_json::Value::Object(caps) = caps else {
+        return;
+    };
+    let cp = caps
+        .entry("completionProvider")
+        .or_insert_with(|| serde_json::json!({}));
+    if let serde_json::Value::Object(cp) = cp {
+        cp.insert("triggerCharacters".to_string(), serde_json::json!(["."]));
     }
 }
 
@@ -447,6 +488,96 @@ fn marked_string_text(s: MarkedString) -> String {
     }
 }
 
+/// Completion items for a `heph` namespace member access whose dotted base ends
+/// just before the cursor. `heph.` → the provider namespaces (`fs`, `go`, …) plus
+/// `core`; `heph.<provider>.` → that provider's functions, with their signature
+/// as detail and doc as the popup. Empty when the cursor isn't on such a member.
+fn provider_member_completions(prefix: &str, shared: &SharedState) -> Vec<CompletionItem> {
+    let Some(base) = completion_member_base(prefix) else {
+        return vec![];
+    };
+    let registry = shared.engine.provider_function_registry();
+    match base.as_slice() {
+        // `heph.` → namespace names. `core` is a static builtin namespace, the
+        // rest come from the providers that registered functions.
+        ["heph"] => {
+            let mut names: Vec<String> = registry.providers().map(|(p, _)| p.to_string()).collect();
+            names.push("core".to_string());
+            names.sort();
+            names.dedup();
+            names
+                .into_iter()
+                .map(|name| CompletionItem {
+                    kind: Some(CompletionItemKind::MODULE),
+                    detail: Some("heph namespace".to_string()),
+                    sort_text: Some(format!("0_{name}")),
+                    label: name,
+                    ..Default::default()
+                })
+                .collect()
+        }
+        // `heph.<provider>.` → that provider's functions.
+        ["heph", provider] => registry
+            .providers()
+            .find(|(p, _)| p == provider)
+            .map(|(_, fns)| {
+                let mut items: Vec<CompletionItem> = fns
+                    .iter()
+                    .map(|(name, rf)| CompletionItem {
+                        kind: Some(CompletionItemKind::FUNCTION),
+                        detail: Some(rf.signature.render(name)),
+                        documentation: (!rf.doc.is_empty())
+                            .then(|| lsp_types::Documentation::String(rf.doc.clone())),
+                        sort_text: Some(format!("0_{name}")),
+                        label: name.clone(),
+                        ..Default::default()
+                    })
+                    .collect();
+                items.sort_by(|a, b| a.label.cmp(&b.label));
+                items
+            })
+            .unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
+/// The dotted base of a member access ending just before the cursor: the segments
+/// before the final `.<partial>`. For `… = heph.fs.gl` returns `[heph, fs]`;
+/// for `heph.` returns `[heph]`. `None` when the text before the cursor isn't a
+/// `<ident>(.<ident>)*.` member access. Walks ASCII identifiers + `.` only.
+fn completion_member_base(prefix: &str) -> Option<Vec<&str>> {
+    let b = prefix.as_bytes();
+    let is_ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    let mut i = b.len();
+    // Skip the (possibly empty) partial member the user is typing.
+    while i > 0 && b.get(i - 1).is_some_and(is_ident) {
+        i -= 1;
+    }
+    // It must be a member access: an identifier preceded by a `.`.
+    if i == 0 || b.get(i - 1) != Some(&b'.') {
+        return None;
+    }
+    i -= 1; // consume the `.`
+    let mut segments: Vec<&str> = Vec::new();
+    loop {
+        let end = i;
+        while i > 0 && b.get(i - 1).is_some_and(is_ident) {
+            i -= 1;
+        }
+        if i == end {
+            break; // no identifier here
+        }
+        segments.push(prefix.get(i..end)?);
+        if i > 0 && b.get(i - 1) == Some(&b'.') {
+            i -= 1; // another `.ident` segment to the left
+        } else {
+            break;
+        }
+    }
+    segments.reverse();
+    (!segments.is_empty()).then_some(segments)
+}
+
 /// A keyword-argument completion item for a driver/provider schema field. `ctx`
 /// is the driver or provider name, shown in the detail line.
 /// Whether the cursor (end of `prefix`, the line text before it) sits inside an
@@ -526,12 +657,19 @@ fn enrich_completion(
         .get(..(col as usize).min(line_text.len()))
         .unwrap_or("");
 
+    // Member access on the `heph` namespace (`heph.` → providers, `heph.<provider>.`
+    // → that provider's functions) takes priority — the stock server can't
+    // complete namespace members at all.
+    let member = provider_member_completions(prefix, shared);
+
     // Inside a `driver = "…"` string → the registered driver names. Otherwise inside
     // a `target(...)` → the driver-independent base args plus (when a driver is
     // chosen) that driver's config fields. Inside a `provider_state(provider="X", …)`
     // → that provider's state fields. Inside any other string we add nothing (the
     // address/string completion path handles those).
-    let extra: Vec<CompletionItem> = if in_driver_value(prefix) {
+    let extra: Vec<CompletionItem> = if !member.is_empty() {
+        member
+    } else if in_driver_value(prefix) {
         shared
             .engine
             .driver_names()
@@ -661,6 +799,31 @@ mod tests {
         assert_eq!(provider_fn_at(line, line.find("fs").unwrap()), None);
         assert_eq!(provider_fn_at("    x = join(a, b)", 9), None);
         assert_eq!(provider_fn_at(r#"  y = os.path.join("a")"#, 14), None);
+    }
+
+    #[test]
+    fn completion_member_base_extracts_dotted_base() {
+        use super::completion_member_base;
+        // `heph.` → base [heph] (offer namespaces).
+        assert_eq!(
+            completion_member_base("    srcs = heph."),
+            Some(vec!["heph"])
+        );
+        // partial member after the dot doesn't change the base.
+        assert_eq!(completion_member_base("x = heph.f"), Some(vec!["heph"]));
+        // two levels → [heph, fs] (offer fs functions).
+        assert_eq!(
+            completion_member_base("x = heph.fs."),
+            Some(vec!["heph", "fs"])
+        );
+        assert_eq!(
+            completion_member_base("x = heph.fs.gl"),
+            Some(vec!["heph", "fs"])
+        );
+        // Not a member access → None.
+        assert_eq!(completion_member_base("x = heph"), None);
+        assert_eq!(completion_member_base("x = "), None);
+        assert_eq!(completion_member_base(""), None);
     }
 
     #[test]

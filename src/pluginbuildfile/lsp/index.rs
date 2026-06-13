@@ -85,6 +85,16 @@ pub(crate) struct DocIndex {
 }
 
 impl DocIndex {
+    /// An index carrying only the buffer text, no provenance. Used when the
+    /// buffer doesn't parse/evaluate (the user is mid-edit, e.g. just typed
+    /// `heph.`) so prefix-based completion/hover still has the current source.
+    pub(crate) fn source_only(source: String) -> DocIndex {
+        DocIndex {
+            source,
+            ..DocIndex::default()
+        }
+    }
+
     /// Build the index from an evaluated buffer. `pkg` is the buffer's package
     /// (used to format `//pkg:name` addresses); `source` is the buffer text.
     pub(crate) fn build(result: &RunResult, pkg: &str, source: String) -> DocIndex {

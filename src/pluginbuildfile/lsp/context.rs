@@ -230,6 +230,10 @@ impl LspContext for HephLspContext {
         let ast = match AstModule::parse(&filename, content.clone(), &Dialect::Extended) {
             Ok(ast) => ast,
             Err(e) => {
+                // Keep the (unparseable) buffer source so prefix-based completion
+                // and hover still work while the user is typing (`heph.` etc.).
+                self.shared
+                    .set_index(uri.clone(), DocIndex::source_only(content));
                 return LspEvalResult {
                     diagnostics: vec![eval_message_to_lsp_diagnostic(EvalMessage::from_error(
                         &path, &e,
@@ -240,15 +244,17 @@ impl LspContext for HephLspContext {
         };
 
         // Best-effort evaluation to populate the provenance / driver index. A
-        // half-typed buffer that fails to evaluate simply yields no index — we do
-        // not surface eval errors as diagnostics (they would be noisy while typing).
+        // half-typed buffer that fails to evaluate simply yields no provenance —
+        // but we keep the source for prefix-based completion/hover. We do not
+        // surface eval errors as diagnostics (they would be noisy while typing).
         let pkg = self.path_to_pkg(&path);
         let source = content.clone();
         if let Ok(result) = eval_source(&filename, content, &pkg, &self.loader()) {
             self.shared
                 .set_index(uri.clone(), DocIndex::build(&result, &pkg, source));
         } else {
-            self.shared.set_index(uri.clone(), DocIndex::default());
+            self.shared
+                .set_index(uri.clone(), DocIndex::source_only(source));
         }
 
         LspEvalResult {
