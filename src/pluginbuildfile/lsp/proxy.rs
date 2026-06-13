@@ -323,6 +323,10 @@ fn field_item(name: &str, ty: &str, doc: String, ctx: &str) -> CompletionItem {
         documentation: Some(lsp_types::Documentation::String(doc)),
         // Insert as `name = ` to match the keyword-argument call site.
         insert_text: Some(format!("{name} = ")),
+        // Editors rank by `sort_text` (falling back to the label), ignoring list
+        // order. The `0_` prefix sorts these schema fields ahead of every
+        // stock/builtin item (whose effective sort key starts with a letter).
+        sort_text: Some(format!("0_{name}")),
         ..Default::default()
     }
 }
