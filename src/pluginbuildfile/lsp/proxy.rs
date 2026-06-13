@@ -315,6 +315,34 @@ fn marked_string_text(s: MarkedString) -> String {
 
 /// A keyword-argument completion item for a driver/provider schema field. `ctx`
 /// is the driver or provider name, shown in the detail line.
+/// Whether the cursor (end of `prefix`, the line text before it) sits inside an
+/// unclosed string literal. Approximate: counts unescaped double quotes.
+fn in_string(prefix: &str) -> bool {
+    prefix.bytes().filter(|&b| b == b'"').count() % 2 == 1
+}
+
+/// Whether the cursor sits inside the value of a `driver = "…"` keyword argument
+/// (`driver = "<partial>` with no closing quote yet on this line).
+fn in_driver_value(prefix: &str) -> bool {
+    let Some(q) = prefix.rfind('"') else {
+        return false;
+    };
+    // No further quote after the last one → still inside the string.
+    let value = &prefix[q + 1..];
+    if value.contains('"') {
+        return false;
+    }
+    let Some(head) = prefix[..q].trim_end().strip_suffix('=') else {
+        return false;
+    };
+    let head = head.trim_end();
+    head.ends_with("driver")
+        && head[..head.len() - "driver".len()]
+            .chars()
+            .last()
+            .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+}
+
 fn field_item(name: &str, ty: &str, doc: String, ctx: &str) -> CompletionItem {
     CompletionItem {
         label: name.to_string(),
@@ -343,19 +371,48 @@ fn enrich_completion(
     };
     let (l, c) = (line + 1, col + 1);
 
-    // Inside a `target(driver="X", …)` → that driver's config fields; inside a
-    // `provider_state(provider="X", …)` → that provider's state fields.
-    let extra: Vec<CompletionItem> = if let Some(driver) = index.driver_at(l, c) {
+    // The source up to the cursor on its line, for string-context detection.
+    let line_text = index.source.lines().nth(line as usize).unwrap_or("");
+    let prefix = line_text
+        .get(..(col as usize).min(line_text.len()))
+        .unwrap_or("");
+
+    // Inside a `driver = "…"` string → the registered driver names. Otherwise inside
+    // a `target(...)` → the driver-independent base args plus (when a driver is
+    // chosen) that driver's config fields. Inside a `provider_state(provider="X", …)`
+    // → that provider's state fields. Inside any other string we add nothing (the
+    // address/string completion path handles those).
+    let extra: Vec<CompletionItem> = if in_driver_value(prefix) {
         shared
             .engine
-            .driver_schema(driver)
-            .map(|s| {
-                s.fields
-                    .into_iter()
-                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, driver))
-                    .collect()
+            .driver_names()
+            .into_iter()
+            .map(|name| CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("driver".to_string()),
+                sort_text: Some(format!("0_{name}")),
+                ..Default::default()
             })
-            .unwrap_or_default()
+            .collect()
+    } else if in_string(prefix) {
+        vec![]
+    } else if let Some(driver) = index.driver_at(l, c) {
+        let mut items: Vec<CompletionItem> = crate::pluginbuildfile::run_file::target_base_fields()
+            .into_iter()
+            .map(|f| field_item(&f.name, &f.ty.render(), f.doc, "target"))
+            .collect();
+        if !driver.is_empty()
+            && let Some(schema) = shared.engine.driver_schema(driver)
+        {
+            items.extend(
+                schema
+                    .fields
+                    .into_iter()
+                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, driver)),
+            );
+        }
+        items
     } else if let Some(provider) = index.state_provider_at(l, c) {
         shared
             .engine
@@ -411,6 +468,22 @@ mod tests {
         assert_eq!(find_symbol_def(&file, "FOOBAR"), Some((6, 0, 6)));
         // Unknown symbol → None.
         assert_eq!(find_symbol_def(&file, "nope"), None);
+    }
+
+    #[test]
+    fn in_driver_value_detects_driver_string() {
+        use super::{in_driver_value, in_string};
+        assert!(in_driver_value(r#"target(name = "t", driver = ""#));
+        assert!(in_driver_value(r#"target(name = "t", driver = "ex"#));
+        assert!(in_driver_value(r#"  driver="b"#)); // no spaces
+        // Not the driver arg.
+        assert!(!in_driver_value(r#"target(name = ""#));
+        assert!(!in_driver_value(r#"target(mydriver = ""#)); // prefix collision
+        // Closed string → not inside it anymore.
+        assert!(!in_driver_value(r#"driver = "exec", "#));
+        // in_string sanity.
+        assert!(in_string(r#"name = "t"#));
+        assert!(!in_string(r#"name = "t", "#));
     }
 
     #[test]

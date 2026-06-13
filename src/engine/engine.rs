@@ -460,6 +460,14 @@ impl Engine {
             .and_then(|d| d.driver.schema())
     }
 
+    /// Names of all registered drivers, sorted. Used by the BUILD-file LSP to
+    /// complete the `driver =` argument of a `target(...)` call.
+    pub fn driver_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.drivers_by_name.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// The state schema a registered provider exposes, if any. Used by the
     /// BUILD-file LSP to complete and document `provider_state(provider="<name>", …)`
     /// args. Returns `None` for unknown providers or providers without a schema.

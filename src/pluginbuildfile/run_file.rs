@@ -475,6 +475,44 @@ fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
         .collect()
 }
 
+/// The driver-independent keyword arguments the `target()` builtin always
+/// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
+/// (below) so the two don't drift. Driver-specific config args come from the
+/// driver's own schema and are merged in by the LSP.
+pub(crate) fn target_base_fields() -> Vec<crate::engine::driver::DriverField> {
+    use crate::engine::driver::DriverField;
+    let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
+        name: name.to_string(),
+        ty,
+        doc: doc.to_string(),
+        required,
+    };
+    vec![
+        f("name", ParamType::String, "Target name (required).", true),
+        f(
+            "driver",
+            ParamType::String,
+            "Driver that builds this target; falls back to the provider's `defaultDriver`.",
+            false,
+        ),
+        f(
+            "labels",
+            ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]),
+            "Labels for querying/filtering this target.",
+            false,
+        ),
+        f(
+            "transitive",
+            ParamType::map(ParamType::union(vec![
+                ParamType::list(ParamType::String),
+                ParamType::map(ParamType::list(ParamType::String)),
+            ])),
+            "Sandbox applied transitively: `deps`, `tools`, `env`, `pass_env`, `runtime_pass_env`, `runtime_env`.",
+            false,
+        ),
+    ]
+}
+
 #[starlark_module]
 fn starlark_module(builder: &mut GlobalsBuilder) {
     /// Declare a build target.

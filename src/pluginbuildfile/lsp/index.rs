@@ -104,10 +104,10 @@ impl DocIndex {
                     .or_default()
                     .push(addr.clone());
             }
-            // The innermost frame is the `target()` call itself.
-            if let Some(inner) = target.provenance.first()
-                && !target.driver.is_empty()
-            {
+            // The innermost frame is the `target()` call itself. Recorded for every
+            // target (driver may be empty) so completion can offer the base
+            // `target()` args even before a driver is chosen.
+            if let Some(inner) = target.provenance.first() {
                 target_calls.push(TargetCall {
                     span: Span::of(inner),
                     driver: target.driver.clone(),
@@ -187,7 +187,9 @@ impl DocIndex {
             .map(|ct| ct.addrs.as_slice())
     }
 
-    /// The driver of the `target()` call covering the 1-based position, if any.
+    /// If the 1-based position is inside a `target()` call, its driver (which may
+    /// be the empty string when no `driver=` is set yet); `None` if not in a
+    /// `target()` call.
     pub(crate) fn driver_at(&self, line: u32, col: u32) -> Option<&str> {
         self.target_calls
             .iter()
