@@ -317,6 +317,9 @@ impl Sandbox {
 pub(crate) struct OnStatePayload {
     pub provider: String,
     pub args: HashMap<String, htvalue::Value>,
+    /// Source call sites of the `provider_state()` call (innermost first). Only
+    /// captured for the LSP; empty on the normal build path. See [`ProvenanceFrame`].
+    pub provenance: Vec<ProvenanceFrame>,
 }
 
 #[derive(Debug)]
@@ -646,9 +649,16 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             )));
         }
 
+        let provenance = if extra.capture_provenance {
+            capture_provenance(eval)
+        } else {
+            Vec::new()
+        };
+
         (extra.on_state)(OnStatePayload {
             provider,
             args: kwargs,
+            provenance,
         })?;
 
         Ok(starlark::values::none::NoneType)

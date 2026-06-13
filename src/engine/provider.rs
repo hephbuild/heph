@@ -223,6 +223,24 @@ impl std::fmt::Debug for GetError {
     }
 }
 
+/// One keyword argument a provider accepts in a `provider_state(provider="X", …)`
+/// call, with its type and docs. Consumed by the BUILD-file LSP for completion and
+/// hover of provider-state args.
+#[derive(Clone, Debug)]
+pub struct StateField {
+    pub name: String,
+    pub ty: crate::htvalue::signature::ParamType,
+    pub doc: String,
+    pub required: bool,
+}
+
+/// Declarative description of the state a provider accepts. Returned by
+/// [`Provider::state_schema`]; `None` means the provider declares no state schema.
+#[derive(Clone, Debug, Default)]
+pub struct StateSchema {
+    pub fields: Vec<StateField>,
+}
+
 pub trait Provider: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
     fn list<'a>(
@@ -253,6 +271,13 @@ pub trait Provider: Send + Sync {
     /// Default: none.
     fn functions(&self) -> Vec<ProviderFunctionDef> {
         vec![]
+    }
+
+    /// Optional: the keyword args this provider accepts in a
+    /// `provider_state(provider="<name>", …)` call, so the BUILD-file LSP can
+    /// complete and document them. Default: none.
+    fn state_schema(&self) -> Option<StateSchema> {
+        None
     }
 
     /// Hand this provider the aggregated registry of every provider's functions.

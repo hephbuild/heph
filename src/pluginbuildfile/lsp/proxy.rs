@@ -307,6 +307,20 @@ fn marked_string_text(s: MarkedString) -> String {
     }
 }
 
+/// A keyword-argument completion item for a driver/provider schema field. `ctx`
+/// is the driver or provider name, shown in the detail line.
+fn field_item(name: &str, ty: &str, doc: String, ctx: &str) -> CompletionItem {
+    CompletionItem {
+        label: name.to_string(),
+        kind: Some(CompletionItemKind::FIELD),
+        detail: Some(format!("{ctx}: {ty}")),
+        documentation: Some(lsp_types::Documentation::String(doc)),
+        // Insert as `name = ` to match the keyword-argument call site.
+        insert_text: Some(format!("{name} = ")),
+        ..Default::default()
+    }
+}
+
 fn enrich_completion(
     resp: &mut lsp_server::Response,
     uri: &LspUrl,
@@ -317,26 +331,35 @@ fn enrich_completion(
     let Some(index) = shared.index(uri) else {
         return;
     };
-    let Some(driver) = index.driver_at(line + 1, col + 1) else {
-        return;
-    };
-    let Some(schema) = shared.engine.driver_schema(driver) else {
-        return;
-    };
+    let (l, c) = (line + 1, col + 1);
 
-    let extra: Vec<CompletionItem> = schema
-        .fields
-        .into_iter()
-        .map(|f| CompletionItem {
-            label: f.name.clone(),
-            kind: Some(CompletionItemKind::FIELD),
-            detail: Some(format!("{}: {}", driver, f.ty.render())),
-            documentation: Some(lsp_types::Documentation::String(f.doc)),
-            // Insert as `name = ` to match the keyword-argument call site.
-            insert_text: Some(format!("{} = ", f.name)),
-            ..Default::default()
-        })
-        .collect();
+    // Inside a `target(driver="X", …)` → that driver's config fields; inside a
+    // `provider_state(provider="X", …)` → that provider's state fields.
+    let extra: Vec<CompletionItem> = if let Some(driver) = index.driver_at(l, c) {
+        shared
+            .engine
+            .driver_schema(driver)
+            .map(|s| {
+                s.fields
+                    .into_iter()
+                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, driver))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else if let Some(provider) = index.state_provider_at(l, c) {
+        shared
+            .engine
+            .provider_state_schema(provider)
+            .map(|s| {
+                s.fields
+                    .into_iter()
+                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, provider))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
     if extra.is_empty() {
         return;
     }

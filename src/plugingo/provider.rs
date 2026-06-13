@@ -440,6 +440,35 @@ impl ProviderTrait for Provider {
             func: Arc::new(BuildAddrFn),
         }]
     }
+
+    fn state_schema(&self) -> Option<crate::engine::provider::StateSchema> {
+        use crate::engine::provider::{StateField, StateSchema};
+        let field = |name: &str, ty: ParamType, doc: &str| StateField {
+            name: name.to_string(),
+            ty,
+            doc: doc.to_string(),
+            required: false,
+        };
+        Some(StateSchema {
+            fields: vec![
+                field(
+                    "go_codegen_root",
+                    ParamType::Bool,
+                    "Mark this package (and descendants) as a Go codegen root.",
+                ),
+                field(
+                    "go_codegen_deps",
+                    ParamType::list(ParamType::String),
+                    "Extra dependencies (target addresses) injected into generated Go targets.",
+                ),
+                field(
+                    "test",
+                    ParamType::map(ParamType::Bool),
+                    "Test settings for this package, e.g. `{\"skip\": True}` to skip its tests.",
+                ),
+            ],
+        })
+    }
 }
 
 /// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — format the heph
