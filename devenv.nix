@@ -92,7 +92,10 @@ in
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")
-    cp $CARGO_TARGET_DIR/debug/heph "${binLocation}"
+    # Atomic replace (new inode) — overwriting the binary in place leaves macOS
+    # holding the previous code-signature for that path and SIGKILLs the next run.
+    cp $CARGO_TARGET_DIR/debug/heph "${binLocation}.new"
+    mv -f "${binLocation}.new" "${binLocation}"
   '';
 
   scripts.install-release-build.exec = ''
@@ -106,7 +109,11 @@ in
       bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$bin"
     fi
     mkdir -p $(dirname "${binLocation}")
-    cp "$bin" "${binLocation}"
+    # Atomic replace (new inode): overwriting in place keeps macOS's cached
+    # code-signature for the old bytes, which SIGKILLs the next run on Apple
+    # Silicon. `mv` swaps the path to a fresh inode so AMFI re-validates.
+    cp "$bin" "${binLocation}.new"
+    mv -f "${binLocation}.new" "${binLocation}"
   '';
 
 
