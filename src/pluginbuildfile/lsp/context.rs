@@ -55,6 +55,7 @@ impl HephLspContext {
             ..Provider::default()
         };
         provider.set_function_registry(Arc::clone(&registry));
+        let shared = SharedState::new(engine, root.clone(), patterns.clone());
         HephLspContext {
             root,
             registry,
@@ -62,7 +63,7 @@ impl HephLspContext {
             globals: Arc::new(OnceLock::new()),
             patterns,
             provider,
-            shared: SharedState::new(engine),
+            shared,
         }
     }
 

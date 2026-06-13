@@ -67,6 +67,11 @@ pub(crate) struct DocIndex {
     /// or imported via `load`), keyed by name. Used to synthesize a signature
     /// tooltip for undocumented functions, which the stock server skips.
     pub defs: std::collections::HashMap<String, String>,
+    /// Symbols imported via `load`, keyed by their local name → (load path,
+    /// exported name in the loaded package). Drives cross-file goto-definition:
+    /// heph merges every BUILD file in a package, but the stock server only parses
+    /// one, so we resolve loaded symbols across all of them ourselves.
+    pub loaded: HashMap<String, (String, String)>,
     /// The buffer's source text, for extracting the identifier under the cursor.
     pub source: String,
 }
@@ -76,6 +81,7 @@ impl DocIndex {
     /// (used to format `//pkg:name` addresses); `source` is the buffer text.
     pub(crate) fn build(result: &RunResult, pkg: &str, source: String) -> DocIndex {
         let defs = function_docs(result);
+        let loaded = parse_load_symbols(&source);
         // Aggregate addresses per unique call-site span. BTreeMap keeps a stable
         // order and dedups identical spans (e.g. a loop body line that produced
         // several targets).
@@ -114,8 +120,18 @@ impl DocIndex {
             call_targets,
             target_calls,
             defs,
+            loaded,
             source,
         }
+    }
+
+    /// The load path and exported name for the loaded symbol at the 1-based
+    /// position, if the identifier under the cursor was imported via `load`.
+    pub(crate) fn loaded_symbol_at(&self, line: u32, col: u32) -> Option<(&str, &str)> {
+        let word = word_at(&self.source, line, col)?;
+        self.loaded
+            .get(word)
+            .map(|(path, exported)| (path.as_str(), exported.as_str()))
     }
 
     /// Rendered hover for the function named by the identifier at the 1-based
@@ -172,6 +188,70 @@ fn function_docs(result: &RunResult) -> HashMap<String, String> {
     out
 }
 
+/// Parse `load(...)` statements out of the source, mapping each imported local
+/// name to `(load path, exported name)`. Handles positional imports
+/// (`load("//p", "sym")` → local == exported == `sym`) and aliased ones
+/// (`load("//p", alias = "sym")` → local `alias`, exported `sym`). A best-effort
+/// textual scan — load statements are simple, single-line in practice.
+fn parse_load_symbols(source: &str) -> HashMap<String, (String, String)> {
+    let mut out = HashMap::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("load(") else {
+            continue;
+        };
+        let Some(close) = rest.find(')') else {
+            continue;
+        };
+        let Some(args) = rest.get(..close) else {
+            continue;
+        };
+        // Split on commas (symbol/path strings never contain commas).
+        let mut parts = args.split(',');
+        let Some(path) = parts.next().and_then(unquote) else {
+            continue;
+        };
+        for part in parts {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.split_once('=') {
+                // `alias = "exported"`
+                Some((local, exported)) => {
+                    let local = local.trim();
+                    if let Some(exported) = unquote(exported)
+                        && !local.is_empty()
+                    {
+                        out.insert(local.to_string(), (path.clone(), exported));
+                    }
+                }
+                // positional `"sym"` — local name equals exported name
+                None => {
+                    if let Some(sym) = unquote(part) {
+                        out.insert(sym.clone(), (path.clone(), sym));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Strip surrounding single or double quotes from a trimmed token.
+fn unquote(s: &str) -> Option<String> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && (bytes.first() == Some(&b'"') || bytes.first() == Some(&b'\''))
+        && bytes.last() == bytes.first()
+    {
+        s.get(1..s.len() - 1).map(str::to_string)
+    } else {
+        None
+    }
+}
+
 /// The identifier (ASCII alphanumeric + `_`) under the 1-based `(line, col)` in
 /// `source`. Returns `None` when the cursor isn't on an identifier character —
 /// Starlark identifiers are ASCII, so byte indexing is safe here.
@@ -199,13 +279,23 @@ fn word_at(source: &str, line: u32, col: u32) -> Option<&str> {
 /// proxy uses to resolve driver schemas.
 pub(crate) struct SharedState {
     pub engine: Arc<Engine>,
+    /// Workspace root + BUILD-file patterns, so the proxy can resolve a loaded
+    /// symbol's package directory and scan its files for the definition.
+    pub root: std::path::PathBuf,
+    pub patterns: Vec<glob::Pattern>,
     docs: Mutex<HashMap<LspUrl, DocIndex>>,
 }
 
 impl SharedState {
-    pub(crate) fn new(engine: Arc<Engine>) -> Arc<SharedState> {
+    pub(crate) fn new(
+        engine: Arc<Engine>,
+        root: std::path::PathBuf,
+        patterns: Vec<glob::Pattern>,
+    ) -> Arc<SharedState> {
         Arc::new(SharedState {
             engine,
+            root,
+            patterns,
             docs: Mutex::new(HashMap::new()),
         })
     }
@@ -291,6 +381,25 @@ target(name = \"direct\", driver = \"exec\")
         assert!(doc.contains('a') && doc.contains('b'), "params: {doc}");
         // A non-identifier / unknown word yields nothing.
         assert!(index.def_hover_at(2, 1).is_none() || !index.defs.contains_key("return"));
+    }
+
+    #[test]
+    fn parse_load_symbols_handles_positional_and_aliased() {
+        let src = r#"load("//lib", "make_name", greeting = "GREETING")
+load("//other", "x")
+"#;
+        let m = super::parse_load_symbols(src);
+        // positional: local == exported
+        assert_eq!(
+            m.get("make_name"),
+            Some(&("//lib".to_string(), "make_name".to_string()))
+        );
+        // aliased: local `greeting` → exported `GREETING`
+        assert_eq!(
+            m.get("greeting"),
+            Some(&("//lib".to_string(), "GREETING".to_string()))
+        );
+        assert_eq!(m.get("x"), Some(&("//other".to_string(), "x".to_string())));
     }
 
     #[test]

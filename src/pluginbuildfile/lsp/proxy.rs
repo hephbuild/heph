@@ -9,13 +9,15 @@
 //!   driver's [`schema`](crate::engine::driver::Driver::schema)).
 
 use super::index::SharedState;
+use crate::pluginbuildfile::run_file::resolve_load_target;
 use lsp_server::{Connection, Message, RequestId};
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionResponse, Hover, HoverContents, MarkedString,
-    MarkupContent, MarkupKind,
+    CompletionItem, CompletionItemKind, CompletionResponse, Hover, HoverContents, LocationLink,
+    MarkedString, MarkupContent, MarkupKind, Position, Range,
 };
 use starlark_lsp::server::LspUrl;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// What an intercepted request was, so its response can be enriched.
@@ -23,6 +25,7 @@ use std::sync::{Arc, Mutex};
 enum Pending {
     Hover { uri: LspUrl, line: u32, col: u32 },
     Completion { uri: LspUrl, line: u32, col: u32 },
+    Definition { uri: LspUrl, line: u32, col: u32 },
 }
 
 /// Pump messages between `client` (editor stdio) and `server` (starlark_lsp),
@@ -77,6 +80,7 @@ fn classify(method: &str, params: &serde_json::Value) -> Option<Pending> {
     match method {
         "textDocument/hover" => Some(Pending::Hover { uri, line, col }),
         "textDocument/completion" => Some(Pending::Completion { uri, line, col }),
+        "textDocument/definition" => Some(Pending::Definition { uri, line, col }),
         _ => None,
     }
 }
@@ -85,7 +89,143 @@ fn enrich(resp: &mut lsp_server::Response, pending: &Pending, shared: &SharedSta
     match pending {
         Pending::Hover { uri, line, col } => enrich_hover(resp, uri, *line, *col, shared),
         Pending::Completion { uri, line, col } => enrich_completion(resp, uri, *line, *col, shared),
+        Pending::Definition { uri, line, col } => enrich_definition(resp, uri, *line, *col, shared),
     }
+}
+
+/// Resolve goto-definition for a `load`-imported symbol across every BUILD file
+/// in its package. The stock server only parses one file per package, so a symbol
+/// defined in a sibling file resolves to the `load(...)` line (or nothing); we
+/// scan the whole package and point at the real definition.
+fn enrich_definition(
+    resp: &mut lsp_server::Response,
+    uri: &LspUrl,
+    line: u32,
+    col: u32,
+    shared: &SharedState,
+) {
+    let LspUrl::File(doc_path) = uri else {
+        return;
+    };
+    let Some(index) = shared.index(uri) else {
+        return;
+    };
+    let Some((load_path, exported)) = index.loaded_symbol_at(line + 1, col + 1) else {
+        return;
+    };
+
+    // If the stock server already resolved into another file, it's correct — leave it.
+    if result_points_to_other_file(resp.result.as_ref(), doc_path) {
+        return;
+    }
+
+    let current_pkg = pkg_of(&shared.root, doc_path);
+    let Ok(resolved) = resolve_load_target(&shared.root, &current_pkg, load_path) else {
+        return;
+    };
+    // The load target is a package dir (scan every BUILD file) or an explicit file.
+    let files: Vec<std::path::PathBuf> = if resolved.is_dir() {
+        package_build_files(&resolved, &shared.patterns)
+    } else {
+        vec![resolved]
+    };
+
+    for file in files {
+        if let Some((dl, c0, c1)) = find_symbol_def(&file, exported) {
+            let Ok(url) = lsp_types::Url::from_file_path(&file) else {
+                continue;
+            };
+            let target_range = Range {
+                start: Position::new(dl, c0),
+                end: Position::new(dl, c1),
+            };
+            let link = LocationLink {
+                origin_selection_range: None,
+                target_uri: url,
+                target_range,
+                target_selection_range: target_range,
+            };
+            resp.result = Some(serde_json::to_value(vec![link]).expect("serialize definition"));
+            resp.error = None;
+            return;
+        }
+    }
+}
+
+/// Whether a goto response already points at a file other than `doc_path` (i.e.
+/// the stock server resolved it cross-file and we should not override).
+fn result_points_to_other_file(result: Option<&serde_json::Value>, doc_path: &Path) -> bool {
+    let Some(value) = result else { return false };
+    let doc = lsp_types::Url::from_file_path(doc_path).ok();
+    let targets = match value {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::Object(_) => vec![value.clone()],
+        _ => return false,
+    };
+    targets.iter().any(|t| {
+        let uri = t
+            .get("targetUri")
+            .or_else(|| t.get("uri"))
+            .and_then(|u| u.as_str());
+        match (uri, &doc) {
+            (Some(u), Some(d)) => u != d.as_str(),
+            (Some(_), None) => true,
+            _ => false,
+        }
+    })
+}
+
+/// Files in `dir` matching a BUILD pattern, sorted by name (heph's merge order).
+fn package_build_files(dir: &Path, patterns: &[glob::Pattern]) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| {
+            patterns
+                .iter()
+                .any(|p| p.matches(&e.file_name().to_string_lossy()))
+        })
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Find the top-level definition of `name` (a `def` or an assignment) in `path`,
+/// returning the 0-based `(line, name_col_start, name_col_end)`. Identifiers are
+/// ASCII, so byte offsets equal columns.
+fn find_symbol_def(path: &Path, name: &str) -> Option<(u32, u32, u32)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let is_def = trimmed
+            .strip_prefix("def ")
+            .map(str::trim_start)
+            .and_then(|r| r.strip_prefix(name))
+            .is_some_and(|r| r.trim_start().starts_with('('));
+        let is_assign = trimmed
+            .strip_prefix(name)
+            .map(str::trim_start)
+            .is_some_and(|r| r.starts_with('=') && !r.starts_with("=="));
+        if is_def || is_assign {
+            let col = line.find(name)? as u32;
+            return Some((i as u32, col, col + name.len() as u32));
+        }
+    }
+    None
+}
+
+/// Package name for a BUILD-file path: its parent dir, workspace-relative,
+/// forward-slashed (empty at the root).
+fn pkg_of(root: &Path, path: &Path) -> String {
+    let parent = path.parent().unwrap_or(path);
+    parent
+        .strip_prefix(root)
+        .unwrap_or(parent)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn enrich_hover(
@@ -214,4 +354,52 @@ fn enrich_completion(
     merged.append(&mut items);
     resp.result = Some(serde_json::to_value(CompletionResponse::Array(merged)).expect("serialize"));
     resp.error = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_symbol_def, pkg_of, result_points_to_other_file};
+    use std::path::Path;
+
+    #[test]
+    fn find_symbol_def_locates_def_and_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("macros.BUILD");
+        std::fs::write(
+            &file,
+            "# top\n\ndef make_name(p):\n    return p\n\nFOO = 1\nFOOBAR = 2\n",
+        )
+        .unwrap();
+
+        // `def make_name(` on line index 2; name starts at col 4.
+        assert_eq!(find_symbol_def(&file, "make_name"), Some((2, 4, 13)));
+        // `FOO = 1` on line 5, col 0..3 — must not match the `FOOBAR` prefix line.
+        assert_eq!(find_symbol_def(&file, "FOO"), Some((5, 0, 3)));
+        assert_eq!(find_symbol_def(&file, "FOOBAR"), Some((6, 0, 6)));
+        // Unknown symbol → None.
+        assert_eq!(find_symbol_def(&file, "nope"), None);
+    }
+
+    #[test]
+    fn pkg_of_is_workspace_relative() {
+        let root = Path::new("/ws");
+        assert_eq!(pkg_of(root, Path::new("/ws/lib/BUILD")), "lib");
+        assert_eq!(pkg_of(root, Path::new("/ws/BUILD")), "");
+    }
+
+    #[test]
+    fn result_points_to_other_file_detects_cross_file_resolution() {
+        let doc = Path::new("/ws/app/BUILD");
+        // Already resolved into a different file → true (don't override).
+        let other = serde_json::json!([{"targetUri": "file:///ws/lib/BUILD"}]);
+        assert!(result_points_to_other_file(Some(&other), doc));
+        // Resolved to the same doc (the load statement) → false (we should override).
+        let same = serde_json::json!([{"targetUri": "file:///ws/app/BUILD"}]);
+        assert!(!result_points_to_other_file(Some(&same), doc));
+        // Empty result → false.
+        assert!(!result_points_to_other_file(
+            Some(&serde_json::json!([])),
+            doc
+        ));
+    }
 }
