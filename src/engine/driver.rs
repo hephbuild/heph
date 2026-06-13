@@ -565,8 +565,9 @@ pub mod targetdef {
             }
         }
 
-        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
         pub enum CodegenMode {
+            #[default]
             None,
             Copy,
             InPlace,
