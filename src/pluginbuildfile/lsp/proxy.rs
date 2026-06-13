@@ -301,10 +301,18 @@ fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) ->
     let (provider, func) = provider_fn_at(line_text, col as usize)?;
     let registry = shared.engine.provider_function_registry();
     let rf = registry.get(&provider, &func)?;
-    // `render` yields `join(*elems: string) -> string`; prefix the namespace so
-    // the hover reads as the call site does: `heph.fs.join(...) -> ...`.
-    let signature = rf.signature.render(&func);
-    let mut md = format!("```python\nheph.{provider}.{signature}\n```");
+    // Match the shape `starlark`'s own `render_doc_item` produces for local
+    // `def`s / builtins (what other hovers use): a `## name` header, a
+    // ```python prototype block, then the doc. `render` yields
+    // `join(*elems: string) -> string`; prefix the namespace so the prototype
+    // reads as the call site does. Underscores are escaped in the header (it's
+    // outside the code fence, where markdown would italicize them).
+    let path = format!("heph.{provider}.{func}");
+    let prototype = format!("heph.{provider}.{}", rf.signature.render(&func));
+    let mut md = format!(
+        "## {}\n\n```python\n{prototype}\n```",
+        path.replace('_', "\\_")
+    );
     if !rf.doc.is_empty() {
         md.push_str("\n\n");
         md.push_str(&rf.doc);
