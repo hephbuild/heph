@@ -18,48 +18,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Synthetic package + target the buildfile provider always exposes for the
-/// BUILD-file language server. Built (via the `exec` driver) by re-execing the
-/// current heph binary as `heph tool build-lsp`. Uncached — it is a long-lived
-/// server, not a reproducible artifact.
-const LSP_PKG: &str = "@heph/build";
-const LSP_NAME: &str = "lsp";
-
-/// Build the synthetic `TargetSpec` for `//@heph/build:lsp`: an `exec` target
-/// that runs the current binary's `tool build-lsp` hidden command with caching
-/// off. Does not touch the filesystem or any BUILD file.
-fn synth_lsp_spec(addr: Addr) -> TargetSpec {
-    use crate::htvalue::Value;
-    let heph_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_owned))
-        .unwrap_or_else(|| "heph".to_string());
-    let mut config = HashMap::new();
-    config.insert(
-        "run".to_string(),
-        Value::List(vec![
-            Value::String(heph_bin),
-            Value::String("tool".to_string()),
-            Value::String("build-lsp".to_string()),
-        ]),
-    );
-    // Long-running server: never cache.
-    config.insert("cache".to_string(), Value::Bool(false));
-    // Pass the editor's full environment through to the server at run time
-    // (PATH, locale, tool config, …); `"*"` is the exec wildcard. Not hashed.
-    config.insert(
-        "runtime_pass_env".to_string(),
-        Value::List(vec![Value::String("*".to_string())]),
-    );
-    TargetSpec {
-        addr,
-        driver: "exec".to_string(),
-        config,
-        labels: vec![],
-        transitive: Default::default(),
-    }
-}
-
 pub struct RequestState {}
 
 pub struct Provider {
@@ -246,18 +204,6 @@ impl EProvider for Provider {
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
         Box::pin(async move {
-            // The synthetic LSP package lists exactly its one target.
-            if req.package == LSP_PKG {
-                let item = Ok(ListResponse {
-                    addr: Addr::new(
-                        req.package.clone(),
-                        LSP_NAME.to_string(),
-                        Default::default(),
-                    ),
-                });
-                return Ok(Box::new(std::iter::once(item))
-                    as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
-            }
             // A package inside a skipped subtree lists nothing — matching what the
             // package walk would have surfaced.
             if self
@@ -320,10 +266,6 @@ impl EProvider for Provider {
                         pkg: PkgBuf::from(p.as_str()),
                     })
                 })
-                // Always surface the synthetic LSP package alongside the walked ones.
-                .chain(std::iter::once(Ok(ListPackageResponse {
-                    pkg: PkgBuf::from(LSP_PKG),
-                })))
                 .collect();
 
             Ok(Box::new(items.into_iter())
@@ -339,16 +281,6 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
-            // The synthetic LSP package never hits the filesystem: only `:lsp`
-            // resolves, any other name in it is NotFound.
-            if req.addr.package == LSP_PKG {
-                if req.addr.name == LSP_NAME {
-                    return Ok(GetResponse {
-                        target_spec: synth_lsp_spec(req.addr.clone()),
-                    });
-                }
-                return Err(NotFound);
-            }
             // A target inside a skipped subtree does not resolve.
             if self
                 .skip
@@ -429,100 +361,6 @@ mod tests {
     use crate::htaddr::parse_addr;
     use std::fs;
     use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn test_synth_lsp_target_get_list_and_packages() {
-        let tmp = tempdir().unwrap();
-        let provider = Provider {
-            root: tmp.path().to_path_buf(),
-            ..Provider::default()
-        };
-        let ctoken = StdCancellationToken::new();
-
-        // get(//@heph/build:lsp) → exec driver, cache off, runs `tool build-lsp`.
-        let res = provider
-            .get(
-                GetRequest {
-                    request_id: "t".to_string(),
-                    addr: parse_addr("//@heph/build:lsp").unwrap(),
-                    states: vec![],
-                    executor: Arc::new(NoopExecutor),
-                },
-                &ctoken,
-            )
-            .await
-            .unwrap();
-        let spec = res.target_spec;
-        assert_eq!(spec.driver, "exec");
-        assert_eq!(
-            spec.config.get("cache"),
-            Some(&crate::htvalue::Value::Bool(false))
-        );
-        let run = match spec.config.get("run") {
-            Some(crate::htvalue::Value::List(v)) => v.clone(),
-            other => panic!("expected run list, got {other:?}"),
-        };
-        let run_strs: Vec<&str> = run
-            .iter()
-            .map(|v| match v {
-                crate::htvalue::Value::String(s) => s.as_str(),
-                _ => panic!("run entries must be strings"),
-            })
-            .collect();
-        assert_eq!(&run_strs[run_strs.len() - 2..], &["tool", "build-lsp"]);
-        // Server inherits the editor's full environment at runtime.
-        assert_eq!(
-            spec.config.get("runtime_pass_env"),
-            Some(&crate::htvalue::Value::List(vec![
-                crate::htvalue::Value::String("*".to_string())
-            ]))
-        );
-
-        // Wrong name in the synthetic package is NotFound.
-        let miss = provider
-            .get(
-                GetRequest {
-                    request_id: "t".to_string(),
-                    addr: parse_addr("//@heph/build:nope").unwrap(),
-                    states: vec![],
-                    executor: Arc::new(NoopExecutor),
-                },
-                &ctoken,
-            )
-            .await;
-        assert!(matches!(miss, Err(GetError::NotFound)));
-
-        // list(@heph/build) yields exactly `lsp`.
-        let listed: Vec<String> = provider
-            .list(
-                ListRequest {
-                    request_id: "t".to_string(),
-                    package: PkgBuf::from(LSP_PKG),
-                    states: vec![],
-                },
-                &ctoken,
-            )
-            .await
-            .unwrap()
-            .map(|r| r.unwrap().addr.name.clone())
-            .collect();
-        assert_eq!(listed, vec!["lsp".to_string()]);
-
-        // list_packages includes the synthetic package.
-        let pkgs: Vec<String> = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
-            .await
-            .unwrap()
-            .map(|r| r.unwrap().pkg.to_string())
-            .collect();
-        assert!(pkgs.iter().any(|p| p == LSP_PKG));
-    }
-
     /// Package discovery is cached across runs through the shared walker: a fresh
     /// provider sharing the fswalk db reuses the discovered set for an unchanged
     /// tree, and a newly-added package (which bumps a recorded dir's mtime) is
@@ -553,10 +391,7 @@ mod tests {
                 .unwrap();
             // Drop the always-present synthetic LSP package; this test covers the
             // filesystem walk.
-            let mut v: Vec<String> = res
-                .map(|r| r.unwrap().pkg.to_string())
-                .filter(|p| p != LSP_PKG)
-                .collect();
+            let mut v: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
             v.sort();
             v
         };
@@ -804,12 +639,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let packages: Vec<String> = res
-            .map(|r| r.unwrap().pkg.to_string())
-            // Exclude the always-present synthetic LSP package; this test covers
-            // filesystem-based package discovery.
-            .filter(|p| p != LSP_PKG)
-            .collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert!(packages.contains(&"".to_string()));
         assert!(packages.contains(&"src".to_string()));
@@ -849,12 +679,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let packages: Vec<String> = res
-            .map(|r| r.unwrap().pkg.to_string())
-            // Exclude the always-present synthetic LSP package; this test covers
-            // filesystem-based package discovery.
-            .filter(|p| p != LSP_PKG)
-            .collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert!(packages.contains(&"src".to_string()));
         assert!(
@@ -939,12 +764,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
-        let packages: Vec<String> = res
-            .map(|r| r.unwrap().pkg.to_string())
-            // Exclude the always-present synthetic LSP package; this test covers
-            // filesystem-based package discovery.
-            .filter(|p| p != LSP_PKG)
-            .collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert_eq!(packages.len(), 4);
         assert!(packages.contains(&"".to_string()));
@@ -983,12 +803,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
-        let packages: Vec<String> = res
-            .map(|r| r.unwrap().pkg.to_string())
-            // Exclude the always-present synthetic LSP package; this test covers
-            // filesystem-based package discovery.
-            .filter(|p| p != LSP_PKG)
-            .collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert_eq!(packages.len(), 2);
         assert!(packages.contains(&"".to_string()));
@@ -1031,12 +846,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
-        let packages: Vec<String> = res
-            .map(|r| r.unwrap().pkg.to_string())
-            // Exclude the always-present synthetic LSP package; this test covers
-            // filesystem-based package discovery.
-            .filter(|p| p != LSP_PKG)
-            .collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert_eq!(packages.len(), 3);
         assert!(packages.contains(&"".to_string()));
@@ -1076,12 +886,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
-        let packages: Vec<String> = res
-            .map(|r| r.unwrap().pkg.to_string())
-            // Exclude the always-present synthetic LSP package; this test covers
-            // filesystem-based package discovery.
-            .filter(|p| p != LSP_PKG)
-            .collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert_eq!(packages.len(), 2);
         assert!(packages.contains(&"".to_string()));

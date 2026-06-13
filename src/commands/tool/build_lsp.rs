@@ -6,7 +6,7 @@ use crate::tui::LogSink;
 
 /// Hidden developer command: run the BUILD-file language server over stdio.
 ///
-/// Editors launch this (directly, or via the `//@heph/build:lsp` target). It
+/// Editors launch this directly (`heph tool build-lsp`). It
 /// speaks LSP JSON-RPC on stdin/stdout and runs until the client disconnects.
 #[derive(ClapArgs, Clone)]
 pub struct Args {}
