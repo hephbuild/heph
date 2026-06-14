@@ -331,18 +331,18 @@ pub async fn run<A: App + 'static>(
     };
 
     if !paused {
+        // Flush any still-buffered build-event logs into the terminal scrollback
+        // *above* the viewport. This must stay on the terminal path
+        // (`insert_before`): it wraps to the viewport width and skips blank lines.
+        // The post-teardown `drain_logs_to_stderr` fallback writes raw bytes, so
+        // letting empties fall through to it dumps stray newlines after the box.
+        drain_logs_to_terminal(&mut terminal, &mut rx, cols);
         // Render one final frame and capture its viewport origin in the *same*
-        // draw, so the anchor matches exactly where the box sits on screen.
-        // `Frame::area().y` is ratatui's own anchor for the inline region — no
-        // cursor DSR query, so nothing can race crossterm's reader.
-        //
-        // Note: we deliberately do *not* `drain_logs_to_terminal` here. That path
-        // calls `insert_before`, which scrolls the inline viewport down to make
-        // room — desyncing the box's on-screen row from the freshly-rendered
-        // anchor and orphaning the previous box-top row above the clear. Any
-        // build-event logs still buffered are flushed to stderr below
-        // (`drain_logs_to_stderr`), which lands them above the summary just the
-        // same, without touching the viewport.
+        // draw, so the anchor matches exactly where the box sits on screen — the
+        // drain above may have scrolled the viewport via `insert_before`, so a
+        // stale origin would be off by the inserted line count. `Frame::area().y`
+        // is ratatui's own anchor for the inline region — no cursor DSR query, so
+        // nothing can race crossterm's reader.
         let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
         let lines = view.render(frame, now_unix_ms(), cols, rows);
         let mut anchor_row: u16 = 0;
