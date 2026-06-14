@@ -162,7 +162,8 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
 }
 
 pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
-    let (_, (p, n, kvs)) = all_consuming(addr_parser).parse(input)
+    let (_, (p, n, kvs)) = all_consuming(addr_parser)
+        .parse(input)
         .map_err(|e| anyhow::anyhow!("invalid address {:?}: {}", input, e))?;
 
     let mut args = BTreeMap::new();
