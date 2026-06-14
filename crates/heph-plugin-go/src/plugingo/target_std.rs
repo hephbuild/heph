@@ -1,6 +1,6 @@
-use crate::engine::provider::TargetSpec;
-use crate::htaddr::Addr;
-use crate::htvalue::Value;
+use heph_plugin::provider::TargetSpec;
+use heph_model::htaddr::Addr;
+use heph_core::htvalue::Value;
 use crate::plugingo::addr_util::{go_bin_tools_config, to_run_value};
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
@@ -109,8 +109,8 @@ pub fn build_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htaddr::Addr;
-    use crate::htpkg::PkgBuf;
+    use heph_model::htaddr::Addr;
+    use heph_model::htpkg::PkgBuf;
 
     fn run_str(spec: &TargetSpec) -> String {
         match spec.config.get("run").unwrap() {

@@ -1,19 +1,19 @@
-use crate::debug_hash::DebugHasher;
-use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
-use crate::engine::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
-use crate::engine::driver::{
+use heph_core::debug_hash::DebugHasher;
+use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path};
+use heph_plugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use crate::hasync::Cancellable;
-use crate::htpkg::PkgBuf;
-use crate::htspec::Spec;
-use crate::htvalue::signature::ParamType;
+use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use heph_core::hasync::Cancellable;
+use heph_model::htpkg::PkgBuf;
+use heph_plugin::htspec::Spec;
+use heph_core::htvalue::signature::ParamType;
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
-use crate::proc_exec;
+use heph_proc::proc_exec;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -106,7 +106,7 @@ impl ManagedDriver for GoGolistDriver {
         })
     }
 
-    fn schema(&self) -> crate::engine::driver::DriverSchema {
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
         GoGolistSpec::schema()
     }
 
@@ -139,7 +139,7 @@ impl ManagedDriver for GoGolistDriver {
                     // files back to their source target; opt these deps in so
                     // the managed bridge emits it (default is off).
                     annotations: std::collections::BTreeMap::from([(
-                        crate::engine::driver_managed::SOURCE_MAP_ANNOTATION.to_string(),
+                        heph_driver_support::driver_managed::SOURCE_MAP_ANNOTATION.to_string(),
                         "true".to_string(),
                     )]),
                     hashed: true,
@@ -328,7 +328,7 @@ impl ManagedDriver for GoGolistDriver {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(crate::plugingo::errors::GoListError {
                 import_path: def.import_path.clone(),
-                stderr_tail: crate::engine::error::last_n_lines(&stderr, 10),
+                stderr_tail: heph_plugin::error::last_n_lines(&stderr, 10),
             }
             .into());
         }
@@ -372,7 +372,7 @@ impl ManagedDriver for GoGolistDriver {
         let pkg_str = req.request.target.addr.package.as_str();
         let download_addr = match &def.thirdparty_download_addr {
             Some(s) => Some(
-                crate::engine::driver::TargetAddr::parse(s, &crate::htpkg::PkgBuf::from(""))
+                heph_plugin::driver::TargetAddr::parse(s, &heph_model::htpkg::PkgBuf::from(""))
                     .with_context(|| format!("parse thirdparty_download_addr {s:?}"))?
                     .r#ref,
             ),
@@ -402,7 +402,7 @@ fn normalize_dir(dir: &str, ws_prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htpkg::PkgBuf;
+    use heph_model::htpkg::PkgBuf;
 
     fn driver() -> GoGolistDriver {
         GoGolistDriver::new("//@heph/bin:go")
@@ -413,9 +413,9 @@ mod tests {
         import_path: &str,
         extra_deps: Vec<(&str, Vec<&str>)>,
     ) -> ParseRequest {
-        use crate::engine::provider::TargetSpec;
-        use crate::htaddr::Addr;
-        use crate::htvalue::Value;
+        use heph_plugin::provider::TargetSpec;
+        use heph_model::htaddr::Addr;
+        use heph_core::htvalue::Value;
         use std::collections::HashMap;
 
         let mut config: HashMap<String, Value> = HashMap::new();
@@ -472,8 +472,8 @@ mod tests {
         }
     }
 
-    fn noop_ctoken() -> crate::hasync::StdCancellationToken {
-        crate::hasync::StdCancellationToken::new()
+    fn noop_ctoken() -> heph_core::hasync::StdCancellationToken {
+        heph_core::hasync::StdCancellationToken::new()
     }
 
     #[tokio::test]
@@ -484,8 +484,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_missing_import_path_errors() {
-        use crate::engine::provider::TargetSpec;
-        use crate::htaddr::Addr;
+        use heph_plugin::provider::TargetSpec;
+        use heph_model::htaddr::Addr;
         use std::collections::HashMap;
 
         let ct = noop_ctoken();

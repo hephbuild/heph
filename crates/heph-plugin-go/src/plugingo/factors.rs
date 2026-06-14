@@ -1,4 +1,4 @@
-use crate::htaddr::Addr;
+use heph_model::htaddr::Addr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Factors {
@@ -43,19 +43,19 @@ impl Factors {
 
 pub fn current_goos() -> String {
     // Go's GOOS naming matches the canonical (Go/OCI) convention.
-    crate::htplatform::os().to_string()
+    heph_core::htplatform::os().to_string()
 }
 
 pub fn current_goarch() -> String {
     // Go's GOARCH naming matches the canonical (Go/OCI) convention.
-    crate::htplatform::arch().to_string()
+    heph_core::htplatform::arch().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htaddr::Addr;
-    use crate::htpkg::PkgBuf;
+    use heph_model::htaddr::Addr;
+    use heph_model::htpkg::PkgBuf;
 
     fn addr_with_args(args: &[(&str, &str)]) -> Addr {
         Addr::new(

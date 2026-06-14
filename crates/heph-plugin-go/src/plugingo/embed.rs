@@ -1,9 +1,9 @@
 #[cfg(test)]
-use crate::engine::provider::TargetSpec;
+use heph_plugin::provider::TargetSpec;
 #[cfg(test)]
-use crate::htaddr::Addr;
+use heph_model::htaddr::Addr;
 #[cfg(test)]
-use crate::htvalue::Value;
+use heph_core::htvalue::Value;
 #[cfg(test)]
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -120,7 +120,7 @@ pub fn compute_embed_cfg_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htpkg::PkgBuf;
+    use heph_model::htpkg::PkgBuf;
 
     fn test_addr() -> Addr {
         Addr::new(

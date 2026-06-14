@@ -1,16 +1,16 @@
-use crate::engine::provider::{
+use heph_plugin::provider::{
     ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
     ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
     ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
 };
-use crate::hasync::Cancellable;
-use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
-use crate::htaddr::Addr;
-use crate::htpkg::PkgBuf;
-use crate::htvalue::signature::{FnSignature, Param, ParamType};
-use crate::htvalue::{Value, parse_strings};
-use crate::htwalk::{CachedWalker, EntryKind, Ignore};
-use crate::pluginfs;
+use heph_core::hasync::Cancellable;
+use heph_core::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
+use heph_core::htvalue::signature::{FnSignature, Param, ParamType};
+use heph_core::htvalue::{Value, parse_strings};
+use heph_walk::{CachedWalker, EntryKind, Ignore};
+use heph_builtins::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
     encode_thirdparty_download, factors_to_args,
@@ -43,7 +43,7 @@ const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
 pub struct Config {
     pub go_bin_addr: String,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
-    /// this provider's own `skip` option. See [`crate::htwalk::Ignore`].
+    /// this provider's own `skip` option. See [`heph_walk::Ignore`].
     pub skip: Arc<Ignore>,
     /// Reject target names this provider doesn't own *before* the `_golist`
     /// resolve (see [`is_known_go_target_name`]). On by default: it avoids a
@@ -200,18 +200,18 @@ impl Provider {
         workspace_root: PathBuf,
         skip_dirs: &[PathBuf],
         skip_globs: &[String],
-        opts: &crate::engine::config_yaml::Options,
+        opts: &heph_plugin::config::Options,
         walker: Arc<CachedWalker>,
     ) -> anyhow::Result<Self> {
-        crate::engine::config_yaml::deny_unknown("go provider", opts, &["gotool", "skip"])?;
+        heph_plugin::config::deny_unknown("go provider", opts, &["gotool", "skip"])?;
         let go_bin_addr: String =
-            crate::engine::config_yaml::decode_opt(opts, "go provider", "gotool")?
+            heph_plugin::config::decode_opt(opts, "go provider", "gotool")?
                 .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
         let user_skip: Vec<String> =
-            crate::engine::config_yaml::decode_opt(opts, "go provider", "skip")?
+            heph_plugin::config::decode_opt(opts, "go provider", "skip")?
                 .unwrap_or_default();
         globs.extend(user_skip);
         let skip = Arc::new(Ignore::new(skip_dirs, &globs)?);
@@ -444,8 +444,8 @@ impl ProviderTrait for Provider {
         }]
     }
 
-    fn state_schema(&self) -> Option<crate::engine::provider::StateSchema> {
-        use crate::engine::provider::{StateField, StateSchema};
+    fn state_schema(&self) -> Option<heph_plugin::provider::StateSchema> {
+        use heph_plugin::provider::{StateField, StateSchema};
         let field = |name: &str, ty: ParamType, doc: &str| StateField {
             name: name.to_string(),
             ty,
@@ -692,7 +692,7 @@ impl ProviderInner {
                     >);
             }
 
-            let packages = crate::process_supervisor::block_or_inline(
+            let packages = heph_proc::process_supervisor::block_or_inline(
                 enclose!((self.workspace_root => workspace_root, self.skip => skip, self.walker => walker) move || {
                     let mut packages = Vec::new();
                     collect_go_packages(&walker, &search_dir, &workspace_root, false, &skip, &mut packages);
@@ -867,7 +867,7 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
         }
     }
     let go_src_query_addr = Addr::new(
-        crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
+        heph_model::htpkg::PkgBuf::from(heph_plugin_query::pluginquery::PACKAGE),
         "q".to_string(),
         q_args,
     );
@@ -1553,9 +1553,9 @@ impl ProviderInner {
                 }
                 let build_test_addr =
                     self.make_addr_with_name(&addr.package, "build_test", &factors);
-                let data_query_addr = crate::htaddr::parse_addr(&format!(
+                let data_query_addr = heph_model::htaddr::parse_addr(&format!(
                     "//{}:q@package={},label=go_test_data",
-                    crate::pluginquery::PACKAGE,
+                    heph_plugin_query::pluginquery::PACKAGE,
                     addr.package.as_str(),
                 ))
                 .context("build go_test_data query addr")
@@ -1570,9 +1570,9 @@ impl ProviderInner {
                 }
                 let build_xtest_addr =
                     self.make_addr_with_name(&addr.package, "build_xtest", &factors);
-                let data_query_addr = crate::htaddr::parse_addr(&format!(
+                let data_query_addr = heph_model::htaddr::parse_addr(&format!(
                     "//{}:q@package={},label=go_test_data",
-                    crate::pluginquery::PACKAGE,
+                    heph_plugin_query::pluginquery::PACKAGE,
                     addr.package.as_str(),
                 ))
                 .context("build go_test_data query addr")
@@ -1630,7 +1630,7 @@ impl ProviderInner {
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(module_root);
                 let go_mod_addr = Addr::new(
-                    crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
+                    heph_model::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
                     "_go_mod".to_string(),
                     Default::default(),
                 );
@@ -1673,7 +1673,7 @@ impl ProviderInner {
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(module_root);
                 let go_mod_addr = Addr::new(
-                    crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
+                    heph_model::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
                     "_go_mod".to_string(),
                     Default::default(),
                 );
@@ -1735,7 +1735,7 @@ impl ProviderInner {
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
-                    let pkg = crate::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
+                    let pkg = heph_proc::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
                                 let entry = entry_result?;
@@ -1745,8 +1745,8 @@ impl ProviderInner {
                                     continue;
                                 }
                                 let data = match entry.kind {
-                                    crate::hartifactcontent::WalkEntryKind::File { data, .. } => data,
-                                    crate::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
+                                    heph_core::hartifactcontent::WalkEntryKind::File { data, .. } => data,
+                                    heph_core::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
                                 };
                                 return decode_go_package(data);
                             }
@@ -1788,7 +1788,7 @@ impl ProviderInner {
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
-                    let addrs = crate::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
+                    let addrs = heph_proc::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
                                 let entry = entry_result?;
@@ -1798,8 +1798,8 @@ impl ProviderInner {
                                     continue;
                                 }
                                 let data = match entry.kind {
-                                    crate::hartifactcontent::WalkEntryKind::File { data, .. } => data,
-                                    crate::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
+                                    heph_core::hartifactcontent::WalkEntryKind::File { data, .. } => data,
+                                    heph_core::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
                                 };
                                 return decode_package_addrs(data);
                             }
@@ -1819,7 +1819,7 @@ impl ProviderInner {
 
     fn make_addr_with_name(
         &self,
-        package: &crate::htpkg::PkgBuf,
+        package: &heph_model::htpkg::PkgBuf,
         name: &str,
         factors: &Factors,
     ) -> Addr {
@@ -1939,7 +1939,7 @@ impl ProviderInner {
             return Ok(Arc::clone(hit));
         }
         let data = if go_mod_path.exists() {
-            let content = crate::process_supervisor::block_or_inline(
+            let content = heph_proc::process_supervisor::block_or_inline(
                 enclose!((go_mod_path) move || std::fs::read_to_string(&go_mod_path)),
             )
             .with_context(|| format!("reading {}", go_mod_path.display()))?;
@@ -1955,7 +1955,7 @@ impl ProviderInner {
             let mut requires = parse_go_mod_requires(&content);
             let go_sum_path = module_root.join("go.sum");
             if go_sum_path.exists() {
-                let sum_content = crate::process_supervisor::block_or_inline(
+                let sum_content = heph_proc::process_supervisor::block_or_inline(
                     enclose!((go_sum_path) move || std::fs::read_to_string(&go_sum_path)),
                 )
                 .with_context(|| format!("reading {}", go_sum_path.display()))?;
@@ -2145,7 +2145,7 @@ impl ProviderInner {
         if !is_workspace_module && is_stdlib_import_path(import_path) {
             let addr = encode_stdlib(import_path, factors);
             let golist_addr = Addr::new(
-                crate::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),
+                heph_model::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),
                 "_golist".to_string(),
                 factors_to_args(factors),
             );
@@ -2254,8 +2254,8 @@ fn build_embed_spec(
     addr: Addr,
     golist_addr: &Addr,
     variant: &str,
-) -> crate::engine::provider::TargetSpec {
-    use crate::htvalue::Value;
+) -> heph_plugin::provider::TargetSpec {
+    use heph_core::htvalue::Value;
     use std::collections::HashMap;
 
     let golist_dep = format!("{}|pkg", golist_addr.format());
@@ -2276,7 +2276,7 @@ fn build_embed_spec(
         )])),
     );
 
-    crate::engine::provider::TargetSpec {
+    heph_plugin::provider::TargetSpec {
         addr,
         driver: "go_embed".to_string(),
         config,
@@ -2320,8 +2320,8 @@ fn build_testmain_spec(
     golist_addr: &Addr,
     test_file_addrs: &[String],
     xtest_file_addrs: &[String],
-) -> crate::engine::provider::TargetSpec {
-    use crate::htvalue::Value;
+) -> heph_plugin::provider::TargetSpec {
+    use heph_core::htvalue::Value;
     use std::collections::HashMap;
 
     let golist_dep = format!("{}|pkg", golist_addr.format());
@@ -2377,7 +2377,7 @@ fn build_testmain_spec(
         )])),
     );
 
-    crate::engine::provider::TargetSpec {
+    heph_plugin::provider::TargetSpec {
         addr,
         driver: "go_testmain".to_string(),
         config,
@@ -2386,17 +2386,17 @@ fn build_testmain_spec(
     }
 }
 
-use crate::engine::provider::{ProbeRequest, ProbeResponse};
+use heph_plugin::provider::{ProbeRequest, ProbeResponse};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::provider::{GetError, GetRequest, Provider as ProviderTrait};
-    use crate::engine::{ArtifactMeta, EResult};
-    use crate::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
-    use crate::hasync::StdCancellationToken;
-    use crate::htpkg::PkgBuf;
-    use crate::htvalue::Value;
+    use heph_plugin::provider::{GetError, GetRequest, Provider as ProviderTrait};
+    use heph_plugin::eresult::{ArtifactMeta, EResult};
+    use heph_core::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
+    use heph_core::hasync::StdCancellationToken;
+    use heph_model::htpkg::PkgBuf;
+    use heph_core::htvalue::Value;
     use crate::plugingo::addr_util::decode_package;
     use crate::plugingo::factors::Factors;
     use crate::plugingo::pkg_analysis::run_go_list;
@@ -2486,7 +2486,7 @@ mod tests {
         assert!(err.to_string().contains("missing `goarch`"), "{err}");
     }
 
-    fn run_str(spec: &crate::engine::provider::TargetSpec) -> String {
+    fn run_str(spec: &heph_plugin::provider::TargetSpec) -> String {
         match spec.config.get("run").unwrap() {
             Value::String(s) => s.clone(),
             Value::List(v) => v
@@ -2641,7 +2641,7 @@ mod tests {
 
         fn query<'a>(
             &'a self,
-            _m: &'a crate::htmatcher::Matcher,
+            _m: &'a heph_model::htmatcher::Matcher,
             _extra_skip: &'a [String],
         ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
             Box::pin(async { Ok(vec![]) })
@@ -2971,7 +2971,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
             fn query<'a>(
                 &'a self,
-                m: &'a crate::htmatcher::Matcher,
+                m: &'a heph_model::htmatcher::Matcher,
                 extra_skip: &'a [String],
             ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
                 self.inner.query(m, extra_skip)
@@ -3036,7 +3036,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
             fn query<'a>(
                 &'a self,
-                _m: &'a crate::htmatcher::Matcher,
+                _m: &'a heph_model::htmatcher::Matcher,
                 _extra_skip: &'a [String],
             ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3563,80 +3563,6 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let result = provider_get(&p, make_addr("somepkg", "build_lib")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
-    }
-
-    // ---- integration test helpers ----
-
-    fn build_test_engine(workspace: &std::path::Path) -> Arc<crate::engine::Engine> {
-        let mut e = crate::engine::Engine::new(crate::engine::Config {
-            root: workspace.to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
-            parallelism: None,
-            ..Default::default()
-        })
-        .unwrap();
-
-        e.register_provider(|_| Box::new(crate::pluginhostbin::Provider))
-            .unwrap();
-
-        e.register_driver(|_| Box::new(crate::pluginhostbin::Driver))
-            .unwrap();
-
-        e.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_sh()))
-            .unwrap();
-        e.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))
-            .unwrap();
-
-        e.register_provider(|init| Box::new(Provider::new(init.root.to_path_buf()).unwrap()))
-            .unwrap();
-
-        Arc::new(e)
-    }
-
-    // ---- integration tests (run with `cargo test -- --ignored`) ----
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_simple_lib_build_lib_e2e() {
-        use crate::engine::{OutputMatcher, ResultOptions};
-
-        let sandbox = copy_fixture("simple_lib");
-        let engine = build_test_engine(sandbox.path());
-        let rs = engine.new_state();
-        let addr = make_addr("", "build_lib");
-
-        let result = engine
-            .clone()
-            .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
-            .await
-            .unwrap();
-
-        assert!(
-            !result.artifacts.is_empty(),
-            "build_lib should produce at least one artifact"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_with_dep_cmd_build_e2e() {
-        use crate::engine::{OutputMatcher, ResultOptions};
-
-        let sandbox = copy_fixture("with_dep");
-        let engine = build_test_engine(sandbox.path());
-        let rs = engine.new_state();
-        let addr = make_addr("cmd", "build");
-
-        let result = engine
-            .clone()
-            .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
-            .await
-            .unwrap();
-
-        assert!(
-            !result.artifacts.is_empty(),
-            "cmd build should produce at least one artifact"
-        );
     }
 
     // ---- list() tests ----

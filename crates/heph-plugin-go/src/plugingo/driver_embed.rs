@@ -1,13 +1,13 @@
-use crate::debug_hash::DebugHasher;
-use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
-use crate::engine::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
-use crate::engine::driver::{
+use heph_core::debug_hash::DebugHasher;
+use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path};
+use heph_plugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use crate::hasync::Cancellable;
-use crate::htspec::{Spec, SpecEnum};
+use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use heph_core::hasync::Cancellable;
+use heph_plugin::htspec::{Spec, SpecEnum};
 use crate::plugingo::embed;
 use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
@@ -79,7 +79,7 @@ impl ManagedDriver for GoEmbedDriver {
         })
     }
 
-    fn schema(&self) -> crate::engine::driver::DriverSchema {
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
         GoEmbedSpec::schema()
     }
 
@@ -264,18 +264,18 @@ impl ManagedDriver for GoEmbedDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::provider::TargetSpec;
-    use crate::htaddr::Addr;
-    use crate::htpkg::PkgBuf;
-    use crate::htvalue::Value;
+    use heph_plugin::provider::TargetSpec;
+    use heph_model::htaddr::Addr;
+    use heph_model::htpkg::PkgBuf;
+    use heph_core::htvalue::Value;
     use std::collections::HashMap;
 
     fn driver() -> GoEmbedDriver {
         GoEmbedDriver
     }
 
-    fn noop_ctoken() -> crate::hasync::StdCancellationToken {
-        crate::hasync::StdCancellationToken::new()
+    fn noop_ctoken() -> heph_core::hasync::StdCancellationToken {
+        heph_core::hasync::StdCancellationToken::new()
     }
 
     fn make_parse_request(pkg: &str, variant: &str, golist_addr: &str) -> ParseRequest {

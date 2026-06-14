@@ -1,7 +1,7 @@
-use crate::engine::driver::TargetAddr;
-use crate::htaddr::{Addr, parse_addr_with_base};
-use crate::htpkg::PkgBuf;
-use crate::pluginfs;
+use heph_plugin::driver::TargetAddr;
+use heph_model::htaddr::{Addr, parse_addr_with_base};
+use heph_model::htpkg::PkgBuf;
+use heph_builtins::pluginfs;
 use anyhow::Context;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -367,7 +367,7 @@ pub(crate) async fn run_go_list(
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(crate::plugingo::errors::GoListError {
             import_path: import_path.to_string(),
-            stderr_tail: crate::engine::error::last_n_lines(&stderr, 10),
+            stderr_tail: heph_plugin::error::last_n_lines(&stderr, 10),
         }
         .into());
     }
@@ -466,11 +466,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
         let mut sm = HashMap::new();
         sm.insert(
             "mypkg/foo.go".to_string(),
-            crate::pluginfs::glob_addr("mypkg/*.go", &[]).format(),
+            heph_builtins::pluginfs::glob_addr("mypkg/*.go", &[]).format(),
         );
         let addrs = resolve_package_addrs(&pkg, "mypkg", &sm, None);
         assert_eq!(addrs.go_files.len(), 1);
-        let expected = crate::pluginfs::file_addr("mypkg/foo.go").format();
+        let expected = heph_builtins::pluginfs::file_addr("mypkg/foo.go").format();
         let got = addrs.go_files.first().expect("one entry");
         assert_eq!(got, &expected);
         assert!(
@@ -483,7 +483,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
     fn test_resolve_package_addrs_source_map_fs_file_drops_filter() {
         // Source addr is already an fs file — filter is a no-op, drop it.
         let pkg = pkg_with_one_go_file("foo.go");
-        let src = crate::pluginfs::file_addr("mypkg/foo.go").format();
+        let src = heph_builtins::pluginfs::file_addr("mypkg/foo.go").format();
         let mut sm = HashMap::new();
         sm.insert("mypkg/foo.go".to_string(), src.clone());
         let addrs = resolve_package_addrs(&pkg, "mypkg", &sm, None);
@@ -512,7 +512,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
         let addrs = resolve_package_addrs(&pkg, "mypkg", &sm, None);
         assert_eq!(
             addrs.go_files,
-            vec![crate::pluginfs::file_addr("mypkg/foo.go").format()]
+            vec![heph_builtins::pluginfs::file_addr("mypkg/foo.go").format()]
         );
     }
 

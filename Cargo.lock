@@ -1719,6 +1719,7 @@ dependencies = [
  "heph-plugin",
  "heph-plugin-buildfile",
  "heph-plugin-exec",
+ "heph-plugin-go",
  "heph-plugin-nix",
  "heph-plugin-query",
  "heph-proc",
@@ -1914,6 +1915,34 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tar",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "heph-plugin-go"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "async-trait",
+ "borsh",
+ "enclose",
+ "futures",
+ "glob",
+ "heph-builtins",
+ "heph-core",
+ "heph-driver-support",
+ "heph-model",
+ "heph-plugin",
+ "heph-plugin-exec",
+ "heph-plugin-query",
+ "heph-proc",
+ "heph-walk",
+ "parking_lot",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "xxhash-rust",

@@ -1,6 +1,6 @@
-use crate::htaddr::Addr;
-use crate::htpkg::PkgBuf;
-use crate::htvalue::Value;
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
+use heph_core::htvalue::Value;
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

@@ -1,6 +1,6 @@
-use crate::engine::provider::TargetSpec;
-use crate::htaddr::Addr;
-use crate::htvalue::Value;
+use heph_plugin::provider::TargetSpec;
+use heph_model::htaddr::Addr;
+use heph_core::htvalue::Value;
 use crate::plugingo::addr_util::{
     go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
@@ -141,8 +141,8 @@ fn generate_run_script(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htpkg::PkgBuf;
-    use crate::pluginfs;
+    use heph_model::htpkg::PkgBuf;
+    use heph_builtins::pluginfs;
 
     fn run_str(spec: &TargetSpec) -> String {
         match spec.config.get("run").unwrap() {

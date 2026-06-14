@@ -1,7 +1,7 @@
-use crate::engine::provider::TargetSpec;
-use crate::htaddr::Addr;
-use crate::htvalue::Value;
-use crate::pluginfs;
+use heph_plugin::provider::TargetSpec;
+use heph_model::htaddr::Addr;
+use heph_core::htvalue::Value;
+use heph_builtins::pluginfs;
 use std::collections::HashMap;
 
 /// Generates a `_go_mod` target that groups go.mod / go.sum pluginfs deps so the engine
@@ -26,7 +26,7 @@ pub fn build_spec(addr: Addr, mod_files: &[String]) -> TargetSpec {
 
     TargetSpec {
         addr,
-        driver: crate::plugingroup::DRIVER_NAME.to_string(),
+        driver: heph_builtins::plugingroup::DRIVER_NAME.to_string(),
         config,
         labels: vec![],
         transitive: Default::default(),
@@ -36,7 +36,7 @@ pub fn build_spec(addr: Addr, mod_files: &[String]) -> TargetSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htpkg::PkgBuf;
+    use heph_model::htpkg::PkgBuf;
 
     fn test_addr() -> Addr {
         Addr::new(PkgBuf::from(""), "_go_mod".to_string(), Default::default())

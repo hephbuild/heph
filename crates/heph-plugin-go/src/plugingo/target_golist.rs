@@ -1,6 +1,6 @@
-use crate::engine::provider::TargetSpec;
-use crate::htaddr::Addr;
-use crate::htvalue::Value;
+use heph_plugin::provider::TargetSpec;
+use heph_model::htaddr::Addr;
+use heph_core::htvalue::Value;
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 
@@ -136,7 +136,7 @@ fn build_spec_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htpkg::PkgBuf;
+    use heph_model::htpkg::PkgBuf;
 
     fn test_addr() -> Addr {
         Addr::new(
