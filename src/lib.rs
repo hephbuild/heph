@@ -39,6 +39,7 @@ pub mod htaddr;
 pub mod htmatcher;
 pub mod htpkg;
 pub mod htplatform;
+pub mod htspec;
 pub mod htvalue;
 pub mod htwalk;
 pub mod log;

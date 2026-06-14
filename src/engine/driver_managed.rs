@@ -65,11 +65,10 @@ pub struct ManagedRunResponse {
 #[async_trait]
 pub trait ManagedDriver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
-    /// Optional config schema, forwarded by the bridge's [`Driver::schema`]. See
+    /// Config schema, forwarded by the bridge's [`Driver::schema`]. A config-less
+    /// driver returns `DriverSchema::default()`. See
     /// [`crate::engine::driver::Driver::schema`].
-    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
-        None
-    }
+    fn schema(&self) -> crate::engine::driver::DriverSchema;
     async fn parse(
         &self,
         req: ParseRequest,
@@ -203,7 +202,7 @@ impl Driver for ManagedDriverBridge {
         self.os.driver.config(req)
     }
 
-    fn schema(&self) -> Option<crate::engine::driver::DriverSchema> {
+    fn schema(&self) -> crate::engine::driver::DriverSchema {
         self.os.driver.schema()
     }
 
@@ -682,6 +681,9 @@ mod shell_fallback_tests {
                 name: "noshell".to_string(),
             })
         }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
         async fn parse(
             &self,
             _: ParseRequest,
@@ -720,6 +722,9 @@ mod shell_fallback_tests {
             Ok(ConfigResponse {
                 name: "recording".to_string(),
             })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
         }
         async fn parse(
             &self,

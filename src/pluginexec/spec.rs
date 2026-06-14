@@ -1,26 +1,43 @@
 use crate::engine::driver::targetdef::path::CodegenMode;
-use crate::engine::driver::{DriverField, DriverSchema};
+use crate::htspec::{FromSpecValue, Spec, SpecStruct};
+use crate::htvalue::Value;
 use crate::htvalue::signature::ParamType;
-use crate::htvalue::{
-    Value, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
-    parse_strings,
-};
 use anyhow::Context;
 use std::collections::HashMap;
 
+/// Exec-driver target config. `#[derive(Spec)]` generates `TargetSpec::from`
+/// (parser) and `TargetSpec::schema` (LSP schema) from these fields, so the two
+/// can never drift; doc comments below become the schema docs. `codegen` is a
+/// [`SpecEnum`](crate::htspec::SpecEnum); `cache` is a bool shorthand or a
+/// [`SpecStruct`] dict ([`CacheDict`]).
+#[derive(Spec)]
 pub(crate) struct TargetSpec {
+    /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
     pub run: Vec<String>,
+    /// Hashed + runtime dependencies, grouped by name → list of target addresses.
     pub deps: HashMap<String, Vec<String>>,
+    /// Dependencies that contribute to the input hash but are not materialized at runtime.
     pub hash_deps: HashMap<String, Vec<String>>,
+    /// Dependencies materialized at runtime but excluded from the input hash.
     pub runtime_deps: HashMap<String, Vec<String>>,
+    /// Build tools, grouped by name → list of target addresses; symlinked under `tools/`.
     pub tools: HashMap<String, Vec<String>>,
+    /// Declared outputs, grouped by name → list of output paths the target writes.
+    #[spec(rename = "out")]
     pub outputs: HashMap<String, Vec<String>>,
+    /// Extra files materialized into the sandbox but not hashed as deps.
     pub support_files: Vec<String>,
+    /// Codegen mode: `copy` or `in_place`. Omit for a normal (non-codegen) target.
     pub codegen: CodegenMode,
+    /// Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.
     pub cache: TargetSpecCache,
+    /// Environment variables set for the command.
     pub env: HashMap<String, String>,
+    /// Names of host environment variables passed through (hashed). `"*"` passes all.
     pub pass_env: Vec<String>,
+    /// Host env vars passed through at runtime only (not hashed). `"*"` passes all.
     pub runtime_pass_env: Vec<String>,
+    /// Environment variables set at runtime only (not hashed).
     pub runtime_env: HashMap<String, String>,
 }
 
@@ -31,38 +48,60 @@ pub(crate) struct TargetSpecCache {
     pub history: u32,
 }
 
-/// Parse the `cache` attribute, which accepts either a bare bool (legacy:
-/// `cache = True/False` toggles both local and remote, history 1) or a dict
-/// `cache = {"enabled": bool, "remote": bool, "history": int}` where any unset
-/// key falls back to its default (enabled/remote true, history 1).
-fn parse_cache(v: &Value) -> anyhow::Result<TargetSpecCache> {
-    match v {
-        Value::Bool(b) => Ok(TargetSpecCache {
-            local: *b,
-            remote: *b,
+impl Default for TargetSpecCache {
+    fn default() -> Self {
+        TargetSpecCache {
+            local: true,
+            remote: true,
             history: 1,
-        }),
-        Value::Map(m) => {
-            let mut c = TargetSpecCache {
-                local: true,
-                remote: true,
-                history: 1,
-            };
-            for (k, val) in m {
-                match k.as_str() {
-                    "enabled" => {
-                        c.local = parse_bool(val).with_context(|| "parse `cache.enabled`")?
-                    }
-                    "remote" => {
-                        c.remote = parse_bool(val).with_context(|| "parse `cache.remote`")?
-                    }
-                    "history" => c.history = parse_cache_history(val)?,
-                    other => anyhow::bail!("unknown `cache` entry: {other:?}"),
-                }
-            }
-            Ok(c)
         }
-        _ => anyhow::bail!("`cache` must be a bool or a dict"),
+    }
+}
+
+/// The dict form of `cache`: `{"enabled": bool, "remote": bool, "history": int}`,
+/// each key optional and defaulting (enabled/remote true, history 1). The
+/// `SpecStruct` derive parses the map and rejects unknown keys.
+#[derive(SpecStruct)]
+struct CacheDict {
+    #[spec(rename = "enabled", default = true)]
+    local: bool,
+    #[spec(default = true)]
+    remote: bool,
+    #[spec(default = 1u32, parse = parse_cache_history)]
+    history: u32,
+}
+
+impl From<CacheDict> for TargetSpecCache {
+    fn from(d: CacheDict) -> Self {
+        TargetSpecCache {
+            local: d.local,
+            remote: d.remote,
+            history: d.history,
+        }
+    }
+}
+
+/// The `cache` attribute accepts either a bare bool (legacy: `cache =
+/// True/False` toggles both local and remote, history 1) or the [`CacheDict`]
+/// form. This is shape-dispatch (not `SpecUnion`): a map *commits* to the dict
+/// arm so its specific parse errors (unknown key, bad `history`) surface,
+/// rather than being masked by a generic "expected bool | map" union error.
+impl FromSpecValue for TargetSpecCache {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        match v {
+            // A bare bool toggles both local and remote; history stays at 1.
+            Value::Bool(b) => Ok(TargetSpecCache {
+                local: *b,
+                remote: *b,
+                history: 1,
+            }),
+            Value::Map(_) => CacheDict::from_spec_value(v).map(TargetSpecCache::from),
+            _ => anyhow::bail!("`cache` must be a bool or a dict"),
+        }
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::union(vec![ParamType::Bool, CacheDict::spec_param_type()])
     }
 }
 
@@ -78,202 +117,10 @@ fn parse_cache_history(v: &Value) -> anyhow::Result<u32> {
     u32::try_from(n).context("`cache.history` too large")
 }
 
-impl TargetSpec {
-    pub fn from(m: HashMap<String, Value>) -> anyhow::Result<TargetSpec> {
-        let mut m: HashMap<&str, &Value> = m.iter().map(|(k, v)| (k.as_str(), v)).collect();
-
-        let mut spec = TargetSpec {
-            run: vec![],
-            cache: TargetSpecCache {
-                local: true,
-                remote: true,
-                history: 1,
-            },
-            outputs: HashMap::new(),
-            support_files: vec![],
-            codegen: CodegenMode::None,
-            deps: HashMap::new(),
-            hash_deps: HashMap::new(),
-            runtime_deps: HashMap::new(),
-            tools: HashMap::new(),
-            env: HashMap::new(),
-            pass_env: vec![],
-            runtime_pass_env: vec![],
-            runtime_env: HashMap::new(),
-        };
-
-        if let Some(v) = m.remove("run") {
-            spec.run = parse_strings(v).with_context(|| "parse `run`")?;
-        };
-
-        if let Some(v) = m.remove("cache") {
-            spec.cache = parse_cache(v).with_context(|| "parse `cache`")?;
-        }
-
-        if let Some(v) = m.remove("out") {
-            spec.outputs = parse_map_string_strings(v).with_context(|| "parse `out`")?;
-        };
-
-        if let Some(v) = m.remove("support_files") {
-            spec.support_files = parse_strings(v).with_context(|| "parse `support_files`")?;
-        };
-
-        if let Some(v) = m.remove("codegen") {
-            spec.codegen = match parse_string(v)? {
-                Some(s) => match s.as_str() {
-                    "copy" => Ok(CodegenMode::Copy),
-                    "in_place" => Ok(CodegenMode::InPlace),
-                    _ => Err(anyhow::anyhow!("invalid codegen mode: {}", s)),
-                },
-                None => Ok(CodegenMode::None),
-            }
-            .with_context(|| "parse `codegen`")?;
-        };
-
-        if let Some(v) = m.remove("deps") {
-            spec.deps = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
-        };
-
-        if let Some(v) = m.remove("hash_deps") {
-            spec.hash_deps = parse_map_string_strings(v).with_context(|| "parse `hash_deps`")?;
-        };
-
-        if let Some(v) = m.remove("runtime_deps") {
-            spec.runtime_deps =
-                parse_map_string_strings(v).with_context(|| "parse `runtime_deps`")?;
-        };
-
-        if let Some(v) = m.remove("tools") {
-            spec.tools = parse_map_string_strings(v).with_context(|| "parse `tools`")?;
-        };
-
-        if let Some(v) = m.remove("env") {
-            spec.env = parse_map_string_string(v).with_context(|| "parse `env`")?;
-        };
-
-        if let Some(v) = m.remove("pass_env") {
-            spec.pass_env = parse_strings(v).with_context(|| "parse `pass_env`")?;
-        };
-
-        if let Some(v) = m.remove("runtime_pass_env") {
-            spec.runtime_pass_env = parse_strings(v).with_context(|| "parse `runtime_pass_env`")?;
-        };
-
-        if let Some(v) = m.remove("runtime_env") {
-            spec.runtime_env = parse_map_string_string(v).with_context(|| "parse `runtime_env`")?;
-        };
-
-        if !m.is_empty() {
-            let unknown_keys: Vec<&str> = m.into_keys().collect();
-            anyhow::bail!("unknown entries found: {:?}", unknown_keys)
-        }
-
-        Ok(spec)
-    }
-
-    /// Declarative schema of the config fields exec accepts, for the BUILD-file
-    /// LSP. Kept in this file alongside [`TargetSpec::from`] so the two field
-    /// lists are edited together and don't drift.
-    pub(crate) fn schema() -> DriverSchema {
-        use ParamType::String as Str;
-        let field = |name: &str, ty: ParamType, doc: &str| DriverField {
-            name: name.to_string(),
-            ty,
-            doc: doc.to_string(),
-            required: false,
-        };
-        // Types mirror exactly what the `parse_*` helpers accept (see
-        // `TargetSpec::from`), each of which is effectively a union:
-        //   parse_strings           → string | list[string]
-        //   parse_map_string_strings→ string | list[string] | map[string | list[string]]
-        //   parse_map_string_string → string | map[string]
-        let str_or_list = || ParamType::union(vec![Str, ParamType::list(Str)]);
-        let group_strings = || {
-            ParamType::union(vec![
-                Str,
-                ParamType::list(Str),
-                ParamType::map(str_or_list()),
-            ])
-        };
-        let str_or_map = || ParamType::union(vec![Str, ParamType::map(Str)]);
-        DriverSchema {
-            fields: vec![
-                field(
-                    "run",
-                    str_or_list(),
-                    "Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.",
-                ),
-                field(
-                    "out",
-                    group_strings(),
-                    "Declared outputs, grouped by name → list of output paths the target writes.",
-                ),
-                field(
-                    "cache",
-                    ParamType::union(vec![
-                        ParamType::Bool,
-                        ParamType::map(ParamType::union(vec![ParamType::Bool, ParamType::Int])),
-                    ]),
-                    "Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.",
-                ),
-                field(
-                    "support_files",
-                    str_or_list(),
-                    "Extra files materialized into the sandbox but not hashed as deps.",
-                ),
-                field(
-                    "codegen",
-                    Str,
-                    "Codegen mode: `copy` or `in_place`. Omit for a normal (non-codegen) target.",
-                ),
-                field(
-                    "deps",
-                    group_strings(),
-                    "Hashed + runtime dependencies, grouped by name → list of target addresses.",
-                ),
-                field(
-                    "hash_deps",
-                    group_strings(),
-                    "Dependencies that contribute to the input hash but are not materialized at runtime.",
-                ),
-                field(
-                    "runtime_deps",
-                    group_strings(),
-                    "Dependencies materialized at runtime but excluded from the input hash.",
-                ),
-                field(
-                    "tools",
-                    group_strings(),
-                    "Build tools, grouped by name → list of target addresses; symlinked under `tools/`.",
-                ),
-                field(
-                    "env",
-                    str_or_map(),
-                    "Environment variables set for the command.",
-                ),
-                field(
-                    "pass_env",
-                    str_or_list(),
-                    "Names of host environment variables passed through (hashed). `\"*\"` passes all.",
-                ),
-                field(
-                    "runtime_pass_env",
-                    str_or_list(),
-                    "Host env vars passed through at runtime only (not hashed). `\"*\"` passes all.",
-                ),
-                field(
-                    "runtime_env",
-                    str_or_map(),
-                    "Environment variables set at runtime only (not hashed).",
-                ),
-            ],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::driver::DriverField;
     use crate::htvalue::Value;
 
     fn make_spec(
@@ -386,8 +233,10 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
+        // `cache` dict is a `SpecStruct`: unknown keys are rejected with the
+        // generic "unknown entries found" message.
         assert!(
-            format!("{err:#}").contains("unknown `cache` entry"),
+            format!("{err:#}").contains("unknown entries found"),
             "{err:#}"
         );
     }
@@ -557,10 +406,12 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
-        assert!(
-            format!("{err:#}").contains("invalid codegen mode: link"),
-            "{err:#}"
-        );
+        // `codegen` is now a `SpecEnum`: an unknown string lists the valid
+        // variants and the field name (from the `parse \`codegen\`` context).
+        let msg = format!("{err:#}");
+        assert!(msg.contains("codegen"), "{msg}");
+        assert!(msg.contains("expected one of"), "{msg}");
+        assert!(msg.contains("link"), "{msg}");
     }
 
     #[test]

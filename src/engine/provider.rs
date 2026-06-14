@@ -131,20 +131,26 @@ pub trait ProviderFn: Send + Sync {
 }
 
 /// One exposed function: its bare name (no `heph.<provider>.` prefix), its
-/// declarative signature, and its handler. The engine enforces `signature`
-/// against every call (see [`crate::htvalue::signature::FnSignature`]).
+/// declarative signature, a one-line doc string, and its handler. The engine
+/// enforces `signature` against every call (see
+/// [`crate::htvalue::signature::FnSignature`]); `doc` is surfaced by the
+/// BUILD-file LSP on hover over `heph.<provider>.<name>`.
 pub struct ProviderFunctionDef {
     pub name: String,
     pub signature: FnSignature,
+    /// Human-readable description shown in LSP hover. Empty for undocumented
+    /// functions (the hover then shows just the rendered signature).
+    pub doc: String,
     pub func: Arc<dyn ProviderFn>,
 }
 
 /// A function as held in the [`ProviderFunctionRegistry`]: its signature
 /// (shared, so the Starlark bridge can both enforce it and derive a native
-/// param spec from it) plus the handler.
+/// param spec from it), its hover doc, plus the handler.
 #[derive(Clone)]
 pub struct RegisteredFn {
     pub signature: Arc<FnSignature>,
+    pub doc: String,
     pub func: Arc<dyn ProviderFn>,
 }
 
@@ -189,6 +195,7 @@ impl ProviderFunctionRegistry {
                 def.name,
                 RegisteredFn {
                     signature: Arc::new(def.signature),
+                    doc: def.doc,
                     func: def.func,
                 },
             );

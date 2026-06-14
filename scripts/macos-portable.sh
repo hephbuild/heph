@@ -65,3 +65,12 @@ if [ -n "$remaining" ]; then
   echo "$remaining" >&2
   exit 1
 fi
+
+# `install_name_tool` rewrites the Mach-O after the linker embedded its ad-hoc
+# code signature, leaving the signature stale. On Apple Silicon the kernel
+# refuses to launch a binary whose signature doesn't match its bytes
+# ("Killed: 9" / AMFI invalid signature), so re-sign ad-hoc as the final step
+# and verify before handing the binary off.
+codesign --force --sign - "$bin"
+codesign --verify --strict "$bin"
+echo "macos-portable: re-signed ad-hoc"

@@ -437,6 +437,9 @@ impl ProviderTrait for Provider {
                 variadic: None,
                 returns: ParamType::String,
             },
+            doc: "Build the address of a Go package's `_golist` target for a given \
+                  GOOS/GOARCH (and optional build tags), as used in `deps`."
+                .to_string(),
             func: Arc::new(BuildAddrFn),
         }]
     }

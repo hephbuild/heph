@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e", "testkit", "plugingo-e2e"]
+members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive"]
 
 [profile.profiling]
 inherits = "release"
@@ -93,6 +93,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 heph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
+htspec-derive = { path = "htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
 memoize = "0.6.0"
@@ -106,10 +107,12 @@ async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
 tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
-starlark = "0.13.0"
-starlark_lsp = "0.13.0"
+starlark = "0.14.2"
+starlark_lsp = "0.14.2"
+allocative = "0.3"
 lsp-server = "0.7"
-lsp-types = "0.94"
+lsp-types = "0.97"
+tower-lsp-server = "0.22"
 rayon = "1.12.0"
 xxhash-rust = { version = "0.8.15" , features = ["xxh3", "std"]}
 itertools = "0.13.0"

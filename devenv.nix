@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p heph-testkit -p plugingo-e2e";
+  qualityCrates = "-p heph -p e2e -p heph-testkit -p plugingo-e2e -p htspec-derive";
 in
 {
   # https://devenv.sh/basics/
@@ -92,13 +92,28 @@ in
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")
-    cp $CARGO_TARGET_DIR/debug/heph "${binLocation}"
+    # Atomic replace (new inode) — overwriting the binary in place leaves macOS
+    # holding the previous code-signature for that path and SIGKILLs the next run.
+    cp $CARGO_TARGET_DIR/debug/heph "${binLocation}.new"
+    mv -f "${binLocation}.new" "${binLocation}"
   '';
 
   scripts.install-release-build.exec = ''
     cargo build --release
+    bin="$CARGO_TARGET_DIR/release/heph"
+    if [ "$(uname -s)" = "Darwin" ]; then
+      # The nix toolchain hard-links libiconv against its /nix/store path, which
+      # dyld aborts on once that store path is GC'd ("Killed"). Rewrite to the
+      # OS /usr/lib copy and re-sign ad-hoc so the installed binary keeps
+      # launching — same treatment the shipped CI artifact gets.
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$bin"
+    fi
     mkdir -p $(dirname "${binLocation}")
-    cp $CARGO_TARGET_DIR/release/heph "${binLocation}"
+    # Atomic replace (new inode): overwriting in place keeps macOS's cached
+    # code-signature for the old bytes, which SIGKILLs the next run on Apple
+    # Silicon. `mv` swaps the path to a fresh inode so AMFI re-validates.
+    cp "$bin" "${binLocation}.new"
+    mv -f "${binLocation}.new" "${binLocation}"
   '';
 
 

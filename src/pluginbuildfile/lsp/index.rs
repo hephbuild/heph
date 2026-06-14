@@ -12,7 +12,7 @@
 use crate::engine::engine::Engine;
 use crate::engine::provider::ProvenanceFrame;
 use crate::pluginbuildfile::run_file::RunResult;
-use starlark_lsp::server::LspUrl;
+use starlark_lsp::server::LspUri;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,6 +85,16 @@ pub(crate) struct DocIndex {
 }
 
 impl DocIndex {
+    /// An index carrying only the buffer text, no provenance. Used when the
+    /// buffer doesn't parse/evaluate (the user is mid-edit, e.g. just typed
+    /// `heph.`) so prefix-based completion/hover still has the current source.
+    pub(crate) fn source_only(source: String) -> DocIndex {
+        DocIndex {
+            source,
+            ..DocIndex::default()
+        }
+    }
+
     /// Build the index from an evaluated buffer. `pkg` is the buffer's package
     /// (used to format `//pkg:name` addresses); `source` is the buffer text.
     pub(crate) fn build(result: &RunResult, pkg: &str, source: String) -> DocIndex {
@@ -315,7 +325,10 @@ pub(crate) struct SharedState {
     /// symbol's package directory and scan its files for the definition.
     pub root: std::path::PathBuf,
     pub patterns: Vec<glob::Pattern>,
-    docs: Mutex<HashMap<LspUrl, DocIndex>>,
+    /// The `heph.core` builtin functions, for member completion/hover of that
+    /// static namespace (which isn't in the provider-function registry).
+    pub core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
+    docs: Mutex<HashMap<LspUri, DocIndex>>,
 }
 
 impl SharedState {
@@ -323,20 +336,22 @@ impl SharedState {
         engine: Arc<Engine>,
         root: std::path::PathBuf,
         patterns: Vec<glob::Pattern>,
+        core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
     ) -> Arc<SharedState> {
         Arc::new(SharedState {
             engine,
             root,
             patterns,
+            core_members,
             docs: Mutex::new(HashMap::new()),
         })
     }
 
-    pub(crate) fn set_index(&self, uri: LspUrl, index: DocIndex) {
+    pub(crate) fn set_index(&self, uri: LspUri, index: DocIndex) {
         self.docs.lock().expect("docs lock").insert(uri, index);
     }
 
-    pub(crate) fn index(&self, uri: &LspUrl) -> Option<DocIndex> {
+    pub(crate) fn index(&self, uri: &LspUri) -> Option<DocIndex> {
         self.docs.lock().expect("docs lock").get(uri).cloned()
     }
 }

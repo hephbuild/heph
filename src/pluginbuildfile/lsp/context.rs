@@ -21,11 +21,12 @@ use starlark::errors::EvalMessage;
 use starlark::syntax::{AstModule, Dialect};
 use starlark_lsp::completion::{StringCompletionResult, StringCompletionType};
 use starlark_lsp::error::eval_message_to_lsp_diagnostic;
-use starlark_lsp::server::{LspContext, LspEvalResult, LspUrl, StringLiteralResult};
+use starlark_lsp::server::{LspContext, LspEvalResult, LspUri, StringLiteralResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tower_lsp_server::UriExt as _;
 
 /// How long a listing provider (and its internal package/target memoization) is
 /// reused before being rebuilt. Bursts of completion requests (keystrokes) within
@@ -54,9 +55,10 @@ impl HephLspContext {
         let root = engine.root().to_path_buf();
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();
+        let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
         let patterns = buildfile_patterns(&root);
         let provider = build_listing_provider(&root, &patterns, &registry);
-        let shared = SharedState::new(engine, root.clone(), patterns.clone());
+        let shared = SharedState::new(engine, root.clone(), patterns.clone(), core_members);
         HephLspContext {
             root,
             registry,
@@ -147,11 +149,9 @@ impl HephLspContext {
     }
 
     /// The on-disk BUILD file URL for a package.
-    fn build_file_url(&self, package: &str) -> Option<LspUrl> {
+    fn build_file_url(&self, package: &str) -> Option<LspUri> {
         let path = first_build_file(&self.root.join(package), &self.patterns)?;
-        lsp_types::Url::from_file_path(path)
-            .ok()
-            .and_then(|u| LspUrl::try_from(u).ok())
+        lsp_types::Uri::from_file_path(path).and_then(|u| LspUri::try_from(u).ok())
     }
 }
 
@@ -218,9 +218,9 @@ fn buildfile_patterns(root: &Path) -> Vec<glob::Pattern> {
 }
 
 impl LspContext for HephLspContext {
-    fn parse_file_with_contents(&self, uri: &LspUrl, content: String) -> LspEvalResult {
+    fn parse_file_with_contents(&self, uri: &LspUri, content: String) -> LspEvalResult {
         let path = match uri {
-            LspUrl::File(p) | LspUrl::Starlark(p) => p.clone(),
+            LspUri::File(p) | LspUri::Starlark(p) => p.clone(),
             _ => return LspEvalResult::default(),
         };
         let filename = path.to_string_lossy().to_string();
@@ -230,6 +230,10 @@ impl LspContext for HephLspContext {
         let ast = match AstModule::parse(&filename, content.clone(), &Dialect::Extended) {
             Ok(ast) => ast,
             Err(e) => {
+                // Keep the (unparseable) buffer source so prefix-based completion
+                // and hover still work while the user is typing (`heph.` etc.).
+                self.shared
+                    .set_index(uri.clone(), DocIndex::source_only(content));
                 return LspEvalResult {
                     diagnostics: vec![eval_message_to_lsp_diagnostic(EvalMessage::from_error(
                         &path, &e,
@@ -240,15 +244,17 @@ impl LspContext for HephLspContext {
         };
 
         // Best-effort evaluation to populate the provenance / driver index. A
-        // half-typed buffer that fails to evaluate simply yields no index — we do
-        // not surface eval errors as diagnostics (they would be noisy while typing).
+        // half-typed buffer that fails to evaluate simply yields no provenance —
+        // but we keep the source for prefix-based completion/hover. We do not
+        // surface eval errors as diagnostics (they would be noisy while typing).
         let pkg = self.path_to_pkg(&path);
         let source = content.clone();
         if let Ok(result) = eval_source(&filename, content, &pkg, &self.loader()) {
             self.shared
                 .set_index(uri.clone(), DocIndex::build(&result, &pkg, source));
         } else {
-            self.shared.set_index(uri.clone(), DocIndex::default());
+            self.shared
+                .set_index(uri.clone(), DocIndex::source_only(source));
         }
 
         LspEvalResult {
@@ -260,38 +266,38 @@ impl LspContext for HephLspContext {
     fn resolve_load(
         &self,
         path: &str,
-        current_file: &LspUrl,
+        current_file: &LspUri,
         _workspace_root: Option<&Path>,
-    ) -> anyhow::Result<LspUrl> {
+    ) -> Result<LspUri, String> {
         // Resolve exactly as the buildfile loader does (`//pkg`, `//pkg/x.BUILD`,
         // `./rel`, `../rel`), so loaded symbols point at the same file heph reads.
         let current_pkg = match current_file {
-            LspUrl::File(p) => self.path_to_pkg(p),
+            LspUri::File(p) => self.path_to_pkg(p),
             _ => String::new(),
         };
-        let resolved = resolve_load_target(&self.root, &current_pkg, path)?;
+        let resolved =
+            resolve_load_target(&self.root, &current_pkg, path).map_err(|e| e.to_string())?;
         // `load("//pkg", …)` targets a directory: resolve to its BUILD file so the
         // file can be parsed for its exported symbols.
         let file = if resolved.is_dir() {
             first_build_file(&resolved, &self.patterns)
-                .ok_or_else(|| anyhow::anyhow!("no BUILD file in {}", resolved.display()))?
+                .ok_or_else(|| format!("no BUILD file in {}", resolved.display()))?
         } else {
             resolved
         };
-        Ok(LspUrl::try_from(
-            lsp_types::Url::from_file_path(&file)
-                .map_err(|()| anyhow::anyhow!("non-file load path"))?,
-        )?)
+        let uri = lsp_types::Uri::from_file_path(&file)
+            .ok_or_else(|| "non-file load path".to_string())?;
+        LspUri::try_from(uri).map_err(|e| e.to_string())
     }
 
     fn render_as_load(
         &self,
-        target: &LspUrl,
-        _current_file: &LspUrl,
+        target: &LspUri,
+        _current_file: &LspUri,
         _workspace_root: Option<&Path>,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, String> {
         match target {
-            LspUrl::File(target_path) => {
+            LspUri::File(target_path) => {
                 let pkg = self.path_to_pkg(target_path);
                 let file = target_path
                     .file_name()
@@ -299,16 +305,16 @@ impl LspContext for HephLspContext {
                     .unwrap_or_default();
                 Ok(format!("//{pkg}:{file}"))
             }
-            _ => anyhow::bail!("can only render file:// load paths"),
+            _ => Err("can only render file:// load paths".to_string()),
         }
     }
 
     fn resolve_string_literal(
         &self,
         literal: &str,
-        current_file: &LspUrl,
+        current_file: &LspUri,
         _workspace_root: Option<&Path>,
-    ) -> anyhow::Result<Option<StringLiteralResult>> {
+    ) -> Result<Option<StringLiteralResult>, String> {
         // Goto-definition on a target address: `//pkg:name` (absolute) or `:name`
         // (relative to the current file's package). Jump to the package's BUILD
         // file. Non-address strings resolve to nothing.
@@ -316,7 +322,7 @@ impl LspContext for HephLspContext {
             rest.split_once(':').map(|(p, _)| p.to_string())
         } else if let Some(_name) = literal.strip_prefix(':') {
             match current_file {
-                LspUrl::File(p) => Some(self.path_to_pkg(p)),
+                LspUri::File(p) => Some(self.path_to_pkg(p)),
                 _ => None,
             }
         } else {
@@ -324,39 +330,39 @@ impl LspContext for HephLspContext {
         };
 
         Ok(package.and_then(|pkg| {
-            self.build_file_url(&pkg).map(|url| StringLiteralResult {
-                url,
+            self.build_file_url(&pkg).map(|uri| StringLiteralResult {
+                uri,
                 location_finder: None,
             })
         }))
     }
 
-    fn get_load_contents(&self, uri: &LspUrl) -> anyhow::Result<Option<String>> {
+    fn get_load_contents(&self, uri: &LspUri) -> Result<Option<String>, String> {
         match uri {
-            LspUrl::File(p) => Ok(std::fs::read_to_string(p).ok()),
+            LspUri::File(p) => Ok(std::fs::read_to_string(p).ok()),
             _ => Ok(None),
         }
     }
 
-    fn get_environment(&self, _uri: &LspUrl) -> DocModule {
+    fn get_environment(&self, _uri: &LspUri) -> DocModule {
         self.doc_globals.clone()
     }
 
-    fn get_url_for_global_symbol(
+    fn get_uri_for_global_symbol(
         &self,
-        _current_file: &LspUrl,
+        _current_file: &LspUri,
         _symbol: &str,
-    ) -> anyhow::Result<Option<LspUrl>> {
+    ) -> Result<Option<LspUri>, String> {
         Ok(None)
     }
 
     fn get_string_completion_options(
         &self,
-        _document_uri: &LspUrl,
+        _document_uri: &LspUri,
         kind: StringCompletionType,
         current_value: &str,
         _workspace_root: Option<&Path>,
-    ) -> anyhow::Result<Vec<StringCompletionResult>> {
+    ) -> Result<Vec<StringCompletionResult>, String> {
         // The first argument of a `load(...)`: complete package paths (`//pkg`),
         // which heph resolves to that package's BUILD file.
         if matches!(kind, StringCompletionType::LoadPath) {
