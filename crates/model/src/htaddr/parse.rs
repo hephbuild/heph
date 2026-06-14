@@ -2,11 +2,12 @@ use crate::htaddr::addr::Addr;
 use crate::htpkg::PkgBuf;
 use anyhow::Context;
 use nom::IResult;
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_till1};
 use nom::character::complete::char as nchar;
 use nom::combinator::{all_consuming, opt};
-use nom::error::VerboseError;
+use nom::error::Error;
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, preceded};
 use serde::Deserialize;
@@ -24,40 +25,40 @@ impl<'de> Deserialize<'de> for Addr {
     }
 }
 
-type R<'a, T> = IResult<&'a str, T, VerboseError<&'a str>>;
+type R<'a, T> = IResult<&'a str, T, Error<&'a str>>;
 
 fn pkg(i: &str) -> R<'_, &str> {
-    take_till(|c: char| c == ':' || c == ' ')(i)
+    take_till(|c: char| c == ':' || c == ' ').parse(i)
 }
 
 fn name(i: &str) -> R<'_, &str> {
-    take_till1(|c: char| matches!(c, '@' | ':' | ' ' | '|'))(i)
+    take_till1(|c: char| matches!(c, '@' | ':' | ' ' | '|')).parse(i)
 }
 
 fn key(i: &str) -> R<'_, &str> {
-    take_till1(|c: char| matches!(c, '=' | ',' | '@' | ' ' | '|' | '"'))(i)
+    take_till1(|c: char| matches!(c, '=' | ',' | '@' | ' ' | '|' | '"')).parse(i)
 }
 
 fn bare_value(i: &str) -> R<'_, &str> {
-    take_till1(|c: char| matches!(c, ',' | ' ' | '|' | '"'))(i)
+    take_till1(|c: char| matches!(c, ',' | ' ' | '|' | '"')).parse(i)
 }
 
 fn quoted_value(i: &str) -> R<'_, &str> {
-    delimited(nchar('"'), take_till(|c| c == '"'), nchar('"'))(i)
+    delimited(nchar('"'), take_till(|c| c == '"'), nchar('"')).parse(i)
 }
 
 fn value(i: &str) -> R<'_, &str> {
-    alt((quoted_value, bare_value))(i)
+    alt((quoted_value, bare_value)).parse(i)
 }
 
 fn arg(i: &str) -> R<'_, (&str, &str)> {
     let (i, k) = key(i)?;
-    let (i, v) = opt(preceded(nchar('='), value))(i)?;
+    let (i, v) = opt(preceded(nchar('='), value)).parse(i)?;
     Ok((i, (k, v.unwrap_or(""))))
 }
 
 fn args(i: &str) -> R<'_, Vec<(&str, &str)>> {
-    separated_list1(nchar(','), arg)(i)
+    separated_list1(nchar(','), arg).parse(i)
 }
 
 #[expect(
@@ -65,11 +66,11 @@ fn args(i: &str) -> R<'_, Vec<(&str, &str)>> {
     reason = "tuple return mirrors grammar productions; refactoring into a struct would obscure the parser"
 )]
 fn addr_parser(i: &str) -> R<'_, (&str, &str, Vec<(&str, &str)>)> {
-    let (i, _) = tag("//")(i)?;
+    let (i, _) = tag("//").parse(i)?;
     let (i, p) = pkg(i)?;
-    let (i, _) = nchar(':')(i)?;
+    let (i, _) = nchar(':').parse(i)?;
     let (i, n) = name(i)?;
-    let (i, a) = opt(preceded(nchar('@'), args))(i)?;
+    let (i, a) = opt(preceded(nchar('@'), args)).parse(i)?;
     Ok((i, (p, n, a.unwrap_or_default())))
 }
 
@@ -161,7 +162,7 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
 }
 
 pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
-    let (_, (p, n, kvs)) = all_consuming(addr_parser)(input)
+    let (_, (p, n, kvs)) = all_consuming(addr_parser).parse(input)
         .map_err(|e| anyhow::anyhow!("invalid address {:?}: {}", input, e))?;
 
     let mut args = BTreeMap::new();

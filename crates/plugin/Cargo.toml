@@ -15,12 +15,12 @@ htspec-derive = { path = "../htspec-derive" }
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-async-trait = "0.1.86"
+async-trait = "0.1.89"
 erased-serde = "0.4"
 smart-default = "0.7.1"
-itertools = "0.13.0"
+itertools = "0.14.0"
 futures = "0.3.32"
-tokio = { version = "1.50.0", features = ["io-util"] }
+tokio = { version = "1.52.3", features = ["io-util"] }
 
 [dev-dependencies]
 serde_json = "1.0"

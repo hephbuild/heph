@@ -12,10 +12,10 @@ hplugin = { package = "plugin", path = "../plugin" }
 anyhow = "1.0.102"
 libc = "0.2"
 parking_lot = "0.12"
-async-trait = "0.1.86"
+async-trait = "0.1.89"
 rustc-hash = "2"
 tracing = "0.1"
-tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "time", "fs"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "time", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"

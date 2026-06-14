@@ -332,7 +332,7 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
                 let row_id = tx.last_insert_rowid();
                 let mut blob = tx
                     .blob_open(
-                        rusqlite::DatabaseName::Main,
+                        rusqlite::MAIN_DB,
                         "artifacts",
                         "data",
                         row_id,
@@ -383,7 +383,9 @@ impl LocalCache for LocalCacheSQLite {
             .context("preparing reader lookup")?;
         let (row_id, blob_len): (i64, usize) = match stmt
             .query_row(rusqlite::params![addr_key, hashin, name], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+                let row_id: i64 = row.get(0)?;
+                let blob_len: i64 = row.get(1)?;
+                Ok((row_id, usize::try_from(blob_len).unwrap_or(0)))
             }) {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(anyhow::anyhow!(NotFoundError));
@@ -400,7 +402,7 @@ impl LocalCache for LocalCacheSQLite {
         if blob_len <= self.inline_threshold {
             let mut blob = conn
                 .blob_open(
-                    rusqlite::DatabaseName::Main,
+                    rusqlite::MAIN_DB,
                     "artifacts",
                     "data",
                     row_id,
@@ -435,7 +437,7 @@ impl LocalCache for LocalCacheSQLite {
         // Move the pooled connection into the rayon pool; returns to pool on drop.
         rayon::spawn(move || {
             let mut blob = match conn.blob_open(
-                rusqlite::DatabaseName::Main,
+                rusqlite::MAIN_DB,
                 "artifacts",
                 "data",
                 row_id,
@@ -621,7 +623,7 @@ impl OwnedBlob {
         let conn_ref: &Connection = &conn;
         let blob = conn_ref
             .blob_open(
-                rusqlite::DatabaseName::Main,
+                rusqlite::MAIN_DB,
                 "artifacts",
                 "data",
                 row_id,
