@@ -43,6 +43,14 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5368709120
           gc-max-store-size-macos: 5368709120
+      # cache-nix-action occasionally restores a store with a registered-but-
+      # invalid path (e.g. a fixed-output patch source dropped by the store GC
+      # before save). The later `devenv shell` eval then hard-fails with
+      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
+      # manual rerun. Re-substitute any missing/invalid paths so the shell can
+      # evaluate. No-op (a few seconds) on a healthy store.
+      - name: Repair restored Nix store
+        run: nix-store --verify --repair
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -123,6 +131,14 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5368709120
           gc-max-store-size-macos: 5368709120
+      # cache-nix-action occasionally restores a store with a registered-but-
+      # invalid path (e.g. a fixed-output patch source dropped by the store GC
+      # before save). The later `devenv shell` eval then hard-fails with
+      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
+      # manual rerun. Re-substitute any missing/invalid paths so the shell can
+      # evaluate. No-op (a few seconds) on a healthy store.
+      - name: Repair restored Nix store
+        run: nix-store --verify --repair
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -251,6 +267,14 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5368709120
           gc-max-store-size-macos: 5368709120
+      # cache-nix-action occasionally restores a store with a registered-but-
+      # invalid path (e.g. a fixed-output patch source dropped by the store GC
+      # before save). The later `devenv shell` eval then hard-fails with
+      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
+      # manual rerun. Re-substitute any missing/invalid paths so the shell can
+      # evaluate. No-op (a few seconds) on a healthy store.
+      - name: Repair restored Nix store
+        run: nix-store --verify --repair
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -324,6 +348,14 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5368709120
           gc-max-store-size-macos: 5368709120
+      # cache-nix-action occasionally restores a store with a registered-but-
+      # invalid path (e.g. a fixed-output patch source dropped by the store GC
+      # before save). The later `devenv shell` eval then hard-fails with
+      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
+      # manual rerun. Re-substitute any missing/invalid paths so the shell can
+      # evaluate. No-op (a few seconds) on a healthy store.
+      - name: Repair restored Nix store
+        run: nix-store --verify --repair
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
