@@ -379,6 +379,12 @@ fn reanchor_after_resize(
     rows: &mut u16,
 ) {
     *events = None;
+    // The resize moves the inline anchor, so the backend's cached cursor is
+    // stale. Drop it now (the EventStream is down, so the refilling live query
+    // below is race-free) — otherwise the same-backend `reanchor_terminal` path
+    // would re-anchor off a stale position. The rebuild branch makes a fresh
+    // backend anyway.
+    terminal.backend_mut().invalidate_cursor_cache();
     let term_height = terminal.size().map(|r| r.height).unwrap_or(24).max(1);
     let desired = crate::tui::progress::rows_for_height(term_height);
     if desired != *rows {

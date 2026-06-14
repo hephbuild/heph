@@ -46,6 +46,15 @@ impl StderrBackend {
             cached_cursor: None,
         }
     }
+
+    /// Drop the cached cursor anchor so the next `get_cursor_position` issues a
+    /// fresh live DSR query. A resize moves the inline anchor, invalidating the
+    /// cache. Callers MUST invoke this only while crossterm's `EventStream` is
+    /// torn down (e.g. inside `reanchor_after_resize`) so the live query that
+    /// refills the cache cannot race the event reader.
+    pub fn invalidate_cursor_cache(&mut self) {
+        self.cached_cursor = None;
+    }
 }
 
 impl Backend for StderrBackend {
@@ -253,7 +262,25 @@ fn parse_dsr(buf: &[u8]) -> Option<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_complete_dsr, parse_dsr};
+    use super::{StderrBackend, has_complete_dsr, parse_dsr};
+    use ratatui::backend::Backend;
+    use ratatui::layout::Position;
+    use std::io;
+
+    #[test]
+    fn cursor_cache_serves_without_query_and_invalidates() {
+        let mut backend = StderrBackend::new(io::stderr());
+        // Seed the cache: get_cursor_position must return it verbatim without a
+        // live DSR query (which would touch /dev/tty and race crossterm).
+        backend.cached_cursor = Some(Position { x: 4, y: 9 });
+        assert_eq!(
+            backend.get_cursor_position().expect("cached"),
+            Position { x: 4, y: 9 }
+        );
+        // After invalidation the cache is empty so the next call would re-query.
+        backend.invalidate_cursor_cache();
+        assert!(backend.cached_cursor.is_none());
+    }
 
     #[test]
     fn parse_dsr_extracts_col_row() {
