@@ -744,3 +744,25 @@ impl Engine {
         Ok(())
     }
 }
+
+impl heph_plugin::lsp::LspEngine for Engine {
+    fn root(&self) -> &std::path::Path {
+        &self.cfg.root
+    }
+
+    fn provider_function_registry(&self) -> Arc<provider::ProviderFunctionRegistry> {
+        Engine::provider_function_registry(self)
+    }
+
+    fn driver_schema(&self, name: &str) -> Option<crate::engine::driver::DriverSchema> {
+        Engine::driver_schema(self, name)
+    }
+
+    fn driver_names(&self) -> Vec<String> {
+        Engine::driver_names(self)
+    }
+
+    fn provider_state_schema(&self, name: &str) -> Option<provider::StateSchema> {
+        Engine::provider_state_schema(self, name)
+    }
+}

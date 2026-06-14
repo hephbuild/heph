@@ -5,7 +5,7 @@
 //! proxy uses for the provenance hover and driver-schema completion.
 
 use super::index::{DocIndex, SharedState};
-use crate::engine::engine::Engine;
+use heph_plugin::lsp::LspEngine;
 use crate::engine::provider::{
     ListPackagesRequest, ListRequest, Provider as EProvider, ProviderFunctionRegistry,
 };
@@ -51,7 +51,7 @@ pub(crate) struct HephLspContext {
 }
 
 impl HephLspContext {
-    pub(crate) fn new(engine: Arc<Engine>) -> HephLspContext {
+    pub(crate) fn new(engine: Arc<dyn LspEngine>) -> HephLspContext {
         let root = engine.root().to_path_buf();
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();

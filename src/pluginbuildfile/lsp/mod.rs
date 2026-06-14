@@ -10,7 +10,7 @@ mod context;
 mod index;
 mod proxy;
 
-use crate::engine::engine::Engine;
+use heph_plugin::lsp::LspEngine;
 use context::HephLspContext;
 use lsp_server::Connection;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// Serve the BUILD-file LSP over stdio until the client disconnects. The
 /// `starlark_lsp` server runs on an in-memory connection; a proxy bridges it to
 /// the real stdio and enriches hover/completion.
-pub fn serve_stdio(engine: Arc<Engine>) -> anyhow::Result<()> {
+pub fn serve_stdio(engine: Arc<dyn LspEngine>) -> anyhow::Result<()> {
     let ctx = HephLspContext::new(engine);
     let shared = Arc::clone(&ctx.shared);
 

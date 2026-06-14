@@ -34,6 +34,7 @@ pub mod driver;
 pub mod eresult;
 pub mod error;
 pub mod htspec;
+pub mod lsp;
 pub mod provider;
 
 // The `htspec` derive macros (SpecEnum/SpecStruct/…) expand to code that

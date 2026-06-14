@@ -9,7 +9,7 @@
 //!   `driver`, so completion inside that call can offer the driver's config
 //!   fields.
 
-use crate::engine::engine::Engine;
+use heph_plugin::lsp::LspEngine;
 use crate::engine::provider::ProvenanceFrame;
 use crate::pluginbuildfile::run_file::RunResult;
 use starlark_lsp::server::LspUri;
@@ -320,7 +320,7 @@ fn word_at(source: &str, line: u32, col: u32) -> Option<&str> {
 /// [`super::proxy`] (reader): the per-document indexes plus the engine handle the
 /// proxy uses to resolve driver schemas.
 pub(crate) struct SharedState {
-    pub engine: Arc<Engine>,
+    pub engine: Arc<dyn LspEngine>,
     /// Workspace root + BUILD-file patterns, so the proxy can resolve a loaded
     /// symbol's package directory and scan its files for the definition.
     pub root: std::path::PathBuf,
@@ -333,7 +333,7 @@ pub(crate) struct SharedState {
 
 impl SharedState {
     pub(crate) fn new(
-        engine: Arc<Engine>,
+        engine: Arc<dyn LspEngine>,
         root: std::path::PathBuf,
         patterns: Vec<glob::Pattern>,
         core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
