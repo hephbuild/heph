@@ -6,18 +6,8 @@
 #![cfg_attr(
     test,
     expect(
-        clippy::get_unwrap,
         clippy::panic_in_result_fn,
         clippy::assertions_on_result_states,
-        clippy::unwrap_used,
-        clippy::unwrap_in_result,
-        clippy::unimplemented,
-        clippy::undocumented_unsafe_blocks,
-        clippy::unreachable,
-        clippy::let_underscore_must_use,
-        clippy::float_cmp,
-        clippy::assertions_on_constants,
-        clippy::cloned_ref_to_slice_refs,
         clippy::err_expect,
         unused_imports,
         reason = "restriction/style lints scoped to production code; tests are exempt"
@@ -26,38 +16,32 @@
 
 extern crate core;
 
-pub mod commands;
-pub mod debug_hash;
-pub mod defer;
-pub mod engine;
-pub mod fdlimit;
-pub mod hartifactcontent;
-pub mod hasync;
-pub mod hlock;
-pub mod hmemoizer;
-pub mod htaddr;
-pub mod htmatcher;
-pub mod htpkg;
-pub mod htplatform;
-pub mod htspec;
-pub mod htvalue;
-pub mod htwalk;
-pub mod log;
-pub mod pluginbuildfile;
-pub mod pluginexec;
-pub mod pluginfs;
-pub mod plugingo;
-pub mod plugingroup;
-pub mod pluginhostbin;
-pub mod pluginnix;
-pub mod pluginquery;
-pub mod pluginstatictarget;
-pub mod plugintextfile;
-pub mod proc_exec;
-pub mod process_supervisor;
+// Foundational leaves now live in `heph-core`; re-export them at their original
+// module paths so `crate::hasync::…` etc. keep resolving unchanged across the
+// monolith.
+pub use heph_builtins::{pluginfs, plugingroup, pluginhostbin, pluginstatictarget, plugintextfile};
+pub use heph_core::{
+    debug_hash, defer, hartifactcontent, hasync, hmemoizer, htplatform, htvalue, version,
+};
+pub use heph_engine::engine;
+pub use heph_lock::hlock;
+pub use heph_model::{htaddr, htmatcher, htpkg};
+pub use heph_plugin::htspec;
+pub use heph_plugin_buildfile::pluginbuildfile;
+pub use heph_plugin_exec::pluginexec;
+pub use heph_plugin_go::plugingo;
+pub use heph_plugin_nix::pluginnix;
+pub use heph_plugin_query::pluginquery;
 #[cfg(target_os = "macos")]
-pub mod process_watcher;
-pub mod sandboxfuse;
-pub mod telemetry;
-pub mod tui;
-pub mod version;
+pub use heph_proc::process_watcher;
+pub use heph_proc::{proc_exec, process_supervisor};
+pub use heph_sandboxfuse as sandboxfuse;
+pub use heph_telemetry::telemetry;
+pub use heph_tui::tui;
+pub use heph_walk as htwalk;
+
+pub mod commands;
+pub mod fdlimit;
+pub mod log;
+#[cfg(test)]
+mod pluginquery_test;

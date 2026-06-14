@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive"]
+members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin", "crates/heph-builtins", "crates/heph-plugin-buildfile", "crates/heph-driver-support", "crates/heph-plugin-exec", "crates/heph-plugin-nix", "crates/heph-plugin-query", "crates/heph-plugin-go", "crates/heph-telemetry", "crates/heph-tui", "crates/heph-lock", "crates/heph-engine"]
 
 [profile.profiling]
 inherits = "release"
@@ -93,7 +93,24 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 heph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
-htspec-derive = { path = "htspec-derive" }
+heph-core = { path = "crates/heph-core" }
+heph-walk = { path = "crates/heph-walk" }
+heph-proc = { path = "crates/heph-proc" }
+heph-model = { path = "crates/heph-model" }
+heph-sandboxfuse = { path = "crates/heph-sandboxfuse", default-features = false }
+heph-plugin = { path = "crates/heph-plugin" }
+heph-builtins = { path = "crates/heph-builtins" }
+heph-plugin-buildfile = { path = "crates/heph-plugin-buildfile" }
+heph-driver-support = { path = "crates/heph-driver-support" }
+heph-plugin-exec = { path = "crates/heph-plugin-exec" }
+heph-plugin-nix = { path = "crates/heph-plugin-nix" }
+heph-plugin-query = { path = "crates/heph-plugin-query" }
+heph-plugin-go = { path = "crates/heph-plugin-go" }
+heph-telemetry = { path = "crates/heph-telemetry" }
+heph-tui = { path = "crates/heph-tui" }
+heph-lock = { path = "crates/heph-lock" }
+heph-engine = { path = "crates/heph-engine" }
+htspec-derive = { path = "crates/htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
 memoize = "0.6.0"
@@ -107,12 +124,6 @@ async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
 tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
-starlark = "0.14.2"
-starlark_lsp = "0.14.2"
-allocative = "0.3"
-lsp-server = "0.7"
-lsp-types = "0.97"
-tower-lsp-server = "0.22"
 rayon = "1.12.0"
 xxhash-rust = { version = "0.8.15" , features = ["xxh3", "std"]}
 itertools = "0.13.0"
@@ -148,26 +159,15 @@ object_store = { version = "0.13.2", features = ["aws", "gcp", "azure", "http", 
 url = "2.5.8"
 flate2 = "1.1.9"
 
-# Linux uses fuser's pure-Rust backend (no `libfuse` feature): mounting shells
-# out to `fusermount3` at runtime, so there is NO build-time/link-time libfuse
-# dependency. That lets the cross-compiled (zigbuild) arm64 release binary link
-# cleanly — there is no C library to find for the target arch.
-[target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.17", optional = true }
-
-# macOS has no pure-Rust mount path, so it must link libfuse (macFUSE). This is
-# a native-only build (no cross), linked against the devenv-provided
-# `macfuse-stubs` osxfuse.pc. NOTE: the shipped macOS binary dynamically links
-# libosxfuse and therefore requires macFUSE installed at runtime to launch.
-[target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.17", optional = true, features = ["libfuse"] }
-
 [features]
-# FUSE sandbox is on by default. Linux links nothing (pure-Rust); macOS links
-# macFUSE. `support_check` probes at runtime and falls back to the copy path
-# when FUSE is unavailable, so a default build is safe on hosts without it.
+# FUSE sandbox is on by default. The FUSE machinery (and its `fuser`/libfuse
+# link) lives in `heph-sandboxfuse`; this just forwards the feature. Linux links
+# nothing (pure-Rust); macOS links macFUSE. `support_check` probes at runtime
+# and falls back to the copy path when FUSE is unavailable, so a default build
+# is safe on hosts without it. The `-weak-lfuse` link arg is emitted by this
+# crate's build.rs (the final binary link).
 default = ["fuse-sandbox"]
-fuse-sandbox = ["dep:fuser"]
+fuse-sandbox = ["heph-sandboxfuse/fuse-sandbox"]
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"
