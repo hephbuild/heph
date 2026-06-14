@@ -10,7 +10,7 @@
 //!   fields.
 
 use heph_plugin::lsp::LspEngine;
-use crate::engine::provider::ProvenanceFrame;
+use heph_plugin::provider::ProvenanceFrame;
 use crate::pluginbuildfile::run_file::RunResult;
 use starlark_lsp::server::LspUri;
 use std::collections::BTreeMap;
@@ -369,9 +369,9 @@ mod tests {
             vec![glob::Pattern::new("BUILD").unwrap()],
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(crate::engine::provider::ProviderFunctionRegistry::default()),
+            Arc::new(heph_plugin::provider::ProviderFunctionRegistry::default()),
             Arc::new(std::sync::OnceLock::new()),
-            Arc::new(crate::htwalk::CachedWalker::disabled()),
+            Arc::new(heph_walk::CachedWalker::disabled()),
         );
         let result = eval_source("BUILD", content.to_string(), "pkg", &loader).unwrap();
         DocIndex::build(&result, "pkg", content.to_string())

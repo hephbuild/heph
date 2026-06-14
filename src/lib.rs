@@ -37,6 +37,7 @@ pub use heph_plugin::htspec;
 pub use heph_builtins::{
     pluginfs, plugingroup, pluginhostbin, pluginstatictarget, plugintextfile,
 };
+pub use heph_plugin_buildfile::pluginbuildfile;
 #[cfg(target_os = "macos")]
 pub use heph_proc::process_watcher;
 pub use heph_proc::{proc_exec, process_supervisor};
@@ -48,7 +49,6 @@ pub mod engine;
 pub mod fdlimit;
 pub mod hlock;
 pub mod log;
-pub mod pluginbuildfile;
 pub mod pluginexec;
 pub mod plugingo;
 pub mod pluginnix;

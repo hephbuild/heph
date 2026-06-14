@@ -765,4 +765,16 @@ impl heph_plugin::lsp::LspEngine for Engine {
     fn provider_state_schema(&self, name: &str) -> Option<provider::StateSchema> {
         Engine::provider_state_schema(self, name)
     }
+
+    fn provider_options(&self, name: &str) -> heph_plugin::config::Options {
+        crate::engine::config_yaml::load_from_root(self.root())
+            .ok()
+            .and_then(|cfg| {
+                cfg.providers
+                    .into_iter()
+                    .find(|p| p.name == name)
+                    .map(|p| p.options)
+            })
+            .unwrap_or_default()
+    }
 }

@@ -1695,7 +1695,6 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "heph"
 version = "0.1.0"
 dependencies = [
- "allocative",
  "ansi-to-tui",
  "anyhow",
  "async-recursion",
@@ -1717,6 +1716,7 @@ dependencies = [
  "heph-core",
  "heph-model",
  "heph-plugin",
+ "heph-plugin-buildfile",
  "heph-proc",
  "heph-proto-gen",
  "heph-sandboxfuse",
@@ -1726,8 +1726,6 @@ dependencies = [
  "indexmap",
  "itertools 0.13.0",
  "libc",
- "lsp-server",
- "lsp-types",
  "memoize",
  "minijinja",
  "nom 7.1.3",
@@ -1749,14 +1747,11 @@ dependencies = [
  "similar",
  "smart-default",
  "stacker",
- "starlark",
- "starlark_lsp",
  "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
- "tower-lsp-server",
  "tracing",
  "tracing-log",
  "tracing-subscriber",
@@ -1844,6 +1839,34 @@ dependencies = [
  "smart-default",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "heph-plugin-buildfile"
+version = "0.1.0"
+dependencies = [
+ "allocative",
+ "anyhow",
+ "async-trait",
+ "enclose",
+ "futures",
+ "glob",
+ "heph-builtins",
+ "heph-core",
+ "heph-model",
+ "heph-plugin",
+ "heph-proc",
+ "heph-walk",
+ "lsp-server",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "starlark",
+ "starlark_lsp",
+ "tempfile",
+ "tokio",
+ "tower-lsp-server",
 ]
 
 [[package]]

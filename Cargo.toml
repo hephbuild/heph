@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin", "crates/heph-builtins"]
+members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin", "crates/heph-builtins", "crates/heph-plugin-buildfile"]
 
 [profile.profiling]
 inherits = "release"
@@ -100,6 +100,7 @@ heph-model = { path = "crates/heph-model" }
 heph-sandboxfuse = { path = "crates/heph-sandboxfuse", default-features = false }
 heph-plugin = { path = "crates/heph-plugin" }
 heph-builtins = { path = "crates/heph-builtins" }
+heph-plugin-buildfile = { path = "crates/heph-plugin-buildfile" }
 htspec-derive = { path = "htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
@@ -114,12 +115,6 @@ async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
 tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
-starlark = "0.14.2"
-starlark_lsp = "0.14.2"
-allocative = "0.3"
-lsp-server = "0.7"
-lsp-types = "0.97"
-tower-lsp-server = "0.22"
 rayon = "1.12.0"
 xxhash-rust = { version = "0.8.15" , features = ["xxh3", "std"]}
 itertools = "0.13.0"

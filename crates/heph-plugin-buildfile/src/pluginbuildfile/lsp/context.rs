@@ -6,11 +6,11 @@
 
 use super::index::{DocIndex, SharedState};
 use heph_plugin::lsp::LspEngine;
-use crate::engine::provider::{
+use heph_plugin::provider::{
     ListPackagesRequest, ListRequest, Provider as EProvider, ProviderFunctionRegistry,
 };
-use crate::hasync::StdCancellationToken;
-use crate::htpkg::PkgBuf;
+use heph_core::hasync::StdCancellationToken;
+use heph_model::htpkg::PkgBuf;
 use crate::pluginbuildfile::Provider;
 use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
@@ -56,7 +56,7 @@ impl HephLspContext {
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
-        let patterns = buildfile_patterns(&root);
+        let patterns = buildfile_patterns(&*engine);
         let provider = build_listing_provider(&root, &patterns, &registry);
         let shared = SharedState::new(engine, root.clone(), patterns.clone(), core_members);
         HephLspContext {
@@ -103,7 +103,7 @@ impl HephLspContext {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::clone(&self.registry),
             Arc::clone(&self.globals),
-            Arc::new(crate::htwalk::CachedWalker::disabled()),
+            Arc::new(heph_walk::CachedWalker::disabled()),
         )
     }
 
@@ -187,25 +187,13 @@ fn build_listing_provider(
 /// BUILD-file name patterns from the workspace's buildfile-provider config,
 /// mirroring what the engine's provider uses. Falls back to `["BUILD"]` when the
 /// config is absent, lists no patterns, or none compile.
-fn buildfile_patterns(root: &Path) -> Vec<glob::Pattern> {
-    use crate::engine::config_yaml;
-    let names: Vec<String> = config_yaml::load_from_root(root)
-        .ok()
-        .and_then(|cfg| {
-            cfg.providers
-                .iter()
-                .find(|p| p.name == "buildfile")
-                .and_then(|p| {
-                    config_yaml::decode_opt::<Vec<String>>(
-                        &p.options,
-                        "buildfile provider",
-                        "patterns",
-                    )
-                    .ok()
-                    .flatten()
-                })
-        })
-        .unwrap_or_default();
+fn buildfile_patterns(engine: &dyn LspEngine) -> Vec<glob::Pattern> {
+    let opts = engine.provider_options("buildfile");
+    let names: Vec<String> =
+        heph_plugin::config::decode_opt::<Vec<String>>(&opts, "buildfile provider", "patterns")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
     let compiled: Vec<glob::Pattern> = names
         .iter()
         .filter_map(|n| glob::Pattern::new(n).ok())

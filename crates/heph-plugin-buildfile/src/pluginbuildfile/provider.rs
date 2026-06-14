@@ -1,14 +1,14 @@
-use crate::engine::provider::GetError::NotFound;
-use crate::engine::provider::{
+use heph_plugin::provider::GetError::NotFound;
+use heph_plugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
-use crate::hasync::Cancellable;
-use crate::hmemoizer::Memoizer;
-use crate::htaddr::Addr;
-use crate::htpkg::PkgBuf;
-use crate::htwalk::{CachedWalker, Ignore};
+use heph_core::hasync::Cancellable;
+use heph_core::hmemoizer::Memoizer;
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
+use heph_walk::{CachedWalker, Ignore};
 use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use enclose::enclose;
@@ -24,7 +24,7 @@ pub struct Provider {
     pub root: std::path::PathBuf,
     pub build_file_patterns: Vec<glob::Pattern>,
     /// Directories pruned during the BUILD-file walk: engine skip dirs/globs plus
-    /// this provider's own `skip` option. See [`crate::htwalk::Ignore`].
+    /// this provider's own `skip` option. See [`heph_walk::Ignore`].
     pub skip: Arc<Ignore>,
     /// Driver applied to targets that omit `driver` in their `target(...)` call.
     /// Set via the `defaultDriver` provider option. `None` means a target with no
@@ -103,15 +103,15 @@ impl Provider {
         root: std::path::PathBuf,
         skip_dirs: &[std::path::PathBuf],
         skip_globs: &[String],
-        opts: &crate::engine::config_yaml::Options,
+        opts: &heph_plugin::config::Options,
     ) -> anyhow::Result<Self> {
-        crate::engine::config_yaml::deny_unknown(
+        heph_plugin::config::deny_unknown(
             "buildfile provider",
             opts,
             &["patterns", "skip", "defaultDriver"],
         )?;
         let patterns: Vec<String> =
-            crate::engine::config_yaml::decode_opt(opts, "buildfile provider", "patterns")?
+            heph_plugin::config::decode_opt(opts, "buildfile provider", "patterns")?
                 .unwrap_or_else(|| vec!["BUILD".to_string()]);
         let compiled = patterns
             .into_iter()
@@ -123,12 +123,12 @@ impl Provider {
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
         let user_skip: Vec<String> =
-            crate::engine::config_yaml::decode_opt(opts, "buildfile provider", "skip")?
+            heph_plugin::config::decode_opt(opts, "buildfile provider", "skip")?
                 .unwrap_or_default();
         globs.extend(user_skip);
         let skip = Ignore::new(skip_dirs, &globs)?;
         let default_driver: Option<String> =
-            crate::engine::config_yaml::decode_opt(opts, "buildfile provider", "defaultDriver")?;
+            heph_plugin::config::decode_opt(opts, "buildfile provider", "defaultDriver")?;
         Ok(Self {
             root,
             build_file_patterns: compiled,
@@ -154,12 +154,12 @@ fn find_packages_sync(
     let mut has_build_file = false;
     for entry in &listing.entries {
         match entry.kind {
-            crate::htwalk::EntryKind::File | crate::htwalk::EntryKind::Symlink => {
+            heph_walk::EntryKind::File | heph_walk::EntryKind::Symlink => {
                 if patterns.iter().any(|p| p.matches(&entry.name)) {
                     has_build_file = true;
                 }
             }
-            crate::htwalk::EntryKind::Dir => {
+            heph_walk::EntryKind::Dir => {
                 let entry_path = path.join(&entry.name);
                 let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
                 if skip.prune_dir(&entry_path, rel) {
@@ -167,7 +167,7 @@ fn find_packages_sync(
                 }
                 find_packages_sync(walker, &entry_path, root, patterns, skip, packages)?;
             }
-            crate::htwalk::EntryKind::Other => {}
+            heph_walk::EntryKind::Other => {}
         }
     }
 
@@ -246,7 +246,7 @@ impl EProvider for Provider {
                 .once(
                     (),
                     enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip, self.walker => walker) move || async move {
-                        let packages = crate::process_supervisor::block_or_inline(move || {
+                        let packages = heph_proc::process_supervisor::block_or_inline(move || {
                             // Recursion reads dirs through the shared walker, so an
                             // unchanged tree is served from the cross-run fswalk cache.
                             let mut packages = std::collections::HashSet::new();
@@ -257,7 +257,7 @@ impl EProvider for Provider {
                     }),
                 )
                 .await
-                .map_err(crate::hmemoizer::unwrap_arc_err)?;
+                .map_err(heph_core::hmemoizer::unwrap_arc_err)?;
 
             let items: Vec<anyhow::Result<ListPackageResponse>> = packages
                 .iter()
@@ -355,10 +355,10 @@ impl EProvider for Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::config_yaml::Options;
-    use crate::engine::provider::GetRequest;
-    use crate::hasync::StdCancellationToken;
-    use crate::htaddr::parse_addr;
+    use heph_plugin::config::Options;
+    use heph_plugin::provider::GetRequest;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_model::htaddr::parse_addr;
     use std::fs;
     use tempfile::tempdir;
     /// Package discovery is cached across runs through the shared walker: a fresh
@@ -494,17 +494,17 @@ mod tests {
     }
 
     struct NoopExecutor;
-    impl crate::engine::provider::ProviderExecutor for NoopExecutor {
+    impl heph_plugin::provider::ProviderExecutor for NoopExecutor {
         fn result<'a>(
             &'a self,
             _addr: &'a Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<Arc<crate::engine::EResult>>> {
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Arc<heph_plugin::eresult::EResult>>> {
             Box::pin(async { anyhow::bail!("noop") })
         }
 
         fn query<'a>(
             &'a self,
-            _m: &'a crate::htmatcher::Matcher,
+            _m: &'a heph_model::htmatcher::Matcher,
             _extra_skip: &'a [String],
         ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
             Box::pin(async { anyhow::bail!("noop") })
@@ -922,7 +922,7 @@ target(
 
     #[tokio::test]
     async fn probe_returns_provider_states_from_build_file() {
-        use crate::htvalue::Value;
+        use heph_core::htvalue::Value;
 
         let tmp_dir = tempdir().unwrap();
         let pkg_name = "p";

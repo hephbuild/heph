@@ -1,14 +1,14 @@
-use crate::engine::driver::TargetAddr;
-use crate::engine::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
-use crate::engine::provider::{
+use heph_plugin::driver::TargetAddr;
+use heph_plugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+use heph_plugin::provider::{
     FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
 };
-use crate::hmemoizer::unwrap_arc_err;
-use crate::htaddr;
-use crate::htpkg::PkgBuf;
-use crate::htvalue::signature::{FnSignature, ParamType};
-use crate::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
-use crate::htwalk::{CachedWalker, EntryKind};
+use heph_core::hmemoizer::unwrap_arc_err;
+use heph_model::htaddr;
+use heph_model::htpkg::PkgBuf;
+use heph_core::htvalue::signature::{FnSignature, ParamType};
+use heph_core::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
+use heph_walk::{CachedWalker, EntryKind};
 use crate::pluginbuildfile::provider::Provider;
 use anyhow::Context;
 use enclose::enclose;
@@ -250,7 +250,7 @@ pub(crate) struct OnTargetPayload {
     pub transitive: Sandbox,
     pub config: HashMap<String, htvalue::Value>,
     /// Source call sites that produced this target (innermost `target()` call
-    /// first). See [`crate::engine::provider::ProvenanceFrame`].
+    /// first). See [`heph_plugin::provider::ProvenanceFrame`].
     pub provenance: Vec<ProvenanceFrame>,
 }
 
@@ -531,8 +531,8 @@ fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
 /// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
 /// (below) so the two don't drift. Driver-specific config args come from the
 /// driver's own schema and are merged in by the LSP.
-pub(crate) fn target_base_fields() -> Vec<crate::engine::driver::DriverField> {
-    use crate::engine::driver::DriverField;
+pub(crate) fn target_base_fields() -> Vec<heph_plugin::driver::DriverField> {
+    use heph_plugin::driver::DriverField;
     let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
         name: name.to_string(),
         ty,
@@ -665,7 +665,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] abs: bool,
     ) -> starlark::Result<String> {
         let resolved = resolve_fs_path(eval, path, abs);
-        Ok(crate::pluginfs::file_addr(&resolved).format())
+        Ok(heph_builtins::pluginfs::file_addr(&resolved).format())
     }
 
     /// Reference files matching a glob `pattern` (with optional `exclude`) as a
@@ -691,7 +691,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             None => vec![],
         };
         let excludes_ref: Vec<&str> = excludes.iter().map(String::as_str).collect();
-        Ok(crate::pluginfs::glob_addr(&resolved, &excludes_ref).format())
+        Ok(heph_builtins::pluginfs::glob_addr(&resolved, &excludes_ref).format())
     }
 
     /// Build a struct (dict) from keyword arguments, for nested target config.
@@ -760,22 +760,22 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
 fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// Host operating system in canonical (Go/OCI) naming, e.g. `linux`, `darwin`.
     fn os() -> starlark::Result<String> {
-        Ok(crate::htplatform::os().to_string())
+        Ok(heph_core::htplatform::os().to_string())
     }
 
     /// Host architecture in canonical (Go/OCI) naming, e.g. `amd64`, `arm64`.
     fn arch() -> starlark::Result<String> {
-        Ok(crate::htplatform::arch().to_string())
+        Ok(heph_core::htplatform::arch().to_string())
     }
 
     /// Host operating system as Rust reports it, e.g. `linux`, `macos`.
     fn os_raw() -> starlark::Result<String> {
-        Ok(crate::htplatform::os_raw().to_string())
+        Ok(heph_core::htplatform::os_raw().to_string())
     }
 
     /// Host architecture as Rust reports it, e.g. `x86_64`, `aarch64`.
     fn arch_raw() -> starlark::Result<String> {
-        Ok(crate::htplatform::arch_raw().to_string())
+        Ok(heph_core::htplatform::arch_raw().to_string())
     }
 
     /// The package currently being evaluated.
@@ -803,7 +803,7 @@ impl Provider {
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
-                    crate::process_supervisor::block_or_inline(move || -> anyhow::Result<Arc<RunResult>> {
+                    heph_proc::process_supervisor::block_or_inline(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
                             BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker);
                         loader
@@ -1191,7 +1191,7 @@ fn eval_ast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htvalue::signature::Param;
+    use heph_core::htvalue::signature::Param;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1216,9 +1216,9 @@ mod tests {
     /// Registry exposing the real `fs` provider functions, so `heph.fs.glob` works
     /// in these unit tests (which run the buildfile provider without an engine).
     fn fs_registry() -> Arc<ProviderFunctionRegistry> {
-        use crate::engine::provider::Provider as _;
+        use heph_plugin::provider::Provider as _;
         let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider("fs", crate::pluginfs::Provider::default().functions());
+        reg.insert_provider("fs", heph_builtins::pluginfs::Provider::default().functions());
         Arc::new(reg)
     }
 
@@ -1666,7 +1666,7 @@ target(
 )
 "#;
         let config = run_target_config(content);
-        let expected = crate::pluginfs::file_addr("mypkg/src/main.rs").format();
+        let expected = heph_builtins::pluginfs::file_addr("mypkg/src/main.rs").format();
         match config.get("src") {
             Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected file addr string, got {:?}", other),
@@ -1683,7 +1683,7 @@ target(
 )
 "#;
         let config = run_target_config(content);
-        let expected = crate::pluginfs::file_addr("vendor/x.rs").format();
+        let expected = heph_builtins::pluginfs::file_addr("vendor/x.rs").format();
         match config.get("src") {
             Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected file addr string, got {:?}", other),
@@ -1700,7 +1700,7 @@ target(
 )
 "#;
         let config = run_target_config(content);
-        let expected = crate::pluginfs::glob_addr("mypkg/src/**/*.rs", &[]).format();
+        let expected = heph_builtins::pluginfs::glob_addr("mypkg/src/**/*.rs", &[]).format();
         match config.get("srcs") {
             Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
@@ -1718,7 +1718,7 @@ target(
 "#;
         let config = run_target_config(content);
         let expected =
-            crate::pluginfs::glob_addr("mypkg/**/*.go", &["vendor/**", "gen/**"]).format();
+            heph_builtins::pluginfs::glob_addr("mypkg/**/*.go", &["vendor/**", "gen/**"]).format();
         match config.get("srcs") {
             Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
@@ -1735,7 +1735,7 @@ target(
 )
 "#;
         let config = run_target_config(content);
-        let expected = crate::pluginfs::glob_addr("**/*.rs", &[]).format();
+        let expected = heph_builtins::pluginfs::glob_addr("**/*.rs", &[]).format();
         match config.get("srcs") {
             Some(htvalue::Value::String(s)) => assert_eq!(s, &expected),
             other => panic!("expected glob addr string, got {:?}", other),
@@ -2186,8 +2186,8 @@ target(
             Some(htvalue::Value::String(s)) => assert_eq!(s, want, "for {key}"),
             other => panic!("expected {key} string, got {other:?}"),
         };
-        expect("os", crate::htplatform::os());
-        expect("arch", crate::htplatform::arch());
+        expect("os", heph_core::htplatform::os());
+        expect("arch", heph_core::htplatform::arch());
         expect("os_raw", std::env::consts::OS);
         expect("arch_raw", std::env::consts::ARCH);
     }
@@ -2445,7 +2445,7 @@ target(name = "t_in_app", driver = SHARED)
         let mut reg = ProviderFunctionRegistry::default();
         reg.insert_provider(
             "myprov",
-            vec![crate::engine::provider::ProviderFunctionDef {
+            vec![heph_plugin::provider::ProviderFunctionDef {
                 name: "echo".to_string(),
                 signature: FnSignature {
                     positional: vec![Param::required("v", ParamType::String)],

@@ -6,7 +6,7 @@
 //! - hover gains a "Targets" block (the addresses produced by the
 //!   symbol under the cursor), and
 //! - completion gains the config fields of the target's `driver` (from the
-//!   driver's [`schema`](crate::engine::driver::Driver::schema)).
+//!   driver's [`schema`](heph_plugin::driver::Driver::schema)).
 
 use super::index::SharedState;
 use crate::pluginbuildfile::run_file::resolve_load_target;
@@ -351,7 +351,7 @@ fn enrich_hover(
 /// `render_doc_item_no_link` the stock server uses — yielding a
 /// `def name(p: str) -> str` prototype with Starlark type names.
 fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) -> Option<String> {
-    use crate::htvalue::signature::Param;
+    use heph_core::htvalue::signature::Param;
     use starlark::docs::markdown::render_doc_item_no_link;
     use starlark::docs::{
         DocFunction, DocItem, DocMember, DocParam, DocParams, DocReturn, DocString, DocStringKind,
@@ -407,8 +407,8 @@ fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) ->
 
 /// Render an htvalue default as a Starlark literal for the hover prototype
 /// (`name: ty = <repr>`). Best-effort: containers collapse to `[]`/`[...]` etc.
-fn default_repr(v: &crate::htvalue::Value) -> String {
-    use crate::htvalue::Value;
+fn default_repr(v: &heph_core::htvalue::Value) -> String {
+    use heph_core::htvalue::Value;
     match v {
         Value::Null() => "None".to_string(),
         Value::Bool(true) => "True".to_string(),
