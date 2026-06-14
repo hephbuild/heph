@@ -4296,10 +4296,11 @@ mod tests {
 
         // Cold build: writes the manifest + blob. (Miss path reads happen here;
         // we only assert on the subsequent hit.)
+        let cold_rs = engine.new_state();
         engine
             .clone()
             .result_addr(
-                engine.new_state(),
+                cold_rs.clone(),
                 &addr,
                 OutputMatcher::All,
                 &ResultOptions::default(),
@@ -4311,6 +4312,20 @@ mod tests {
             1,
             "cold build executes once"
         );
+
+        // The cold build's cache write enqueues a fire-and-forget history-trim GC
+        // on the background lane (see `try_trim_after_write`), which itself reads
+        // the manifest. Drain it before resetting the counter so that lagging read
+        // is never attributed to the hit below — otherwise the count races to 2.
+        let pending = cold_rs.bg_pending();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pending.load(Ordering::SeqCst) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background GC did not drain"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         // Fresh request → full cache hit. The manifest backing read must happen
         // exactly once for the whole resolution.
