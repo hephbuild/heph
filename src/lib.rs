@@ -42,6 +42,7 @@ pub use heph_plugin_exec::pluginexec;
 pub use heph_plugin_nix::pluginnix;
 pub use heph_plugin_query::pluginquery;
 pub use heph_plugin_go::plugingo;
+pub use heph_telemetry::telemetry;
 #[cfg(target_os = "macos")]
 pub use heph_proc::process_watcher;
 pub use heph_proc::{proc_exec, process_supervisor};
@@ -57,5 +58,4 @@ pub mod log;
 mod plugingo_e2e_test;
 #[cfg(test)]
 mod pluginquery_test;
-pub mod telemetry;
 pub mod tui;

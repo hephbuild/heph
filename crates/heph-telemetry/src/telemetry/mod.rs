@@ -28,7 +28,7 @@ mod spool;
 
 pub use collector::{TelemetryCollector, TelemetrySnapshot};
 
-use crate::engine::event::BuildEventKind;
+use heph_core::events::BuildEventKind;
 use clap::ArgMatches;
 use clap::parser::ValueSource;
 use posthog_rs::{ClientOptionsBuilder, Event};
@@ -278,8 +278,8 @@ fn set_args(m: &ArgMatches) -> Vec<String> {
 /// Coarse, non-PII failure class: user-cancelled vs a target that genuinely
 /// failed vs anything else.
 fn classify_failure(e: &anyhow::Error) -> &'static str {
-    use crate::engine::error::{CancelledError, TargetFailure, UpstreamFailed};
-    use crate::hmemoizer::downcast_chain_ref;
+    use heph_plugin::error::{CancelledError, TargetFailure, UpstreamFailed};
+    use heph_core::hmemoizer::downcast_chain_ref;
     if downcast_chain_ref::<CancelledError>(e).is_some() {
         "cancelled"
     } else if downcast_chain_ref::<TargetFailure>(e).is_some()
@@ -327,10 +327,10 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     // Environment — coarse and non-identifying.
     put("os", std::env::consts::OS.into());
     put("arch", std::env::consts::ARCH.into());
-    put("version", crate::version::VERSION.into());
+    put("version", heph_core::version::VERSION.into());
     // Semver segments, broken out for filtering/grouping in PostHog. Absent when
     // the version doesn't parse (rather than reporting junk).
-    if let Some(v) = crate::version::parse(crate::version::VERSION) {
+    if let Some(v) = heph_core::version::parse(heph_core::version::VERSION) {
         put("version_major", v.major.into());
         put("version_minor", v.minor.into());
         put("version_patch", v.patch.into());
@@ -390,7 +390,7 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
         distinct_id: distinct_id(&dir)?,
         event: "cli_command".to_string(),
         props,
-        created_ms: crate::engine::event::now_unix_ms() as i64,
+        created_ms: heph_core::events::now_unix_ms() as i64,
     };
     Spool::open(&dir.join("telemetry-spool.db"))?.enqueue(&event)
 }
@@ -559,7 +559,7 @@ mod tests {
                 distinct_id: "live-test".into(),
                 event: "cli_command".into(),
                 props,
-                created_ms: crate::engine::event::now_unix_ms() as i64,
+                created_ms: heph_core::events::now_unix_ms() as i64,
             })
             .expect("enqueue");
         drop(spool);

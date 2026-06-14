@@ -1725,6 +1725,7 @@ dependencies = [
  "heph-proc",
  "heph-proto-gen",
  "heph-sandboxfuse",
+ "heph-telemetry",
  "heph-walk",
  "htspec-derive",
  "humantime",
@@ -2013,6 +2014,25 @@ dependencies = [
  "parking_lot",
  "tar",
  "tempfile",
+]
+
+[[package]]
+name = "heph-telemetry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "heph-core",
+ "heph-plugin",
+ "posthog-rs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

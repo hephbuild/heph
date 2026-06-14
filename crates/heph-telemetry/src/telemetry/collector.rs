@@ -12,11 +12,11 @@
 //! the p99 is approximate (within a factor of 2) but the collector never holds
 //! more than a few hundred bytes even for a build with millions of artifacts.
 //!
-//! [`RequestState::emit`]: crate::engine::request_state::RequestState::emit
+//! [`RequestState::emit`]: RequestState::emit
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::engine::event::BuildEventKind;
+use heph_core::events::BuildEventKind;
 
 /// One bucket per possible bit-length of a `u64` (0..=64). Bucket `i` (`i >= 1`)
 /// holds values in `[2^(i-1), 2^i - 1]`; bucket `0` holds value `0`.

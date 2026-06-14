@@ -1,9 +1,6 @@
-// Foundational leaf crate: zero dependencies on any other heph crate. Holds the
-// primitives every layer reuses (cancellation, memoization, value model, hashing,
-// platform/version metadata, artifact-content tar helpers, deferred cleanup).
-//
-// Restriction lints in `[workspace.lints.clippy]` are production guards; test code
-// legitimately uses panicking helpers. Mirror the monolith's test exemption here.
+//! Anonymous usage telemetry: collects per-run counters from the engine's build
+//! events and ships a single snapshot to PostHog on exit. Depends only on
+//! heph-core (events) + heph-plugin (error); the engine calls its record_* API.
 #![cfg_attr(
     test,
     expect(
@@ -25,13 +22,4 @@
     )
 )]
 
-pub mod debug_hash;
-pub mod defer;
-pub mod events;
-pub mod fsutil;
-pub mod hartifactcontent;
-pub mod hasync;
-pub mod hmemoizer;
-pub mod htplatform;
-pub mod htvalue;
-pub mod version;
+pub mod telemetry;
