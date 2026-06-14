@@ -1,0 +1,32 @@
+[package]
+name = "builtins"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hwalk = { package = "walk", path = "../walk" }
+hplugin = { package = "plugin", path = "../plugin" }
+anyhow = "1.0.102"
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1.86"
+futures = "0.3.32"
+glob = "0.3"
+wax = "0.7"
+parking_lot = "0.12"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+rustc-hash = "2"
+xattr = "1"
+which = "8.0.2"
+tracing = "0.1"
+itertools = "0.13.0"
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "fs", "process"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+serde_yaml = "0.9"
+tempfile = "3"

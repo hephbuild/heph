@@ -430,6 +430,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "builtins"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "futures",
+ "glob",
+ "itertools 0.13.0",
+ "model",
+ "parking_lot",
+ "plugin",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "walk",
+ "wax",
+ "which",
+ "xattr",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -706,6 +733,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "enclose",
+ "futures",
+ "libc",
+ "rustc-hash",
+ "serde",
+ "tar",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -1119,6 +1162,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "glob",
+ "model",
+ "plugin",
+ "rayon",
+ "sandboxfuse",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "walkdir",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1150,8 +1214,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "heph",
- "heph-testkit",
  "tempfile",
+ "testkit",
  "tokio",
 ]
 
@@ -1184,6 +1248,68 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "async-stream",
+ "async-trait",
+ "borsh",
+ "builtins",
+ "chrono",
+ "core",
+ "crossbeam-channel",
+ "derivative",
+ "driver-support",
+ "enclose",
+ "flate2",
+ "futures",
+ "glob",
+ "humantime",
+ "indexmap",
+ "libc",
+ "lock",
+ "memoize",
+ "model",
+ "object_store",
+ "parking_lot",
+ "plugin",
+ "plugin-buildfile",
+ "plugin-exec",
+ "plugin-query",
+ "proc",
+ "quick_cache",
+ "r2d2",
+ "r2d2_sqlite",
+ "rayon",
+ "rusqlite",
+ "rustc-hash",
+ "sandboxfuse",
+ "serde",
+ "serde-jsonlines",
+ "serde_json",
+ "serde_yaml",
+ "similar",
+ "smart-default",
+ "stacker",
+ "tar",
+ "telemetry",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "walk",
+ "wax",
+ "which",
+ "xattr",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "env_filter"
@@ -1695,40 +1821,49 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "heph"
 version = "0.1.0"
 dependencies = [
- "allocative",
  "ansi-to-tui",
  "anyhow",
  "async-recursion",
  "async-stream",
  "async-trait",
  "borsh",
+ "builtins",
  "chrono",
  "clap",
  "clap_complete",
+ "core",
  "crossbeam-channel",
  "crossterm",
  "derivative",
+ "driver-support",
  "enclose",
+ "engine",
  "erased-serde 0.4.10",
  "flate2",
- "fuser",
  "futures",
  "glob",
- "heph-proto-gen",
  "htspec-derive",
  "humantime",
  "indexmap",
  "itertools 0.13.0",
  "libc",
- "lsp-server",
- "lsp-types",
+ "lock",
  "memoize",
  "minijinja",
+ "model",
  "nom 7.1.3",
  "object_store",
  "parking_lot",
+ "plugin",
+ "plugin-buildfile",
+ "plugin-exec",
+ "plugin-go",
+ "plugin-nix",
+ "plugin-query",
  "posthog-rs",
  "pprof",
+ "proc",
+ "proto-gen",
  "quick_cache",
  "r2d2",
  "r2d2_sqlite",
@@ -1736,6 +1871,7 @@ dependencies = [
  "rayon",
  "rusqlite",
  "rustc-hash",
+ "sandboxfuse",
  "serde",
  "serde-jsonlines",
  "serde_json",
@@ -1743,44 +1879,25 @@ dependencies = [
  "similar",
  "smart-default",
  "stacker",
- "starlark",
- "starlark_lsp",
  "tar",
+ "telemetry",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
- "tower-lsp-server",
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "tui",
  "unicode-width 0.2.0",
  "url",
  "uuid",
+ "walk",
  "walkdir",
  "wax",
  "which",
  "xattr",
  "xxhash-rust",
-]
-
-[[package]]
-name = "heph-proto-gen"
-version = "0.1.0"
-dependencies = [
- "prost 0.13.5",
- "prost-types 0.13.5",
- "serde",
-]
-
-[[package]]
-name = "heph-testkit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "heph",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -2338,6 +2455,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
+name = "lock"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "libc",
+ "parking_lot",
+ "plugin",
+ "rustc-hash",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2576,6 +2709,17 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "model"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nom 7.1.3",
+ "rustc-hash",
+ "serde",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3045,14 +3189,149 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "erased-serde 0.4.10",
+ "futures",
+ "htspec-derive",
+ "itertools 0.13.0",
+ "model",
+ "sandboxfuse",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "smart-default",
+ "tempfile",
+ "tokio",
+ "walk",
+]
+
+[[package]]
+name = "plugin-buildfile"
+version = "0.1.0"
+dependencies = [
+ "allocative",
+ "anyhow",
+ "async-trait",
+ "builtins",
+ "core",
+ "enclose",
+ "futures",
+ "glob",
+ "lsp-server",
+ "lsp-types",
+ "model",
+ "plugin",
+ "proc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "starlark",
+ "starlark_lsp",
+ "tempfile",
+ "tokio",
+ "tower-lsp-server",
+ "walk",
+]
+
+[[package]]
+name = "plugin-exec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "crossterm",
+ "driver-support",
+ "enclose",
+ "glob",
+ "libc",
+ "minijinja",
+ "model",
+ "plugin",
+ "proc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tar",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-go"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "async-trait",
+ "borsh",
+ "builtins",
+ "core",
+ "driver-support",
+ "enclose",
+ "futures",
+ "glob",
+ "model",
+ "parking_lot",
+ "plugin",
+ "plugin-exec",
+ "plugin-query",
+ "proc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "walk",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-nix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "model",
+ "plugin",
+ "proc",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "builtins",
+ "core",
+ "futures",
+ "model",
+ "plugin",
+]
+
+[[package]]
 name = "plugingo-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
  "heph",
- "heph-testkit",
  "tempfile",
+ "testkit",
  "tokio",
 ]
 
@@ -3164,6 +3443,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3264,6 +3555,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
  "prost 0.13.5",
+]
+
+[[package]]
+name = "proto-gen"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "serde",
 ]
 
 [[package]]
@@ -3926,6 +4226,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandboxfuse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core",
+ "crossbeam-channel",
+ "fuser",
+ "libc",
+ "parking_lot",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4563,6 +4877,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "telemetry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "core",
+ "plugin",
+ "posthog-rs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4646,6 +4979,16 @@ dependencies = [
  "wezterm-dynamic",
  "wezterm-input-types",
  "winapi",
+]
+
+[[package]]
+name = "testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "heph",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -4982,6 +5325,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tui"
+version = "0.1.0"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "async-trait",
+ "core",
+ "crossterm",
+ "futures",
+ "libc",
+ "ratatui",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5115,6 +5477,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
+]
+
+[[package]]
+name = "walk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "borsh",
+ "glob",
+ "parking_lot",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "rustc-hash",
+ "tempfile",
+ "tracing",
+ "wax",
+ "xxhash-rust",
 ]
 
 [[package]]

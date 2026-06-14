@@ -1,0 +1,16 @@
+[package]
+name = "plugingo-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+heph = { path = "../.." }
+htestkit = { package = "testkit", path = "../testkit" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+anyhow = "1"
+tempfile = "3"
+futures = "0.3"

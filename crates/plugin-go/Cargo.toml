@@ -1,0 +1,33 @@
+[package]
+name = "plugin-go"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hwalk = { package = "walk", path = "../walk" }
+hproc = { package = "proc", path = "../proc" }
+hplugin = { package = "plugin", path = "../plugin" }
+hbuiltins = { package = "builtins", path = "../builtins" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+hplugin-exec = { package = "plugin-exec", path = "../plugin-exec" }
+hplugin-query = { package = "plugin-query", path = "../plugin-query" }
+anyhow = "1.0.102"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1.86"
+async-recursion = "1"
+futures = "0.3.32"
+enclose = "1"
+parking_lot = "0.12"
+borsh = { version = "1.5.7", features = ["derive"] }
+glob = "0.3"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"

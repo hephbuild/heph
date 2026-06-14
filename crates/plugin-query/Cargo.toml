@@ -1,0 +1,16 @@
+[package]
+name = "plugin-query"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hplugin = { package = "plugin", path = "../plugin" }
+hbuiltins = { package = "builtins", path = "../builtins" }
+anyhow = "1.0.102"
+async-trait = "0.1.86"
+futures = "0.3.32"

@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::available_parallelism;
 
@@ -51,37 +50,9 @@ pub fn block_on<F: Future>(fut: F) -> anyhow::Result<F::Output> {
 /// While `SuppressionHandle::set(true)` is in effect (e.g. the TUI is paused
 /// for an interactive prompt), `trigger()` silently drops presses — neither
 /// kernel SIGINT nor TUI Ctrl+C cancels engine work in that window.
-#[derive(Clone)]
-pub struct ShutdownTrigger {
-    tx: mpsc::UnboundedSender<()>,
-    suppressed: Arc<AtomicBool>,
-}
-
-impl ShutdownTrigger {
-    pub fn trigger(&self) {
-        if self.suppressed.load(Ordering::Acquire) {
-            return;
-        }
-        _ = self.tx.send(());
-    }
-
-    pub fn suppression(&self) -> SuppressionHandle {
-        SuppressionHandle {
-            flag: Arc::clone(&self.suppressed),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct SuppressionHandle {
-    flag: Arc<AtomicBool>,
-}
-
-impl SuppressionHandle {
-    pub fn set(&self, suppressed: bool) {
-        self.flag.store(suppressed, Ordering::Release);
-    }
-}
+// The shutdown signal types moved to `heph-core::shutdown` so the TUI can hold a
+// trigger without depending on this bin module; re-exported for existing callers.
+pub use hcore::shutdown::{ShutdownTrigger, SuppressionHandle};
 
 /// Read the telemetry opt-out flag straight from `.hephconfig2`, independent of
 /// engine construction, so the top-level CLI reporter can decide whether to send
@@ -183,11 +154,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         remote_cache_backends,
     );
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    let trigger = ShutdownTrigger {
-        tx,
-        suppressed: Arc::new(AtomicBool::new(false)),
-    };
+    let (trigger, rx) = ShutdownTrigger::new();
     spawn_sigint_producer(trigger.clone());
     spawn_shutdown_handler(Arc::downgrade(&engine), rx);
     Ok((engine, trigger))
@@ -378,11 +345,7 @@ drivers:
             })
             .expect("engine"),
         );
-        let (tx, rx) = mpsc::unbounded_channel();
-        let trigger = ShutdownTrigger {
-            tx,
-            suppressed: Arc::new(AtomicBool::new(false)),
-        };
+        let (trigger, rx) = ShutdownTrigger::new();
         spawn_shutdown_handler(Arc::downgrade(&engine), rx);
         (dir, engine, trigger)
     }
