@@ -46,9 +46,13 @@ pub use result::OutputMatcher;
 pub use result::ResultOptions;
 pub use result::{InteractiveInner, InteractiveWrapper};
 pub use spec::EngineTargetSpec;
-pub mod driver_managed;
-pub mod driver_managed_fuse;
-pub mod driver_managed_os;
+// The managed-driver base moved to `heph-driver-support`; re-export at the old
+// engine paths. `managed_register` adds `Engine::new_managed_driver` (engine
+// state + the pluginexec shell fallback).
+pub use heph_driver_support::driver_managed;
+pub use heph_driver_support::driver_managed_fuse;
+pub use heph_driver_support::driver_managed_os;
+mod managed_register;
 mod execute;
 mod result_lock;
 pub use result_lock::{LockBackend, ResultLock};

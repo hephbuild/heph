@@ -243,6 +243,28 @@ impl Driver {
             },
         }
     }
+
+    /// The default shell fallback managed drivers swap in when the inner driver
+    /// doesn't support shell mode: an `exec` driver with `run = []` (an
+    /// interactive bash session via `init.sh`). Built here because the fallback
+    /// is this plugin's own exec driver.
+    pub fn default_exec_shell_fallback()
+    -> std::sync::Arc<crate::engine::driver_managed::ShellFallback> {
+        let mut config: std::collections::HashMap<String, crate::htvalue::Value> =
+            std::collections::HashMap::new();
+        config.insert("run".to_string(), crate::htvalue::Value::List(vec![]));
+        std::sync::Arc::new(crate::engine::driver_managed::ShellFallback {
+            driver: std::sync::Arc::new(Driver::new_exec()),
+            spec_template: std::sync::Arc::new(crate::engine::provider::TargetSpec {
+                addr: Default::default(),
+                driver: "exec".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            }),
+        })
+    }
+
     pub fn new_bash() -> Self {
         Self {
             name: "bash".to_string(),
@@ -2636,7 +2658,12 @@ mod tests {
         let sandbox = tmp.path().join("sandbox");
         std::fs::create_dir_all(&sandbox)?;
 
-        let bridge = ManagedDriverBridge::new_os_for_test(Box::new(Driver::new_bash()));
+        let bridge = ManagedDriverBridge::new(
+            Box::new(Driver::new_bash()),
+            Driver::default_exec_shell_fallback(),
+            crate::engine::config_yaml::FuseConfig::default(),
+            None,
+        );
 
         let request_id = "test".to_string();
         let req = RunRequest {

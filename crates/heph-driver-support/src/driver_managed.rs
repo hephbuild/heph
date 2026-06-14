@@ -1,23 +1,21 @@
-use crate::engine::Engine;
 #[cfg(test)]
-use crate::engine::config_yaml::FuseEnabled;
-use crate::engine::config_yaml::{FuseConfig, FuseMode};
-use crate::engine::driver::inputartifact;
-use crate::engine::driver::outputartifact::Content::TarPath;
-use crate::engine::driver::targetdef::path::{self, Content};
-use crate::engine::driver::{
+use crate::fuseconfig::FuseEnabled;
+use crate::fuseconfig::{FuseConfig, FuseMode};
+use heph_plugin::driver::inputartifact;
+use heph_plugin::driver::outputartifact::Content::TarPath;
+use heph_plugin::driver::targetdef::path::{self, Content};
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver,
     ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse, outputartifact,
 };
-use crate::engine::driver_managed_fuse::ManagedDriverFuse;
-use crate::engine::driver_managed_os::ManagedDriverOs;
-use crate::engine::provider::TargetSpec;
-use crate::hartifactcontent;
-use crate::hasync::{self, Cancellable};
-use crate::htvalue::Value;
+use crate::driver_managed_fuse::ManagedDriverFuse;
+use crate::driver_managed_os::ManagedDriverOs;
+use heph_plugin::provider::TargetSpec;
+use heph_core::hartifactcontent;
+use heph_core::hasync::{self, Cancellable};
 use anyhow::Context;
 use async_trait::async_trait;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -67,8 +65,8 @@ pub trait ManagedDriver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
     /// Config schema, forwarded by the bridge's [`Driver::schema`]. A config-less
     /// driver returns `DriverSchema::default()`. See
-    /// [`crate::engine::driver::Driver::schema`].
-    fn schema(&self) -> crate::engine::driver::DriverSchema;
+    /// [`heph_plugin::driver::Driver::schema`].
+    fn schema(&self) -> heph_plugin::driver::DriverSchema;
     async fn parse(
         &self,
         req: ParseRequest,
@@ -126,58 +124,45 @@ pub struct ShellFallback {
     pub spec_template: Arc<TargetSpec>,
 }
 
-impl ShellFallback {
-    /// Default: pluginexec with `run = []`. `wrap_run_shell` turns
-    /// the single `bash` command into an interactive bash session via
-    /// `bash_args_shell` + `init.sh`.
-    pub fn default_exec() -> Arc<Self> {
-        let mut config: HashMap<String, Value> = HashMap::new();
-        config.insert("run".to_string(), Value::List(vec![]));
-        Arc::new(Self {
-            driver: Arc::new(crate::pluginexec::Driver::new_exec()),
-            spec_template: Arc::new(TargetSpec {
-                addr: Default::default(),
-                driver: "exec".to_string(),
-                config,
-                labels: vec![],
-                transitive: Default::default(),
-            }),
-        })
-    }
+/// FUSE wiring the engine hands the bridge when a `LayeredFs` is available.
+/// Keeps the bridge's FUSE fields private to this crate while letting the
+/// engine supply the engine-owned bits (home dir, shared fs, lower/upper).
+pub struct FuseSlot {
+    pub home: PathBuf,
+    pub fs: Arc<heph_sandboxfuse::LayeredFs>,
+    pub fuse_lower: PathBuf,
+    pub fuse_upper: PathBuf,
 }
 
-impl Engine {
-    pub fn new_managed_driver(&self, driver: Box<dyn ManagedDriver>) -> ManagedDriverBridge {
+impl ManagedDriverBridge {
+    /// Assemble a bridge from its inner driver, the shell fallback, the resolved
+    /// FUSE config, and (when FUSE is available) the engine-supplied slot.
+    pub fn new(
+        driver: Box<dyn ManagedDriver>,
+        shell_fallback: Arc<ShellFallback>,
+        cfg: FuseConfig,
+        fuse: Option<FuseSlot>,
+    ) -> Self {
         let driver = Arc::new(driver);
-        let shell_fallback = ShellFallback::default_exec();
         let os = ManagedDriverOs {
             driver: driver.clone(),
             shell_fallback: shell_fallback.clone(),
         };
-        let fuse = self.fuse.layered_fs().map(|fs| ManagedDriverFuse {
+        let fuse = fuse.map(|f| ManagedDriverFuse {
             driver: driver.clone(),
             shell_fallback: shell_fallback.clone(),
-            home: self.home.clone(),
-            fs,
-            fuse_lower: self.fuse.lower.clone(),
-            fuse_upper: self.fuse.upper.clone(),
+            home: f.home,
+            fs: f.fs,
+            fuse_lower: f.fuse_lower,
+            fuse_upper: f.fuse_upper,
         });
-        ManagedDriverBridge {
-            cfg: self.cfg.fuse,
-            os,
-            fuse,
-        }
+        Self { cfg, os, fuse }
     }
 }
 
 impl ManagedDriverBridge {
     /// Test helper: build an OS-only bridge (no FUSE) without an `Engine`.
     /// Production code paths construct bridges via `Engine::new_managed_driver`.
-    #[cfg(test)]
-    pub(crate) fn new_os_for_test(driver: Box<dyn ManagedDriver>) -> Self {
-        Self::new_os_for_test_with_shell_fallback(driver, ShellFallback::default_exec())
-    }
-
     #[cfg(test)]
     pub(crate) fn new_os_for_test_with_shell_fallback(
         driver: Box<dyn ManagedDriver>,
@@ -202,7 +187,7 @@ impl Driver for ManagedDriverBridge {
         self.os.driver.config(req)
     }
 
-    fn schema(&self) -> crate::engine::driver::DriverSchema {
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
         self.os.driver.schema()
     }
 
@@ -412,7 +397,7 @@ async fn run_shell_fallback<'a, 'io>(
 
 pub(crate) fn collect_outputs(
     res: &mut ManagedRunResponse,
-    target: &crate::engine::driver::targetdef::TargetDef,
+    target: &heph_plugin::driver::targetdef::TargetDef,
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
@@ -458,7 +443,7 @@ pub(crate) fn collect_outputs(
 /// Absent (the default) means the input is excluded — source_map.json is
 /// only emitted for targets whose inputs explicitly request it (e.g. the
 /// go plugin's golist deps). Value must be the string `"true"`.
-pub(crate) const SOURCE_MAP_ANNOTATION: &str = "source_map";
+pub const SOURCE_MAP_ANNOTATION: &str = "source_map";
 
 fn source_map_enabled(input: &RunInput) -> bool {
     input
@@ -668,8 +653,8 @@ fn pack_to_artifact_tar(
 #[cfg(test)]
 mod shell_fallback_tests {
     use super::*;
-    use crate::engine::driver::targetdef::TargetDef;
-    use crate::hasync::StdCancellationToken;
+    use heph_plugin::driver::targetdef::TargetDef;
+    use heph_core::hasync::StdCancellationToken;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct NoShellDriver;
@@ -681,8 +666,8 @@ mod shell_fallback_tests {
                 name: "noshell".to_string(),
             })
         }
-        fn schema(&self) -> crate::engine::driver::DriverSchema {
-            crate::engine::driver::DriverSchema::default()
+        fn schema(&self) -> heph_plugin::driver::DriverSchema {
+            heph_plugin::driver::DriverSchema::default()
         }
         async fn parse(
             &self,
@@ -723,8 +708,8 @@ mod shell_fallback_tests {
                 name: "recording".to_string(),
             })
         }
-        fn schema(&self) -> crate::engine::driver::DriverSchema {
-            crate::engine::driver::DriverSchema::default()
+        fn schema(&self) -> heph_plugin::driver::DriverSchema {
+            heph_plugin::driver::DriverSchema::default()
         }
         async fn parse(
             &self,
@@ -740,7 +725,7 @@ mod shell_fallback_tests {
                     inputs: vec![],
                     outputs: vec![],
                     support_files: vec![],
-                    cache: crate::engine::driver::targetdef::CacheConfig::off(),
+                    cache: heph_plugin::driver::targetdef::CacheConfig::off(),
                     pty: false,
                     hash: vec![],
                     transparent: false,
@@ -780,12 +765,24 @@ mod shell_fallback_tests {
     async fn run_shell_dispatches_to_fallback_when_driver_does_not_support() -> anyhow::Result<()> {
         let parse_called = Arc::new(AtomicBool::new(false));
         let run_shell_called = Arc::new(AtomicBool::new(false));
+        let mut config: std::collections::HashMap<String, heph_core::htvalue::Value> =
+            std::collections::HashMap::new();
+        config.insert(
+            "run".to_string(),
+            heph_core::htvalue::Value::List(vec![]),
+        );
         let fallback = Arc::new(ShellFallback {
             driver: Arc::new(RecordingShellDriver {
                 parse_called: parse_called.clone(),
                 run_shell_called: run_shell_called.clone(),
             }),
-            spec_template: ShellFallback::default_exec().spec_template.clone(),
+            spec_template: Arc::new(TargetSpec {
+                addr: Default::default(),
+                driver: "exec".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            }),
         });
         let bridge = ManagedDriverBridge::new_os_for_test_with_shell_fallback(
             Box::new(NoShellDriver),
@@ -804,7 +801,7 @@ mod shell_fallback_tests {
             inputs: vec![],
             outputs: vec![],
             support_files: vec![],
-            cache: crate::engine::driver::targetdef::CacheConfig::off(),
+            cache: heph_plugin::driver::targetdef::CacheConfig::off(),
             pty: false,
             hash: vec![],
             transparent: false,
@@ -839,10 +836,10 @@ mod shell_fallback_tests {
 #[cfg(test)]
 mod source_map_tests {
     use super::*;
-    use crate::engine::driver::inputartifact::{InputArtifact, Type};
-    use crate::hartifactcontent::tar::{TarPacker, TarWalker};
-    use crate::hartifactcontent::{Content, WalkEntry};
-    use crate::htaddr::parse_addr;
+    use heph_plugin::driver::inputartifact::{InputArtifact, Type};
+    use heph_core::hartifactcontent::tar::{TarPacker, TarWalker};
+    use heph_core::hartifactcontent::{Content, WalkEntry};
+    use heph_model::htaddr::parse_addr;
     use std::io::{Cursor, Read};
 
     struct TarBytes(Vec<u8>);

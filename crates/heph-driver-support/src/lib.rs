@@ -1,9 +1,8 @@
-// Foundational leaf crate: zero dependencies on any other heph crate. Holds the
-// primitives every layer reuses (cancellation, memoization, value model, hashing,
-// platform/version metadata, artifact-content tar helpers, deferred cleanup).
-//
-// Restriction lints in `[workspace.lints.clippy]` are production guards; test code
-// legitimately uses panicking helpers. Mirror the monolith's test exemption here.
+//! The managed-driver base shared by the exec-family plugins (exec/go/nix): the
+//! `ManagedDriver` trait and the `ManagedDriverBridge` that materializes a
+//! sandbox (FUSE overlay or copy) and dispatches `parse`/`run`/`run_shell` to
+//! the inner driver. Depends only on the contract + FUSE crate; the engine wires
+//! it (`Engine::new_managed_driver`) and supplies the pluginexec shell fallback.
 #![cfg_attr(
     test,
     expect(
@@ -25,12 +24,7 @@
     )
 )]
 
-pub mod debug_hash;
-pub mod defer;
-pub mod fsutil;
-pub mod hartifactcontent;
-pub mod hasync;
-pub mod hmemoizer;
-pub mod htplatform;
-pub mod htvalue;
-pub mod version;
+pub mod driver_managed;
+pub mod driver_managed_fuse;
+pub mod driver_managed_os;
+pub mod fuseconfig;

@@ -1,12 +1,12 @@
-use crate::engine::driver::{RunInput, RunRequest, RunResponse};
-use crate::engine::driver_managed::{
+use heph_plugin::driver::{RunInput, RunRequest, RunResponse};
+use crate::driver_managed::{
     ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, list_path_for,
     resolve_unpack_root, write_source_map,
 };
-use crate::hartifactcontent;
-use crate::hartifactcontent::tar_index::TarIndex;
-use crate::hasync::Cancellable;
-use crate::sandboxfuse;
+use heph_core::hartifactcontent;
+use heph_core::hartifactcontent::tar_index::TarIndex;
+use heph_core::hasync::Cancellable;
+use heph_sandboxfuse as sandboxfuse;
 use anyhow::Context;
 use std::collections::BTreeMap;
 use std::fs;
@@ -49,9 +49,9 @@ impl ManagedDriverFuse {
         // mount leaves orphans that fail the outer `rmdir` with
         // ENOTEMPTY. Direct rm on upper avoids that path entirely.
         let upper_cleanup_dir = self.fuse_upper.join(&rel);
-        let mut sandbox_cleanup: Option<crate::engine::sandbox_cleaner::SandboxCleanupJob> =
+        let mut sandbox_cleanup: Option<heph_plugin::driver::SandboxCleanupJob> =
             Some(Box::new(move || {
-                crate::engine::sandbox_cleaner::remove_dir_all(&upper_cleanup_dir)
+                heph_core::fsutil::remove_dir_all(&upper_cleanup_dir)
             }));
 
         let ws_dir = sandbox_dir.join("ws");

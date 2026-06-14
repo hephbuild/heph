@@ -1714,6 +1714,7 @@ dependencies = [
  "glob",
  "heph-builtins",
  "heph-core",
+ "heph-driver-support",
  "heph-model",
  "heph-plugin",
  "heph-plugin-buildfile",
@@ -1805,6 +1806,27 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "heph-driver-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "glob",
+ "heph-core",
+ "heph-model",
+ "heph-plugin",
+ "heph-sandboxfuse",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "walkdir",
  "xxhash-rust",
 ]
 
