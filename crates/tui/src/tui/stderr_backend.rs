@@ -31,6 +31,10 @@ use ratatui::layout::{Position, Size};
 
 pub struct StderrBackend {
     inner: CrosstermBackend<BufWriter<io::Stderr>>,
+    /// The inline viewport's cursor anchor, captured on the first
+    /// `get_cursor_position` and reused for this backend's lifetime. See that
+    /// method for why a *live* DSR query is only safe at backend construction.
+    cached_cursor: Option<Position>,
 }
 
 impl StderrBackend {
@@ -39,6 +43,7 @@ impl StderrBackend {
         // into one syscall on `flush`, matching stdout's buffering.
         Self {
             inner: CrosstermBackend::new(BufWriter::new(stderr)),
+            cached_cursor: None,
         }
     }
 }
@@ -73,14 +78,32 @@ impl Backend for StderrBackend {
         self.inner.show_cursor()
     }
 
-    /// Query cursor position via stderr (not stdout) so a piped stdout
-    /// is never corrupted by the DSR escape.
+    /// Cursor position for the inline viewport anchor.
+    ///
+    /// A *live* DSR query (`\x1b[6n` → read the reply off `/dev/tty`) races
+    /// crossterm's `EventStream` reader, which consumes the same tty input:
+    /// whoever reads first wins, and a lost reply blocks/stalls the query.
+    /// heph guarantees no `EventStream` is alive only at backend construction
+    /// (initial `with_options`, and the resize/resume rebuilds, which tear the
+    /// stream down first). Newer ratatui, however, issues this query from many
+    /// in-loop paths (`autoresize` on any size delta, `clear`, `insert_before`)
+    /// while the stream *is* alive — the freeze this guards against.
+    ///
+    /// The anchor is fixed for an inline viewport's lifetime (a real resize
+    /// builds a fresh backend), so we query the terminal exactly once — on the
+    /// first call, at construction time, which is the race-free window — and
+    /// serve every later call from the cache. No in-loop call ever races.
     fn get_cursor_position(&mut self) -> io::Result<Position> {
+        if let Some(pos) = self.cached_cursor {
+            return Ok(pos);
+        }
         // Drain any buffered backend writes first — the DSR query below
         // writes raw to `io::stderr()`, bypassing `inner`'s `BufWriter`,
         // so unflushed cells would otherwise land after the query.
         Backend::flush(&mut self.inner)?;
-        query_cursor_position_via_stderr()
+        let pos = query_cursor_position_via_stderr()?;
+        self.cached_cursor = Some(pos);
+        Ok(pos)
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
