@@ -1,15 +1,15 @@
-use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
-use crate::engine::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
-use crate::engine::driver::{
+use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
+use heph_plugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use crate::hasync::Cancellable;
-use crate::htpkg::PkgBuf;
-use crate::htspec::Spec;
-use crate::htvalue::signature::ParamType;
-use crate::proc_exec;
+use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use heph_core::hasync::Cancellable;
+use heph_model::htpkg::PkgBuf;
+use heph_plugin::htspec::Spec;
+use heph_core::htvalue::signature::ParamType;
+use heph_proc::proc_exec;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -227,7 +227,7 @@ impl ManagedDriver for Driver {
         })
     }
 
-    fn schema(&self) -> crate::engine::driver::DriverSchema {
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
         NixSpec::schema()
     }
 
@@ -472,10 +472,10 @@ impl ManagedDriver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::provider::TargetSpec;
-    use crate::hasync::StdCancellationToken;
-    use crate::htaddr::parse_addr;
-    use crate::htvalue::Value;
+    use heph_plugin::provider::TargetSpec;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_model::htaddr::parse_addr;
+    use heph_core::htvalue::Value;
     use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {

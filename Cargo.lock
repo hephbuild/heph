@@ -1719,6 +1719,7 @@ dependencies = [
  "heph-plugin",
  "heph-plugin-buildfile",
  "heph-plugin-exec",
+ "heph-plugin-nix",
  "heph-proc",
  "heph-proto-gen",
  "heph-sandboxfuse",
@@ -1911,6 +1912,25 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tar",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "heph-plugin-nix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "heph-core",
+ "heph-driver-support",
+ "heph-model",
+ "heph-plugin",
+ "heph-proc",
+ "serde",
+ "serde_json",
  "tar",
  "tempfile",
  "tokio",

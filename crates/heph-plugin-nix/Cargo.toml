@@ -1,0 +1,24 @@
+[package]
+name = "heph-plugin-nix"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+heph-core = { path = "../heph-core" }
+heph-model = { path = "../heph-model" }
+heph-plugin = { path = "../heph-plugin" }
+heph-proc = { path = "../heph-proc" }
+heph-driver-support = { path = "../heph-driver-support" }
+anyhow = "1.0.102"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1.86"
+tar = "0.4"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"

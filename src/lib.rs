@@ -39,6 +39,7 @@ pub use heph_builtins::{
 };
 pub use heph_plugin_buildfile::pluginbuildfile;
 pub use heph_plugin_exec::pluginexec;
+pub use heph_plugin_nix::pluginnix;
 #[cfg(target_os = "macos")]
 pub use heph_proc::process_watcher;
 pub use heph_proc::{proc_exec, process_supervisor};
@@ -51,7 +52,6 @@ pub mod fdlimit;
 pub mod hlock;
 pub mod log;
 pub mod plugingo;
-pub mod pluginnix;
 pub mod pluginquery;
 pub mod telemetry;
 pub mod tui;
