@@ -17,7 +17,29 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Serializes every `Command::spawn` in this test binary.
+///
+/// The four tests run as threads in a single process under plain `cargo test`.
+/// Spawning a child is fork+exec, and a fork snapshots the entire fd table.
+/// While one thread has a socketpair fd with `CLOEXEC` temporarily cleared —
+/// on macOS `socketpair` + `fcntl` is not atomic, and we deliberately clear it
+/// on the supervisor end so it survives `exec` — a concurrent fork on another
+/// thread inherits that fd. If the leaked fd is the *parent* end of a
+/// supervisor socket, that supervisor never observes EOF when its owning test
+/// drops the parent: it blocks in `read` forever and the tracked child is
+/// never reaped (15s timeout). Holding this gate across each spawn's fd-setup
+/// window guarantees no fork ever overlaps another thread's cleared-`CLOEXEC`
+/// window, so no socket end can leak between tests.
+static SPAWN_GATE: Mutex<()> = Mutex::new(());
+
+fn spawn_gate() -> MutexGuard<'static, ()> {
+    SPAWN_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// How long to wait for the supervisor subprocess to observe socket EOF and
 /// SIGKILL its tracked targets. Generous because under a loaded CI runner
@@ -70,6 +92,7 @@ fn spawn_sleep_session_leader(secs: u64) -> std::process::Child {
             Ok(())
         });
     }
+    let _gate = spawn_gate();
     cmd.spawn().expect("spawn sleep")
 }
 
@@ -77,6 +100,10 @@ fn spawn_sleep_session_leader(secs: u64) -> std::process::Child {
 /// parent's end and the supervisor's `Child` handle. The parent end has
 /// CLOEXEC set; the supervisor's end has CLOEXEC cleared.
 fn spawn_supervisor() -> (UnixStream, std::process::Child) {
+    // Hold the gate across the whole fd-setup window: socketpair creation, the
+    // CLOEXEC toggles, the supervisor fork, and closing our copy of the child
+    // end. No other thread may fork while any of these fds is CLOEXEC-cleared.
+    let _gate = spawn_gate();
     let (parent, child) = UnixStream::pair().expect("socketpair");
     set_cloexec(parent.as_raw_fd(), true);
     let child_fd = child.into_raw_fd();
@@ -213,7 +240,10 @@ fn supervisor_reaps_non_setsid_child_via_direct_kill() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut sleep_child = cmd.spawn().expect("spawn sleep without setsid");
+    let mut sleep_child = {
+        let _gate = spawn_gate();
+        cmd.spawn().expect("spawn sleep without setsid")
+    };
     let sleep_pid = sleep_child.id();
 
     let (mut parent, mut supervisor) = spawn_supervisor();
@@ -260,7 +290,10 @@ fn supervisor_reaps_grandchildren_via_pgid_kill() {
             Ok(())
         });
     }
-    let mut sh = cmd.spawn().expect("spawn sh");
+    let mut sh = {
+        let _gate = spawn_gate();
+        cmd.spawn().expect("spawn sh")
+    };
     let sh_pid = sh.id();
 
     // Poll for the pid file to appear.
