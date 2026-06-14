@@ -1,12 +1,12 @@
-use crate::engine::provider::{
+use heph_plugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     Provider as EProvider, TargetSpec,
 };
-use crate::hasync::Cancellable;
-use crate::htaddr::parse_addr;
-use crate::htpkg::PkgBuf;
-use crate::htvalue::Value;
+use heph_core::hasync::Cancellable;
+use heph_model::htaddr::parse_addr;
+use heph_model::htpkg::PkgBuf;
+use heph_core::htvalue::Value;
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;

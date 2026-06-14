@@ -1,4 +1,4 @@
-use crate::engine::driver::{
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
     outputartifact::{Content, ContentFile, OutputArtifact, Type},
@@ -7,19 +7,19 @@ use crate::engine::driver::{
         path::{CodegenMode, Content as PathContent, Path},
     },
 };
-use crate::engine::provider::{
+use heph_plugin::provider::{
     ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, FnArgs,
     FnCallContext, GetError, GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest,
     ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, ProviderFn,
     ProviderFunctionDef, TargetSpec,
 };
-use crate::hasync::Cancellable;
-use crate::htaddr::Addr;
-use crate::htpkg::PkgBuf;
-use crate::htspec::Spec;
-use crate::htvalue::Value;
-use crate::htvalue::signature::{FnSignature, Param, ParamType};
-use crate::htwalk::{CachedWalker, Ignore};
+use heph_core::hasync::Cancellable;
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
+use heph_plugin::htspec::Spec;
+use heph_core::htvalue::Value;
+use heph_core::htvalue::signature::{FnSignature, Param, ParamType};
+use heph_walk::{CachedWalker, Ignore};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -644,7 +644,7 @@ fn walk_glob(
                 let listing = walker.read_dir(&dir)?;
                 for entry in &listing.entries {
                     let abs = dir.join(&entry.name);
-                    if entry.kind == crate::htwalk::EntryKind::Dir {
+                    if entry.kind == heph_walk::EntryKind::Dir {
                         // Never descend into skip dirs or skip-glob subtrees.
                         let rel = abs.strip_prefix(root).unwrap_or(&abs);
                         if !compiled.skip.prune_dir(&abs, rel) {
@@ -652,7 +652,7 @@ fn walk_glob(
                         }
                     } else if matches!(
                         entry.kind,
-                        crate::htwalk::EntryKind::File | crate::htwalk::EntryKind::Symlink
+                        heph_walk::EntryKind::File | heph_walk::EntryKind::Symlink
                     ) {
                         // A symlink-to-dir is rejected by `file_hash` (which follows
                         // and errors on a dir), matching the old walk.
@@ -793,14 +793,14 @@ struct FsSpec {
 }
 
 #[async_trait]
-impl crate::engine::driver::Driver for Driver {
+impl heph_plugin::driver::Driver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
             name: DRIVER_NAME.to_string(),
         })
     }
 
-    fn schema(&self) -> crate::engine::driver::DriverSchema {
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
         FsSpec::schema()
     }
 
@@ -1005,11 +1005,11 @@ impl crate::engine::driver::Driver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::{Driver as EDriver, RunRequest};
-    use crate::engine::provider::Provider as EProvider;
-    use crate::hasync::StdCancellationToken;
-    use crate::htaddr::parse_addr;
-    use crate::htwalk::file_hashout;
+    use heph_plugin::driver::{Driver as EDriver, RunRequest};
+    use heph_plugin::provider::Provider as EProvider;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_model::htaddr::parse_addr;
+    use heph_walk::file_hashout;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1018,20 +1018,20 @@ mod tests {
     }
 
     struct NoopExecutor;
-    impl crate::engine::provider::ProviderExecutor for NoopExecutor {
+    impl heph_plugin::provider::ProviderExecutor for NoopExecutor {
         fn result<'a>(
             &'a self,
-            _addr: &'a crate::htaddr::Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<crate::engine::EResult>>>
+            _addr: &'a heph_model::htaddr::Addr,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<heph_plugin::eresult::EResult>>>
         {
             Box::pin(async { anyhow::bail!("noop") })
         }
 
         fn query<'a>(
             &'a self,
-            _m: &'a crate::htmatcher::Matcher,
+            _m: &'a heph_model::htmatcher::Matcher,
             _extra_skip: &'a [String],
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<crate::htaddr::Addr>>> {
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<heph_model::htaddr::Addr>>> {
             Box::pin(async { anyhow::bail!("noop") })
         }
     }
@@ -1890,7 +1890,7 @@ mod tests {
     fn test_file_addr_roundtrips_through_format_and_parse() {
         let addr = file_addr("some/path/foo.txt");
         let formatted = addr.format();
-        let parsed = crate::htaddr::parse_addr(&formatted).unwrap();
+        let parsed = heph_model::htaddr::parse_addr(&formatted).unwrap();
         assert_eq!(parsed.package, addr.package);
         assert_eq!(parsed.name, addr.name);
         assert_eq!(parsed.args.get("f"), addr.args.get("f"));
@@ -1918,7 +1918,7 @@ mod tests {
     fn test_glob_addr_roundtrips_through_format_and_parse() {
         let addr = glob_addr("src/*.rs", &["skip.rs"]);
         let formatted = addr.format();
-        let parsed = crate::htaddr::parse_addr(&formatted).unwrap();
+        let parsed = heph_model::htaddr::parse_addr(&formatted).unwrap();
         assert_eq!(parsed.name, "glob");
         assert_eq!(parsed.args.get("p"), addr.args.get("p"));
         assert_eq!(parsed.args.get("e"), addr.args.get("e"));

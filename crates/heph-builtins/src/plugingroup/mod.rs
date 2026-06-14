@@ -1,11 +1,11 @@
-use crate::engine::driver::TargetAddr;
-use crate::engine::driver::{
+use heph_plugin::driver::TargetAddr;
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
     targetdef::{CacheConfig, Input, InputMode, TargetDef},
 };
-use crate::hasync::Cancellable;
-use crate::htspec::Spec;
+use heph_core::hasync::Cancellable;
+use heph_plugin::htspec::Spec;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -27,14 +27,14 @@ struct GroupDef;
 pub struct Driver;
 
 #[async_trait]
-impl crate::engine::driver::Driver for Driver {
+impl heph_plugin::driver::Driver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
             name: DRIVER_NAME.to_string(),
         })
     }
 
-    fn schema(&self) -> crate::engine::driver::DriverSchema {
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
         GroupSpec::schema()
     }
 
@@ -120,11 +120,11 @@ impl crate::engine::driver::Driver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::Driver as EDriver;
-    use crate::engine::provider::TargetSpec;
-    use crate::hasync::StdCancellationToken;
-    use crate::htaddr::parse_addr;
-    use crate::htvalue::Value;
+    use heph_plugin::driver::Driver as EDriver;
+    use heph_plugin::provider::TargetSpec;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_model::htaddr::parse_addr;
+    use heph_core::htvalue::Value;
     use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {
@@ -146,8 +146,8 @@ mod tests {
 
     #[test]
     fn test_schema_lists_deps() {
-        use crate::engine::driver::Driver as _;
-        use crate::htvalue::signature::ParamType;
+        use heph_plugin::driver::Driver as _;
+        use heph_core::htvalue::signature::ParamType;
         let schema = Driver.schema();
         assert_eq!(schema.fields.len(), 1);
         let f = &schema.fields[0];

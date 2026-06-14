@@ -1713,6 +1713,7 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
+ "heph-builtins",
  "heph-core",
  "heph-model",
  "heph-plugin",
@@ -1763,6 +1764,33 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "wax",
+ "which",
+ "xattr",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "heph-builtins"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "glob",
+ "heph-core",
+ "heph-model",
+ "heph-plugin",
+ "heph-walk",
+ "itertools 0.13.0",
+ "parking_lot",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
  "wax",
  "which",
  "xattr",

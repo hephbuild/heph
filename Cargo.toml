@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin"]
+members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin", "crates/heph-builtins"]
 
 [profile.profiling]
 inherits = "release"
@@ -99,6 +99,7 @@ heph-proc = { path = "crates/heph-proc" }
 heph-model = { path = "crates/heph-model" }
 heph-sandboxfuse = { path = "crates/heph-sandboxfuse", default-features = false }
 heph-plugin = { path = "crates/heph-plugin" }
+heph-builtins = { path = "crates/heph-builtins" }
 htspec-derive = { path = "htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"

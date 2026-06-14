@@ -1,4 +1,4 @@
-use crate::engine::driver::{
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, outputartifact,
     targetdef::{
@@ -6,13 +6,13 @@ use crate::engine::driver::{
         path::{CodegenMode, Content, Path},
     },
 };
-use crate::engine::provider::{
+use heph_plugin::provider::{
     ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, GetError,
     GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
     ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec,
 };
-use crate::hasync::Cancellable;
-use crate::htpkg::PkgBuf;
+use heph_core::hasync::Cancellable;
+use heph_model::htpkg::PkgBuf;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::sync::Arc;
@@ -109,7 +109,7 @@ struct HostBinDef {
 pub struct Driver;
 
 #[async_trait]
-impl crate::engine::driver::Driver for Driver {
+impl heph_plugin::driver::Driver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
             name: DRIVER_NAME.to_string(),
@@ -117,8 +117,8 @@ impl crate::engine::driver::Driver for Driver {
     }
 
     /// The hostbin driver takes no target config (it keys off the target name).
-    fn schema(&self) -> crate::engine::driver::DriverSchema {
-        crate::engine::driver::DriverSchema::default()
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
+        heph_plugin::driver::DriverSchema::default()
     }
 
     async fn parse(
@@ -210,10 +210,10 @@ impl crate::engine::driver::Driver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::{Driver as EDriver, RunRequest};
-    use crate::engine::provider::Provider as EProvider;
-    use crate::hasync::StdCancellationToken;
-    use crate::htaddr::parse_addr;
+    use heph_plugin::driver::{Driver as EDriver, RunRequest};
+    use heph_plugin::provider::Provider as EProvider;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_model::htaddr::parse_addr;
 
     fn make_ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
@@ -421,20 +421,20 @@ mod tests {
     }
 
     struct NoopExecutor;
-    impl crate::engine::provider::ProviderExecutor for NoopExecutor {
+    impl heph_plugin::provider::ProviderExecutor for NoopExecutor {
         fn result<'a>(
             &'a self,
-            _addr: &'a crate::htaddr::Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<crate::engine::EResult>>>
+            _addr: &'a heph_model::htaddr::Addr,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<heph_plugin::eresult::EResult>>>
         {
             Box::pin(async { anyhow::bail!("noop") })
         }
 
         fn query<'a>(
             &'a self,
-            _m: &'a crate::htmatcher::Matcher,
+            _m: &'a heph_model::htmatcher::Matcher,
             _extra_skip: &'a [String],
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<crate::htaddr::Addr>>> {
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<heph_model::htaddr::Addr>>> {
             Box::pin(async { anyhow::bail!("noop") })
         }
     }
