@@ -3,11 +3,11 @@ use heph::pluginbuildfile;
 use heph::pluginexec;
 use heph::plugingo;
 use heph::pluginstatictarget;
-use heph_testkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
+use htestkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-pub use heph_testkit::{artifact_paths, artifact_string};
+pub use htestkit::{artifact_paths, artifact_string};
 
 macro_rules! require_go {
     () => {

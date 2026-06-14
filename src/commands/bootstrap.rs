@@ -52,7 +52,7 @@ pub fn block_on<F: Future>(fut: F) -> anyhow::Result<F::Output> {
 /// kernel SIGINT nor TUI Ctrl+C cancels engine work in that window.
 // The shutdown signal types moved to `heph-core::shutdown` so the TUI can hold a
 // trigger without depending on this bin module; re-exported for existing callers.
-pub use heph_core::shutdown::{ShutdownTrigger, SuppressionHandle};
+pub use hcore::shutdown::{ShutdownTrigger, SuppressionHandle};
 
 /// Read the telemetry opt-out flag straight from `.hephconfig2`, independent of
 /// engine construction, so the top-level CLI reporter can decide whether to send

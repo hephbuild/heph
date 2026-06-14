@@ -4,14 +4,14 @@ use anyhow::Result;
 use heph::pluginbuildfile;
 use heph::pluginexec;
 use heph::pluginstatictarget;
-use heph_testkit::WorkspaceBuilder;
+use htestkit::WorkspaceBuilder;
 
-pub use heph_testkit::{artifact_bytes, artifact_paths, artifact_string, root};
+pub use htestkit::{artifact_bytes, artifact_paths, artifact_string, root};
 
-pub struct Workspace(heph_testkit::Workspace);
+pub struct Workspace(htestkit::Workspace);
 
 impl std::ops::Deref for Workspace {
-    type Target = heph_testkit::Workspace;
+    type Target = htestkit::Workspace;
     fn deref(&self) -> &Self::Target {
         &self.0
     }

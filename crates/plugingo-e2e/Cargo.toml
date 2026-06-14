@@ -9,7 +9,7 @@ workspace = true
 
 [dev-dependencies]
 heph = { path = "../.." }
-heph-testkit = { path = "../testkit" }
+htestkit = { package = "testkit", path = "../testkit" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
 tempfile = "3"

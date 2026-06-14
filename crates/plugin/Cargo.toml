@@ -1,0 +1,28 @@
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hwalk = { package = "walk", path = "../walk" }
+hsandboxfuse = { package = "sandboxfuse", path = "../sandboxfuse", default-features = false }
+htspec-derive = { path = "../htspec-derive" }
+anyhow = "1.0.102"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+async-trait = "0.1.86"
+erased-serde = "0.4"
+smart-default = "0.7.1"
+itertools = "0.13.0"
+futures = "0.3.32"
+tokio = { version = "1.50.0", features = ["io-util"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+serde_yaml = "0.9"
+tempfile = "3"

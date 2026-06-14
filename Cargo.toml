@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin", "crates/heph-builtins", "crates/heph-plugin-buildfile", "crates/heph-driver-support", "crates/heph-plugin-exec", "crates/heph-plugin-nix", "crates/heph-plugin-query", "crates/heph-plugin-go", "crates/heph-telemetry", "crates/heph-tui", "crates/heph-lock", "crates/heph-engine"]
+members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
 
 [profile.profiling]
 inherits = "release"
@@ -92,24 +92,24 @@ clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
-heph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
-heph-core = { path = "crates/heph-core" }
-heph-walk = { path = "crates/heph-walk" }
-heph-proc = { path = "crates/heph-proc" }
-heph-model = { path = "crates/heph-model" }
-heph-sandboxfuse = { path = "crates/heph-sandboxfuse", default-features = false }
-heph-plugin = { path = "crates/heph-plugin" }
-heph-builtins = { path = "crates/heph-builtins" }
-heph-plugin-buildfile = { path = "crates/heph-plugin-buildfile" }
-heph-driver-support = { path = "crates/heph-driver-support" }
-heph-plugin-exec = { path = "crates/heph-plugin-exec" }
-heph-plugin-nix = { path = "crates/heph-plugin-nix" }
-heph-plugin-query = { path = "crates/heph-plugin-query" }
-heph-plugin-go = { path = "crates/heph-plugin-go" }
-heph-telemetry = { path = "crates/heph-telemetry" }
-heph-tui = { path = "crates/heph-tui" }
-heph-lock = { path = "crates/heph-lock" }
-heph-engine = { path = "crates/heph-engine" }
+hproto-gen = { package = "proto-gen", path = "gen/proto", features = ["proto_full"] }
+hcore = { package = "core", path = "crates/core" }
+hwalk = { package = "walk", path = "crates/walk" }
+hproc = { package = "proc", path = "crates/proc" }
+hmodel = { package = "model", path = "crates/model" }
+hsandboxfuse = { package = "sandboxfuse", path = "crates/sandboxfuse", default-features = false }
+hplugin = { package = "plugin", path = "crates/plugin" }
+hbuiltins = { package = "builtins", path = "crates/builtins" }
+hplugin-buildfile = { package = "plugin-buildfile", path = "crates/plugin-buildfile" }
+hdriver-support = { package = "driver-support", path = "crates/driver-support" }
+hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
+hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
+hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
+hplugin-go = { package = "plugin-go", path = "crates/plugin-go" }
+htelemetry = { package = "telemetry", path = "crates/telemetry" }
+htui = { package = "tui", path = "crates/tui" }
+hlock = { package = "lock", path = "crates/lock" }
+hengine = { package = "engine", path = "crates/engine" }
 htspec-derive = { path = "crates/htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
@@ -167,7 +167,7 @@ flate2 = "1.1.9"
 # is safe on hosts without it. The `-weak-lfuse` link arg is emitted by this
 # crate's build.rs (the final binary link).
 default = ["fuse-sandbox"]
-fuse-sandbox = ["heph-sandboxfuse/fuse-sandbox"]
+fuse-sandbox = ["hsandboxfuse/fuse-sandbox"]
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

@@ -15,7 +15,7 @@
 use heph::engine::{Config, Engine, OutputMatcher, RemoteCacheDef, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::{pluginbuildfile, pluginexec};
-use heph_testkit::artifact_string;
+use htestkit::artifact_string;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
