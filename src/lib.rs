@@ -44,6 +44,4 @@ pub mod commands;
 pub mod fdlimit;
 pub mod log;
 #[cfg(test)]
-mod plugingo_e2e_test;
-#[cfg(test)]
 mod pluginquery_test;

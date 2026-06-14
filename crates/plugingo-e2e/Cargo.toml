@@ -1,5 +1,5 @@
 [package]
-name = "heph-testkit"
+name = "plugingo-e2e"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -7,8 +7,10 @@ publish = false
 [lints]
 workspace = true
 
-[dependencies]
-heph = { path = ".." }
+[dev-dependencies]
+heph = { path = "../.." }
+heph-testkit = { path = "../testkit" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
 tempfile = "3"
+futures = "0.3"
