@@ -4,7 +4,7 @@
 //! `EVFILT_USER` wake reliability bug documented in `RCA_MACOS_WAKER.md`.
 //! No workarounds — plain `tokio::process::Command` + `.wait().await`.
 
-use crate::hasync::Cancellable;
+use heph_core::hasync::Cancellable;
 use crate::process_supervisor;
 use std::io;
 use std::process::{ExitStatus, Output};

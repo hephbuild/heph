@@ -6,7 +6,7 @@
 //! (kernel condvar). Tokio's cross-thread waker (`mio::Waker` → `EVFILT_USER`)
 //! is never used.
 
-use crate::hasync::Cancellable;
+use heph_core::hasync::Cancellable;
 use crate::process_supervisor;
 use crate::process_watcher;
 use std::io::{self, Write as _};

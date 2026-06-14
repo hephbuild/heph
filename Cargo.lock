@@ -1715,7 +1715,9 @@ dependencies = [
  "futures",
  "glob",
  "heph-core",
+ "heph-proc",
  "heph-proto-gen",
+ "heph-walk",
  "htspec-derive",
  "humantime",
  "indexmap",
@@ -1782,6 +1784,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "heph-proc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "heph-core",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "heph-proto-gen"
 version = "0.1.0"
 dependencies = [
@@ -1798,6 +1812,24 @@ dependencies = [
  "heph",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "heph-walk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "borsh",
+ "glob",
+ "parking_lot",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "rustc-hash",
+ "tempfile",
+ "tracing",
+ "wax",
+ "xxhash-rust",
 ]
 
 [[package]]

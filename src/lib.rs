@@ -32,6 +32,10 @@ extern crate core;
 pub use heph_core::{
     debug_hash, defer, hartifactcontent, hasync, hmemoizer, htplatform, htvalue, version,
 };
+pub use heph_walk as htwalk;
+pub use heph_proc::{proc_exec, process_supervisor};
+#[cfg(target_os = "macos")]
+pub use heph_proc::process_watcher;
 
 pub mod commands;
 pub mod engine;
@@ -41,7 +45,6 @@ pub mod htaddr;
 pub mod htmatcher;
 pub mod htpkg;
 pub mod htspec;
-pub mod htwalk;
 pub mod log;
 pub mod pluginbuildfile;
 pub mod pluginexec;
@@ -53,10 +56,6 @@ pub mod pluginnix;
 pub mod pluginquery;
 pub mod pluginstatictarget;
 pub mod plugintextfile;
-pub mod proc_exec;
-pub mod process_supervisor;
-#[cfg(target_os = "macos")]
-pub mod process_watcher;
 pub mod sandboxfuse;
 pub mod telemetry;
 pub mod tui;

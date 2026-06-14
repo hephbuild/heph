@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core"]
+members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc"]
 
 [profile.profiling]
 inherits = "release"
@@ -94,6 +94,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 heph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
 heph-core = { path = "crates/heph-core" }
+heph-walk = { path = "crates/heph-walk" }
+heph-proc = { path = "crates/heph-proc" }
 htspec-derive = { path = "htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"

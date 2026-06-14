@@ -17,7 +17,7 @@
 //! - [`output`] — batch: spawn, capture stdout/stderr, wait, return `Output`.
 //! - [`spawn`] — low-level: returns a [`Handle`] for streaming + stdin pump.
 
-use crate::hasync::Cancellable;
+use heph_core::hasync::Cancellable;
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::OwnedFd;
