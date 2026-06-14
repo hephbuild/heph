@@ -29,27 +29,25 @@ extern crate core;
 // Foundational leaves now live in `heph-core`; re-export them at their original
 // module paths so `crate::hasync::…` etc. keep resolving unchanged across the
 // monolith.
+pub use heph_builtins::{pluginfs, plugingroup, pluginhostbin, pluginstatictarget, plugintextfile};
 pub use heph_core::{
     debug_hash, defer, hartifactcontent, hasync, hmemoizer, htplatform, htvalue, version,
 };
+pub use heph_engine::engine;
+pub use heph_lock::hlock;
 pub use heph_model::{htaddr, htmatcher, htpkg};
 pub use heph_plugin::htspec;
-pub use heph_builtins::{
-    pluginfs, plugingroup, pluginhostbin, pluginstatictarget, plugintextfile,
-};
 pub use heph_plugin_buildfile::pluginbuildfile;
 pub use heph_plugin_exec::pluginexec;
+pub use heph_plugin_go::plugingo;
 pub use heph_plugin_nix::pluginnix;
 pub use heph_plugin_query::pluginquery;
-pub use heph_plugin_go::plugingo;
-pub use heph_telemetry::telemetry;
-pub use heph_tui::tui;
-pub use heph_lock::hlock;
-pub use heph_engine::engine;
 #[cfg(target_os = "macos")]
 pub use heph_proc::process_watcher;
 pub use heph_proc::{proc_exec, process_supervisor};
 pub use heph_sandboxfuse as sandboxfuse;
+pub use heph_telemetry::telemetry;
+pub use heph_tui::tui;
 pub use heph_walk as htwalk;
 
 pub mod commands;

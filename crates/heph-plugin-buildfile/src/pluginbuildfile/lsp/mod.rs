@@ -10,8 +10,8 @@ mod context;
 mod index;
 mod proxy;
 
-use heph_plugin::lsp::LspEngine;
 use context::HephLspContext;
+use heph_plugin::lsp::LspEngine;
 use lsp_server::Connection;
 use std::sync::Arc;
 

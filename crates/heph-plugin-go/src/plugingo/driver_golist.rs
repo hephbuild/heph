@@ -1,21 +1,21 @@
+use crate::plugingo::pkg_analysis::{
+    GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
+};
+use anyhow::Context;
+use async_trait::async_trait;
 use heph_core::debug_hash::DebugHasher;
+use heph_core::hasync::Cancellable;
+use heph_core::htvalue::signature::ParamType;
+use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use heph_model::htpkg::PkgBuf;
 use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use heph_plugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use heph_core::hasync::Cancellable;
-use heph_model::htpkg::PkgBuf;
 use heph_plugin::htspec::Spec;
-use heph_core::htvalue::signature::ParamType;
-use crate::plugingo::pkg_analysis::{
-    GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
-};
 use heph_proc::proc_exec;
-use anyhow::Context;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
@@ -413,9 +413,9 @@ mod tests {
         import_path: &str,
         extra_deps: Vec<(&str, Vec<&str>)>,
     ) -> ParseRequest {
-        use heph_plugin::provider::TargetSpec;
-        use heph_model::htaddr::Addr;
         use heph_core::htvalue::Value;
+        use heph_model::htaddr::Addr;
+        use heph_plugin::provider::TargetSpec;
         use std::collections::HashMap;
 
         let mut config: HashMap<String, Value> = HashMap::new();
@@ -484,8 +484,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_missing_import_path_errors() {
-        use heph_plugin::provider::TargetSpec;
         use heph_model::htaddr::Addr;
+        use heph_plugin::provider::TargetSpec;
         use std::collections::HashMap;
 
         let ct = noop_ctoken();

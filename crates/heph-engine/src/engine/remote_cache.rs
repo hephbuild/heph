@@ -37,13 +37,13 @@ use crate::engine::local_cache::{
 };
 use crate::engine::remote_cache_latency::{UNREACHABLE, load_order, store_order};
 use crate::engine::remote_cache_objstore::ObjStoreBackend;
-use heph_core::hasync::Cancellable;
-use heph_model::htaddr::Addr;
 use anyhow::Context;
 use async_trait::async_trait;
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use futures::future::join_all;
+use heph_core::hasync::Cancellable;
+use heph_model::htaddr::Addr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;

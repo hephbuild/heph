@@ -1,17 +1,17 @@
+use anyhow::Context as _;
+use async_trait::async_trait;
+use heph_core::hasync::Cancellable;
+use heph_core::htvalue::signature::ParamType;
+use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use heph_model::htpkg::PkgBuf;
 use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use heph_plugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use heph_core::hasync::Cancellable;
-use heph_model::htpkg::PkgBuf;
 use heph_plugin::htspec::Spec;
-use heph_core::htvalue::signature::ParamType;
 use heph_proc::proc_exec;
-use anyhow::Context as _;
-use async_trait::async_trait;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -472,10 +472,10 @@ impl ManagedDriver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::provider::TargetSpec;
     use heph_core::hasync::StdCancellationToken;
-    use heph_model::htaddr::parse_addr;
     use heph_core::htvalue::Value;
+    use heph_model::htaddr::parse_addr;
+    use heph_plugin::provider::TargetSpec;
     use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {

@@ -1,17 +1,17 @@
+use crate::plugingo::embed;
+use crate::plugingo::pkg_analysis::decode_go_package;
+use anyhow::Context;
+use async_trait::async_trait;
 use heph_core::debug_hash::DebugHasher;
+use heph_core::hasync::Cancellable;
+use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use heph_plugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use heph_driver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use heph_core::hasync::Cancellable;
 use heph_plugin::htspec::{Spec, SpecEnum};
-use crate::plugingo::embed;
-use crate::plugingo::pkg_analysis::decode_go_package;
-use anyhow::Context;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
@@ -264,10 +264,10 @@ impl ManagedDriver for GoEmbedDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::provider::TargetSpec;
+    use heph_core::htvalue::Value;
     use heph_model::htaddr::Addr;
     use heph_model::htpkg::PkgBuf;
-    use heph_core::htvalue::Value;
+    use heph_plugin::provider::TargetSpec;
     use std::collections::HashMap;
 
     fn driver() -> GoEmbedDriver {

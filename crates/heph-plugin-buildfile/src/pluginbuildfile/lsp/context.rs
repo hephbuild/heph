@@ -5,15 +5,15 @@
 //! proxy uses for the provenance hover and driver-schema completion.
 
 use super::index::{DocIndex, SharedState};
-use heph_plugin::lsp::LspEngine;
-use heph_plugin::provider::{
-    ListPackagesRequest, ListRequest, Provider as EProvider, ProviderFunctionRegistry,
-};
-use heph_core::hasync::StdCancellationToken;
-use heph_model::htpkg::PkgBuf;
 use crate::pluginbuildfile::Provider;
 use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
+};
+use heph_core::hasync::StdCancellationToken;
+use heph_model::htpkg::PkgBuf;
+use heph_plugin::lsp::LspEngine;
+use heph_plugin::provider::{
+    ListPackagesRequest, ListRequest, Provider as EProvider, ProviderFunctionRegistry,
 };
 use starlark::docs::DocModule;
 use starlark::environment::Globals;

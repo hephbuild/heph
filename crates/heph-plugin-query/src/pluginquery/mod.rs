@@ -1,13 +1,13 @@
+use futures::future::BoxFuture;
+use heph_core::hasync::Cancellable;
+use heph_core::htvalue::Value;
+use heph_model::htmatcher::Matcher;
+use heph_model::htpkg::PkgBuf;
 use heph_plugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     Provider as EProvider, TargetSpec,
 };
-use heph_core::hasync::Cancellable;
-use heph_model::htmatcher::Matcher;
-use heph_model::htpkg::PkgBuf;
-use heph_core::htvalue::Value;
-use futures::future::BoxFuture;
 use std::collections::HashMap;
 
 pub const PACKAGE: &str = "@heph/query";
@@ -157,4 +157,3 @@ impl EProvider for Provider {
         Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
     }
 }
-

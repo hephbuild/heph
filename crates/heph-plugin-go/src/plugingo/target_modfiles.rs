@@ -1,7 +1,7 @@
-use heph_plugin::provider::TargetSpec;
-use heph_model::htaddr::Addr;
-use heph_core::htvalue::Value;
 use heph_builtins::pluginfs;
+use heph_core::htvalue::Value;
+use heph_model::htaddr::Addr;
+use heph_plugin::provider::TargetSpec;
 use std::collections::HashMap;
 
 /// Generates a `_go_mod` target that groups go.mod / go.sum pluginfs deps so the engine

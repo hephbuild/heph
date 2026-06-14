@@ -13,12 +13,12 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use heph_core::shutdown::ShutdownTrigger;
-use heph_core::events::{EventReceiver, now_unix_ms};
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
 use crate::tui::log_sink::LogSink;
 use crate::tui::progress::HSCROLL_STEP;
 use crate::tui::stderr_backend::StderrBackend;
+use heph_core::events::{EventReceiver, now_unix_ms};
+use heph_core::shutdown::ShutdownTrigger;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(80);

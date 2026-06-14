@@ -1,9 +1,9 @@
 use tokio::sync::mpsc;
 
-use heph_core::shutdown::ShutdownTrigger;
-use heph_core::events::EventReceiver;
 use crate::tui::app::{App, AppContext, CIAppView};
 use crate::tui::log_sink::LogSink;
+use heph_core::events::EventReceiver;
+use heph_core::shutdown::ShutdownTrigger;
 
 pub async fn run<A: App>(
     app: A,

@@ -2,8 +2,8 @@
 //! same trait surface as the in-memory one (the inline per-module tests cover
 //! the in-memory bridge in detail).
 
-use heph_core::hasync::StdCancellationToken;
 use crate::hlock::traits::{TLock, TUpgradableReadGuard, TWriteGuard};
+use heph_core::hasync::StdCancellationToken;
 use std::sync::Arc;
 use std::time::Duration;
 

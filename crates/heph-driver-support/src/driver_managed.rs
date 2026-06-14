@@ -1,6 +1,12 @@
+use crate::driver_managed_fuse::ManagedDriverFuse;
+use crate::driver_managed_os::ManagedDriverOs;
 #[cfg(test)]
 use crate::fuseconfig::FuseEnabled;
 use crate::fuseconfig::{FuseConfig, FuseMode};
+use anyhow::Context;
+use async_trait::async_trait;
+use heph_core::hartifactcontent;
+use heph_core::hasync::{self, Cancellable};
 use heph_plugin::driver::inputartifact;
 use heph_plugin::driver::outputartifact::Content::TarPath;
 use heph_plugin::driver::targetdef::path::{self, Content};
@@ -8,13 +14,7 @@ use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver,
     ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse, outputartifact,
 };
-use crate::driver_managed_fuse::ManagedDriverFuse;
-use crate::driver_managed_os::ManagedDriverOs;
 use heph_plugin::provider::TargetSpec;
-use heph_core::hartifactcontent;
-use heph_core::hasync::{self, Cancellable};
-use anyhow::Context;
-use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
@@ -653,8 +653,8 @@ fn pack_to_artifact_tar(
 #[cfg(test)]
 mod shell_fallback_tests {
     use super::*;
-    use heph_plugin::driver::targetdef::TargetDef;
     use heph_core::hasync::StdCancellationToken;
+    use heph_plugin::driver::targetdef::TargetDef;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct NoShellDriver;
@@ -767,10 +767,7 @@ mod shell_fallback_tests {
         let run_shell_called = Arc::new(AtomicBool::new(false));
         let mut config: std::collections::HashMap<String, heph_core::htvalue::Value> =
             std::collections::HashMap::new();
-        config.insert(
-            "run".to_string(),
-            heph_core::htvalue::Value::List(vec![]),
-        );
+        config.insert("run".to_string(), heph_core::htvalue::Value::List(vec![]));
         let fallback = Arc::new(ShellFallback {
             driver: Arc::new(RecordingShellDriver {
                 parse_called: parse_called.clone(),
@@ -836,10 +833,10 @@ mod shell_fallback_tests {
 #[cfg(test)]
 mod source_map_tests {
     use super::*;
-    use heph_plugin::driver::inputartifact::{InputArtifact, Type};
     use heph_core::hartifactcontent::tar::{TarPacker, TarWalker};
     use heph_core::hartifactcontent::{Content, WalkEntry};
     use heph_model::htaddr::parse_addr;
+    use heph_plugin::driver::inputartifact::{InputArtifact, Type};
     use std::io::{Cursor, Read};
 
     struct TarBytes(Vec<u8>);

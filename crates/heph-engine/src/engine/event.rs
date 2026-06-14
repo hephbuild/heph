@@ -12,9 +12,7 @@ use std::future::Future;
 // Event types moved to `heph-core::events` (shared by the TUI + telemetry
 // without an engine dep); re-exported so `engine::event::BuildEventKind` etc.
 // keep resolving. `emit_scope` stays here — it needs `RequestState`.
-pub use heph_core::events::{
-    BuildEvent, BuildEventKind, EventReceiver, EventSender, now_unix_ms,
-};
+pub use heph_core::events::{BuildEvent, BuildEventKind, EventReceiver, EventSender, now_unix_ms};
 
 /// Internal drop-guard so the `*End` event fires on early-return (`?`) **and** on
 /// cancellation (the awaited future is dropped mid-flight). Once armed, the guard

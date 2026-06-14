@@ -2,12 +2,12 @@ use crate::engine::Engine;
 use crate::engine::error::{CycleError, TargetNotFoundError};
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
+use futures::Stream;
 use heph_core::hmemoizer::downcast_chain_ref;
 use heph_model::htaddr::Addr;
 use heph_model::htmatcher;
 use heph_model::htmatcher::MatchResult;
 use heph_model::htpkg::PkgBuf;
-use futures::Stream;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
@@ -110,9 +110,9 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::Config;
-    use heph_model::htmatcher::Matcher;
-    use heph_builtins::pluginstatictarget;
     use futures::TryStreamExt;
+    use heph_builtins::pluginstatictarget;
+    use heph_model::htmatcher::Matcher;
     use std::collections::HashMap;
     use tempfile::tempdir;
 
@@ -147,8 +147,8 @@ mod tests {
             ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
             ListPackagesRequest, ListResponse, ProbeRequest, ProbeResponse,
         };
-        use heph_core::hasync::Cancellable;
         use futures::future::BoxFuture;
+        use heph_core::hasync::Cancellable;
 
         // Provider that surfaces the same addr twice in one package, and the
         // same package twice from `list_packages`.
@@ -340,8 +340,8 @@ mod tests {
             ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
             ListPackagesRequest, ListResponse, ProbeRequest, ProbeResponse, State,
         };
-        use heph_core::hasync::Cancellable;
         use futures::future::BoxFuture;
+        use heph_core::hasync::Cancellable;
         use std::sync::Mutex;
 
         struct Recorder {

@@ -172,8 +172,8 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::Config;
-    use heph_model::htpkg::PkgBuf;
     use heph_builtins::pluginstatictarget;
+    use heph_model::htpkg::PkgBuf;
     use std::collections::HashMap;
 
     /// Build a static target declaring an `out` default-group with the given
@@ -208,7 +208,9 @@ mod tests {
         // exec driver parses specs into defs (with codegen-stamped outputs); the
         // fs provider/driver resolves any synthesized inputs; the static provider
         // supplies the specs and the `list_packages` query needs.
-        engine.register_managed_driver(|_| Box::new(heph_plugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(heph_plugin_exec::pluginexec::Driver::new_exec())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))

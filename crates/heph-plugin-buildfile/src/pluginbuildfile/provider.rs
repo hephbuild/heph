@@ -1,18 +1,18 @@
+use crate::pluginbuildfile::run_file::RunResult;
+use anyhow::Context;
+use enclose::enclose;
+use futures::future::BoxFuture;
+use heph_core::hasync::Cancellable;
+use heph_core::hmemoizer::Memoizer;
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
 use heph_plugin::provider::GetError::NotFound;
 use heph_plugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
-use heph_core::hasync::Cancellable;
-use heph_core::hmemoizer::Memoizer;
-use heph_model::htaddr::Addr;
-use heph_model::htpkg::PkgBuf;
 use heph_walk::{CachedWalker, Ignore};
-use crate::pluginbuildfile::run_file::RunResult;
-use anyhow::Context;
-use enclose::enclose;
-use futures::future::BoxFuture;
 use starlark::environment::Globals;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -355,10 +355,10 @@ impl EProvider for Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::config::Options;
-    use heph_plugin::provider::GetRequest;
     use heph_core::hasync::StdCancellationToken;
     use heph_model::htaddr::parse_addr;
+    use heph_plugin::config::Options;
+    use heph_plugin::provider::GetRequest;
     use std::fs;
     use tempfile::tempdir;
     /// Package discovery is cached across runs through the shared walker: a fresh
@@ -498,7 +498,8 @@ mod tests {
         fn result<'a>(
             &'a self,
             _addr: &'a Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<Arc<heph_plugin::eresult::EResult>>> {
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Arc<heph_plugin::eresult::EResult>>>
+        {
             Box::pin(async { anyhow::bail!("noop") })
         }
 

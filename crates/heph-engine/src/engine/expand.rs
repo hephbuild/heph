@@ -3,10 +3,10 @@ use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::path::Content;
 use crate::engine::driver::targetdef::{Input, InputMode};
 use crate::engine::request_state::RequestState;
-use heph_core::hmemoizer::unwrap_arc_err;
-use heph_model::htaddr::Addr;
 use async_recursion::async_recursion;
 use enclose::enclose;
+use heph_core::hmemoizer::unwrap_arc_err;
+use heph_model::htaddr::Addr;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -72,9 +72,10 @@ fn synthesized_fs_inputs(
             let fs_addr = match &path.content {
                 Content::FilePath(p) => heph_builtins::pluginfs::file_addr(p),
                 Content::Glob(p) => heph_builtins::pluginfs::glob_addr(p, &[]),
-                Content::DirPath(p) => {
-                    heph_builtins::pluginfs::glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[])
-                }
+                Content::DirPath(p) => heph_builtins::pluginfs::glob_addr(
+                    &format!("{}/**/*", p.trim_end_matches('/')),
+                    &[],
+                ),
             };
             if seen.insert(fs_addr.clone()) {
                 out.push(introspect_input(fs_addr, template));
@@ -298,10 +299,10 @@ mod tests {
         ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
         Provider as EProvider, TargetSpec,
     };
-    use heph_core::hasync::Cancellable;
-    use heph_model::htpkg::PkgBuf;
-    use heph_core::htvalue::Value;
     use futures::future::BoxFuture;
+    use heph_core::hasync::Cancellable;
+    use heph_core::htvalue::Value;
+    use heph_model::htpkg::PkgBuf;
     use std::collections::HashMap;
 
     /// Minimal in-memory provider that hands back hand-crafted `TargetSpec`s.
@@ -409,7 +410,9 @@ mod tests {
         // group + fs are registered by Engine::new; only the exec driver needs
         // adding here. The fs provider/driver resolves the synthesized `@heph/fs`
         // inputs produced by introspect-outputs expansion.
-        engine.register_managed_driver(|_| Box::new(heph_plugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(heph_plugin_exec::pluginexec::Driver::new_exec())
+        })?;
         engine.register_provider(move |_| Box::new(CannedProvider { specs }))?;
         Ok((Arc::new(engine), root))
     }

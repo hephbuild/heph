@@ -20,6 +20,7 @@
 //! under `<home>/lock/` (an outer "gateway" and an inner reader/writer file);
 //! the in-memory backend serializes only within this process.
 
+use anyhow::Result;
 use heph_core::hasync::Cancellable;
 use heph_lock::hlock::{
     FLock, FRWLock, KeyedGuard, KeyedTLock, MemLock, MemRWLock, TBridge, TBridgeReadGuard,
@@ -27,7 +28,6 @@ use heph_lock::hlock::{
     mem_tlock,
 };
 use heph_model::htaddr::Addr;
-use anyhow::Result;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 

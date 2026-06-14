@@ -1,11 +1,11 @@
 #[cfg(test)]
-use heph_plugin::provider::TargetSpec;
-#[cfg(test)]
-use heph_model::htaddr::Addr;
+use anyhow::Context;
 #[cfg(test)]
 use heph_core::htvalue::Value;
 #[cfg(test)]
-use anyhow::Context;
+use heph_model::htaddr::Addr;
+#[cfg(test)]
+use heph_plugin::provider::TargetSpec;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::HashMap;

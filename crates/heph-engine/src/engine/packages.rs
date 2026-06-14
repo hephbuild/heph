@@ -1,10 +1,10 @@
 use crate::engine::Engine;
 use crate::engine::provider::ListPackagesRequest;
 use crate::engine::request_state::RequestState;
+use enclose::enclose;
 use heph_core::hmemoizer::unwrap_arc_err;
 use heph_model::htmatcher;
 use heph_model::htpkg::PkgBuf;
-use enclose::enclose;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
@@ -87,9 +87,9 @@ mod tests {
         ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
         ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     };
+    use futures::future::BoxFuture;
     use heph_core::hasync::Cancellable;
     use heph_model::htmatcher::Matcher;
-    use futures::future::BoxFuture;
 
     fn pkg(s: &str) -> PkgBuf {
         PkgBuf::from(s)

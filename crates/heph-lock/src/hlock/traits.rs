@@ -15,9 +15,9 @@
 //! wait can be interrupted. Non-blocking `try_*` methods take no token. All
 //! fallible operations return [`anyhow::Result`].
 
-use heph_core::hasync::Cancellable;
 use anyhow::Result;
 use async_trait::async_trait;
+use heph_core::hasync::Cancellable;
 
 /// Convenience alias for the cancellation token accepted by every blocking
 /// acquire.

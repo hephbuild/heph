@@ -1,3 +1,7 @@
+use async_trait::async_trait;
+use futures::future::BoxFuture;
+use heph_core::hasync::Cancellable;
+use heph_model::htpkg::PkgBuf;
 use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, outputartifact,
@@ -11,10 +15,6 @@ use heph_plugin::provider::{
     GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
     ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec,
 };
-use heph_core::hasync::Cancellable;
-use heph_model::htpkg::PkgBuf;
-use async_trait::async_trait;
-use futures::future::BoxFuture;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -210,10 +210,10 @@ impl heph_plugin::driver::Driver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::driver::{Driver as EDriver, RunRequest};
-    use heph_plugin::provider::Provider as EProvider;
     use heph_core::hasync::StdCancellationToken;
     use heph_model::htaddr::parse_addr;
+    use heph_plugin::driver::{Driver as EDriver, RunRequest};
+    use heph_plugin::provider::Provider as EProvider;
 
     fn make_ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
@@ -425,8 +425,10 @@ mod tests {
         fn result<'a>(
             &'a self,
             _addr: &'a heph_model::htaddr::Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<heph_plugin::eresult::EResult>>>
-        {
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<std::sync::Arc<heph_plugin::eresult::EResult>>,
+        > {
             Box::pin(async { anyhow::bail!("noop") })
         }
 

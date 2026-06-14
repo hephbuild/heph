@@ -1,8 +1,8 @@
-use heph_plugin::driver::targetdef::path::CodegenMode;
-use heph_plugin::htspec::{FromSpecValue, Spec, SpecStruct};
+use anyhow::Context;
 use heph_core::htvalue::Value;
 use heph_core::htvalue::signature::ParamType;
-use anyhow::Context;
+use heph_plugin::driver::targetdef::path::CodegenMode;
+use heph_plugin::htspec::{FromSpecValue, Spec, SpecStruct};
 use std::collections::HashMap;
 
 /// Exec-driver target config. `#[derive(Spec)]` generates `TargetSpec::from`
@@ -120,8 +120,8 @@ fn parse_cache_history(v: &Value) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::driver::DriverField;
     use heph_core::htvalue::Value;
+    use heph_plugin::driver::DriverField;
 
     fn make_spec(
         extra: impl IntoIterator<Item = (&'static str, Value)>,

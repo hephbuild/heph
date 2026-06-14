@@ -1,10 +1,10 @@
-use heph_plugin::provider::TargetSpec;
-use heph_model::htaddr::Addr;
-use heph_core::htvalue::Value;
 use crate::plugingo::addr_util::{
     go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
+use heph_core::htvalue::Value;
+use heph_model::htaddr::Addr;
+use heph_plugin::provider::TargetSpec;
 use std::collections::{BTreeMap, HashMap};
 
 pub fn build_spec(

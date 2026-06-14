@@ -39,7 +39,9 @@ impl<'de> Deserialize<'de> for FuseEnabled {
                     "auto" => Ok(FuseEnabled::Auto),
                     "true" | "on" => Ok(FuseEnabled::On),
                     "false" | "off" => Ok(FuseEnabled::Off),
-                    other => Err(E::custom(format!("expected true/false/auto, got {other:?}"))),
+                    other => Err(E::custom(format!(
+                        "expected true/false/auto, got {other:?}"
+                    ))),
                 }
             }
         }

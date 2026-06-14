@@ -34,11 +34,11 @@
 //! still believes it holds a shared lock. A writer only deletes after every
 //! reader has drained, so no live holder ever sits on a removed inode.
 
-use heph_plugin::error::CancelledError;
-use heph_core::hasync::Cancellable;
 use crate::hlock::traits::{Ctoken, Lock, RWLock};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use heph_core::hasync::Cancellable;
+use heph_plugin::error::CancelledError;
 use libc::c_int;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};

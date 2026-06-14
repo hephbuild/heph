@@ -1,12 +1,12 @@
-use heph_plugin::provider::TargetSpec;
-use heph_model::htaddr::Addr;
-use heph_core::htvalue::Value;
 use crate::plugingo::addr_util::{
     go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
 use crate::plugingo::pkg_analysis::GoPackage;
 use crate::plugingo::target_std::archive_filename;
+use heph_core::htvalue::Value;
+use heph_model::htaddr::Addr;
+use heph_plugin::provider::TargetSpec;
 use std::collections::{BTreeMap, HashMap};
 
 /// Build the `download` target that runs `go mod download` for a single
@@ -346,8 +346,8 @@ fn generate_compile_script(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_model::htpkg::PkgBuf;
     use crate::plugingo::pkg_analysis::{GoModule, GoPackage};
+    use heph_model::htpkg::PkgBuf;
 
     fn run_str(spec: &TargetSpec) -> String {
         match spec.config.get("run").unwrap() {

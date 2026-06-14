@@ -2,13 +2,13 @@ use crate::engine::Engine;
 use crate::engine::driver::outputartifact;
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::result::ArtifactMeta;
-use heph_core::hartifactcontent;
-use heph_core::hasync::Cancellable;
-use heph_model::htaddr::Addr;
 use anyhow::Context;
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use enclose::enclose;
+use heph_core::hartifactcontent;
+use heph_core::hasync::Cancellable;
+use heph_model::htaddr::Addr;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -161,9 +161,9 @@ impl hartifactcontent::Content for CacheArtifact {
     ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<hartifactcontent::WalkEntry>> + '_>>
     {
         Ok(match &self.content_type {
-            hartifactcontent::Type::Tar => Box::new(heph_core::hartifactcontent::tar::TarWalker::new(
-                self.reader()?,
-            )?),
+            hartifactcontent::Type::Tar => Box::new(
+                heph_core::hartifactcontent::tar::TarWalker::new(self.reader()?)?,
+            ),
             #[expect(clippy::unimplemented, reason = "cpio format is not yet implemented")]
             hartifactcontent::Type::Cpio => unimplemented!("cpio is not implemented"),
         })

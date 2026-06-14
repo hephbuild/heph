@@ -1,17 +1,17 @@
+use crate::pluginbuildfile::provider::Provider;
+use anyhow::Context;
+use enclose::enclose;
+use heph_core::hmemoizer::unwrap_arc_err;
+use heph_core::htvalue::signature::{FnSignature, ParamType};
+use heph_core::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
+use heph_model::htaddr;
+use heph_model::htpkg::PkgBuf;
 use heph_plugin::driver::TargetAddr;
 use heph_plugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use heph_plugin::provider::{
     FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
 };
-use heph_core::hmemoizer::unwrap_arc_err;
-use heph_model::htaddr;
-use heph_model::htpkg::PkgBuf;
-use heph_core::htvalue::signature::{FnSignature, ParamType};
-use heph_core::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use heph_walk::{CachedWalker, EntryKind};
-use crate::pluginbuildfile::provider::Provider;
-use anyhow::Context;
-use enclose::enclose;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
@@ -1218,7 +1218,10 @@ mod tests {
     fn fs_registry() -> Arc<ProviderFunctionRegistry> {
         use heph_plugin::provider::Provider as _;
         let mut reg = ProviderFunctionRegistry::default();
-        reg.insert_provider("fs", heph_builtins::pluginfs::Provider::default().functions());
+        reg.insert_provider(
+            "fs",
+            heph_builtins::pluginfs::Provider::default().functions(),
+        );
         Arc::new(reg)
     }
 

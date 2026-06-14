@@ -1,8 +1,8 @@
-use heph_plugin::provider::TargetSpec;
-use heph_model::htaddr::Addr;
-use heph_core::htvalue::Value;
 use crate::plugingo::addr_util::{go_bin_tools_config, to_run_value};
 use crate::plugingo::factors::Factors;
+use heph_core::htvalue::Value;
+use heph_model::htaddr::Addr;
+use heph_plugin::provider::TargetSpec;
 use std::collections::HashMap;
 
 /// Derive a unique archive filename from an import path so that multiple archives

@@ -1,13 +1,13 @@
+use anyhow::Context as _;
+use async_trait::async_trait;
+use heph_core::hasync::Cancellable;
 use heph_plugin::driver::TargetAddr;
 use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
     targetdef::{CacheConfig, Input, InputMode, TargetDef},
 };
-use heph_core::hasync::Cancellable;
 use heph_plugin::htspec::Spec;
-use anyhow::Context as _;
-use async_trait::async_trait;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -120,11 +120,11 @@ impl heph_plugin::driver::Driver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_core::htvalue::Value;
+    use heph_model::htaddr::parse_addr;
     use heph_plugin::driver::Driver as EDriver;
     use heph_plugin::provider::TargetSpec;
-    use heph_core::hasync::StdCancellationToken;
-    use heph_model::htaddr::parse_addr;
-    use heph_core::htvalue::Value;
     use std::collections::HashMap;
 
     fn ctoken() -> StdCancellationToken {
@@ -146,8 +146,8 @@ mod tests {
 
     #[test]
     fn test_schema_lists_deps() {
-        use heph_plugin::driver::Driver as _;
         use heph_core::htvalue::signature::ParamType;
+        use heph_plugin::driver::Driver as _;
         let schema = Driver.schema();
         assert_eq!(schema.fields.len(), 1);
         let f = &schema.fields[0];

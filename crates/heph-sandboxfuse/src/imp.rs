@@ -11,8 +11,6 @@
 //! sections. Read paths (layer bytes via tar index, upper passthrough)
 //! never touch the mutex.
 
-use heph_core::hartifactcontent::ReadSeek;
-use heph_core::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
 use anyhow::Context;
 use crossbeam_channel::{Sender, unbounded};
 use fuser::{
@@ -21,6 +19,8 @@ use fuser::{
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
 };
+use heph_core::hartifactcontent::ReadSeek;
+use heph_core::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};

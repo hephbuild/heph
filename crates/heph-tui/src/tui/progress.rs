@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
-use heph_core::events::{BuildEvent, BuildEventKind};
 use crate::tui::app::{CIAppView, TUIAppView};
+use heph_core::events::{BuildEvent, BuildEventKind};
 
 /// Floor on the pinned viewport row count. The viewport targets one third of the
 /// terminal height (see [`rows_for_height`]) but never shrinks below this, which

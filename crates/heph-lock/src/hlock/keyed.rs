@@ -364,10 +364,10 @@ impl<K: Eq + Hash, L> std::fmt::Debug for KeyedTLock<K, L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_core::hasync::StdCancellationToken;
     use crate::hlock::bridge::{TBridge, mem_tlock};
     use crate::hlock::flock::FLock;
     use crate::hlock::mem::{MemLock, MemRWLock};
+    use heph_core::hasync::StdCancellationToken;
 
     fn ct() -> StdCancellationToken {
         StdCancellationToken::new()

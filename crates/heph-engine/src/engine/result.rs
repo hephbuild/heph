@@ -11,23 +11,23 @@ use crate::engine::provider::{
 };
 use crate::engine::request_state::RequestState;
 use crate::engine::spec::EngineTargetSpec;
+use async_recursion::async_recursion;
+use enclose::enclose;
 use heph_core::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use heph_model::htaddr::Addr;
 use heph_model::htmatcher::MatchResult;
 use heph_model::htpkg::PkgBuf;
-use async_recursion::async_recursion;
-use enclose::enclose;
 
-use heph_core::defer;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::grow_stack::{GrowStack, grow_stack};
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::{CacheArtifact, Manifest, ManifestArtifactType};
 use crate::engine::result_lock::ResultReadGuard;
-use heph_core::hartifactcontent::{Content, ReadSeek, WalkEntry, WalkEntryKind};
-use heph_model::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
+use heph_core::defer;
+use heph_core::hartifactcontent::{Content, ReadSeek, WalkEntry, WalkEntryKind};
+use heph_model::htmatcher::Matcher;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -289,7 +289,12 @@ fn build_eresult(
 /// emit an unstamped output that would then be double-sourced. (`in_place` outputs
 /// are never stamped, so they remain usable on any filesystem.)
 fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()> {
-    xattr::set(path, heph_builtins::pluginfs::CODEGEN_XATTR, value.as_bytes()).with_context(|| {
+    xattr::set(
+        path,
+        heph_builtins::pluginfs::CODEGEN_XATTR,
+        value.as_bytes(),
+    )
+    .with_context(|| {
         format!(
             "stamp codegen xattr on {:?}: `codegen = \"copy\"` requires a filesystem with \
              extended-attribute support",
@@ -2093,10 +2098,10 @@ mod tests {
         ProbeRequest, ProbeResponse,
     };
     use crate::engine::result_lock::{LockBackend, ResultLock};
+    use futures::future::BoxFuture;
     use heph_core::hasync::{Cancellable, StdCancellationToken};
     use heph_model::htmatcher::Matcher;
     use heph_model::htpkg::PkgBuf;
-    use futures::future::BoxFuture;
     use std::collections::BTreeMap;
     use std::sync::Arc as SArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2596,7 +2601,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_managed_driver(|_| Box::new(heph_plugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(heph_plugin_exec::pluginexec::Driver::new_exec())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok(Arc::new(engine))
@@ -2740,7 +2747,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_managed_driver(|_| Box::new(heph_plugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(heph_plugin_exec::pluginexec::Driver::new_exec())
+        })?;
         // Cycling provider FIRST, so `get_spec` hits it before the static one.
         let cycles_for = cycles_for.to_string();
         engine.register_provider(move |_| {
@@ -3480,7 +3489,9 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_managed_driver(|_| Box::new(heph_plugin_exec::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(heph_plugin_exec::pluginexec::Driver::new_exec())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -4359,7 +4370,9 @@ mod tests {
         // so codegen targets can run real shell. The `@heph/fs` provider+driver
         // (auto-registered by `Engine::new`) resolves the synthesized
         // introspect-outputs inputs.
-        engine.register_managed_driver(|_| Box::new(heph_plugin_exec::pluginexec::Driver::new_bash()))?;
+        engine.register_managed_driver(|_| {
+            Box::new(heph_plugin_exec::pluginexec::Driver::new_bash())
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -4642,7 +4655,8 @@ mod tests {
         // Skip the exclusion assertions on a filesystem that can't persist xattrs.
         let probe = root.path().join(".xattr_probe");
         std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, heph_builtins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
+        let xattr_supported =
+            xattr::set(&probe, heph_builtins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
 
         // Materialize + stamp the copy output, and write back the in_place file.
         resolve_collecting_events(&engine, &heph_model::htaddr::parse_addr("//pkg:cp")?)
@@ -4699,7 +4713,8 @@ mod tests {
         // assertions (not the run) if not, so a tmpfs can't make us flake.
         let probe = root.path().join(".xattr_probe");
         std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, heph_builtins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
+        let xattr_supported =
+            xattr::set(&probe, heph_builtins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
 
         let cp_addr = heph_model::htaddr::parse_addr("//pkg:cp")?;
         let ip_addr = heph_model::htaddr::parse_addr("//pkg:ip")?;

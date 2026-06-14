@@ -1,3 +1,11 @@
+use anyhow::Context;
+use async_trait::async_trait;
+use futures::future::BoxFuture;
+use heph_core::hasync::Cancellable;
+use heph_core::htvalue::Value;
+use heph_core::htvalue::signature::{FnSignature, Param, ParamType};
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
 use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
@@ -7,22 +15,14 @@ use heph_plugin::driver::{
         path::{CodegenMode, Content as PathContent, Path},
     },
 };
+use heph_plugin::htspec::Spec;
 use heph_plugin::provider::{
     ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, FnArgs,
     FnCallContext, GetError, GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest,
     ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, ProviderFn,
     ProviderFunctionDef, TargetSpec,
 };
-use heph_core::hasync::Cancellable;
-use heph_model::htaddr::Addr;
-use heph_model::htpkg::PkgBuf;
-use heph_plugin::htspec::Spec;
-use heph_core::htvalue::Value;
-use heph_core::htvalue::signature::{FnSignature, Param, ParamType};
 use heph_walk::{CachedWalker, Ignore};
-use anyhow::Context;
-use async_trait::async_trait;
-use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
@@ -1005,10 +1005,10 @@ impl heph_plugin::driver::Driver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::driver::{Driver as EDriver, RunRequest};
-    use heph_plugin::provider::Provider as EProvider;
     use heph_core::hasync::StdCancellationToken;
     use heph_model::htaddr::parse_addr;
+    use heph_plugin::driver::{Driver as EDriver, RunRequest};
+    use heph_plugin::provider::Provider as EProvider;
     use heph_walk::file_hashout;
     use std::fs;
     use tempfile::tempdir;
@@ -1022,8 +1022,10 @@ mod tests {
         fn result<'a>(
             &'a self,
             _addr: &'a heph_model::htaddr::Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<heph_plugin::eresult::EResult>>>
-        {
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<std::sync::Arc<heph_plugin::eresult::EResult>>,
+        > {
             Box::pin(async { anyhow::bail!("noop") })
         }
 

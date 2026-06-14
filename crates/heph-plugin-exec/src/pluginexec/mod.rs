@@ -2,7 +2,11 @@ mod filterenv;
 mod pty;
 mod spec;
 
+use anyhow::Context;
+use async_trait::async_trait;
 use heph_core::debug_hash::DebugHasher;
+use heph_core::hasync::Cancellable;
+use heph_driver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use heph_plugin::driver::sandbox::EnvValue;
 use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use heph_plugin::driver::targetdef::{
@@ -12,11 +16,7 @@ use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr, outputartifact,
 };
-use heph_driver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
-use heph_core::hasync::Cancellable;
 use heph_proc::proc_exec;
-use anyhow::Context;
-use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
@@ -310,7 +310,11 @@ impl Driver {
     }
 }
 
-fn spec_path_to_target_path(raw: &str, pkg: &heph_model::htpkg::PkgBuf, codegen: &CodegenMode) -> Path {
+fn spec_path_to_target_path(
+    raw: &str,
+    pkg: &heph_model::htpkg::PkgBuf,
+    codegen: &CodegenMode,
+) -> Path {
     let path = if pkg.is_empty() {
         raw.to_string()
     } else {
@@ -332,10 +336,7 @@ fn spec_path_to_target_path(raw: &str, pkg: &heph_model::htpkg::PkgBuf, codegen:
 
 fn decode_path(opts: &heph_plugin::config::Options) -> anyhow::Result<Vec<String>> {
     heph_plugin::config::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
-    Ok(
-        heph_plugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?
-            .unwrap_or_default(),
-    )
+    Ok(heph_plugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?.unwrap_or_default())
 }
 
 /// RAII guard that restores the parent terminal's cooked mode when dropped.
@@ -1323,11 +1324,11 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::driver::RunRequest;
-    use heph_driver_support::driver_managed::ManagedDriver;
-    use heph_core::hasync::StdCancellationToken;
-    use heph_model::htaddr::Addr;
     use enclose::enclose;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_driver_support::driver_managed::ManagedDriver;
+    use heph_model::htaddr::Addr;
+    use heph_plugin::driver::RunRequest;
 
     fn make_req<'a, 'io>(request: RunRequest<'a, 'io>) -> ManagedRunRequest<'a, 'io> {
         let path = request.sandbox_dir.clone();
@@ -2565,8 +2566,8 @@ mod tests {
     /// unpack-then-symlink flow that production hits.
     #[tokio::test]
     async fn test_multi_output_tool_via_bridge() -> anyhow::Result<()> {
-        use heph_plugin::driver::{Driver as _, RunInput, inputartifact, outputartifact};
         use heph_driver_support::driver_managed::ManagedDriverBridge;
+        use heph_plugin::driver::{Driver as _, RunInput, inputartifact, outputartifact};
 
         let ctoken = StdCancellationToken::new();
         let tmp = tempfile::tempdir()?;

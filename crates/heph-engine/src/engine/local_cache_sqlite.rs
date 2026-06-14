@@ -1,7 +1,7 @@
 use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader, TargetStream};
+use anyhow::{Context, Result};
 use heph_core::hartifactcontent;
 use heph_model::htaddr::Addr;
-use anyhow::{Context, Result};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;

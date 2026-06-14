@@ -28,9 +28,9 @@ mod spool;
 
 pub use collector::{TelemetryCollector, TelemetrySnapshot};
 
-use heph_core::events::BuildEventKind;
 use clap::ArgMatches;
 use clap::parser::ValueSource;
+use heph_core::events::BuildEventKind;
 use posthog_rs::{ClientOptionsBuilder, Event};
 use spool::{FLUSH_BATCH, Spool, SpooledEvent};
 use std::path::PathBuf;
@@ -278,8 +278,8 @@ fn set_args(m: &ArgMatches) -> Vec<String> {
 /// Coarse, non-PII failure class: user-cancelled vs a target that genuinely
 /// failed vs anything else.
 fn classify_failure(e: &anyhow::Error) -> &'static str {
-    use heph_plugin::error::{CancelledError, TargetFailure, UpstreamFailed};
     use heph_core::hmemoizer::downcast_chain_ref;
+    use heph_plugin::error::{CancelledError, TargetFailure, UpstreamFailed};
     if downcast_chain_ref::<CancelledError>(e).is_some() {
         "cancelled"
     } else if downcast_chain_ref::<TargetFailure>(e).is_some()

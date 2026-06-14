@@ -1,8 +1,8 @@
 //! Shared helper to make a blocking acquire respect a [`Cancellable`] token.
 
-use heph_plugin::error::CancelledError;
-use heph_core::hasync::Cancellable;
 use anyhow::{Context, Result};
+use heph_core::hasync::Cancellable;
+use heph_plugin::error::CancelledError;
 use std::future::Future;
 
 /// Race an acquire `fut` against `ctoken`. Returns the future's result, or a

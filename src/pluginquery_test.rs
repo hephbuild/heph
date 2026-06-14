@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use crate::pluginquery::*;
     use crate::engine::{Config, Engine};
     use crate::htaddr::parse_addr;
     use crate::htmatcher::Matcher;
     use crate::htvalue::Value;
+    use crate::pluginquery::*;
     use crate::pluginstatictarget;
     use std::collections::HashMap;
     use std::sync::Arc;

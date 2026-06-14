@@ -1,16 +1,3 @@
-use heph_plugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
-    ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
-};
-use heph_core::hasync::Cancellable;
-use heph_core::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
-use heph_model::htaddr::Addr;
-use heph_model::htpkg::PkgBuf;
-use heph_core::htvalue::signature::{FnSignature, Param, ParamType};
-use heph_core::htvalue::{Value, parse_strings};
-use heph_walk::{CachedWalker, EntryKind, Ignore};
-use heph_builtins::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
     encode_thirdparty_download, factors_to_args,
@@ -33,6 +20,19 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use enclose::enclose;
 use futures::future::{BoxFuture, try_join_all};
+use heph_builtins::pluginfs;
+use heph_core::hasync::Cancellable;
+use heph_core::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
+use heph_core::htvalue::signature::{FnSignature, Param, ParamType};
+use heph_core::htvalue::{Value, parse_strings};
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
+use heph_plugin::provider::{
+    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
+    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
+    ProviderExecutor, ProviderFn, ProviderFunctionDef, State,
+};
+use heph_walk::{CachedWalker, EntryKind, Ignore};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -204,15 +204,13 @@ impl Provider {
         walker: Arc<CachedWalker>,
     ) -> anyhow::Result<Self> {
         heph_plugin::config::deny_unknown("go provider", opts, &["gotool", "skip"])?;
-        let go_bin_addr: String =
-            heph_plugin::config::decode_opt(opts, "go provider", "gotool")?
-                .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
+        let go_bin_addr: String = heph_plugin::config::decode_opt(opts, "go provider", "gotool")?
+            .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
         let user_skip: Vec<String> =
-            heph_plugin::config::decode_opt(opts, "go provider", "skip")?
-                .unwrap_or_default();
+            heph_plugin::config::decode_opt(opts, "go provider", "skip")?.unwrap_or_default();
         globs.extend(user_skip);
         let skip = Arc::new(Ignore::new(skip_dirs, &globs)?);
         Self::with_config(
@@ -2391,17 +2389,17 @@ use heph_plugin::provider::{ProbeRequest, ProbeResponse};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heph_plugin::provider::{GetError, GetRequest, Provider as ProviderTrait};
-    use heph_plugin::eresult::{ArtifactMeta, EResult};
-    use heph_core::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
-    use heph_core::hasync::StdCancellationToken;
-    use heph_model::htpkg::PkgBuf;
-    use heph_core::htvalue::Value;
     use crate::plugingo::addr_util::decode_package;
     use crate::plugingo::factors::Factors;
     use crate::plugingo::pkg_analysis::run_go_list;
     use anyhow::Context;
     use futures::future::BoxFuture;
+    use heph_core::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
+    use heph_core::hasync::StdCancellationToken;
+    use heph_core::htvalue::Value;
+    use heph_model::htpkg::PkgBuf;
+    use heph_plugin::eresult::{ArtifactMeta, EResult};
+    use heph_plugin::provider::{GetError, GetRequest, Provider as ProviderTrait};
     use std::collections::HashMap;
     use std::io;
     use std::path::PathBuf;

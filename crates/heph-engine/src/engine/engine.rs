@@ -9,8 +9,8 @@ use crate::engine::provider::Provider as SDKProvider;
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::ResultLock;
 use crate::engine::{driver, provider};
-use heph_sandboxfuse as sandboxfuse;
 use anyhow::Context;
+use heph_sandboxfuse as sandboxfuse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -394,20 +394,14 @@ impl Engine {
         // engine hands every plugin, so every fs glob walk prunes the same paths.
         // The fallible variant lets a bad `fs.skip` glob surface as an error here.
         engine.try_register_provider(|init| {
-            let ignore = Arc::new(heph_walk::Ignore::new(
-                &init.skip_dirs,
-                &init.skip_globs,
-            )?);
+            let ignore = Arc::new(heph_walk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(Box::new(heph_builtins::pluginfs::Provider::new(
                 ignore,
                 init.walker.clone(),
             )))
         })?;
         engine.try_register_driver(|init| {
-            let ignore = Arc::new(heph_walk::Ignore::new(
-                &init.skip_dirs,
-                &init.skip_globs,
-            )?);
+            let ignore = Arc::new(heph_walk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             Ok(Box::new(heph_builtins::pluginfs::Driver::new(
                 ignore,
                 init.walker.clone(),
