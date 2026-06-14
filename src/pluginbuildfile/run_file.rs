@@ -29,6 +29,62 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `heph.core` host/platform namespace, plus a dynamic `heph.<provider>.<fn>`
 /// namespace for every function the providers expose. Built once per
 /// buildfile-provider lifetime (the registry is fixed after the engine injects it).
+/// One `heph.core.<fn>` builtin, for LSP member completion/hover: bare name, a
+/// one-line signature for the completion detail, and the full rendered doc.
+pub(crate) struct CoreMember {
+    pub name: String,
+    pub detail: String,
+    pub doc: String,
+}
+
+/// Enumerate the `heph.core` namespace's functions from the globals doc. These
+/// are static `#[starlark_module]` builtins (not provider-registry functions),
+/// so the proxy can't get them from the registry — it reads this list instead.
+pub(crate) fn heph_core_members(globals_doc: &starlark::docs::DocModule) -> Vec<CoreMember> {
+    use starlark::docs::markdown::render_doc_item_no_link;
+    use starlark::docs::{DocItem, DocMember};
+
+    // Navigate `heph` → `core`; both are namespaces (nested `DocModule`s).
+    let nested = |item: &DocItem, key: &str| -> Option<DocItem> {
+        match item {
+            DocItem::Module(m) => m.members.get(key).cloned(),
+            _ => None,
+        }
+    };
+    let Some(heph) = globals_doc.members.get("heph") else {
+        return vec![];
+    };
+    let core = match nested(heph, "core") {
+        Some(DocItem::Module(m)) => m.members,
+        _ => return vec![],
+    };
+
+    core.iter()
+        .map(|(name, item)| {
+            let detail = match item {
+                DocItem::Member(DocMember::Function(f)) => {
+                    let params = f
+                        .params
+                        .pos_only
+                        .iter()
+                        .chain(f.params.pos_or_named.iter())
+                        .chain(f.params.named_only.iter())
+                        .map(|p| format!("{}: {}", p.name, p.typ))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{name}({params}) -> {}", f.ret.typ)
+                }
+                _ => String::new(),
+            };
+            CoreMember {
+                name: name.clone(),
+                detail,
+                doc: render_doc_item_no_link(name, item),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
     let mut builder = GlobalsBuilder::standard();
     builder = builder.with(starlark_module);

@@ -359,6 +359,14 @@ fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) ->
 
     let line_text = source.lines().nth(line as usize)?;
     let (provider, func) = provider_fn_at(line_text, col as usize)?;
+    // `heph.core.<fn>` builtins aren't in the registry — their doc is pre-rendered.
+    if provider == "core" {
+        return shared
+            .core_members
+            .iter()
+            .find(|m| m.name == func)
+            .map(|m| m.doc.clone());
+    }
     let registry = shared.engine.provider_function_registry();
     let rf = registry.get(&provider, &func)?;
     let sig = &rf.signature;
@@ -517,6 +525,24 @@ fn provider_member_completions(prefix: &str, shared: &SharedState) -> Vec<Comple
                 })
                 .collect()
         }
+        // `heph.core.` → the static `heph.core` builtins (not in the registry).
+        ["heph", "core"] => shared
+            .core_members
+            .iter()
+            .map(|m| CompletionItem {
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: (!m.detail.is_empty()).then(|| m.detail.clone()),
+                documentation: (!m.doc.is_empty()).then(|| {
+                    lsp_types::Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: m.doc.clone(),
+                    })
+                }),
+                sort_text: Some(format!("0_{}", m.name)),
+                label: m.name.clone(),
+                ..Default::default()
+            })
+            .collect(),
         // `heph.<provider>.` → that provider's functions.
         ["heph", provider] => registry
             .providers()

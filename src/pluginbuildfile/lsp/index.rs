@@ -325,6 +325,9 @@ pub(crate) struct SharedState {
     /// symbol's package directory and scan its files for the definition.
     pub root: std::path::PathBuf,
     pub patterns: Vec<glob::Pattern>,
+    /// The `heph.core` builtin functions, for member completion/hover of that
+    /// static namespace (which isn't in the provider-function registry).
+    pub core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
     docs: Mutex<HashMap<LspUri, DocIndex>>,
 }
 
@@ -333,11 +336,13 @@ impl SharedState {
         engine: Arc<Engine>,
         root: std::path::PathBuf,
         patterns: Vec<glob::Pattern>,
+        core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
     ) -> Arc<SharedState> {
         Arc::new(SharedState {
             engine,
             root,
             patterns,
+            core_members,
             docs: Mutex::new(HashMap::new()),
         })
     }
