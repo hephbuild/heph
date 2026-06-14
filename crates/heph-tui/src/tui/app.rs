@@ -5,8 +5,8 @@ use ratatui::text::Line;
 use tokio::sync::{mpsc, oneshot};
 
 use super::log_sink::LogSink;
-use crate::engine::event::{BuildEvent, EventSender};
-use crate::engine::sandbox_cleaner::PendingCounter;
+use heph_core::events::{BuildEvent, EventSender};
+type PendingCounter = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
 pub(crate) enum Control {
     Pause(oneshot::Sender<()>),

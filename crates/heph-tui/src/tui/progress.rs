@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
-use crate::engine::event::{BuildEvent, BuildEventKind};
+use heph_core::events::{BuildEvent, BuildEventKind};
 use crate::tui::app::{CIAppView, TUIAppView};
 
 /// Floor on the pinned viewport row count. The viewport targets one third of the
@@ -1432,7 +1432,7 @@ impl TUIAppView for TuiProgressView {
     fn set_finished(&mut self) {
         // Freeze the elapsed clock at the finish instant; the viewport keeps
         // rendering while held but the time must stop counting.
-        self.finished_at_ms = Some(crate::engine::event::now_unix_ms());
+        self.finished_at_ms = Some(heph_core::events::now_unix_ms());
     }
 
     /// Final report — the elapsed clock plus the header model's summary segment,
@@ -1450,7 +1450,7 @@ impl TUIAppView for TuiProgressView {
         // finish instant rather than the teardown wall clock.
         let clock = self
             .finished_at_ms
-            .unwrap_or_else(crate::engine::event::now_unix_ms);
+            .unwrap_or_else(heph_core::events::now_unix_ms);
         let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
         let elapsed = elapsed.trim_start();
         use std::io::Write;

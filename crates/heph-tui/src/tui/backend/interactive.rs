@@ -13,8 +13,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::commands::bootstrap::ShutdownTrigger;
-use crate::engine::event::{EventReceiver, now_unix_ms};
+use heph_core::shutdown::ShutdownTrigger;
+use heph_core::events::{EventReceiver, now_unix_ms};
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
 use crate::tui::log_sink::LogSink;
 use crate::tui::progress::HSCROLL_STEP;

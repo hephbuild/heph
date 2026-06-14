@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
-use crate::commands::bootstrap::ShutdownTrigger;
-use crate::engine::event::EventReceiver;
+use heph_core::shutdown::ShutdownTrigger;
+use heph_core::events::EventReceiver;
 use crate::tui::app::{App, AppContext, CIAppView};
 use crate::tui::log_sink::LogSink;
 

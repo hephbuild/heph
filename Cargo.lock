@@ -1726,6 +1726,7 @@ dependencies = [
  "heph-proto-gen",
  "heph-sandboxfuse",
  "heph-telemetry",
+ "heph-tui",
  "heph-walk",
  "htspec-derive",
  "humantime",
@@ -2043,6 +2044,25 @@ dependencies = [
  "heph",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "heph-tui"
+version = "0.1.0"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "async-trait",
+ "crossterm",
+ "futures",
+ "heph-core",
+ "libc",
+ "ratatui",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

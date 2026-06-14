@@ -28,7 +28,7 @@ pub async fn run_app<A: App + 'static>(
     app: A,
     sink: LogSink,
     interactive: bool,
-    shutdown: crate::commands::bootstrap::ShutdownTrigger,
+    shutdown: heph_core::shutdown::ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
     // Establish a stable identity for the runtime's outer `block_on`
     // future so the memoizer's cross-task wait-for graph doesn't collide
@@ -38,7 +38,7 @@ pub async fn run_app<A: App + 'static>(
     // Each backend owns the build-event channel: it creates the (sender,
     // receiver) pair, hands the sender to the app via `AppContext`, and consumes
     // the receiver for rendering. This auto-plumbs the bus into every command.
-    crate::hmemoizer::with_cycle_ctx(async move {
+    heph_core::hmemoizer::with_cycle_ctx(async move {
         if interactive {
             backend::interactive::run(app, sink, shutdown).await
         } else {
