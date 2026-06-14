@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub type Options = BTreeMap<String, serde_yaml::Value>;
+// The engine-free plugin option helpers now live in the contract crate;
+// re-export so `config_yaml::{Options, decode_opt, deny_unknown}` keep resolving.
+pub use heph_plugin::config::{Options, decode_opt, deny_unknown};
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -433,34 +435,6 @@ pub fn load(path: &Path) -> anyhow::Result<ConfigYaml> {
 }
 
 /// Decode a single option value into `T`. Returns the default if the key is absent.
-pub fn decode_opt<T: for<'de> Deserialize<'de>>(
-    opts: &Options,
-    plugin: &str,
-    key: &str,
-) -> anyhow::Result<Option<T>> {
-    match opts.get(key) {
-        Some(v) => {
-            let parsed = serde_yaml::from_value::<T>(v.clone())
-                .with_context(|| format!("{plugin}: invalid value for option `{key}`"))?;
-            Ok(Some(parsed))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Verify that `opts` contains only the keys listed in `allowed`. Errors otherwise.
-pub fn deny_unknown(plugin: &str, opts: &Options, allowed: &[&str]) -> anyhow::Result<()> {
-    for key in opts.keys() {
-        if !allowed.iter().any(|k| k == key) {
-            anyhow::bail!(
-                "{plugin}: unknown option `{key}` (allowed: {})",
-                allowed.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
