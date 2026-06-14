@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model"]
+members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse"]
 
 [profile.profiling]
 inherits = "release"
@@ -97,6 +97,7 @@ heph-core = { path = "crates/heph-core" }
 heph-walk = { path = "crates/heph-walk" }
 heph-proc = { path = "crates/heph-proc" }
 heph-model = { path = "crates/heph-model" }
+heph-sandboxfuse = { path = "crates/heph-sandboxfuse", default-features = false }
 htspec-derive = { path = "htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"
@@ -152,26 +153,15 @@ object_store = { version = "0.13.2", features = ["aws", "gcp", "azure", "http", 
 url = "2.5.8"
 flate2 = "1.1.9"
 
-# Linux uses fuser's pure-Rust backend (no `libfuse` feature): mounting shells
-# out to `fusermount3` at runtime, so there is NO build-time/link-time libfuse
-# dependency. That lets the cross-compiled (zigbuild) arm64 release binary link
-# cleanly — there is no C library to find for the target arch.
-[target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.17", optional = true }
-
-# macOS has no pure-Rust mount path, so it must link libfuse (macFUSE). This is
-# a native-only build (no cross), linked against the devenv-provided
-# `macfuse-stubs` osxfuse.pc. NOTE: the shipped macOS binary dynamically links
-# libosxfuse and therefore requires macFUSE installed at runtime to launch.
-[target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.17", optional = true, features = ["libfuse"] }
-
 [features]
-# FUSE sandbox is on by default. Linux links nothing (pure-Rust); macOS links
-# macFUSE. `support_check` probes at runtime and falls back to the copy path
-# when FUSE is unavailable, so a default build is safe on hosts without it.
+# FUSE sandbox is on by default. The FUSE machinery (and its `fuser`/libfuse
+# link) lives in `heph-sandboxfuse`; this just forwards the feature. Linux links
+# nothing (pure-Rust); macOS links macFUSE. `support_check` probes at runtime
+# and falls back to the copy path when FUSE is unavailable, so a default build
+# is safe on hosts without it. The `-weak-lfuse` link arg is emitted by this
+# crate's build.rs (the final binary link).
 default = ["fuse-sandbox"]
-fuse-sandbox = ["dep:fuser"]
+fuse-sandbox = ["heph-sandboxfuse/fuse-sandbox"]
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

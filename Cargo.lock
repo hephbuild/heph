@@ -1711,13 +1711,13 @@ dependencies = [
  "enclose",
  "erased-serde 0.4.10",
  "flate2",
- "fuser",
  "futures",
  "glob",
  "heph-core",
  "heph-model",
  "heph-proc",
  "heph-proto-gen",
+ "heph-sandboxfuse",
  "heph-walk",
  "htspec-derive",
  "humantime",
@@ -1814,6 +1814,20 @@ dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
  "serde",
+]
+
+[[package]]
+name = "heph-sandboxfuse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "fuser",
+ "heph-core",
+ "libc",
+ "parking_lot",
+ "tar",
+ "tempfile",
 ]
 
 [[package]]

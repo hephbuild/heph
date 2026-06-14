@@ -37,6 +37,7 @@ pub use heph_model::{htaddr, htmatcher, htpkg};
 pub use heph_proc::process_watcher;
 pub use heph_proc::{proc_exec, process_supervisor};
 pub use heph_walk as htwalk;
+pub use heph_sandboxfuse as sandboxfuse;
 
 pub mod commands;
 pub mod engine;
@@ -54,6 +55,5 @@ pub mod pluginnix;
 pub mod pluginquery;
 pub mod pluginstatictarget;
 pub mod plugintextfile;
-pub mod sandboxfuse;
 pub mod telemetry;
 pub mod tui;

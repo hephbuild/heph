@@ -64,9 +64,9 @@ fn probe() -> FuseSupport {
 #[macro_export]
 macro_rules! require_fuse {
     () => {
-        match $crate::sandboxfuse::support_check() {
-            $crate::sandboxfuse::FuseSupport::Available => {}
-            $crate::sandboxfuse::FuseSupport::Unavailable(reason) => {
+        match $crate::support_check() {
+            $crate::FuseSupport::Available => {}
+            $crate::FuseSupport::Unavailable(reason) => {
                 eprintln!("skipping: FUSE unavailable: {reason}");
                 return;
             }

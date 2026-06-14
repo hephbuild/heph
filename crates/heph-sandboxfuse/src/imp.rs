@@ -11,8 +11,8 @@
 //! sections. Read paths (layer bytes via tar index, upper passthrough)
 //! never touch the mutex.
 
-use crate::hartifactcontent::ReadSeek;
-use crate::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
+use heph_core::hartifactcontent::ReadSeek;
+use heph_core::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
 use anyhow::Context;
 use crossbeam_channel::{Sender, unbounded};
 use fuser::{
@@ -535,7 +535,7 @@ impl LayeredFs {
 /// remains compact and avoids holding the slots read-lock across IO.
 fn copy_up_layer_entry(
     layer: &Layer,
-    entry: &crate::hartifactcontent::tar_index::IndexEntry,
+    entry: &heph_core::hartifactcontent::tar_index::IndexEntry,
     dst: &Path,
 ) -> std::io::Result<()> {
     match &entry.kind {
@@ -1512,7 +1512,7 @@ impl Mount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hartifactcontent::tar::TarPacker;
+    use heph_core::hartifactcontent::tar::TarPacker;
     use std::io::Cursor;
 
     fn pack(files: &[(&str, &[u8])]) -> Vec<u8> {

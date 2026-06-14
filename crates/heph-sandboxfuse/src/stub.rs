@@ -2,8 +2,8 @@
 //! the `fuse-sandbox` feature is off). All entry points return errors so
 //! the bridge transparently takes the copy path.
 
-use crate::hartifactcontent::ReadSeek;
-use crate::hartifactcontent::tar_index::TarIndex;
+use heph_core::hartifactcontent::ReadSeek;
+use heph_core::hartifactcontent::tar_index::TarIndex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
