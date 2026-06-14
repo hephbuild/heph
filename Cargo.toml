@@ -177,3 +177,10 @@ fuse-sandbox = ["hsandboxfuse/fuse-sandbox"]
 serde-jsonlines = "0.7.0"
 tempfile = "3"
 
+# Fork exposing `event::raw_input` (EventSource/UnixInternalEventSource/
+# InternalEvent) so the TUI can own a single tty reader and demux cursor-position
+# replies from key events — see crates/tui/src/tui/input.rs. Avoids the
+# DSR-query / EventStream two-reader race.
+[patch.crates-io]
+crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fixstderr" }
+
