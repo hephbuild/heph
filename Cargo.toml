@@ -12,9 +12,13 @@ debug = true
 strip = "none"
 
 [profile.release]
-codegen-units = 1 # Allows compiler to perform better optimization.
-lto = true # Enables Link-time Optimization.
-opt-level = 3 # Prioritizes small binary size. Use `3` if you prefer speed.
+# Thin LTO keeps cross-crate inlining but links in parallel (fat `lto = true`
+# is a single-threaded whole-program pass that dominated wall time and erased
+# the benefit of the crate split). codegen-units > 1 restores parallel codegen.
+# Runtime perf stays within noise of fat LTO.
+codegen-units = 16
+lto = "thin"
+opt-level = 3 # Prioritizes speed.
 strip = true # Ensures debug symbols are removed.
 
 [workspace.lints.clippy]
