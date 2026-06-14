@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin", "crates/heph-builtins", "crates/heph-plugin-buildfile", "crates/heph-driver-support", "crates/heph-plugin-exec", "crates/heph-plugin-nix", "crates/heph-plugin-query", "crates/heph-plugin-go", "crates/heph-telemetry", "crates/heph-tui"]
+members = ["gen/proto", "e2e", "testkit", "plugingo-e2e", "htspec-derive", "crates/heph-core", "crates/heph-walk", "crates/heph-proc", "crates/heph-model", "crates/heph-sandboxfuse", "crates/heph-plugin", "crates/heph-builtins", "crates/heph-plugin-buildfile", "crates/heph-driver-support", "crates/heph-plugin-exec", "crates/heph-plugin-nix", "crates/heph-plugin-query", "crates/heph-plugin-go", "crates/heph-telemetry", "crates/heph-tui", "crates/heph-lock", "crates/heph-engine"]
 
 [profile.profiling]
 inherits = "release"
@@ -108,6 +108,8 @@ heph-plugin-query = { path = "crates/heph-plugin-query" }
 heph-plugin-go = { path = "crates/heph-plugin-go" }
 heph-telemetry = { path = "crates/heph-telemetry" }
 heph-tui = { path = "crates/heph-tui" }
+heph-lock = { path = "crates/heph-lock" }
+heph-engine = { path = "crates/heph-engine" }
 htspec-derive = { path = "htspec-derive" }
 nom = { version = "7", default-features = false, features = ["std"] }
 anyhow = "1.0.102"

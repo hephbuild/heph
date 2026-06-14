@@ -1,0 +1,21 @@
+[package]
+name = "heph-lock"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+heph-core = { path = "../heph-core" }
+heph-plugin = { path = "../heph-plugin" }
+anyhow = "1.0.102"
+libc = "0.2"
+parking_lot = "0.12"
+async-trait = "0.1.86"
+rustc-hash = "2"
+tracing = "0.1"
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "time", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"

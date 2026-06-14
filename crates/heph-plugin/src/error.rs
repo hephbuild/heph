@@ -29,6 +29,11 @@ impl fmt::Display for CancelledError {
 
 impl std::error::Error for CancelledError {}
 
+/// True if `e` (anywhere in its source chain) is a `CancelledError`.
+pub fn is_cancelled(e: &anyhow::Error) -> bool {
+    heph_core::hmemoizer::downcast_chain_ref::<CancelledError>(e).is_some()
+}
+
 #[derive(Debug, Clone)]
 pub struct CycleError {
     pub from: Addr,
