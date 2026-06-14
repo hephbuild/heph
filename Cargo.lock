@@ -1718,6 +1718,7 @@ dependencies = [
  "heph-model",
  "heph-plugin",
  "heph-plugin-buildfile",
+ "heph-plugin-exec",
  "heph-proc",
  "heph-proto-gen",
  "heph-sandboxfuse",
@@ -1889,6 +1890,31 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower-lsp-server",
+]
+
+[[package]]
+name = "heph-plugin-exec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "crossterm",
+ "enclose",
+ "glob",
+ "heph-core",
+ "heph-driver-support",
+ "heph-model",
+ "heph-plugin",
+ "heph-proc",
+ "libc",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tar",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]

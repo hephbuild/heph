@@ -2,20 +2,19 @@ mod filterenv;
 mod pty;
 mod spec;
 
-use crate::debug_hash::DebugHasher;
-use crate::engine;
-use crate::engine::driver::sandbox::EnvValue;
-use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
-use crate::engine::driver::targetdef::{
+use heph_core::debug_hash::DebugHasher;
+use heph_plugin::driver::sandbox::EnvValue;
+use heph_plugin::driver::targetdef::path::{CodegenMode, Content, Path};
+use heph_plugin::driver::targetdef::{
     CacheConfig, Input, InputMode, Output, TargetDef as EngineTargetDef,
 };
-use crate::engine::driver::{
+use heph_plugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr, outputartifact,
 };
-use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
-use crate::hasync::Cancellable;
-use crate::proc_exec;
+use heph_driver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+use heph_core::hasync::Cancellable;
+use heph_proc::proc_exec;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -249,13 +248,13 @@ impl Driver {
     /// interactive bash session via `init.sh`). Built here because the fallback
     /// is this plugin's own exec driver.
     pub fn default_exec_shell_fallback()
-    -> std::sync::Arc<crate::engine::driver_managed::ShellFallback> {
-        let mut config: std::collections::HashMap<String, crate::htvalue::Value> =
+    -> std::sync::Arc<heph_driver_support::driver_managed::ShellFallback> {
+        let mut config: std::collections::HashMap<String, heph_core::htvalue::Value> =
             std::collections::HashMap::new();
-        config.insert("run".to_string(), crate::htvalue::Value::List(vec![]));
-        std::sync::Arc::new(crate::engine::driver_managed::ShellFallback {
+        config.insert("run".to_string(), heph_core::htvalue::Value::List(vec![]));
+        std::sync::Arc::new(heph_driver_support::driver_managed::ShellFallback {
             driver: std::sync::Arc::new(Driver::new_exec()),
-            spec_template: std::sync::Arc::new(crate::engine::provider::TargetSpec {
+            spec_template: std::sync::Arc::new(heph_plugin::provider::TargetSpec {
                 addr: Default::default(),
                 driver: "exec".to_string(),
                 config,
@@ -289,21 +288,21 @@ impl Driver {
         }
     }
 
-    pub fn from_options_exec(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Self> {
+    pub fn from_options_exec(opts: &heph_plugin::config::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
             ..Self::new_exec()
         })
     }
 
-    pub fn from_options_bash(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Self> {
+    pub fn from_options_bash(opts: &heph_plugin::config::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
             ..Self::new_bash()
         })
     }
 
-    pub fn from_options_sh(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Self> {
+    pub fn from_options_sh(opts: &heph_plugin::config::Options) -> anyhow::Result<Self> {
         Ok(Self {
             search_path: decode_path(opts)?,
             ..Self::new_sh()
@@ -311,7 +310,7 @@ impl Driver {
     }
 }
 
-fn spec_path_to_target_path(raw: &str, pkg: &crate::htpkg::PkgBuf, codegen: &CodegenMode) -> Path {
+fn spec_path_to_target_path(raw: &str, pkg: &heph_model::htpkg::PkgBuf, codegen: &CodegenMode) -> Path {
     let path = if pkg.is_empty() {
         raw.to_string()
     } else {
@@ -331,10 +330,10 @@ fn spec_path_to_target_path(raw: &str, pkg: &crate::htpkg::PkgBuf, codegen: &Cod
     }
 }
 
-fn decode_path(opts: &crate::engine::config_yaml::Options) -> anyhow::Result<Vec<String>> {
-    crate::engine::config_yaml::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
+fn decode_path(opts: &heph_plugin::config::Options) -> anyhow::Result<Vec<String>> {
+    heph_plugin::config::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
     Ok(
-        crate::engine::config_yaml::decode_opt(opts, "exec/bash/sh driver", "path")?
+        heph_plugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?
             .unwrap_or_default(),
     )
 }
@@ -460,14 +459,14 @@ async fn pump_stdin(
 }
 
 #[async_trait]
-impl engine::driver_managed::ManagedDriver for Driver {
+impl heph_driver_support::driver_managed::ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
             name: self.name.clone(),
         })
     }
 
-    fn schema(&self) -> engine::driver::DriverSchema {
+    fn schema(&self) -> heph_plugin::driver::DriverSchema {
         spec::TargetSpec::schema()
     }
 
@@ -741,7 +740,7 @@ impl Driver {
         ctoken: &(dyn Cancellable + Send + Sync),
         shell: bool,
     ) -> anyhow::Result<ManagedRunResponse> {
-        crate::hmemoizer::set_phase("pluginexec:sandbox_setup");
+        heph_core::hmemoizer::set_phase("pluginexec:sandbox_setup");
         let rreq = req.request;
         let def = rreq.target.def::<TargetDef>();
 
@@ -866,7 +865,7 @@ impl Driver {
                     m.input.origin_id == input.origin_id
                         && matches!(
                             m.input.artifact.r#type,
-                            crate::engine::driver::inputartifact::Type::Dep
+                            heph_plugin::driver::inputartifact::Type::Dep
                         )
                 }) {
                     let list_path = m.require_list_path()?;
@@ -938,7 +937,7 @@ impl Driver {
                         m.input.origin_id == input.origin_id
                             && matches!(
                                 m.input.artifact.r#type,
-                                crate::engine::driver::inputartifact::Type::Dep
+                                heph_plugin::driver::inputartifact::Type::Dep
                             )
                     }) else {
                         continue;
@@ -1126,7 +1125,7 @@ impl Driver {
             }
         };
 
-        crate::hmemoizer::set_phase("pluginexec:spawn");
+        heph_core::hmemoizer::set_phase("pluginexec:spawn");
         let mut handle = proc_exec::spawn(spec).with_context(|| "spawn child process")?;
 
         // Drop the parent's copy of the slave so the master sees EOF when the
@@ -1204,7 +1203,7 @@ impl Driver {
             }
         };
 
-        crate::hmemoizer::set_phase("pluginexec:wait_subprocess");
+        heph_core::hmemoizer::set_phase("pluginexec:wait_subprocess");
         // The wait happens in a spawned task. `Handle::wait_or_cancel` uses
         // `block_in_place` internally to park on a `std::sync::mpsc` from the
         // kqueue watcher — kernel condvar wake, no tokio waker on the wait
@@ -1242,7 +1241,7 @@ impl Driver {
                 tokio::select! {
                     wait_res = &mut wait_handle => {
                         if !ctoken.is_cancelled() {
-                            crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
+                            heph_core::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
                             _ = tokio::time::timeout(
                                 std::time::Duration::from_millis(50),
                                 &mut io,
@@ -1251,7 +1250,7 @@ impl Driver {
                         wait_res
                     }
                     _ = &mut io => {
-                        crate::hmemoizer::set_phase("pluginexec:post_io_wait");
+                        heph_core::hmemoizer::set_phase("pluginexec:post_io_wait");
                         (&mut wait_handle).await
                     }
                 }
@@ -1266,7 +1265,7 @@ impl Driver {
                 tokio::select! {
                     wait_res = &mut wait_handle => {
                         if !ctoken.is_cancelled() {
-                            crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
+                            heph_core::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
                             _ = tokio::time::timeout(
                                 std::time::Duration::from_millis(50),
                                 &mut io,
@@ -1275,14 +1274,14 @@ impl Driver {
                         wait_res
                     }
                     _ = &mut io => {
-                        crate::hmemoizer::set_phase("pluginexec:post_io_wait");
+                        heph_core::hmemoizer::set_phase("pluginexec:post_io_wait");
                         (&mut wait_handle).await
                     }
                 }
             }
         };
 
-        crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
+        heph_core::hmemoizer::set_phase("pluginexec:post_wait_status_check");
         // Cancellation takes precedence over whatever the wait task returned
         // (`wait_or_cancel` surfaces an io error on cancel) so we preserve the
         // `Err("cancelled")` contract callers and tests rely on.
@@ -1294,13 +1293,13 @@ impl Driver {
             .context("wait for child process")?;
         if !status.success() {
             let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
-            return Err(crate::engine::error::ProcessFailed {
+            return Err(heph_plugin::error::ProcessFailed {
                 status: status.to_string(),
-                log_tail: crate::engine::error::last_n_lines(&log, 10),
+                log_tail: heph_plugin::error::last_n_lines(&log, 10),
             }
             .into());
         }
-        crate::hmemoizer::set_phase("pluginexec:post_wait_done");
+        heph_core::hmemoizer::set_phase("pluginexec:post_wait_done");
 
         Ok(ManagedRunResponse {
             artifacts: vec![outputartifact::OutputArtifact {
@@ -1324,10 +1323,10 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::RunRequest;
-    use crate::engine::driver_managed::ManagedDriver;
-    use crate::hasync::StdCancellationToken;
-    use crate::htaddr::Addr;
+    use heph_plugin::driver::RunRequest;
+    use heph_driver_support::driver_managed::ManagedDriver;
+    use heph_core::hasync::StdCancellationToken;
+    use heph_model::htaddr::Addr;
     use enclose::enclose;
 
     fn make_req<'a, 'io>(request: RunRequest<'a, 'io>) -> ManagedRunRequest<'a, 'io> {
@@ -1391,7 +1390,7 @@ mod tests {
 
     #[test]
     fn from_options_sh_no_path() {
-        let opts = crate::engine::config_yaml::Options::new();
+        let opts = heph_plugin::config::Options::new();
         let d = Driver::from_options_sh(&opts).expect("from_options");
         assert_eq!(d.name, "sh");
         assert!(d.search_path.is_empty());
@@ -1399,7 +1398,7 @@ mod tests {
 
     #[test]
     fn from_options_exec_no_path() {
-        let opts = crate::engine::config_yaml::Options::new();
+        let opts = heph_plugin::config::Options::new();
         let d = Driver::from_options_exec(&opts).expect("from_options");
         assert_eq!(d.name, "exec");
         assert!(d.search_path.is_empty());
@@ -1407,7 +1406,7 @@ mod tests {
 
     #[test]
     fn from_options_exec_reads_path() {
-        let mut opts = crate::engine::config_yaml::Options::new();
+        let mut opts = heph_plugin::config::Options::new();
         opts.insert(
             "path".to_string(),
             serde_yaml::from_str("[/usr/bin, /bin]").expect("yaml"),
@@ -1418,7 +1417,7 @@ mod tests {
 
     #[test]
     fn from_options_bash_rejects_unknown_key() {
-        let mut opts = crate::engine::config_yaml::Options::new();
+        let mut opts = heph_plugin::config::Options::new();
         opts.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
         let err = Driver::from_options_bash(&opts).err().expect("must error");
         assert!(err.to_string().contains("bogus"), "{err}");
@@ -2003,20 +2002,20 @@ mod tests {
         let config = HashMap::from([
             (
                 "run".to_string(),
-                crate::htvalue::Value::String("echo".to_string()),
+                heph_core::htvalue::Value::String("echo".to_string()),
             ),
             (
                 "pass_env".to_string(),
-                crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                heph_core::htvalue::Value::List(vec![heph_core::htvalue::Value::String(
                     "heph_TEST_PARSE_PASS".to_string(),
                 )]),
             ),
         ]);
         let res = driver
             .parse(
-                crate::engine::driver::ParseRequest {
+                heph_plugin::driver::ParseRequest {
                     request_id: "test".to_string(),
-                    target_spec: std::sync::Arc::new(crate::engine::provider::TargetSpec {
+                    target_spec: std::sync::Arc::new(heph_plugin::provider::TargetSpec {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
@@ -2042,20 +2041,20 @@ mod tests {
         let config = HashMap::from([
             (
                 "run".to_string(),
-                crate::htvalue::Value::String("echo".to_string()),
+                heph_core::htvalue::Value::String("echo".to_string()),
             ),
             (
                 "pass_env".to_string(),
-                crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+                heph_core::htvalue::Value::List(vec![heph_core::htvalue::Value::String(
                     "heph_TEST_DEFINITELY_UNSET_99999".to_string(),
                 )]),
             ),
         ]);
         let res = driver
             .parse(
-                crate::engine::driver::ParseRequest {
+                heph_plugin::driver::ParseRequest {
                     request_id: "test".to_string(),
-                    target_spec: std::sync::Arc::new(crate::engine::provider::TargetSpec {
+                    target_spec: std::sync::Arc::new(heph_plugin::provider::TargetSpec {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
@@ -2074,20 +2073,20 @@ mod tests {
     /// Drives `parse()` with the given `extra` config keys merged on top of a
     /// minimal exec spec (just `run`). Returns the resulting EngineTargetDef.
     async fn parse_with(
-        extra: HashMap<String, crate::htvalue::Value>,
-    ) -> anyhow::Result<crate::engine::driver::targetdef::TargetDef> {
+        extra: HashMap<String, heph_core::htvalue::Value>,
+    ) -> anyhow::Result<heph_plugin::driver::targetdef::TargetDef> {
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
         let mut config = HashMap::from([(
             "run".to_string(),
-            crate::htvalue::Value::String("echo".to_string()),
+            heph_core::htvalue::Value::String("echo".to_string()),
         )]);
         config.extend(extra);
         let res = driver
             .parse(
-                crate::engine::driver::ParseRequest {
+                heph_plugin::driver::ParseRequest {
                     request_id: "test".to_string(),
-                    target_spec: std::sync::Arc::new(crate::engine::provider::TargetSpec {
+                    target_spec: std::sync::Arc::new(heph_plugin::provider::TargetSpec {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
@@ -2105,7 +2104,7 @@ mod tests {
     async fn test_parse_hash_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
         let extra = HashMap::from([(
             "hash_deps".to_string(),
-            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+            heph_core::htvalue::Value::List(vec![heph_core::htvalue::Value::String(
                 "//some:dep".to_string(),
             )]),
         )]);
@@ -2132,7 +2131,7 @@ mod tests {
     async fn test_parse_runtime_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
         let extra = HashMap::from([(
             "runtime_deps".to_string(),
-            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+            heph_core::htvalue::Value::List(vec![heph_core::htvalue::Value::String(
                 "//some:dep".to_string(),
             )]),
         )]);
@@ -2159,7 +2158,7 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_runtime = parse_with(HashMap::from([(
             "runtime_deps".to_string(),
-            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+            heph_core::htvalue::Value::List(vec![heph_core::htvalue::Value::String(
                 "//some:dep".to_string(),
             )]),
         )]))
@@ -2179,7 +2178,7 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_hash = parse_with(HashMap::from([(
             "hash_deps".to_string(),
-            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+            heph_core::htvalue::Value::List(vec![heph_core::htvalue::Value::String(
                 "//some:dep".to_string(),
             )]),
         )]))
@@ -2195,7 +2194,7 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_deps = parse_with(HashMap::from([(
             "deps".to_string(),
-            crate::htvalue::Value::List(vec![crate::htvalue::Value::String(
+            heph_core::htvalue::Value::List(vec![heph_core::htvalue::Value::String(
                 "//some:dep".to_string(),
             )]),
         )]))
@@ -2210,17 +2209,17 @@ mod tests {
         // changing an env value is a semantic change to the target's input.
         let with_v1 = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::htvalue::Value::Map(HashMap::from([(
+            heph_core::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::htvalue::Value::String("v1".to_string()),
+                heph_core::htvalue::Value::String("v1".to_string()),
             )])),
         )]))
         .await?;
         let with_v2 = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::htvalue::Value::Map(HashMap::from([(
+            heph_core::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::htvalue::Value::String("v2".to_string()),
+                heph_core::htvalue::Value::String("v2".to_string()),
             )])),
         )]))
         .await?;
@@ -2234,17 +2233,17 @@ mod tests {
         // def hash.
         let with_foo = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::htvalue::Value::Map(HashMap::from([(
+            heph_core::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::htvalue::Value::String("v".to_string()),
+                heph_core::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;
         let with_bar = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::htvalue::Value::Map(HashMap::from([(
+            heph_core::htvalue::Value::Map(HashMap::from([(
                 "BAR".to_string(),
-                crate::htvalue::Value::String("v".to_string()),
+                heph_core::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;
@@ -2258,9 +2257,9 @@ mod tests {
         let base = parse_with(HashMap::new()).await?;
         let with_env = parse_with(HashMap::from([(
             "env".to_string(),
-            crate::htvalue::Value::Map(HashMap::from([(
+            heph_core::htvalue::Value::Map(HashMap::from([(
                 "FOO".to_string(),
-                crate::htvalue::Value::String("v".to_string()),
+                heph_core::htvalue::Value::String("v".to_string()),
             )])),
         )]))
         .await?;
@@ -2286,12 +2285,12 @@ mod tests {
         origin_id: &str,
         tool_path: &std::path::Path,
         list_dir: &std::path::Path,
-    ) -> anyhow::Result<crate::engine::driver_managed::ManagedRunInput> {
+    ) -> anyhow::Result<heph_driver_support::driver_managed::ManagedRunInput> {
         make_tool_managed_input_full(
             origin_id,
             tool_path,
             list_dir,
-            crate::htaddr::Addr::default(),
+            heph_model::htaddr::Addr::default(),
             "",
         )
     }
@@ -2300,8 +2299,8 @@ mod tests {
         origin_id: &str,
         tool_path: &std::path::Path,
         list_dir: &std::path::Path,
-        source_addr: crate::htaddr::Addr,
-    ) -> anyhow::Result<crate::engine::driver_managed::ManagedRunInput> {
+        source_addr: heph_model::htaddr::Addr,
+    ) -> anyhow::Result<heph_driver_support::driver_managed::ManagedRunInput> {
         make_tool_managed_input_full(origin_id, tool_path, list_dir, source_addr, "")
     }
 
@@ -2309,13 +2308,13 @@ mod tests {
         origin_id: &str,
         tool_path: &std::path::Path,
         list_dir: &std::path::Path,
-        source_addr: crate::htaddr::Addr,
+        source_addr: heph_model::htaddr::Addr,
         hashout: &str,
-    ) -> anyhow::Result<crate::engine::driver_managed::ManagedRunInput> {
-        use crate::engine::driver::{RunInput, inputartifact, outputartifact};
+    ) -> anyhow::Result<heph_driver_support::driver_managed::ManagedRunInput> {
+        use heph_plugin::driver::{RunInput, inputartifact, outputartifact};
         let list_path = list_dir.join(format!("input_{origin_id}.list"));
         std::fs::write(&list_path, format!("{}\n", tool_path.display()))?;
-        Ok(crate::engine::driver_managed::ManagedRunInput {
+        Ok(heph_driver_support::driver_managed::ManagedRunInput {
             input: RunInput {
                 artifact: inputartifact::InputArtifact {
                     r#type: inputartifact::Type::Dep,
@@ -2354,7 +2353,7 @@ mod tests {
                 tool_group_inputs: BTreeMap::from([(
                     group.to_string(),
                     vec![Input {
-                        r#ref: crate::engine::driver::TargetAddr::default(),
+                        r#ref: heph_plugin::driver::TargetAddr::default(),
                         mode: InputMode::Tool,
                         origin_id: origin_id.to_string(),
                         annotations: BTreeMap::from([(
@@ -2488,7 +2487,7 @@ mod tests {
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
-                        r#ref: crate::engine::driver::TargetAddr::default(),
+                        r#ref: heph_plugin::driver::TargetAddr::default(),
                         mode: InputMode::Tool,
                         origin_id: origin_id.to_string(),
                         annotations: BTreeMap::from([(
@@ -2566,8 +2565,8 @@ mod tests {
     /// unpack-then-symlink flow that production hits.
     #[tokio::test]
     async fn test_multi_output_tool_via_bridge() -> anyhow::Result<()> {
-        use crate::engine::driver::{Driver as _, RunInput, inputartifact, outputartifact};
-        use crate::engine::driver_managed::ManagedDriverBridge;
+        use heph_plugin::driver::{Driver as _, RunInput, inputartifact, outputartifact};
+        use heph_driver_support::driver_managed::ManagedDriverBridge;
 
         let ctoken = StdCancellationToken::new();
         let tmp = tempfile::tempdir()?;
@@ -2585,7 +2584,7 @@ mod tests {
         let mut artifacts: Vec<RunInput> = Vec::new();
         for name in names {
             let src = make_tool_binary(&store_dir, name, "echo ok")?;
-            let mut tp = crate::hartifactcontent::tar::TarPacker::new();
+            let mut tp = heph_core::hartifactcontent::tar::TarPacker::new();
             tp.create_file(
                 src.to_string_lossy().into_owned(),
                 format!("pkg/bin/{name}"),
@@ -2609,7 +2608,7 @@ mod tests {
                     }),
                 },
                 origin_id: origin_id.to_string(),
-                source_addr: crate::htaddr::Addr::default(),
+                source_addr: heph_model::htaddr::Addr::default(),
                 filters: vec![],
                 annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
             });
@@ -2618,7 +2617,7 @@ mod tests {
         // Exec target with one declared tool input matching the shared origin_id.
         let target_def = EngineTargetDef {
             addr: Addr::new(
-                crate::htpkg::PkgBuf::from("pkg"),
+                heph_model::htpkg::PkgBuf::from("pkg"),
                 "consumer".to_string(),
                 BTreeMap::new(),
             ),
@@ -2631,7 +2630,7 @@ mod tests {
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
-                        r#ref: crate::engine::driver::TargetAddr::default(),
+                        r#ref: heph_plugin::driver::TargetAddr::default(),
                         mode: InputMode::Tool,
                         origin_id: origin_id.to_string(),
                         annotations: BTreeMap::from([(
@@ -2661,7 +2660,7 @@ mod tests {
         let bridge = ManagedDriverBridge::new(
             Box::new(Driver::new_bash()),
             Driver::default_exec_shell_fallback(),
-            crate::engine::config_yaml::FuseConfig::default(),
+            heph_driver_support::fuseconfig::FuseConfig::default(),
             None,
         );
 
@@ -2731,8 +2730,8 @@ mod tests {
         // N ManagedRunInput, all sharing the same origin_id and list_path —
         // exactly what `inputs_result_exec` + the managed bridge produce for
         // an N-output tool ref.
-        use crate::engine::driver::{RunInput, inputartifact, outputartifact};
-        let make_managed = || crate::engine::driver_managed::ManagedRunInput {
+        use heph_plugin::driver::{RunInput, inputartifact, outputartifact};
+        let make_managed = || heph_driver_support::driver_managed::ManagedRunInput {
             input: RunInput {
                 artifact: inputartifact::InputArtifact {
                     r#type: inputartifact::Type::Dep,
@@ -2750,7 +2749,7 @@ mod tests {
                     }),
                 },
                 origin_id: origin_id.to_string(),
-                source_addr: crate::htaddr::Addr::default(),
+                source_addr: heph_model::htaddr::Addr::default(),
                 filters: vec![],
                 annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
             },
@@ -2885,7 +2884,7 @@ mod tests {
                     "".to_string(),
                     vec![
                         Input {
-                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            r#ref: heph_plugin::driver::TargetAddr::default(),
                             mode: InputMode::Tool,
                             origin_id: "tool|a|0".to_string(),
                             annotations: BTreeMap::new(),
@@ -2893,7 +2892,7 @@ mod tests {
                             runtime: true,
                         },
                         Input {
-                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            r#ref: heph_plugin::driver::TargetAddr::default(),
                             mode: InputMode::Tool,
                             origin_id: "tool|b|0".to_string(),
                             annotations: BTreeMap::new(),
@@ -2958,7 +2957,7 @@ mod tests {
 
         let tool_path = make_tool_binary(tmp.path(), "node", "echo ok")?;
         let src = Addr::new(
-            crate::htpkg::PkgBuf::from("pkg"),
+            heph_model::htpkg::PkgBuf::from("pkg"),
             "node_tool".to_string(),
             BTreeMap::new(),
         );
@@ -2981,7 +2980,7 @@ mod tests {
                     (
                         "g1".to_string(),
                         vec![Input {
-                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            r#ref: heph_plugin::driver::TargetAddr::default(),
                             mode: InputMode::Tool,
                             origin_id: "tool|g1|0".to_string(),
                             annotations: BTreeMap::new(),
@@ -2992,7 +2991,7 @@ mod tests {
                     (
                         "g2".to_string(),
                         vec![Input {
-                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            r#ref: heph_plugin::driver::TargetAddr::default(),
                             mode: InputMode::Tool,
                             origin_id: "tool|g2|0".to_string(),
                             annotations: BTreeMap::new(),

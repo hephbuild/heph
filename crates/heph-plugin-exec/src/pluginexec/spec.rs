@@ -1,14 +1,14 @@
-use crate::engine::driver::targetdef::path::CodegenMode;
-use crate::htspec::{FromSpecValue, Spec, SpecStruct};
-use crate::htvalue::Value;
-use crate::htvalue::signature::ParamType;
+use heph_plugin::driver::targetdef::path::CodegenMode;
+use heph_plugin::htspec::{FromSpecValue, Spec, SpecStruct};
+use heph_core::htvalue::Value;
+use heph_core::htvalue::signature::ParamType;
 use anyhow::Context;
 use std::collections::HashMap;
 
 /// Exec-driver target config. `#[derive(Spec)]` generates `TargetSpec::from`
 /// (parser) and `TargetSpec::schema` (LSP schema) from these fields, so the two
 /// can never drift; doc comments below become the schema docs. `codegen` is a
-/// [`SpecEnum`](crate::htspec::SpecEnum); `cache` is a bool shorthand or a
+/// [`SpecEnum`](heph_plugin::htspec::SpecEnum); `cache` is a bool shorthand or a
 /// [`SpecStruct`] dict ([`CacheDict`]).
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
@@ -120,8 +120,8 @@ fn parse_cache_history(v: &Value) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::DriverField;
-    use crate::htvalue::Value;
+    use heph_plugin::driver::DriverField;
+    use heph_core::htvalue::Value;
 
     fn make_spec(
         extra: impl IntoIterator<Item = (&'static str, Value)>,
