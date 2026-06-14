@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 // The engine-free plugin option helpers now live in the contract crate;
@@ -244,9 +245,73 @@ pub struct MemCacheConfig {
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
 /// default to off; FUSE is opt-in.
-// FUSE config moved to `heph-driver-support` (the bridge reads it); re-exported
-// so `config_yaml::{FuseConfig, FuseEnabled, FuseMode}` keep resolving.
-pub use heph_driver_support::fuseconfig::{FuseConfig, FuseEnabled, FuseMode};
+// The resolved decision the bridge acts on lives in `heph-driver-support`; the
+// YAML shape + parsing is owned here (central config), and `FuseConfig::mode()`
+// resolves to it.
+pub use heph_driver_support::fuseconfig::FuseMode;
+
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FuseConfig {
+    #[serde(default)]
+    pub enabled: Option<FuseEnabled>,
+}
+
+/// Tri-state config value. Parses YAML `true`, `false`, or `"auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseEnabled {
+    On,
+    Off,
+    Auto,
+}
+
+impl<'de> serde::Deserialize<'de> for FuseEnabled {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error as DeError, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = FuseEnabled;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "true, false, or \"auto\"")
+            }
+            fn visit_bool<E: DeError>(self, v: bool) -> Result<FuseEnabled, E> {
+                Ok(if v { FuseEnabled::On } else { FuseEnabled::Off })
+            }
+            fn visit_str<E: DeError>(self, v: &str) -> Result<FuseEnabled, E> {
+                match v {
+                    "auto" => Ok(FuseEnabled::Auto),
+                    "true" | "on" => Ok(FuseEnabled::On),
+                    "false" | "off" => Ok(FuseEnabled::Off),
+                    other => Err(E::custom(format!(
+                        "expected true/false/auto, got {other:?}"
+                    ))),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl FuseConfig {
+    /// Resolve the YAML config to the bridge's decision enum.
+    pub fn mode(&self) -> FuseMode {
+        match self.enabled {
+            Some(FuseEnabled::On) => FuseMode::On,
+            Some(FuseEnabled::Auto) => FuseMode::Auto,
+            Some(FuseEnabled::Off) | None => FuseMode::Off,
+        }
+    }
+
+    /// Convenience: FUSE off (explicit `enabled: false` or omitted).
+    pub fn is_off(&self) -> bool {
+        matches!(self.mode(), FuseMode::Off)
+    }
+
+    /// Convenience: is FUSE forced on by config?
+    pub fn is_on(&self) -> bool {
+        matches!(self.mode(), FuseMode::On)
+    }
+}
 
 /// Execute-phase lock backend. `lock: { backend: fs | mem }`. Omit the block (or
 /// `backend`) to default to the filesystem backend.

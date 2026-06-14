@@ -1,8 +1,6 @@
 use crate::driver_managed_fuse::ManagedDriverFuse;
 use crate::driver_managed_os::ManagedDriverOs;
-#[cfg(test)]
-use crate::fuseconfig::FuseEnabled;
-use crate::fuseconfig::{FuseConfig, FuseMode};
+use crate::fuseconfig::FuseMode;
 use anyhow::Context;
 use async_trait::async_trait;
 use heph_core::hartifactcontent;
@@ -110,7 +108,7 @@ pub trait ManagedDriver: Send + Sync {
 const AUTO_FUSE_BYTE_THRESHOLD: u64 = 1024 * 1024;
 
 pub struct ManagedDriverBridge {
-    cfg: FuseConfig,
+    cfg: FuseMode,
     os: ManagedDriverOs,
     fuse: Option<ManagedDriverFuse>,
 }
@@ -140,7 +138,7 @@ impl ManagedDriverBridge {
     pub fn new(
         driver: Box<dyn ManagedDriver>,
         shell_fallback: Arc<ShellFallback>,
-        cfg: FuseConfig,
+        cfg: FuseMode,
         fuse: Option<FuseSlot>,
     ) -> Self {
         let driver = Arc::new(driver);
@@ -169,9 +167,7 @@ impl ManagedDriverBridge {
         shell_fallback: Arc<ShellFallback>,
     ) -> Self {
         Self {
-            cfg: FuseConfig {
-                enabled: Some(FuseEnabled::Off),
-            },
+            cfg: FuseMode::Off,
             os: ManagedDriverOs {
                 driver: Arc::new(driver),
                 shell_fallback,
@@ -245,7 +241,7 @@ impl ManagedDriverBridge {
     /// Decides os vs fuse based on `FuseConfig` and (auto only) input
     /// walk. Errors when `enabled=true` but no FUSE mount available.
     fn pick(&self, inputs: &[RunInput]) -> anyhow::Result<Pick> {
-        match self.cfg.mode() {
+        match self.cfg {
             FuseMode::Off => Ok(Pick::Os),
             FuseMode::On => {
                 if self.fuse.is_none() {

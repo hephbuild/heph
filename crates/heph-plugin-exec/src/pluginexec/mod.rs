@@ -2661,7 +2661,7 @@ mod tests {
         let bridge = ManagedDriverBridge::new(
             Box::new(Driver::new_bash()),
             Driver::default_exec_shell_fallback(),
-            heph_driver_support::fuseconfig::FuseConfig::default(),
+            heph_driver_support::fuseconfig::FuseMode::Off,
             None,
         );
 

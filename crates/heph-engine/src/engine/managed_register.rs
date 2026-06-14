@@ -19,7 +19,7 @@ impl Engine {
         ManagedDriverBridge::new(
             driver,
             heph_plugin_exec::pluginexec::Driver::default_exec_shell_fallback(),
-            self.cfg.fuse,
+            self.cfg.fuse.mode(),
             fuse,
         )
     }
