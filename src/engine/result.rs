@@ -153,7 +153,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     res => res,
                                 }?;
 
-                                match m.matches_spec(&spec) {
+                                match crate::engine::matcher_spec::match_spec(m, &spec) {
                                     MatchResult::MatchYes => result.push(addr),
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
@@ -173,7 +173,11 @@ impl ProviderExecutor for EngineProviderExecutor {
                                             }
                                             Err(e) => return Err(e),
                                         };
-                                        if m.matches(&def.target_def) == MatchResult::MatchYes {
+                                        if crate::engine::matcher_target::match_target(
+                                            m,
+                                            &def.target_def,
+                                        ) == MatchResult::MatchYes
+                                        {
                                             result.push(addr);
                                         }
                                     }

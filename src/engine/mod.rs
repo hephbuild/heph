@@ -57,6 +57,7 @@ pub mod gitignore;
 mod grow_stack;
 mod link;
 mod matcher_spec;
+pub mod matcher_target;
 mod meta;
 pub mod sandbox_cleaner;
 pub mod validate;

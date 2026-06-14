@@ -69,7 +69,7 @@ impl Engine {
                                     res => res,
                                 }?;
 
-                                match m.matches_spec(&spec) {
+                                match crate::engine::matcher_spec::match_spec(m, &spec) {
                                     MatchResult::MatchYes => {
                                         if seen.insert(addr.clone()) { yield addr; }
                                     }
@@ -83,7 +83,10 @@ impl Engine {
                                             Err(e) => Err(e)?,
                                         };
 
-                                        if m.matches(&def.target_def) == MatchResult::MatchYes
+                                        if crate::engine::matcher_target::match_target(
+                                            m,
+                                            &def.target_def,
+                                        ) == MatchResult::MatchYes
                                             && seen.insert(addr.clone())
                                         {
                                             yield addr;

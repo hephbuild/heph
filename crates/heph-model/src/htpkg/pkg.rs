@@ -9,7 +9,7 @@ impl PkgBuf {
         self.0.as_bytes()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
