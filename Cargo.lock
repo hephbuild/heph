@@ -1720,6 +1720,7 @@ dependencies = [
  "heph-plugin-buildfile",
  "heph-plugin-exec",
  "heph-plugin-nix",
+ "heph-plugin-query",
  "heph-proc",
  "heph-proto-gen",
  "heph-sandboxfuse",
@@ -1935,6 +1936,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "xxhash-rust",
+]
+
+[[package]]
+name = "heph-plugin-query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "heph-builtins",
+ "heph-core",
+ "heph-model",
+ "heph-plugin",
 ]
 
 [[package]]

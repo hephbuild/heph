@@ -1,0 +1,16 @@
+[package]
+name = "heph-plugin-query"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+heph-core = { path = "../heph-core" }
+heph-model = { path = "../heph-model" }
+heph-plugin = { path = "../heph-plugin" }
+heph-builtins = { path = "../heph-builtins" }
+anyhow = "1.0.102"
+async-trait = "0.1.86"
+futures = "0.3.32"
