@@ -26,21 +26,21 @@
 
 extern crate core;
 
+// Foundational leaves now live in `heph-core`; re-export them at their original
+// module paths so `crate::hasync::…` etc. keep resolving unchanged across the
+// monolith.
+pub use heph_core::{
+    debug_hash, defer, hartifactcontent, hasync, hmemoizer, htplatform, htvalue, version,
+};
+
 pub mod commands;
-pub mod debug_hash;
-pub mod defer;
 pub mod engine;
 pub mod fdlimit;
-pub mod hartifactcontent;
-pub mod hasync;
 pub mod hlock;
-pub mod hmemoizer;
 pub mod htaddr;
 pub mod htmatcher;
 pub mod htpkg;
-pub mod htplatform;
 pub mod htspec;
-pub mod htvalue;
 pub mod htwalk;
 pub mod log;
 pub mod pluginbuildfile;
@@ -60,4 +60,3 @@ pub mod process_watcher;
 pub mod sandboxfuse;
 pub mod telemetry;
 pub mod tui;
-pub mod version;

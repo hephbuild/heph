@@ -27,6 +27,12 @@ pub enum Type {
 pub trait ReadSeek: io::Read + io::Seek {}
 impl<T: io::Read + io::Seek> ReadSeek for T {}
 
+impl std::fmt::Debug for dyn Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Artifact")
+    }
+}
+
 pub trait Content: Send + Sync {
     fn reader(&self) -> anyhow::Result<Box<dyn io::Read>>;
     fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>;

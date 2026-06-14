@@ -1714,6 +1714,7 @@ dependencies = [
  "fuser",
  "futures",
  "glob",
+ "heph-core",
  "heph-proto-gen",
  "htspec-derive",
  "humantime",
@@ -1761,6 +1762,22 @@ dependencies = [
  "wax",
  "which",
  "xattr",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "heph-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "enclose",
+ "futures",
+ "libc",
+ "rustc-hash",
+ "serde",
+ "tar",
+ "tempfile",
+ "tokio",
  "xxhash-rust",
 ]
 

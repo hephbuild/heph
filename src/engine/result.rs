@@ -28,7 +28,6 @@ use crate::hartifactcontent::{Content, ReadSeek, WalkEntry, WalkEntryKind};
 use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
-use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -187,12 +186,6 @@ impl ProviderExecutor for EngineProviderExecutor {
 
             Ok(result)
         })
-    }
-}
-
-impl fmt::Debug for dyn Content {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Artifact")
     }
 }
 
