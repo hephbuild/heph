@@ -18,8 +18,11 @@ pub use cwd::get_cwd;
 pub use cwd::get_cwp;
 mod root;
 pub use root::get_root;
-pub mod driver;
-pub mod error;
+// The plugin contract (driver/provider/error + targetdef/eresult/htspec) now
+// lives in the `heph-plugin` crate; re-export at the original engine paths so
+// `crate::engine::driver::…` etc. resolve unchanged across engine + plugins.
+pub use heph_plugin::driver;
+pub use heph_plugin::error;
 pub mod event;
 mod local_cache;
 mod local_cache_fs;
@@ -31,8 +34,8 @@ mod packages;
 mod remote_cache;
 mod remote_cache_latency;
 mod remote_cache_objstore;
+pub use heph_plugin::provider;
 pub use remote_cache::{RemoteCacheDef, RemoteCacheSet};
-pub mod provider;
 mod query;
 pub mod request_state;
 pub mod spec;

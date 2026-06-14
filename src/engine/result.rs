@@ -202,11 +202,6 @@ pub struct ExtendedTargetDef {
     pub driver: String,
 }
 
-#[derive(Clone)]
-pub struct ArtifactMeta {
-    pub hashout: String,
-}
-
 /// Aggregate of a multi-target fanout. `errors` is non-empty only when the
 /// request was started with `Engine::new_state_with_fail_fast(false)`; with
 /// fail-fast (default), the first error short-circuits `Engine::result` and
@@ -217,15 +212,10 @@ pub struct BatchResult {
     pub errors: Vec<(Addr, anyhow::Error)>,
 }
 
-#[derive(Clone, Default)]
-pub struct EResult {
-    pub artifacts: Vec<Arc<dyn Content>>,
-    /// Auxiliary artifacts a dependent target materializes into its sandbox
-    /// without surfacing in SRC/list env routing. Sourced from the producing
-    /// target's `support_files` declaration; never filtered by output group.
-    pub support_artifacts: Vec<Arc<dyn Content>>,
-    pub artifacts_meta: Vec<ArtifactMeta>,
-}
+// `EResult` + `ArtifactMeta` now live in the `heph-plugin` contract crate (the
+// Driver/Provider trait surface returns them); re-exported here so
+// `crate::engine::result::EResult` keeps resolving across the engine + plugins.
+pub use heph_plugin::eresult::{ArtifactMeta, EResult};
 
 /// A cache-backed artifact paired with the read lock guarding its cache entry.
 /// Delegates every [`Content`] method to the inner artifact; the guard is held

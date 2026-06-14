@@ -1,7 +1,8 @@
-use crate::htaddr::Addr;
-use crate::htpkg::PkgBuf;
-use crate::{hasync, htaddr};
 use async_trait::async_trait;
+use heph_core::hasync;
+use heph_model::htaddr;
+use heph_model::htaddr::Addr;
+use heph_model::htpkg::PkgBuf;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::Display;
 use std::path::PathBuf;
@@ -89,7 +90,7 @@ impl TargetAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::htpkg::PkgBuf;
+    use heph_model::htpkg::PkgBuf;
 
     fn base() -> PkgBuf {
         PkgBuf::from("")
@@ -150,15 +151,18 @@ mod tests {
 }
 
 pub mod sandbox {
-    use crate::engine::driver::TargetAddr;
+    use crate::driver::TargetAddr;
     use serde::{Deserialize, Serialize};
     use smart_default::SmartDefault;
     use std::collections::{BTreeSet, HashMap};
 
     #[derive(Default, Clone, Debug, Serialize, Deserialize)]
     pub struct Sandbox {
-        pub(crate) tools: Vec<Tool>,
-        pub(crate) deps: Vec<Dep>,
+        // Read by driver plugins (pluginexec consumes these to build inputs).
+        // Append via `push_tool`/`push_dep` to keep the dedup indexes in sync;
+        // direct mutation bypasses them.
+        pub tools: Vec<Tool>,
+        pub deps: Vec<Dep>,
         pub env: HashMap<String, Env>,
         // Membership indexes for O(log n) dedup. Derived from tools/deps; not
         // serialized so wire format and hashin bytes are unchanged.
@@ -207,7 +211,7 @@ pub mod sandbox {
             &self.deps
         }
 
-        pub(crate) fn merge_sandbox(&mut self, inbound: Sandbox, id: String) {
+        pub fn merge_sandbox(&mut self, inbound: Sandbox, id: String) {
             for t in inbound.tools {
                 self.push_tool(Tool {
                     id: format!("{}_tool_{}", id, t.id),
@@ -274,7 +278,7 @@ pub mod sandbox {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::htpkg::PkgBuf;
+        use heph_model::htpkg::PkgBuf;
 
         fn tool(addr: &str, group: &str, id: &str) -> Tool {
             Tool {
@@ -379,12 +383,12 @@ pub struct ConfigResponse {
 
 pub struct ParseRequest {
     pub request_id: String,
-    pub target_spec: std::sync::Arc<crate::engine::provider::TargetSpec>,
+    pub target_spec: std::sync::Arc<crate::provider::TargetSpec>,
 }
 
 pub mod targetdef {
-    use crate::engine::driver::TargetAddr;
-    use crate::htaddr::Addr;
+    use crate::driver::TargetAddr;
+    use heph_model::htaddr::Addr;
     use itertools::Itertools;
     use serde::Serialize;
     use std::any::Any;
@@ -600,7 +604,7 @@ pub struct ApplyTransitiveResponse {
 }
 
 pub mod inputartifact {
-    use crate::hartifactcontent::Content;
+    use heph_core::hartifactcontent::Content;
     use std::sync::Arc;
 
     pub enum Type {
@@ -626,7 +630,7 @@ pub struct RunInput {
 }
 
 pub mod outputartifact {
-    use crate::hartifactcontent::{Content as HContent, WalkEntry, WalkEntryKind};
+    use heph_core::hartifactcontent::{Content as HContent, WalkEntry, WalkEntryKind};
     use std::fs::File;
     use std::io;
     use std::io::Read;
@@ -696,9 +700,9 @@ pub mod outputartifact {
                         x: file.x,
                     },
                 }))),
-                Content::TarPath(path) => Box::new(crate::hartifactcontent::tar::TarWalker::new(
-                    File::open(path)?,
-                )?),
+                Content::TarPath(path) => Box::new(
+                    heph_core::hartifactcontent::tar::TarWalker::new(File::open(path)?)?,
+                ),
                 #[expect(clippy::unimplemented, reason = "cpio format is not yet implemented")]
                 Content::CpioPath(_) => unimplemented!("cpio is not implemented"),
             })
@@ -721,6 +725,12 @@ pub struct RunRequest<'a, 'io> {
     pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub sandbox_dir: std::path::PathBuf,
 }
+/// Cleanup closure a driver returns for the engine to run after `cache_locally`.
+/// The FUSE/OS sandbox layers each supply their own teardown; the engine's
+/// `sandbox_cleaner` enqueues it. Defined here (the contract) because
+/// `RunResponse` carries it.
+pub type SandboxCleanupJob = Box<dyn FnOnce() -> std::io::Result<()> + Send + 'static>;
+
 #[derive(Default)]
 pub struct RunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
@@ -730,13 +740,13 @@ pub struct RunResponse {
     /// the OS bridge rms the plain sandbox dir. Result.rs hands this
     /// to `sandbox_cleaner::enqueue` after `cache_locally` finishes,
     /// so the cleaner thread never has to branch on FUSE vs OS.
-    pub sandbox_cleanup: Option<crate::engine::sandbox_cleaner::SandboxCleanupJob>,
+    pub sandbox_cleanup: Option<crate::driver::SandboxCleanupJob>,
     /// FUSE slot guards held open until the result lifecycle ends
     /// (alongside the cleanup `defer!` in result.rs). Dropping a guard
     /// deregisters the slot from the shared `LayeredFs`. Result.rs
     /// holds them across `cache_locally` and drops in the same defer
     /// that enqueues the sandbox-dir cleanup.
-    pub fuse_slot_guards: Vec<crate::sandboxfuse::SlotGuard>,
+    pub fuse_slot_guards: Vec<heph_sandboxfuse::SlotGuard>,
 }
 
 /// One config field a driver accepts in a `target(...)` call, with its type and
@@ -745,7 +755,7 @@ pub struct RunResponse {
 #[derive(Clone, Debug)]
 pub struct DriverField {
     pub name: String,
-    pub ty: crate::htvalue::signature::ParamType,
+    pub ty: heph_core::htvalue::signature::ParamType,
     pub doc: String,
     pub required: bool,
 }

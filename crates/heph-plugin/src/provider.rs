@@ -1,13 +1,13 @@
-use crate::engine::driver::sandbox::Sandbox;
-use crate::engine::result::EResult;
-use crate::hasync::Cancellable;
-use crate::htaddr::Addr;
-use crate::htmatcher::Matcher;
-use crate::htpkg::PkgBuf;
-use crate::htvalue::Value;
-use crate::htvalue::signature::FnSignature;
+use crate::driver::sandbox::Sandbox;
+use crate::eresult::EResult;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
+use heph_core::hasync::Cancellable;
+use heph_core::htvalue::Value;
+use heph_core::htvalue::signature::FnSignature;
+use heph_model::htaddr::Addr;
+use heph_model::htmatcher::Matcher;
+use heph_model::htpkg::PkgBuf;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -133,7 +133,7 @@ pub trait ProviderFn: Send + Sync {
 /// One exposed function: its bare name (no `heph.<provider>.` prefix), its
 /// declarative signature, a one-line doc string, and its handler. The engine
 /// enforces `signature` against every call (see
-/// [`crate::htvalue::signature::FnSignature`]); `doc` is surfaced by the
+/// [`heph_core::htvalue::signature::FnSignature`]); `doc` is surfaced by the
 /// BUILD-file LSP on hover over `heph.<provider>.<name>`.
 pub struct ProviderFunctionDef {
     pub name: String,
@@ -236,7 +236,7 @@ impl std::fmt::Debug for GetError {
 #[derive(Clone, Debug)]
 pub struct StateField {
     pub name: String,
-    pub ty: crate::htvalue::signature::ParamType,
+    pub ty: heph_core::htvalue::signature::ParamType,
     pub doc: String,
     pub required: bool,
 }

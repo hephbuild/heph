@@ -10,7 +10,7 @@
 //! Field/value types implement [`FromSpecValue`] in one of four ways:
 //!   * the primitive + container impls below (`String`, `bool`, `u32`,
 //!     `Vec<String>`, the two `HashMap` shapes) — several are themselves unions
-//!     (e.g. `string | list[string]`), reusing `crate::htvalue::parse_*`;
+//!     (e.g. `string | list[string]`), reusing `heph_core::htvalue::parse_*`;
 //!   * `#[derive(SpecStruct)]` — a nested object with well-known keys
 //!     (`map[...]`);
 //!   * `#[derive(SpecEnum)]` — a string-valued enum;
@@ -18,13 +18,18 @@
 //!     hand-written impl for a bespoke shape (see `TargetSpecCache` in
 //!     `pluginexec::spec`).
 
-use crate::htvalue::signature::ParamType;
-use crate::htvalue::{
+use heph_core::htvalue::signature::ParamType;
+use heph_core::htvalue::{
     Value, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
     parse_strings,
 };
 
 pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
+
+// The `Spec` derive macro emits `crate::htspec::DriverField` / `DriverSchema`
+// (portable across the monolith re-export and this crate). Re-export them here
+// so those expansions resolve wherever the macro is used.
+pub use crate::driver::{DriverField, DriverSchema};
 
 /// A type parsable from a BUILD-file [`Value`] that also describes its own
 /// accepted shape. Implemented for the primitive + container shapes specs use;
@@ -151,7 +156,7 @@ impl FromSpecValue for std::collections::HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::DriverField;
+    use crate::driver::DriverField;
     use std::collections::HashMap;
 
     // A spec exercising the common field shapes plus every per-field override.

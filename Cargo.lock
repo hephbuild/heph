@@ -1715,6 +1715,7 @@ dependencies = [
  "glob",
  "heph-core",
  "heph-model",
+ "heph-plugin",
  "heph-proc",
  "heph-proto-gen",
  "heph-sandboxfuse",
@@ -1793,6 +1794,28 @@ dependencies = [
  "rustc-hash",
  "serde",
  "xxhash-rust",
+]
+
+[[package]]
+name = "heph-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "erased-serde 0.4.10",
+ "futures",
+ "heph-core",
+ "heph-model",
+ "heph-sandboxfuse",
+ "heph-walk",
+ "htspec-derive",
+ "itertools 0.13.0",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "smart-default",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

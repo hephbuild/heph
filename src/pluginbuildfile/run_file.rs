@@ -254,104 +254,104 @@ pub(crate) struct OnTargetPayload {
     pub provenance: Vec<ProvenanceFrame>,
 }
 
-impl Sandbox {
-    fn from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Self> {
-        let m = match m {
-            htvalue::Value::Map(m) => m,
-            htvalue::Value::Null() => {
-                return Ok(Default::default());
-            }
-            _ => anyhow::bail!("Expected map, got {:?}", m),
-        };
-
-        let mut m: HashMap<&str, &htvalue::Value> =
-            m.iter().map(|(k, v)| (k.as_str(), v)).collect();
-
-        let mut sandbox = Self::default();
-
-        if let Some(v) = m.remove("deps") {
-            let parsed = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
-            for (i, (k, ss)) in parsed.iter().enumerate() {
-                for s in ss {
-                    sandbox.push_dep(Dep {
-                        r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `deps`")?,
-                        mode: Mode::None,
-                        group: k.to_string(),
-                        runtime: true,
-                        hash: true,
-                        id: format!("dep|{}|{}", k, i),
-                    });
-                }
-            }
+/// Parse a BUILD-file `sandbox`/`transitive` value (Starlark → `htvalue`) into a
+/// [`Sandbox`]. Free function rather than an inherent `impl` because `Sandbox`
+/// now lives in the `heph-plugin` contract crate (orphan rule).
+fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
+    let m = match m {
+        htvalue::Value::Map(m) => m,
+        htvalue::Value::Null() => {
+            return Ok(Default::default());
         }
+        _ => anyhow::bail!("Expected map, got {:?}", m),
+    };
 
-        if let Some(v) = m.remove("env") {
-            sandbox.env = parse_map_string_string(v)
-                .with_context(|| "parse `env`")?
-                .into_iter()
-                .map(|(k, v)| {
-                    (
-                        k,
-                        Env {
-                            value: EnvValue::Literal(v),
-                            hash: true,
-                            append: false,
-                            append_prefix: "".to_string(),
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-        }
+    let mut m: HashMap<&str, &htvalue::Value> = m.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
-        if let Some(v) = m.remove("tools") {
-            let parsed = parse_map_string_strings(v).with_context(|| "parse `tools`")?;
-            for (i, (k, ss)) in parsed.iter().enumerate() {
-                for s in ss {
-                    sandbox.push_tool(Tool {
-                        r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `tools`")?,
-                        group: k.to_string(),
-                        hash: true,
-                        id: format!("tool|{}|{}", k, i),
-                    });
-                }
+    let mut sandbox = Sandbox::default();
+
+    if let Some(v) = m.remove("deps") {
+        let parsed = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
+        for (i, (k, ss)) in parsed.iter().enumerate() {
+            for s in ss {
+                sandbox.push_dep(Dep {
+                    r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `deps`")?,
+                    mode: Mode::None,
+                    group: k.to_string(),
+                    runtime: true,
+                    hash: true,
+                    id: format!("dep|{}|{}", k, i),
+                });
             }
         }
-
-        if let Some(v) = m.remove("pass_env") {
-            for name in parse_strings(v).with_context(|| "parse `pass_env`")? {
-                sandbox.env.insert(
-                    name,
-                    Env {
-                        value: EnvValue::Pass,
-                        hash: true,
-                        append: false,
-                        append_prefix: "".to_string(),
-                    },
-                );
-            }
-        }
-
-        if let Some(v) = m.remove("runtime_pass_env") {
-            for name in parse_strings(v).with_context(|| "parse `runtime_pass_env`")? {
-                sandbox.env.insert(
-                    name,
-                    Env {
-                        value: EnvValue::Pass,
-                        hash: false,
-                        append: false,
-                        append_prefix: "".to_string(),
-                    },
-                );
-            }
-        }
-
-        if !m.is_empty() {
-            let unknown_keys: Vec<&str> = m.into_keys().collect();
-            anyhow::bail!("unknown entries found: {:?}", unknown_keys)
-        }
-
-        Ok(sandbox)
     }
+
+    if let Some(v) = m.remove("env") {
+        sandbox.env = parse_map_string_string(v)
+            .with_context(|| "parse `env`")?
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    Env {
+                        value: EnvValue::Literal(v),
+                        hash: true,
+                        append: false,
+                        append_prefix: "".to_string(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+    }
+
+    if let Some(v) = m.remove("tools") {
+        let parsed = parse_map_string_strings(v).with_context(|| "parse `tools`")?;
+        for (i, (k, ss)) in parsed.iter().enumerate() {
+            for s in ss {
+                sandbox.push_tool(Tool {
+                    r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `tools`")?,
+                    group: k.to_string(),
+                    hash: true,
+                    id: format!("tool|{}|{}", k, i),
+                });
+            }
+        }
+    }
+
+    if let Some(v) = m.remove("pass_env") {
+        for name in parse_strings(v).with_context(|| "parse `pass_env`")? {
+            sandbox.env.insert(
+                name,
+                Env {
+                    value: EnvValue::Pass,
+                    hash: true,
+                    append: false,
+                    append_prefix: "".to_string(),
+                },
+            );
+        }
+    }
+
+    if let Some(v) = m.remove("runtime_pass_env") {
+        for name in parse_strings(v).with_context(|| "parse `runtime_pass_env`")? {
+            sandbox.env.insert(
+                name,
+                Env {
+                    value: EnvValue::Pass,
+                    hash: false,
+                    append: false,
+                    append_prefix: "".to_string(),
+                },
+            );
+        }
+    }
+
+    if !m.is_empty() {
+        let unknown_keys: Vec<&str> = m.into_keys().collect();
+        anyhow::bail!("unknown entries found: {:?}", unknown_keys)
+    }
+
+    Ok(sandbox)
 }
 
 #[derive(Debug, Clone)]
@@ -617,7 +617,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                         Ok(None)
                     }
                     "transitive" => {
-                        transitive = Sandbox::from(starlark_to_rust(e.1), &PkgBuf::from(extra.pkg))
+                        transitive = sandbox_from(starlark_to_rust(e.1), &PkgBuf::from(extra.pkg))
                             .with_context(|| "transitive")?;
                         Ok(None)
                     }

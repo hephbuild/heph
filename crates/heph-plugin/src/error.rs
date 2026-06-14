@@ -1,4 +1,4 @@
-use crate::htaddr::Addr;
+use heph_model::htaddr::Addr;
 use std::fmt;
 
 #[derive(Debug, Clone)]
