@@ -7,15 +7,15 @@
 use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::{Cancellable, StdCancellationToken};
+use hmodel::htaddr::Addr;
+use hmodel::htmatcher::Matcher;
+use hmodel::htpkg::PkgBuf;
 use hplugin::eresult::{ArtifactMeta, EResult};
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
     ProviderExecutor, TargetSpec,
 };
-use hmodel::htaddr::Addr;
-use hmodel::htmatcher::Matcher;
-use hmodel::htpkg::PkgBuf;
 use plugin_remote::RemoteProvider;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -55,7 +55,9 @@ impl Provider for TestProvider {
                 }),
             ];
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
 
@@ -72,7 +74,9 @@ impl Provider for TestProvider {
                 pkg: PkgBuf::from("//pkg"),
             })];
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                >)
         })
     }
 
@@ -84,11 +88,7 @@ impl Provider for TestProvider {
         Box::pin(async move {
             // Call back into the host to resolve a dependency.
             let dep = addr("//dep", "lib");
-            let eres = req
-                .executor
-                .result(&dep)
-                .await
-                .map_err(GetError::Other)?;
+            let eres = req.executor.result(&dep).await.map_err(GetError::Other)?;
             // Verify the callback round-tripped the artifact metadata.
             let got = eres
                 .artifacts_meta
@@ -597,8 +597,14 @@ async fn multi_driver_routing_one_connection() {
     let (br, bw) = b.into_split();
 
     let mut map: HashMap<String, Arc<dyn ManagedDriver>> = HashMap::new();
-    map.insert("alpha".to_string(), Arc::new(NamedDriver("alpha".to_string())));
-    map.insert("beta".to_string(), Arc::new(NamedDriver("beta".to_string())));
+    map.insert(
+        "alpha".to_string(),
+        Arc::new(NamedDriver("alpha".to_string())),
+    );
+    map.insert(
+        "beta".to_string(),
+        Arc::new(NamedDriver("beta".to_string())),
+    );
     let _guest = plugin_sdk::serve_components(None, map, br, bw);
 
     // One connection, two driver handles selected by name.
@@ -660,7 +666,9 @@ impl Provider for CycleTestProvider {
     {
         Box::pin(async move {
             Ok(Box::new(std::iter::empty())
-                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
     fn list_packages<'a>(
@@ -673,7 +681,9 @@ impl Provider for CycleTestProvider {
     > {
         Box::pin(async move {
             Ok(Box::new(std::iter::empty())
-                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                >)
         })
     }
     fn get<'a>(

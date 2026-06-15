@@ -45,7 +45,9 @@ in
      enable = true;
      channel = "stable";
      components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
-     targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" "wasm32-wasip2" ]
+     # wasip1 is required by cargo-component's default build+adapt path even
+     # when the final component targets wasip2; keep both.
+     targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" "wasm32-wasip1" "wasm32-wasip2" ]
        ++ lib.optionals pkgs.stdenv.isLinux [ "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
    };
 

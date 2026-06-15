@@ -120,7 +120,9 @@ impl Provider for RemoteProvider {
                 }
             }
             Ok(Box::new(out.into_iter())
-                as Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = Result<ListPackageResponse>> + Send,
+                >)
         })
     }
 
@@ -158,9 +160,9 @@ impl Provider for RemoteProvider {
                                 to: req.addr.clone(),
                             },
                         ))),
-                        pb::get_error::Kind::Cancelled => {
-                            Err(GetError::Other(anyhow::Error::new(hplugin::error::CancelledError)))
-                        }
+                        pb::get_error::Kind::Cancelled => Err(GetError::Other(anyhow::Error::new(
+                            hplugin::error::CancelledError,
+                        ))),
                         _ => Err(GetError::Other(anyhow::anyhow!("{}", ge.message))),
                     }
                 }

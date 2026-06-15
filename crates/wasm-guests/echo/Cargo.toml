@@ -1,0 +1,20 @@
+# Standalone workspace root: this guest is built with cargo-component for
+# wasm32-wasip2, kept out of the host workspace. The empty table stops cargo
+# from walking up into the parent repo's workspace.
+[workspace]
+
+[package]
+name = "echo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "component:echo"
+
+[package.metadata.component.dependencies]

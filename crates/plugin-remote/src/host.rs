@@ -101,7 +101,10 @@ impl InboundHandler for HostCallbackHandler {
 impl HostCallbackHandler {
     async fn handle_result(&self, id: u64, req: pb::ResultRequest, mux: &Arc<Mux>) {
         let Some(scope) = self.inner.scope(&req.request_id) else {
-            mux.send_body(id, err_frame(format!("unknown request scope {}", req.request_id)));
+            mux.send_body(
+                id,
+                err_frame(format!("unknown request scope {}", req.request_id)),
+            );
             return;
         };
         let addr = convert::addr_from_pb(req.addr.unwrap_or_default());
@@ -140,7 +143,10 @@ impl HostCallbackHandler {
 
     async fn handle_note_dep(&self, id: u64, req: pb::NoteDepRequest, mux: &Arc<Mux>) {
         let Some(scope) = self.inner.scope(&req.request_id) else {
-            mux.send_body(id, err_frame(format!("unknown request scope {}", req.request_id)));
+            mux.send_body(
+                id,
+                err_frame(format!("unknown request scope {}", req.request_id)),
+            );
             return;
         };
         let addr = convert::addr_from_pb(req.addr.unwrap_or_default());
@@ -162,7 +168,10 @@ impl HostCallbackHandler {
 
     async fn handle_query(&self, id: u64, req: pb::QueryRequest, mux: &Arc<Mux>) {
         let Some(scope) = self.inner.scope(&req.request_id) else {
-            mux.send_body(id, err_frame(format!("unknown request scope {}", req.request_id)));
+            mux.send_body(
+                id,
+                err_frame(format!("unknown request scope {}", req.request_id)),
+            );
             return;
         };
         let matcher = convert::matcher_from_pb(req.matcher.unwrap_or_default());
@@ -180,7 +189,13 @@ impl HostCallbackHandler {
     async fn handle_open_artifact(&self, id: u64, req: pb::OpenArtifactRequest, mux: &Arc<Mux>) {
         let idx: usize = req.handle_id.parse().unwrap_or(usize::MAX);
         let Some(content) = self.inner.leases.get(&req.lease_id, idx) else {
-            mux.send_body(id, err_frame(format!("unknown artifact {}#{}", req.lease_id, req.handle_id)));
+            mux.send_body(
+                id,
+                err_frame(format!(
+                    "unknown artifact {}#{}",
+                    req.lease_id, req.handle_id
+                )),
+            );
             return;
         };
         // Content::reader is sync; read on a blocking thread. M1 reads the whole

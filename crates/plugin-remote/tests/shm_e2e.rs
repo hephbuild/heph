@@ -9,13 +9,13 @@
 use futures::future::BoxFuture;
 use hcore::hasync::{Cancellable, StdCancellationToken};
 use hmodel::htaddr::Addr;
+use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
     ProviderExecutor, TargetSpec,
 };
-use hmodel::htmatcher::Matcher;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -42,7 +42,9 @@ impl Provider for TestProvider {
                 addr: addr("pkg", "a"),
             })];
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
     fn list_packages<'a>(
@@ -55,7 +57,9 @@ impl Provider for TestProvider {
     > {
         Box::pin(async move {
             Ok(Box::new(std::iter::empty())
-                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                >)
         })
     }
     fn get<'a>(
@@ -111,7 +115,10 @@ async fn provider_over_shm() {
     let _guest = plugin_sdk::serve(Arc::new(TestProvider), gr, gw);
     let host = plugin_remote::RemoteProvider::connect(hr, hw, "shm-test");
 
-    assert_eq!(host.config(ConfigRequest {}).expect("config").name, "shm-test");
+    assert_eq!(
+        host.config(ConfigRequest {}).expect("config").name,
+        "shm-test"
+    );
 
     let ctoken = StdCancellationToken::new();
     let executor: Arc<dyn ProviderExecutor> = Arc::new(NoopExec);

@@ -20,11 +20,13 @@ prost = "0.14"
 tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros", "net"] }
 tracing = "0.1"
 libc = "0.2"
+wasmtime = { version = "45", optional = true }
+wasmtime-wasi = { version = "45", optional = true }
 
 [features]
 # heavy transports, off by default; proto (UDS) is always available
 shm = ["plugin-abi/shm"]
-wasm = []
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dev-dependencies]
 plugin-sdk = { path = "../plugin-sdk" }

@@ -5,6 +5,9 @@ edition = "2024"
 
 [workspace]
 members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-sdk", "crates/plugin-remote", "crates/plugin-echo", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
+# wasm guest components are built with cargo-component for wasm32-wasip2, not by
+# the host `cargo build --workspace`; keep them out of the workspace.
+exclude = ["crates/wasm-guests"]
 
 [profile.profiling]
 inherits = "release"

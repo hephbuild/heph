@@ -21,7 +21,7 @@ pub use driver::RemoteDriver;
 pub use managed::RemoteManagedDriver;
 pub use provider::RemoteProvider;
 #[cfg(unix)]
-pub use spawn::{spawn_plugin, spawn_streams, PLUGIN_FD};
+pub use spawn::{PLUGIN_FD, spawn_plugin, spawn_streams};
 
 #[cfg(feature = "shm")]
 pub mod shm;
