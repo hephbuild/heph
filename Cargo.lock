@@ -1291,7 +1291,13 @@ name = "e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core",
+ "futures",
  "heph",
+ "model",
+ "plugin",
+ "plugin-remote",
+ "plugin-sdk",
  "tempfile",
  "testkit",
  "tokio",
