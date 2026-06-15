@@ -3546,6 +3546,8 @@ dependencies = [
  "prost 0.14.4",
  "proto-gen",
  "rkyv",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

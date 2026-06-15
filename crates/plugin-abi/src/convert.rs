@@ -12,9 +12,11 @@ use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+use hplugin::driver::targetdef::{RawDef, RawDefBytes};
 use hplugin::driver::TargetAddr;
 use hplugin::provider::{State, TargetSpec};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 // ---- Addr ----
 
@@ -284,6 +286,25 @@ pub fn matcher_from_pb(m: pb::Matcher) -> Matcher {
     }
 }
 
+// ---- raw_def (opaque driver blob) ----
+
+/// Serialize a driver's `raw_def` to a wire blob (JSON). Works on any `RawDef`,
+/// whether a concrete value (in-process) or a round-tripped [`RawDefBytes`].
+pub fn raw_def_to_blob(raw: &Arc<dyn RawDef>) -> anyhow::Result<pb::RawDefBlob> {
+    let data = serde_json::to_vec(&**raw)?;
+    Ok(pb::RawDefBlob {
+        driver: String::new(),
+        format: pb::raw_def_blob::Format::Json as i32,
+        data: data.into(),
+    })
+}
+
+/// Reconstruct a `raw_def` from a wire blob as a [`RawDefBytes`] carrier. The
+/// receiving driver reads its concrete config via `TargetDef::def_de`.
+pub fn raw_def_from_blob(blob: &pb::RawDefBlob) -> anyhow::Result<Arc<dyn RawDef>> {
+    Ok(Arc::new(RawDefBytes::from_json_slice(&blob.data)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +374,21 @@ mod tests {
             Matcher::Not(Box::new(Matcher::Label("x".to_string()))),
         ]);
         assert_eq!(matcher_from_pb(matcher_to_pb(&m)), m);
+    }
+
+    #[test]
+    fn raw_def_blob_roundtrip() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct D {
+            x: u32,
+        }
+        let raw: Arc<dyn RawDef> = Arc::new(D { x: 5 });
+        let blob = raw_def_to_blob(&raw).expect("to blob");
+        let back = raw_def_from_blob(&blob).expect("from blob");
+        // The reconstructed RawDefBytes re-serializes to the original value.
+        assert_eq!(
+            serde_json::to_value(&*back).expect("reserialize"),
+            serde_json::json!({"x": 5})
+        );
     }
 }

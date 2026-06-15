@@ -422,6 +422,61 @@ pub mod targetdef {
         erased_serde::serialize(&**d, s)
     }
 
+    /// A `RawDef` carried as serialized bytes rather than a concrete value.
+    ///
+    /// `RawDef` is serialize-only (erased), which is enough to ship a target def
+    /// out of the process, but a driver's `run`/`apply_transitive` needs its
+    /// concrete config type back. This carrier closes that loop: it holds the
+    /// serialized value and lazily deserializes it into the requested type on
+    /// the first [`TargetDef::def_de`] call, caching the materialized value so a
+    /// `&T` can be handed out (same ergonomics as the in-process downcast path).
+    ///
+    /// This is how a `TargetDef` round-trips across the plugin boundary (proto /
+    /// shm / wasm): the host wraps the wire blob in a `RawDefBytes`, and the
+    /// driver reads it with `def_de::<ConcreteDef>()`.
+    pub struct RawDefBytes {
+        value: serde_json::Value,
+        cell: std::sync::OnceLock<Box<dyn Any + Send + Sync>>,
+    }
+
+    impl RawDefBytes {
+        /// Wrap an already-parsed JSON value.
+        pub fn from_value(value: serde_json::Value) -> Self {
+            Self {
+                value,
+                cell: std::sync::OnceLock::new(),
+            }
+        }
+
+        /// Wrap a JSON-encoded raw-def blob (as produced by serializing a
+        /// `RawDef`).
+        pub fn from_json_slice(bytes: &[u8]) -> anyhow::Result<Self> {
+            Ok(Self::from_value(serde_json::from_slice(bytes)?))
+        }
+
+        fn materialize<T>(&self) -> &T
+        where
+            T: serde::de::DeserializeOwned + Send + Sync + 'static,
+        {
+            let boxed = self.cell.get_or_init(|| {
+                let v: T = serde_json::from_value(self.value.clone())
+                    .expect("RawDefBytes: deserialize into requested raw_def type");
+                Box::new(v) as Box<dyn Any + Send + Sync>
+            });
+            boxed
+                .downcast_ref::<T>()
+                .expect("RawDefBytes: materialized raw_def type mismatch")
+        }
+    }
+
+    // Serialize transparently as the wrapped value, so re-serializing a
+    // round-tripped `TargetDef` yields the original blob.
+    impl serde::Serialize for RawDefBytes {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            self.value.serialize(s)
+        }
+    }
+
     /// Per-target cache configuration.
     ///
     /// `enabled` gates local caching; `remote_enabled` gates the remote cache
@@ -484,6 +539,26 @@ pub mod targetdef {
                 .downcast_ref::<T>()
                 .expect("TargetDef raw_def type mismatch: wrong type T requested")
         }
+
+        /// Like [`def`](Self::def), but also works when the raw_def crossed a
+        /// process boundary and arrived as a serialized [`RawDefBytes`]: it
+        /// downcasts the concrete value in-process (zero cost), or deserializes
+        /// the carried blob into `T` on first use (cached). Remote-capable
+        /// drivers read their config with this instead of `def`, and their
+        /// def type must be `Serialize + DeserializeOwned`.
+        pub fn def_de<T>(&self) -> &T
+        where
+            T: serde::de::DeserializeOwned + Send + Sync + 'static,
+        {
+            let any = RawDef::as_any(self.raw_def.as_ref());
+            if let Some(v) = any.downcast_ref::<T>() {
+                return v;
+            }
+            any.downcast_ref::<RawDefBytes>()
+                .expect("TargetDef raw_def: neither the concrete type nor a serialized RawDefBytes")
+                .materialize::<T>()
+        }
+
         pub fn set_def<T: serde::Serialize + Send + Sync + 'static>(&mut self, def: T) {
             self.raw_def = Arc::new(def);
         }
@@ -494,6 +569,77 @@ pub mod targetdef {
                 .unique()
                 .cloned()
                 .collect()
+        }
+    }
+
+    #[cfg(test)]
+    mod raw_def_tests {
+        use super::*;
+        use hmodel::htpkg::PkgBuf;
+
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct MyDef {
+            name: String,
+            n: u32,
+        }
+
+        fn td(raw: Arc<dyn RawDef>) -> TargetDef {
+            TargetDef {
+                addr: Addr::new(PkgBuf::from("//x"), "y".to_string(), Default::default()),
+                labels: vec![],
+                raw_def: raw,
+                inputs: vec![],
+                outputs: vec![],
+                support_files: vec![],
+                cache: CacheConfig::off(),
+                pty: false,
+                hash: vec![],
+                transparent: false,
+            }
+        }
+
+        #[test]
+        fn def_de_downcasts_in_process() {
+            let t = td(Arc::new(MyDef {
+                name: "a".to_string(),
+                n: 7,
+            }));
+            assert_eq!(
+                t.def_de::<MyDef>(),
+                &MyDef {
+                    name: "a".to_string(),
+                    n: 7
+                }
+            );
+        }
+
+        #[test]
+        fn def_de_materializes_serialized_blob() {
+            let original = MyDef {
+                name: "a".to_string(),
+                n: 7,
+            };
+            // Serialize as a RawDef would cross the wire, then wrap as bytes.
+            let bytes = serde_json::to_vec(&original).expect("serialize");
+            let t = td(Arc::new(
+                RawDefBytes::from_json_slice(&bytes).expect("wrap"),
+            ));
+            assert_eq!(t.def_de::<MyDef>(), &original);
+        }
+
+        #[test]
+        fn raw_def_bytes_reserializes_to_original() {
+            let original = MyDef {
+                name: "a".to_string(),
+                n: 7,
+            };
+            let bytes = serde_json::to_vec(&original).expect("serialize");
+            let t = td(Arc::new(
+                RawDefBytes::from_json_slice(&bytes).expect("wrap"),
+            ));
+            // Re-serializing the (round-tripped) raw_def yields the original.
+            let reser = serde_json::to_value(&*t.raw_def).expect("reserialize");
+            assert_eq!(reser, serde_json::json!({"name": "a", "n": 7}));
         }
     }
 
