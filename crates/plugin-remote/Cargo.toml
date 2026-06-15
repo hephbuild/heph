@@ -23,7 +23,7 @@ libc = "0.2"
 
 [features]
 # heavy transports, off by default; proto (UDS) is always available
-shm = []
+shm = ["plugin-abi/shm"]
 wasm = []
 
 [dev-dependencies]

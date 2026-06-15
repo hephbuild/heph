@@ -29,3 +29,6 @@ pub mod convert;
 pub mod frame;
 #[cfg(feature = "transport")]
 pub mod mux;
+
+#[cfg(feature = "shm")]
+pub mod shm;

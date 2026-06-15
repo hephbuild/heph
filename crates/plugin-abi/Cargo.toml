@@ -22,10 +22,13 @@ prost = { version = "0.14", optional = true }
 tokio = { version = "1.52", features = ["io-util", "rt", "sync", "macros"], optional = true }
 async-trait = { version = "0.1.89", optional = true }
 tracing = { version = "0.1", optional = true }
+# shm tier (iceoryx2 byte-pipe under the existing Mux)
+iceoryx2 = { version = "0.9", optional = true }
 
 [features]
 convert = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:serde_json"]
 transport = ["dep:prost", "dep:tokio", "dep:async-trait", "dep:tracing"]
+shm = ["transport", "dep:iceoryx2"]
 
 [dev-dependencies]
 rkyv = "0.8"
