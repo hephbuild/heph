@@ -3644,6 +3644,7 @@ dependencies = [
  "plugin",
  "plugin-exec",
  "plugin-query",
+ "plugin-sdk",
  "proc",
  "serde",
  "serde_json",

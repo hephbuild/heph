@@ -21,7 +21,7 @@ pub use ctx::Ctx;
 pub use host::HostClient;
 pub use serve::{serve, serve_components, serve_driver, serve_managed_driver, serve_plugin};
 #[cfg(unix)]
-pub use serve::serve_inherited;
+pub use serve::{serve_components_inherited, serve_inherited};
 
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
 pub use hplugin::{driver, eresult, provider};

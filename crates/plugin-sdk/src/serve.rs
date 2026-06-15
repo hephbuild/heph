@@ -106,15 +106,34 @@ where
 /// `main` typically does just `serve_inherited(Arc::new(MyProvider)).await`.
 #[cfg(unix)]
 pub async fn serve_inherited(provider: Arc<dyn Provider>) -> anyhow::Result<()> {
+    let (r, w) = inherited_fd3()?;
+    serve(provider, r, w).wait_closed().await;
+    Ok(())
+}
+
+/// Guest entry point for a multi-component plugin (a provider and/or several
+/// named managed drivers — the plugin-go shape) over the inherited fd 3.
+#[cfg(unix)]
+pub async fn serve_components_inherited(
+    provider: Option<Arc<dyn Provider>>,
+    managed: HashMap<String, Arc<dyn ManagedDriver>>,
+) -> anyhow::Result<()> {
+    let (r, w) = inherited_fd3()?;
+    serve_components(provider, managed, r, w).wait_closed().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn inherited_fd3() -> anyhow::Result<(
+    tokio::net::unix::OwnedReadHalf,
+    tokio::net::unix::OwnedWriteHalf,
+)> {
     use std::os::unix::io::FromRawFd;
     // SAFETY: fd 3 is the protocol socket the host passed us at spawn; we own it.
     let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(3) };
     std_stream.set_nonblocking(true)?;
     let stream = tokio::net::UnixStream::from_std(std_stream)?;
-    let (r, w) = stream.into_split();
-    let mux = serve(provider, r, w);
-    mux.wait_closed().await;
-    Ok(())
+    Ok(stream.into_split())
 }
 
 struct GuestHandler {

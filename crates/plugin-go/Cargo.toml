@@ -16,6 +16,7 @@ hbuiltins = { package = "builtins", path = "../builtins" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "../plugin-exec" }
 hplugin-query = { package = "plugin-query", path = "../plugin-query" }
+plugin-sdk = { path = "../plugin-sdk" }
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
@@ -28,6 +29,10 @@ borsh = { version = "1.6.1", features = ["derive"] }
 glob = "0.3"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
+
+[[bin]]
+name = "heph-plugin-go"
+path = "src/bin/heph-plugin-go.rs"
 
 [dev-dependencies]
 tempfile = "3"
