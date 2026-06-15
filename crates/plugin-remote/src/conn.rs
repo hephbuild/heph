@@ -14,6 +14,7 @@ use plugin_abi::mux::Mux;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+#[derive(Clone)]
 pub struct RemotePlugin {
     mux: Arc<Mux>,
     inner: Arc<HostInner>,

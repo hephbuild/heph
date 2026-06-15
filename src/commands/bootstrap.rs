@@ -109,15 +109,36 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
             .with_walker(init.walker.clone()),
         ))
     })?;
-    e.register_provider_factory("go", |init, opts| {
-        Ok(Box::new(plugingo::Provider::from_options(
-            init.root.to_path_buf(),
-            &init.skip_dirs,
-            &init.skip_globs,
-            opts,
-            init.walker.clone(),
-        )?))
-    })?;
+    // The go plugin can run out-of-process (opt-in via HEPH_REMOTE_GO): one
+    // heph-plugin-go process serves the `go` provider + golist/embed/testmain
+    // drivers over the plugin transport. Default stays in-process.
+    let remote_go = std::env::var_os("HEPH_REMOTE_GO").is_some()
+        && tokio::runtime::Handle::try_current().is_ok();
+    if remote_go {
+        register_remote_go(&mut e, &root)?;
+    } else {
+        e.register_provider_factory("go", |init, opts| {
+            Ok(Box::new(plugingo::Provider::from_options(
+                init.root.to_path_buf(),
+                &init.skip_dirs,
+                &init.skip_globs,
+                opts,
+                init.walker.clone(),
+            )?))
+        })?;
+        e.register_managed_driver_factory("go_golist", |_init, opts| {
+            config_yaml::deny_unknown("go_golist driver", opts, &[])?;
+            Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
+        })?;
+        e.register_managed_driver_factory("go_embed", |_init, opts| {
+            config_yaml::deny_unknown("go_embed driver", opts, &[])?;
+            Ok(Box::new(plugingo::GoEmbedDriver))
+        })?;
+        e.register_managed_driver_factory("go_testmain", |_init, opts| {
+            config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
+            Ok(Box::new(plugingo::GoTestmainDriver))
+        })?;
+    }
 
     e.register_managed_driver_factory("exec", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
@@ -127,18 +148,6 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     })?;
     e.register_managed_driver_factory("sh", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
-    })?;
-    e.register_managed_driver_factory("go_golist", |_init, opts| {
-        config_yaml::deny_unknown("go_golist driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
-    })?;
-    e.register_managed_driver_factory("go_embed", |_init, opts| {
-        config_yaml::deny_unknown("go_embed driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoEmbedDriver))
-    })?;
-    e.register_managed_driver_factory("go_testmain", |_init, opts| {
-        config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoTestmainDriver))
     })?;
 
     e.apply_config(&file.providers, &file.drivers)?;
@@ -397,4 +406,48 @@ drivers:
             "trigger after resume must cancel"
         );
     }
+}
+
+/// Spawn `heph-plugin-go` (next to the heph executable) and register its `go`
+/// provider + golist/embed/testmain managed drivers as remote handles sharing
+/// one connection. Opt-in via `HEPH_REMOTE_GO`. plugin-go stays Rust — this just
+/// runs it out-of-process.
+#[cfg(unix)]
+fn register_remote_go(e: &mut engine::Engine, root: &std::path::Path) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate heph executable")?;
+    let bin = exe
+        .parent()
+        .map(|p| p.join("heph-plugin-go"))
+        .context("heph-plugin-go directory")?;
+    let env = vec![
+        (
+            "HEPH_PLUGIN_GO_ROOT".to_string(),
+            root.to_string_lossy().into_owned(),
+        ),
+        ("HEPH_PLUGIN_GO_BIN".to_string(), "//@heph/bin:go".to_string()),
+    ];
+    let ((r, w), child) = hplugin_remote::spawn_streams(&bin, &[], &env)
+        .with_context(|| format!("spawn {}", bin.display()))?;
+    // The plugin self-exits when our end of the socket closes (engine drop), so
+    // we don't reap the child eagerly.
+    std::mem::forget(child);
+    let plugin = hplugin_remote::RemotePlugin::connect(r, w);
+    // Register as factories (same opt-in semantics as in-process): only
+    // activated when the config lists `go` / `go_*`.
+    {
+        let p = plugin.clone();
+        e.register_provider_factory("go", move |_init, _opts| Ok(Box::new(p.provider("go"))))?;
+    }
+    for name in ["go_golist", "go_embed", "go_testmain"] {
+        let p = plugin.clone();
+        e.register_managed_driver_factory(name, move |_init, _opts| {
+            Ok(Box::new(p.managed_driver(name)))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn register_remote_go(_e: &mut engine::Engine, _root: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::bail!("HEPH_REMOTE_GO is only supported on unix")
 }

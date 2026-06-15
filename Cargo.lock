@@ -1971,6 +1971,7 @@ dependencies = [
  "plugin-go",
  "plugin-nix",
  "plugin-query",
+ "plugin-remote",
  "posthog-rs",
  "pprof",
  "proc",
