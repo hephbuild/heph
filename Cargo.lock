@@ -3951,6 +3951,7 @@ dependencies = [
  "minijinja",
  "model",
  "plugin",
+ "plugin-sdk",
  "proc",
  "serde",
  "serde_json",

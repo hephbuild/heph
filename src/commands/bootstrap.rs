@@ -140,15 +140,22 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         })?;
     }
 
-    e.register_managed_driver_factory("exec", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
-    })?;
-    e.register_managed_driver_factory("bash", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
-    })?;
-    e.register_managed_driver_factory("sh", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
-    })?;
+    // exec/bash/sh can likewise run out-of-process (opt-in via HEPH_REMOTE_EXEC).
+    let remote_exec = std::env::var_os("HEPH_REMOTE_EXEC").is_some()
+        && tokio::runtime::Handle::try_current().is_ok();
+    if remote_exec {
+        register_remote_exec(&mut e)?;
+    } else {
+        e.register_managed_driver_factory("exec", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+        })?;
+        e.register_managed_driver_factory("bash", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+        })?;
+        e.register_managed_driver_factory("sh", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
+        })?;
+    }
 
     e.apply_config(&file.providers, &file.drivers)?;
 
@@ -430,7 +437,9 @@ fn register_remote_go(e: &mut engine::Engine, root: &std::path::Path) -> anyhow:
         .with_context(|| format!("spawn {}", bin.display()))?;
     // The plugin self-exits when our end of the socket closes (engine drop), so
     // we don't reap the child eagerly.
-    std::mem::forget(child);
+    // Dropping the handle does not kill the child (std detaches); the plugin
+    // self-exits when our socket end closes at engine drop.
+    drop(child);
     let plugin = hplugin_remote::RemotePlugin::connect(r, w);
     // Register as factories (same opt-in semantics as in-process): only
     // activated when the config lists `go` / `go_*`.
@@ -450,4 +459,33 @@ fn register_remote_go(e: &mut engine::Engine, root: &std::path::Path) -> anyhow:
 #[cfg(not(unix))]
 fn register_remote_go(_e: &mut engine::Engine, _root: &std::path::Path) -> anyhow::Result<()> {
     anyhow::bail!("HEPH_REMOTE_GO is only supported on unix")
+}
+
+/// Spawn `heph-plugin-exec` and register its exec/bash/sh managed drivers as
+/// remote handles sharing one connection. Opt-in via `HEPH_REMOTE_EXEC`.
+#[cfg(unix)]
+fn register_remote_exec(e: &mut engine::Engine) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate heph executable")?;
+    let bin = exe
+        .parent()
+        .map(|p| p.join("heph-plugin-exec"))
+        .context("heph-plugin-exec directory")?;
+    let ((r, w), child) = hplugin_remote::spawn_streams(&bin, &[], &[])
+        .with_context(|| format!("spawn {}", bin.display()))?;
+    // Dropping the handle does not kill the child (std detaches); the plugin
+    // self-exits when our socket end closes at engine drop.
+    drop(child);
+    let plugin = hplugin_remote::RemotePlugin::connect(r, w);
+    for name in ["exec", "bash", "sh"] {
+        let p = plugin.clone();
+        e.register_managed_driver_factory(name, move |_init, _opts| {
+            Ok(Box::new(p.managed_driver(name)))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn register_remote_exec(_e: &mut engine::Engine) -> anyhow::Result<()> {
+    anyhow::bail!("HEPH_REMOTE_EXEC is only supported on unix")
 }

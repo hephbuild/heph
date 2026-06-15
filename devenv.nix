@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p walk -p proc -p model -p sandboxfuse -p plugin -p builtins -p plugin-buildfile -p driver-support -p plugin-exec -p plugin-nix -p plugin-query -p plugin-go -p telemetry -p tui -p lock -p engine";
+  qualityCrates = "-p heph -p e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-remote -p plugin-echo -p builtins -p plugin-buildfile -p driver-support -p plugin-exec -p plugin-nix -p plugin-query -p plugin-go -p telemetry -p tui -p lock -p engine";
 in
 {
   # https://devenv.sh/basics/
@@ -18,6 +18,10 @@ in
     pkgs.cargo-zigbuild
     pkgs.tokio-console
     pkgs.sccache
+    # wasm component tooling for the wasm plugin transport (M4): build guest
+    # components + inspect/convert wasm.
+    pkgs.cargo-component
+    pkgs.wasm-tools
     # pkg-config + libfuse for the `fuse-sandbox` feature.
     # - Linux: `fuse3` ships headers/pc files fuser links against.
     # - macOS: `macfuse-stubs` provides the build-time `osxfuse.pc` per
@@ -41,7 +45,7 @@ in
      enable = true;
      channel = "stable";
      components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
-     targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" ]
+     targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" "wasm32-wasip2" ]
        ++ lib.optionals pkgs.stdenv.isLinux [ "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
    };
 
