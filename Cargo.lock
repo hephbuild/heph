@@ -3539,8 +3539,15 @@ name = "plugin-abi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "core",
+ "model",
+ "plugin",
+ "prost 0.14.4",
  "proto-gen",
  "rkyv",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3657,15 +3664,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "futures",
+ "model",
+ "plugin",
+ "plugin-abi",
+ "plugin-sdk",
+ "prost 0.14.4",
+ "tokio",
+ "tracing",
+ "walk",
+]
+
+[[package]]
 name = "plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "core",
+ "futures",
  "model",
  "plugin",
  "plugin-abi",
+ "prost 0.14.4",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

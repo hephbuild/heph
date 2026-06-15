@@ -1,5 +1,5 @@
 [package]
-name = "plugin-sdk"
+name = "plugin-remote"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,10 +10,20 @@ workspace = true
 hplugin = { package = "plugin", path = "../plugin" }
 hmodel = { package = "model", path = "../model" }
 hcore = { package = "core", path = "../core" }
+hwalk = { package = "walk", path = "../walk" }
 plugin-abi = { path = "../plugin-abi", features = ["convert", "transport"] }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 futures = "0.3.32"
 prost = "0.14"
-tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros"] }
+tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros", "net"] }
 tracing = "0.1"
+
+[features]
+# heavy transports, off by default; proto (UDS) is always available
+shm = []
+wasm = []
+
+[dev-dependencies]
+plugin-sdk = { path = "../plugin-sdk" }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time"] }

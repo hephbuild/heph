@@ -15,9 +15,11 @@
 
 pub mod ctx;
 pub mod host;
+pub mod serve;
 
 pub use ctx::Ctx;
 pub use host::HostClient;
+pub use serve::serve;
 
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
 pub use hplugin::{driver, eresult, provider};

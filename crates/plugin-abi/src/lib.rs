@@ -24,3 +24,8 @@ pub mod shm_types;
 
 #[cfg(feature = "convert")]
 pub mod convert;
+
+#[cfg(feature = "transport")]
+pub mod frame;
+#[cfg(feature = "transport")]
+pub mod mux;
