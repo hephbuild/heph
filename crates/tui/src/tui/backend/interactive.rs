@@ -156,7 +156,12 @@ pub async fn run<A: App + 'static>(
                             // `stderr_backend.rs`). The stream is rebuilt on resume.
                             events = None;
                             drain_logs_to_terminal(&mut terminal, &mut rx, cols);
-                            drop(terminal.clear());
+                            // Collapse to the viewport origin (not `terminal.clear()`,
+                            // which restores the live bottom-of-box cursor): the
+                            // cooked-mode stdout write below must land at the box's
+                            // top so the resume re-anchor reuses the cleared rows
+                            // instead of stranding them as a blank gap.
+                            collapse_inline_viewport(&mut terminal);
                             drop(terminal.show_cursor());
                             drop(disable_raw_mode());
                             sink.switch_to_direct();
@@ -330,42 +335,48 @@ pub async fn run<A: App + 'static>(
         }
     };
 
-    if !paused {
-        // Flush any still-buffered build-event logs into the terminal scrollback
-        // *above* the viewport. This must stay on the terminal path
-        // (`insert_before`): it wraps to the viewport width and skips blank lines.
-        // The post-teardown `drain_logs_to_stderr` fallback writes raw bytes, so
-        // letting empties fall through to it dumps stray newlines after the box.
-        drain_logs_to_terminal(&mut terminal, &mut rx, cols);
-        // Render one final frame and capture its viewport origin in the *same*
-        // draw, so the anchor matches exactly where the box sits on screen — the
-        // drain above may have scrolled the viewport via `insert_before`, so a
-        // stale origin would be off by the inserted line count. `Frame::area().y`
-        // is ratatui's own anchor for the inline region — no cursor DSR query, so
-        // nothing can race crossterm's reader.
-        let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
-        let lines = view.render(frame, now_unix_ms(), cols, rows);
-        let mut anchor_row: u16 = 0;
-        drop(terminal.draw(|f| {
-            let area = f.area();
-            anchor_row = area.y;
-            f.render_widget(Paragraph::new(Text::from(lines)), area);
-        }));
-        // Collapse the inline viewport and leave the cursor at its origin so the
-        // final summary (printed below) lands where the box started. We do this
-        // by hand from `anchor_row` rather than via `terminal.clear()`, which
-        // would issue a cursor DSR query (deadlocking crossterm's reader vs the
-        // EventStream) and restore the live bottom-of-box cursor.
+    if paused {
+        // The run finished while a `BufferedStdout` flush had the TUI paused: the
+        // pause already tore the viewport down (cleared + cooked mode) and wrote
+        // straight to stdout, so the live cursor now sits just below that output.
+        // Rebuild the terminal so its inline viewport re-anchors there (a DSR
+        // query with no `EventStream` alive — the pause dropped it), then fall
+        // through to the same collapse. Without this the summary would print at
+        // the stale paused cursor, stranding the reserved viewport rows as a
+        // blank gap above it.
+        //
+        // Use a 1-row viewport, not the full box height: we only render the
+        // one-line summary from here on, and a tall viewport whose cursor sits at
+        // the bottom of the screen (after a long stdout dump) makes
+        // `compute_inline_size` scroll a box-height of blank rows in to reserve
+        // space — exactly the gap we're avoiding.
+        drop(enable_raw_mode());
+        if let Ok(rebuilt) = Terminal::with_options(
+            StderrBackend::new(io::stderr()),
+            TerminalOptions {
+                viewport: Viewport::Inline(1),
+            },
+        ) {
+            terminal = rebuilt;
+        }
+        cols = terminal_cols(&terminal);
+    }
+
+    // Flush any still-buffered build-event logs into the terminal scrollback
+    // *above* the viewport. This must stay on the terminal path (`insert_before`):
+    // it wraps to the viewport width and skips blank lines. The post-teardown
+    // `drain_logs_to_stderr` fallback writes raw bytes, so letting empties fall
+    // through to it dumps stray newlines after the box.
+    drain_logs_to_terminal(&mut terminal, &mut rx, cols);
+    // Collapse the viewport to its origin so the final summary (printed below)
+    // lands where the box started, not below it.
+    collapse_inline_viewport(&mut terminal);
+    {
         let backend = terminal.backend_mut();
-        drop(backend.set_cursor_position(Position {
-            x: 0,
-            y: anchor_row,
-        }));
-        drop(backend.clear_region(ClearType::AfterCursor));
         drop(backend.show_cursor());
         drop(Backend::flush(backend));
-        drop(disable_raw_mode());
     }
+    drop(disable_raw_mode());
     sink.switch_to_direct();
     drain_logs_to_stderr(&mut rx);
 
@@ -435,6 +446,28 @@ fn reanchor_after_resize(
     *events = Some(EventStream::new());
     // The backend size ratatui actually re-anchored to is the source of truth.
     *cols = terminal_cols(terminal);
+}
+
+/// Collapse the inline viewport: erase the box and leave the cursor at the
+/// viewport's origin (top-left). Used at pause and at exit so whatever is
+/// printed next — a cooked-mode stdout flush, or the final summary — lands where
+/// the box started rather than below it.
+///
+/// Unlike [`ratatui::Terminal::clear`], this issues no cursor DSR query (so it
+/// can't race crossterm's reader) and does not restore the live bottom-of-box
+/// cursor. Restoring the live cursor is what stranded the cleared rows as a
+/// blank gap: on pause, the stdout write then landed at the box's bottom and the
+/// resume re-anchored a full viewport-height lower. The empty `draw` diffs the
+/// box away; `Frame::area().y` is ratatui's own inline anchor.
+fn collapse_inline_viewport(terminal: &mut StderrTerminal) {
+    let mut anchor_row: u16 = 0;
+    drop(terminal.draw(|f| anchor_row = f.area().y));
+    let backend = terminal.backend_mut();
+    drop(backend.set_cursor_position(Position {
+        x: 0,
+        y: anchor_row,
+    }));
+    drop(backend.clear_region(ClearType::AfterCursor));
 }
 
 fn drain_logs_to_terminal(
