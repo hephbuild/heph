@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+// Shared value/address/sandbox types for the heph external-plugin ABI.
+// Mirrors the in-process contract types in crates/plugin and crates/model so
+// the same logical interface can be carried over proto (UDS), shm (iceoryx2)
+// and wasm transports. See crates/plugin-abi/README.md.
+package heph.plugin.v1;
+
+// Dynamic config value. Mirrors hcore::htvalue::Value. Kept distinct from
+// google.protobuf.Value because heph distinguishes Int/Uint/Float and Null.
+message Value {
+  message Null {}
+  message Map {
+    map<string, Value> entries = 1;
+  }
+  message List {
+    repeated Value items = 1;
+  }
+  oneof kind {
+    string string_val = 1;
+    bool bool_val = 2;
+    double float_val = 3;
+    int64 int_val = 4;
+    uint64 uint_val = 5;
+    Null null_val = 6;
+    Map map_val = 7;
+    List list_val = 8;
+  }
+}
+
+// Target address. Mirrors hmodel::Addr (package //pkg : name @args).
+message Addr {
+  string package = 1;
+  string name = 2;
+  map<string, string> args = 3;
+}
+
+// A reference to (an output of) a target. Mirrors driver::TargetAddr.
+message TargetAddr {
+  Addr ref = 1;
+  optional string output = 2;
+  repeated string filters = 3;
+}
+
+// Provider-emitted state attached to a package. Mirrors provider::State.
+message State {
+  string package = 1;
+  string provider = 2;
+  map<string, Value> state = 3;
+}
+
+// Query predicate. Mirrors hmodel::Matcher (recursive).
+message Matcher {
+  message List {
+    repeated Matcher matchers = 1;
+  }
+  oneof kind {
+    Addr addr = 1;
+    string label = 2;
+    string package = 3;
+    string package_prefix = 4;
+    string tree_output_to = 5;
+    List or = 6;
+    List and = 7;
+    Matcher not = 8;
+  }
+}
+
+// ---- Sandbox (driver::sandbox) ----
+
+enum DepMode {
+  DEP_MODE_UNSPECIFIED = 0;
+  DEP_MODE_NONE = 1;
+  DEP_MODE_LINK = 2;
+}
+
+message Tool {
+  TargetAddr ref = 1;
+  string group = 2;
+  bool hash = 3;
+  string id = 4;
+}
+
+message Dep {
+  TargetAddr ref = 1;
+  DepMode mode = 2;
+  string group = 3;
+  bool runtime = 4;
+  bool hash = 5;
+  string id = 6;
+}
+
+message Env {
+  // EnvValue: literal string, or "pass" (inherit from host env).
+  oneof value {
+    string literal = 1;
+    bool pass = 2; // set true for Pass
+  }
+  bool hash = 3;
+  bool append = 4;
+  string append_prefix = 5;
+}
+
+message Sandbox {
+  repeated Tool tools = 1;
+  repeated Dep deps = 2;
+  map<string, Env> env = 3;
+}

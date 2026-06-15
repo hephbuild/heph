@@ -1,0 +1,15 @@
+[package]
+name = "plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hplugin = { package = "plugin", path = "../plugin" }
+hmodel = { package = "model", path = "../model" }
+hcore = { package = "core", path = "../core" }
+plugin-abi = { path = "../plugin-abi" }
+anyhow = "1.0.102"
+async-trait = "0.1.89"

@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+// Driver-exported methods. Mirrors the hplugin::Driver trait.
+// NOTE: schema() (DriverSchema) is not yet modeled; added when needed.
+package heph.plugin.v1;
+
+import "plugin/v1/common.proto";
+import "plugin/v1/targetdef.proto";
+import "plugin/v1/callback.proto";
+
+message ParseRequest {
+  string request_id = 1;
+  TargetSpec target_spec = 2;
+}
+message ParseResponse {
+  TargetDef target_def = 1;
+}
+
+message ApplyTransitiveRequest {
+  string request_id = 1;
+  TargetDef target_def = 2;
+  Sandbox sandbox = 3;
+}
+message ApplyTransitiveResponse {
+  TargetDef target_def = 1;
+}
+
+// Run inputs are materialized dep artifacts — also abstract, so they cross as
+// ArtifactHandles; the host materializes them into the sandbox dir.
+message RunInput {
+  ArtifactHandle artifact = 1;
+  string origin_id = 2;
+  Addr source_addr = 3;
+  repeated string filters = 4;
+  map<string, string> annotations = 5;
+}
+
+message RunRequest {
+  string request_id = 1;
+  TargetDef target = 2;
+  string tree_root_path = 3;
+  repeated RunInput inputs = 4;
+  string hashin = 5;
+  string sandbox_dir = 6;
+  // stdio crosses as inherited fds at spawn, not through the RPC channel;
+  // these flags only say whether the host wired each stream.
+  bool has_stdin = 7;
+  bool has_stdout = 8;
+  bool has_stderr = 9;
+  // true => run_shell, false => run
+  bool shell = 10;
+}
+
+// fuse_slot_guards and sandbox_cleanup are non-transferable host RAII,
+// constructed host-side after the remote run returns.
+message RunResponse {
+  repeated OutputArtifactRef artifacts = 1;
+}

@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+// Transport framing + handshake. One mux loop per connection: every Frame
+// carries a correlation id; bodies are either host->plugin calls, plugin->host
+// callbacks, or control. Used directly by the proto transport; the shm/wasm
+// transports reuse the same logical bodies.
+package heph.plugin.v1;
+
+import "plugin/v1/provider.proto";
+import "plugin/v1/driver.proto";
+import "plugin/v1/callback.proto";
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_PROTO = 1;
+  TRANSPORT_SHM = 2;
+  TRANSPORT_WASM = 3;
+}
+
+enum PluginKind {
+  PLUGIN_KIND_UNSPECIFIED = 0;
+  PLUGIN_KIND_PROVIDER = 1;
+  PLUGIN_KIND_DRIVER = 2;
+  PLUGIN_KIND_BOTH = 3;
+}
+
+enum PayloadEncoding {
+  PAYLOAD_ENCODING_UNSPECIFIED = 0;
+  PAYLOAD_ENCODING_PROST = 1;
+  PAYLOAD_ENCODING_RKYV = 2;  // Rust zero-copy fast path (shm)
+  PAYLOAD_ENCODING_CAPNP = 3; // polyglot zero-copy (shm, e.g. Go)
+}
+
+// Plugin -> host on connect.
+message Handshake {
+  string abi_semver = 1;
+  Transport transport = 2;
+  string plugin_name = 3;
+  PluginKind kind = 4;
+  uint64 capabilities = 5;
+  PayloadEncoding payload_encoding = 6;
+}
+
+// Host -> plugin reply.
+message Hello {
+  string abi_semver = 1;
+  uint64 host_capabilities = 2;
+}
+
+message Cancel {
+  uint64 request_id = 1;
+}
+
+message Error {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_OTHER = 1;
+    KIND_CANCELLED = 2;
+    KIND_NOT_FOUND = 3;
+  }
+  Kind kind = 1;
+  string message = 2;
+}
+
+// One element of a streamed response (e.g. an encoded ListResponse, or a chunk
+// of artifact bytes from OpenArtifact), correlated by the frame id.
+message StreamItem {
+  bytes item = 1;
+}
+message StreamEnd {
+  optional Error error = 1;
+}
+
+message Frame {
+  uint64 id = 1;
+  oneof body {
+    // control
+    Handshake handshake = 2;
+    Hello hello = 3;
+    Cancel cancel = 4;
+    Error error = 5;
+    StreamItem stream_item = 6;
+    StreamEnd stream_end = 7;
+
+    // plugin-exported calls (host->plugin request / plugin->host response)
+    ConfigRequest config_req = 16;
+    ConfigResponse config_resp = 17;
+    ListRequest list_req = 18; // results stream via StreamItem(ListResponse)
+    ListPackagesRequest list_packages_req = 19; // results stream via StreamItem
+    GetRequest get_req = 20;
+    GetResponse get_resp = 21;
+    GetError get_err = 22;
+    ProbeRequest probe_req = 23;
+    ProbeResponse probe_resp = 24;
+    ParseRequest parse_req = 25;
+    ParseResponse parse_resp = 26;
+    ApplyTransitiveRequest apply_transitive_req = 27;
+    ApplyTransitiveResponse apply_transitive_resp = 28;
+    RunRequest run_req = 29;
+    RunResponse run_resp = 30;
+
+    // host-exported callbacks (plugin->host request / host->plugin response)
+    ResultRequest result_req = 40;
+    ResultResponse result_resp = 41;
+    OpenArtifactRequest open_artifact_req = 42;
+    NoteDepRequest note_dep_req = 43;
+    NoteDepResponse note_dep_resp = 44;
+    QueryRequest query_req = 45;
+    QueryResponse query_resp = 46;
+    WalkRequest walk_req = 47;
+    WalkResponse walk_resp = 48;
+    ConfigGetRequest config_get_req = 49;
+    ConfigGetResponse config_get_resp = 50;
+    ReleaseLeaseRequest release_lease_req = 51;
+    ReleaseLeaseResponse release_lease_resp = 52;
+  }
+}

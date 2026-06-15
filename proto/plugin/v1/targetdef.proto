@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+// Target spec/def wire types. Mirrors crates/plugin/src/driver.rs.
+package heph.plugin.v1;
+
+import "plugin/v1/common.proto";
+
+// Provider output. Mirrors driver::TargetSpec.
+message TargetSpec {
+  Addr addr = 1;
+  string driver = 2;
+  map<string, Value> config = 3;
+  repeated string labels = 4;
+  Sandbox transitive = 5;
+}
+
+// Opaque driver-specific config blob. The host never inspects this; it is
+// produced and consumed only by the originating driver (which both parse()s
+// and run()s the target). Mirrors the erased TargetDef::raw_def.
+message RawDefBlob {
+  enum Format {
+    FORMAT_UNSPECIFIED = 0;
+    FORMAT_JSON = 1;
+    FORMAT_MSGPACK = 2;
+  }
+  string driver = 1;
+  Format format = 2;
+  bytes data = 3;
+}
+
+enum InputMode {
+  INPUT_MODE_UNSPECIFIED = 0;
+  INPUT_MODE_STANDARD = 1;
+  INPUT_MODE_LINK = 2;
+  INPUT_MODE_TOOL = 3;
+}
+
+message Input {
+  TargetAddr ref = 1;
+  InputMode mode = 2;
+  string origin_id = 3;
+  map<string, string> annotations = 4;
+  bool hashed = 5;
+  bool runtime = 6;
+}
+
+enum CodegenMode {
+  CODEGEN_MODE_UNSPECIFIED = 0;
+  CODEGEN_MODE_NONE = 1;
+  CODEGEN_MODE_COPY = 2;
+  CODEGEN_MODE_IN_PLACE = 3;
+}
+
+// Mirrors driver::path::Path + path::Content.
+message Path {
+  oneof content {
+    string file_path = 1;
+    string dir_path = 2;
+    string glob = 3;
+  }
+  CodegenMode codegen_tree = 4;
+  bool collect = 5;
+}
+
+message Output {
+  string group = 1;
+  repeated Path paths = 2;
+}
+
+message CacheConfig {
+  bool enabled = 1;
+  bool remote_enabled = 2;
+  uint32 history = 3;
+}
+
+// Driver parsed form. Mirrors driver::targetdef::TargetDef.
+message TargetDef {
+  Addr addr = 1;
+  repeated string labels = 2;
+  RawDefBlob raw_def = 3;
+  repeated Input inputs = 4;
+  repeated Output outputs = 5;
+  repeated Path support_files = 6;
+  CacheConfig cache = 7;
+  bool pty = 8;
+  bytes hash = 9;
+  bool transparent = 10;
+}
+
+// ---- Run outputs (driver -> host). Mirrors outputartifact::OutputArtifact.
+// These are fresh files the plugin just wrote into its sandbox dir, so they
+// cross as paths (or small inline Raw bytes). Distinct from result()/input
+// artifacts, which are abstract readers passed as ArtifactHandle (callback.proto).
+
+enum ArtifactType {
+  ARTIFACT_TYPE_UNSPECIFIED = 0;
+  ARTIFACT_TYPE_OUTPUT = 1;
+  ARTIFACT_TYPE_LOG = 2;
+  ARTIFACT_TYPE_SUPPORT_FILE = 3;
+}
+
+message ContentFile {
+  string source_path = 1;
+  string out_path = 2;
+  bool x = 3;
+}
+
+message ContentRaw {
+  bytes data = 1;
+  string path = 2;
+  bool x = 3;
+}
+
+message OutputArtifactRef {
+  string group = 1;
+  string name = 2;
+  ArtifactType type = 3;
+  oneof content {
+    ContentFile file = 4;
+    ContentRaw raw = 5;
+    string tar_path = 6;
+    string cpio_path = 7;
+  }
+  string hashout = 8;
+}

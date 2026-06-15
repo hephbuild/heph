@@ -1,0 +1,15 @@
+[package]
+name = "plugin-abi"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hproto-gen = { package = "proto-gen", path = "../../gen/proto", features = ["proto_full"] }
+anyhow = "1.0.102"
+rkyv = "0.8"
+
+[dev-dependencies]
+rkyv = "0.8"

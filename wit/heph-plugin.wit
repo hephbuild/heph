@@ -1,0 +1,166 @@
+// WIT mirror of the heph external-plugin ABI, for the wasm (component-model)
+// transport. The proto schema in proto/plugin/v1/*.proto is the source of
+// truth; this file mirrors the same logical interface for wasm guests.
+//
+// NOTE: this is consumed by the wasm tier (milestone M4). It is authored now so
+// all three transports share one contract; wit-bindgen validation + a
+// proto<->wit parity check land in M4. Keep field sets in sync with the proto.
+
+package heph:plugin@0.1.0;
+
+interface types {
+    // hmodel::Addr
+    record addr {
+        package: string,
+        name: string,
+        args: list<tuple<string, string>>,
+    }
+
+    // hcore::htvalue::Value (recursive)
+    variant value {
+        string-val(string),
+        bool-val(bool),
+        float-val(f64),
+        int-val(s64),
+        uint-val(u64),
+        null-val,
+        map-val(list<tuple<string, value>>),
+        list-val(list<value>),
+    }
+
+    record target-addr {
+        %ref: addr,
+        output: option<string>,
+        filters: list<string>,
+    }
+
+    record state {
+        package: string,
+        provider: string,
+        state: list<tuple<string, value>>,
+    }
+
+    enum dep-mode { none, link }
+
+    record tool { %ref: target-addr, group: string, hash: bool, id: string }
+    record dep {
+        %ref: target-addr, mode: dep-mode, group: string,
+        runtime: bool, hash: bool, id: string,
+    }
+    variant env-value { literal(string), %pass }
+    record env { value: env-value, hash: bool, append: bool, append-prefix: string }
+    record sandbox {
+        tools: list<tool>,
+        deps: list<dep>,
+        env: list<tuple<string, env>>,
+    }
+
+    record target-spec {
+        addr: addr,
+        driver: string,
+        config: list<tuple<string, value>>,
+        labels: list<string>,
+        transitive: sandbox,
+    }
+
+    enum raw-def-format { json, msgpack }
+    // opaque driver-specific blob; host never inspects it
+    record raw-def-blob { driver: string, format: raw-def-format, data: list<u8> }
+
+    enum input-mode { standard, link, tool }
+    record input {
+        %ref: target-addr, mode: input-mode, origin-id: string,
+        annotations: list<tuple<string, string>>, hashed: bool, runtime: bool,
+    }
+
+    enum codegen-mode { none, copy, in-place }
+    variant path-content { file-path(string), dir-path(string), glob(string) }
+    record path { content: path-content, codegen-tree: codegen-mode, collect: bool }
+    record output { group: string, paths: list<path> }
+    record cache-config { enabled: bool, remote-enabled: bool, history: u32 }
+
+    record target-def {
+        addr: addr,
+        labels: list<string>,
+        raw-def: raw-def-blob,
+        inputs: list<input>,
+        outputs: list<output>,
+        support-files: list<path>,
+        cache: cache-config,
+        pty: bool,
+        hash: list<u8>,
+        transparent: bool,
+    }
+
+    // result/input artifacts cross as opaque handles (abstract readers)
+    record artifact-handle {
+        handle-id: string, group: string, name: string,
+        hashout: string, byte-size: u64, support: bool,
+    }
+
+    // driver run outputs (fresh files the plugin wrote)
+    enum artifact-type { output, log, support-file }
+    record content-file { source-path: string, out-path: string, x: bool }
+    record content-raw { data: list<u8>, path: string, x: bool }
+    variant artifact-content {
+        file(content-file), raw(content-raw), tar-path(string), cpio-path(string),
+    }
+    record output-artifact-ref {
+        group: string, name: string, %type: artifact-type,
+        content: artifact-content, hashout: string,
+    }
+}
+
+// Host-exported callback surface (the plugin imports this).
+interface host {
+    use types.{addr, value, artifact-handle};
+
+    record result-ref { lease-id: string, artifacts: list<artifact-handle> }
+
+    // executor.result: registers the dep edge host-side, returns handles+lease.
+    result: func(request-id: string, addr: addr) -> result<result-ref, string>;
+    // lazy artifact bytes (abstract Content has no path).
+    open-artifact: func(lease-id: string, handle-id: string, offset: u64) -> result<list<u8>, string>;
+    // cache-hit fast path: register edge only; err carries cycle message.
+    note-dep: func(request-id: string, parent: addr, %addr: addr) -> result<_, string>;
+    query: func(request-id: string, matcher-label: string, extra-skip: list<string>) -> result<list<addr>, string>;
+    walk: func(dir: string) -> result<list<string>, string>;
+    config-get: func(key: string) -> option<value>;
+    release-lease: func(lease-id: string);
+    // cancellation: wasm can't be preempted, so the guest polls this.
+    cancelled: func(request-id: string) -> bool;
+}
+
+// Plugin-exported provider methods (the guest exports this).
+interface provider {
+    use types.{addr, target-spec, state};
+
+    config: func() -> string; // provider name
+    list: func(request-id: string, package: string, states: list<state>) -> result<list<addr>, string>;
+    list-packages: func(prefix: string) -> result<list<string>, string>;
+    get: func(request-id: string, addr: addr, states: list<state>) -> result<option<target-spec>, string>;
+    probe: func(request-id: string, package: string) -> result<list<state>, string>;
+}
+
+// Plugin-exported driver methods (the guest exports this).
+interface driver {
+    use types.{target-spec, target-def, sandbox, output-artifact-ref, artifact-handle, addr};
+
+    record run-input {
+        artifact: artifact-handle, origin-id: string, source-addr: addr,
+        filters: list<string>, annotations: list<tuple<string, string>>,
+    }
+
+    config: func() -> string;
+    parse: func(request-id: string, spec: target-spec) -> result<target-def, string>;
+    apply-transitive: func(request-id: string, def: target-def, sandbox: sandbox) -> result<target-def, string>;
+    run: func(request-id: string, def: target-def, tree-root: string, inputs: list<run-input>,
+              hashin: string, sandbox-dir: string, shell: bool) -> result<list<output-artifact-ref>, string>;
+}
+
+// A plugin imports the host callbacks and exports provider and/or driver.
+world plugin {
+    import host;
+    export provider;
+    export driver;
+}

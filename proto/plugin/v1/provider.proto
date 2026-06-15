@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+// Provider-exported methods. Mirrors the hplugin::Provider trait.
+// NOTE: functions()/state_schema() (BUILD-file Starlark integration) are not
+// yet modeled here; they are not on the remote data path and will be added
+// when the remote provider needs to surface provider functions.
+package heph.plugin.v1;
+
+import "plugin/v1/common.proto";
+import "plugin/v1/targetdef.proto";
+
+message ConfigRequest {}
+message ConfigResponse {
+  string name = 1;
+}
+
+message ListRequest {
+  string request_id = 1;
+  string package = 2;
+  repeated State states = 3;
+}
+message ListResponse {
+  Addr addr = 1;
+}
+
+message ListPackagesRequest {
+  string prefix = 1;
+}
+message ListPackageResponse {
+  string pkg = 1;
+}
+
+// executor is NOT serialized: callbacks travel on the host-callback channel
+// (callback.proto), correlated to this request by request_id.
+message GetRequest {
+  string request_id = 1;
+  Addr addr = 2;
+  repeated State states = 3;
+}
+message GetResponse {
+  TargetSpec target_spec = 1;
+}
+// Mirrors provider::GetError { NotFound, Other(_) }.
+message GetError {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_NOT_FOUND = 1;
+    KIND_OTHER = 2;
+  }
+  Kind kind = 1;
+  string message = 2;
+}
+
+message ProbeRequest {
+  string request_id = 1;
+  string package = 2;
+}
+message ProbeResponse {
+  repeated State states = 1;
+}
