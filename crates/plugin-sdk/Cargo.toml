@@ -15,5 +15,5 @@ anyhow = "1.0.102"
 async-trait = "0.1.89"
 futures = "0.3.32"
 prost = "0.14"
-tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros"] }
+tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros", "net"] }
 tracing = "0.1"

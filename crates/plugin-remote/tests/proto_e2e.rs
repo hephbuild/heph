@@ -100,9 +100,11 @@ impl Provider for TestProvider {
                     "callback hashout mismatch: {got:?}"
                 )));
             }
-            let mut spec = TargetSpec::default();
-            spec.addr = req.addr;
-            spec.driver = "exec".to_string();
+            let spec = TargetSpec {
+                addr: req.addr,
+                driver: "exec".to_string(),
+                ..Default::default()
+            };
             Ok(GetResponse { target_spec: spec })
         })
     }

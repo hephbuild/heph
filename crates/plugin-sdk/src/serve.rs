@@ -38,6 +38,22 @@ where
     Mux::start(read, write, handler)
 }
 
+/// Guest entry point: serve `provider` over the inherited fd 3 (set up by the
+/// host's `spawn_plugin`) and block until the host disconnects. A plugin's
+/// `main` typically does just `serve_inherited(Arc::new(MyProvider)).await`.
+#[cfg(unix)]
+pub async fn serve_inherited(provider: Arc<dyn Provider>) -> anyhow::Result<()> {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: fd 3 is the protocol socket the host passed us at spawn; we own it.
+    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(3) };
+    std_stream.set_nonblocking(true)?;
+    let stream = tokio::net::UnixStream::from_std(std_stream)?;
+    let (r, w) = stream.into_split();
+    let mux = serve(provider, r, w);
+    mux.wait_closed().await;
+    Ok(())
+}
+
 struct GuestHandler {
     provider: Arc<dyn Provider>,
     // frame-id -> cancellation token for the in-flight method call

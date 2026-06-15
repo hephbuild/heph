@@ -3579,6 +3579,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-echo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core",
+ "futures",
+ "model",
+ "plugin",
+ "plugin-remote",
+ "plugin-sdk",
+ "tokio",
+]
+
+[[package]]
 name = "plugin-exec"
 version = "0.1.0"
 dependencies = [
@@ -3671,6 +3685,7 @@ dependencies = [
  "async-trait",
  "core",
  "futures",
+ "libc",
  "model",
  "plugin",
  "plugin-abi",

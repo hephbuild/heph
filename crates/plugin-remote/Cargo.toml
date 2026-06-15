@@ -18,6 +18,7 @@ futures = "0.3.32"
 prost = "0.14"
 tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros", "net"] }
 tracing = "0.1"
+libc = "0.2"
 
 [features]
 # heavy transports, off by default; proto (UDS) is always available

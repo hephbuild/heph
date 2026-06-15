@@ -10,8 +10,12 @@ pub mod lease;
 
 mod host;
 mod provider;
+#[cfg(unix)]
+mod spawn;
 
 pub use provider::RemoteProvider;
+#[cfg(unix)]
+pub use spawn::{spawn_plugin, PLUGIN_FD};
 
 #[cfg(feature = "shm")]
 pub mod shm;

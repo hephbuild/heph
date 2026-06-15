@@ -14,10 +14,10 @@ use crate::pb;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 pub use pb::frame::Body;
 
@@ -66,6 +66,8 @@ pub struct Mux {
     out: mpsc::UnboundedSender<pb::Frame>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
+    closed: AtomicBool,
+    closed_notify: Notify,
 }
 
 impl Mux {
@@ -82,6 +84,8 @@ impl Mux {
             out: out_tx,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            closed_notify: Notify::new(),
         });
 
         // writer task
@@ -94,6 +98,31 @@ impl Mux {
 
     fn alloc_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// True once the connection has closed (peer EOF or I/O error).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Resolves when the connection closes. A guest's `main` awaits this to
+    /// stay alive for the lifetime of the connection and exit on disconnect.
+    pub async fn wait_closed(&self) {
+        loop {
+            if self.is_closed() {
+                return;
+            }
+            let notified = self.closed_notify.notified();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.closed_notify.notify_waiters();
     }
 
     /// Send a frame with an explicit id (used by handlers to reply).
@@ -208,4 +237,5 @@ async fn reader_loop<R: AsyncRead + Unpin>(
             }
         }
     }
+    mux.mark_closed();
 }
