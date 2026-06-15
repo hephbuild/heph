@@ -27,4 +27,6 @@ wasm = []
 
 [dev-dependencies]
 plugin-sdk = { path = "../plugin-sdk" }
+async-trait = "0.1.89"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time"] }

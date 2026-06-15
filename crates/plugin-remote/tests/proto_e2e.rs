@@ -278,3 +278,139 @@ async fn get_cancellation_returns_error() {
     };
     assert!(msg.contains("cancelled"), "unexpected error: {msg}");
 }
+
+// ---- driver path: parse + apply_transitive round-trip raw_def via def_de ----
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+struct MyCfg {
+    msg: String,
+    n: u32,
+}
+
+struct TestDriver;
+
+#[async_trait::async_trait]
+impl hplugin::driver::Driver for TestDriver {
+    fn config(
+        &self,
+        _req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        Ok(hplugin::driver::ConfigResponse {
+            name: "td".to_string(),
+        })
+    }
+
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        hplugin::driver::DriverSchema::default()
+    }
+
+    async fn parse(
+        &self,
+        req: hplugin::driver::ParseRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        let target_def = hplugin::driver::targetdef::TargetDef {
+            addr: req.target_spec.addr.clone(),
+            labels: vec![],
+            raw_def: Arc::new(MyCfg {
+                msg: "hi".to_string(),
+                n: 9,
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: hplugin::driver::targetdef::CacheConfig::off(),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+        Ok(hplugin::driver::ParseResponse { target_def })
+    }
+
+    async fn apply_transitive(
+        &self,
+        req: hplugin::driver::ApplyTransitiveRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        // Guest reads the wire raw_def back as the concrete type via def_de.
+        let cfg = req.target_def.def_de::<MyCfg>();
+        anyhow::ensure!(cfg.msg == "hi" && cfg.n == 9, "raw_def lost in transit");
+        Ok(hplugin::driver::ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+
+    async fn run<'a, 'io>(
+        &self,
+        _req: hplugin::driver::RunRequest<'a, 'io>,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::RunResponse> {
+        anyhow::bail!("test driver does not run")
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        _req: hplugin::driver::RunRequest<'a, 'io>,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::RunResponse> {
+        anyhow::bail!("test driver does not run")
+    }
+}
+
+#[tokio::test]
+async fn driver_parse_and_apply_transitive_roundtrip() {
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+    let host = plugin_remote::RemoteDriver::connect(ar, aw, "td");
+    let _guest = plugin_sdk::serve_driver(Arc::new(TestDriver), br, bw);
+
+    use hplugin::driver::Driver;
+    assert_eq!(
+        host.config(hplugin::driver::ConfigRequest {})
+            .expect("config")
+            .name,
+        "td"
+    );
+
+    let ctoken = StdCancellationToken::new();
+
+    // parse: TargetDef (incl. opaque raw_def) crosses back; def_de reconstructs.
+    let spec = Arc::new(hplugin::provider::TargetSpec {
+        addr: addr("//x", "y"),
+        driver: "td".to_string(),
+        ..Default::default()
+    });
+    let parsed = host
+        .parse(
+            hplugin::driver::ParseRequest {
+                request_id: "r1".to_string(),
+                target_spec: spec,
+            },
+            &ctoken,
+        )
+        .await
+        .expect("parse");
+    assert_eq!(
+        parsed.target_def.def_de::<MyCfg>(),
+        &MyCfg {
+            msg: "hi".to_string(),
+            n: 9
+        }
+    );
+
+    // apply_transitive: ship the round-tripped TargetDef back; the guest reads
+    // its raw_def via def_de (proving the contract works guest-side too).
+    let applied = host
+        .apply_transitive(
+            hplugin::driver::ApplyTransitiveRequest {
+                request_id: "r2".to_string(),
+                target_def: parsed.target_def,
+                sandbox: hplugin::driver::sandbox::Sandbox::default(),
+            },
+            &ctoken,
+        )
+        .await
+        .expect("apply_transitive");
+    assert_eq!(applied.target_def.def_de::<MyCfg>().n, 9);
+}

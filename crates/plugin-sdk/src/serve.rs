@@ -8,6 +8,9 @@ use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hcore::hasync::StdCancellationToken;
 use hplugin::eresult::{ArtifactMeta, EResult};
+use hplugin::driver::{
+    ApplyTransitiveRequest, ConfigRequest as DriverConfigRequest, Driver, ParseRequest,
+};
 use hplugin::provider::{
     ConfigRequest, GetError, GetRequest, ListPackagesRequest, ListRequest, ProbeRequest, Provider,
     ProviderExecutor,
@@ -31,8 +34,32 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    serve_plugin(Some(provider), None, read, write)
+}
+
+/// Serve a driver-only plugin.
+pub fn serve_driver<R, W>(driver: Arc<dyn Driver>, read: R, write: W) -> Arc<Mux>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    serve_plugin(None, Some(driver), read, write)
+}
+
+/// Serve a plugin that may export a provider, a driver, or both.
+pub fn serve_plugin<R, W>(
+    provider: Option<Arc<dyn Provider>>,
+    driver: Option<Arc<dyn Driver>>,
+    read: R,
+    write: W,
+) -> Arc<Mux>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let handler = Arc::new(GuestHandler {
         provider,
+        driver,
         tokens: Mutex::new(HashMap::new()),
     });
     Mux::start(read, write, handler)
@@ -55,7 +82,8 @@ pub async fn serve_inherited(provider: Arc<dyn Provider>) -> anyhow::Result<()> 
 }
 
 struct GuestHandler {
-    provider: Arc<dyn Provider>,
+    provider: Option<Arc<dyn Provider>>,
+    driver: Option<Arc<dyn Driver>>,
     // frame-id -> cancellation token for the in-flight method call
     tokens: Mutex<HashMap<u64, Arc<StdCancellationToken>>>,
 }
@@ -82,27 +110,44 @@ fn err_frame(message: String) -> Body {
 impl InboundHandler for GuestHandler {
     async fn handle(&self, id: u64, body: Body, mux: Arc<Mux>) {
         match body {
-            Body::ConfigReq(_) => match self.provider.config(ConfigRequest {}) {
-                Ok(resp) => mux.send_body(id, Body::ConfigResp(pb::ConfigResponse { name: resp.name })),
-                Err(e) => mux.send_body(id, err_frame(e.to_string())),
-            },
+            Body::ConfigReq(_) => {
+                let name = if let Some(p) = &self.provider {
+                    p.config(ConfigRequest {}).map(|r| r.name)
+                } else if let Some(d) = &self.driver {
+                    d.config(DriverConfigRequest {}).map(|r| r.name)
+                } else {
+                    Err(anyhow::anyhow!("plugin exports neither provider nor driver"))
+                };
+                match name {
+                    Ok(name) => mux.send_body(id, Body::ConfigResp(pb::ConfigResponse { name })),
+                    Err(e) => mux.send_body(id, err_frame(e.to_string())),
+                }
+            }
             Body::ListReq(req) => {
+                let Some(provider) = self.provider.clone() else {
+                    mux.send_body(id, stream_err("plugin has no provider".to_string()));
+                    return;
+                };
                 let tok = self.new_token(id);
                 let lreq = ListRequest {
                     request_id: req.request_id,
                     package: PkgBuf::from(req.package),
                     states: req.states.into_iter().map(convert::state_from_pb).collect(),
                 };
-                let res = self.provider.list(lreq, &*tok).await;
+                let res = provider.list(lreq, &*tok).await;
                 self.stream_addrs(id, res, &mux);
                 self.drop_token(id);
             }
             Body::ListPackagesReq(req) => {
+                let Some(provider) = self.provider.clone() else {
+                    mux.send_body(id, stream_err("plugin has no provider".to_string()));
+                    return;
+                };
                 let tok = self.new_token(id);
                 let lreq = ListPackagesRequest {
                     prefix: PkgBuf::from(req.prefix),
                 };
-                let res = self.provider.list_packages(lreq, &*tok).await;
+                let res = provider.list_packages(lreq, &*tok).await;
                 match res {
                     Ok(iter) => {
                         for item in iter {
@@ -130,6 +175,10 @@ impl InboundHandler for GuestHandler {
                 self.drop_token(id);
             }
             Body::GetReq(req) => {
+                let Some(provider) = self.provider.clone() else {
+                    mux.send_body(id, err_frame("plugin has no provider".to_string()));
+                    return;
+                };
                 let tok = self.new_token(id);
                 let executor: Arc<dyn ProviderExecutor> = Arc::new(MuxExecutor {
                     mux: Arc::clone(&mux),
@@ -141,7 +190,7 @@ impl InboundHandler for GuestHandler {
                     states: req.states.into_iter().map(convert::state_from_pb).collect(),
                     executor,
                 };
-                match self.provider.get(greq, &*tok).await {
+                match provider.get(greq, &*tok).await {
                     Ok(gr) => mux.send_body(
                         id,
                         Body::GetResp(pb::GetResponse {
@@ -166,18 +215,82 @@ impl InboundHandler for GuestHandler {
                 self.drop_token(id);
             }
             Body::ProbeReq(req) => {
+                let Some(provider) = self.provider.clone() else {
+                    mux.send_body(id, err_frame("plugin has no provider".to_string()));
+                    return;
+                };
                 let tok = self.new_token(id);
                 let preq = ProbeRequest {
                     request_id: req.request_id,
                     package: PkgBuf::from(req.package),
                 };
-                match self.provider.probe(preq, &*tok).await {
+                match provider.probe(preq, &*tok).await {
                     Ok(pr) => mux.send_body(
                         id,
                         Body::ProbeResp(pb::ProbeResponse {
                             states: pr.states.iter().map(convert::state_to_pb).collect(),
                         }),
                     ),
+                    Err(e) => mux.send_body(id, err_frame(e.to_string())),
+                }
+                self.drop_token(id);
+            }
+            Body::ParseReq(req) => {
+                let Some(driver) = self.driver.clone() else {
+                    mux.send_body(id, err_frame("plugin has no driver".to_string()));
+                    return;
+                };
+                let tok = self.new_token(id);
+                let preq = ParseRequest {
+                    request_id: req.request_id,
+                    target_spec: Arc::new(convert::target_spec_from_pb(
+                        req.target_spec.unwrap_or_default(),
+                    )),
+                };
+                match driver.parse(preq, &*tok).await {
+                    Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+                        Ok(td) => mux.send_body(
+                            id,
+                            Body::ParseResp(pb::ParseResponse {
+                                target_def: Some(td),
+                            }),
+                        ),
+                        Err(e) => mux.send_body(id, err_frame(e.to_string())),
+                    },
+                    Err(e) => mux.send_body(id, err_frame(e.to_string())),
+                }
+                self.drop_token(id);
+            }
+            Body::ApplyTransitiveReq(req) => {
+                let Some(driver) = self.driver.clone() else {
+                    mux.send_body(id, err_frame("plugin has no driver".to_string()));
+                    return;
+                };
+                let tok = self.new_token(id);
+                let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default())
+                {
+                    Ok(td) => td,
+                    Err(e) => {
+                        mux.send_body(id, err_frame(e.to_string()));
+                        self.drop_token(id);
+                        return;
+                    }
+                };
+                let areq = ApplyTransitiveRequest {
+                    request_id: req.request_id,
+                    target_def,
+                    sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
+                };
+                match driver.apply_transitive(areq, &*tok).await {
+                    Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+                        Ok(td) => mux.send_body(
+                            id,
+                            Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
+                                target_def: Some(td),
+                            }),
+                        ),
+                        Err(e) => mux.send_body(id, err_frame(e.to_string())),
+                    },
                     Err(e) => mux.send_body(id, err_frame(e.to_string())),
                 }
                 self.drop_token(id);

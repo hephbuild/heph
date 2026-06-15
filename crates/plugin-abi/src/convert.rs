@@ -286,6 +286,152 @@ pub fn matcher_from_pb(m: pb::Matcher) -> Matcher {
     }
 }
 
+// ---- TargetDef and its parts (driver path) ----
+
+use hplugin::driver::targetdef::path::{CodegenMode, Content as PathContent, Path};
+use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+
+fn input_mode_to_pb(m: &InputMode) -> pb::InputMode {
+    match m {
+        InputMode::Standard => pb::InputMode::Standard,
+        InputMode::Link => pb::InputMode::Link,
+        InputMode::Tool => pb::InputMode::Tool,
+    }
+}
+
+fn input_mode_from_pb(m: i32) -> InputMode {
+    match pb::InputMode::try_from(m).unwrap_or(pb::InputMode::Standard) {
+        pb::InputMode::Link => InputMode::Link,
+        pb::InputMode::Tool => InputMode::Tool,
+        _ => InputMode::Standard,
+    }
+}
+
+fn input_to_pb(i: &Input) -> pb::Input {
+    pb::Input {
+        r#ref: Some(target_addr_to_pb(&i.r#ref)),
+        mode: input_mode_to_pb(&i.mode) as i32,
+        origin_id: i.origin_id.clone(),
+        annotations: i.annotations.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        hashed: i.hashed,
+        runtime: i.runtime,
+    }
+}
+
+fn input_from_pb(i: pb::Input) -> Input {
+    Input {
+        r#ref: target_addr_from_pb(i.r#ref.unwrap_or_default()),
+        mode: input_mode_from_pb(i.mode),
+        origin_id: i.origin_id,
+        annotations: i.annotations.into_iter().collect(),
+        hashed: i.hashed,
+        runtime: i.runtime,
+    }
+}
+
+fn codegen_to_pb(c: &CodegenMode) -> pb::CodegenMode {
+    match c {
+        CodegenMode::None => pb::CodegenMode::None,
+        CodegenMode::Copy => pb::CodegenMode::Copy,
+        CodegenMode::InPlace => pb::CodegenMode::InPlace,
+    }
+}
+
+fn codegen_from_pb(c: i32) -> CodegenMode {
+    match pb::CodegenMode::try_from(c).unwrap_or(pb::CodegenMode::None) {
+        pb::CodegenMode::Copy => CodegenMode::Copy,
+        pb::CodegenMode::InPlace => CodegenMode::InPlace,
+        _ => CodegenMode::None,
+    }
+}
+
+fn path_to_pb(p: &Path) -> pb::Path {
+    let content = match &p.content {
+        PathContent::FilePath(s) => pb::path::Content::FilePath(s.clone()),
+        PathContent::DirPath(s) => pb::path::Content::DirPath(s.clone()),
+        PathContent::Glob(s) => pb::path::Content::Glob(s.clone()),
+    };
+    pb::Path {
+        content: Some(content),
+        codegen_tree: codegen_to_pb(&p.codegen_tree) as i32,
+        collect: p.collect,
+    }
+}
+
+fn path_from_pb(p: pb::Path) -> Path {
+    let content = match p.content {
+        Some(pb::path::Content::FilePath(s)) => PathContent::FilePath(s),
+        Some(pb::path::Content::DirPath(s)) => PathContent::DirPath(s),
+        Some(pb::path::Content::Glob(s)) => PathContent::Glob(s),
+        None => PathContent::FilePath(String::new()),
+    };
+    Path {
+        content,
+        codegen_tree: codegen_from_pb(p.codegen_tree),
+        collect: p.collect,
+    }
+}
+
+fn output_to_pb(o: &Output) -> pb::Output {
+    pb::Output {
+        group: o.group.clone(),
+        paths: o.paths.iter().map(path_to_pb).collect(),
+    }
+}
+
+fn output_from_pb(o: pb::Output) -> Output {
+    Output {
+        group: o.group,
+        paths: o.paths.into_iter().map(path_from_pb).collect(),
+    }
+}
+
+fn cache_config_to_pb(c: &CacheConfig) -> pb::CacheConfig {
+    pb::CacheConfig {
+        enabled: c.enabled,
+        remote_enabled: c.remote_enabled,
+        history: c.history,
+    }
+}
+
+fn cache_config_from_pb(c: pb::CacheConfig) -> CacheConfig {
+    CacheConfig {
+        enabled: c.enabled,
+        remote_enabled: c.remote_enabled,
+        history: c.history,
+    }
+}
+
+pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
+    Ok(pb::TargetDef {
+        addr: Some(addr_to_pb(&td.addr)),
+        labels: td.labels.clone(),
+        raw_def: Some(raw_def_to_blob(&td.raw_def)?),
+        inputs: td.inputs.iter().map(input_to_pb).collect(),
+        outputs: td.outputs.iter().map(output_to_pb).collect(),
+        support_files: td.support_files.iter().map(path_to_pb).collect(),
+        cache: Some(cache_config_to_pb(&td.cache)),
+        pty: td.pty,
+        hash: td.hash.clone().into(),
+        transparent: td.transparent,
+    })
+}
+
+pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
+    Ok(TargetDef {
+        addr: addr_from_pb(td.addr.unwrap_or_default()),
+        labels: td.labels,
+        raw_def: raw_def_from_blob(&td.raw_def.unwrap_or_default())?,
+        inputs: td.inputs.into_iter().map(input_from_pb).collect(),
+        outputs: td.outputs.into_iter().map(output_from_pb).collect(),
+        support_files: td.support_files.into_iter().map(path_from_pb).collect(),
+        cache: cache_config_from_pb(td.cache.unwrap_or_default()),
+        pty: td.pty,
+        hash: td.hash.to_vec(),
+        transparent: td.transparent,
+    })
+}
+
 // ---- raw_def (opaque driver blob) ----
 
 /// Serialize a driver's `raw_def` to a wire blob (JSON). Works on any `RawDef`,
