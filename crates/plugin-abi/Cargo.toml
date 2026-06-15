@@ -10,6 +10,14 @@ workspace = true
 hproto-gen = { package = "proto-gen", path = "../../gen/proto", features = ["proto_full"] }
 anyhow = "1.0.102"
 rkyv = "0.8"
+# convert feature: conversions between pb wire types and the in-process
+# hplugin/hmodel/hcore types. Optional so the bare wire crate stays light.
+hplugin = { package = "plugin", path = "../plugin", optional = true }
+hmodel = { package = "model", path = "../model", optional = true }
+hcore = { package = "core", path = "../core", optional = true }
+
+[features]
+convert = ["dep:hplugin", "dep:hmodel", "dep:hcore"]
 
 [dev-dependencies]
 rkyv = "0.8"

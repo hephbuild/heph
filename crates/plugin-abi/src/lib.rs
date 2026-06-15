@@ -21,3 +21,6 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 pub const ABI_SEMVER: &str = "0.1.0";
 
 pub mod shm_types;
+
+#[cfg(feature = "convert")]
+pub mod convert;
