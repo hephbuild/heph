@@ -1,0 +1,19 @@
+# Guest-side SDK for heph wasm plugins. Standalone workspace: compiled only for
+# wasm32-wasip2 by the guest, kept out of the host `cargo build --workspace`.
+#
+# It depends on plugin-abi WITHOUT the `convert`/`transport` features — those
+# pull in hplugin (-> hsandboxfuse FUSE, hwalk) which do not build for wasm. The
+# guest works against the prost `pb` types directly; the host keeps `convert`.
+[workspace]
+
+[package]
+name = "heph-plugin-sdk-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+plugin-abi = { path = "../../plugin-abi" }
+prost = "0.14"
+
+[lib]
+crate-type = ["rlib"]

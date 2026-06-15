@@ -1,0 +1,68 @@
+package heph:plugin;
+
+/// Shared types for the wasm tier of the heph external-plugin ABI.
+///
+/// Payloads are deliberately `list<u8>` carrying protobuf-encoded
+/// `heph.plugin.v1` messages (proto/plugin/v1/*.proto) — the SAME wire schema
+/// the proto (UDS) and shm (iceoryx2) transports use. Keeping one schema source
+/// (proto) avoids re-encoding every message as a WIT record and the three-way
+/// drift that would create; the WIT here mirrors the *service* surface, not the
+/// message structure.
+interface types {
+    /// Typed error category so neither guest nor host ever matches on the
+    /// message string. Mirrors the wire `Error.Kind` / `GetError.Kind`.
+    enum error-kind {
+        other,
+        not-found,
+        cycle,
+        cancelled,
+        unimplemented,
+    }
+    record plugin-error {
+        kind: error-kind,
+        message: string,
+    }
+}
+
+/// Callbacks the guest invokes back into the host while serving a request — the
+/// AbiHost surface. This is the bidirectional crux: a guest provider calls these
+/// to resolve dependencies through the engine's executor mid-`get`.
+interface host {
+    use types.{plugin-error};
+
+    /// ResultRequest -> ResultResponse. Registers the parent->addr DepDag edge
+    /// host-side (cycle check) and returns artifact handles + a lease.
+    /// (Named `resolve`, not `result`: `result` is a WIT reserved keyword.)
+    resolve: func(req: list<u8>) -> result<list<u8>, plugin-error>;
+
+    /// NoteDepRequest -> NoteDepResponse. Cache-hit fast path: register the dep
+    /// edge only. Returns the cycle flag when the edge closes a cycle.
+    note-dep: func(req: list<u8>) -> result<list<u8>, plugin-error>;
+
+    /// QueryRequest -> QueryResponse.
+    query: func(req: list<u8>) -> result<list<u8>, plugin-error>;
+}
+
+/// Methods the guest exports — the provider and driver surface. A single guest
+/// component may serve both. Mirrors hplugin::Provider / hplugin::Driver.
+/// (Named `api`, not `plugin`: a world and an interface can't share a name.)
+interface api {
+    use types.{plugin-error};
+
+    /// -> ConfigResponse (provider name).
+    provider-config: func() -> result<list<u8>, plugin-error>;
+    /// GetRequest -> GetResponse.
+    provider-get: func(req: list<u8>) -> result<list<u8>, plugin-error>;
+
+    /// -> ConfigResponse (driver name).
+    driver-config: func() -> result<list<u8>, plugin-error>;
+    /// ParseRequest -> ParseResponse.
+    driver-parse: func(req: list<u8>) -> result<list<u8>, plugin-error>;
+    /// RunRequest -> RunResponse.
+    driver-run: func(req: list<u8>) -> result<list<u8>, plugin-error>;
+}
+
+world plugin {
+    import host;
+    export api;
+}

@@ -1,0 +1,19 @@
+# Hello-world heph plugin compiled to a wasm component (provider + driver).
+# Standalone workspace, built with cargo-component for wasm32-wasip2; kept out
+# of the host `cargo build --workspace`.
+[workspace]
+
+[package]
+name = "helloworld"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+heph-plugin-sdk-wasm = { path = "../sdk" }
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "heph:plugin"
