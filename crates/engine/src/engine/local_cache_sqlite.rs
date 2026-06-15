@@ -331,13 +331,7 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
                 })?;
                 let row_id = tx.last_insert_rowid();
                 let mut blob = tx
-                    .blob_open(
-                        rusqlite::DatabaseName::Main,
-                        "artifacts",
-                        "data",
-                        row_id,
-                        false,
-                    )
+                    .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, false)
                     .with_context(|| format!("opening blob for {}", job.key.2))?;
                 job.buf
                     .seek(io::SeekFrom::Start(0))
@@ -381,31 +375,28 @@ impl LocalCache for LocalCacheSQLite {
                 "SELECT rowid, length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
             )
             .context("preparing reader lookup")?;
-        let (row_id, blob_len): (i64, usize) = match stmt
-            .query_row(rusqlite::params![addr_key, hashin, name], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+        let (row_id, blob_len): (i64, usize) =
+            match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| {
+                let row_id: i64 = row.get(0)?;
+                let blob_len: i64 = row.get(1)?;
+                Ok((row_id, usize::try_from(blob_len).unwrap_or(0)))
             }) {
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(anyhow::anyhow!(NotFoundError));
-            }
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("looking up {name} hashin={hashin} in sqlite cache"));
-            }
-            Ok(v) => v,
-        };
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(anyhow::anyhow!(NotFoundError));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("looking up {name} hashin={hashin} in sqlite cache")
+                    });
+                }
+                Ok(v) => v,
+            };
 
         let size = blob_len as u64;
 
         if blob_len <= self.inline_threshold {
             let mut blob = conn
-                .blob_open(
-                    rusqlite::DatabaseName::Main,
-                    "artifacts",
-                    "data",
-                    row_id,
-                    true,
-                )
+                .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
                 .with_context(|| format!("opening blob for {name}"))?;
             let mut buf = Vec::with_capacity(blob_len);
             io::copy(&mut blob, &mut buf)
@@ -434,16 +425,11 @@ impl LocalCache for LocalCacheSQLite {
 
         // Move the pooled connection into the rayon pool; returns to pool on drop.
         rayon::spawn(move || {
-            let mut blob = match conn.blob_open(
-                rusqlite::DatabaseName::Main,
-                "artifacts",
-                "data",
-                row_id,
-                true,
-            ) {
-                Ok(b) => b,
-                Err(_) => return,
-            };
+            let mut blob =
+                match conn.blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
             drop(io::copy(&mut blob, &mut pipe_writer));
         });
 
@@ -620,13 +606,7 @@ impl OwnedBlob {
     fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>, row_id: i64) -> Result<Self> {
         let conn_ref: &Connection = &conn;
         let blob = conn_ref
-            .blob_open(
-                rusqlite::DatabaseName::Main,
-                "artifacts",
-                "data",
-                row_id,
-                true,
-            )
+            .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
             .context("opening seekable sqlite blob")?;
         // SAFETY: `blob` borrows from `conn` which is owned alongside it in
         // the returned struct; struct field drop order (blob before _conn)

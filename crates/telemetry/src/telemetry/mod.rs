@@ -2,7 +2,8 @@
 //!
 //! Reports coarse usage shape to PostHog (EU region) to guide development.
 //! Every event is *personless* (`$process_person_profile: false` — no person
-//! profile is ever created) and carries only os/arch/version plus aggregate run
+//! profile is ever created) and carries only os (`$os`/`$os_version`, stamped by
+//! posthog-rs), arch, and version plus aggregate run
 //! counters — never target addresses, labels, filesystem paths, or any user
 //! identifier. The `distinct_id` is a random per-install UUID stored in the
 //! machine's config dir (or the constant `"ci"` on CI runners, where ephemeral
@@ -316,7 +317,26 @@ struct ReportContext<'a> {
 fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     let stats = COLLECTOR.snapshot();
     let plugins = PLUGINS.get().cloned().unwrap_or_default();
+    let props = build_props(&ctx, &stats, plugins);
 
+    let dir = config_dir()?;
+    let event = SpooledEvent {
+        uuid: uuid::Uuid::new_v4().to_string(),
+        distinct_id: distinct_id(&dir)?,
+        event: "cli_command".to_string(),
+        props,
+        created_ms: hcore::events::now_unix_ms() as i64,
+    };
+    Spool::open(&dir.join("telemetry-spool.db"))?.enqueue(&event)
+}
+
+/// Assemble the event property bag. `$os` / `$os_version` are intentionally
+/// absent — posthog-rs stamps them (via `os_info`) on the capture path.
+fn build_props(
+    ctx: &ReportContext<'_>,
+    stats: &TelemetrySnapshot,
+    plugins: Plugins,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut props = serde_json::Map::new();
     let mut put = |k: &str, v: serde_json::Value| drop(props.insert(k.to_string(), v));
     // Personless: never create/update a person profile for this distinct_id.
@@ -324,8 +344,9 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     // A fresh id per invocation, distinct from the install id — lets one event
     // be correlated/deduped without identifying the machine.
     put("run_id", uuid::Uuid::new_v4().to_string().into());
-    // Environment — coarse and non-identifying.
-    put("os", std::env::consts::OS.into());
+    // Environment — coarse and non-identifying. `$os` / `$os_version` are
+    // stamped by posthog-rs itself (via os_info) on the capture path, so we
+    // only add arch here.
     put("arch", std::env::consts::ARCH.into());
     put("version", hcore::version::VERSION.into());
     // Semver segments, broken out for filtering/grouping in PostHog. Absent when
@@ -384,15 +405,7 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
         plugins.remote_cache_backends.into(),
     );
 
-    let dir = config_dir()?;
-    let event = SpooledEvent {
-        uuid: uuid::Uuid::new_v4().to_string(),
-        distinct_id: distinct_id(&dir)?,
-        event: "cli_command".to_string(),
-        props,
-        created_ms: hcore::events::now_unix_ms() as i64,
-    };
-    Spool::open(&dir.join("telemetry-spool.db"))?.enqueue(&event)
+    props
 }
 
 /// Flush the spool synchronously, blocking until sent (or failed). Used on CI,
@@ -516,6 +529,43 @@ mod tests {
         // A vendor marker present (even empty) signals CI.
         assert!(ci_from(|n| (n == "GITHUB_ACTIONS").then(String::new)));
         assert!(ci_from(|n| (n == "BUILDKITE").then(|| "yes".to_string())));
+    }
+
+    #[test]
+    fn build_props_omits_os_and_keeps_arch() {
+        let snapshot = TelemetrySnapshot {
+            targets: 0,
+            local_cache_hits: 0,
+            local_cache_misses: 0,
+            artifacts: 0,
+            artifact_bytes: 0,
+            max_artifact_bytes: 0,
+            p99_artifact_bytes: 0,
+            sized_artifacts: 0,
+            executes: 0,
+            p99_execute_ms: 0,
+            graph_size: 0,
+        };
+        let ctx = ReportContext {
+            command: "run",
+            request_shape: "addr",
+            flags: &[],
+            success: true,
+            failure: None,
+            duration_ms: 1,
+        };
+        let props = build_props(&ctx, &snapshot, Plugins::default());
+
+        // posthog-rs stamps `$os` / `$os_version` itself, so build_props must
+        // not carry an `os` of its own (nor the `$`-prefixed keys).
+        assert!(!props.contains_key("os"), "os must be left to posthog-rs");
+        assert!(!props.contains_key("$os"));
+        assert!(!props.contains_key("$os_version"));
+        // arch is ours to report and stays.
+        assert_eq!(
+            props.get("arch").and_then(|v| v.as_str()),
+            Some(std::env::consts::ARCH)
+        );
     }
 
     #[test]

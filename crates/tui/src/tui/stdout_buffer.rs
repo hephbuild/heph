@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,10 +9,13 @@ use super::app::{AppContext, Pauser};
 
 const DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Accumulates lines off the hot path and periodically pauses the TUI
-/// to flush them to stdout. The TUI renders to stderr; without pausing,
-/// raw writes to stdout would interleave with spinner redraws on the
-/// same tty.
+/// Accumulates lines off the hot path and periodically flushes them to stdout.
+///
+/// The TUI renders to stderr. When stdout is the *same* tty, a raw stdout write
+/// would interleave with spinner redraws, so we pause the TUI around each flush.
+/// When stdout is redirected (a pipe/file), there is nothing to interleave with —
+/// pausing would only churn the TUI (each resume re-anchors the inline viewport,
+/// scrolling blank lines onto stderr), so we write directly without pausing.
 pub struct BufferedStdout {
     buf: Arc<Mutex<Vec<u8>>>,
     task: Option<JoinHandle<()>>,
@@ -29,10 +32,13 @@ impl BufferedStdout {
         let pauser = ctx.pauser();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
+        // Decide once: pausing the TUI is only needed when stdout shares the
+        // stderr tty (interleaving risk). Redirected stdout never interleaves.
+        let pause_for_writes = io::stdout().is_terminal();
         let task = tokio::spawn({
             let buf = buf.clone();
             async move {
-                drive(buf, pauser, interval, shutdown_rx).await;
+                drive(buf, pauser, pause_for_writes, interval, shutdown_rx).await;
             }
         });
 
@@ -78,6 +84,7 @@ impl Drop for BufferedStdout {
 async fn drive(
     buf: Arc<Mutex<Vec<u8>>>,
     pauser: Pauser,
+    pause_for_writes: bool,
     interval: Duration,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -87,17 +94,17 @@ async fn drive(
         tokio::select! {
             biased;
             _ = &mut shutdown => {
-                flush_once(&buf, &pauser).await;
+                flush_once(&buf, &pauser, pause_for_writes).await;
                 break;
             }
             _ = ticker.tick() => {
-                flush_once(&buf, &pauser).await;
+                flush_once(&buf, &pauser, pause_for_writes).await;
             }
         }
     }
 }
 
-async fn flush_once(buf: &Arc<Mutex<Vec<u8>>>, pauser: &Pauser) {
+async fn flush_once(buf: &Arc<Mutex<Vec<u8>>>, pauser: &Pauser, pause_for_writes: bool) {
     let bytes = {
         let mut b = buf.lock().expect("stdout buffer lock");
         if b.is_empty() {
@@ -105,6 +112,13 @@ async fn flush_once(buf: &Arc<Mutex<Vec<u8>>>, pauser: &Pauser) {
         }
         std::mem::take(&mut *b)
     };
-    let _guard = pauser.pause().await;
+    // Only pause the TUI when stdout shares the stderr tty; otherwise a redirected
+    // write can't interleave, and pausing would needlessly re-anchor the viewport.
+    let guard = if pause_for_writes {
+        Some(pauser.pause().await)
+    } else {
+        None
+    };
     drop(io::stdout().lock().write_all(&bytes));
+    drop(guard);
 }

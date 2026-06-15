@@ -6,7 +6,9 @@ use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
+use ratatui::backend::{Backend, ClearType};
 use ratatui::buffer::Buffer;
+use ratatui::layout::Position;
 use ratatui::prelude::Widget;
 use ratatui::text::Text;
 use ratatui::widgets::{Paragraph, Wrap};
@@ -146,15 +148,21 @@ pub async fn run<A: App + 'static>(
                             // a Ctrl+C delivered to the cooked-mode prompt can't
                             // race past us and cancel engine work.
                             suppression.set(true);
-                            drain_logs_to_terminal(&mut terminal, &mut rx, cols);
-                            drop(terminal.clear());
-                            drop(terminal.show_cursor());
-                            // Drop EventStream so its background reader thread
-                            // releases the internal event lock; cursor::position
-                            // (DSR query in Terminal::with_options on resume)
-                            // shares crossterm's internal reader and races
-                            // otherwise.
+                            // Drop the EventStream *before* `clear()`. `clear()`
+                            // issues a cursor DSR query (`get_cursor_position`),
+                            // which reads its reply through crossterm's single
+                            // global reader; a live EventStream monopolises that
+                            // reader and the query would deadlock (see
+                            // `stderr_backend.rs`). The stream is rebuilt on resume.
                             events = None;
+                            drain_logs_to_terminal(&mut terminal, &mut rx, cols);
+                            // Collapse to the viewport origin (not `terminal.clear()`,
+                            // which restores the live bottom-of-box cursor): the
+                            // cooked-mode stdout write below must land at the box's
+                            // top so the resume re-anchor reuses the cleared rows
+                            // instead of stranding them as a blank gap.
+                            collapse_inline_viewport(&mut terminal);
+                            drop(terminal.show_cursor());
                             drop(disable_raw_mode());
                             sink.switch_to_direct();
                             paused = true;
@@ -327,12 +335,48 @@ pub async fn run<A: App + 'static>(
         }
     };
 
-    if !paused {
-        drain_logs_to_terminal(&mut terminal, &mut rx, cols);
-        drop(terminal.clear());
-        drop(terminal.show_cursor());
-        drop(disable_raw_mode());
+    if paused {
+        // The run finished while a `BufferedStdout` flush had the TUI paused: the
+        // pause already tore the viewport down (cleared + cooked mode) and wrote
+        // straight to stdout, so the live cursor now sits just below that output.
+        // Rebuild the terminal so its inline viewport re-anchors there (a DSR
+        // query with no `EventStream` alive — the pause dropped it), then fall
+        // through to the same collapse. Without this the summary would print at
+        // the stale paused cursor, stranding the reserved viewport rows as a
+        // blank gap above it.
+        //
+        // Use a 1-row viewport, not the full box height: we only render the
+        // one-line summary from here on, and a tall viewport whose cursor sits at
+        // the bottom of the screen (after a long stdout dump) makes
+        // `compute_inline_size` scroll a box-height of blank rows in to reserve
+        // space — exactly the gap we're avoiding.
+        drop(enable_raw_mode());
+        if let Ok(rebuilt) = Terminal::with_options(
+            StderrBackend::new(io::stderr()),
+            TerminalOptions {
+                viewport: Viewport::Inline(1),
+            },
+        ) {
+            terminal = rebuilt;
+        }
+        cols = terminal_cols(&terminal);
     }
+
+    // Flush any still-buffered build-event logs into the terminal scrollback
+    // *above* the viewport. This must stay on the terminal path (`insert_before`):
+    // it wraps to the viewport width and skips blank lines. The post-teardown
+    // `drain_logs_to_stderr` fallback writes raw bytes, so letting empties fall
+    // through to it dumps stray newlines after the box.
+    drain_logs_to_terminal(&mut terminal, &mut rx, cols);
+    // Collapse the viewport to its origin so the final summary (printed below)
+    // lands where the box started, not below it.
+    collapse_inline_viewport(&mut terminal);
+    {
+        let backend = terminal.backend_mut();
+        drop(backend.show_cursor());
+        drop(Backend::flush(backend));
+    }
+    drop(disable_raw_mode());
     sink.switch_to_direct();
     drain_logs_to_stderr(&mut rx);
 
@@ -367,11 +411,11 @@ fn reanchor_terminal<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) {
 
 /// Re-anchor after a terminal resize, keeping the inline viewport at ~1/3 of the
 /// new terminal height. The DSR query (inside `autoresize`, and again when we
-/// rebuild the terminal for a new row count) reads its reply off `/dev/tty`;
-/// crossterm's `EventStream` reader consumes the same tty, so it must be torn
-/// down across the query (see `stderr_backend.rs` invariant). There must be no
-/// `.await` between the two `events` writes — callers run this from the
-/// synchronous tick arm.
+/// rebuild the terminal for a new row count) reads its reply through crossterm's
+/// shared reader; the `EventStream` monopolises that reader, so it must be torn
+/// down across the query (see `stderr_backend.rs`). There must be no `.await`
+/// between the two `events` writes — callers run this from the synchronous tick
+/// arm.
 fn reanchor_after_resize(
     terminal: &mut StderrTerminal,
     events: &mut Option<EventStream>,
@@ -402,6 +446,28 @@ fn reanchor_after_resize(
     *events = Some(EventStream::new());
     // The backend size ratatui actually re-anchored to is the source of truth.
     *cols = terminal_cols(terminal);
+}
+
+/// Collapse the inline viewport: erase the box and leave the cursor at the
+/// viewport's origin (top-left). Used at pause and at exit so whatever is
+/// printed next — a cooked-mode stdout flush, or the final summary — lands where
+/// the box started rather than below it.
+///
+/// Unlike [`ratatui::Terminal::clear`], this issues no cursor DSR query (so it
+/// can't race crossterm's reader) and does not restore the live bottom-of-box
+/// cursor. Restoring the live cursor is what stranded the cleared rows as a
+/// blank gap: on pause, the stdout write then landed at the box's bottom and the
+/// resume re-anchored a full viewport-height lower. The empty `draw` diffs the
+/// box away; `Frame::area().y` is ratatui's own inline anchor.
+fn collapse_inline_viewport(terminal: &mut StderrTerminal) {
+    let mut anchor_row: u16 = 0;
+    drop(terminal.draw(|f| anchor_row = f.area().y));
+    let backend = terminal.backend_mut();
+    drop(backend.set_cursor_position(Position {
+        x: 0,
+        y: anchor_row,
+    }));
+    drop(backend.clear_region(ClearType::AfterCursor));
 }
 
 fn drain_logs_to_terminal(

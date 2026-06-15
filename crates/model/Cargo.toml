@@ -8,7 +8,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
-nom = { version = "7", default-features = false, features = ["std"] }
+nom = { version = "8", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 rustc-hash = "2"

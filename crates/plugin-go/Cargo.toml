@@ -19,15 +19,15 @@ hplugin-query = { package = "plugin-query", path = "../plugin-query" }
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
-async-trait = "0.1.86"
+async-trait = "0.1.89"
 async-recursion = "1"
 futures = "0.3.32"
 enclose = "1"
 parking_lot = "0.12"
-borsh = { version = "1.5.7", features = ["derive"] }
+borsh = { version = "1.6.1", features = ["derive"] }
 glob = "0.3"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
-tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"
