@@ -621,3 +621,118 @@ async fn multi_driver_routing_one_connection() {
     let pb_ = beta.parse(mk_req(), &ctoken).await.expect("beta parse");
     assert_eq!(pb_.target_def.def_de::<MyCfg>().msg, "beta");
 }
+
+// ---- typed cycle error propagates across the boundary (not by message) ----
+
+/// Host executor that simulates the engine detecting a cycle: result/note_dep
+/// return a typed CycleError.
+struct CycleExec;
+impl ProviderExecutor for CycleExec {
+    fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+        Box::pin(async move {
+            Err(anyhow::Error::new(hplugin::error::CycleError {
+                from: addr.clone(),
+                to: addr.clone(),
+            }))
+        })
+    }
+    fn query<'a>(
+        &'a self,
+        _m: &'a Matcher,
+        _s: &'a [String],
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+        Box::pin(async move { Ok(vec![]) })
+    }
+}
+
+struct CycleTestProvider;
+impl Provider for CycleTestProvider {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        Ok(ConfigResponse {
+            name: "cyc".to_string(),
+        })
+    }
+    fn list<'a>(
+        &'a self,
+        _req: ListRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
+    {
+        Box::pin(async move {
+            Ok(Box::new(std::iter::empty())
+                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+        })
+    }
+    fn list_packages<'a>(
+        &'a self,
+        _req: ListPackagesRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<
+        'a,
+        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+    > {
+        Box::pin(async move {
+            Ok(Box::new(std::iter::empty())
+                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+        })
+    }
+    fn get<'a>(
+        &'a self,
+        req: GetRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+        Box::pin(async move {
+            // Resolving a dep cycles host-side; the typed error must survive the
+            // round trip back to the host get().
+            req.executor
+                .result(&addr("//dep", "x"))
+                .await
+                .map_err(GetError::Other)?;
+            Ok(GetResponse {
+                target_spec: TargetSpec {
+                    addr: req.addr,
+                    ..Default::default()
+                },
+            })
+        })
+    }
+    fn probe<'a>(
+        &'a self,
+        _req: ProbeRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+        Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
+    }
+}
+
+#[tokio::test]
+async fn cycle_error_propagates_typed() {
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+    let _guest = plugin_sdk::serve(Arc::new(CycleTestProvider), br, bw);
+    let host = RemoteProvider::connect(ar, aw, "cyc");
+
+    let ctoken = StdCancellationToken::new();
+    let executor: Arc<dyn ProviderExecutor> = Arc::new(CycleExec);
+    let res = host
+        .get(
+            GetRequest {
+                request_id: "r1".to_string(),
+                addr: addr("//pkg", "a"),
+                states: vec![],
+                executor,
+            },
+            &ctoken,
+        )
+        .await;
+
+    match res {
+        Ok(_) => panic!("expected a cycle error"),
+        Err(GetError::NotFound) => panic!("expected Other(CycleError), got NotFound"),
+        Err(GetError::Other(e)) => assert!(
+            e.downcast_ref::<hplugin::error::CycleError>().is_some(),
+            "expected a typed CycleError (not message), got: {e:#}"
+        ),
+    }
+}

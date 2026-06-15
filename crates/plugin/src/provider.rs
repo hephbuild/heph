@@ -96,6 +96,18 @@ pub trait ProviderExecutor: Send + Sync {
         m: &'a Matcher,
         extra_skip: &'a [String],
     ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
+
+    /// Register a `parent → addr` dependency edge without resolving `addr`'s
+    /// result. The cache-hit fast path: a provider that already has `addr`'s
+    /// derived data still must register the edge (the synchronous cycle check),
+    /// but needn't pay for a full `result`. Returns a [`crate::error::CycleError`]
+    /// (in the error chain) when the edge closes a cycle.
+    ///
+    /// Default falls back to `result` (correct, just not cheap); the engine
+    /// overrides it with a direct edge insert.
+    fn note_dep<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move { self.result(addr).await.map(|_| ()) })
+    }
 }
 
 pub struct GetRequest {

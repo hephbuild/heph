@@ -22,6 +22,7 @@ use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
 use plugin_abi::convert;
+use plugin_abi::error::{WireError, WireErrorKind};
 use plugin_abi::mux::{Body, InboundHandler, Mux};
 use plugin_abi::pb;
 use prost::Message;
@@ -279,7 +280,7 @@ impl InboundHandler for GuestHandler {
                     Err(GetError::Other(e)) => mux.send_body(
                         id,
                         Body::GetErr(pb::GetError {
-                            kind: pb::get_error::Kind::Other as i32,
+                            kind: get_error_kind(&e) as i32,
                             message: e.to_string(),
                         }),
                     ),
@@ -540,7 +541,45 @@ fn stream_err(message: String) -> Body {
     })
 }
 
-/// A `ProviderExecutor` that forwards `result`/`query` to the host over the mux.
+/// True if `e`'s chain carries a dependency-cycle error.
+fn is_cycle(e: &anyhow::Error) -> bool {
+    hcore::hmemoizer::downcast_chain_ref::<hplugin::error::CycleError>(e).is_some()
+}
+
+/// Classify an anyhow error into the wire `GetError` kind, by type (not message).
+fn get_error_kind(e: &anyhow::Error) -> pb::get_error::Kind {
+    if is_cycle(e) {
+        pb::get_error::Kind::Cycle
+    } else if hplugin::error::is_cancelled(e) {
+        pb::get_error::Kind::Cancelled
+    } else {
+        pb::get_error::Kind::Other
+    }
+}
+
+/// Map a transport [`WireError`] back to the corresponding typed engine error,
+/// by kind (never by message). `addr` is the target being resolved, used to
+/// rebuild a `CycleError`.
+fn map_wire_err(e: anyhow::Error, addr: &Addr) -> anyhow::Error {
+    if let Some(w) = e.downcast_ref::<WireError>() {
+        match w.kind {
+            WireErrorKind::Cycle => {
+                return anyhow::Error::new(hplugin::error::CycleError {
+                    from: addr.clone(),
+                    to: addr.clone(),
+                });
+            }
+            WireErrorKind::Cancelled => {
+                return anyhow::Error::new(hplugin::error::CancelledError);
+            }
+            WireErrorKind::NotFound | WireErrorKind::Other => {}
+        }
+    }
+    e
+}
+
+/// A `ProviderExecutor` that forwards `result`/`query`/`note_dep` to the host
+/// over the mux.
 struct MuxExecutor {
     mux: Arc<Mux>,
     request_id: String,
@@ -579,7 +618,12 @@ impl ProviderExecutor for MuxExecutor {
                 request_id: self.request_id.clone(),
                 addr: Some(convert::addr_to_pb(addr)),
             });
-            match self.mux.call(body).await? {
+            let resp = self
+                .mux
+                .call(body)
+                .await
+                .map_err(|e| map_wire_err(e, addr))?;
+            match resp {
                 Body::ResultResp(rr) => {
                     // Eagerly pull each artifact's bytes over the mux. M2: whole
                     // artifact in one fetch; lazy/offset chunking is M3. Most
@@ -632,6 +676,33 @@ impl ProviderExecutor for MuxExecutor {
                     Ok(qr.addrs.into_iter().map(convert::addr_from_pb).collect())
                 }
                 other => anyhow::bail!("unexpected query response: {other:?}"),
+            }
+        })
+    }
+
+    fn note_dep<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // The host registers parent -> addr from its own request context, so
+            // `parent` here is informational only.
+            let body = Body::NoteDepReq(pb::NoteDepRequest {
+                request_id: self.request_id.clone(),
+                parent: None,
+                addr: Some(convert::addr_to_pb(addr)),
+            });
+            match self.mux.call(body).await.map_err(|e| map_wire_err(e, addr))? {
+                Body::NoteDepResp(r) => {
+                    if r.ok {
+                        Ok(())
+                    } else if r.cycle {
+                        Err(anyhow::Error::new(hplugin::error::CycleError {
+                            from: addr.clone(),
+                            to: addr.clone(),
+                        }))
+                    } else {
+                        anyhow::bail!("{}", r.message)
+                    }
+                }
+                other => anyhow::bail!("unexpected note_dep response: {other:?}"),
             }
         })
     }

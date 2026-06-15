@@ -46,6 +46,8 @@ message GetError {
     KIND_UNSPECIFIED = 0;
     KIND_NOT_FOUND = 1;
     KIND_OTHER = 2;
+    KIND_CYCLE = 3;
+    KIND_CANCELLED = 4;
   }
   Kind kind = 1;
   string message = 2;

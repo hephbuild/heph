@@ -157,7 +157,7 @@ impl Mux {
                 let resp = resp
                     .map_err(|_e| anyhow::anyhow!("plugin connection closed before response"))?;
                 if let Body::Error(e) = resp {
-                    anyhow::bail!("plugin error: {}", e.message);
+                    return Err(crate::error::WireError::from_pb(e).into());
                 }
                 Ok(resp)
             }

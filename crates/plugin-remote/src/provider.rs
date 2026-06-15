@@ -147,10 +147,21 @@ impl Provider for RemoteProvider {
                     target_spec: convert::target_spec_from_pb(gr.target_spec.unwrap_or_default()),
                 }),
                 Ok(Body::GetErr(ge)) => {
-                    if ge.kind == pb::get_error::Kind::NotFound as i32 {
-                        Err(GetError::NotFound)
-                    } else {
-                        Err(GetError::Other(anyhow::anyhow!("{}", ge.message)))
+                    // Reconstruct the typed error from the kind (never the message).
+                    match pb::get_error::Kind::try_from(ge.kind)
+                        .unwrap_or(pb::get_error::Kind::Other)
+                    {
+                        pb::get_error::Kind::NotFound => Err(GetError::NotFound),
+                        pb::get_error::Kind::Cycle => Err(GetError::Other(anyhow::Error::new(
+                            hplugin::error::CycleError {
+                                from: req.addr.clone(),
+                                to: req.addr.clone(),
+                            },
+                        ))),
+                        pb::get_error::Kind::Cancelled => {
+                            Err(GetError::Other(anyhow::Error::new(hplugin::error::CancelledError)))
+                        }
+                        _ => Err(GetError::Other(anyhow::anyhow!("{}", ge.message))),
                     }
                 }
                 Ok(other) => Err(GetError::Other(anyhow::anyhow!(

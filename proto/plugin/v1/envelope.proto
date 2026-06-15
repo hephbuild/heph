@@ -57,6 +57,7 @@ message Error {
     KIND_OTHER = 1;
     KIND_CANCELLED = 2;
     KIND_NOT_FOUND = 3;
+    KIND_CYCLE = 4;
   }
   Kind kind = 1;
   string message = 2;

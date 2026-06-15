@@ -26,6 +26,8 @@ pub mod shm_types;
 pub mod convert;
 
 #[cfg(feature = "transport")]
+pub mod error;
+#[cfg(feature = "transport")]
 pub mod frame;
 #[cfg(feature = "transport")]
 pub mod mux;

@@ -54,6 +54,27 @@ fn err_frame(message: String) -> Body {
     })
 }
 
+/// True if `e`'s chain contains a dependency-cycle error.
+fn is_cycle(e: &anyhow::Error) -> bool {
+    hcore::hmemoizer::downcast_chain_ref::<hplugin::error::CycleError>(e).is_some()
+}
+
+/// Build an Error frame whose kind reflects the real error type (downcast, never
+/// message-matched), so the guest can reconstruct a typed error.
+fn err_frame_from(e: &anyhow::Error) -> Body {
+    let kind = if is_cycle(e) {
+        pb::error::Kind::Cycle
+    } else if hplugin::error::is_cancelled(e) {
+        pb::error::Kind::Cancelled
+    } else {
+        pb::error::Kind::Other
+    };
+    Body::Error(pb::Error {
+        kind: kind as i32,
+        message: e.to_string(),
+    })
+}
+
 #[async_trait]
 impl InboundHandler for HostCallbackHandler {
     async fn handle(&self, id: u64, body: Body, mux: Arc<Mux>) {
@@ -113,34 +134,28 @@ impl HostCallbackHandler {
                     }),
                 );
             }
-            Err(e) => mux.send_body(id, err_frame(e.to_string())),
+            Err(e) => mux.send_body(id, err_frame_from(&e)),
         }
     }
 
     async fn handle_note_dep(&self, id: u64, req: pb::NoteDepRequest, mux: &Arc<Mux>) {
-        // M1: fall back to a full result() to register the dep edge (the engine
-        // registers parent->addr before any await). The true edge-only fast
-        // path is an engine API added in M2/M3.
         let Some(scope) = self.inner.scope(&req.request_id) else {
             mux.send_body(id, err_frame(format!("unknown request scope {}", req.request_id)));
             return;
         };
         let addr = convert::addr_from_pb(req.addr.unwrap_or_default());
-        let resp = match scope.executor.result(&addr).await {
-            Ok(_) => pb::NoteDepResponse {
+        // Edge-only registration (cheap); cycle is detected by type, not message.
+        let resp = match scope.executor.note_dep(&addr).await {
+            Ok(()) => pb::NoteDepResponse {
                 ok: true,
                 cycle: false,
                 message: String::new(),
             },
-            Err(e) => {
-                let msg = e.to_string();
-                let cycle = msg.to_lowercase().contains("cycle");
-                pb::NoteDepResponse {
-                    ok: false,
-                    cycle,
-                    message: msg,
-                }
-            }
+            Err(e) => pb::NoteDepResponse {
+                ok: false,
+                cycle: is_cycle(&e),
+                message: e.to_string(),
+            },
         };
         mux.send_body(id, Body::NoteDepResp(resp));
     }
@@ -158,7 +173,7 @@ impl HostCallbackHandler {
                     addrs: addrs.iter().map(convert::addr_to_pb).collect(),
                 }),
             ),
-            Err(e) => mux.send_body(id, err_frame(e.to_string())),
+            Err(e) => mux.send_body(id, err_frame_from(&e)),
         }
     }
 
@@ -182,7 +197,7 @@ impl HostCallbackHandler {
                 mux.send_body(id, Body::StreamItem(pb::StreamItem { item: buf.into() }));
                 mux.send_body(id, Body::StreamEnd(pb::StreamEnd { error: None }));
             }
-            Ok(Err(e)) => mux.send_body(id, err_frame(e.to_string())),
+            Ok(Err(e)) => mux.send_body(id, err_frame_from(&e)),
             Err(e) => mux.send_body(id, err_frame(format!("artifact read task failed: {e}"))),
         }
     }

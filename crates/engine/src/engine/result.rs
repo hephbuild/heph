@@ -71,6 +71,15 @@ impl ProviderExecutor for EngineProviderExecutor {
         })
     }
 
+    fn note_dep<'a>(
+        &'a self,
+        addr: &'a Addr,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        // Edge-only: register parent → addr (the synchronous cycle check) without
+        // executing. parent is already set on `rs` by the enclosing result_addr.
+        Box::pin(async move { self.rs.track_dep(addr).map_err(anyhow::Error::new) })
+    }
+
     fn query<'a>(
         &'a self,
         m: &'a Matcher,
