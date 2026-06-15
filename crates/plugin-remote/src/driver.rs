@@ -40,8 +40,12 @@ impl RemoteDriver {
             inner: Arc::clone(&inner),
         });
         let mux = Mux::start(read, write, handler);
+        Self::from_parts(mux, inner, name.into())
+    }
+
+    pub(crate) fn from_parts(mux: Arc<Mux>, inner: Arc<HostInner>, name: String) -> Self {
         Self {
-            name: name.into(),
+            name,
             mux,
             _inner: inner,
         }
@@ -70,6 +74,7 @@ impl Driver for RemoteDriver {
         let body = Body::ParseReq(pb::ParseRequest {
             request_id: req.request_id,
             target_spec: Some(convert::target_spec_to_pb(req.target_spec.as_ref())),
+            driver: self.name.clone(),
         });
         match self.mux.call_cancellable(body, ctoken.cancelled()).await? {
             Body::ParseResp(pr) => Ok(ParseResponse {
@@ -88,6 +93,7 @@ impl Driver for RemoteDriver {
             request_id: req.request_id,
             target_def: Some(convert::target_def_to_pb(&req.target_def)?),
             sandbox: Some(convert::sandbox_to_pb(&req.sandbox)),
+            driver: self.name.clone(),
         });
         match self.mux.call_cancellable(body, ctoken.cancelled()).await? {
             Body::ApplyTransitiveResp(r) => Ok(ApplyTransitiveResponse {

@@ -44,8 +44,15 @@ impl RemoteManagedDriver {
             inner: Arc::clone(&inner),
         });
         let mux = Mux::start(read, write, handler);
+        Self::from_parts(mux, inner, name.into())
+    }
+
+    /// Build from a shared connection (used by [`crate::RemotePlugin`] when a
+    /// plugin exposes several named drivers over one connection). `name` selects
+    /// which guest driver handles each request.
+    pub(crate) fn from_parts(mux: Arc<Mux>, inner: Arc<HostInner>, name: String) -> Self {
         Self {
-            name: name.into(),
+            name,
             mux,
             _inner: inner,
         }
@@ -96,6 +103,7 @@ impl ManagedDriver for RemoteManagedDriver {
         let body = Body::ParseReq(pb::ParseRequest {
             request_id: req.request_id,
             target_spec: Some(convert::target_spec_to_pb(req.target_spec.as_ref())),
+            driver: self.name.clone(),
         });
         match self.mux.call_cancellable(body, ctoken.cancelled()).await? {
             Body::ParseResp(pr) => Ok(ParseResponse {
@@ -114,6 +122,7 @@ impl ManagedDriver for RemoteManagedDriver {
             request_id: req.request_id,
             target_def: Some(convert::target_def_to_pb(&req.target_def)?),
             sandbox: Some(convert::sandbox_to_pb(&req.sandbox)),
+            driver: self.name.clone(),
         });
         match self.mux.call_cancellable(body, ctoken.cancelled()).await? {
             Body::ApplyTransitiveResp(r) => Ok(ApplyTransitiveResponse {
@@ -161,6 +170,7 @@ impl RemoteManagedDriver {
             sandbox_pkg_dir: req.sandbox_pkg_dir.to_string_lossy().into_owned(),
             inputs: req.inputs.iter().map(managed_input_to_pb).collect(),
             shell,
+            driver: self.name.clone(),
         });
         match self.mux.call_cancellable(body, ctoken.cancelled()).await? {
             Body::ManagedRunResp(r) => Ok(ManagedRunResponse {

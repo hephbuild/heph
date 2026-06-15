@@ -19,7 +19,7 @@ pub mod serve;
 
 pub use ctx::Ctx;
 pub use host::HostClient;
-pub use serve::{serve, serve_driver, serve_managed_driver, serve_plugin};
+pub use serve::{serve, serve_components, serve_driver, serve_managed_driver, serve_plugin};
 #[cfg(unix)]
 pub use serve::serve_inherited;
 

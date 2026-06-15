@@ -49,24 +49,17 @@ where
     serve_plugin(None, Some(driver), read, write)
 }
 
-/// Serve a managed-driver plugin (target execution: parse/apply_transitive/run
-/// at the driver-support `ManagedDriver` layer; the host materializes the
-/// sandbox).
+/// Serve a single managed-driver plugin (target execution at the driver-support
+/// `ManagedDriver` layer; the host materializes the sandbox).
 pub fn serve_managed_driver<R, W>(managed: Arc<dyn ManagedDriver>, read: R, write: W) -> Arc<Mux>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let handler = Arc::new(GuestHandler {
-        provider: None,
-        driver: None,
-        managed: Some(managed),
-        tokens: Mutex::new(HashMap::new()),
-    });
-    Mux::start(read, write, handler)
+    serve_components(None, HashMap::from([(String::new(), managed)]), read, write)
 }
 
-/// Serve a plugin that may export a provider, a driver, or both.
+/// Serve a plugin that may export a provider, a driver, or both (single driver).
 pub fn serve_plugin<R, W>(
     provider: Option<Arc<dyn Provider>>,
     driver: Option<Arc<dyn Driver>>,
@@ -80,7 +73,29 @@ where
     let handler = Arc::new(GuestHandler {
         provider,
         driver,
-        managed: None,
+        managed: HashMap::new(),
+        tokens: Mutex::new(HashMap::new()),
+    });
+    Mux::start(read, write, handler)
+}
+
+/// Serve a plugin that exposes a provider and/or several named managed drivers
+/// over one connection (the plugin-go shape: provider + golist/embed/testmain).
+/// Driver-targeted requests carry the driver name to route here.
+pub fn serve_components<R, W>(
+    provider: Option<Arc<dyn Provider>>,
+    managed: HashMap<String, Arc<dyn ManagedDriver>>,
+    read: R,
+    write: W,
+) -> Arc<Mux>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let handler = Arc::new(GuestHandler {
+        provider,
+        driver: None,
+        managed,
         tokens: Mutex::new(HashMap::new()),
     });
     Mux::start(read, write, handler)
@@ -105,9 +120,23 @@ pub async fn serve_inherited(provider: Arc<dyn Provider>) -> anyhow::Result<()> 
 struct GuestHandler {
     provider: Option<Arc<dyn Provider>>,
     driver: Option<Arc<dyn Driver>>,
-    managed: Option<Arc<dyn ManagedDriver>>,
+    managed: HashMap<String, Arc<dyn ManagedDriver>>,
     // frame-id -> cancellation token for the in-flight method call
     tokens: Mutex<HashMap<u64, Arc<StdCancellationToken>>>,
+}
+
+impl GuestHandler {
+    /// Pick a managed driver by selector; fall back to the sole one when the
+    /// selector is empty or there is exactly one registered.
+    fn pick_managed(&self, sel: &str) -> Option<Arc<dyn ManagedDriver>> {
+        if let Some(d) = self.managed.get(sel) {
+            return Some(Arc::clone(d));
+        }
+        if self.managed.len() == 1 {
+            return self.managed.values().next().cloned();
+        }
+        None
+    }
 }
 
 impl GuestHandler {
@@ -137,7 +166,7 @@ impl InboundHandler for GuestHandler {
                     p.config(ConfigRequest {}).map(|r| r.name)
                 } else if let Some(d) = &self.driver {
                     d.config(DriverConfigRequest {}).map(|r| r.name)
-                } else if let Some(m) = &self.managed {
+                } else if let Some(m) = self.managed.values().next() {
                     m.config(DriverConfigRequest {}).map(|r| r.name)
                 } else {
                     Err(anyhow::anyhow!("plugin exports neither provider nor driver"))
@@ -261,16 +290,19 @@ impl InboundHandler for GuestHandler {
             }
             Body::ParseReq(req) => {
                 let tok = self.new_token(id);
+                let sel = req.driver.clone();
                 let preq = ParseRequest {
                     request_id: req.request_id,
                     target_spec: Arc::new(convert::target_spec_from_pb(
                         req.target_spec.unwrap_or_default(),
                     )),
                 };
-                let result = match (self.driver.clone(), self.managed.clone()) {
-                    (Some(d), _) => d.parse(preq, &*tok).await,
-                    (None, Some(m)) => m.parse(preq, &*tok).await,
-                    (None, None) => Err(anyhow::anyhow!("plugin has no driver")),
+                let result = if let Some(d) = self.driver.clone() {
+                    d.parse(preq, &*tok).await
+                } else if let Some(m) = self.pick_managed(&sel) {
+                    m.parse(preq, &*tok).await
+                } else {
+                    Err(anyhow::anyhow!("plugin has no driver"))
                 };
                 match result {
                     Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
@@ -297,15 +329,18 @@ impl InboundHandler for GuestHandler {
                         return;
                     }
                 };
+                let sel = req.driver.clone();
                 let areq = ApplyTransitiveRequest {
                     request_id: req.request_id,
                     target_def,
                     sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
                 };
-                let result = match (self.driver.clone(), self.managed.clone()) {
-                    (Some(d), _) => d.apply_transitive(areq, &*tok).await,
-                    (None, Some(m)) => m.apply_transitive(areq, &*tok).await,
-                    (None, None) => Err(anyhow::anyhow!("plugin has no driver")),
+                let result = if let Some(d) = self.driver.clone() {
+                    d.apply_transitive(areq, &*tok).await
+                } else if let Some(m) = self.pick_managed(&sel) {
+                    m.apply_transitive(areq, &*tok).await
+                } else {
+                    Err(anyhow::anyhow!("plugin has no driver"))
                 };
                 match result {
                     Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
@@ -322,7 +357,7 @@ impl InboundHandler for GuestHandler {
                 self.drop_token(id);
             }
             Body::ManagedRunReq(req) => {
-                let Some(managed) = self.managed.clone() else {
+                let Some(managed) = self.pick_managed(&req.driver) else {
                     mux.send_body(id, err_frame("plugin has no managed driver".to_string()));
                     return;
                 };

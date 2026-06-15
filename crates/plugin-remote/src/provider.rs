@@ -39,11 +39,11 @@ impl RemoteProvider {
             inner: Arc::clone(&inner),
         });
         let mux = Mux::start(read, write, handler);
-        Self {
-            name: name.into(),
-            mux,
-            inner,
-        }
+        Self::from_parts(mux, inner, name.into())
+    }
+
+    pub(crate) fn from_parts(mux: Arc<Mux>, inner: Arc<HostInner>, name: String) -> Self {
+        Self { name, mux, inner }
     }
 }
 

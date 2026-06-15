@@ -8,6 +8,7 @@
 
 pub mod lease;
 
+mod conn;
 mod driver;
 mod host;
 mod managed;
@@ -15,6 +16,7 @@ mod provider;
 #[cfg(unix)]
 mod spawn;
 
+pub use conn::RemotePlugin;
 pub use driver::RemoteDriver;
 pub use managed::RemoteManagedDriver;
 pub use provider::RemoteProvider;

@@ -528,3 +528,96 @@ async fn managed_run_executes_remotely() {
     // The guest actually wrote the file into the shared sandbox.
     assert!(sandbox.join("out.txt").exists());
 }
+
+// ---- multi-driver routing: several named managed drivers, one connection ----
+
+struct NamedDriver(String);
+
+#[async_trait::async_trait]
+impl hdriver_support::driver_managed::ManagedDriver for NamedDriver {
+    fn config(
+        &self,
+        _req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        Ok(hplugin::driver::ConfigResponse {
+            name: self.0.clone(),
+        })
+    }
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        hplugin::driver::DriverSchema::default()
+    }
+    async fn parse(
+        &self,
+        req: hplugin::driver::ParseRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        // Encode which driver handled this in the raw_def, to assert routing.
+        let target_def = hplugin::driver::targetdef::TargetDef {
+            addr: req.target_spec.addr.clone(),
+            labels: vec![],
+            raw_def: Arc::new(MyCfg {
+                msg: self.0.clone(),
+                n: 0,
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: hplugin::driver::targetdef::CacheConfig::off(),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+        Ok(hplugin::driver::ParseResponse { target_def })
+    }
+    async fn apply_transitive(
+        &self,
+        req: hplugin::driver::ApplyTransitiveRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        Ok(hplugin::driver::ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+    async fn run<'a, 'io>(
+        &self,
+        _req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hdriver_support::driver_managed::ManagedRunResponse> {
+        anyhow::bail!("not used")
+    }
+}
+
+#[tokio::test]
+async fn multi_driver_routing_one_connection() {
+    use hdriver_support::driver_managed::ManagedDriver;
+    use std::collections::HashMap;
+
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+
+    let mut map: HashMap<String, Arc<dyn ManagedDriver>> = HashMap::new();
+    map.insert("alpha".to_string(), Arc::new(NamedDriver("alpha".to_string())));
+    map.insert("beta".to_string(), Arc::new(NamedDriver("beta".to_string())));
+    let _guest = plugin_sdk::serve_components(None, map, br, bw);
+
+    // One connection, two driver handles selected by name.
+    let plugin = plugin_remote::RemotePlugin::connect(ar, aw);
+    let alpha = plugin.managed_driver("alpha");
+    let beta = plugin.managed_driver("beta");
+
+    let ctoken = StdCancellationToken::new();
+    let mk_req = || hplugin::driver::ParseRequest {
+        request_id: "r".to_string(),
+        target_spec: Arc::new(hplugin::provider::TargetSpec {
+            addr: addr("//x", "y"),
+            ..Default::default()
+        }),
+    };
+
+    let pa = alpha.parse(mk_req(), &ctoken).await.expect("alpha parse");
+    assert_eq!(pa.target_def.def_de::<MyCfg>().msg, "alpha");
+
+    let pb_ = beta.parse(mk_req(), &ctoken).await.expect("beta parse");
+    assert_eq!(pb_.target_def.def_de::<MyCfg>().msg, "beta");
+}
