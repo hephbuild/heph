@@ -49,6 +49,7 @@ fn is_response(body: &Body) -> bool {
             | Body::ParseResp(_)
             | Body::ApplyTransitiveResp(_)
             | Body::RunResp(_)
+            | Body::ManagedRunResp(_)
             | Body::ResultResp(_)
             | Body::NoteDepResp(_)
             | Body::QueryResp(_)

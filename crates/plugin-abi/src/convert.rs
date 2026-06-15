@@ -432,6 +432,79 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
     })
 }
 
+// ---- OutputArtifact (driver run outputs) ----
+
+use hplugin::driver::outputartifact::{Content as OaContent, ContentFile, ContentRaw, OutputArtifact, Type as OaType};
+
+fn oa_type_to_pb(t: &OaType) -> pb::ArtifactType {
+    match t {
+        OaType::Output => pb::ArtifactType::Output,
+        OaType::Log => pb::ArtifactType::Log,
+        OaType::SupportFile => pb::ArtifactType::SupportFile,
+    }
+}
+
+fn oa_type_from_pb(t: i32) -> OaType {
+    match pb::ArtifactType::try_from(t).unwrap_or(pb::ArtifactType::Output) {
+        pb::ArtifactType::Log => OaType::Log,
+        pb::ArtifactType::SupportFile => OaType::SupportFile,
+        _ => OaType::Output,
+    }
+}
+
+pub fn output_artifact_to_pb(oa: &OutputArtifact) -> pb::OutputArtifactRef {
+    let content = match &oa.content {
+        OaContent::File(f) => pb::output_artifact_ref::Content::File(pb::ContentFile {
+            source_path: f.source_path.clone(),
+            out_path: f.out_path.clone(),
+            x: f.x,
+        }),
+        OaContent::Raw(r) => pb::output_artifact_ref::Content::Raw(pb::ContentRaw {
+            data: r.data.clone().into(),
+            path: r.path.clone(),
+            x: r.x,
+        }),
+        OaContent::TarPath(p) => pb::output_artifact_ref::Content::TarPath(p.clone()),
+        OaContent::CpioPath(p) => pb::output_artifact_ref::Content::CpioPath(p.clone()),
+    };
+    pb::OutputArtifactRef {
+        group: oa.group.clone(),
+        name: oa.name.clone(),
+        r#type: oa_type_to_pb(&oa.r#type) as i32,
+        content: Some(content),
+        hashout: oa.hashout.clone(),
+    }
+}
+
+pub fn output_artifact_from_pb(oa: pb::OutputArtifactRef) -> OutputArtifact {
+    let content = match oa.content {
+        Some(pb::output_artifact_ref::Content::File(f)) => OaContent::File(ContentFile {
+            source_path: f.source_path,
+            out_path: f.out_path,
+            x: f.x,
+        }),
+        Some(pb::output_artifact_ref::Content::Raw(r)) => OaContent::Raw(ContentRaw {
+            data: r.data.to_vec(),
+            path: r.path,
+            x: r.x,
+        }),
+        Some(pb::output_artifact_ref::Content::TarPath(p)) => OaContent::TarPath(p),
+        Some(pb::output_artifact_ref::Content::CpioPath(p)) => OaContent::CpioPath(p),
+        None => OaContent::Raw(ContentRaw {
+            data: vec![],
+            path: String::new(),
+            x: false,
+        }),
+    };
+    OutputArtifact {
+        group: oa.group,
+        name: oa.name,
+        r#type: oa_type_from_pb(oa.r#type),
+        content,
+        hashout: oa.hashout,
+    }
+}
+
 // ---- raw_def (opaque driver blob) ----
 
 /// Serialize a driver's `raw_def` to a wire blob (JSON). Works on any `RawDef`,

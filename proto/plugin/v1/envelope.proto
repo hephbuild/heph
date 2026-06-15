@@ -98,6 +98,8 @@ message Frame {
     ApplyTransitiveResponse apply_transitive_resp = 28;
     RunRequest run_req = 29;
     RunResponse run_resp = 30;
+    ManagedRunRequest managed_run_req = 53;
+    ManagedRunResponse managed_run_resp = 54;
 
     // host-exported callbacks (plugin->host request / host->plugin response)
     ResultRequest result_req = 40;

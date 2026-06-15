@@ -10,11 +10,13 @@ pub mod lease;
 
 mod driver;
 mod host;
+mod managed;
 mod provider;
 #[cfg(unix)]
 mod spawn;
 
 pub use driver::RemoteDriver;
+pub use managed::RemoteManagedDriver;
 pub use provider::RemoteProvider;
 #[cfg(unix)]
 pub use spawn::{spawn_plugin, PLUGIN_FD};

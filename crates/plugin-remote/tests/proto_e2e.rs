@@ -414,3 +414,117 @@ async fn driver_parse_and_apply_transitive_roundtrip() {
         .expect("apply_transitive");
     assert_eq!(applied.target_def.def_de::<MyCfg>().n, 9);
 }
+
+// ---- managed run: host materializes, guest executes in the shared sandbox ----
+
+struct TestManagedDriver;
+
+#[async_trait::async_trait]
+impl hdriver_support::driver_managed::ManagedDriver for TestManagedDriver {
+    fn config(
+        &self,
+        _req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        Ok(hplugin::driver::ConfigResponse {
+            name: "tmd".to_string(),
+        })
+    }
+
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        hplugin::driver::DriverSchema::default()
+    }
+
+    async fn parse(
+        &self,
+        _req: hplugin::driver::ParseRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        anyhow::bail!("not used")
+    }
+
+    async fn apply_transitive(
+        &self,
+        _req: hplugin::driver::ApplyTransitiveRequest,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        anyhow::bail!("not used")
+    }
+
+    async fn run<'a, 'io>(
+        &self,
+        req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hdriver_support::driver_managed::ManagedRunResponse> {
+        // Execute in the (host-prepared) sandbox: write an output file.
+        let out = req.sandbox_pkg_dir.join("out.txt");
+        std::fs::write(&out, b"built")?;
+        Ok(hdriver_support::driver_managed::ManagedRunResponse {
+            artifacts: vec![hplugin::driver::outputartifact::OutputArtifact {
+                group: "out".to_string(),
+                name: "out.txt".to_string(),
+                r#type: hplugin::driver::outputartifact::Type::Output,
+                content: hplugin::driver::outputartifact::Content::File(
+                    hplugin::driver::outputartifact::ContentFile {
+                        source_path: out.to_string_lossy().into_owned(),
+                        out_path: "out.txt".to_string(),
+                        x: false,
+                    },
+                ),
+                hashout: "h".to_string(),
+            }],
+        })
+    }
+}
+
+#[tokio::test]
+async fn managed_run_executes_remotely() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sandbox = dir.path().to_path_buf();
+
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+    let host = plugin_remote::RemoteManagedDriver::connect(ar, aw, "tmd");
+    let _guest = plugin_sdk::serve_managed_driver(Arc::new(TestManagedDriver), br, bw);
+
+    let ctoken = StdCancellationToken::new();
+    let request_id = "r1".to_string();
+    let target = hplugin::driver::targetdef::TargetDef {
+        addr: addr("//x", "y"),
+        labels: vec![],
+        raw_def: Arc::new(()),
+        inputs: vec![],
+        outputs: vec![],
+        support_files: vec![],
+        cache: hplugin::driver::targetdef::CacheConfig::off(),
+        pty: false,
+        hash: vec![],
+        transparent: false,
+    };
+    let hashin = "hash".to_string();
+    let rr = hplugin::driver::RunRequest {
+        request_id: &request_id,
+        target: &target,
+        tree_root_path: sandbox.clone(),
+        inputs: vec![],
+        hashin: hashin.as_str(),
+        stdin: None,
+        stdout: None,
+        stderr: None,
+        sandbox_dir: sandbox.clone(),
+    };
+    let mrr = hdriver_support::driver_managed::ManagedRunRequest {
+        request: rr,
+        sandbox_dir: sandbox.clone(),
+        sandbox_ws_dir: sandbox.clone(),
+        sandbox_pkg_dir: sandbox.clone(),
+        inputs: vec![],
+    };
+
+    use hdriver_support::driver_managed::ManagedDriver;
+    let resp = host.run(mrr, &ctoken).await.expect("managed run");
+    assert_eq!(resp.artifacts.len(), 1);
+    assert_eq!(resp.artifacts[0].name, "out.txt");
+    // The guest actually wrote the file into the shared sandbox.
+    assert!(sandbox.join("out.txt").exists());
+}

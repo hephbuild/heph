@@ -56,3 +56,43 @@ message RunRequest {
 message RunResponse {
   repeated OutputArtifactRef artifacts = 1;
 }
+
+// ---- Managed run (driver-support ManagedDriver layer) ----
+// The host's ManagedDriverBridge already materialized inputs into the shared
+// sandbox dirs, so a managed run carries only paths + metadata — never input
+// bytes. The guest executes in the sandbox and returns output artifacts.
+
+enum InputArtifactType {
+  INPUT_ARTIFACT_TYPE_UNSPECIFIED = 0;
+  INPUT_ARTIFACT_TYPE_DEP = 1;
+  INPUT_ARTIFACT_TYPE_SUPPORT = 2;
+}
+
+message ManagedRunInput {
+  InputArtifactType type = 1;
+  string origin_id = 2;
+  Addr source_addr = 3;
+  repeated string filters = 4;
+  map<string, string> annotations = 5;
+  // Where this input was unpacked on the shared filesystem.
+  string unpack_root = 6;
+  // List file for Dep inputs (absent for Support inputs).
+  optional string list_path = 7;
+}
+
+message ManagedRunRequest {
+  string request_id = 1;
+  TargetDef target = 2;
+  string tree_root_path = 3;
+  string hashin = 4;
+  string sandbox_dir = 5;
+  string sandbox_ws_dir = 6;
+  string sandbox_pkg_dir = 7;
+  repeated ManagedRunInput inputs = 8;
+  // true => run_shell
+  bool shell = 9;
+}
+
+message ManagedRunResponse {
+  repeated OutputArtifactRef artifacts = 1;
+}

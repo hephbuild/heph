@@ -8,9 +8,12 @@ use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hcore::hasync::StdCancellationToken;
 use hplugin::eresult::{ArtifactMeta, EResult};
+use hdriver_support::driver_managed::{ManagedDriver, ManagedRunInput, ManagedRunRequest};
 use hplugin::driver::{
-    ApplyTransitiveRequest, ConfigRequest as DriverConfigRequest, Driver, ParseRequest,
+    inputartifact, ApplyTransitiveRequest, ConfigRequest as DriverConfigRequest, Driver,
+    ParseRequest, RunInput, RunRequest,
 };
+use std::path::PathBuf;
 use hplugin::provider::{
     ConfigRequest, GetError, GetRequest, ListPackagesRequest, ListRequest, ProbeRequest, Provider,
     ProviderExecutor,
@@ -46,6 +49,23 @@ where
     serve_plugin(None, Some(driver), read, write)
 }
 
+/// Serve a managed-driver plugin (target execution: parse/apply_transitive/run
+/// at the driver-support `ManagedDriver` layer; the host materializes the
+/// sandbox).
+pub fn serve_managed_driver<R, W>(managed: Arc<dyn ManagedDriver>, read: R, write: W) -> Arc<Mux>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let handler = Arc::new(GuestHandler {
+        provider: None,
+        driver: None,
+        managed: Some(managed),
+        tokens: Mutex::new(HashMap::new()),
+    });
+    Mux::start(read, write, handler)
+}
+
 /// Serve a plugin that may export a provider, a driver, or both.
 pub fn serve_plugin<R, W>(
     provider: Option<Arc<dyn Provider>>,
@@ -60,6 +80,7 @@ where
     let handler = Arc::new(GuestHandler {
         provider,
         driver,
+        managed: None,
         tokens: Mutex::new(HashMap::new()),
     });
     Mux::start(read, write, handler)
@@ -84,6 +105,7 @@ pub async fn serve_inherited(provider: Arc<dyn Provider>) -> anyhow::Result<()> 
 struct GuestHandler {
     provider: Option<Arc<dyn Provider>>,
     driver: Option<Arc<dyn Driver>>,
+    managed: Option<Arc<dyn ManagedDriver>>,
     // frame-id -> cancellation token for the in-flight method call
     tokens: Mutex<HashMap<u64, Arc<StdCancellationToken>>>,
 }
@@ -115,6 +137,8 @@ impl InboundHandler for GuestHandler {
                     p.config(ConfigRequest {}).map(|r| r.name)
                 } else if let Some(d) = &self.driver {
                     d.config(DriverConfigRequest {}).map(|r| r.name)
+                } else if let Some(m) = &self.managed {
+                    m.config(DriverConfigRequest {}).map(|r| r.name)
                 } else {
                     Err(anyhow::anyhow!("plugin exports neither provider nor driver"))
                 };
@@ -236,10 +260,6 @@ impl InboundHandler for GuestHandler {
                 self.drop_token(id);
             }
             Body::ParseReq(req) => {
-                let Some(driver) = self.driver.clone() else {
-                    mux.send_body(id, err_frame("plugin has no driver".to_string()));
-                    return;
-                };
                 let tok = self.new_token(id);
                 let preq = ParseRequest {
                     request_id: req.request_id,
@@ -247,7 +267,12 @@ impl InboundHandler for GuestHandler {
                         req.target_spec.unwrap_or_default(),
                     )),
                 };
-                match driver.parse(preq, &*tok).await {
+                let result = match (self.driver.clone(), self.managed.clone()) {
+                    (Some(d), _) => d.parse(preq, &*tok).await,
+                    (None, Some(m)) => m.parse(preq, &*tok).await,
+                    (None, None) => Err(anyhow::anyhow!("plugin has no driver")),
+                };
+                match result {
                     Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
                         Ok(td) => mux.send_body(
                             id,
@@ -262,10 +287,6 @@ impl InboundHandler for GuestHandler {
                 self.drop_token(id);
             }
             Body::ApplyTransitiveReq(req) => {
-                let Some(driver) = self.driver.clone() else {
-                    mux.send_body(id, err_frame("plugin has no driver".to_string()));
-                    return;
-                };
                 let tok = self.new_token(id);
                 let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default())
                 {
@@ -281,7 +302,12 @@ impl InboundHandler for GuestHandler {
                     target_def,
                     sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
                 };
-                match driver.apply_transitive(areq, &*tok).await {
+                let result = match (self.driver.clone(), self.managed.clone()) {
+                    (Some(d), _) => d.apply_transitive(areq, &*tok).await,
+                    (None, Some(m)) => m.apply_transitive(areq, &*tok).await,
+                    (None, None) => Err(anyhow::anyhow!("plugin has no driver")),
+                };
+                match result {
                     Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
                         Ok(td) => mux.send_body(
                             id,
@@ -295,6 +321,15 @@ impl InboundHandler for GuestHandler {
                 }
                 self.drop_token(id);
             }
+            Body::ManagedRunReq(req) => {
+                let Some(managed) = self.managed.clone() else {
+                    mux.send_body(id, err_frame("plugin has no managed driver".to_string()));
+                    return;
+                };
+                let tok = self.new_token(id);
+                self.handle_managed_run(id, req, managed, &*tok, &mux).await;
+                self.drop_token(id);
+            }
             Body::Cancel(c) => {
                 if let Some(tok) = self.tokens.lock().expect("tokens").get(&c.request_id) {
                     tok.cancel();
@@ -305,7 +340,111 @@ impl InboundHandler for GuestHandler {
     }
 }
 
+fn run_input_from_pb(mi: &pb::ManagedRunInput) -> RunInput {
+    let ty = match pb::InputArtifactType::try_from(mi.r#type).unwrap_or(pb::InputArtifactType::Dep) {
+        pb::InputArtifactType::Support => inputartifact::Type::Support,
+        _ => inputartifact::Type::Dep,
+    };
+    RunInput {
+        artifact: inputartifact::InputArtifact {
+            r#type: ty,
+            origin_id: mi.origin_id.clone(),
+            // Input bytes are on the shared filesystem (unpack_root); the guest
+            // reads from disk, never from this Content.
+            content: Arc::new(NullContent),
+        },
+        origin_id: mi.origin_id.clone(),
+        source_addr: convert::addr_from_pb(mi.source_addr.clone().unwrap_or_default()),
+        filters: mi.filters.clone(),
+        annotations: mi
+            .annotations
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    }
+}
+
+fn managed_input_from_pb(mi: pb::ManagedRunInput) -> ManagedRunInput {
+    let input = run_input_from_pb(&mi);
+    ManagedRunInput {
+        input,
+        list_path: mi.list_path.map(PathBuf::from),
+        unpack_root: PathBuf::from(mi.unpack_root),
+    }
+}
+
+/// Placeholder Content for materialized run inputs — the bytes live on the
+/// shared filesystem (unpack_root), so this is never read.
+struct NullContent;
+
+impl Content for NullContent {
+    fn reader(&self) -> Result<Box<dyn Read>> {
+        anyhow::bail!("managed run input content is on disk (unpack_root), not streamed")
+    }
+    fn walk(&self) -> Result<Box<dyn Iterator<Item = Result<WalkEntry>> + '_>> {
+        anyhow::bail!("managed run input content is on disk (unpack_root), not streamed")
+    }
+    fn hashout(&self) -> Result<String> {
+        Ok(String::new())
+    }
+}
+
 impl GuestHandler {
+    async fn handle_managed_run(
+        &self,
+        id: u64,
+        req: pb::ManagedRunRequest,
+        managed: Arc<dyn ManagedDriver>,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        mux: &Arc<Mux>,
+    ) {
+        let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
+            Ok(t) => t,
+            Err(e) => {
+                mux.send_body(id, err_frame(e.to_string()));
+                return;
+            }
+        };
+        let request_id = req.request_id;
+        let hashin = req.hashin;
+        let sandbox_dir = PathBuf::from(req.sandbox_dir);
+        let run_inputs: Vec<RunInput> = req.inputs.iter().map(run_input_from_pb).collect();
+        let managed_inputs: Vec<ManagedRunInput> =
+            req.inputs.into_iter().map(managed_input_from_pb).collect();
+        let rr = RunRequest {
+            request_id: &request_id,
+            target: &target,
+            tree_root_path: PathBuf::from(req.tree_root_path),
+            inputs: run_inputs,
+            hashin: hashin.as_str(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox_dir.clone(),
+        };
+        let mrr = ManagedRunRequest {
+            request: rr,
+            sandbox_dir,
+            sandbox_ws_dir: PathBuf::from(req.sandbox_ws_dir),
+            sandbox_pkg_dir: PathBuf::from(req.sandbox_pkg_dir),
+            inputs: managed_inputs,
+        };
+        let result = if req.shell {
+            managed.run_shell(mrr, ctoken).await
+        } else {
+            managed.run(mrr, ctoken).await
+        };
+        match result {
+            Ok(resp) => mux.send_body(
+                id,
+                Body::ManagedRunResp(pb::ManagedRunResponse {
+                    artifacts: resp.artifacts.iter().map(convert::output_artifact_to_pb).collect(),
+                }),
+            ),
+            Err(e) => mux.send_body(id, err_frame(e.to_string())),
+        }
+    }
+
     fn stream_addrs(
         &self,
         id: u64,
