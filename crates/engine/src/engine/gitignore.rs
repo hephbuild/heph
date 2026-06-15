@@ -3,7 +3,7 @@
 //! Codegen targets with `codegen = copy` write generated files into the source
 //! tree; those files must be gitignored. This module owns the *core* logic —
 //! enumerating the patterns and rendering the marked section — so it can be
-//! reused by the `gen-gitignore` command and by future validations (e.g. a
+//! reused by the `tool gen-gitignore` command and by future validations (e.g. a
 //! CI check that the committed `.gitignore` is up to date). The command layer
 //! only handles file IO and progress reporting.
 
@@ -21,8 +21,14 @@ use hmodel::htmatcher::{MatchResult, Matcher};
 /// are owned by heph and rewritten on every run; everything outside is
 /// preserved verbatim.
 pub const BEGIN_MARKER: &str =
-    "# BEGIN heph-generated (managed by `heph gen-gitignore` — do not edit)";
+    "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)";
 pub const END_MARKER: &str = "# END heph-generated";
+
+/// Stable prefix of [`BEGIN_MARKER`]. Detection matches on this rather than the
+/// full marker so that changing the parenthetical (e.g. the command name) never
+/// orphans an already-committed section — the old block is still found and
+/// rewritten with the current [`BEGIN_MARKER`] text.
+pub const BEGIN_MARKER_PREFIX: &str = "# BEGIN heph-generated";
 
 /// Separator between a gitignore pattern and the trailing `# //pkg:target`
 /// comment naming the emitting target. The space-hash-space form keeps the
@@ -130,7 +136,10 @@ fn parse_entry(line: &str) -> GitignoreEntry {
     reason = "slice indices come from `find` on ASCII markers — always char-aligned"
 )]
 pub fn parse_section(existing: &str) -> Vec<GitignoreEntry> {
-    let (Some(start), Some(end)) = (existing.find(BEGIN_MARKER), existing.find(END_MARKER)) else {
+    let (Some(start), Some(end)) = (
+        existing.find(BEGIN_MARKER_PREFIX),
+        existing.find(END_MARKER),
+    ) else {
         return Vec::new();
     };
     if end < start {
@@ -139,7 +148,7 @@ pub fn parse_section(existing: &str) -> Vec<GitignoreEntry> {
     existing[start..end]
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with(BEGIN_MARKER))
+        .filter(|l| !l.is_empty() && !l.starts_with(BEGIN_MARKER_PREFIX))
         .map(parse_entry)
         .collect()
 }
@@ -199,7 +208,10 @@ pub fn render(existing: &str, entries: &[GitignoreEntry]) -> String {
     }
     section.push_str(END_MARKER);
 
-    match (existing.find(BEGIN_MARKER), existing.find(END_MARKER)) {
+    match (
+        existing.find(BEGIN_MARKER_PREFIX),
+        existing.find(END_MARKER),
+    ) {
         (Some(start), Some(end_marker_pos)) if end_marker_pos >= start => {
             let end = end_marker_pos + END_MARKER.len();
             let mut result = String::with_capacity(existing.len() + section.len());
@@ -302,6 +314,19 @@ mod tests {
             out,
             format!("top\n{BEGIN_MARKER}\n/new\n{END_MARKER}\nbottom\n")
         );
+    }
+
+    #[test]
+    fn detects_and_rewrites_legacy_begin_marker() {
+        // A section committed before the command moved to `heph tool gen-gitignore`
+        // carries the old parenthetical. Detection keys on the stable prefix, so the
+        // block is found, parsed, and rewritten with the current marker text — never
+        // orphaned into a duplicate.
+        let legacy = "# BEGIN heph-generated (managed by `heph gen-gitignore` — do not edit)\n/old\n# END heph-generated\n";
+        assert_eq!(parse_section(legacy), vec![bare("/old")]);
+
+        let out = render(legacy, &[bare("/new")]);
+        assert_eq!(out, format!("{BEGIN_MARKER}\n/new\n{END_MARKER}\n"));
     }
 
     #[test]
