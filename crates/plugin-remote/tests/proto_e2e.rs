@@ -5,7 +5,7 @@
 //! next; this proves the protocol.)
 
 use futures::future::BoxFuture;
-use hcore::hartifactcontent::{Content, WalkEntry};
+use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::{Cancellable, StdCancellationToken};
 use hplugin::eresult::{ArtifactMeta, EResult};
 use hplugin::provider::{
@@ -100,6 +100,29 @@ impl Provider for TestProvider {
                     "callback hashout mismatch: {got:?}"
                 )));
             }
+            // Read package.bin out of the artifact — exercises byte streaming +
+            // tar walk through the transport (the plugin-go hot read).
+            let art = eres
+                .artifacts
+                .first()
+                .ok_or_else(|| GetError::Other(anyhow::anyhow!("no artifacts")))?;
+            let mut found: Option<String> = None;
+            for entry in art.walk().map_err(GetError::Other)? {
+                let entry = entry.map_err(GetError::Other)?;
+                if entry.path.file_name().and_then(|n| n.to_str()) == Some("package.bin")
+                    && let WalkEntryKind::File { mut data, .. } = entry.kind
+                {
+                    let mut s = String::new();
+                    data.read_to_string(&mut s)
+                        .map_err(|e| GetError::Other(e.into()))?;
+                    found = Some(s);
+                }
+            }
+            if found.as_deref() != Some("hello") {
+                return Err(GetError::Other(anyhow::anyhow!(
+                    "package.bin mismatch: {found:?}"
+                )));
+            }
             let spec = TargetSpec {
                 addr: req.addr,
                 driver: "exec".to_string(),
@@ -120,11 +143,23 @@ impl Provider for TestProvider {
 
 // ---- host stub engine executor ----
 
-struct MemContent;
+/// A tar artifact containing `package.bin` = "hello" — what the host would
+/// hand back from a cache result; the guest must fetch + walk it.
+fn pkg_tar() -> Vec<u8> {
+    let mut p = hcore::hartifactcontent::tar::TarPacker::new();
+    p.create_raw(b"hello".to_vec(), "package.bin", false);
+    let mut buf = Vec::new();
+    p.pack(&mut buf).expect("pack tar");
+    buf
+}
+
+struct MemContent {
+    bytes: Vec<u8>,
+}
 
 impl Content for MemContent {
     fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+        Ok(Box::new(Cursor::new(self.bytes.clone())))
     }
     fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
         Ok(Box::new(std::iter::empty()))
@@ -133,7 +168,7 @@ impl Content for MemContent {
         Ok(DEP_HASH.to_string())
     }
     fn byte_size(&self) -> Option<u64> {
-        Some(0)
+        Some(self.bytes.len() as u64)
     }
 }
 
@@ -143,7 +178,7 @@ impl ProviderExecutor for StubExec {
     fn result<'a>(&'a self, _addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
         Box::pin(async move {
             Ok(Arc::new(EResult {
-                artifacts: vec![Arc::new(MemContent) as Arc<dyn Content>],
+                artifacts: vec![Arc::new(MemContent { bytes: pkg_tar() }) as Arc<dyn Content>],
                 support_artifacts: vec![],
                 artifacts_meta: vec![ArtifactMeta {
                     hashout: DEP_HASH.to_string(),

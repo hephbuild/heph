@@ -240,6 +240,32 @@ struct MuxExecutor {
     request_id: String,
 }
 
+impl MuxExecutor {
+    /// Pull all bytes of one artifact via `open_artifact` (streamed as chunks).
+    async fn fetch_artifact(&self, lease_id: &str, handle_id: &str) -> Result<Vec<u8>> {
+        let mut rx = self.mux.call_stream(Body::OpenArtifactReq(pb::OpenArtifactRequest {
+            lease_id: lease_id.to_string(),
+            handle_id: handle_id.to_string(),
+            offset: 0,
+        }));
+        let mut bytes = Vec::new();
+        while let Some(b) = rx.recv().await {
+            match b {
+                Body::StreamItem(si) => bytes.extend_from_slice(&si.item),
+                Body::StreamEnd(se) => {
+                    if let Some(e) = se.error {
+                        anyhow::bail!("{}", e.message);
+                    }
+                    break;
+                }
+                Body::Error(e) => anyhow::bail!("{}", e.message),
+                _ => {}
+            }
+        }
+        Ok(bytes)
+    }
+}
+
 impl ProviderExecutor for MuxExecutor {
     fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, Result<Arc<EResult>>> {
         Box::pin(async move {
@@ -249,25 +275,23 @@ impl ProviderExecutor for MuxExecutor {
             });
             match self.mux.call(body).await? {
                 Body::ResultResp(rr) => {
-                    let artifacts: Vec<Arc<dyn Content>> = rr
-                        .artifacts
-                        .iter()
-                        .map(|h| {
-                            Arc::new(RemoteContent {
-                                hashout: h.hashout.clone(),
-                                byte_size: h.byte_size,
-                            }) as Arc<dyn Content>
-                        })
-                        .collect();
-                    let artifacts_meta = rr
-                        .artifacts
-                        .iter()
-                        .map(|h| ArtifactMeta {
+                    // Eagerly pull each artifact's bytes over the mux. M2: whole
+                    // artifact in one fetch; lazy/offset chunking is M3. Most
+                    // plugins read a tiny file (e.g. package.bin) so this is
+                    // cheap in practice.
+                    let mut artifacts: Vec<Arc<dyn Content>> = Vec::with_capacity(rr.artifacts.len());
+                    let mut artifacts_meta = Vec::with_capacity(rr.artifacts.len());
+                    for h in &rr.artifacts {
+                        let bytes = self.fetch_artifact(&rr.lease_id, &h.handle_id).await?;
+                        artifacts.push(Arc::new(RemoteContent {
+                            bytes,
                             hashout: h.hashout.clone(),
-                        })
-                        .collect();
-                    // M1 does not read artifact bytes, so release the lease now.
-                    // Lazy byte streaming + lease-on-drop lands in M2.
+                        }) as Arc<dyn Content>);
+                        artifacts_meta.push(ArtifactMeta {
+                            hashout: h.hashout.clone(),
+                        });
+                    }
+                    // Bytes are now owned locally; release the host-side guards.
                     drop(
                         self.mux
                             .call(Body::ReleaseLeaseReq(pb::ReleaseLeaseRequest {
@@ -307,24 +331,27 @@ impl ProviderExecutor for MuxExecutor {
     }
 }
 
-/// Host artifact handle on the guest side. M1 exposes only metadata; byte access
-/// (`reader`/`walk`) streams over the mux in M2.
+/// A host artifact materialized on the guest side: the bytes are fetched eagerly
+/// over the mux, then read/walked locally. Artifacts are tar (the only content
+/// type the cache produces today), so `walk` uses the tar walker.
 struct RemoteContent {
+    bytes: Vec<u8>,
     hashout: String,
-    byte_size: u64,
 }
 
 impl Content for RemoteContent {
     fn reader(&self) -> Result<Box<dyn Read>> {
-        anyhow::bail!("remote artifact byte access lands in M2")
+        Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
     }
     fn walk(&self) -> Result<Box<dyn Iterator<Item = Result<WalkEntry>> + '_>> {
-        anyhow::bail!("remote artifact walk lands in M2")
+        Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
+            std::io::Cursor::new(self.bytes.clone()),
+        )?))
     }
     fn hashout(&self) -> Result<String> {
         Ok(self.hashout.clone())
     }
     fn byte_size(&self) -> Option<u64> {
-        Some(self.byte_size)
+        Some(self.bytes.len() as u64)
     }
 }
