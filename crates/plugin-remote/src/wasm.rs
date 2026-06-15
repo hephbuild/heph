@@ -16,7 +16,8 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 mod echo_bindings {
     wasmtime::component::bindgen!({
-        inline: "package component:echo;\nworld echo {\n  export greet: func(name: string) -> string;\n}",
+        // Must stay in sync with crates/wasm-guests/echo/wit/world.wit.
+        inline: "package component:echo;\nworld echo {\n  import host-lookup: func(key: string) -> string;\n  export greet: func(name: string) -> string;\n}",
         world: "echo",
     });
 }
@@ -37,6 +38,15 @@ impl WasiView for HostState {
     }
 }
 
+// Host-side implementation of the world's `host-lookup` import — the guest
+// calls this back during `greet`. Stand-in for the real AbiHost executor
+// surface (result/note_dep/query); proves the guest→host callback path.
+impl echo_bindings::EchoImports for HostState {
+    fn host_lookup(&mut self, key: String) -> String {
+        format!("host:{key}")
+    }
+}
+
 /// De-risk slice: instantiate `wasm` (a component exporting `greet`) and call
 /// `greet(name)`. Synchronous — `greet` is pure compute, no host imports beyond
 /// the WASI shims the component links against.
@@ -54,6 +64,12 @@ pub fn instantiate_and_greet(wasm: &[u8], name: &str) -> Result<String> {
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
         .map_err(anyhow::Error::from)
         .context("linking WASI imports")?;
+    echo_bindings::Echo::add_to_linker::<_, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state| state,
+    )
+    .map_err(anyhow::Error::from)
+    .context("linking host imports")?;
 
     let state = HostState {
         table: ResourceTable::new(),

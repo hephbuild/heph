@@ -44,7 +44,9 @@ fn echo_component_greets_over_wasmtime_host() {
     let wasm_path = build_echo_component(tmp.path());
     let wasm = std::fs::read(&wasm_path).expect("read built component");
 
+    // greet() calls back into the host's `host-lookup` import (-> "host:heph")
+    // and folds it into the reply — exercising both call directions over wasm.
     let out = plugin_remote::wasm::instantiate_and_greet(&wasm, "heph")
         .expect("instantiate + call greet");
-    assert_eq!(out, "hello heph");
+    assert_eq!(out, "hello heph (host:heph)");
 }

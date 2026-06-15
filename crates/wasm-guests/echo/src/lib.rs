@@ -7,7 +7,10 @@ struct Component;
 
 impl Guest for Component {
     fn greet(name: String) -> String {
-        format!("hello {name}")
+        // Call back into the host, then fold the host's answer into our reply.
+        // Proves the guest→host callback path over wasm.
+        let from_host = bindings::host_lookup(&name);
+        format!("hello {name} ({from_host})")
     }
 }
 
