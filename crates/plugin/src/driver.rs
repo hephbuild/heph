@@ -643,7 +643,7 @@ pub mod targetdef {
         }
     }
 
-    #[derive(Clone, Hash, Serialize)]
+    #[derive(Clone, Hash, Serialize, serde::Deserialize)]
     pub struct Input {
         pub r#ref: TargetAddr,
         pub mode: InputMode,
@@ -678,7 +678,7 @@ pub mod targetdef {
         }
     }
 
-    #[derive(Clone, Hash, PartialEq, Serialize)]
+    #[derive(Clone, Hash, PartialEq, Serialize, serde::Deserialize)]
     pub enum InputMode {
         Standard,
         Link,

@@ -20,7 +20,7 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 pub struct GoTestmainDriver;
 
-#[derive(Clone, serde::Serialize, PartialEq, Eq, Default, SpecEnum)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default, SpecEnum)]
 enum TestmainMode {
     /// Internal tests only (pkg.test_go_files). testmain.go imports `_test "P"`.
     Internal,
@@ -44,7 +44,7 @@ struct GoTestmainSpec {
     out: HashMap<String, Vec<String>>,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct GoTestmainDef {
     golist_origin_id: String,
     mode: TestmainMode,
@@ -194,7 +194,7 @@ impl ManagedDriver for GoTestmainDriver {
         req: ManagedRunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let def = req.request.target.def::<GoTestmainDef>();
+        let def = req.request.target.def_de::<GoTestmainDef>();
 
         let managed = req
             .inputs
