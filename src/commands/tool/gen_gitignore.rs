@@ -12,7 +12,9 @@ use crate::htpkg::{self, PkgBuf};
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
-#[command(override_usage = "heph gen-gitignore\n       heph gen-gitignore <PACKAGE_MATCHER>")]
+#[command(
+    override_usage = "heph tool gen-gitignore\n       heph tool gen-gitignore <PACKAGE_MATCHER>"
+)]
 pub struct Args {
     /// Package matcher (e.g. //pkg/...); omit to regenerate the whole section.
     /// When given, only the lines emitted by targets under that matcher are

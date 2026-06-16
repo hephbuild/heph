@@ -144,7 +144,9 @@ impl App for ValidateApp {
                 ));
             }
             if stale {
-                problems.push("`.gitignore` is out of date — run `heph gen-gitignore`".to_string());
+                problems.push(
+                    "`.gitignore` is out of date — run `heph tool gen-gitignore`".to_string(),
+                );
             }
             if !problems.is_empty() {
                 anyhow::bail!("validation failed:\n  {}", problems.join("\n  "));
