@@ -434,9 +434,11 @@ drivers:
     #[test]
     fn substitute_os_arch_replaces_placeholders() {
         let out = super::substitute_os_arch("https://x/heph-{os}-{arch}.bin");
-        assert!(out.contains(std::env::consts::OS), "{out}");
-        assert!(out.contains(std::env::consts::ARCH), "{out}");
         assert!(!out.contains("{os}") && !out.contains("{arch}"), "{out}");
+        // arch uses the published spelling (amd64/arm64), never the rust consts.
+        assert!(!out.contains("x86_64") && !out.contains("aarch64"), "{out}");
+        // os uses darwin, never the rust `macos` spelling.
+        assert!(!out.contains("macos"), "{out}");
     }
 
     #[cfg(unix)]
@@ -665,11 +667,21 @@ fn resolve_bin_argv(
     })
 }
 
-/// Substitute `{os}`/`{arch}` in a plugin download URL with this host's values
-/// (`std::env::consts::OS` / `ARCH`, e.g. `linux`/`macos`, `x86_64`/`aarch64`).
+/// Substitute `{os}`/`{arch}` in a plugin download URL with the values used in
+/// published artifact names: os `linux`/`darwin` and arch `amd64`/`arm64`
+/// (mapped from the rust `std::env::consts` spellings `macos` and
+/// `x86_64`/`aarch64`). Unmapped hosts fall back to the raw consts value.
 fn substitute_os_arch(url: &str) -> String {
-    url.replace("{os}", std::env::consts::OS)
-        .replace("{arch}", std::env::consts::ARCH)
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    url.replace("{os}", os).replace("{arch}", arch)
 }
 
 /// Download a plugin binary from `url_tmpl` (after `{os}`/`{arch}` substitution),
