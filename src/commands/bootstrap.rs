@@ -445,6 +445,7 @@ drivers:
     #[test]
     fn resolve_bin_argv_path_and_exec() {
         use crate::engine::config_yaml::BinConfig;
+        let root = std::path::Path::new("/repo");
         let home = std::path::Path::new("/tmp/unused");
         let path = BinConfig {
             path: Some("/usr/local/bin/heph-plugin-go".into()),
@@ -452,8 +453,18 @@ drivers:
             url: None,
         };
         assert_eq!(
-            super::resolve_bin_argv(&path, "go", home).unwrap(),
+            super::resolve_bin_argv(&path, "go", root, home).unwrap(),
             vec!["/usr/local/bin/heph-plugin-go".to_string()]
+        );
+        // Relative path resolves against the workspace root, not the cwd.
+        let rel = BinConfig {
+            path: Some(".heph3/heph-go-plugin".into()),
+            exec: None,
+            url: None,
+        };
+        assert_eq!(
+            super::resolve_bin_argv(&rel, "go", root, home).unwrap(),
+            vec!["/repo/.heph3/heph-go-plugin".to_string()]
         );
         let exec = BinConfig {
             path: None,
@@ -466,7 +477,7 @@ drivers:
             url: None,
         };
         assert_eq!(
-            super::resolve_bin_argv(&exec, "go", home).unwrap(),
+            super::resolve_bin_argv(&exec, "go", root, home).unwrap(),
             vec![
                 "cargo".to_string(),
                 "run".to_string(),
@@ -498,8 +509,9 @@ drivers:
       path: /opt/heph-plugin-exec
 "#;
         let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let root = std::path::Path::new("/repo");
         let home = std::path::Path::new("/tmp/unused");
-        let groups = super::plan_bin_groups(&file, home).expect("plan");
+        let groups = super::plan_bin_groups(&file, root, home).expect("plan");
         assert_eq!(groups.len(), 2, "two distinct binaries => two groups");
 
         let go = groups
@@ -524,7 +536,12 @@ drivers:
     fn plan_bin_groups_empty_without_bin() {
         let file: config_yaml::ConfigYaml =
             serde_yaml::from_str("providers:\n  - name: buildfile\n").expect("parse");
-        let groups = super::plan_bin_groups(&file, std::path::Path::new("/tmp")).expect("plan");
+        let groups = super::plan_bin_groups(
+            &file,
+            std::path::Path::new("/repo"),
+            std::path::Path::new("/tmp"),
+        )
+        .expect("plan");
         assert!(groups.is_empty());
     }
 }
@@ -548,6 +565,7 @@ type BinGroups = std::collections::BTreeMap<Vec<String>, Vec<(String, BinKind)>>
 #[cfg(unix)]
 fn plan_bin_groups(
     file: &config_yaml::ConfigYaml,
+    root: &std::path::Path,
     home_dir: &std::path::Path,
 ) -> anyhow::Result<BinGroups> {
     let mut groups: BinGroups = std::collections::BTreeMap::new();
@@ -557,7 +575,7 @@ fn plan_bin_groups(
     ] {
         for entry in entries {
             if let Some(bin) = &entry.bin {
-                let argv = resolve_bin_argv(bin, &entry.name, home_dir)?;
+                let argv = resolve_bin_argv(bin, &entry.name, root, home_dir)?;
                 groups
                     .entry(argv)
                     .or_default()
@@ -583,7 +601,7 @@ fn register_bin_plugins(
 ) -> anyhow::Result<()> {
     // Group entries by resolved argv so identical launch commands collapse to one
     // process (deterministic order via BTreeMap).
-    let groups = plan_bin_groups(file, home_dir)?;
+    let groups = plan_bin_groups(file, root, home_dir)?;
     if groups.is_empty() {
         return Ok(());
     }
@@ -646,16 +664,22 @@ fn register_bin_plugins(
 }
 
 /// Resolve a [`config_yaml::BinConfig`] to a spawnable argv (`argv[0]` is the
-/// program). `url` sources are downloaded + cached first; `path`/`exec` are
-/// used as-is.
+/// program). A relative `path` is resolved against the workspace `root` (so it
+/// doesn't depend on the process cwd); `exec` is used as-is (its program is
+/// PATH-resolved at spawn); `url` is downloaded + cached first.
 #[cfg(unix)]
 fn resolve_bin_argv(
     bin: &config_yaml::BinConfig,
     ctx: &str,
+    root: &std::path::Path,
     home_dir: &std::path::Path,
 ) -> anyhow::Result<Vec<String>> {
     Ok(match bin.resolve(ctx)? {
-        config_yaml::BinSource::Path(p) => vec![p],
+        config_yaml::BinSource::Path(p) => {
+            let pb = std::path::PathBuf::from(&p);
+            let abs = if pb.is_absolute() { pb } else { root.join(pb) };
+            vec![abs.to_string_lossy().into_owned()]
+        }
         config_yaml::BinSource::Exec(argv) => argv,
         config_yaml::BinSource::Url(url) => {
             vec![

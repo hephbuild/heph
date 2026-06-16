@@ -3,26 +3,26 @@ providers:
     options:
       patterns:
         - BUILD
-  # The go plugin runs out-of-process. `bin.exec` launches it via cargo in
-  # release mode; the provider + its go_* drivers share one process because they
-  # resolve to the same launch command. Swap for `bin: { path: <heph-plugin-go> }`
-  # to use a prebuilt binary.
+  # The go plugin runs out-of-process. `bin.path` (relative to the workspace
+  # root) points at the binary built by the `gen-example` devenv script. The
+  # provider + its go_* drivers share one process because they resolve to the
+  # same launch command.
   - name: go
     bin:
-      exec: [cargo, run, --release, -p, plugin-go, --bin, heph-plugin-go]
+      path: .heph3/heph-go-plugin
 drivers:
   - name: exec
   - name: bash
   - name: sh
   - name: go_golist
     bin:
-      exec: [cargo, run, --release, -p, plugin-go, --bin, heph-plugin-go]
+      path: .heph3/heph-go-plugin
   - name: go_embed
     bin:
-      exec: [cargo, run, --release, -p, plugin-go, --bin, heph-plugin-go]
+      path: .heph3/heph-go-plugin
   - name: go_testmain
     bin:
-      exec: [cargo, run, --release, -p, plugin-go, --bin, heph-plugin-go]
+      path: .heph3/heph-go-plugin
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus
