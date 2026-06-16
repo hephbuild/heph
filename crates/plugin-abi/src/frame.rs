@@ -13,11 +13,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// length prefix allocating unbounded memory.
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
-/// Encode and write one frame (length prefix + payload), then flush.
+/// Append one length-prefixed frame to `buf` (no I/O). Lets the writer coalesce
+/// many frames into a single `write` syscall — the dominant transport cost under
+/// the high callback fan-out is per-frame syscalls, not bytes.
+pub fn encode_frame_into(buf: &mut Vec<u8>, f: &pb::Frame) -> anyhow::Result<()> {
+    let len = u32::try_from(f.encoded_len()).map_err(|_e| anyhow::anyhow!("frame too large"))?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    f.encode(buf)?;
+    Ok(())
+}
+
+/// Encode and write one frame (length prefix + payload) in a single write, then
+/// flush. (Bulk paths use [`encode_frame_into`] + one write for many frames.)
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &pb::Frame) -> anyhow::Result<()> {
-    let buf = f.encode_to_vec();
-    let len = u32::try_from(buf.len()).map_err(|_e| anyhow::anyhow!("frame too large"))?;
-    w.write_u32_le(len).await?;
+    let mut buf = Vec::with_capacity(f.encoded_len() + 4);
+    encode_frame_into(&mut buf, f)?;
     w.write_all(&buf).await?;
     w.flush().await?;
     Ok(())

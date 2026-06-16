@@ -9,14 +9,14 @@
 //! On the host this carries plugin calls outbound + callbacks inbound; on the
 //! guest, the reverse.
 
-use crate::frame::{read_frame, write_frame};
+use crate::frame::{encode_frame_into, read_frame};
 use crate::pb;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 pub use pb::frame::Body;
@@ -95,7 +95,9 @@ impl Mux {
 
         // writer task
         tokio::spawn(writer_loop(write, out_rx));
-        // reader task
+        // reader task — buffered so the length-prefix + body reads (and many
+        // pipelined frames) come from one syscall's worth of data.
+        let read = tokio::io::BufReader::with_capacity(64 * 1024, read);
         tokio::spawn(reader_loop(read, Arc::clone(&mux), handler));
 
         mux
@@ -224,9 +226,26 @@ impl Mux {
 }
 
 async fn writer_loop<W: AsyncWrite + Unpin>(mut write: W, mut rx: mpsc::UnboundedReceiver<pb::Frame>) {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     while let Some(frame) = rx.recv().await {
-        if let Err(e) = write_frame(&mut write, &frame).await {
+        // Coalesce every frame already queued into one buffer, so a burst of
+        // callbacks/responses costs a single write syscall instead of one each.
+        buf.clear();
+        if let Err(e) = encode_frame_into(&mut buf, &frame) {
+            tracing::warn!(error = %e, "frame encode failed; dropping");
+            continue;
+        }
+        while let Ok(frame) = rx.try_recv() {
+            if let Err(e) = encode_frame_into(&mut buf, &frame) {
+                tracing::warn!(error = %e, "frame encode failed; dropping");
+            }
+        }
+        if let Err(e) = write.write_all(&buf).await {
             tracing::warn!(error = %e, "frame write failed; closing writer");
+            break;
+        }
+        if let Err(e) = write.flush().await {
+            tracing::warn!(error = %e, "frame flush failed; closing writer");
             break;
         }
     }
