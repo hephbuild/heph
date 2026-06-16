@@ -10,6 +10,27 @@
       <sourceFolder url="file://$MODULE_DIR$/plugingo-e2e/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/testkit/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/builtins/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/driver-support/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/e2e/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/engine/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/htspec-derive/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/lock/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/model/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-buildfile/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-exec/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-go/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-nix/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-query/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugingo-e2e/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/proc/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/sandboxfuse/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/telemetry/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/testkit/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tui/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/walk/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.devenv" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/.claude/worktrees" />
