@@ -55,4 +55,14 @@ impl RemotePlugin {
     pub fn driver(&self, name: impl Into<String>) -> RemoteDriver {
         RemoteDriver::from_parts(Arc::clone(&self.mux), Arc::clone(&self.inner), name.into())
     }
+
+    /// A native [`ScopedExecutor`](hplugin::provider::ScopedExecutor) over this
+    /// plugin's scope registry — for in-process / dylib transports that route the
+    /// hot callbacks (result/note_dep/query) as direct calls instead of over the
+    /// mux. The scope ids it dispatches are the ones `RemoteProvider::get` mints.
+    pub fn scoped_executor(&self) -> Arc<dyn hplugin::provider::ScopedExecutor> {
+        Arc::new(crate::host::ScopedHostExecutor {
+            inner: Arc::clone(&self.inner),
+        })
+    }
 }

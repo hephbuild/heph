@@ -67,22 +67,28 @@ in
     cd $DEVENV_ROOT/example/go/large && go mod tidy
   '';
   # Set up the example workspace end to end: regenerate the large go repo and
-  # build the out-of-process go plugin into example/.heph3/heph-go-plugin, which
-  # example/.hephconfig2 launches via `bin: { path: .heph3/heph-go-plugin }`.
+  # Build the go plugin as a loadable cdylib into example/.heph3/heph-go-plugin.dylib,
+  # which example/.hephconfig2 loads in-process via `dylib: { path: ... }` behind the
+  # stable ABI (native speed — see ai-docs/PERFORMANCE.md). The cdylib basename is
+  # platform-specific (lib*.dylib on macOS, lib*.so on Linux).
   scripts.gen-example.exec = ''
     gen
     gen-go-large
-    cargo build --release -p plugin-go --bin heph-plugin-go
-    bin="$CARGO_TARGET_DIR/release/heph-plugin-go"
+    cargo build --release -p plugin-go-cdylib
     if [ "$(uname -s)" = "Darwin" ]; then
-      # Rewrite the nix-store libiconv load command to /usr/lib so the spawned
-      # plugin keeps launching after the store path is GC'd (same as the CLI).
-      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$bin"
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.dylib"
+    else
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.so"
     fi
-    dest="$DEVENV_ROOT/example/.heph3/heph-go-plugin"
+    if [ "$(uname -s)" = "Darwin" ]; then
+      # Rewrite the nix-store libiconv load command to /usr/lib so the loaded
+      # dylib keeps resolving after the store path is GC'd (same as the CLI).
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
+    fi
+    dest="$DEVENV_ROOT/example/.heph3/heph-go-plugin.dylib"
     mkdir -p "$(dirname "$dest")"
     # Atomic replace (new inode) so a running macOS process keeps its signature.
-    cp "$bin" "$dest.new"
+    cp "$lib" "$dest.new"
     mv -f "$dest.new" "$dest"
   '';
   scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";

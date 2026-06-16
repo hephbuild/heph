@@ -76,6 +76,7 @@ where
         driver,
         managed: HashMap::new(),
         tokens: Mutex::new(HashMap::new()),
+        scoped: None,
     });
     Mux::start(read, write, handler)
 }
@@ -93,11 +94,44 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    serve_components_inner(provider, managed, None, read, write)
+}
+
+/// Serve a multi-component plugin with a **native** scoped executor for the hot
+/// callbacks (in-process / dylib transport). result/note_dep/query become direct
+/// calls into `scoped` instead of serialized mux round-trips; cold methods still
+/// cross over `read`/`write`.
+pub fn serve_components_with_scoped<R, W>(
+    provider: Option<Arc<dyn Provider>>,
+    managed: HashMap<String, Arc<dyn ManagedDriver>>,
+    scoped: Arc<dyn hplugin::provider::ScopedExecutor>,
+    read: R,
+    write: W,
+) -> Arc<Mux>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    serve_components_inner(provider, managed, Some(scoped), read, write)
+}
+
+fn serve_components_inner<R, W>(
+    provider: Option<Arc<dyn Provider>>,
+    managed: HashMap<String, Arc<dyn ManagedDriver>>,
+    scoped: Option<Arc<dyn hplugin::provider::ScopedExecutor>>,
+    read: R,
+    write: W,
+) -> Arc<Mux>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let handler = Arc::new(GuestHandler {
         provider,
         driver: None,
         managed,
         tokens: Mutex::new(HashMap::new()),
+        scoped,
     });
     Mux::start(read, write, handler)
 }
@@ -120,7 +154,7 @@ pub async fn serve_components_inherited(
     managed: HashMap<String, Arc<dyn ManagedDriver>>,
 ) -> anyhow::Result<()> {
     let (r, w) = inherited_fd3()?;
-    serve_components(provider, managed, r, w)
+    serve_components_inner(provider, managed, None, r, w)
         .wait_closed()
         .await;
     Ok(())
@@ -185,6 +219,10 @@ struct GuestHandler {
     managed: HashMap<String, Arc<dyn ManagedDriver>>,
     // frame-id -> cancellation token for the in-flight method call
     tokens: Mutex<HashMap<u64, Arc<StdCancellationToken>>>,
+    // Native callback path (in-process / dylib): when set, the per-request
+    // executor's result/note_dep/query are direct calls into the host scope
+    // registry instead of serialized mux round-trips — the hot-path win.
+    scoped: Option<Arc<dyn hplugin::provider::ScopedExecutor>>,
 }
 
 impl GuestHandler {
@@ -304,6 +342,7 @@ impl InboundHandler for GuestHandler {
                 let executor: Arc<dyn ProviderExecutor> = Arc::new(MuxExecutor {
                     mux: Arc::clone(&mux),
                     request_id: req.request_id.clone(),
+                    scoped: self.scoped.clone(),
                 });
                 let greq = GetRequest {
                     request_id: req.request_id,
@@ -640,6 +679,23 @@ fn map_wire_err(e: anyhow::Error, addr: &Addr) -> anyhow::Error {
 struct MuxExecutor {
     mux: Arc<Mux>,
     request_id: String,
+    /// Native callback path (in-process / dylib): direct calls into the host
+    /// scope registry, no serialization. Takes priority over the mux.
+    scoped: Option<Arc<dyn hplugin::provider::ScopedExecutor>>,
+}
+
+/// Interpret a `NoteDepResponse` (from either transport) as a typed result.
+fn note_dep_result(r: pb::NoteDepResponse, addr: &Addr) -> Result<()> {
+    if r.ok {
+        Ok(())
+    } else if r.cycle {
+        Err(anyhow::Error::new(hplugin::error::CycleError {
+            from: addr.clone(),
+            to: addr.clone(),
+        }))
+    } else {
+        anyhow::bail!("{}", r.message)
+    }
 }
 
 impl MuxExecutor {
@@ -672,6 +728,9 @@ impl MuxExecutor {
 
 impl ProviderExecutor for MuxExecutor {
     fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, Result<Arc<EResult>>> {
+        if let Some(scoped) = &self.scoped {
+            return scoped.result(&self.request_id, addr);
+        }
         Box::pin(async move {
             let body = Body::ResultReq(pb::ResultRequest {
                 request_id: self.request_id.clone(),
@@ -725,6 +784,9 @@ impl ProviderExecutor for MuxExecutor {
         m: &'a Matcher,
         extra_skip: &'a [String],
     ) -> BoxFuture<'a, Result<Vec<Addr>>> {
+        if let Some(scoped) = &self.scoped {
+            return scoped.query(&self.request_id, m, extra_skip);
+        }
         Box::pin(async move {
             let body = Body::QueryReq(pb::QueryRequest {
                 request_id: self.request_id.clone(),
@@ -741,32 +803,24 @@ impl ProviderExecutor for MuxExecutor {
     }
 
     fn note_dep<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, Result<()>> {
+        if let Some(scoped) = &self.scoped {
+            return scoped.note_dep(&self.request_id, addr);
+        }
         Box::pin(async move {
             // The host registers parent -> addr from its own request context, so
             // `parent` here is informational only.
-            let body = Body::NoteDepReq(pb::NoteDepRequest {
+            let req = pb::NoteDepRequest {
                 request_id: self.request_id.clone(),
                 parent: None,
                 addr: Some(convert::addr_to_pb(addr)),
-            });
+            };
             match self
                 .mux
-                .call(body)
+                .call(Body::NoteDepReq(req))
                 .await
                 .map_err(|e| map_wire_err(e, addr))?
             {
-                Body::NoteDepResp(r) => {
-                    if r.ok {
-                        Ok(())
-                    } else if r.cycle {
-                        Err(anyhow::Error::new(hplugin::error::CycleError {
-                            from: addr.clone(),
-                            to: addr.clone(),
-                        }))
-                    } else {
-                        anyhow::bail!("{}", r.message)
-                    }
-                }
+                Body::NoteDepResp(r) => note_dep_result(r, addr),
                 other => anyhow::bail!("unexpected note_dep response: {other:?}"),
             }
         })

@@ -2335,6 +2335,7 @@ dependencies = [
  "plugin-nix",
  "plugin-query",
  "plugin-remote",
+ "plugin-stabby",
  "posthog-rs",
  "pprof",
  "proc",
@@ -4383,6 +4384,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-go-cdylib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "driver-support",
+ "plugin",
+ "plugin-go",
+ "plugin-stabby",
+ "stabby",
+ "walk",
+]
+
+[[package]]
 name = "plugin-nix"
 version = "0.1.0"
 dependencies = [
@@ -4453,6 +4467,24 @@ dependencies = [
  "prost 0.14.4",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "plugin-stabby"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "futures",
+ "libloading",
+ "model",
+ "plugin",
+ "plugin-abi",
+ "prost 0.14.4",
+ "stabby",
+ "tokio",
 ]
 
 [[package]]
@@ -5739,6 +5771,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2-const-stable"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f179d4e11094a893b82fff208f74d448a7512f99f5a0acbd5c679b705f83ed9"
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5901,6 +5939,41 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "stabby"
+version = "72.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7b834ec7ced12095fea1e4b07dcb7e8cf2b59b18afa3eac52494d835965a5ec"
+dependencies = [
+ "libloading",
+ "rustversion",
+ "stabby-abi",
+]
+
+[[package]]
+name = "stabby-abi"
+version = "72.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff1a4f477858a5bdf927c9fab7f579899de9b13e39f8b3b3b300c89fbab632f4"
+dependencies = [
+ "rustc_version",
+ "rustversion",
+ "sha2-const-stable",
+ "stabby-macros",
+]
+
+[[package]]
+name = "stabby-macros"
+version = "72.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b31c4b2434980b67ad83f300a58088ba14d59454dcd79ba3d87419bbd924d31e"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

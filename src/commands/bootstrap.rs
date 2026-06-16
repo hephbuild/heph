@@ -100,11 +100,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // Names a `bin:` config entry routes to an out-of-process plugin. For those,
     // skip the in-process built-in factory below and register a remote handle
     // (spawned by `register_bin_plugins`) under the same name instead.
+    // A name routes out-of-process (`bin:`) OR to an in-process loadable cdylib
+    // (`dylib:`) / wasm component (`wasm:`); either way the built-in in-process
+    // factory below is skipped.
     let bin_names: std::collections::HashSet<&str> = file
         .providers
         .iter()
         .chain(file.drivers.iter())
-        .filter(|en| en.bin.is_some())
+        .filter(|en| en.bin.is_some() || en.dylib.is_some() || en.wasm.is_some())
         .map(|en| en.name.as_str())
         .collect();
 
@@ -173,6 +176,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // process per distinct launch command; all the names that share it (e.g. the
     // `go` provider + its `go_*` drivers) register against that one connection.
     register_bin_plugins(&mut e, &root, &home_dir, &file)?;
+
+    // Load + register every in-process loadable plugin declared via `dylib:`. One
+    // cdylib per distinct path serves a provider + its drivers (e.g. `go` plus the
+    // `go_*` drivers), loaded once behind the stable ABI at native speed.
+    register_dylib_plugins(&mut e, &root, &home_dir, &file)?;
+
+    // Load + register every wasm-component plugin declared via `wasm:`.
+    register_wasm_plugins(&mut e, &root, &home_dir, &file)?;
 
     e.apply_config(&file.providers, &file.drivers)?;
 
@@ -616,10 +627,9 @@ fn register_bin_plugins(
         let (program, args) = argv
             .split_first()
             .context("internal: empty plugin argv after resolution")?;
-        // Proto transport over a UDS socketpair (fd 3). The shm transport exists
-        // (feature `shm`, plugin-remote::spawn_shm) but is slower here — the
-        // per-call cost is async wakeup latency, not syscalls — so the default
-        // launch uses proto.
+        // Cold protocol over a UDS socketpair (fd 3). For native-speed in-process
+        // plugins use `dylib:` (the stable ABI) instead; this `bin:` path is the
+        // portable out-of-process transport.
         let ((r, w), child) =
             hplugin_remote::spawn_streams(std::path::Path::new(program), args, &env)
                 .with_context(|| format!("spawn plugin `{program}`"))?;
@@ -643,6 +653,143 @@ fn register_bin_plugins(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Load + register every `dylib:` plugin. One cdylib per distinct path is loaded
+/// in-process behind the stable ABI (ABI-checked via stabby type reports), and the
+/// provider + drivers it exports are registered under their own names. The engine
+/// then drives them through its normal traits at native speed.
+#[cfg(unix)]
+fn register_dylib_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut paths: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for en in file.providers.iter().chain(file.drivers.iter()) {
+        if let Some(d) = &en.dylib {
+            paths.insert(resolve_artifact_path(d.resolve(&en.name)?, root, home_dir)?);
+        }
+    }
+
+    let root_str = root.to_string_lossy().into_owned();
+    for path in paths {
+        let (provider, drivers) = hplugin_stabby::load_stable::load(&path, &root_str)
+            .with_context(|| format!("load plugin dylib {}", path.display()))?;
+        if let Some(p) = provider {
+            let name = p.name().to_string();
+            e.register_provider_factory(&name, move |_init, _opts| Ok(Box::new(p.clone())))?;
+        }
+        for (name, drv) in drivers {
+            e.register_managed_driver_factory(&name, move |_init, _opts| {
+                Ok(Box::new(drv.clone()))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn register_dylib_plugins(
+    _e: &mut engine::Engine,
+    _root: &std::path::Path,
+    _home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    if file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .any(|en| en.dylib.is_some())
+    {
+        anyhow::bail!("`dylib:` plugins are only supported on unix");
+    }
+    Ok(())
+}
+
+/// Resolve a loadable-artifact source to a concrete file path: a `path` is taken
+/// relative to the workspace `root`; a `url` is downloaded + cached (same fetch
+/// path as `bin:` urls).
+#[cfg(unix)]
+fn resolve_artifact_path(
+    src: config_yaml::ArtifactSource,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(match src {
+        config_yaml::ArtifactSource::Path(p) => root.join(p),
+        config_yaml::ArtifactSource::Url(u) => download_plugin(&u, home_dir)?,
+    })
+}
+
+/// Load + register every `wasm:` plugin. One wasm component per distinct path is
+/// loaded in-process via wasmtime (capability-sandboxed); the provider and/or
+/// driver it exports register under the config entry names that point at it.
+#[cfg(all(unix, feature = "wasm"))]
+fn register_wasm_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+
+    // path -> (provider entry name, driver entry name)
+    let mut by_path: BTreeMap<std::path::PathBuf, (Option<String>, Option<String>)> =
+        BTreeMap::new();
+    for en in &file.providers {
+        if let Some(w) = &en.wasm {
+            let p = resolve_artifact_path(w.resolve(&en.name)?, root, home_dir)?;
+            by_path.entry(p).or_default().0 = Some(en.name.clone());
+        }
+    }
+    for en in &file.drivers {
+        if let Some(w) = &en.wasm {
+            let p = resolve_artifact_path(w.resolve(&en.name)?, root, home_dir)?;
+            by_path.entry(p).or_default().1 = Some(en.name.clone());
+        }
+    }
+
+    for (path, (prov, drv)) in by_path {
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("read wasm plugin {}", path.display()))?;
+        let plugin = hplugin_remote::wasm::WasmPlugin::load(
+            &bytes,
+            prov.clone().unwrap_or_default(),
+            drv.clone().unwrap_or_default(),
+        )
+        .with_context(|| format!("load wasm plugin {}", path.display()))?;
+        if let Some(name) = prov {
+            let pl = std::sync::Arc::clone(&plugin);
+            e.register_provider_factory(&name, move |_init, _opts| Ok(Box::new(pl.provider())))?;
+        }
+        if let Some(name) = drv {
+            let pl = std::sync::Arc::clone(&plugin);
+            e.register_driver_factory(&name, move |_init, _opts| Ok(Box::new(pl.driver())))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(all(unix, feature = "wasm")))]
+fn register_wasm_plugins(
+    _e: &mut engine::Engine,
+    _root: &std::path::Path,
+    _home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    if file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .any(|en| en.wasm.is_some())
+    {
+        anyhow::bail!("`wasm:` plugins require building heph with the `wasm` feature on unix");
     }
     Ok(())
 }

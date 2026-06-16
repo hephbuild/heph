@@ -341,6 +341,52 @@ pub struct PluginEntry {
     /// the name resolves to an in-process built-in factory.
     #[serde(default)]
     pub bin: Option<BinConfig>,
+    /// In-process loadable-plugin cdylib spec (stable ABI, native-speed). A
+    /// separately-built, hot-swappable artifact loaded in-process. Mutually
+    /// exclusive with `bin`/`wasm`.
+    #[serde(default)]
+    pub dylib: Option<ArtifactConfig>,
+    /// In-process wasm-component plugin spec (wasmtime, capability-sandboxed).
+    /// For pure-compute plugins. Mutually exclusive with `bin`/`dylib`.
+    #[serde(default)]
+    pub wasm: Option<ArtifactConfig>,
+}
+
+/// How to locate a loadable in-process plugin artifact (a cdylib or a wasm
+/// component). Exactly one of `path`/`url` must be set:
+/// - `path`: a file on disk, relative to the workspace root.
+/// - `url`: a URL with `{os}`/`{arch}` placeholders; downloaded + cached.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ArtifactConfig {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// The resolved, mutually-exclusive source of an [`ArtifactConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactSource {
+    /// A path relative to the workspace root.
+    Path(String),
+    /// A `{os}`/`{arch}` URL to download + cache.
+    Url(String),
+}
+
+impl ArtifactConfig {
+    /// Validate that exactly one of `path`/`url` is set and return it. `ctx` names
+    /// the entry for error messages.
+    pub fn resolve(&self, ctx: &str) -> anyhow::Result<ArtifactSource> {
+        match (&self.path, &self.url) {
+            (Some(p), None) => Ok(ArtifactSource::Path(p.clone())),
+            (None, Some(u)) => Ok(ArtifactSource::Url(u.clone())),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("artifact for `{ctx}` sets both `path` and `url`; set exactly one")
+            }
+            (None, None) => anyhow::bail!("artifact for `{ctx}` sets neither `path` nor `url`"),
+        }
+    }
 }
 
 /// How to launch an out-of-process plugin. Exactly one of `path`/`exec`/`url`

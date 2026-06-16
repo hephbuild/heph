@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-sdk", "crates/plugin-remote", "crates/plugin-echo", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
+members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-sdk", "crates/plugin-remote", "crates/plugin-stabby", "crates/plugin-go-cdylib", "crates/plugin-echo", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
 # wasm guest components are built with cargo-component for wasm32-wasip2, not by
 # the host `cargo build --workspace`; keep them out of the workspace.
 exclude = ["crates/wasm-guests"]
@@ -114,6 +114,7 @@ hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
 hplugin-go = { package = "plugin-go", path = "crates/plugin-go" }
 hplugin-remote = { package = "plugin-remote", path = "crates/plugin-remote" }
+hplugin-stabby = { package = "plugin-stabby", path = "crates/plugin-stabby", features = ["host", "guest"] }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
 htui = { package = "tui", path = "crates/tui" }
 hlock = { package = "lock", path = "crates/lock" }
@@ -180,6 +181,10 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # crate's build.rs (the final binary link).
 default = ["fuse-sandbox"]
 fuse-sandbox = ["hsandboxfuse/fuse-sandbox"]
+# Out-of-process plugin shm tier (iceoryx2 byte-pipe under the Mux). Opt-in.
+shm = ["hplugin-remote/shm"]
+# In-process wasm-component plugins (`wasm:` config), via wasmtime. Opt-in.
+wasm = ["hplugin-remote/wasm"]
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

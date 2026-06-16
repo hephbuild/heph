@@ -139,7 +139,8 @@ fn run_loop(
         // until the link is live; once we've received anything the peer is
         // connected, so stop paying for it on the hot path.
         if !connected {
-            drop(publisher.update_connections());
+            // Discover a late-connecting subscriber; ignore the result.
+            let _discovered = publisher.update_connections();
         }
 
         // Outbound: publish queued chunks. On disconnect, publish a 0-length EOF
@@ -308,7 +309,7 @@ mod tests {
                 .expect("parent read");
             assert_eq!(&b, b"pong");
         });
-        let _ = child.wait();
+        let _status = child.wait();
     }
 
     #[tokio::test]

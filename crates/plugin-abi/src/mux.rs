@@ -27,6 +27,15 @@ pub use pb::frame::Body;
 #[async_trait]
 pub trait InboundHandler: Send + Sync + 'static {
     async fn handle(&self, id: u64, body: Body, mux: Arc<Mux>);
+
+    /// Fast path for cheap, synchronous, non-reentrant requests: if this body can
+    /// be served without awaiting (e.g. a `note_dep` edge insert), return the
+    /// reply to send inline — skipping the per-request `tokio::spawn` + task-hop
+    /// the async `handle` path costs. Return `Err(body)` to fall back to `handle`
+    /// (the body is boxed — it's a large prost enum). Default: everything async.
+    fn try_inline(&self, _id: u64, body: Body) -> Result<Body, Box<Body>> {
+        Err(Box::new(body))
+    }
 }
 
 enum Pending {
@@ -274,11 +283,20 @@ async fn reader_loop<R: AsyncRead + Unpin>(
                 if is_response(&body) {
                     mux.route_response(id, body);
                 } else {
-                    let mux = Arc::clone(&mux);
-                    let handler = Arc::clone(&handler);
-                    tokio::spawn(async move {
-                        handler.handle(id, body, mux).await;
-                    });
+                    // Inline cheap synchronous requests (no spawn, no task-hop);
+                    // spawn the rest so a slow/reentrant handler can't stall the
+                    // reader from draining further frames.
+                    match handler.try_inline(id, body) {
+                        Ok(reply) => mux.send_body(id, reply),
+                        Err(body) => {
+                            let mux = Arc::clone(&mux);
+                            let handler = Arc::clone(&handler);
+                            let body = *body;
+                            tokio::spawn(async move {
+                                handler.handle(id, body, mux).await;
+                            });
+                        }
+                    }
                 }
             }
             Ok(None) => break, // peer closed

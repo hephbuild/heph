@@ -57,6 +57,87 @@ impl HostInner {
     fn scope(&self, scope_id: &str) -> Option<Arc<Scope>> {
         self.scopes.lock().expect("scopes").get(scope_id).cloned()
     }
+
+    /// Register the `parent -> addr` dep edge for a `note_dep` request and build
+    /// the response — fully synchronous.
+    ///
+    /// `note_dep` is inline-synchronous host-side: it is a dep-DAG edge insert
+    /// (`RequestState::track_dep`) with no real await, so `block_on` drives the
+    /// future to completion with a single poll and never touches the scheduler.
+    /// That lets the hot, high-volume callback be served without a `tokio::spawn`
+    /// (the Mux inline fast path) or even a tokio worker at all (the spin mailbox).
+    pub(crate) fn note_dep_resp(&self, req: pb::NoteDepRequest) -> pb::NoteDepResponse {
+        match self.scope(&req.request_id) {
+            Some(scope) => {
+                let addr = convert::addr_from_pb(req.addr.unwrap_or_default());
+                match futures::executor::block_on(scope.executor.note_dep(&addr)) {
+                    Ok(()) => pb::NoteDepResponse {
+                        ok: true,
+                        cycle: false,
+                        message: String::new(),
+                    },
+                    Err(e) => pb::NoteDepResponse {
+                        ok: false,
+                        cycle: is_cycle(&e),
+                        message: e.to_string(),
+                    },
+                }
+            }
+            None => pb::NoteDepResponse {
+                ok: false,
+                cycle: false,
+                message: format!("unknown request scope {}", req.request_id),
+            },
+        }
+    }
+}
+
+/// A [`ScopedExecutor`] over the host scope registry: routes a plugin's callbacks
+/// (by request scope id) directly into the per-request engine executor. Used by
+/// the in-process / dylib transports where the callback is a native call rather
+/// than a serialized round-trip — the whole hot-path win.
+pub(crate) struct ScopedHostExecutor {
+    pub inner: Arc<HostInner>,
+}
+
+impl hplugin::provider::ScopedExecutor for ScopedHostExecutor {
+    fn result<'a>(
+        &'a self,
+        request_id: &'a str,
+        addr: &'a hmodel::htaddr::Addr,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Arc<hplugin::eresult::EResult>>> {
+        Box::pin(async move {
+            match self.inner.scope(request_id) {
+                Some(scope) => scope.executor.result(addr).await,
+                None => anyhow::bail!("unknown request scope {request_id}"),
+            }
+        })
+    }
+    fn note_dep<'a>(
+        &'a self,
+        request_id: &'a str,
+        addr: &'a hmodel::htaddr::Addr,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            match self.inner.scope(request_id) {
+                Some(scope) => scope.executor.note_dep(addr).await,
+                None => anyhow::bail!("unknown request scope {request_id}"),
+            }
+        })
+    }
+    fn query<'a>(
+        &'a self,
+        request_id: &'a str,
+        m: &'a hmodel::htmatcher::Matcher,
+        extra_skip: &'a [String],
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<hmodel::htaddr::Addr>>> {
+        Box::pin(async move {
+            match self.inner.scope(request_id) {
+                Some(scope) => scope.executor.query(m, extra_skip).await,
+                None => anyhow::bail!("unknown request scope {request_id}"),
+            }
+        })
+    }
 }
 
 pub(crate) struct HostCallbackHandler {
@@ -112,6 +193,15 @@ impl InboundHandler for HostCallbackHandler {
             }
         }
     }
+
+    /// `note_dep` is the dominant callback and fully synchronous, so serve it
+    /// inline in the reader loop instead of spawning a task per call.
+    fn try_inline(&self, _id: u64, body: Body) -> Result<Body, Box<Body>> {
+        match body {
+            Body::NoteDepReq(req) => Ok(Body::NoteDepResp(self.inner.note_dep_resp(req))),
+            other => Err(Box::new(other)),
+        }
+    }
 }
 
 impl HostCallbackHandler {
@@ -158,28 +248,9 @@ impl HostCallbackHandler {
     }
 
     async fn handle_note_dep(&self, id: u64, req: pb::NoteDepRequest, mux: &Arc<Mux>) {
-        let Some(scope) = self.inner.scope(&req.request_id) else {
-            mux.send_body(
-                id,
-                err_frame(format!("unknown request scope {}", req.request_id)),
-            );
-            return;
-        };
-        let addr = convert::addr_from_pb(req.addr.unwrap_or_default());
-        // Edge-only registration (cheap); cycle is detected by type, not message.
-        let resp = match scope.executor.note_dep(&addr).await {
-            Ok(()) => pb::NoteDepResponse {
-                ok: true,
-                cycle: false,
-                message: String::new(),
-            },
-            Err(e) => pb::NoteDepResponse {
-                ok: false,
-                cycle: is_cycle(&e),
-                message: e.to_string(),
-            },
-        };
-        mux.send_body(id, Body::NoteDepResp(resp));
+        // note_dep is synchronous; the inline fast path normally serves it before
+        // a spawn. This async arm stays for completeness / non-inline transports.
+        mux.send_body(id, Body::NoteDepResp(self.inner.note_dep_resp(req)));
     }
 
     async fn handle_query(&self, id: u64, req: pb::QueryRequest, mux: &Arc<Mux>) {

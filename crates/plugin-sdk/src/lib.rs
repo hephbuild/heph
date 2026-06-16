@@ -21,7 +21,10 @@ pub use ctx::Ctx;
 pub use host::HostClient;
 #[cfg(all(unix, feature = "shm"))]
 pub use serve::serve_components_shm;
-pub use serve::{serve, serve_components, serve_driver, serve_managed_driver, serve_plugin};
+pub use serve::{
+    serve, serve_components, serve_components_with_scoped, serve_driver, serve_managed_driver,
+    serve_plugin,
+};
 #[cfg(unix)]
 pub use serve::{serve_components_inherited, serve_inherited};
 
