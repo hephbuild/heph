@@ -40,7 +40,9 @@ impl Provider for TestProvider {
                 addr: addr("pkg", "a"),
             })];
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
 
@@ -57,7 +59,9 @@ impl Provider for TestProvider {
                 pkg: PkgBuf::from("pkg"),
             })];
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                >)
         })
     }
 
@@ -108,4 +112,3 @@ async fn remote_provider_serves_get_spec_through_engine() -> anyhow::Result<()> 
 
     Ok(())
 }
-

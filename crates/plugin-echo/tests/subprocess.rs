@@ -5,13 +5,11 @@
 use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hcore::hasync::StdCancellationToken;
-use hplugin::eresult::{ArtifactMeta, EResult};
-use hplugin::provider::{
-    ConfigRequest, GetRequest, ListRequest, Provider, ProviderExecutor,
-};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
+use hplugin::eresult::{ArtifactMeta, EResult};
+use hplugin::provider::{ConfigRequest, GetRequest, ListRequest, Provider, ProviderExecutor};
 use plugin_remote::spawn_plugin;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};

@@ -44,7 +44,9 @@ impl Provider for EchoProvider {
                 }),
             ];
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
 
@@ -61,7 +63,9 @@ impl Provider for EchoProvider {
                 pkg: PkgBuf::from("//pkg"),
             })];
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                >)
         })
     }
 

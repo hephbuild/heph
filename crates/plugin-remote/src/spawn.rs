@@ -143,7 +143,7 @@ pub fn spawn_shm(
     let mux = plugin.mux_handle();
     tokio::spawn(async move {
         let mut byte = [0u8; 1];
-        let _ = uds_r.read(&mut byte).await; // resolves on EOF (no more data sent)
+        let _n = uds_r.read(&mut byte).await; // resolves on EOF (no more data sent)
         mux.close();
         drop(uds_w);
         drop(child);

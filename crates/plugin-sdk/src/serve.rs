@@ -192,7 +192,7 @@ pub async fn serve_components_shm(
     let watch_mux = Arc::clone(&mux);
     tokio::spawn(async move {
         let mut byte = [0u8; 1];
-        let _ = uds_r.read(&mut byte).await;
+        let _n = uds_r.read(&mut byte).await;
         watch_mux.close();
     });
     let _hold = uds_w; // keep the write half open for host-side liveness
