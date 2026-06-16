@@ -7,7 +7,8 @@
 //! exactly as before.
 //!
 //! Config is passed by the host at spawn via env vars:
-//! - `HEPH_PLUGIN_GO_ROOT`    — workspace root (default: cwd)
+//! - `HEPH_PLUGIN_ROOT`       — workspace root (injected by the host for every
+//!   `bin:` plugin); `HEPH_PLUGIN_GO_ROOT` overrides it; default cwd.
 //! - `HEPH_PLUGIN_GO_BIN`     — addr of the go toolchain (default `//@heph/bin:go`)
 //! - `HEPH_PLUGIN_GO_WALK_DB` — fs-walk cache db path (default: under root)
 
@@ -20,6 +21,7 @@ use std::sync::Arc;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let root = std::env::var_os("HEPH_PLUGIN_GO_ROOT")
+        .or_else(|| std::env::var_os("HEPH_PLUGIN_ROOT"))
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let go_bin =

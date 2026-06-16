@@ -2344,6 +2344,7 @@ dependencies = [
  "r2d2_sqlite",
  "ratatui",
  "rayon",
+ "reqwest 0.13.4",
  "rusqlite",
  "rustc-hash",
  "sandboxfuse",

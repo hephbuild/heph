@@ -166,6 +166,10 @@ uuid = { version = "1.23.3", features = ["v4"] }
 object_store = { version = "0.13.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 url = "2.5.8"
 flate2 = "1.1.9"
+# Blocking HTTP client, used only to download `bin: { url }` plugins. rustls-tls
+# avoids a system OpenSSL link; blocking runs on its own thread so it is safe to
+# call from inside the async runtime (see bootstrap::download_plugin).
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 
 [features]
 # FUSE sandbox is on by default. The FUSE machinery (and its `fuser`/libfuse

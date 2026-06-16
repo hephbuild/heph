@@ -97,26 +97,33 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_driver(|_| Box::new(plugintextfile::Driver))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
-    // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
-    e.register_provider_factory("buildfile", |init, opts| {
-        Ok(Box::new(
-            pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-            )?
-            .with_walker(init.walker.clone()),
-        ))
-    })?;
-    // The go plugin can run out-of-process (opt-in via HEPH_REMOTE_GO): one
-    // heph-plugin-go process serves the `go` provider + golist/embed/testmain
-    // drivers over the plugin transport. Default stays in-process.
-    let remote_go = std::env::var_os("HEPH_REMOTE_GO").is_some()
-        && tokio::runtime::Handle::try_current().is_ok();
-    if remote_go {
-        register_remote_go(&mut e, &root)?;
-    } else {
+    // Names a `bin:` config entry routes to an out-of-process plugin. For those,
+    // skip the in-process built-in factory below and register a remote handle
+    // (spawned by `register_bin_plugins`) under the same name instead.
+    let bin_names: std::collections::HashSet<&str> = file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .filter(|en| en.bin.is_some())
+        .map(|en| en.name.as_str())
+        .collect();
+
+    // Opt-in built-in factories — instantiated by `apply_config` if listed in
+    // the YAML and not overridden by a `bin:` entry.
+    if !bin_names.contains("buildfile") {
+        e.register_provider_factory("buildfile", |init, opts| {
+            Ok(Box::new(
+                pluginbuildfile::Provider::from_options(
+                    init.root.to_path_buf(),
+                    &init.skip_dirs,
+                    &init.skip_globs,
+                    opts,
+                )?
+                .with_walker(init.walker.clone()),
+            ))
+        })?;
+    }
+    if !bin_names.contains("go") {
         e.register_provider_factory("go", |init, opts| {
             Ok(Box::new(plugingo::Provider::from_options(
                 init.root.to_path_buf(),
@@ -126,36 +133,46 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
                 init.walker.clone(),
             )?))
         })?;
+    }
+    if !bin_names.contains("go_golist") {
         e.register_managed_driver_factory("go_golist", |_init, opts| {
             config_yaml::deny_unknown("go_golist driver", opts, &[])?;
             Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
         })?;
+    }
+    if !bin_names.contains("go_embed") {
         e.register_managed_driver_factory("go_embed", |_init, opts| {
             config_yaml::deny_unknown("go_embed driver", opts, &[])?;
             Ok(Box::new(plugingo::GoEmbedDriver))
         })?;
+    }
+    if !bin_names.contains("go_testmain") {
         e.register_managed_driver_factory("go_testmain", |_init, opts| {
             config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
             Ok(Box::new(plugingo::GoTestmainDriver))
         })?;
     }
-
-    // exec/bash/sh can likewise run out-of-process (opt-in via HEPH_REMOTE_EXEC).
-    let remote_exec = std::env::var_os("HEPH_REMOTE_EXEC").is_some()
-        && tokio::runtime::Handle::try_current().is_ok();
-    if remote_exec {
-        register_remote_exec(&mut e)?;
-    } else {
+    if !bin_names.contains("exec") {
         e.register_managed_driver_factory("exec", |_init, opts| {
             Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
         })?;
+    }
+    if !bin_names.contains("bash") {
         e.register_managed_driver_factory("bash", |_init, opts| {
             Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
         })?;
+    }
+    if !bin_names.contains("sh") {
         e.register_managed_driver_factory("sh", |_init, opts| {
             Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
         })?;
     }
+    drop(bin_names);
+
+    // Spawn + register every out-of-process plugin declared via `bin:`. One
+    // process per distinct launch command; all the names that share it (e.g. the
+    // `go` provider + its `go_*` drivers) register against that one connection.
+    register_bin_plugins(&mut e, &root, &home_dir, &file)?;
 
     e.apply_config(&file.providers, &file.drivers)?;
 
@@ -413,79 +430,301 @@ drivers:
             "trigger after resume must cancel"
         );
     }
+
+    #[test]
+    fn substitute_os_arch_replaces_placeholders() {
+        let out = super::substitute_os_arch("https://x/heph-{os}-{arch}.bin");
+        assert!(out.contains(std::env::consts::OS), "{out}");
+        assert!(out.contains(std::env::consts::ARCH), "{out}");
+        assert!(!out.contains("{os}") && !out.contains("{arch}"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bin_argv_path_and_exec() {
+        use crate::engine::config_yaml::BinConfig;
+        let home = std::path::Path::new("/tmp/unused");
+        let path = BinConfig {
+            path: Some("/usr/local/bin/heph-plugin-go".into()),
+            exec: None,
+            url: None,
+        };
+        assert_eq!(
+            super::resolve_bin_argv(&path, "go", home).unwrap(),
+            vec!["/usr/local/bin/heph-plugin-go".to_string()]
+        );
+        let exec = BinConfig {
+            path: None,
+            exec: Some(vec![
+                "cargo".into(),
+                "run".into(),
+                "-p".into(),
+                "plugin-go".into(),
+            ]),
+            url: None,
+        };
+        assert_eq!(
+            super::resolve_bin_argv(&exec, "go", home).unwrap(),
+            vec![
+                "cargo".to_string(),
+                "run".to_string(),
+                "-p".to_string(),
+                "plugin-go".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_bin_groups_collapses_shared_command() {
+        // A provider + two drivers all pointing at the same binary collapse into
+        // one spawn group; a driver with a different binary is its own group.
+        let yaml = r#"
+providers:
+  - name: go
+    bin:
+      path: /opt/heph-plugin-go
+drivers:
+  - name: go_golist
+    bin:
+      path: /opt/heph-plugin-go
+  - name: go_embed
+    bin:
+      path: /opt/heph-plugin-go
+  - name: exec
+    bin:
+      path: /opt/heph-plugin-exec
+"#;
+        let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let home = std::path::Path::new("/tmp/unused");
+        let groups = super::plan_bin_groups(&file, home).expect("plan");
+        assert_eq!(groups.len(), 2, "two distinct binaries => two groups");
+
+        let go = groups
+            .get(&vec!["/opt/heph-plugin-go".to_string()])
+            .expect("go group");
+        assert_eq!(
+            go,
+            &vec![
+                ("go".to_string(), super::BinKind::Provider),
+                ("go_golist".to_string(), super::BinKind::Driver),
+                ("go_embed".to_string(), super::BinKind::Driver),
+            ]
+        );
+        let exec = groups
+            .get(&vec!["/opt/heph-plugin-exec".to_string()])
+            .expect("exec group");
+        assert_eq!(exec, &vec![("exec".to_string(), super::BinKind::Driver)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_bin_groups_empty_without_bin() {
+        let file: config_yaml::ConfigYaml =
+            serde_yaml::from_str("providers:\n  - name: buildfile\n").expect("parse");
+        let groups = super::plan_bin_groups(&file, std::path::Path::new("/tmp")).expect("plan");
+        assert!(groups.is_empty());
+    }
 }
 
-/// Spawn `heph-plugin-go` (next to the heph executable) and register its `go`
-/// provider + golist/embed/testmain managed drivers as remote handles sharing
-/// one connection. Opt-in via `HEPH_REMOTE_GO`. plugin-go stays Rust — this just
-/// runs it out-of-process.
+/// Whether a `bin` entry contributes a provider or a (managed) driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BinKind {
+    Provider,
+    Driver,
+}
+
+/// Spawn plan: launch argv → the named provider/driver entries served by that
+/// one process.
 #[cfg(unix)]
-fn register_remote_go(e: &mut engine::Engine, root: &std::path::Path) -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context("locate heph executable")?;
-    let bin = exe
-        .parent()
-        .map(|p| p.join("heph-plugin-go"))
-        .context("heph-plugin-go directory")?;
-    let env = vec![
-        (
-            "HEPH_PLUGIN_GO_ROOT".to_string(),
-            root.to_string_lossy().into_owned(),
-        ),
-        ("HEPH_PLUGIN_GO_BIN".to_string(), "//@heph/bin:go".to_string()),
-    ];
-    let ((r, w), child) = hplugin_remote::spawn_streams(&bin, &[], &env)
-        .with_context(|| format!("spawn {}", bin.display()))?;
-    // The plugin self-exits when our end of the socket closes (engine drop), so
-    // we don't reap the child eagerly.
-    // Dropping the handle does not kill the child (std detaches); the plugin
-    // self-exits when our socket end closes at engine drop.
-    drop(child);
-    let plugin = hplugin_remote::RemotePlugin::connect(r, w);
-    // Register as factories (same opt-in semantics as in-process): only
-    // activated when the config lists `go` / `go_*`.
+type BinGroups = std::collections::BTreeMap<Vec<String>, Vec<(String, BinKind)>>;
+
+/// Plan which out-of-process plugins to spawn: resolve every `bin:` entry to its
+/// launch argv and group entries that share the identical command, so one
+/// process serves all of them (e.g. the `go` provider + its `go_*` drivers).
+/// `url` sources are downloaded here. Pure of engine state so it is unit-tested.
+#[cfg(unix)]
+fn plan_bin_groups(
+    file: &config_yaml::ConfigYaml,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<BinGroups> {
+    let mut groups: BinGroups = std::collections::BTreeMap::new();
+    for (entries, kind) in [
+        (&file.providers, BinKind::Provider),
+        (&file.drivers, BinKind::Driver),
+    ] {
+        for entry in entries {
+            if let Some(bin) = &entry.bin {
+                let argv = resolve_bin_argv(bin, &entry.name, home_dir)?;
+                groups
+                    .entry(argv)
+                    .or_default()
+                    .push((entry.name.clone(), kind));
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// Spawn every out-of-process plugin declared via a `bin:` config entry and
+/// register a remote handle under each entry's name. Entries that resolve to the
+/// identical launch command share one spawned process + connection (so the `go`
+/// provider and its `go_*` drivers, all pointing at the same binary, run in one
+/// process). plugin-go/exec stay Rust binaries — `bin.exec: [cargo, run, ...]`
+/// or `bin.path: /usr/local/bin/heph-plugin-go` is how they are now launched.
+#[cfg(unix)]
+fn register_bin_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    // Group entries by resolved argv so identical launch commands collapse to one
+    // process (deterministic order via BTreeMap).
+    let groups = plan_bin_groups(file, home_dir)?;
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    // Spawned plugins discover the workspace root through this env var.
+    let env = vec![(
+        "HEPH_PLUGIN_ROOT".to_string(),
+        root.to_string_lossy().into_owned(),
+    )];
+
+    for (argv, members) in groups {
+        let (program, args) = argv
+            .split_first()
+            .context("internal: empty plugin argv after resolution")?;
+        let ((r, w), child) =
+            hplugin_remote::spawn_streams(std::path::Path::new(program), args, &env)
+                .with_context(|| format!("spawn plugin `{program}`"))?;
+        // Dropping the handle does not kill the child (std detaches); the plugin
+        // self-exits when our socket end closes at engine drop.
+        drop(child);
+        let plugin = hplugin_remote::RemotePlugin::connect(r, w);
+        for (name, kind) in members {
+            match kind {
+                BinKind::Provider => {
+                    let p = plugin.clone();
+                    let nm = name.clone();
+                    e.register_provider_factory(&name, move |_init, _opts| {
+                        Ok(Box::new(p.provider(nm)))
+                    })?;
+                }
+                BinKind::Driver => {
+                    let p = plugin.clone();
+                    let nm = name.clone();
+                    e.register_managed_driver_factory(&name, move |_init, _opts| {
+                        Ok(Box::new(p.managed_driver(nm)))
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn register_bin_plugins(
+    _e: &mut engine::Engine,
+    _root: &std::path::Path,
+    _home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    if file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .any(|en| en.bin.is_some())
     {
-        let p = plugin.clone();
-        e.register_provider_factory("go", move |_init, _opts| Ok(Box::new(p.provider("go"))))?;
-    }
-    for name in ["go_golist", "go_embed", "go_testmain"] {
-        let p = plugin.clone();
-        e.register_managed_driver_factory(name, move |_init, _opts| {
-            Ok(Box::new(p.managed_driver(name)))
-        })?;
+        anyhow::bail!("out-of-process `bin:` plugins are only supported on unix");
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn register_remote_go(_e: &mut engine::Engine, _root: &std::path::Path) -> anyhow::Result<()> {
-    anyhow::bail!("HEPH_REMOTE_GO is only supported on unix")
-}
-
-/// Spawn `heph-plugin-exec` and register its exec/bash/sh managed drivers as
-/// remote handles sharing one connection. Opt-in via `HEPH_REMOTE_EXEC`.
+/// Resolve a [`config_yaml::BinConfig`] to a spawnable argv (`argv[0]` is the
+/// program). `url` sources are downloaded + cached first; `path`/`exec` are
+/// used as-is.
 #[cfg(unix)]
-fn register_remote_exec(e: &mut engine::Engine) -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context("locate heph executable")?;
-    let bin = exe
-        .parent()
-        .map(|p| p.join("heph-plugin-exec"))
-        .context("heph-plugin-exec directory")?;
-    let ((r, w), child) = hplugin_remote::spawn_streams(&bin, &[], &[])
-        .with_context(|| format!("spawn {}", bin.display()))?;
-    // Dropping the handle does not kill the child (std detaches); the plugin
-    // self-exits when our socket end closes at engine drop.
-    drop(child);
-    let plugin = hplugin_remote::RemotePlugin::connect(r, w);
-    for name in ["exec", "bash", "sh"] {
-        let p = plugin.clone();
-        e.register_managed_driver_factory(name, move |_init, _opts| {
-            Ok(Box::new(p.managed_driver(name)))
-        })?;
-    }
-    Ok(())
+fn resolve_bin_argv(
+    bin: &config_yaml::BinConfig,
+    ctx: &str,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    Ok(match bin.resolve(ctx)? {
+        config_yaml::BinSource::Path(p) => vec![p],
+        config_yaml::BinSource::Exec(argv) => argv,
+        config_yaml::BinSource::Url(url) => {
+            vec![
+                download_plugin(&url, home_dir)?
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        }
+    })
 }
 
-#[cfg(not(unix))]
-fn register_remote_exec(_e: &mut engine::Engine) -> anyhow::Result<()> {
-    anyhow::bail!("HEPH_REMOTE_EXEC is only supported on unix")
+/// Substitute `{os}`/`{arch}` in a plugin download URL with this host's values
+/// (`std::env::consts::OS` / `ARCH`, e.g. `linux`/`macos`, `x86_64`/`aarch64`).
+fn substitute_os_arch(url: &str) -> String {
+    url.replace("{os}", std::env::consts::OS)
+        .replace("{arch}", std::env::consts::ARCH)
+}
+
+/// Download a plugin binary from `url_tmpl` (after `{os}`/`{arch}` substitution),
+/// cache it under `<home>/plugins/<os>-<arch>/`, make it executable, and return
+/// its path. A previously-downloaded binary is reused (no re-fetch).
+#[cfg(unix)]
+fn download_plugin(
+    url_tmpl: &str,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let url = substitute_os_arch(url_tmpl);
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("plugin");
+    let dir = home_dir.join("plugins").join(format!(
+        "{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    let dest = dir.join(filename);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+
+    // reqwest::blocking spins up its own runtime; run it on a dedicated std
+    // thread so it is safe to call from within the async runtime new_engine runs
+    // on (a nested block_on would otherwise panic).
+    let url_for_thread = url.clone();
+    let bytes = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+        let resp = reqwest::blocking::get(&url_for_thread)
+            .with_context(|| format!("GET {url_for_thread}"))?
+            .error_for_status()
+            .with_context(|| format!("GET {url_for_thread}"))?;
+        Ok(resp.bytes()?.to_vec())
+    })
+    .join()
+    .map_err(|_e| anyhow::anyhow!("plugin download thread panicked"))??;
+
+    // Write to a temp path then rename so a partial download is never seen as a
+    // usable binary by a concurrent run.
+    let tmp = dir.join(format!(".{filename}.download"));
+    {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &dest)
+        .with_context(|| format!("install plugin to {}", dest.display()))?;
+    Ok(dest)
 }

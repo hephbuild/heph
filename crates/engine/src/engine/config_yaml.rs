@@ -336,6 +336,61 @@ pub struct PluginEntry {
     pub name: String,
     #[serde(default)]
     pub options: Options,
+    /// External-plugin launch spec. When present, this provider/driver runs
+    /// out-of-process and is matched by name to a spawned plugin; when absent,
+    /// the name resolves to an in-process built-in factory.
+    #[serde(default)]
+    pub bin: Option<BinConfig>,
+}
+
+/// How to launch an out-of-process plugin. Exactly one of `path`/`exec`/`url`
+/// must be set:
+/// - `path`: a binary on disk, spawned directly with no extra args.
+/// - `exec`: an argv (`exec[0]` is the program, resolved via `PATH`; the rest
+///   are args) — e.g. `["cargo", "run", "-p", "plugin-go"]`.
+/// - `url`: a URL with `{os}`/`{arch}` placeholders; the binary is downloaded,
+///   cached, made executable, then spawned.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BinConfig {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub exec: Option<Vec<String>>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// The resolved, mutually-exclusive launch source of a [`BinConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinSource {
+    /// Spawn this binary directly (no args).
+    Path(String),
+    /// Spawn `argv[0]` (PATH-resolved) with `argv[1..]` as args.
+    Exec(Vec<String>),
+    /// Download (after `{os}`/`{arch}` substitution), cache, then spawn.
+    Url(String),
+}
+
+impl BinConfig {
+    /// Validate that exactly one of `path`/`exec`/`url` is set and return it.
+    /// `ctx` names the entry for error messages.
+    pub fn resolve(&self, ctx: &str) -> anyhow::Result<BinSource> {
+        match (&self.path, &self.exec, &self.url) {
+            (Some(p), None, None) => Ok(BinSource::Path(p.clone())),
+            (None, Some(e), None) => {
+                if e.is_empty() {
+                    anyhow::bail!("plugin `{ctx}` bin.exec must not be empty");
+                }
+                Ok(BinSource::Exec(e.clone()))
+            }
+            (None, None, Some(u)) => Ok(BinSource::Url(u.clone())),
+            (None, None, None) => {
+                anyhow::bail!("plugin `{ctx}` bin requires one of path/exec/url")
+            }
+            _ => anyhow::bail!("plugin `{ctx}` bin: set exactly one of path/exec/url"),
+        }
+    }
 }
 
 /// Canonical filename of the per-workspace config, located at the repo root.
@@ -957,6 +1012,99 @@ caches:
         assert_eq!(r.uri, "s3://b/p");
         assert!(r.read);
         assert!(!r.write);
+    }
+
+    #[test]
+    fn parses_bin_path_exec_url() {
+        let yaml = r#"
+providers:
+  - name: go
+    bin:
+      exec: [cargo, run, -p, plugin-go]
+drivers:
+  - name: exec
+    bin:
+      path: /usr/local/bin/heph-plugin-exec
+  - name: rust
+    bin:
+      url: https://example.com/rust-{os}-{arch}
+"#;
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(
+            cfg.providers[0]
+                .bin
+                .as_ref()
+                .unwrap()
+                .resolve("go")
+                .unwrap(),
+            BinSource::Exec(vec![
+                "cargo".into(),
+                "run".into(),
+                "-p".into(),
+                "plugin-go".into()
+            ])
+        );
+        assert_eq!(
+            cfg.drivers[0]
+                .bin
+                .as_ref()
+                .unwrap()
+                .resolve("exec")
+                .unwrap(),
+            BinSource::Path("/usr/local/bin/heph-plugin-exec".into())
+        );
+        assert_eq!(
+            cfg.drivers[1]
+                .bin
+                .as_ref()
+                .unwrap()
+                .resolve("rust")
+                .unwrap(),
+            BinSource::Url("https://example.com/rust-{os}-{arch}".into())
+        );
+    }
+
+    #[test]
+    fn bin_absent_is_in_process() {
+        let cfg: ConfigYaml =
+            serde_yaml::from_str("providers:\n  - name: buildfile\n").expect("parse");
+        assert!(cfg.providers[0].bin.is_none());
+    }
+
+    #[test]
+    fn bin_rejects_multiple_sources() {
+        let cfg: ConfigYaml = serde_yaml::from_str(
+            "drivers:\n  - name: x\n    bin:\n      path: /a\n      url: http://b\n",
+        )
+        .expect("parse");
+        let err = cfg.drivers[0]
+            .bin
+            .as_ref()
+            .unwrap()
+            .resolve("x")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn bin_rejects_empty_exec() {
+        let cfg: ConfigYaml =
+            serde_yaml::from_str("drivers:\n  - name: x\n    bin:\n      exec: []\n")
+                .expect("parse");
+        let err = cfg.drivers[0]
+            .bin
+            .as_ref()
+            .unwrap()
+            .resolve("x")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn bin_rejects_unknown_field() {
+        let yaml = "drivers:\n  - name: x\n    bin:\n      bogus: 1\n";
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]
