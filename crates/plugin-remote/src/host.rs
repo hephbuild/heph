@@ -32,6 +32,22 @@ pub(crate) struct HostInner {
     /// request_id and comes back on every callback.
     scope_seq: std::sync::atomic::AtomicU64,
     pub leases: LeaseTable,
+    // TEMP instrumentation: count callbacks to size the resolve-path fan-out.
+    result_calls: std::sync::atomic::AtomicU64,
+    note_dep_calls: std::sync::atomic::AtomicU64,
+    query_calls: std::sync::atomic::AtomicU64,
+}
+
+impl Drop for HostInner {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        tracing::info!(
+            result = self.result_calls.load(Relaxed),
+            note_dep = self.note_dep_calls.load(Relaxed),
+            query = self.query_calls.load(Relaxed),
+            "remote plugin host callback totals"
+        );
+    }
 }
 
 impl HostInner {
@@ -116,6 +132,7 @@ impl InboundHandler for HostCallbackHandler {
 
 impl HostCallbackHandler {
     async fn handle_result(&self, id: u64, req: pb::ResultRequest, mux: &Arc<Mux>) {
+        self.inner.result_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(scope) = self.inner.scope(&req.request_id) else {
             mux.send_body(
                 id,
@@ -158,6 +175,7 @@ impl HostCallbackHandler {
     }
 
     async fn handle_note_dep(&self, id: u64, req: pb::NoteDepRequest, mux: &Arc<Mux>) {
+        self.inner.note_dep_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(scope) = self.inner.scope(&req.request_id) else {
             mux.send_body(
                 id,
@@ -183,6 +201,7 @@ impl HostCallbackHandler {
     }
 
     async fn handle_query(&self, id: u64, req: pb::QueryRequest, mux: &Arc<Mux>) {
+        self.inner.query_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(scope) = self.inner.scope(&req.request_id) else {
             mux.send_body(
                 id,

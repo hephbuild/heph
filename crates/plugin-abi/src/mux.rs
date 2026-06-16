@@ -69,6 +69,8 @@ pub struct Mux {
     pending: Mutex<HashMap<u64, Pending>>,
     closed: AtomicBool,
     closed_notify: Notify,
+    frames_in: AtomicU64,
+    frames_out: AtomicU64,
 }
 
 impl Mux {
@@ -87,6 +89,8 @@ impl Mux {
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             closed_notify: Notify::new(),
+            frames_in: AtomicU64::new(0),
+            frames_out: AtomicU64::new(0),
         });
 
         // writer task
@@ -133,6 +137,7 @@ impl Mux {
 
     /// Send a frame with an explicit id (used by handlers to reply).
     pub fn send_body(&self, id: u64, body: Body) {
+        self.frames_out.fetch_add(1, Ordering::Relaxed);
         drop(self.out.send(pb::Frame {
             id,
             body: Some(body),
@@ -235,6 +240,7 @@ async fn reader_loop<R: AsyncRead + Unpin>(
     loop {
         match read_frame(&mut read).await {
             Ok(Some(frame)) => {
+                mux.frames_in.fetch_add(1, Ordering::Relaxed);
                 let id = frame.id;
                 let Some(body) = frame.body else { continue };
                 if is_response(&body) {
@@ -255,4 +261,14 @@ async fn reader_loop<R: AsyncRead + Unpin>(
         }
     }
     mux.mark_closed();
+}
+
+impl Drop for Mux {
+    fn drop(&mut self) {
+        tracing::info!(
+            frames_in = self.frames_in.load(Ordering::Relaxed),
+            frames_out = self.frames_out.load(Ordering::Relaxed),
+            "mux total frames"
+        );
+    }
 }
