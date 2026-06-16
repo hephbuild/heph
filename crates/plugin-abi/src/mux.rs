@@ -123,6 +123,11 @@ impl Mux {
 
     fn mark_closed(&self) {
         self.closed.store(true, Ordering::Release);
+        // Drop every pending sender so in-flight unary calls observe
+        // RecvError (-> "connection closed") and streams end, instead of
+        // hanging forever when the peer dies mid-request (e.g. a plugin
+        // process that panicked/exited).
+        self.pending.lock().expect("mux pending").clear();
         self.closed_notify.notify_waiters();
     }
 
@@ -147,6 +152,13 @@ impl Mux {
     where
         F: std::future::Future<Output = ()>,
     {
+        // Closing-the-connection race: if the peer dies after we insert the
+        // pending entry but the read loop already passed mark_closed, the entry
+        // would never be answered. Racing `wait_closed` guarantees the call
+        // returns instead of hanging.
+        if self.is_closed() {
+            anyhow::bail!("plugin connection closed");
+        }
         let id = self.alloc_id();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("mux pending").insert(id, Pending::Unary(tx));
@@ -165,6 +177,10 @@ impl Mux {
                 self.pending.lock().expect("mux pending").remove(&id);
                 self.send_body(id, Body::Cancel(pb::Cancel { request_id: id }));
                 anyhow::bail!("cancelled")
+            }
+            () = self.wait_closed() => {
+                self.pending.lock().expect("mux pending").remove(&id);
+                anyhow::bail!("plugin connection closed before response")
             }
         }
     }
