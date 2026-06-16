@@ -14,6 +14,12 @@ inherits = "release"
 debug = true
 strip = "none"
 
+# Test binaries link `--all-features` in CI (wasmtime + iceoryx2 + the wasm
+# toolchain), so full debuginfo makes the linker OOM on CI runners. Line-tables
+# keep backtraces with line numbers while shrinking the link enough to fit.
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 # Thin LTO keeps cross-crate inlining but links in parallel (fat `lto = true`
 # is a single-threaded whole-program pass that dominated wall time and erased
