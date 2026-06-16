@@ -97,7 +97,9 @@ in
   # gen/proto is excluded).
   scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> clippy --all-features' && cargo clippy --all-targets --all-features --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
-  scripts.tst.exec = "cargo test --locked --all";
+  # Test everything, including feature-gated code (shm/wasm transports, the
+  # cross-process + wasm e2e tests) — `--all-features` enables every crate feature.
+  scripts.tst.exec = "cargo test --locked --all --all-features";
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';
