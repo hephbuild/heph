@@ -112,7 +112,6 @@ hdriver-support = { package = "driver-support", path = "crates/driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
 hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
-hplugin-go = { package = "plugin-go", path = "crates/plugin-go" }
 hplugin-remote = { package = "plugin-remote", path = "crates/plugin-remote" }
 hplugin-stabby = { package = "plugin-stabby", path = "crates/plugin-stabby", features = ["host", "guest"] }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }

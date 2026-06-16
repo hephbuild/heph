@@ -6,9 +6,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 use crate::engine::config_yaml;
-use crate::{
-    engine, pluginbuildfile, pluginexec, plugingo, pluginhostbin, pluginnix, plugintextfile,
-};
+use crate::{engine, pluginbuildfile, pluginexec, pluginhostbin, pluginnix, plugintextfile};
 
 /// Builds the multi-thread runtime used by every command entry point.
 ///
@@ -126,35 +124,9 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
             ))
         })?;
     }
-    if !bin_names.contains("go") {
-        e.register_provider_factory("go", |init, opts| {
-            Ok(Box::new(plugingo::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-                init.walker.clone(),
-            )?))
-        })?;
-    }
-    if !bin_names.contains("go_golist") {
-        e.register_managed_driver_factory("go_golist", |_init, opts| {
-            config_yaml::deny_unknown("go_golist driver", opts, &[])?;
-            Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
-        })?;
-    }
-    if !bin_names.contains("go_embed") {
-        e.register_managed_driver_factory("go_embed", |_init, opts| {
-            config_yaml::deny_unknown("go_embed driver", opts, &[])?;
-            Ok(Box::new(plugingo::GoEmbedDriver))
-        })?;
-    }
-    if !bin_names.contains("go_testmain") {
-        e.register_managed_driver_factory("go_testmain", |_init, opts| {
-            config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
-            Ok(Box::new(plugingo::GoTestmainDriver))
-        })?;
-    }
+    // The go plugin is no longer a compiled-in built-in: it ships as a separate
+    // artifact loaded via `dylib:` (native speed) or spawned via `bin:`. A config
+    // entry named `go`/`go_*` without a transport therefore has no factory.
     if !bin_names.contains("exec") {
         e.register_managed_driver_factory("exec", |_init, opts| {
             Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))

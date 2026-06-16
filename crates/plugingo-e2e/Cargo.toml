@@ -9,6 +9,8 @@ workspace = true
 
 [dev-dependencies]
 heph = { path = "../.." }
+# go is no longer a heph built-in; the e2e harness constructs it directly.
+plugin-go = { path = "../plugin-go" }
 htestkit = { package = "testkit", path = "../testkit" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
