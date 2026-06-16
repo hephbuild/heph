@@ -97,9 +97,13 @@ in
   # gen/proto is excluded).
   scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> clippy --all-features' && cargo clippy --all-targets --all-features --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
-  # Test everything, including feature-gated code (shm/wasm transports, the
-  # cross-process + wasm e2e tests) — `--all-features` enables every crate feature.
-  scripts.tst.exec = "cargo test --locked --all --all-features";
+  # Test everything. The default pass covers all crates with their default
+  # features (heph default now pulls shm+wasm). The targeted passes then exercise
+  # the feature-gated transport code + e2e (shm cross-process, wasm component,
+  # stabby roundtrip). NB: a single `--all-features` run can't be used — it turns
+  # on `fuse-sandbox` workspace-wide, hard-linking libfuse into crates that lack
+  # the `-weak-lfuse` build.rs, which then abort at launch on macFUSE-less runners.
+  scripts.tst.exec = "cargo test --locked --all && cargo test --locked -p plugin-abi --features shm && cargo test --locked -p plugin-remote --features shm,wasm && cargo test --locked -p plugin-stabby --features host,guest";
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';
