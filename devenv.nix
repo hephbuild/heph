@@ -71,7 +71,7 @@ in
   # example/.hephconfig2 launches via `bin: { path: .heph3/heph-go-plugin }`.
   scripts.gen-example.exec = ''
     gen-go-large
-    cargo build --release --bin heph-plugin-go
+    cargo build --release -p plugin-go --bin heph-plugin-go
     bin="$CARGO_TARGET_DIR/release/heph-plugin-go"
     if [ "$(uname -s)" = "Darwin" ]; then
       # Rewrite the nix-store libiconv load command to /usr/lib so the spawned
