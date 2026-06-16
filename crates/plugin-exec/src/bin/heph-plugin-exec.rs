@@ -30,8 +30,19 @@ fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let opts = hplugin::config::Options::new();
     let mut managed: HashMap<String, Arc<dyn ManagedDriver>> = HashMap::new();
-    managed.insert("exec".to_string(), Arc::new(Driver::from_options_exec(&opts)?));
-    managed.insert("bash".to_string(), Arc::new(Driver::from_options_bash(&opts)?));
+    managed.insert(
+        "exec".to_string(),
+        Arc::new(Driver::from_options_exec(&opts)?),
+    );
+    managed.insert(
+        "bash".to_string(),
+        Arc::new(Driver::from_options_bash(&opts)?),
+    );
     managed.insert("sh".to_string(), Arc::new(Driver::from_options_sh(&opts)?));
+
+    #[cfg(feature = "shm")]
+    if let Ok(id) = std::env::var("HEPH_PLUGIN_SHM") {
+        return plugin_sdk::serve_components_shm(&id, None, managed).await;
+    }
     plugin_sdk::serve_components_inherited(None, managed).await
 }

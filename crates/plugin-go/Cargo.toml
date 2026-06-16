@@ -30,6 +30,10 @@ glob = "0.3"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
 
+[features]
+# shm transport (iceoryx2); opt-in (slower than proto here on macOS).
+shm = ["plugin-sdk/shm"]
+
 [[bin]]
 name = "heph-plugin-go"
 path = "src/bin/heph-plugin-go.rs"

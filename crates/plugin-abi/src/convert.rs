@@ -11,9 +11,9 @@ use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
+use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{RawDef, RawDefBytes};
-use hplugin::driver::TargetAddr;
 use hplugin::provider::{State, TargetSpec};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -198,7 +198,11 @@ pub fn sandbox_to_pb(s: &Sandbox) -> pb::Sandbox {
     pb::Sandbox {
         tools: s.tools.iter().map(tool_to_pb).collect(),
         deps: s.deps.iter().map(dep_to_pb).collect(),
-        env: s.env.iter().map(|(k, v)| (k.clone(), env_to_pb(v))).collect(),
+        env: s
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), env_to_pb(v)))
+            .collect(),
     }
 }
 
@@ -312,7 +316,11 @@ fn input_to_pb(i: &Input) -> pb::Input {
         r#ref: Some(target_addr_to_pb(&i.r#ref)),
         mode: input_mode_to_pb(&i.mode) as i32,
         origin_id: i.origin_id.clone(),
-        annotations: i.annotations.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        annotations: i
+            .annotations
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         hashed: i.hashed,
         runtime: i.runtime,
     }
@@ -434,7 +442,9 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
 
 // ---- OutputArtifact (driver run outputs) ----
 
-use hplugin::driver::outputartifact::{Content as OaContent, ContentFile, ContentRaw, OutputArtifact, Type as OaType};
+use hplugin::driver::outputartifact::{
+    Content as OaContent, ContentFile, ContentRaw, OutputArtifact, Type as OaType,
+};
 
 fn oa_type_to_pb(t: &OaType) -> pb::ArtifactType {
     match t {
@@ -550,7 +560,10 @@ mod tests {
             ("f".to_string(), Value::Float(1.5)),
             ("b".to_string(), Value::Bool(true)),
             ("n".to_string(), Value::Null()),
-            ("l".to_string(), Value::List(vec![Value::Int(1), Value::Int(2)])),
+            (
+                "l".to_string(),
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+            ),
         ]));
         assert_eq!(value_from_pb(value_to_pb(&v)), v);
     }

@@ -61,5 +61,13 @@ async fn run() -> anyhow::Result<()> {
     managed.insert("go_embed".to_string(), Arc::new(GoEmbedDriver));
     managed.insert("go_testmain".to_string(), Arc::new(GoTestmainDriver));
 
-    plugin_sdk::serve_components_inherited(Some(Arc::new(provider)), managed).await
+    let provider: Option<Arc<dyn hplugin::provider::Provider>> = Some(Arc::new(provider));
+
+    // Data over shm when the host launched us with HEPH_PLUGIN_SHM (fd 3 stays as
+    // the liveness channel); otherwise the plain fd-3 UDS transport.
+    #[cfg(feature = "shm")]
+    if let Ok(id) = std::env::var("HEPH_PLUGIN_SHM") {
+        return plugin_sdk::serve_components_shm(&id, provider, managed).await;
+    }
+    plugin_sdk::serve_components_inherited(provider, managed).await
 }

@@ -55,25 +55,25 @@ fn result_response_parity() {
         pb::ResultResponse,
         shm_types::ResultResponse,
         pb::ResultResponse {
-        lease_id: "lease-7".to_string(),
-        artifacts: vec![
-            pb::ArtifactHandle {
-                handle_id: "h1".to_string(),
-                group: "out".to_string(),
-                name: "package.bin".to_string(),
-                hashout: "abc123".to_string(),
-                byte_size: 4096,
-                support: false,
-            },
-            pb::ArtifactHandle {
-                handle_id: "h2".to_string(),
-                group: "log".to_string(),
-                name: "stderr".to_string(),
-                hashout: String::new(),
-                byte_size: 0,
-                support: true,
-            },
-        ],
+            lease_id: "lease-7".to_string(),
+            artifacts: vec![
+                pb::ArtifactHandle {
+                    handle_id: "h1".to_string(),
+                    group: "out".to_string(),
+                    name: "package.bin".to_string(),
+                    hashout: "abc123".to_string(),
+                    byte_size: 4096,
+                    support: false,
+                },
+                pb::ArtifactHandle {
+                    handle_id: "h2".to_string(),
+                    group: "log".to_string(),
+                    name: "stderr".to_string(),
+                    hashout: String::new(),
+                    byte_size: 0,
+                    support: true,
+                },
+            ],
         }
     );
 }

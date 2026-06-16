@@ -616,11 +616,13 @@ fn register_bin_plugins(
         let (program, args) = argv
             .split_first()
             .context("internal: empty plugin argv after resolution")?;
+        // Proto transport over a UDS socketpair (fd 3). The shm transport exists
+        // (feature `shm`, plugin-remote::spawn_shm) but is slower here — the
+        // per-call cost is async wakeup latency, not syscalls — so the default
+        // launch uses proto.
         let ((r, w), child) =
             hplugin_remote::spawn_streams(std::path::Path::new(program), args, &env)
                 .with_context(|| format!("spawn plugin `{program}`"))?;
-        // Dropping the handle does not kill the child (std detaches); the plugin
-        // self-exits when our socket end closes at engine drop.
         drop(child);
         let plugin = hplugin_remote::RemotePlugin::connect(r, w);
         for (name, kind) in members {

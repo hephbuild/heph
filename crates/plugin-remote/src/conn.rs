@@ -35,6 +35,12 @@ impl RemotePlugin {
         Self { mux, inner }
     }
 
+    /// The shared mux, for liveness watchers that close the connection when the
+    /// peer process dies.
+    pub fn mux_handle(&self) -> Arc<Mux> {
+        Arc::clone(&self.mux)
+    }
+
     /// A handle to this plugin's provider (`name` is its registered name).
     pub fn provider(&self, name: impl Into<String>) -> RemoteProvider {
         RemoteProvider::from_parts(Arc::clone(&self.mux), Arc::clone(&self.inner), name.into())

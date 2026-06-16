@@ -16,6 +16,7 @@
 //! in the loaned sample) and event-driven wakeup (`Listener`/`WaitSet`) are
 //! follow-up optimizations.
 
+use iceoryx2::port::update_connections::UpdateConnections;
 use iceoryx2::prelude::*;
 use std::io;
 use std::pin::Pin;
@@ -25,8 +26,15 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-/// Max bytes per iceoryx2 sample; larger writes are split across samples.
-const MAX_CHUNK: usize = 64 * 1024;
+/// Max bytes per iceoryx2 sample; larger writes are split across samples. Kept
+/// small so a deep subscriber buffer (below) stays affordable — buffer memory is
+/// `SUB_BUFFER * MAX_CHUNK` per service.
+const MAX_CHUNK: usize = 4 * 1024;
+
+/// Subscriber queue depth. pub/sub is lossy (a full queue drops samples), so this
+/// must exceed the protocol's peak in-flight frame count or a Mux call stalls
+/// forever on a dropped reply. `SUB_BUFFER * MAX_CHUNK` (= 32 MiB) per service.
+const SUB_BUFFER: usize = 8192;
 
 pub struct ShmReadHalf {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -55,17 +63,26 @@ pub fn connect(
     std::thread::spawn(move || {
         let ports = (|| -> anyhow::Result<_> {
             let node = NodeBuilder::new().create::<ipc::Service>()?;
+            // pub/sub is lossy: a full subscriber buffer drops samples. A build's
+            // concurrent request/callback fan-out bursts hundreds of frames, so
+            // size the buffer (and loaned samples) generously to never overflow —
+            // a dropped frame would stall a Mux call forever.
             let send_svc = node
                 .service_builder(&send_service.as_str().try_into()?)
                 .publish_subscribe::<[u8]>()
+                .subscriber_max_buffer_size(SUB_BUFFER)
+                .history_size(0)
                 .open_or_create()?;
             let recv_svc = node
                 .service_builder(&recv_service.as_str().try_into()?)
                 .publish_subscribe::<[u8]>()
+                .subscriber_max_buffer_size(SUB_BUFFER)
+                .history_size(0)
                 .open_or_create()?;
             let publisher = send_svc
                 .publisher_builder()
                 .initial_max_slice_len(MAX_CHUNK)
+                .max_loaned_samples(8)
                 .create()?;
             let subscriber = recv_svc.subscriber_builder().create()?;
             Ok((node, publisher, subscriber))
@@ -108,10 +125,26 @@ fn run_loop(
     wrx: &smpsc::Receiver<Vec<u8>>,
     rtx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
+    // Adaptive backoff: while frames are flowing (a build's hot resolve), spin so
+    // round-trip latency is ~microseconds, not the per-hop poll interval. After a
+    // stretch of idleness (between builds), back off to sleeping so an idle plugin
+    // doesn't peg a core. The hot path is what the cost model cares about.
+    let mut idle_iters: u32 = 0;
+    let mut connected = false;
     loop {
         let mut idle = true;
 
-        // Outbound: publish queued chunks.
+        // Discover subscribers that connected after this publisher was created
+        // (the host's publisher exists before the plugin subscribes). Only needed
+        // until the link is live; once we've received anything the peer is
+        // connected, so stop paying for it on the hot path.
+        if !connected {
+            drop(publisher.update_connections());
+        }
+
+        // Outbound: publish queued chunks. On disconnect, publish a 0-length EOF
+        // marker so the peer's reader observes a clean close (shm has no implicit
+        // EOF), then exit.
         loop {
             match wrx.try_recv() {
                 Ok(chunk) => {
@@ -121,16 +154,25 @@ fn run_loop(
                     }
                 }
                 Err(smpsc::TryRecvError::Empty) => break,
-                Err(smpsc::TryRecvError::Disconnected) => return,
+                Err(smpsc::TryRecvError::Disconnected) => {
+                    drop(publish(publisher, &[]));
+                    return;
+                }
             }
         }
 
-        // Inbound: forward received payloads.
+        // Inbound: forward received payloads. A 0-length payload is the peer's EOF
+        // marker → drop our forwarding channel (reader sees end) and exit.
         loop {
             match subscriber.receive() {
                 Ok(Some(sample)) => {
+                    let payload = sample.payload();
+                    if payload.is_empty() {
+                        return;
+                    }
                     idle = false;
-                    if rtx.send(sample.payload().to_vec()).is_err() {
+                    connected = true;
+                    if rtx.send(payload.to_vec()).is_err() {
                         return;
                     }
                 }
@@ -140,7 +182,16 @@ fn run_loop(
         }
 
         if idle {
-            std::thread::sleep(Duration::from_micros(50));
+            idle_iters = idle_iters.saturating_add(1);
+            if idle_iters < 256 {
+                std::hint::spin_loop();
+            } else if idle_iters < 4096 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        } else {
+            idle_iters = 0;
         }
     }
 }
@@ -215,6 +266,50 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static N: AtomicU32 = AtomicU32::new(0);
+
+    /// Cross-process delivery: re-exec this test binary as a child (subscriber)
+    /// and ping/pong over shm. shm_byte_pipe_roundtrip only proves the same
+    /// process; this proves two processes actually share the iceoryx2 services.
+    #[test]
+    fn shm_cross_process_delivery() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if std::env::var("HEPH_SHM_XTEST").is_ok() {
+            // Child: subscribe h2g, publish g2h; echo ping->pong.
+            rt.block_on(async {
+                let (mut r, mut w) = connect("xt_g2h", "xt_h2g").expect("child connect");
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b).await.expect("child read");
+                w.write_all(b"pong").await.expect("child write");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            return;
+        }
+        // Mimic heph's order: parent (publisher) connects BEFORE the child
+        // (subscriber) — so update_connections must rediscover the late subscriber.
+        let (mut r, mut w) = connect("xt_h2g", "xt_g2h").expect("parent connect");
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .env("HEPH_SHM_XTEST", "1")
+            .args(["--exact", "shm::tests::shm_cross_process_delivery"])
+            .spawn()
+            .expect("spawn child");
+        std::thread::sleep(Duration::from_millis(400)); // let child subscribe
+        rt.block_on(async {
+            w.write_all(b"ping").await.expect("parent write");
+            let mut b = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(5), r.read_exact(&mut b))
+                .await
+                .expect("cross-process shm delivery timed out")
+                .expect("parent read");
+            assert_eq!(&b, b"pong");
+        });
+        let _ = child.wait();
+    }
 
     #[tokio::test]
     async fn shm_byte_pipe_roundtrip() {

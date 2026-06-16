@@ -13,11 +13,11 @@ use crate::frame::{encode_frame_into, read_frame};
 use crate::pb;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 pub use pb::frame::Body;
 
@@ -69,8 +69,6 @@ pub struct Mux {
     pending: Mutex<HashMap<u64, Pending>>,
     closed: AtomicBool,
     closed_notify: Notify,
-    frames_in: AtomicU64,
-    frames_out: AtomicU64,
 }
 
 impl Mux {
@@ -89,8 +87,6 @@ impl Mux {
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             closed_notify: Notify::new(),
-            frames_in: AtomicU64::new(0),
-            frames_out: AtomicU64::new(0),
         });
 
         // writer task
@@ -127,6 +123,12 @@ impl Mux {
         }
     }
 
+    /// Externally close the connection (e.g. a liveness watcher detected the
+    /// peer process died). Fails pending calls and ends `wait_closed`.
+    pub fn close(&self) {
+        self.mark_closed();
+    }
+
     fn mark_closed(&self) {
         self.closed.store(true, Ordering::Release);
         // Drop every pending sender so in-flight unary calls observe
@@ -139,7 +141,6 @@ impl Mux {
 
     /// Send a frame with an explicit id (used by handlers to reply).
     pub fn send_body(&self, id: u64, body: Body) {
-        self.frames_out.fetch_add(1, Ordering::Relaxed);
         drop(self.out.send(pb::Frame {
             id,
             body: Some(body),
@@ -168,7 +169,10 @@ impl Mux {
         }
         let id = self.alloc_id();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("mux pending").insert(id, Pending::Unary(tx));
+        self.pending
+            .lock()
+            .expect("mux pending")
+            .insert(id, Pending::Unary(tx));
         self.send_body(id, body);
         tokio::pin!(cancel);
         tokio::select! {
@@ -198,7 +202,10 @@ impl Mux {
     pub fn call_stream(&self, body: Body) -> mpsc::UnboundedReceiver<Body> {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.pending.lock().expect("mux pending").insert(id, Pending::Stream(tx));
+        self.pending
+            .lock()
+            .expect("mux pending")
+            .insert(id, Pending::Stream(tx));
         self.send_body(id, body);
         rx
     }
@@ -225,7 +232,10 @@ impl Mux {
     }
 }
 
-async fn writer_loop<W: AsyncWrite + Unpin>(mut write: W, mut rx: mpsc::UnboundedReceiver<pb::Frame>) {
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut write: W,
+    mut rx: mpsc::UnboundedReceiver<pb::Frame>,
+) {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     while let Some(frame) = rx.recv().await {
         // Coalesce every frame already queued into one buffer, so a burst of
@@ -259,7 +269,6 @@ async fn reader_loop<R: AsyncRead + Unpin>(
     loop {
         match read_frame(&mut read).await {
             Ok(Some(frame)) => {
-                mux.frames_in.fetch_add(1, Ordering::Relaxed);
                 let id = frame.id;
                 let Some(body) = frame.body else { continue };
                 if is_response(&body) {
@@ -280,14 +289,4 @@ async fn reader_loop<R: AsyncRead + Unpin>(
         }
     }
     mux.mark_closed();
-}
-
-impl Drop for Mux {
-    fn drop(&mut self) {
-        tracing::info!(
-            frames_in = self.frames_in.load(Ordering::Relaxed),
-            frames_out = self.frames_out.load(Ordering::Relaxed),
-            "mux total frames"
-        );
-    }
 }

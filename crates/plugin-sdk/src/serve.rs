@@ -7,20 +7,19 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hcore::hasync::StdCancellationToken;
-use hplugin::eresult::{ArtifactMeta, EResult};
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunInput, ManagedRunRequest};
+use hmodel::htaddr::Addr;
+use hmodel::htmatcher::Matcher;
+use hmodel::htpkg::PkgBuf;
 use hplugin::driver::{
-    inputartifact, ApplyTransitiveRequest, ConfigRequest as DriverConfigRequest, Driver,
-    ParseRequest, RunInput, RunRequest,
+    ApplyTransitiveRequest, ConfigRequest as DriverConfigRequest, Driver, ParseRequest, RunInput,
+    RunRequest, inputartifact,
 };
-use std::path::PathBuf;
+use hplugin::eresult::{ArtifactMeta, EResult};
 use hplugin::provider::{
     ConfigRequest, GetError, GetRequest, ListPackagesRequest, ListRequest, ProbeRequest, Provider,
     ProviderExecutor,
 };
-use hmodel::htaddr::Addr;
-use hmodel::htmatcher::Matcher;
-use hmodel::htpkg::PkgBuf;
 use plugin_abi::convert;
 use plugin_abi::error::{WireError, WireErrorKind};
 use plugin_abi::mux::{Body, InboundHandler, Mux};
@@ -28,6 +27,7 @@ use plugin_abi::pb;
 use prost::Message;
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Serve `provider` over an established duplex byte stream. Returns the mux
@@ -120,7 +120,49 @@ pub async fn serve_components_inherited(
     managed: HashMap<String, Arc<dyn ManagedDriver>>,
 ) -> anyhow::Result<()> {
     let (r, w) = inherited_fd3()?;
-    serve_components(provider, managed, r, w).wait_closed().await;
+    serve_components(provider, managed, r, w)
+        .wait_closed()
+        .await;
+    Ok(())
+}
+
+/// Guest entry point over the **shm** transport: serve the protocol on an
+/// iceoryx2 byte-pipe (no per-frame syscalls) while watching the inherited fd 3
+/// (UDS) for EOF as the host-liveness signal. Used when the host launched us via
+/// `spawn_shm` (env `HEPH_PLUGIN_SHM`).
+#[cfg(all(unix, feature = "shm"))]
+pub async fn serve_components_shm(
+    shm_id: &str,
+    provider: Option<Arc<dyn Provider>>,
+    managed: HashMap<String, Arc<dyn ManagedDriver>>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let h2g = format!("{shm_id}_h2g");
+    let g2h = format!("{shm_id}_g2h");
+    // Guest: publish on g2h, subscribe on h2g (mirror of the host). After this
+    // returns our subscriber is live.
+    let (gr, gw) = plugin_abi::shm::connect(&g2h, &h2g)
+        .map_err(|e| anyhow::anyhow!("guest shm connect: {e}"))?;
+    let mux = serve_components(provider, managed, gr, gw);
+
+    let (mut uds_r, mut uds_w) = inherited_fd3()?;
+    // Readiness handshake: tell the host our shm subscriber is up so it doesn't
+    // publish before we can receive (iceoryx2 drops pre-subscribe messages).
+    uds_w
+        .write_all(&[1u8])
+        .await
+        .map_err(|e| anyhow::anyhow!("shm readiness signal: {e}"))?;
+
+    // Liveness: hold the UDS write half open; when the host closes its end
+    // (exit/crash) our read half hits EOF → close the connection → we exit.
+    let watch_mux = Arc::clone(&mux);
+    tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        let _ = uds_r.read(&mut byte).await;
+        watch_mux.close();
+    });
+    let _hold = uds_w; // keep the write half open for host-side liveness
+    mux.wait_closed().await;
     Ok(())
 }
 
@@ -162,7 +204,10 @@ impl GuestHandler {
 impl GuestHandler {
     fn new_token(&self, id: u64) -> Arc<StdCancellationToken> {
         let tok = Arc::new(StdCancellationToken::new());
-        self.tokens.lock().expect("tokens").insert(id, Arc::clone(&tok));
+        self.tokens
+            .lock()
+            .expect("tokens")
+            .insert(id, Arc::clone(&tok));
         tok
     }
     fn drop_token(&self, id: u64) {
@@ -189,7 +234,9 @@ impl InboundHandler for GuestHandler {
                 } else if let Some(m) = self.managed.values().next() {
                     m.config(DriverConfigRequest {}).map(|r| r.name)
                 } else {
-                    Err(anyhow::anyhow!("plugin exports neither provider nor driver"))
+                    Err(anyhow::anyhow!(
+                        "plugin exports neither provider nor driver"
+                    ))
                 };
                 match name {
                     Ok(name) => mux.send_body(id, Body::ConfigResp(pb::ConfigResponse { name })),
@@ -231,7 +278,8 @@ impl InboundHandler for GuestHandler {
                                         item: pb::ListPackageResponse {
                                             pkg: lpr.pkg.as_str().to_string(),
                                         }
-                                        .encode_to_vec().into(),
+                                        .encode_to_vec()
+                                        .into(),
                                     }),
                                 ),
                                 Err(e) => {
@@ -340,15 +388,15 @@ impl InboundHandler for GuestHandler {
             }
             Body::ApplyTransitiveReq(req) => {
                 let tok = self.new_token(id);
-                let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default())
-                {
-                    Ok(td) => td,
-                    Err(e) => {
-                        mux.send_body(id, err_frame(e.to_string()));
-                        self.drop_token(id);
-                        return;
-                    }
-                };
+                let target_def =
+                    match convert::target_def_from_pb(req.target_def.unwrap_or_default()) {
+                        Ok(td) => td,
+                        Err(e) => {
+                            mux.send_body(id, err_frame(e.to_string()));
+                            self.drop_token(id);
+                            return;
+                        }
+                    };
                 let sel = req.driver.clone();
                 let areq = ApplyTransitiveRequest {
                     request_id: req.request_id,
@@ -390,13 +438,17 @@ impl InboundHandler for GuestHandler {
                     tok.cancel();
                 }
             }
-            other => mux.send_body(id, err_frame(format!("unhandled inbound request: {other:?}"))),
+            other => mux.send_body(
+                id,
+                err_frame(format!("unhandled inbound request: {other:?}")),
+            ),
         }
     }
 }
 
 fn run_input_from_pb(mi: &pb::ManagedRunInput) -> RunInput {
-    let ty = match pb::InputArtifactType::try_from(mi.r#type).unwrap_or(pb::InputArtifactType::Dep) {
+    let ty = match pb::InputArtifactType::try_from(mi.r#type).unwrap_or(pb::InputArtifactType::Dep)
+    {
         pb::InputArtifactType::Support => inputartifact::Type::Support,
         _ => inputartifact::Type::Dep,
     };
@@ -493,7 +545,11 @@ impl GuestHandler {
             Ok(resp) => mux.send_body(
                 id,
                 Body::ManagedRunResp(pb::ManagedRunResponse {
-                    artifacts: resp.artifacts.iter().map(convert::output_artifact_to_pb).collect(),
+                    artifacts: resp
+                        .artifacts
+                        .iter()
+                        .map(convert::output_artifact_to_pb)
+                        .collect(),
                 }),
             ),
             Err(e) => mux.send_body(id, err_frame(e.to_string())),
@@ -516,7 +572,8 @@ impl GuestHandler {
                                 item: pb::ListResponse {
                                     addr: Some(convert::addr_to_pb(&lr.addr)),
                                 }
-                                .encode_to_vec().into(),
+                                .encode_to_vec()
+                                .into(),
                             }),
                         ),
                         Err(e) => {
@@ -588,11 +645,13 @@ struct MuxExecutor {
 impl MuxExecutor {
     /// Pull all bytes of one artifact via `open_artifact` (streamed as chunks).
     async fn fetch_artifact(&self, lease_id: &str, handle_id: &str) -> Result<Vec<u8>> {
-        let mut rx = self.mux.call_stream(Body::OpenArtifactReq(pb::OpenArtifactRequest {
-            lease_id: lease_id.to_string(),
-            handle_id: handle_id.to_string(),
-            offset: 0,
-        }));
+        let mut rx = self
+            .mux
+            .call_stream(Body::OpenArtifactReq(pb::OpenArtifactRequest {
+                lease_id: lease_id.to_string(),
+                handle_id: handle_id.to_string(),
+                offset: 0,
+            }));
         let mut bytes = Vec::new();
         while let Some(b) = rx.recv().await {
             match b {
@@ -629,7 +688,8 @@ impl ProviderExecutor for MuxExecutor {
                     // artifact in one fetch; lazy/offset chunking is M3. Most
                     // plugins read a tiny file (e.g. package.bin) so this is
                     // cheap in practice.
-                    let mut artifacts: Vec<Arc<dyn Content>> = Vec::with_capacity(rr.artifacts.len());
+                    let mut artifacts: Vec<Arc<dyn Content>> =
+                        Vec::with_capacity(rr.artifacts.len());
                     let mut artifacts_meta = Vec::with_capacity(rr.artifacts.len());
                     for h in &rr.artifacts {
                         let bytes = self.fetch_artifact(&rr.lease_id, &h.handle_id).await?;
@@ -689,7 +749,12 @@ impl ProviderExecutor for MuxExecutor {
                 parent: None,
                 addr: Some(convert::addr_to_pb(addr)),
             });
-            match self.mux.call(body).await.map_err(|e| map_wire_err(e, addr))? {
+            match self
+                .mux
+                .call(body)
+                .await
+                .map_err(|e| map_wire_err(e, addr))?
+            {
                 Body::NoteDepResp(r) => {
                     if r.ok {
                         Ok(())

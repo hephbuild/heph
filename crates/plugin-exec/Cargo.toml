@@ -25,6 +25,10 @@ minijinja = "2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "net"] }
 
+[features]
+# shm transport (iceoryx2); opt-in (slower than proto here on macOS).
+shm = ["plugin-sdk/shm"]
+
 [[bin]]
 name = "heph-plugin-exec"
 path = "src/bin/heph-plugin-exec.rs"
