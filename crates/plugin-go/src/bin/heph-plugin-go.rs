@@ -18,8 +18,25 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+// A multi-thread runtime, sized like the engine's (crates/.../bootstrap.rs).
+// plugingo fans out `go list` subprocesses and parks workers via
+// `block_in_place` on every subprocess chunk read; on a current-thread runtime
+// those fall back to a 1ms poll loop and all work serializes onto one thread —
+// catastrophic for a wide `//...` walk. The generous blocking pool gives
+// block_in_place headroom.
+fn main() -> anyhow::Result<()> {
+    let n = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(8);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(n)
+        .max_blocking_threads(8 * n + 64)
+        .enable_all()
+        .build()?;
+    rt.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let root = std::env::var_os("HEPH_PLUGIN_GO_ROOT")
         .or_else(|| std::env::var_os("HEPH_PLUGIN_ROOT"))
         .map(PathBuf::from)

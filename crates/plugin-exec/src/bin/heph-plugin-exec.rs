@@ -12,8 +12,22 @@ use plugin_exec::pluginexec::Driver;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+// Multi-thread runtime: the exec driver parks workers via `block_in_place`
+// while reading the target's subprocess stdio, which requires a multi-thread
+// runtime (current-thread falls back to a poll loop and serializes).
+fn main() -> anyhow::Result<()> {
+    let n = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(8);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(n)
+        .max_blocking_threads(8 * n + 64)
+        .enable_all()
+        .build()?;
+    rt.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let opts = hplugin::config::Options::new();
     let mut managed: HashMap<String, Arc<dyn ManagedDriver>> = HashMap::new();
     managed.insert("exec".to_string(), Arc::new(Driver::from_options_exec(&opts)?));
