@@ -70,6 +70,7 @@ in
   # build the out-of-process go plugin into example/.heph3/heph-go-plugin, which
   # example/.hephconfig2 launches via `bin: { path: .heph3/heph-go-plugin }`.
   scripts.gen-example.exec = ''
+    gen
     gen-go-large
     cargo build --release -p plugin-go --bin heph-plugin-go
     bin="$CARGO_TARGET_DIR/release/heph-plugin-go"
