@@ -23,23 +23,39 @@ pub(crate) struct Scope {
 #[derive(Default)]
 pub(crate) struct HostInner {
     scopes: Mutex<HashMap<String, Arc<Scope>>>,
+    /// Mints unique callback-scope ids. The engine's request_id is shared across
+    /// a whole request tree, so concurrent provider `get`s within one request
+    /// (e.g. plugingo's import-closure fan-out) would collide on it — one get's
+    /// unregister would tear down a sibling's still-live scope, and they carry
+    /// different executors (different cycle-detection parent) anyway. So each
+    /// call gets its own scope id, which is what travels on the wire as the
+    /// request_id and comes back on every callback.
+    scope_seq: std::sync::atomic::AtomicU64,
     pub leases: LeaseTable,
 }
 
 impl HostInner {
-    pub fn register(&self, request_id: String, executor: Arc<dyn ProviderExecutor>) {
+    /// A fresh, process-unique scope id for one host→guest call.
+    pub fn fresh_scope_id(&self) -> String {
+        let n = self
+            .scope_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("scope-{n}")
+    }
+
+    pub fn register(&self, scope_id: String, executor: Arc<dyn ProviderExecutor>) {
         self.scopes
             .lock()
             .expect("scopes")
-            .insert(request_id, Arc::new(Scope { executor }));
+            .insert(scope_id, Arc::new(Scope { executor }));
     }
 
-    pub fn unregister(&self, request_id: &str) {
-        self.scopes.lock().expect("scopes").remove(request_id);
+    pub fn unregister(&self, scope_id: &str) {
+        self.scopes.lock().expect("scopes").remove(scope_id);
     }
 
-    fn scope(&self, request_id: &str) -> Option<Arc<Scope>> {
-        self.scopes.lock().expect("scopes").get(request_id).cloned()
+    fn scope(&self, scope_id: &str) -> Option<Arc<Scope>> {
+        self.scopes.lock().expect("scopes").get(scope_id).cloned()
     }
 }
 

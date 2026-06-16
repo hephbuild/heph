@@ -132,18 +132,22 @@ impl Provider for RemoteProvider {
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, std::result::Result<GetResponse, GetError>> {
         Box::pin(async move {
-            let request_id = req.request_id.clone();
+            // Mint a unique scope id for this call: the engine's request_id is
+            // shared across the whole request tree, so concurrent gets within one
+            // request (plugingo's import-closure fan-out) would collide on it.
+            // This scope id is what travels on the wire and returns on callbacks.
+            let scope_id = self.inner.fresh_scope_id();
             // Register the executor so the plugin's result()/query() callbacks
-            // for this request route back to it.
+            // for this call route back to it.
             self.inner
-                .register(request_id.clone(), Arc::clone(&req.executor));
+                .register(scope_id.clone(), Arc::clone(&req.executor));
             let body = Body::GetReq(pb::GetRequest {
-                request_id: req.request_id,
+                request_id: scope_id.clone(),
                 addr: Some(convert::addr_to_pb(&req.addr)),
                 states: req.states.iter().map(convert::state_to_pb).collect(),
             });
             let res = self.mux.call_cancellable(body, ctoken.cancelled()).await;
-            self.inner.unregister(&request_id);
+            self.inner.unregister(&scope_id);
             match res {
                 Ok(Body::GetResp(gr)) => Ok(GetResponse {
                     target_spec: convert::target_spec_from_pb(gr.target_spec.unwrap_or_default()),

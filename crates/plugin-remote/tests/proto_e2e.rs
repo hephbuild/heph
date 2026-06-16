@@ -746,3 +746,118 @@ async fn cycle_error_propagates_typed() {
         ),
     }
 }
+
+// ---- regression: per-call scope ids ----
+
+/// Records the wire request_id each `get` arrives with, so a test can assert the
+/// host mints a distinct scope id per call (not the shared engine request_id).
+struct RecordingProvider {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Provider for RecordingProvider {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        Ok(ConfigResponse {
+            name: "rec".to_string(),
+        })
+    }
+    fn list<'a>(
+        &'a self,
+        _req: ListRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
+    {
+        Box::pin(async move {
+            Ok(Box::new(std::iter::empty())
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
+        })
+    }
+    fn list_packages<'a>(
+        &'a self,
+        _req: ListPackagesRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<
+        'a,
+        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+    > {
+        Box::pin(async move {
+            Ok(Box::new(std::iter::empty())
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                >)
+        })
+    }
+    fn get<'a>(
+        &'a self,
+        req: GetRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+        self.seen.lock().expect("seen").push(req.request_id.clone());
+        Box::pin(async move {
+            Ok(GetResponse {
+                target_spec: TargetSpec {
+                    addr: req.addr,
+                    driver: "exec".to_string(),
+                    ..Default::default()
+                },
+            })
+        })
+    }
+    fn probe<'a>(
+        &'a self,
+        _req: ProbeRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+        Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
+    }
+}
+
+/// Two gets that share one engine request_id (as plugingo's import-closure
+/// fan-out does within a single request) must reach the guest as DISTINCT wire
+/// scope ids — otherwise one call's scope teardown would break the other's
+/// callbacks ("unknown request scope").
+#[tokio::test]
+async fn concurrent_gets_get_distinct_scope_ids() {
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let (ar, aw) = a.into_split();
+    let (br, bw) = b.into_split();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guest = plugin_sdk::serve(
+        Arc::new(RecordingProvider {
+            seen: Arc::clone(&seen),
+        }),
+        br,
+        bw,
+    );
+    let host = RemoteProvider::connect(ar, aw, "rec");
+    let ctoken = StdCancellationToken::new();
+    let executor: Arc<dyn ProviderExecutor> = Arc::new(StubExec);
+
+    for name in ["a", "b"] {
+        host.get(
+            GetRequest {
+                // Same engine request_id for both calls, on purpose.
+                request_id: "req-0".to_string(),
+                addr: addr("//pkg", name),
+                states: vec![],
+                executor: Arc::clone(&executor),
+            },
+            &ctoken,
+        )
+        .await
+        .expect("get ok");
+    }
+
+    let seen = seen.lock().expect("seen").clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_ne!(
+        seen[0], seen[1],
+        "each get must mint a unique scope id: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|s| s != "req-0"),
+        "wire id must be the scope id, not the engine request_id: {seen:?}"
+    );
+}
