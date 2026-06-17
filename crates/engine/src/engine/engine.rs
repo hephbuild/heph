@@ -751,12 +751,13 @@ impl hplugin::lsp::LspEngine for Engine {
         // Built-in providers carry their options on the matching `builtin:` plugin
         // entry. (cdylib-plugin providers self-describe and aren't keyed by name
         // in config, so they fall through to defaults here.)
+        use crate::engine::config_yaml::PluginIdentifier;
         crate::engine::config_yaml::load_from_root(self.root())
             .ok()
             .and_then(|cfg| {
                 cfg.plugins
                     .into_iter()
-                    .find(|p| p.builtin.as_deref() == Some(name))
+                    .find(|p| matches!(&p.identifier, PluginIdentifier::Builtin(b) if b == name))
                     .map(|p| p.options)
             })
             .unwrap_or_default()

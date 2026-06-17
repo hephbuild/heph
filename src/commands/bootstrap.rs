@@ -194,15 +194,16 @@ fn register_plugins(
     home_dir: &std::path::Path,
     file: &config_yaml::ConfigYaml,
 ) -> anyhow::Result<()> {
-    let mut manifests: Vec<(config_yaml::PluginSource, Vec<u8>)> = Vec::new();
+    let mut manifests: Vec<(config_yaml::PluginIdentifier, Vec<u8>)> = Vec::new();
     for spec in &file.plugins {
-        match spec.resolve()? {
-            config_yaml::PluginSource::Builtin(name) => e
-                .apply_builtin(&name, &spec.options)
+        match &spec.identifier {
+            config_yaml::PluginIdentifier::Builtin(name) => e
+                .apply_builtin(name, &spec.options)
                 .with_context(|| format!("apply builtin plugin `{name}`"))?,
-            // Encode options once (pb::Value bytes) for the cdylib's create entry.
-            other => manifests.push((
-                other,
+            // Manifest plugin: encode options once (pb::Value bytes) for the
+            // cdylib's create entry, resolve + load below.
+            _ => manifests.push((
+                spec.identifier.clone(),
                 hplugin_abi::convert::options_to_pb_bytes(&spec.options),
             )),
         }
@@ -238,7 +239,7 @@ fn load_dylib_plugins(
     e: &mut engine::Engine,
     root: &std::path::Path,
     home_dir: &std::path::Path,
-    manifests: Vec<(config_yaml::PluginSource, Vec<u8>)>,
+    manifests: Vec<(config_yaml::PluginIdentifier, Vec<u8>)>,
 ) -> anyhow::Result<()> {
     use rayon::prelude::*;
 
@@ -272,7 +273,7 @@ fn load_dylib_plugins(
     _e: &mut engine::Engine,
     _root: &std::path::Path,
     _home_dir: &std::path::Path,
-    manifests: Vec<(config_yaml::PluginSource, Vec<u8>)>,
+    manifests: Vec<(config_yaml::PluginIdentifier, Vec<u8>)>,
 ) -> anyhow::Result<()> {
     if manifests.is_empty() {
         Ok(())
@@ -287,12 +288,12 @@ fn load_dylib_plugins(
 /// manifest, or a `url` to download + cache).
 #[cfg(unix)]
 fn resolve_manifest_dylib(
-    src: &config_yaml::PluginSource,
+    src: &config_yaml::PluginIdentifier,
     root: &std::path::Path,
     home_dir: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     let (manifest_bytes, manifest_dir) = match src {
-        config_yaml::PluginSource::ManifestPath(p) => {
+        config_yaml::PluginIdentifier::Path(p) => {
             let pb = std::path::PathBuf::from(p);
             let mp = if pb.is_absolute() { pb } else { root.join(pb) };
             let bytes = std::fs::read(&mp)
@@ -303,7 +304,7 @@ fn resolve_manifest_dylib(
                 .unwrap_or_else(|| root.to_path_buf());
             (bytes, dir)
         }
-        config_yaml::PluginSource::ManifestUrl(u) => {
+        config_yaml::PluginIdentifier::Url(u) => {
             let mp = download_plugin(u, home_dir)?;
             let bytes = std::fs::read(&mp)
                 .with_context(|| format!("read downloaded plugin manifest {}", mp.display()))?;
@@ -313,7 +314,7 @@ fn resolve_manifest_dylib(
                 .unwrap_or_else(|| home_dir.to_path_buf());
             (bytes, dir)
         }
-        config_yaml::PluginSource::Builtin(_) => {
+        config_yaml::PluginIdentifier::Builtin(_) => {
             anyhow::bail!("internal: builtin plugin reached manifest resolution")
         }
     };
@@ -533,9 +534,9 @@ mod tests {
 
         // The helper exercises built-in plugins only (no cdylib loading).
         for spec in &file.plugins {
-            match spec.resolve()? {
-                config_yaml::PluginSource::Builtin(name) => {
-                    e.apply_builtin(&name, &spec.options)?
+            match &spec.identifier {
+                config_yaml::PluginIdentifier::Builtin(name) => {
+                    e.apply_builtin(name, &spec.options)?
                 }
                 _ => anyhow::bail!("test helper supports only `builtin:` plugins"),
             }
@@ -547,11 +548,11 @@ mod tests {
     fn applies_listed_builtins() {
         let yaml = r#"
 plugins:
-  - builtin: buildfile
+  - identifier: { builtin: buildfile }
     options:
       patterns: [BUILD]
-  - builtin: exec
-  - builtin: bash
+  - identifier: { builtin: exec }
+  - identifier: { builtin: bash }
 "#;
         let (_dir, e) = build_engine_from_yaml(yaml).expect("engine");
         assert!(e.providers_by_name.contains_key("buildfile"));
@@ -592,7 +593,7 @@ fs:
 
     #[test]
     fn unknown_builtin_errors() {
-        let yaml = "plugins:\n  - builtin: nope\n";
+        let yaml = "plugins:\n  - identifier: { builtin: nope }\n";
         let err = build_engine_from_yaml(yaml).err().expect("must error");
         assert!(err.to_string().contains("nope"), "{err}");
     }

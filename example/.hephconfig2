@@ -3,16 +3,16 @@
 # cdylib (loaded in-process behind the stable ABI — native speed, no IPC). Each
 # entry's `options:` map is passed to the plugin's construction.
 plugins:
-  - builtin: buildfile
+  - identifier: { builtin: buildfile }
     options:
       patterns:
         - BUILD
-  - builtin: exec
-  - builtin: bash
-  - builtin: sh
+  - identifier: { builtin: exec }
+  - identifier: { builtin: bash }
+  - identifier: { builtin: sh }
   # The go plugin: one manifest names the cdylib for this host. The provider + its
   # go_* drivers all come from that one library. Built by the `gen-example` script.
-  - path: .heph3/heph-go-plugin.json
+  - identifier: { path: .heph3/heph-go-plugin.json }
     options:
       go_bin: "//@heph/bin:go"
 #fuse:
