@@ -9,7 +9,9 @@ use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 use hplugin::eresult::{ArtifactMeta, EResult};
 use hplugin::provider::ProviderExecutor;
-use hplugin_stabby::abi::{DynExecutor, StableExecutorDyn};
+use hplugin_stabby::abi::{
+    DynArtifact, DynExecutor, DynRead, StableArtifactContentDyn, StableExecutorDyn, StableReadDyn,
+};
 use prost::Message;
 use std::io::Read;
 use std::sync::Arc;
@@ -48,12 +50,9 @@ impl ProviderExecutor for GuestExecutor {
             if r.ok {
                 let mut artifacts: Vec<Arc<dyn Content>> = Vec::with_capacity(r.artifacts.len());
                 let mut meta = Vec::with_capacity(r.artifacts.len());
-                for a in r.artifacts.iter() {
-                    let hashout = a.hashout.to_string();
-                    artifacts.push(Arc::new(StableContent {
-                        bytes: a.bytes.to_vec(),
-                        hashout: hashout.clone(),
-                    }) as Arc<dyn Content>);
+                for a in r.artifacts {
+                    let hashout = a.hashout().to_string();
+                    artifacts.push(Arc::new(StableContent { handle: a }) as Arc<dyn Content>);
                     meta.push(ArtifactMeta { hashout });
                 }
                 Ok(Arc::new(EResult {
@@ -100,28 +99,64 @@ impl ProviderExecutor for GuestExecutor {
     }
 }
 
-/// A host artifact materialized guest-side from eagerly-read bytes. Artifacts are
-/// tar (the only content type the cache produces today), so `walk` uses the tar
-/// walker. Mirrors `plugin_sdk::serve::RemoteContent`.
+/// A host artifact, streamed guest-side over the stable ABI: `reader()` opens a
+/// fresh streaming reader on the host handle (no buffering); `walk()` runs the tar
+/// walker over that stream (artifacts are tar — the only content the cache
+/// produces today). The handle owns the host `Content` for its lifetime.
 struct StableContent {
-    bytes: Vec<u8>,
-    hashout: String,
+    handle: DynArtifact,
 }
 
 impl Content for StableContent {
     fn reader(&self) -> Result<Box<dyn Read>> {
-        Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+        Ok(Box::new(GuestRead::new(self.handle.open())))
     }
     fn walk(&self) -> Result<Box<dyn Iterator<Item = Result<WalkEntry>> + '_>> {
         Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
-            std::io::Cursor::new(self.bytes.clone()),
+            self.reader()?,
         )?))
     }
     fn hashout(&self) -> Result<String> {
-        Ok(self.hashout.clone())
+        Ok(self.handle.hashout().to_string())
     }
     fn byte_size(&self) -> Option<u64> {
-        Some(self.bytes.len() as u64)
+        match self.handle.byte_size() {
+            u64::MAX => None,
+            n => Some(n),
+        }
+    }
+}
+
+/// Adapts a stable [`DynRead`] (chunk-pull) to `std::io::Read`: serves the current
+/// chunk via a `Cursor`, pulling the next chunk when it drains; an empty chunk is EOF.
+struct GuestRead {
+    inner: DynRead,
+    cur: std::io::Cursor<Vec<u8>>,
+}
+
+impl GuestRead {
+    fn new(inner: DynRead) -> Self {
+        Self {
+            inner,
+            cur: std::io::Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for GuestRead {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.cur.read(out)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            // Current chunk drained — pull the next; empty = EOF.
+            let chunk = self.inner.read_chunk();
+            if chunk.is_empty() {
+                return Ok(0);
+            }
+            self.cur = std::io::Cursor::new(chunk.to_vec());
+        }
     }
 }
 
@@ -145,7 +180,7 @@ mod tests {
         fn result<'a>(&'a self, _addr: &'a Addr) -> BoxFuture<'a, Result<Arc<EResult>>> {
             Box::pin(async {
                 Ok(Arc::new(EResult {
-                    artifacts: vec![Arc::new(Bytes(b"hello".to_vec())) as Arc<dyn Content>],
+                    artifacts: vec![Arc::new(Bytes(big_payload())) as Arc<dyn Content>],
                     support_artifacts: vec![],
                     artifacts_meta: vec![ArtifactMeta {
                         hashout: "h1".into(),
@@ -175,6 +210,12 @@ mod tests {
         }
     }
 
+    /// A payload spanning several 64 KiB stream chunks, to prove the streaming
+    /// reader reassembles across chunk boundaries (not whole-buffered, not truncated).
+    fn big_payload() -> Vec<u8> {
+        (0..200_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
     // The hot path crosses the stable ABI (host adapter -> stabby dyn -> guest
     // adapter) and back, same process — proving the conversions before the cdylib.
     #[test]
@@ -192,12 +233,22 @@ mod tests {
         let eres = futures::executor::block_on(guest.result(&addr)).expect("result");
         assert_eq!(eres.artifacts.len(), 1);
         assert_eq!(eres.artifacts_meta[0].hashout, "h1");
-        let mut buf = String::new();
+        // The artifact streams across the seam in chunks; the guest reader must
+        // reproduce the full payload exactly.
+        let mut buf = Vec::new();
         eres.artifacts[0]
             .reader()
             .unwrap()
-            .read_to_string(&mut buf)
+            .read_to_end(&mut buf)
             .unwrap();
-        assert_eq!(buf, "hello");
+        assert_eq!(buf, big_payload());
+        // A second reader() opens a fresh stream (reader is re-openable).
+        let mut buf2 = Vec::new();
+        eres.artifacts[0]
+            .reader()
+            .unwrap()
+            .read_to_end(&mut buf2)
+            .unwrap();
+        assert_eq!(buf2, big_payload());
     }
 }

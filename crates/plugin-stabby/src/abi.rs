@@ -18,13 +18,35 @@ pub struct NoteDepOutcome {
     pub message: SString,
 }
 
-/// One result artifact, materialized as bytes at the seam (plugin-go reads a
-/// tiny `package.bin`; lazy streaming is a later optimization).
+/// A streaming reader over an artifact's bytes. `read_chunk` returns up to an
+/// internal chunk (empty `SVec` = EOF), so the guest pulls lazily and the whole
+/// artifact is never buffered in memory at the seam.
 #[stabby::stabby]
-pub struct StableArtifact {
-    pub hashout: SString,
-    pub bytes: SVec<u8>,
+pub trait StableRead {
+    /// `&self` (not `&mut`) so it dispatches over the stable vtable like the rest
+    /// of the ABI; implementors use interior mutability for the read cursor.
+    extern "C" fn read_chunk(&self) -> SVec<u8>;
 }
+
+/// An owned, ABI-stable streaming reader handle. Not `Send`: like
+/// `hcore::Content::reader`, it is opened and consumed on one thread (the
+/// `Send + Sync` artifact handle is what crosses threads).
+pub type DynRead = stabby::dynptr!(stabby::boxed::Box<dyn StableRead>);
+
+/// One result artifact as a lazy handle: `open` yields a FRESH streaming reader
+/// (the guest's `reader()` and `walk()` each re-read), plus cheap metadata. The
+/// handle owns the underlying `Content` (host-side), keeping its cache read-guard
+/// alive while the guest streams.
+#[stabby::stabby]
+pub trait StableArtifactContent {
+    extern "C" fn open(&self) -> DynRead;
+    extern "C" fn hashout(&self) -> SString;
+    /// Byte size hint; `u64::MAX` means unknown.
+    extern "C" fn byte_size(&self) -> u64;
+}
+
+/// An owned, ABI-stable artifact handle.
+pub type DynArtifact = stabby::dynptr!(stabby::boxed::Box<dyn StableArtifactContent + Send + Sync>);
 
 /// Outcome of a `result` resolution.
 #[stabby::stabby]
@@ -33,7 +55,7 @@ pub struct ResultOutcome {
     pub cycle: bool,
     pub cancelled: bool,
     pub message: SString,
-    pub artifacts: SVec<StableArtifact>,
+    pub artifacts: SVec<DynArtifact>,
 }
 
 /// Outcome of a `query`.

@@ -2,8 +2,10 @@
 //! a loaded plugin can call back via direct stabby vtable dispatch.
 
 use crate::abi::{
-    DynExecutor, NoteDepOutcome, QueryOutcome, ResultOutcome, StableArtifact, StableExecutor,
+    DynArtifact, DynExecutor, DynRead, NoteDepOutcome, QueryOutcome, ResultOutcome,
+    StableArtifactContent, StableExecutor, StableRead,
 };
+use hcore::hartifactcontent::Content;
 use hmodel::htaddr::parse_addr;
 use hplugin::provider::ProviderExecutor;
 use prost::Message;
@@ -12,6 +14,61 @@ use stabby::string::String as SString;
 use stabby::vec::Vec as SVec;
 use std::io::Read;
 use std::sync::Arc;
+
+/// Chunk size for streaming an artifact across the seam — bounds peak memory per
+/// in-flight read regardless of artifact size.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Host-side streaming reader: pulls ≤`READ_CHUNK` bytes from the artifact's
+/// `Content` reader on each `read_chunk`, returning an empty `SVec` at EOF.
+/// `RefCell` because the ABI method is `&self` (vtable dispatch); the reader is
+/// consumed on one thread.
+struct HostRead {
+    inner: std::cell::RefCell<Box<dyn Read>>,
+}
+
+impl StableRead for HostRead {
+    extern "C" fn read_chunk(&self) -> SVec<u8> {
+        let mut buf = vec![0u8; READ_CHUNK];
+        // Read a single chunk; partial reads are fine (guest loops until EOF).
+        match self.inner.borrow_mut().read(&mut buf) {
+            Ok(0) | Err(_) => SVec::new(),
+            Ok(n) => {
+                buf.truncate(n);
+                SVec::from(buf.as_slice())
+            }
+        }
+    }
+}
+
+/// Host-side artifact handle. Owns the `Arc<dyn Content>` (keeping its cache
+/// read-guard alive while the guest streams) and opens a fresh reader on demand.
+struct HostArtifactContent {
+    content: Arc<dyn Content>,
+}
+
+impl StableArtifactContent for HostArtifactContent {
+    extern "C" fn open(&self) -> DynRead {
+        // A reader that errors immediately yields empty (EOF) chunks — the guest
+        // then sees a truncated/empty stream rather than a hang.
+        let inner: Box<dyn Read> = self
+            .content
+            .reader()
+            .unwrap_or_else(|_| Box::new(std::io::empty()));
+        stabby::boxed::Box::new(HostRead {
+            inner: std::cell::RefCell::new(inner),
+        })
+        .into()
+    }
+
+    extern "C" fn hashout(&self) -> SString {
+        self.content.hashout().unwrap_or_default().into()
+    }
+
+    extern "C" fn byte_size(&self) -> u64 {
+        self.content.byte_size().unwrap_or(u64::MAX)
+    }
+}
 
 /// Wraps the per-request engine executor; handed to the plugin as a [`DynExecutor`].
 pub struct HostExecutor {
@@ -74,35 +131,17 @@ impl StableExecutor for HostExecutor {
             };
             match self.inner.result(&parsed).await {
                 Ok(eres) => {
-                    let mut artifacts = SVec::new();
-                    for (idx, art) in eres.artifacts.iter().enumerate() {
-                        let hashout = eres
-                            .artifacts_meta
-                            .get(idx)
-                            .map(|m| m.hashout.clone())
-                            .or_else(|| art.hashout().ok())
-                            .unwrap_or_default();
-                        // Eagerly read the bytes (plugin-go reads a tiny file).
-                        let bytes = match art.reader().and_then(|mut r| {
-                            let mut b = Vec::new();
-                            r.read_to_end(&mut b)?;
-                            Ok(b)
-                        }) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                return ResultOutcome {
-                                    ok: false,
-                                    cycle: false,
-                                    cancelled: false,
-                                    message: format!("artifact read: {e}").into(),
-                                    artifacts: SVec::new(),
-                                };
-                            }
-                        };
-                        artifacts.push(StableArtifact {
-                            hashout: hashout.into(),
-                            bytes: SVec::from(bytes.as_slice()),
-                        });
+                    // Hand each artifact across as a lazy streaming handle — the
+                    // Arc<dyn Content> moves into the handle (keeping its cache
+                    // read-guard alive), and bytes are pulled chunk-by-chunk by the
+                    // guest. Nothing is buffered whole here.
+                    let mut artifacts: SVec<DynArtifact> = SVec::new();
+                    for art in eres.artifacts.iter() {
+                        let handle: DynArtifact = stabby::boxed::Box::new(HostArtifactContent {
+                            content: Arc::clone(art),
+                        })
+                        .into();
+                        artifacts.push(handle);
                     }
                     ResultOutcome {
                         ok: true,
