@@ -95,51 +95,30 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_driver(|_| Box::new(plugintextfile::Driver))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
-    // A name carrying a `dylib:` entry routes to an in-process loadable cdylib
-    // (the stable ABI, native speed) instead of the built-in in-process factory
-    // below, so skip the factory for those names.
-    let bin_names: std::collections::HashSet<&str> = file
-        .providers
-        .iter()
-        .chain(file.drivers.iter())
-        .filter(|en| en.dylib.is_some())
-        .map(|en| en.name.as_str())
-        .collect();
-
-    // Opt-in built-in factories — instantiated by `apply_config` if listed in
-    // the YAML and not overridden by a `bin:` entry.
-    if !bin_names.contains("buildfile") {
-        e.register_provider_factory("buildfile", |init, opts| {
-            Ok(Box::new(
-                pluginbuildfile::Provider::from_options(
-                    init.root.to_path_buf(),
-                    &init.skip_dirs,
-                    &init.skip_globs,
-                    opts,
-                )?
-                .with_walker(init.walker.clone()),
-            ))
-        })?;
-    }
-    // The go plugin is no longer a compiled-in built-in: it ships as a separate
-    // artifact loaded via `dylib:` (native speed) or spawned via `bin:`. A config
-    // entry named `go`/`go_*` without a transport therefore has no factory.
-    if !bin_names.contains("exec") {
-        e.register_managed_driver_factory("exec", |_init, opts| {
-            Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
-        })?;
-    }
-    if !bin_names.contains("bash") {
-        e.register_managed_driver_factory("bash", |_init, opts| {
-            Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
-        })?;
-    }
-    if !bin_names.contains("sh") {
-        e.register_managed_driver_factory("sh", |_init, opts| {
-            Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
-        })?;
-    }
-    drop(bin_names);
+    // Opt-in built-in factories — instantiated by `apply_config` only if the YAML
+    // lists their name. The go plugin is no longer compiled in: it ships as a
+    // separate cdylib loaded via `dylib:` (below), under its own `go`/`go_*` names
+    // that don't collide with these built-ins.
+    e.register_provider_factory("buildfile", |init, opts| {
+        Ok(Box::new(
+            pluginbuildfile::Provider::from_options(
+                init.root.to_path_buf(),
+                &init.skip_dirs,
+                &init.skip_globs,
+                opts,
+            )?
+            .with_walker(init.walker.clone()),
+        ))
+    })?;
+    e.register_managed_driver_factory("exec", |_init, opts| {
+        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+    })?;
+    e.register_managed_driver_factory("bash", |_init, opts| {
+        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+    })?;
+    e.register_managed_driver_factory("sh", |_init, opts| {
+        Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
+    })?;
 
     // Load + register every in-process loadable plugin declared via `dylib:`. One
     // cdylib per distinct path serves a provider + its drivers (e.g. `go` plus the
@@ -218,19 +197,46 @@ fn register_dylib_plugins(
     home_dir: &std::path::Path,
     file: &config_yaml::ConfigYaml,
 ) -> anyhow::Result<()> {
-    use std::collections::BTreeSet;
+    use rayon::prelude::*;
+    use std::collections::HashSet;
 
-    let mut paths: BTreeSet<std::path::PathBuf> = BTreeSet::new();
-    for en in file.providers.iter().chain(file.drivers.iter()) {
-        if let Some(d) = &en.dylib {
-            paths.insert(resolve_artifact_path(d.resolve(&en.name)?, root, home_dir)?);
-        }
+    // Distinct dylib sources: a provider and its drivers usually all point at the
+    // same artifact, so dedup to load each cdylib once.
+    let mut seen: HashSet<String> = HashSet::new();
+    let sources: Vec<config_yaml::ArtifactSource> = file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .filter_map(|en| en.dylib.as_ref().map(|d| d.resolve(&en.name)))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|s| {
+            let key = match s {
+                config_yaml::ArtifactSource::Path(p) => format!("p:{p}"),
+                config_yaml::ArtifactSource::Url(u) => format!("u:{u}"),
+            };
+            seen.insert(key)
+        })
+        .collect();
+    if sources.is_empty() {
+        return Ok(());
     }
 
+    // Resolve (downloading `url` artifacts, each under a cross-process file lock)
+    // and load each cdylib in parallel — independent work, and loading constructs
+    // the plugin (e.g. the go provider's walker), which isn't free.
     let root_str = root.to_string_lossy().into_owned();
-    for path in paths {
-        let (provider, drivers) = hplugin_stabby::load_stable::load(&path, &root_str)
-            .with_context(|| format!("load plugin dylib {}", path.display()))?;
+    let loaded = sources
+        .into_par_iter()
+        .map(|src| -> anyhow::Result<_> {
+            let path = resolve_artifact_path(src, root, home_dir)?;
+            hplugin_stabby::load_stable::load(&path, &root_str)
+                .with_context(|| format!("load plugin dylib {}", path.display()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // Engine mutation is single-threaded; register the loaded components in order.
+    for (provider, drivers) in loaded {
         if let Some(p) = provider {
             let name = p.name().to_string();
             e.register_provider_factory(&name, move |_init, _opts| Ok(Box::new(p.clone())))?;
@@ -262,9 +268,9 @@ fn register_dylib_plugins(
     Ok(())
 }
 
-/// Resolve a loadable-artifact source to a concrete file path: a `path` is taken
-/// relative to the workspace `root`; a `url` is downloaded + cached (same fetch
-/// path as `bin:` urls).
+/// Resolve a loadable-artifact source to a concrete file path: an absolute `path`
+/// is used as-is, a relative one is taken against the workspace `root`; a `url` is
+/// downloaded + cached.
 #[cfg(unix)]
 fn resolve_artifact_path(
     src: config_yaml::ArtifactSource,
@@ -272,9 +278,50 @@ fn resolve_artifact_path(
     home_dir: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     Ok(match src {
-        config_yaml::ArtifactSource::Path(p) => root.join(p),
+        config_yaml::ArtifactSource::Path(p) => {
+            let p = std::path::PathBuf::from(p);
+            if p.is_absolute() { p } else { root.join(p) }
+        }
         config_yaml::ArtifactSource::Url(u) => download_plugin(&u, home_dir)?,
     })
+}
+
+/// An exclusive, advisory, cross-process file lock (`flock(2)`), released on drop.
+/// Serializes concurrent plugin downloads of the same artifact across heph
+/// processes so two runs don't fetch (or half-write) the same file at once.
+#[cfg(unix)]
+struct FileLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `self.file` owns a valid fd for the lifetime of this guard.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn lock_exclusive(path: &std::path::Path) -> anyhow::Result<FileLock> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open lock file {}", path.display()))?;
+    // Blocking exclusive acquire; advisory and tied to the open file description.
+    // SAFETY: `file` owns the fd; `flock` is valid for the call's duration.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("flock LOCK_EX on {}", path.display()));
+    }
+    Ok(FileLock { file })
 }
 
 /// Substitute `{os}`/`{arch}` in a plugin download URL with the values used in
@@ -321,6 +368,14 @@ fn download_plugin(
         return Ok(dest);
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+
+    // Serialize concurrent downloads of this artifact (across processes too): hold
+    // an exclusive lock for the fetch, then re-check — another run may have just
+    // installed it while we waited.
+    let _lock = lock_exclusive(&dir.join(format!("{filename}.lock")))?;
+    if dest.exists() {
+        return Ok(dest);
+    }
 
     // reqwest::blocking spins up its own runtime; run it on a dedicated std
     // thread so it is safe to call from within the async runtime new_engine runs
