@@ -9,6 +9,23 @@ use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::string::String as SString;
 use stabby::vec::Vec as SVec;
 
+/// One `Addr` arg (`key=value`).
+#[stabby::stabby]
+pub struct StableArg {
+    pub key: SString,
+    pub val: SString,
+}
+
+/// A target address crossing the seam as its already-parsed parts (package, name,
+/// args), so neither side formats-to-string then re-parses (`//pkg:name`) per
+/// callback. Args are preserved — they are part of the addr's interned identity.
+#[stabby::stabby]
+pub struct StableAddr {
+    pub package: SString,
+    pub name: SString,
+    pub args: SVec<StableArg>,
+}
+
 /// Outcome of a `note_dep` dep-edge registration.
 #[stabby::stabby]
 pub struct NoteDepOutcome {
@@ -77,8 +94,11 @@ pub struct QueryOutcome {
 /// prost bytes (query is rare/zero on the hot path).
 #[stabby::stabby]
 pub trait StableExecutor {
-    extern "C" fn note_dep<'a>(&'a self, addr: SString) -> DynFuture<'a, NoteDepOutcome>;
-    extern "C" fn result<'a>(&'a self, addr: SString) -> DynFuture<'a, ResultOutcome>;
+    /// Synchronous: registering a dep edge is a `DepDag` insert (no real await),
+    /// so it skips the boxed-future + stabby future-vtable cost of the other
+    /// callbacks. This is the highest-volume callback on the hot path.
+    extern "C" fn note_dep(&self, addr: StableAddr) -> NoteDepOutcome;
+    extern "C" fn result<'a>(&'a self, addr: StableAddr) -> DynFuture<'a, ResultOutcome>;
     extern "C" fn query<'a>(
         &'a self,
         matcher_pb: SVec<u8>,

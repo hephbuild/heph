@@ -37,11 +37,16 @@ fn build(cfg: CreateConfig) -> anyhow::Result<PluginComponents> {
 
     // Tunables come from the plugin's `options:` map (config yaml), decoded the
     // same way an in-process plugin reads its options.
-    let options = plugin_sdk::stabby::options_from_pb_bytes(&cfg.options[..])?;
+    let mut options = plugin_sdk::stabby::options_from_pb_bytes(&cfg.options[..])?;
+    // `go_bin`/`walk_db` are this cdylib's own (driver/walker) options — consume
+    // them here and keep them out of the provider's map, whose `from_options`
+    // rejects unknown keys (it knows only its provider options, e.g. `gotool`).
     let go_bin = hplugin::config::decode_opt::<String>(&options, "go", "go_bin")?
         .unwrap_or_else(|| "//@heph/bin:go".to_string());
     let walk_db = hplugin::config::decode_opt::<PathBuf>(&options, "go", "walk_db")?
         .unwrap_or_else(|| root.join(".heph-plugin-go-fswalk.db"));
+    options.remove("go_bin");
+    options.remove("walk_db");
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
     let provider: Arc<dyn hplugin::provider::Provider> =

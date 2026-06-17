@@ -2,11 +2,12 @@
 //! a loaded plugin can call back via direct stabby vtable dispatch.
 
 use crate::abi::{
-    DynArtifact, DynExecutor, DynRead, NoteDepOutcome, QueryOutcome, ResultOutcome,
+    DynArtifact, DynExecutor, DynRead, NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr,
     StableArtifactContent, StableExecutor, StableRead,
 };
 use hcore::hartifactcontent::Content;
-use hmodel::htaddr::parse_addr;
+use hmodel::htaddr::Addr;
+use hmodel::htpkg::PkgBuf;
 use hplugin::provider::ProviderExecutor;
 use prost::Message;
 use stabby::future::DynFutureUnsync as DynFuture;
@@ -22,21 +23,22 @@ const READ_CHUNK: usize = 64 * 1024;
 /// Host-side streaming reader: pulls ≤`READ_CHUNK` bytes from the artifact's
 /// `Content` reader on each `read_chunk`, returning an empty `SVec` at EOF.
 /// `RefCell` because the ABI method is `&self` (vtable dispatch); the reader is
-/// consumed on one thread.
+/// consumed on one thread. The scratch `buf` is allocated once per reader and
+/// reused across chunks (incl. the EOF read), not re-allocated per call.
 struct HostRead {
     inner: std::cell::RefCell<Box<dyn Read>>,
+    buf: std::cell::RefCell<Vec<u8>>,
 }
 
 impl StableRead for HostRead {
     extern "C" fn read_chunk(&self) -> SVec<u8> {
-        let mut buf = vec![0u8; READ_CHUNK];
-        // Read a single chunk; partial reads are fine (guest loops until EOF).
-        match self.inner.borrow_mut().read(&mut buf) {
+        let mut inner = self.inner.borrow_mut();
+        let mut buf = self.buf.borrow_mut();
+        // Read a single chunk into the reused buffer; partial reads are fine
+        // (the guest loops until EOF). Only the `n` read bytes are copied out.
+        match inner.read(&mut buf) {
             Ok(0) | Err(_) => SVec::new(),
-            Ok(n) => {
-                buf.truncate(n);
-                SVec::from(buf.as_slice())
-            }
+            Ok(n) => SVec::from(buf.get(..n).unwrap_or_default()),
         }
     }
 }
@@ -57,6 +59,7 @@ impl StableArtifactContent for HostArtifactContent {
             .unwrap_or_else(|_| Box::new(std::io::empty()));
         stabby::boxed::Box::new(HostRead {
             inner: std::cell::RefCell::new(inner),
+            buf: std::cell::RefCell::new(vec![0u8; READ_CHUNK]),
         })
         .into()
     }
@@ -86,49 +89,42 @@ fn is_cycle(e: &anyhow::Error) -> bool {
     hcore::hmemoizer::downcast_chain_ref::<hplugin::error::CycleError>(e).is_some()
 }
 
+/// Reconstruct an `Addr` from the seam's parts — no `//pkg:name` parse.
+fn addr_from_stable(a: &StableAddr) -> Addr {
+    let args = a
+        .args
+        .iter()
+        .map(|arg| (arg.key.to_string(), arg.val.to_string()))
+        .collect();
+    Addr::new(
+        PkgBuf::from(a.package.to_string()),
+        a.name.to_string(),
+        args,
+    )
+}
+
 impl StableExecutor for HostExecutor {
-    extern "C" fn note_dep<'a>(&'a self, addr: SString) -> DynFuture<'a, NoteDepOutcome> {
-        stabby::boxed::Box::new(async move {
-            let parsed = match parse_addr(&addr) {
-                Ok(a) => a,
-                Err(e) => {
-                    return NoteDepOutcome {
-                        ok: false,
-                        cycle: false,
-                        message: format!("addr parse: {e}").into(),
-                    };
-                }
-            };
-            match self.inner.note_dep(&parsed).await {
-                Ok(()) => NoteDepOutcome {
-                    ok: true,
-                    cycle: false,
-                    message: SString::new(),
-                },
-                Err(e) => NoteDepOutcome {
-                    ok: false,
-                    cycle: is_cycle(&e),
-                    message: e.to_string().into(),
-                },
-            }
-        })
-        .into()
+    extern "C" fn note_dep(&self, addr: StableAddr) -> NoteDepOutcome {
+        let parsed = addr_from_stable(&addr);
+        // The engine's note_dep is a synchronous DepDag insert wrapped in a
+        // ready future; drive it to completion without boxing a stabby future.
+        match futures::executor::block_on(self.inner.note_dep(&parsed)) {
+            Ok(()) => NoteDepOutcome {
+                ok: true,
+                cycle: false,
+                message: SString::new(),
+            },
+            Err(e) => NoteDepOutcome {
+                ok: false,
+                cycle: is_cycle(&e),
+                message: e.to_string().into(),
+            },
+        }
     }
 
-    extern "C" fn result<'a>(&'a self, addr: SString) -> DynFuture<'a, ResultOutcome> {
+    extern "C" fn result<'a>(&'a self, addr: StableAddr) -> DynFuture<'a, ResultOutcome> {
         stabby::boxed::Box::new(async move {
-            let parsed = match parse_addr(&addr) {
-                Ok(a) => a,
-                Err(e) => {
-                    return ResultOutcome {
-                        ok: false,
-                        cycle: false,
-                        cancelled: false,
-                        message: format!("addr parse: {e}").into(),
-                        artifacts: SVec::new(),
-                    };
-                }
-            };
+            let parsed = addr_from_stable(&addr);
             match self.inner.result(&parsed).await {
                 Ok(eres) => {
                     // Hand each artifact across as a lazy streaming handle — the

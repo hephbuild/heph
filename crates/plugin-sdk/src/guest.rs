@@ -10,7 +10,8 @@ use hmodel::htmatcher::Matcher;
 use hplugin::eresult::{ArtifactMeta, EResult};
 use hplugin::provider::ProviderExecutor;
 use hplugin_stabby::abi::{
-    DynArtifact, DynExecutor, DynRead, StableArtifactContentDyn, StableExecutorDyn, StableReadDyn,
+    DynArtifact, DynExecutor, DynRead, StableAddr, StableArtifactContentDyn, StableExecutorDyn,
+    StableReadDyn,
 };
 use prost::Message;
 use std::io::Read;
@@ -27,10 +28,27 @@ impl GuestExecutor {
     }
 }
 
+/// Build the seam's [`StableAddr`] from an `Addr` — no `//pkg:name` format.
+fn stable_addr(a: &Addr) -> StableAddr {
+    StableAddr {
+        package: a.package.as_str().into(),
+        name: a.name.clone().into(),
+        args: a
+            .args
+            .iter()
+            .map(|(k, v)| hplugin_stabby::abi::StableArg {
+                key: k.clone().into(),
+                val: v.clone().into(),
+            })
+            .collect(),
+    }
+}
+
 impl ProviderExecutor for GuestExecutor {
     fn note_dep<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, Result<()>> {
+        // Synchronous stable call — no boxed future across the seam.
+        let r = self.exec.note_dep(stable_addr(addr));
         Box::pin(async move {
-            let r = self.exec.note_dep(addr.to_string().into()).await;
             if r.ok {
                 Ok(())
             } else if r.cycle {
@@ -46,7 +64,7 @@ impl ProviderExecutor for GuestExecutor {
 
     fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, Result<Arc<EResult>>> {
         Box::pin(async move {
-            let r = self.exec.result(addr.to_string().into()).await;
+            let r = self.exec.result(stable_addr(addr)).await;
             if r.ok {
                 let mut artifacts: Vec<Arc<dyn Content>> = Vec::with_capacity(r.artifacts.len());
                 let mut meta = Vec::with_capacity(r.artifacts.len());
