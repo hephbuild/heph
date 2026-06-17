@@ -251,7 +251,7 @@ fn load_dylib_plugins(
     let loaded = manifests
         .into_par_iter()
         .map(|(src, options_pb)| -> anyhow::Result<_> {
-            let dylib = resolve_manifest_dylib(&src, root, home_dir)?;
+            let dylib = resolve_manifest_dylib(&src, root)?;
             hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, &options_pb)
                 .with_context(|| format!("load plugin dylib {}", dylib.display()))
         })
@@ -283,6 +283,23 @@ fn load_dylib_plugins(
     }
 }
 
+/// Expand a leading `~` / `~/` to `$HOME` so config and manifest paths can point
+/// at the user-global plugin dir (`~/.heph/plugins/...`). A bare `~` or `~/rest`
+/// expands; `~user` and embedded `~` are left untouched. Returns the input
+/// unchanged when `HOME` is unset.
+#[cfg(unix)]
+fn expand_tilde(p: &str) -> std::path::PathBuf {
+    let rest = if p == "~" {
+        Some("")
+    } else {
+        p.strip_prefix("~/")
+    };
+    match (rest, std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => std::path::PathBuf::from(home).join(rest),
+        _ => std::path::PathBuf::from(p),
+    }
+}
+
 /// Resolve a plugin manifest source to the concrete dylib path for this host:
 /// load the manifest (local read or download), pick the artifact matching the
 /// host os/arch, then resolve that artifact (a local `path` sibling of the
@@ -291,11 +308,10 @@ fn load_dylib_plugins(
 fn resolve_manifest_dylib(
     src: &config_yaml::PluginIdentifier,
     root: &std::path::Path,
-    home_dir: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     let (manifest_bytes, manifest_dir) = match src {
         config_yaml::PluginIdentifier::Path(p) => {
-            let pb = std::path::PathBuf::from(p);
+            let pb = expand_tilde(p);
             let mp = if pb.is_absolute() { pb } else { root.join(pb) };
             let bytes = std::fs::read(&mp)
                 .with_context(|| format!("read plugin manifest {}", mp.display()))?;
@@ -306,13 +322,14 @@ fn resolve_manifest_dylib(
             (bytes, dir)
         }
         config_yaml::PluginIdentifier::Url(u) => {
-            let mp = download_plugin(u, home_dir)?;
+            // Manifest json is cached under ~/.heph/plugins alongside its artifacts.
+            let mp = download_plugin(u)?;
             let bytes = std::fs::read(&mp)
                 .with_context(|| format!("read downloaded plugin manifest {}", mp.display()))?;
             let dir = mp
                 .parent()
                 .map(|d| d.to_path_buf())
-                .unwrap_or_else(|| home_dir.to_path_buf());
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
             (bytes, dir)
         }
         config_yaml::PluginIdentifier::Builtin(_) => {
@@ -335,14 +352,14 @@ fn resolve_manifest_dylib(
         })?;
     match (&art.path, &art.url) {
         (Some(p), None) => {
-            let pb = std::path::PathBuf::from(p);
+            let pb = expand_tilde(p);
             Ok(if pb.is_absolute() {
                 pb
             } else {
                 manifest_dir.join(pb)
             })
         }
-        (None, Some(u)) => download_plugin(u, home_dir),
+        (None, Some(u)) => download_plugin(u),
         _ => anyhow::bail!(
             "plugin `{}` artifact for {os}/{arch} must set exactly one of `path`/`url`",
             manifest.name
@@ -421,14 +438,42 @@ fn substitute_os_arch(url: &str) -> String {
     url.replace("{os}", os).replace("{arch}", arch)
 }
 
-/// Download a plugin binary from `url_tmpl` (after `{os}`/`{arch}` substitution),
-/// cache it under `<home>/plugins/<os>-<arch>/`, make it executable, and return
-/// its path. A previously-downloaded binary is reused (no re-fetch).
+/// The user-global plugin download cache: `~/.heph/plugins/<os>-<arch>/`. Plugins
+/// are workspace-independent, so they're cached once per user (not per repo).
 #[cfg(unix)]
-fn download_plugin(
-    url_tmpl: &str,
-    home_dir: &std::path::Path,
-) -> anyhow::Result<std::path::PathBuf> {
+fn plugin_cache_dir() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate ~/.heph plugin cache"))?;
+    Ok(home.join(".heph").join("plugins").join(format!(
+        "{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )))
+}
+
+/// Wipe this host's plugin download cache (`~/.heph/plugins/<os>-<arch>/`) so the
+/// next resolve re-fetches. Used by `heph tool resolve-plugins --force`.
+#[cfg(unix)]
+pub fn clear_plugin_cache() -> anyhow::Result<()> {
+    let dir = plugin_cache_dir()?;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("clear plugin cache {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn clear_plugin_cache() -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Download a plugin file from `url_tmpl` (after `{os}`/`{arch}` substitution),
+/// cache it under `~/.heph/plugins/<os>-<arch>/`, make it executable, and return
+/// its path. A previously-downloaded file is reused (no re-fetch).
+#[cfg(unix)]
+fn download_plugin(url_tmpl: &str) -> anyhow::Result<std::path::PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
@@ -438,11 +483,7 @@ fn download_plugin(
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("plugin");
-    let dir = home_dir.join("plugins").join(format!(
-        "{}-{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    ));
+    let dir = plugin_cache_dir()?;
     let dest = dir.join(filename);
     if dest.exists() {
         return Ok(dest);
@@ -560,6 +601,29 @@ plugins:
         assert!(e.drivers_by_name.contains_key("exec"));
         assert!(e.drivers_by_name.contains_key("bash"));
         assert!(e.providers_by_name.contains_key("fs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_tilde_expands_home_prefix_only() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME");
+        assert_eq!(
+            expand_tilde("~/.heph/plugins/go.json"),
+            home.join(".heph/plugins/go.json")
+        );
+        assert_eq!(expand_tilde("~"), home);
+        // No leading `~/`: left untouched (absolute, relative, and `~user`).
+        assert_eq!(
+            expand_tilde("/abs/path"),
+            std::path::PathBuf::from("/abs/path")
+        );
+        assert_eq!(
+            expand_tilde("rel/path"),
+            std::path::PathBuf::from("rel/path")
+        );
+        assert_eq!(expand_tilde("~bob/x"), std::path::PathBuf::from("~bob/x"));
     }
 
     #[test]
