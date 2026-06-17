@@ -1,0 +1,31 @@
+[package]
+name = "plugin-stabby"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+# libloading must match the version stabby's `StabbyLibrary::get_stabbied`
+# extension trait is implemented for, or the method won't resolve on our handle.
+stabby = { version = "72.1.8", features = ["libloading"] }
+libloading = "0.9"
+anyhow = "1.0.102"
+futures = "0.3.32"
+hplugin = { package = "plugin", path = "../plugin", optional = true }
+hmodel = { package = "model", path = "../model", optional = true }
+hcore = { package = "core", path = "../core", optional = true }
+hdriver-support = { package = "driver-support", path = "../driver-support", optional = true }
+plugin-abi = { path = "../plugin-abi", features = ["convert"], optional = true }
+prost = { version = "0.14", optional = true }
+async-trait = { version = "0.1.89", optional = true }
+
+[features]
+# host: adapters from the engine's ProviderExecutor onto the stable ABI, plus
+# the libloading-based cdylib loader. The shared ABI contract (`abi`) is always
+# compiled (needs only stabby) so the guest SDK can depend on it feature-free.
+host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:plugin-abi", "dep:prost", "dep:async-trait"]
+
+[dev-dependencies]
+futures = "0.3.32"

@@ -6,9 +6,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 use crate::engine::config_yaml;
-use crate::{
-    engine, pluginbuildfile, pluginexec, plugingo, pluginhostbin, pluginnix, plugintextfile,
-};
+use crate::{engine, pluginbuildfile, pluginexec, pluginhostbin, pluginnix, plugintextfile};
 
 /// Builds the multi-thread runtime used by every command entry point.
 ///
@@ -97,49 +95,56 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_driver(|_| Box::new(plugintextfile::Driver))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
-    // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
-    e.register_provider_factory("buildfile", |init, opts| {
-        Ok(Box::new(
-            pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-            )?
-            .with_walker(init.walker.clone()),
-        ))
-    })?;
-    e.register_provider_factory("go", |init, opts| {
-        Ok(Box::new(plugingo::Provider::from_options(
-            init.root.to_path_buf(),
-            &init.skip_dirs,
-            &init.skip_globs,
-            opts,
-            init.walker.clone(),
-        )?))
-    })?;
+    // A name carrying a `dylib:` entry routes to an in-process loadable cdylib
+    // (the stable ABI, native speed) instead of the built-in in-process factory
+    // below, so skip the factory for those names.
+    let bin_names: std::collections::HashSet<&str> = file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .filter(|en| en.dylib.is_some())
+        .map(|en| en.name.as_str())
+        .collect();
 
-    e.register_managed_driver_factory("exec", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
-    })?;
-    e.register_managed_driver_factory("bash", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
-    })?;
-    e.register_managed_driver_factory("sh", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
-    })?;
-    e.register_managed_driver_factory("go_golist", |_init, opts| {
-        config_yaml::deny_unknown("go_golist driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
-    })?;
-    e.register_managed_driver_factory("go_embed", |_init, opts| {
-        config_yaml::deny_unknown("go_embed driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoEmbedDriver))
-    })?;
-    e.register_managed_driver_factory("go_testmain", |_init, opts| {
-        config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoTestmainDriver))
-    })?;
+    // Opt-in built-in factories — instantiated by `apply_config` if listed in
+    // the YAML and not overridden by a `bin:` entry.
+    if !bin_names.contains("buildfile") {
+        e.register_provider_factory("buildfile", |init, opts| {
+            Ok(Box::new(
+                pluginbuildfile::Provider::from_options(
+                    init.root.to_path_buf(),
+                    &init.skip_dirs,
+                    &init.skip_globs,
+                    opts,
+                )?
+                .with_walker(init.walker.clone()),
+            ))
+        })?;
+    }
+    // The go plugin is no longer a compiled-in built-in: it ships as a separate
+    // artifact loaded via `dylib:` (native speed) or spawned via `bin:`. A config
+    // entry named `go`/`go_*` without a transport therefore has no factory.
+    if !bin_names.contains("exec") {
+        e.register_managed_driver_factory("exec", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+        })?;
+    }
+    if !bin_names.contains("bash") {
+        e.register_managed_driver_factory("bash", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+        })?;
+    }
+    if !bin_names.contains("sh") {
+        e.register_managed_driver_factory("sh", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
+        })?;
+    }
+    drop(bin_names);
+
+    // Load + register every in-process loadable plugin declared via `dylib:`. One
+    // cdylib per distinct path serves a provider + its drivers (e.g. `go` plus the
+    // `go_*` drivers), loaded once behind the stable ABI at native speed.
+    register_dylib_plugins(&mut e, &root, &home_dir, &file)?;
 
     e.apply_config(&file.providers, &file.drivers)?;
 
@@ -200,6 +205,150 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
         tracing::error!("second ctrl-c, aborting");
         std::process::exit(130);
     });
+}
+
+/// Load + register every `dylib:` plugin. One cdylib per distinct path is loaded
+/// in-process behind the stable ABI (ABI-checked via stabby type reports), and the
+/// provider + drivers it exports are registered under their own names. The engine
+/// then drives them through its normal traits at native speed.
+#[cfg(unix)]
+fn register_dylib_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut paths: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for en in file.providers.iter().chain(file.drivers.iter()) {
+        if let Some(d) = &en.dylib {
+            paths.insert(resolve_artifact_path(d.resolve(&en.name)?, root, home_dir)?);
+        }
+    }
+
+    let root_str = root.to_string_lossy().into_owned();
+    for path in paths {
+        let (provider, drivers) = hplugin_stabby::load_stable::load(&path, &root_str)
+            .with_context(|| format!("load plugin dylib {}", path.display()))?;
+        if let Some(p) = provider {
+            let name = p.name().to_string();
+            e.register_provider_factory(&name, move |_init, _opts| Ok(Box::new(p.clone())))?;
+        }
+        for (name, drv) in drivers {
+            e.register_managed_driver_factory(&name, move |_init, _opts| {
+                Ok(Box::new(drv.clone()))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn register_dylib_plugins(
+    _e: &mut engine::Engine,
+    _root: &std::path::Path,
+    _home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    if file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .any(|en| en.dylib.is_some())
+    {
+        anyhow::bail!("`dylib:` plugins are only supported on unix");
+    }
+    Ok(())
+}
+
+/// Resolve a loadable-artifact source to a concrete file path: a `path` is taken
+/// relative to the workspace `root`; a `url` is downloaded + cached (same fetch
+/// path as `bin:` urls).
+#[cfg(unix)]
+fn resolve_artifact_path(
+    src: config_yaml::ArtifactSource,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(match src {
+        config_yaml::ArtifactSource::Path(p) => root.join(p),
+        config_yaml::ArtifactSource::Url(u) => download_plugin(&u, home_dir)?,
+    })
+}
+
+/// Substitute `{os}`/`{arch}` in a plugin download URL with the values used in
+/// published artifact names: os `linux`/`darwin` and arch `amd64`/`arm64`
+/// (mapped from the rust `std::env::consts` spellings `macos` and
+/// `x86_64`/`aarch64`). Unmapped hosts fall back to the raw consts value.
+fn substitute_os_arch(url: &str) -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    url.replace("{os}", os).replace("{arch}", arch)
+}
+
+/// Download a plugin binary from `url_tmpl` (after `{os}`/`{arch}` substitution),
+/// cache it under `<home>/plugins/<os>-<arch>/`, make it executable, and return
+/// its path. A previously-downloaded binary is reused (no re-fetch).
+#[cfg(unix)]
+fn download_plugin(
+    url_tmpl: &str,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let url = substitute_os_arch(url_tmpl);
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("plugin");
+    let dir = home_dir.join("plugins").join(format!(
+        "{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    let dest = dir.join(filename);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+
+    // reqwest::blocking spins up its own runtime; run it on a dedicated std
+    // thread so it is safe to call from within the async runtime new_engine runs
+    // on (a nested block_on would otherwise panic).
+    let url_for_thread = url.clone();
+    let bytes = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+        let resp = reqwest::blocking::get(&url_for_thread)
+            .with_context(|| format!("GET {url_for_thread}"))?
+            .error_for_status()
+            .with_context(|| format!("GET {url_for_thread}"))?;
+        Ok(resp.bytes()?.to_vec())
+    })
+    .join()
+    .map_err(|_e| anyhow::anyhow!("plugin download thread panicked"))??;
+
+    // Write to a temp path then rename so a partial download is never seen as a
+    // usable binary by a concurrent run.
+    let tmp = dir.join(format!(".{filename}.download"));
+    {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &dest)
+        .with_context(|| format!("install plugin to {}", dest.display()))?;
+    Ok(dest)
 }
 
 #[cfg(test)]
@@ -396,5 +545,15 @@ drivers:
             await_cancelled(rs.ctoken()).await,
             "trigger after resume must cancel"
         );
+    }
+
+    #[test]
+    fn substitute_os_arch_replaces_placeholders() {
+        let out = super::substitute_os_arch("https://x/heph-{os}-{arch}.bin");
+        assert!(!out.contains("{os}") && !out.contains("{arch}"), "{out}");
+        // arch uses the published spelling (amd64/arm64), never the rust consts.
+        assert!(!out.contains("x86_64") && !out.contains("aarch64"), "{out}");
+        // os uses darwin, never the rust `macos` spelling.
+        assert!(!out.contains("macos"), "{out}");
     }
 }

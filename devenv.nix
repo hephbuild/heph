@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p walk -p proc -p model -p sandboxfuse -p plugin -p builtins -p plugin-buildfile -p driver-support -p plugin-exec -p plugin-nix -p plugin-query -p plugin-go -p telemetry -p tui -p lock -p engine";
+  qualityCrates = "-p heph -p e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p plugin-exec -p plugin-nix -p plugin-query -p plugin-go -p telemetry -p tui -p lock -p engine";
 in
 {
   # https://devenv.sh/basics/
@@ -60,9 +60,38 @@ in
     go run . -seed 42 -out $DEVENV_ROOT/example/go/large -module example.com/large -pkgs 500 -max-depth 7
     cd $DEVENV_ROOT/example/go/large && go mod tidy
   '';
-  scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
+  # Set up the example workspace end to end: regenerate the large go repo and
+  # build the go plugin as a loadable cdylib into example/.heph3/heph-go-plugin.dylib,
+  # which example/.hephconfig2 loads in-process via `dylib: { path: ... }` behind the
+  # stable ABI (native speed — see ai-docs/PERFORMANCE.md). The cdylib basename is
+  # platform-specific (lib*.dylib on macOS, lib*.so on Linux).
+  scripts.gen-example.exec = ''
+    gen
+    gen-go-large
+    cargo build --release -p plugin-go-cdylib
+    if [ "$(uname -s)" = "Darwin" ]; then
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.dylib"
+      # Rewrite the nix-store libiconv load command to /usr/lib so the loaded
+      # dylib keeps resolving after the store path is GC'd (same as the CLI).
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
+    else
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.so"
+    fi
+    dest="$DEVENV_ROOT/example/.heph3/heph-go-plugin.dylib"
+    mkdir -p "$(dirname "$dest")"
+    # Atomic replace (new inode) so a running macOS process keeps its signature.
+    cp "$lib" "$dest.new"
+    mv -f "$dest.new" "$dest"
+  '';
+  # Lint default-feature code, then again with every feature enabled (so
+  # feature-gated code — the stabby host loader — is covered too), then fmt-check
+  # all hand-written crates (qualityCrates; generated gen/proto is excluded).
+  scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> clippy --all-features' && cargo clippy --all-targets --all-features --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
-  scripts.tst.exec = "cargo test --locked --all";
+  # Test everything. The default pass covers all crates with default features; the
+  # targeted pass exercises the stabby host loader + adapters (gated behind the
+  # `host` feature, off in plugin-stabby's default build).
+  scripts.tst.exec = "cargo test --locked --all && cargo test --locked -p plugin-stabby --features host";
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';

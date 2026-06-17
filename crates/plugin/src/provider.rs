@@ -96,6 +96,45 @@ pub trait ProviderExecutor: Send + Sync {
         m: &'a Matcher,
         extra_skip: &'a [String],
     ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
+
+    /// Register a `parent → addr` dependency edge without resolving `addr`'s
+    /// result. The cache-hit fast path: a provider that already has `addr`'s
+    /// derived data still must register the edge (the synchronous cycle check),
+    /// but needn't pay for a full `result`. Returns a [`crate::error::CycleError`]
+    /// (in the error chain) when the edge closes a cycle.
+    ///
+    /// Default falls back to `result` (correct, just not cheap); the engine
+    /// overrides it with a direct edge insert.
+    fn note_dep<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move { self.result(addr).await.map(|_| ()) })
+    }
+}
+
+/// The [`ProviderExecutor`] callback surface, addressed by request scope id
+/// instead of carrying the executor inline. Used to route a plugin's callbacks
+/// back to the right per-request executor over a transport boundary where the
+/// executor itself cannot cross (out-of-process, or a dylib): the host registers
+/// each `get`'s executor under a scope id, the plugin's callbacks carry that id,
+/// and this trait dispatches them. In-process the implementation is a direct
+/// call into the engine executor (no serialization); across a cdylib it is the
+/// stable-ABI mirror.
+pub trait ScopedExecutor: Send + Sync {
+    fn result<'a>(
+        &'a self,
+        request_id: &'a str,
+        addr: &'a Addr,
+    ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>>;
+    fn note_dep<'a>(
+        &'a self,
+        request_id: &'a str,
+        addr: &'a Addr,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
+    fn query<'a>(
+        &'a self,
+        request_id: &'a str,
+        m: &'a Matcher,
+        extra_skip: &'a [String],
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
 }
 
 pub struct GetRequest {

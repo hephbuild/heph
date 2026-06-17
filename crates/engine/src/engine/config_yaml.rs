@@ -336,6 +336,48 @@ pub struct PluginEntry {
     pub name: String,
     #[serde(default)]
     pub options: Options,
+    /// In-process loadable-plugin cdylib spec (stable ABI, native speed). A
+    /// separately-built, hot-swappable artifact loaded in-process. When absent,
+    /// the name resolves to an in-process built-in factory.
+    #[serde(default)]
+    pub dylib: Option<ArtifactConfig>,
+}
+
+/// How to locate a loadable in-process plugin cdylib. Exactly one of
+/// `path`/`url` must be set:
+/// - `path`: a file on disk, relative to the workspace root.
+/// - `url`: a URL with `{os}`/`{arch}` placeholders; downloaded + cached.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ArtifactConfig {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// The resolved, mutually-exclusive source of an [`ArtifactConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactSource {
+    /// A path relative to the workspace root.
+    Path(String),
+    /// A `{os}`/`{arch}` URL to download + cache.
+    Url(String),
+}
+
+impl ArtifactConfig {
+    /// Validate that exactly one of `path`/`url` is set and return it. `ctx` names
+    /// the entry for error messages.
+    pub fn resolve(&self, ctx: &str) -> anyhow::Result<ArtifactSource> {
+        match (&self.path, &self.url) {
+            (Some(p), None) => Ok(ArtifactSource::Path(p.clone())),
+            (None, Some(u)) => Ok(ArtifactSource::Url(u.clone())),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("artifact for `{ctx}` sets both `path` and `url`; set exactly one")
+            }
+            (None, None) => anyhow::bail!("artifact for `{ctx}` sets neither `path` nor `url`"),
+        }
+    }
 }
 
 /// Canonical filename of the per-workspace config, located at the repo root.
@@ -957,6 +999,81 @@ caches:
         assert_eq!(r.uri, "s3://b/p");
         assert!(r.read);
         assert!(!r.write);
+    }
+
+    #[test]
+    fn parses_dylib_path_and_url() {
+        let yaml = r#"
+providers:
+  - name: go
+    dylib:
+      path: .heph3/heph-go-plugin.dylib
+drivers:
+  - name: rust
+    dylib:
+      url: https://example.com/rust-{os}-{arch}.dylib
+"#;
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(
+            cfg.providers[0]
+                .dylib
+                .as_ref()
+                .unwrap()
+                .resolve("go")
+                .unwrap(),
+            ArtifactSource::Path(".heph3/heph-go-plugin.dylib".into())
+        );
+        assert_eq!(
+            cfg.drivers[0]
+                .dylib
+                .as_ref()
+                .unwrap()
+                .resolve("rust")
+                .unwrap(),
+            ArtifactSource::Url("https://example.com/rust-{os}-{arch}.dylib".into())
+        );
+    }
+
+    #[test]
+    fn dylib_absent_is_in_process() {
+        let cfg: ConfigYaml =
+            serde_yaml::from_str("providers:\n  - name: buildfile\n").expect("parse");
+        assert!(cfg.providers[0].dylib.is_none());
+    }
+
+    #[test]
+    fn dylib_rejects_multiple_sources() {
+        let cfg: ConfigYaml = serde_yaml::from_str(
+            "drivers:\n  - name: x\n    dylib:\n      path: /a\n      url: http://b\n",
+        )
+        .expect("parse");
+        let err = cfg.drivers[0]
+            .dylib
+            .as_ref()
+            .unwrap()
+            .resolve("x")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn dylib_rejects_no_source() {
+        let cfg: ConfigYaml =
+            serde_yaml::from_str("drivers:\n  - name: x\n    dylib: {}\n").expect("parse");
+        let err = cfg.drivers[0]
+            .dylib
+            .as_ref()
+            .unwrap()
+            .resolve("x")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("neither"), "{err}");
+    }
+
+    #[test]
+    fn dylib_rejects_unknown_field() {
+        let yaml = "drivers:\n  - name: x\n    dylib:\n      bogus: 1\n";
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

@@ -33,7 +33,7 @@ struct GoEmbedSpec {
     out: HashMap<String, Vec<String>>,
 }
 
-#[derive(Clone, PartialEq, Debug, serde::Serialize, SpecEnum)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize, SpecEnum)]
 enum EmbedVariant {
     Embed,
     /// embed_patterns ∪ test_embed_patterns / embed_files ∪ test_embed_files —
@@ -57,7 +57,7 @@ impl Hash for EmbedVariant {
 /// (paths, file resolution semantics) changes.
 const GO_EMBED_FORMAT_VERSION: u32 = 5;
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct GoEmbedDef {
     variant: EmbedVariant,
     golist_origin_id: String,
@@ -191,7 +191,7 @@ impl ManagedDriver for GoEmbedDriver {
         req: ManagedRunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let def = req.request.target.def::<GoEmbedDef>();
+        let def = req.request.target.def_de::<GoEmbedDef>();
 
         // Find package.bin from the golist input
         let managed = req

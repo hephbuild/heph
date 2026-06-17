@@ -1,0 +1,31 @@
+[package]
+name = "plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hplugin = { package = "plugin", path = "../plugin" }
+hmodel = { package = "model", path = "../model" }
+hcore = { package = "core", path = "../core" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+# Shared ABI contract (the `abi` module: types crossing the cdylib boundary).
+# default-features = false → just the contract, not the host loader/adapters.
+hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", default-features = false }
+plugin-abi = { path = "../plugin-abi", features = ["convert"] }
+stabby = "72.1.8"
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+futures = "0.3.32"
+prost = "0.14"
+# A loaded cdylib owns its own tokio runtime — its statically-linked tokio is
+# distinct from the host's, so async work that touches the reactor (e.g. plugin-go
+# shelling out to `go list` in a driver `run`) must execute on the cdylib's runtime.
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+# The guest↔host round-trip test exercises the host adapter too.
+hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }
+futures = "0.3.32"
