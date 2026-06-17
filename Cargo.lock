@@ -3492,7 +3492,6 @@ dependencies = [
  "htspec-derive",
  "itertools 0.14.0",
  "model",
- "sandboxfuse",
  "serde",
  "serde_json",
  "serde_yaml",

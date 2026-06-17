@@ -31,7 +31,7 @@ impl Engine {
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
         Option<crate::engine::sandbox_cleaner::SandboxCleanupJob>,
-        Vec<hsandboxfuse::SlotGuard>,
+        Vec<hplugin::driver::SandboxGuard>,
     )> {
         let driver = self
             .drivers_by_name

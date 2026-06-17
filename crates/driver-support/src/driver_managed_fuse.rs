@@ -6,7 +6,7 @@ use anyhow::Context;
 use hcore::hartifactcontent;
 use hcore::hartifactcontent::tar_index::TarIndex;
 use hcore::hasync::Cancellable;
-use hplugin::driver::{RunInput, RunRequest, RunResponse};
+use hplugin::driver::{RunInput, RunRequest, RunResponse, SandboxGuard};
 use hsandboxfuse as sandboxfuse;
 use std::collections::BTreeMap;
 use std::fs;
@@ -142,11 +142,21 @@ impl ManagedDriverFuse {
         )
         .await?;
 
+        // Type-erase the slot guards into the contract's opaque `SandboxGuard`
+        // so `hplugin` need not depend on `sandboxfuse`; the engine only holds
+        // and drops them (drop deregisters the slot).
+        let erase = |guards: Vec<sandboxfuse::SlotGuard>| -> Vec<SandboxGuard> {
+            guards
+                .into_iter()
+                .map(|g| Box::new(g) as SandboxGuard)
+                .collect()
+        };
+
         if shell {
             return Ok(RunResponse {
                 artifacts: vec![],
                 sandbox_cleanup: sandbox_cleanup.take(),
-                fuse_slot_guards: std::mem::take(&mut slot_guards),
+                fuse_slot_guards: erase(std::mem::take(&mut slot_guards)),
             });
         }
 
@@ -155,7 +165,7 @@ impl ManagedDriverFuse {
         Ok(RunResponse {
             artifacts: res.artifacts,
             sandbox_cleanup: sandbox_cleanup.take(),
-            fuse_slot_guards: slot_guards,
+            fuse_slot_guards: erase(slot_guards),
         })
     }
 }

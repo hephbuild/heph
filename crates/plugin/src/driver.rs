@@ -877,6 +877,14 @@ pub struct RunRequest<'a, 'io> {
 /// `RunResponse` carries it.
 pub type SandboxCleanupJob = Box<dyn FnOnce() -> std::io::Result<()> + Send + 'static>;
 
+/// An opaque, type-erased RAII guard a driver returns for the engine to hold and
+/// drop. The contract only ever holds and drops these (drop deregisters the
+/// resource); it never inspects them — so the concrete type (e.g. the FUSE
+/// driver's slot guard) stays in the driver crate, and the contract does NOT
+/// link the FUSE implementation. Erasing it here is what keeps `plugin` (and the
+/// whole contract layer above it) free of the `sandboxfuse`/`fuser`/libfuse edge.
+pub type SandboxGuard = Box<dyn std::any::Any + Send + 'static>;
+
 #[derive(Default)]
 pub struct RunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
@@ -887,12 +895,13 @@ pub struct RunResponse {
     /// to `sandbox_cleaner::enqueue` after `cache_locally` finishes,
     /// so the cleaner thread never has to branch on FUSE vs OS.
     pub sandbox_cleanup: Option<crate::driver::SandboxCleanupJob>,
-    /// FUSE slot guards held open until the result lifecycle ends
-    /// (alongside the cleanup `defer!` in result.rs). Dropping a guard
-    /// deregisters the slot from the shared `LayeredFs`. Result.rs
-    /// holds them across `cache_locally` and drops in the same defer
-    /// that enqueues the sandbox-dir cleanup.
-    pub fuse_slot_guards: Vec<hsandboxfuse::SlotGuard>,
+    /// Opaque sandbox guards (the FUSE driver's slot guards) held open until the
+    /// result lifecycle ends, alongside the cleanup `defer!` in result.rs.
+    /// Dropping a guard deregisters its slot from the shared `LayeredFs`.
+    /// Result.rs holds them across `cache_locally` and drops them in the same
+    /// defer that enqueues the sandbox-dir cleanup. Type-erased ([`SandboxGuard`])
+    /// so the contract does not depend on the FUSE implementation.
+    pub fuse_slot_guards: Vec<SandboxGuard>,
 }
 
 /// One config field a driver accepts in a `target(...)` call, with its type and
