@@ -238,6 +238,14 @@ jobs:
     outputs:
       release_url: ${{ steps.create_release.outputs.url }}
     steps:
+      # Checkout brings tools/pluginmanifest (the manifest generator); the built
+      # artifacts download into dist/ alongside it.
+      - name: Checkout
+        uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
@@ -250,25 +258,17 @@ jobs:
       - name: List artifacts
         run: ls -lahR dist
 
-      # Build the go plugin distribution manifest from the per-os/arch cdylibs that
-      # were uploaded: one entry per artifact, its `url` the release-asset URL the
-      # manifest is published alongside (so `plugins: - { url: .../heph-go-plugin.json }`
-      # resolves the right dylib for the host).
+      # Build the go plugin distribution manifest from the per-os/arch cdylibs in
+      # dist/ — one entry per artifact, its `url` the release-asset URL it's
+      # published alongside (so `plugins: - { identifier: { url: .../heph-go-plugin.json } }`
+      # resolves the right dylib for the host). JSON via tools/pluginmanifest.
       - name: Generate go plugin manifest
         run: |
           VERSION="${{needs.gen.outputs.version}}"
           BASE="https://github.com/hephbuild/heph-artifacts-v1/releases/download/$VERSION"
-          arts=""
-          for f in dist/heph-go-plugin_*.dylib; do
-            [ -e "$f" ] || continue
-            bn=$(basename "$f")
-            rest=${bn#heph-go-plugin_}; rest=${rest%.dylib}   # <os>_<arch>
-            os=${rest%_*}; arch=${rest#*_}
-            [ -n "$arts" ] && arts="$arts,"
-            arts="$arts{\"os\":\"$os\",\"arch\":\"$arch\",\"url\":\"$BASE/$bn\"}"
-          done
-          printf '{"name":"go","version":"%s","artifacts":[%s]}\n' "$VERSION" "$arts" \
-            > dist/heph-go-plugin.json
+          ( cd tools/pluginmanifest && go run . -name go -version "$VERSION" \
+              -prefix heph-go-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
+              -out "$GITHUB_WORKSPACE/dist/heph-go-plugin.json" )
           cat dist/heph-go-plugin.json
 
       - name: Create Release in artifacts repo

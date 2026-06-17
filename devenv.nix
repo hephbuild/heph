@@ -83,14 +83,12 @@ in
     cp "$lib" "$dest.new"
     mv -f "$dest.new" "$dest"
     # Write the local plugin manifest the example config points at (`path:
-    # .heph3/heph-go-plugin.json`). Its one artifact entry points at the dylib
-    # sibling above for this host (os/arch in published spelling).
-    case "$(uname -s)" in Darwin) os=darwin ;; *) os=linux ;; esac
-    case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; *) arch=amd64 ;; esac
-    cat > "$DEVENV_ROOT/example/.heph3/heph-go-plugin.json" <<JSON
-    { "name": "go", "version": "dev",
-      "artifacts": [ { "os": "$os", "arch": "$arch", "path": "heph-go-plugin.dylib" } ] }
-JSON
+    # .heph3/heph-go-plugin.json`): one artifact for this host pointing at the
+    # dylib sibling above. (tools/pluginmanifest emits the JSON — host os/arch
+    # from Go's runtime, no shell guessing.)
+    cd "$DEVENV_ROOT/tools/pluginmanifest"
+    go run . -name go -host-path heph-go-plugin.dylib \
+      -out "$DEVENV_ROOT/example/.heph3/heph-go-plugin.json"
   '';
   # Lint default-feature code, then again with every feature enabled (so
   # feature-gated code — the stabby host loader — is covered too), then fmt-check
