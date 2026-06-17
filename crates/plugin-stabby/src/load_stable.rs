@@ -46,7 +46,11 @@ pub type LoadedComponents = (
 /// (different stabby version, or drifted boundary types) is a hard error. The
 /// `Library` is intentionally leaked: the returned trait objects' vtables live in
 /// the dylib's code, which must stay mapped for the process lifetime.
-pub fn load(path: &std::path::Path, root: &str) -> anyhow::Result<LoadedComponents> {
+pub fn load(
+    path: &std::path::Path,
+    root: &str,
+    options: &[u8],
+) -> anyhow::Result<LoadedComponents> {
     use crate::abi::PluginComponents;
     use anyhow::Context;
     use stabby::libloading::StabbyLibrary;
@@ -62,7 +66,10 @@ pub fn load(path: &std::path::Path, root: &str) -> anyhow::Result<LoadedComponen
         // `CreateFn` before returning it; calling it is then ABI-sound.
         let create = unsafe { lib.get_stabbied::<CreateFn>(CREATE_SYMBOL) }
             .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
-        create(CreateConfig { root: root.into() })
+        create(CreateConfig {
+            root: root.into(),
+            options: stabby::vec::Vec::from(options),
+        })
     };
     // Keep the dylib mapped for the process lifetime (the returned trait objects'
     // vtables point into its code); leaking the handle is intentional.

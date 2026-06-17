@@ -34,16 +34,18 @@ pub extern "C" fn heph_plugin_create(cfg: CreateConfig) -> PluginComponents {
 
 fn build(cfg: CreateConfig) -> anyhow::Result<PluginComponents> {
     let root = PathBuf::from(cfg.root.to_string());
-    let go_bin =
-        std::env::var("HEPH_PLUGIN_GO_BIN").unwrap_or_else(|_| "//@heph/bin:go".to_string());
-    let walk_db = std::env::var_os("HEPH_PLUGIN_GO_WALK_DB")
-        .map(PathBuf::from)
+
+    // Tunables come from the plugin's `options:` map (config yaml), decoded the
+    // same way an in-process plugin reads its options.
+    let options = plugin_sdk::stabby::options_from_pb_bytes(&cfg.options[..])?;
+    let go_bin = hplugin::config::decode_opt::<String>(&options, "go", "go_bin")?
+        .unwrap_or_else(|| "//@heph/bin:go".to_string());
+    let walk_db = hplugin::config::decode_opt::<PathBuf>(&options, "go", "walk_db")?
         .unwrap_or_else(|| root.join(".heph-plugin-go-fswalk.db"));
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
-    let opts = hplugin::config::Options::new();
     let provider: Arc<dyn hplugin::provider::Provider> =
-        Arc::new(Provider::from_options(root, &[], &[], &opts, walker)?);
+        Arc::new(Provider::from_options(root, &[], &[], &options, walker)?);
 
     let mut drivers = stabby::vec::Vec::new();
     let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::new(go_bin));

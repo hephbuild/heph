@@ -95,10 +95,10 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_driver(|_| Box::new(plugintextfile::Driver))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
-    // Opt-in built-in factories — instantiated by `apply_config` only if the YAML
-    // lists their name. The go plugin is no longer compiled in: it ships as a
-    // separate cdylib loaded via `dylib:` (below), under its own `go`/`go_*` names
-    // that don't collide with these built-ins.
+    // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
+    // <name> }` entry selects them. The go plugin is no longer compiled in: it
+    // ships as a separate cdylib loaded from a `path:`/`url:` manifest entry,
+    // under its own `go`/`go_*` names.
     e.register_provider_factory("buildfile", |init, opts| {
         Ok(Box::new(
             pluginbuildfile::Provider::from_options(
@@ -120,12 +120,10 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
     })?;
 
-    // Load + register every in-process loadable plugin declared via `dylib:`. One
-    // cdylib per distinct path serves a provider + its drivers (e.g. `go` plus the
-    // `go_*` drivers), loaded once behind the stable ABI at native speed.
-    register_dylib_plugins(&mut e, &root, &home_dir, &file)?;
-
-    e.apply_config(&file.providers, &file.drivers)?;
+    // Apply every `plugins:` entry: a `builtin:` instantiates the matching
+    // factory above; a `path:`/`url:` resolves a manifest, loads the cdylib, and
+    // registers the provider + drivers it exports.
+    register_plugins(&mut e, &root, &home_dir, &file)?;
 
     let engine = Arc::new(e);
 
@@ -186,104 +184,184 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
     });
 }
 
-/// Load + register every `dylib:` plugin. One cdylib per distinct path is loaded
-/// in-process behind the stable ABI (ABI-checked via stabby type reports), and the
-/// provider + drivers it exports are registered under their own names. The engine
-/// then drives them through its normal traits at native speed.
-#[cfg(unix)]
-fn register_dylib_plugins(
+/// Apply every `plugins:` entry. `builtin:` entries instantiate the matching
+/// in-process factory; `path:`/`url:` entries resolve a `*-plugin.json` manifest,
+/// load the cdylib it names for this host, and register the provider + drivers it
+/// exports (directly — the plugin self-describes its names via `config()`).
+fn register_plugins(
     e: &mut engine::Engine,
     root: &std::path::Path,
     home_dir: &std::path::Path,
     file: &config_yaml::ConfigYaml,
 ) -> anyhow::Result<()> {
-    use rayon::prelude::*;
-    use std::collections::HashSet;
+    let mut manifests: Vec<(config_yaml::PluginSource, Vec<u8>)> = Vec::new();
+    for spec in &file.plugins {
+        match spec.resolve()? {
+            config_yaml::PluginSource::Builtin(name) => e
+                .apply_builtin(&name, &spec.options)
+                .with_context(|| format!("apply builtin plugin `{name}`"))?,
+            // Encode options once (pb::Value bytes) for the cdylib's create entry.
+            other => manifests.push((
+                other,
+                hplugin_abi::convert::options_to_pb_bytes(&spec.options),
+            )),
+        }
+    }
+    load_dylib_plugins(e, root, home_dir, manifests)
+}
 
-    // Distinct dylib sources: a provider and its drivers usually all point at the
-    // same artifact, so dedup to load each cdylib once.
-    let mut seen: HashSet<String> = HashSet::new();
-    let sources: Vec<config_yaml::ArtifactSource> = file
-        .providers
-        .iter()
-        .chain(file.drivers.iter())
-        .filter_map(|en| en.dylib.as_ref().map(|d| d.resolve(&en.name)))
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|s| {
-            let key = match s {
-                config_yaml::ArtifactSource::Path(p) => format!("p:{p}"),
-                config_yaml::ArtifactSource::Url(u) => format!("u:{u}"),
-            };
-            seen.insert(key)
-        })
-        .collect();
-    if sources.is_empty() {
+/// One plugin distribution manifest (`*-plugin.json`): a name + the dylib to load
+/// per os/arch.
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+struct PluginManifest {
+    name: String,
+    #[serde(default)]
+    artifacts: Vec<ManifestArtifact>,
+}
+
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+struct ManifestArtifact {
+    os: String,
+    arch: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Resolve each manifest to a host dylib, load it (parallel — loading constructs
+/// the plugin, which isn't free), and register its exported components directly.
+#[cfg(unix)]
+fn load_dylib_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    manifests: Vec<(config_yaml::PluginSource, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    use rayon::prelude::*;
+
+    if manifests.is_empty() {
         return Ok(());
     }
-
-    // Resolve (downloading `url` artifacts, each under a cross-process file lock)
-    // and load each cdylib in parallel — independent work, and loading constructs
-    // the plugin (e.g. the go provider's walker), which isn't free.
     let root_str = root.to_string_lossy().into_owned();
-    let loaded = sources
+    let loaded = manifests
         .into_par_iter()
-        .map(|src| -> anyhow::Result<_> {
-            let path = resolve_artifact_path(src, root, home_dir)?;
-            hplugin_stabby::load_stable::load(&path, &root_str)
-                .with_context(|| format!("load plugin dylib {}", path.display()))
+        .map(|(src, options_pb)| -> anyhow::Result<_> {
+            let dylib = resolve_manifest_dylib(&src, root, home_dir)?;
+            hplugin_stabby::load_stable::load(&dylib, &root_str, &options_pb)
+                .with_context(|| format!("load plugin dylib {}", dylib.display()))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Engine mutation is single-threaded; register the loaded components in order.
     for (provider, drivers) in loaded {
         if let Some(p) = provider {
-            let name = p.name().to_string();
-            e.register_provider_factory(&name, move |_init, _opts| Ok(Box::new(p.clone())))?;
+            e.register_provider(|_| Box::new(p))?;
         }
-        for (name, drv) in drivers {
-            e.register_managed_driver_factory(&name, move |_init, _opts| {
-                Ok(Box::new(drv.clone()))
-            })?;
+        for (_name, drv) in drivers {
+            e.register_managed_driver(|_| Box::new(drv))?;
         }
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn register_dylib_plugins(
+fn load_dylib_plugins(
     _e: &mut engine::Engine,
     _root: &std::path::Path,
     _home_dir: &std::path::Path,
-    file: &config_yaml::ConfigYaml,
+    manifests: Vec<(config_yaml::PluginSource, Vec<u8>)>,
 ) -> anyhow::Result<()> {
-    if file
-        .providers
-        .iter()
-        .chain(file.drivers.iter())
-        .any(|en| en.dylib.is_some())
-    {
-        anyhow::bail!("`dylib:` plugins are only supported on unix");
+    if manifests.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("`path:`/`url:` (cdylib) plugins are only supported on unix")
     }
-    Ok(())
 }
 
-/// Resolve a loadable-artifact source to a concrete file path: an absolute `path`
-/// is used as-is, a relative one is taken against the workspace `root`; a `url` is
-/// downloaded + cached.
+/// Resolve a plugin manifest source to the concrete dylib path for this host:
+/// load the manifest (local read or download), pick the artifact matching the
+/// host os/arch, then resolve that artifact (a local `path` sibling of the
+/// manifest, or a `url` to download + cache).
 #[cfg(unix)]
-fn resolve_artifact_path(
-    src: config_yaml::ArtifactSource,
+fn resolve_manifest_dylib(
+    src: &config_yaml::PluginSource,
     root: &std::path::Path,
     home_dir: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
-    Ok(match src {
-        config_yaml::ArtifactSource::Path(p) => {
-            let p = std::path::PathBuf::from(p);
-            if p.is_absolute() { p } else { root.join(p) }
+    let (manifest_bytes, manifest_dir) = match src {
+        config_yaml::PluginSource::ManifestPath(p) => {
+            let pb = std::path::PathBuf::from(p);
+            let mp = if pb.is_absolute() { pb } else { root.join(pb) };
+            let bytes = std::fs::read(&mp)
+                .with_context(|| format!("read plugin manifest {}", mp.display()))?;
+            let dir = mp
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| root.to_path_buf());
+            (bytes, dir)
         }
-        config_yaml::ArtifactSource::Url(u) => download_plugin(&u, home_dir)?,
-    })
+        config_yaml::PluginSource::ManifestUrl(u) => {
+            let mp = download_plugin(u, home_dir)?;
+            let bytes = std::fs::read(&mp)
+                .with_context(|| format!("read downloaded plugin manifest {}", mp.display()))?;
+            let dir = mp
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| home_dir.to_path_buf());
+            (bytes, dir)
+        }
+        config_yaml::PluginSource::Builtin(_) => {
+            anyhow::bail!("internal: builtin plugin reached manifest resolution")
+        }
+    };
+
+    let manifest: PluginManifest =
+        serde_json::from_slice(&manifest_bytes).context("parse plugin manifest json")?;
+    let (os, arch) = host_os_arch();
+    let art = manifest
+        .artifacts
+        .iter()
+        .find(|a| a.os == os && a.arch == arch)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "plugin `{}` has no artifact for this host ({os}/{arch})",
+                manifest.name
+            )
+        })?;
+    match (&art.path, &art.url) {
+        (Some(p), None) => {
+            let pb = std::path::PathBuf::from(p);
+            Ok(if pb.is_absolute() {
+                pb
+            } else {
+                manifest_dir.join(pb)
+            })
+        }
+        (None, Some(u)) => download_plugin(u, home_dir),
+        _ => anyhow::bail!(
+            "plugin `{}` artifact for {os}/{arch} must set exactly one of `path`/`url`",
+            manifest.name
+        ),
+    }
+}
+
+/// Host os/arch in the published-artifact spelling (`darwin`/`linux`,
+/// `amd64`/`arm64`), matching the manifest's `artifacts[].{os,arch}`.
+#[cfg(unix)]
+fn host_os_arch() -> (String, String) {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    (os.to_string(), arch.to_string())
 }
 
 /// An exclusive, advisory, cross-process file lock (`flock(2)`), released on drop.
@@ -453,20 +531,27 @@ mod tests {
             Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
         })?;
 
-        e.apply_config(&file.providers, &file.drivers)?;
+        // The helper exercises built-in plugins only (no cdylib loading).
+        for spec in &file.plugins {
+            match spec.resolve()? {
+                config_yaml::PluginSource::Builtin(name) => {
+                    e.apply_builtin(&name, &spec.options)?
+                }
+                _ => anyhow::bail!("test helper supports only `builtin:` plugins"),
+            }
+        }
         Ok((dir, e))
     }
 
     #[test]
-    fn applies_listed_providers_and_drivers() {
+    fn applies_listed_builtins() {
         let yaml = r#"
-providers:
-  - name: buildfile
+plugins:
+  - builtin: buildfile
     options:
       patterns: [BUILD]
-drivers:
-  - name: exec
-  - name: bash
+  - builtin: exec
+  - builtin: bash
 "#;
         let (_dir, e) = build_engine_from_yaml(yaml).expect("engine");
         assert!(e.providers_by_name.contains_key("buildfile"));
@@ -506,23 +591,10 @@ fs:
     }
 
     #[test]
-    fn unknown_provider_errors() {
-        let yaml = r#"
-providers:
-  - name: nope
-"#;
+    fn unknown_builtin_errors() {
+        let yaml = "plugins:\n  - builtin: nope\n";
         let err = build_engine_from_yaml(yaml).err().expect("must error");
         assert!(err.to_string().contains("nope"), "{err}");
-    }
-
-    #[test]
-    fn unknown_driver_errors() {
-        let yaml = r#"
-drivers:
-  - name: ghost
-"#;
-        let err = build_engine_from_yaml(yaml).err().expect("must error");
-        assert!(err.to_string().contains("ghost"), "{err}");
     }
 
     #[test]

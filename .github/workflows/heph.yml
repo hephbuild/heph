@@ -250,6 +250,27 @@ jobs:
       - name: List artifacts
         run: ls -lahR dist
 
+      # Build the go plugin distribution manifest from the per-os/arch cdylibs that
+      # were uploaded: one entry per artifact, its `url` the release-asset URL the
+      # manifest is published alongside (so `plugins: - { url: .../heph-go-plugin.json }`
+      # resolves the right dylib for the host).
+      - name: Generate go plugin manifest
+        run: |
+          VERSION="${{needs.gen.outputs.version}}"
+          BASE="https://github.com/hephbuild/heph-artifacts-v1/releases/download/$VERSION"
+          arts=""
+          for f in dist/heph-go-plugin_*.dylib; do
+            [ -e "$f" ] || continue
+            bn=$(basename "$f")
+            rest=${bn#heph-go-plugin_}; rest=${rest%.dylib}   # <os>_<arch>
+            os=${rest%_*}; arch=${rest#*_}
+            [ -n "$arts" ] && arts="$arts,"
+            arts="$arts{\"os\":\"$os\",\"arch\":\"$arch\",\"url\":\"$BASE/$bn\"}"
+          done
+          printf '{"name":"go","version":"%s","artifacts":[%s]}\n' "$VERSION" "$arts" \
+            > dist/heph-go-plugin.json
+          cat dist/heph-go-plugin.json
+
       - name: Create Release in artifacts repo
         id: create_release
         uses: softprops/action-gh-release@v3

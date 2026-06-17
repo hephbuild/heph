@@ -102,12 +102,14 @@ pub type DynProvider = stabby::dynptr!(stabby::boxed::Box<dyn StableProvider + S
 pub type DynManagedDriver =
     stabby::dynptr!(stabby::boxed::Box<dyn StableManagedDriver + Send + Sync>);
 
-/// Config handed to a cdylib's create entry. Generic: the workspace root; the
-/// plugin reads any plugin-specific settings from its own env (as the spawned
-/// `bin:` variant does).
+/// Config handed to a cdylib's create entry: the workspace root plus the
+/// plugin's `options:` map (from config yaml), encoded as a `plugin-abi`
+/// `pb::Value` map (prost bytes). The plugin decodes the options and instantiates
+/// its provider + drivers from them.
 #[stabby::stabby]
 pub struct CreateConfig {
     pub root: SString,
+    pub options: SVec<u8>,
 }
 
 /// A named managed driver in a plugin's component bundle.

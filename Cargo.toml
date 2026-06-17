@@ -112,6 +112,7 @@ hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
 # The go plugin is no longer compiled in; it ships as a separate cdylib loaded
 # via `dylib:`. The host needs the stable-ABI loader (`host` feature).
 hplugin-stabby = { package = "plugin-stabby", path = "crates/plugin-stabby", features = ["host"] }
+hplugin-abi = { package = "plugin-abi", path = "crates/plugin-abi", features = ["convert"] }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
 htui = { package = "tui", path = "crates/tui" }
 hlock = { package = "lock", path = "crates/lock" }

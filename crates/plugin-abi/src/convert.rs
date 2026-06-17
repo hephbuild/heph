@@ -7,6 +7,7 @@
 //! the remote driver path needs them (M2).
 
 use crate::pb;
+use anyhow::Context as _;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
@@ -70,6 +71,104 @@ pub fn value_from_pb(v: pb::Value) -> Value {
                 .collect(),
         ),
         Some(Kind::ListVal(l)) => Value::List(l.items.into_iter().map(value_from_pb).collect()),
+    }
+}
+
+// ---- Options (plugin config map) ----
+//
+// A plugin's `options:` map (`BTreeMap<String, serde_yaml::Value>`) crosses the
+// stable ABI as a `pb::Value` map (prost bytes). The guest reconstructs the same
+// `Options` map and decodes it with `hplugin::config::decode_opt`, exactly as an
+// in-process plugin does.
+
+fn yaml_to_pb(v: &serde_yaml::Value) -> pb::Value {
+    use pb::value::{Kind, List, Map, Null};
+    let kind = match v {
+        serde_yaml::Value::Null => Kind::NullVal(Null {}),
+        serde_yaml::Value::Bool(b) => Kind::BoolVal(*b),
+        serde_yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Kind::IntVal(i)
+            } else if let Some(u) = n.as_u64() {
+                Kind::UintVal(u)
+            } else {
+                Kind::FloatVal(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_yaml::Value::String(s) => Kind::StringVal(s.clone()),
+        serde_yaml::Value::Sequence(seq) => Kind::ListVal(List {
+            items: seq.iter().map(yaml_to_pb).collect(),
+        }),
+        serde_yaml::Value::Mapping(m) => Kind::MapVal(Map {
+            entries: m
+                .iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        serde_yaml::Value::String(s) => s.clone(),
+                        other => serde_yaml::to_string(other).unwrap_or_default(),
+                    };
+                    (key, yaml_to_pb(v))
+                })
+                .collect(),
+        }),
+        // Tagged values carry an explicit YAML tag we don't model; cross the inner value.
+        serde_yaml::Value::Tagged(t) => return yaml_to_pb(&t.value),
+    };
+    pb::Value { kind: Some(kind) }
+}
+
+fn pb_to_yaml(v: pb::Value) -> serde_yaml::Value {
+    use pb::value::Kind;
+    match v.kind {
+        Some(Kind::StringVal(s)) => serde_yaml::Value::String(s),
+        Some(Kind::BoolVal(b)) => serde_yaml::Value::Bool(b),
+        Some(Kind::FloatVal(f)) => serde_yaml::Value::Number(serde_yaml::Number::from(f)),
+        Some(Kind::IntVal(i)) => serde_yaml::Value::Number(serde_yaml::Number::from(i)),
+        Some(Kind::UintVal(u)) => serde_yaml::Value::Number(serde_yaml::Number::from(u)),
+        Some(Kind::NullVal(_)) | None => serde_yaml::Value::Null,
+        Some(Kind::ListVal(l)) => {
+            serde_yaml::Value::Sequence(l.items.into_iter().map(pb_to_yaml).collect())
+        }
+        Some(Kind::MapVal(m)) => {
+            let mut out = serde_yaml::Mapping::new();
+            for (k, v) in m.entries {
+                out.insert(serde_yaml::Value::String(k), pb_to_yaml(v));
+            }
+            serde_yaml::Value::Mapping(out)
+        }
+    }
+}
+
+/// Encode a plugin `options:` map to `pb::Value` (Map) prost bytes for the ABI.
+pub fn options_to_pb_bytes(opts: &BTreeMap<String, serde_yaml::Value>) -> Vec<u8> {
+    use prost::Message;
+    let map = pb::value::Map {
+        entries: opts
+            .iter()
+            .map(|(k, v)| (k.clone(), yaml_to_pb(v)))
+            .collect(),
+    };
+    pb::Value {
+        kind: Some(pb::value::Kind::MapVal(map)),
+    }
+    .encode_to_vec()
+}
+
+/// Decode ABI options bytes back into a plugin `options:` map. Non-map / empty
+/// payloads decode to an empty map.
+pub fn options_from_pb_bytes(bytes: &[u8]) -> anyhow::Result<BTreeMap<String, serde_yaml::Value>> {
+    use prost::Message;
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let v = pb::Value::decode(bytes).context("decode plugin options pb::Value")?;
+    match v.kind {
+        Some(pb::value::Kind::MapVal(m)) => Ok(m
+            .entries
+            .into_iter()
+            .map(|(k, v)| (k, pb_to_yaml(v)))
+            .collect()),
+        _ => Ok(BTreeMap::new()),
     }
 }
 
@@ -622,5 +721,29 @@ mod tests {
             serde_json::to_value(&*back).expect("reserialize"),
             serde_json::json!({"x": 5})
         );
+    }
+
+    #[test]
+    fn options_pb_bytes_roundtrip() {
+        // A plugin options map crosses the ABI as pb::Value bytes and decodes back
+        // unchanged — covering scalars, nesting, and a list.
+        let yaml = r#"
+go_bin: "//@heph/bin:go"
+parallel: 4
+flag: true
+nested: { a: 1, b: [x, y] }
+"#;
+        let opts: BTreeMap<String, serde_yaml::Value> =
+            serde_yaml::from_str(yaml).expect("parse opts");
+        let bytes = options_to_pb_bytes(&opts);
+        let back = options_from_pb_bytes(&bytes).expect("decode opts");
+        assert_eq!(back, opts);
+
+        // Typed decode through the same path a plugin author uses.
+        let go_bin: String = serde_yaml::from_value(back["go_bin"].clone()).expect("go_bin");
+        assert_eq!(go_bin, "//@heph/bin:go");
+
+        // Empty payload decodes to an empty map (absent options).
+        assert!(options_from_pb_bytes(&[]).expect("empty").is_empty());
     }
 }

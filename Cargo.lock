@@ -1937,6 +1937,7 @@ dependencies = [
  "object_store",
  "parking_lot",
  "plugin",
+ "plugin-abi",
  "plugin-buildfile",
  "plugin-exec",
  "plugin-nix",
@@ -3509,9 +3510,11 @@ dependencies = [
  "core",
  "model",
  "plugin",
+ "prost 0.14.4",
  "proto-gen",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
