@@ -419,9 +419,7 @@ jobs:
   release:
     name: Release
     needs: [gen, upload_artifacts, lint, test]
-    # Disabled: `upload_artifacts` already publishes the build as a prerelease.
-    # This job promoted it to production + triggered the site deploy; turned off
-    # for now. Re-enable with `github.ref == 'refs/heads/master'`.
+    # Disabled. Re-enable by restoring: if: github.ref == 'refs/heads/master'
     if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -432,8 +430,8 @@ jobs:
           repository: hephbuild/heph-artifacts-v1
           token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
           tag_name: ${{needs.gen.outputs.version}}
-          prerelease: true
-          make_latest: false
+          prerelease: false
+          make_latest: true
 
       - name: Trigger Deploy on hephbuild.github.io
         uses: actions/github-script@v8
