@@ -183,9 +183,12 @@ jobs:
           # devenv macfuse-stubs; zig mangles the nix `-L` path under its SDK
           # syslibroot and fails to find `-lfuse`, so the (native arm64) macOS
           # runner uses plain `cargo build` — no cross needed there. The go plugin
-          # cdylib is built in the same invocation (shared compile).
+          # cdylib builds in a second invocation: `--bin heph` is a target filter
+          # that would exclude the cdylib's lib target, so it can't share the bin's
+          # command. The compile is still shared (deps are already built).
           if [ "${{ matrix.os }}" = "darwin" ]; then
-            cargo build --release --locked --target ${{ matrix.target }} -p heph --bin heph -p plugin-go-cdylib
+            cargo build --release --locked --target ${{ matrix.target }} -p heph --bin heph
+            cargo build --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
             lib="$OUT/libplugin_go_cdylib.dylib"
             # The nix toolchain hard-links libiconv against its /nix/store path,
             # which is absent on user machines (dyld aborts at launch). Rewrite
@@ -193,7 +196,8 @@ jobs:
             bash scripts/macos-portable.sh "$OUT/heph"
             bash scripts/macos-portable.sh "$lib"
           else
-            cargo zigbuild --release --locked --target ${{ matrix.target }} -p heph --bin heph -p plugin-go-cdylib
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p heph --bin heph
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
             lib="$OUT/libplugin_go_cdylib.so"
           fi
           cp "$OUT/heph" $BIN_NAME
