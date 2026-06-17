@@ -61,7 +61,7 @@ pub fn connect(
 
     // All iceoryx2 handles (!Send) live on this one thread.
     std::thread::spawn(move || {
-        let ports = (|| -> anyhow::Result<_> {
+        let setup = || -> anyhow::Result<_> {
             let node = NodeBuilder::new().create::<ipc::Service>()?;
             // pub/sub is lossy: a full subscriber buffer drops samples. A build's
             // concurrent request/callback fan-out bursts hundreds of frames, so
@@ -86,7 +86,19 @@ pub fn connect(
                 .create()?;
             let subscriber = recv_svc.subscriber_builder().create()?;
             Ok((node, publisher, subscriber))
-        })();
+        };
+        // `open_or_create` races another process opening/creating the same
+        // service and returns the transient `SystemInFlux`; retry briefly.
+        let mut ports = setup();
+        for _ in 0..50 {
+            match &ports {
+                Err(e) if e.to_string().contains("InFlux") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    ports = setup();
+                }
+                _ => break,
+            }
+        }
 
         match ports {
             Ok((_node, publisher, subscriber)) => {
