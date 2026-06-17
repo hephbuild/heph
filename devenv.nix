@@ -126,6 +126,28 @@ in
     mv /tmp/heph "${binLocation}"
   '';
 
+  # Install the go plugin (cdylib + manifest) into the user-global ~/.heph dir, so
+  # an installed `heph3` can load it from any workspace via
+  # `plugins: - { identifier: { path: ~/.heph/plugins/go/heph-go-plugin.json } }`.
+  # Always a release build — it's a runtime artifact. The manifest (one host
+  # artifact, path = the sibling dylib) is emitted by tools/pluginmanifest.
+  scripts.install-go-plugin.exec = ''
+    cargo build --release -p plugin-go-cdylib
+    if [ "$(uname -s)" = "Darwin" ]; then
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.dylib"
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
+    else
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.so"
+    fi
+    dest="$HOME/.heph/plugins/go"
+    mkdir -p "$dest"
+    cp "$lib" "$dest/heph-go-plugin.dylib.new"
+    mv -f "$dest/heph-go-plugin.dylib.new" "$dest/heph-go-plugin.dylib"
+    ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
+        && go run . -name go -host-path heph-go-plugin.dylib -out "$dest/heph-go-plugin.json" )
+    echo "installed go plugin -> $dest"
+  '';
+
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")
@@ -133,6 +155,7 @@ in
     # holding the previous code-signature for that path and SIGKILLs the next run.
     cp $CARGO_TARGET_DIR/debug/heph "${binLocation}.new"
     mv -f "${binLocation}.new" "${binLocation}"
+    install-go-plugin
   '';
 
   scripts.install-release-build.exec = ''
@@ -151,6 +174,7 @@ in
     # Silicon. `mv` swaps the path to a fresh inode so AMFI re-validates.
     cp "$bin" "${binLocation}.new"
     mv -f "${binLocation}.new" "${binLocation}"
+    install-go-plugin
   '';
 
 
