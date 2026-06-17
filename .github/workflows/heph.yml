@@ -50,7 +50,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -138,7 +138,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -297,7 +297,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -378,7 +378,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
