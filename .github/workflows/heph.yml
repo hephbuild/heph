@@ -429,8 +429,8 @@ jobs:
           repository: hephbuild/heph-artifacts-v1
           token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
           tag_name: ${{needs.gen.outputs.version}}
-          prerelease: false
-          make_latest: true
+          prerelease: true
+          make_latest: false
 
       - name: Trigger Deploy on hephbuild.github.io
         uses: actions/github-script@v8
