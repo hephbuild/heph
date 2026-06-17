@@ -11,8 +11,8 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{GoEmbedDriver, GoGolistDriver, GoTestmainDriver, Provider};
-use plugin_sdk::abi::{CreateConfig, NamedDriver, PluginComponents};
-use plugin_sdk::serve::{make_dyn_managed_driver, make_dyn_provider};
+use plugin_sdk::stabby::abi::{CreateConfig, NamedDriver, PluginComponents};
+use plugin_sdk::stabby::{make_dyn_managed_driver, make_dyn_provider};
 use std::path::PathBuf;
 use std::sync::Arc;
 

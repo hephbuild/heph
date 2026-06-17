@@ -13,7 +13,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hplugin-go = { package = "plugin-go", path = "../plugin-go" }
-plugin-sdk = { path = "../plugin-sdk" }
+# Opt into the stabby cdylib transport — the SDK is transport-agnostic by default.
+plugin-sdk = { path = "../plugin-sdk", features = ["stabby"] }
 hplugin = { package = "plugin", path = "../plugin" }
 hwalk = { package = "walk", path = "../walk" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }

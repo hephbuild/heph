@@ -89,9 +89,10 @@ in
   scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> clippy --all-features' && cargo clippy --all-targets --all-features --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
   # Test everything. The default pass covers all crates with default features; the
-  # targeted pass exercises the stabby host loader + adapters (gated behind the
-  # `host` feature, off in plugin-stabby's default build).
-  scripts.tst.exec = "cargo test --locked --all && cargo test --locked -p plugin-stabby --features host";
+  # targeted passes exercise the feature-gated transport code, off by default:
+  # the stabby host loader/adapters (plugin-stabby `host`) and the stabby guest
+  # serving (plugin-sdk `stabby` — the SDK is transport-agnostic by default).
+  scripts.tst.exec = "cargo test --locked --all && cargo test --locked -p plugin-stabby --features host && cargo test --locked -p plugin-sdk --features stabby";
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';
