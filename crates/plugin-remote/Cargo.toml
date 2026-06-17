@@ -1,0 +1,36 @@
+[package]
+name = "plugin-remote"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hplugin = { package = "plugin", path = "../plugin" }
+hmodel = { package = "model", path = "../model" }
+hcore = { package = "core", path = "../core" }
+hwalk = { package = "walk", path = "../walk" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+plugin-abi = { path = "../plugin-abi", features = ["convert", "transport"] }
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+futures = "0.3.32"
+prost = "0.14"
+tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros", "net"] }
+tracing = "0.1"
+libc = "0.2"
+wasmtime = { version = "45", optional = true }
+wasmtime-wasi = { version = "45", optional = true }
+
+[features]
+# heavy transports, off by default; proto (UDS) is always available
+shm = ["plugin-abi/shm"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
+[dev-dependencies]
+plugin-sdk = { path = "../plugin-sdk" }
+async-trait = "0.1.89"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time"] }

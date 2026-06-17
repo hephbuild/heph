@@ -1,9 +1,14 @@
+// Shared integration-test helper module: each test binary `mod common`s this but
+// uses only some helpers, so per-binary dead-code/unused-import warnings are
+// expected here (the items are exercised across the suite).
+#![allow(dead_code, unused_imports)]
+
 use anyhow::Context as _;
 use heph::pluginbuildfile;
 use heph::pluginexec;
-use heph::plugingo;
 use heph::pluginstatictarget;
 use htestkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
+use plugin_go::plugingo;
 use std::path::PathBuf;
 use tempfile::TempDir;
 

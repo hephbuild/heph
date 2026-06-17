@@ -1,0 +1,33 @@
+[package]
+name = "plugin-stabby"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+stabby = { version = "72.1.8", features = ["libloading"] }
+libloading = "0.8"
+anyhow = "1.0.102"
+futures = "0.3.32"
+hplugin = { package = "plugin", path = "../plugin", optional = true }
+hmodel = { package = "model", path = "../model", optional = true }
+hcore = { package = "core", path = "../core", optional = true }
+hdriver-support = { package = "driver-support", path = "../driver-support", optional = true }
+plugin-abi = { path = "../plugin-abi", features = ["convert"], optional = true }
+prost = { version = "0.14", optional = true }
+async-trait = { version = "0.1.89", optional = true }
+# Guest only: a cdylib owns its own tokio runtime — its statically-linked tokio is
+# distinct from the host's, so async work that touches the reactor (e.g. plugin-go
+# shelling out to `go list` in a driver `run`) must execute on the cdylib's runtime.
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync"], optional = true }
+
+[features]
+# host: adapters from the engine's ProviderExecutor onto the stable ABI.
+host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:plugin-abi", "dep:prost", "dep:async-trait"]
+# guest: adapters wrapping the stable ABI back into hplugin traits.
+guest = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:plugin-abi", "dep:prost", "dep:async-trait", "dep:tokio"]
+
+[dev-dependencies]
+futures = "0.3.32"

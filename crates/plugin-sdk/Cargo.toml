@@ -1,0 +1,24 @@
+[package]
+name = "plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hplugin = { package = "plugin", path = "../plugin" }
+hmodel = { package = "model", path = "../model" }
+hcore = { package = "core", path = "../core" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+plugin-abi = { path = "../plugin-abi", features = ["convert", "transport"] }
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+futures = "0.3.32"
+prost = "0.14"
+tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros", "net"] }
+tracing = "0.1"
+
+[features]
+# shm transport (iceoryx2) for the guest serve path; pulled in by plugin bins.
+shm = ["plugin-abi/shm"]

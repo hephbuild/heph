@@ -4,12 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
+members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-sdk", "crates/plugin-remote", "crates/plugin-stabby", "crates/plugin-go-cdylib", "crates/plugin-echo", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
+# wasm guest components are built with cargo-component for wasm32-wasip2, not by
+# the host `cargo build --workspace`; keep them out of the workspace.
+exclude = ["crates/wasm-guests"]
 
 [profile.profiling]
 inherits = "release"
 debug = true
 strip = "none"
+
+# Test binaries link `--all-features` in CI (wasmtime + iceoryx2 + the wasm
+# toolchain), so full debuginfo makes the linker OOM on CI runners. Line-tables
+# keep backtraces with line numbers while shrinking the link enough to fit.
+[profile.test]
+debug = "line-tables-only"
 
 [profile.release]
 # Thin LTO keeps cross-crate inlining but links in parallel (fat `lto = true`
@@ -109,7 +118,8 @@ hdriver-support = { package = "driver-support", path = "crates/driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
 hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
-hplugin-go = { package = "plugin-go", path = "crates/plugin-go" }
+hplugin-remote = { package = "plugin-remote", path = "crates/plugin-remote" }
+hplugin-stabby = { package = "plugin-stabby", path = "crates/plugin-stabby", features = ["host", "guest"] }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
 htui = { package = "tui", path = "crates/tui" }
 hlock = { package = "lock", path = "crates/lock" }
@@ -162,6 +172,10 @@ uuid = { version = "1.23.3", features = ["v4"] }
 object_store = { version = "0.13.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 url = "2.5.8"
 flate2 = "1.1.9"
+# Blocking HTTP client, used only to download `bin: { url }` plugins. rustls-tls
+# avoids a system OpenSSL link; blocking runs on its own thread so it is safe to
+# call from inside the async runtime (see bootstrap::download_plugin).
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 
 [features]
 # FUSE sandbox is on by default. The FUSE machinery (and its `fuser`/libfuse
@@ -170,8 +184,14 @@ flate2 = "1.1.9"
 # and falls back to the copy path when FUSE is unavailable, so a default build
 # is safe on hosts without it. The `-weak-lfuse` link arg is emitted by this
 # crate's build.rs (the final binary link).
-default = ["fuse-sandbox"]
+# shm + wasm ship by default so the binary supports every plugin transport
+# (bin: UDS, bin: shm, dylib:, wasm:) out of the box.
+default = ["fuse-sandbox", "shm", "wasm"]
 fuse-sandbox = ["hsandboxfuse/fuse-sandbox"]
+# Out-of-process plugin shm tier (iceoryx2 byte-pipe under the Mux).
+shm = ["hplugin-remote/shm"]
+# In-process wasm-component plugins (`wasm:` config), via wasmtime.
+wasm = ["hplugin-remote/wasm"]
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

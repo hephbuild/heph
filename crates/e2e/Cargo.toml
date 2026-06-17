@@ -10,6 +10,12 @@ workspace = true
 [dev-dependencies]
 heph = { path = "../.." }
 htestkit = { package = "testkit", path = "../testkit" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+plugin-remote = { path = "../plugin-remote" }
+plugin-sdk = { path = "../plugin-sdk" }
+hplugin = { package = "plugin", path = "../plugin" }
+hmodel = { package = "model", path = "../model" }
+hcore = { package = "core", path = "../core" }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net"] }
 anyhow = "1"
 tempfile = "3"

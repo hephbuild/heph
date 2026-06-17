@@ -6,9 +6,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 use crate::engine::config_yaml;
-use crate::{
-    engine, pluginbuildfile, pluginexec, plugingo, pluginhostbin, pluginnix, plugintextfile,
-};
+use crate::{engine, pluginbuildfile, pluginexec, pluginhostbin, pluginnix, plugintextfile};
 
 /// Builds the multi-thread runtime used by every command entry point.
 ///
@@ -97,49 +95,67 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_driver(|_| Box::new(plugintextfile::Driver))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
-    // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
-    e.register_provider_factory("buildfile", |init, opts| {
-        Ok(Box::new(
-            pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-            )?
-            .with_walker(init.walker.clone()),
-        ))
-    })?;
-    e.register_provider_factory("go", |init, opts| {
-        Ok(Box::new(plugingo::Provider::from_options(
-            init.root.to_path_buf(),
-            &init.skip_dirs,
-            &init.skip_globs,
-            opts,
-            init.walker.clone(),
-        )?))
-    })?;
+    // Names a `bin:` config entry routes to an out-of-process plugin. For those,
+    // skip the in-process built-in factory below and register a remote handle
+    // (spawned by `register_bin_plugins`) under the same name instead.
+    // A name routes out-of-process (`bin:`) OR to an in-process loadable cdylib
+    // (`dylib:`) / wasm component (`wasm:`); either way the built-in in-process
+    // factory below is skipped.
+    let bin_names: std::collections::HashSet<&str> = file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .filter(|en| en.bin.is_some() || en.dylib.is_some() || en.wasm.is_some())
+        .map(|en| en.name.as_str())
+        .collect();
 
-    e.register_managed_driver_factory("exec", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
-    })?;
-    e.register_managed_driver_factory("bash", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
-    })?;
-    e.register_managed_driver_factory("sh", |_init, opts| {
-        Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
-    })?;
-    e.register_managed_driver_factory("go_golist", |_init, opts| {
-        config_yaml::deny_unknown("go_golist driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
-    })?;
-    e.register_managed_driver_factory("go_embed", |_init, opts| {
-        config_yaml::deny_unknown("go_embed driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoEmbedDriver))
-    })?;
-    e.register_managed_driver_factory("go_testmain", |_init, opts| {
-        config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoTestmainDriver))
-    })?;
+    // Opt-in built-in factories — instantiated by `apply_config` if listed in
+    // the YAML and not overridden by a `bin:` entry.
+    if !bin_names.contains("buildfile") {
+        e.register_provider_factory("buildfile", |init, opts| {
+            Ok(Box::new(
+                pluginbuildfile::Provider::from_options(
+                    init.root.to_path_buf(),
+                    &init.skip_dirs,
+                    &init.skip_globs,
+                    opts,
+                )?
+                .with_walker(init.walker.clone()),
+            ))
+        })?;
+    }
+    // The go plugin is no longer a compiled-in built-in: it ships as a separate
+    // artifact loaded via `dylib:` (native speed) or spawned via `bin:`. A config
+    // entry named `go`/`go_*` without a transport therefore has no factory.
+    if !bin_names.contains("exec") {
+        e.register_managed_driver_factory("exec", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
+        })?;
+    }
+    if !bin_names.contains("bash") {
+        e.register_managed_driver_factory("bash", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
+        })?;
+    }
+    if !bin_names.contains("sh") {
+        e.register_managed_driver_factory("sh", |_init, opts| {
+            Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
+        })?;
+    }
+    drop(bin_names);
+
+    // Spawn + register every out-of-process plugin declared via `bin:`. One
+    // process per distinct launch command; all the names that share it (e.g. the
+    // `go` provider + its `go_*` drivers) register against that one connection.
+    register_bin_plugins(&mut e, &root, &home_dir, &file)?;
+
+    // Load + register every in-process loadable plugin declared via `dylib:`. One
+    // cdylib per distinct path serves a provider + its drivers (e.g. `go` plus the
+    // `go_*` drivers), loaded once behind the stable ABI at native speed.
+    register_dylib_plugins(&mut e, &root, &home_dir, &file)?;
+
+    // Load + register every wasm-component plugin declared via `wasm:`.
+    register_wasm_plugins(&mut e, &root, &home_dir, &file)?;
 
     e.apply_config(&file.providers, &file.drivers)?;
 
@@ -397,4 +413,475 @@ drivers:
             "trigger after resume must cancel"
         );
     }
+
+    #[test]
+    fn substitute_os_arch_replaces_placeholders() {
+        let out = super::substitute_os_arch("https://x/heph-{os}-{arch}.bin");
+        assert!(!out.contains("{os}") && !out.contains("{arch}"), "{out}");
+        // arch uses the published spelling (amd64/arm64), never the rust consts.
+        assert!(!out.contains("x86_64") && !out.contains("aarch64"), "{out}");
+        // os uses darwin, never the rust `macos` spelling.
+        assert!(!out.contains("macos"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bin_argv_path_and_exec() {
+        use crate::engine::config_yaml::BinConfig;
+        let root = std::path::Path::new("/repo");
+        let home = std::path::Path::new("/tmp/unused");
+        let path = BinConfig {
+            path: Some("/usr/local/bin/heph-plugin-go".into()),
+            exec: None,
+            url: None,
+        };
+        assert_eq!(
+            super::resolve_bin_argv(&path, "go", root, home).unwrap(),
+            vec!["/usr/local/bin/heph-plugin-go".to_string()]
+        );
+        // Relative path resolves against the workspace root, not the cwd.
+        let rel = BinConfig {
+            path: Some(".heph3/heph-go-plugin".into()),
+            exec: None,
+            url: None,
+        };
+        assert_eq!(
+            super::resolve_bin_argv(&rel, "go", root, home).unwrap(),
+            vec!["/repo/.heph3/heph-go-plugin".to_string()]
+        );
+        let exec = BinConfig {
+            path: None,
+            exec: Some(vec![
+                "cargo".into(),
+                "run".into(),
+                "-p".into(),
+                "plugin-go".into(),
+            ]),
+            url: None,
+        };
+        assert_eq!(
+            super::resolve_bin_argv(&exec, "go", root, home).unwrap(),
+            vec![
+                "cargo".to_string(),
+                "run".to_string(),
+                "-p".to_string(),
+                "plugin-go".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_bin_groups_collapses_shared_command() {
+        // A provider + two drivers all pointing at the same binary collapse into
+        // one spawn group; a driver with a different binary is its own group.
+        let yaml = r#"
+providers:
+  - name: go
+    bin:
+      path: /opt/heph-plugin-go
+drivers:
+  - name: go_golist
+    bin:
+      path: /opt/heph-plugin-go
+  - name: go_embed
+    bin:
+      path: /opt/heph-plugin-go
+  - name: exec
+    bin:
+      path: /opt/heph-plugin-exec
+"#;
+        let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let root = std::path::Path::new("/repo");
+        let home = std::path::Path::new("/tmp/unused");
+        let groups = super::plan_bin_groups(&file, root, home).expect("plan");
+        assert_eq!(groups.len(), 2, "two distinct binaries => two groups");
+
+        let go = groups
+            .get(&vec!["/opt/heph-plugin-go".to_string()])
+            .expect("go group");
+        assert_eq!(
+            go,
+            &vec![
+                ("go".to_string(), super::BinKind::Provider),
+                ("go_golist".to_string(), super::BinKind::Driver),
+                ("go_embed".to_string(), super::BinKind::Driver),
+            ]
+        );
+        let exec = groups
+            .get(&vec!["/opt/heph-plugin-exec".to_string()])
+            .expect("exec group");
+        assert_eq!(exec, &vec![("exec".to_string(), super::BinKind::Driver)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_bin_groups_empty_without_bin() {
+        let file: config_yaml::ConfigYaml =
+            serde_yaml::from_str("providers:\n  - name: buildfile\n").expect("parse");
+        let groups = super::plan_bin_groups(
+            &file,
+            std::path::Path::new("/repo"),
+            std::path::Path::new("/tmp"),
+        )
+        .expect("plan");
+        assert!(groups.is_empty());
+    }
+}
+
+/// Whether a `bin` entry contributes a provider or a (managed) driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BinKind {
+    Provider,
+    Driver,
+}
+
+/// Spawn plan: launch argv → the named provider/driver entries served by that
+/// one process.
+#[cfg(unix)]
+type BinGroups = std::collections::BTreeMap<Vec<String>, Vec<(String, BinKind)>>;
+
+/// Plan which out-of-process plugins to spawn: resolve every `bin:` entry to its
+/// launch argv and group entries that share the identical command, so one
+/// process serves all of them (e.g. the `go` provider + its `go_*` drivers).
+/// `url` sources are downloaded here. Pure of engine state so it is unit-tested.
+#[cfg(unix)]
+fn plan_bin_groups(
+    file: &config_yaml::ConfigYaml,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<BinGroups> {
+    let mut groups: BinGroups = std::collections::BTreeMap::new();
+    for (entries, kind) in [
+        (&file.providers, BinKind::Provider),
+        (&file.drivers, BinKind::Driver),
+    ] {
+        for entry in entries {
+            if let Some(bin) = &entry.bin {
+                let argv = resolve_bin_argv(bin, &entry.name, root, home_dir)?;
+                groups
+                    .entry(argv)
+                    .or_default()
+                    .push((entry.name.clone(), kind));
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// Spawn every out-of-process plugin declared via a `bin:` config entry and
+/// register a remote handle under each entry's name. Entries that resolve to the
+/// identical launch command share one spawned process + connection (so the `go`
+/// provider and its `go_*` drivers, all pointing at the same binary, run in one
+/// process). plugin-go/exec stay Rust binaries — `bin.exec: [cargo, run, ...]`
+/// or `bin.path: /usr/local/bin/heph-plugin-go` is how they are now launched.
+#[cfg(unix)]
+fn register_bin_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    // Group entries by resolved argv so identical launch commands collapse to one
+    // process (deterministic order via BTreeMap).
+    let groups = plan_bin_groups(file, root, home_dir)?;
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    // Spawned plugins discover the workspace root through this env var.
+    let env = vec![(
+        "HEPH_PLUGIN_ROOT".to_string(),
+        root.to_string_lossy().into_owned(),
+    )];
+
+    for (argv, members) in groups {
+        let (program, args) = argv
+            .split_first()
+            .context("internal: empty plugin argv after resolution")?;
+        // Cold protocol over a UDS socketpair (fd 3). For native-speed in-process
+        // plugins use `dylib:` (the stable ABI) instead; this `bin:` path is the
+        // portable out-of-process transport.
+        let ((r, w), child) =
+            hplugin_remote::spawn_streams(std::path::Path::new(program), args, &env)
+                .with_context(|| format!("spawn plugin `{program}`"))?;
+        drop(child);
+        let plugin = hplugin_remote::RemotePlugin::connect(r, w);
+        for (name, kind) in members {
+            match kind {
+                BinKind::Provider => {
+                    let p = plugin.clone();
+                    let nm = name.clone();
+                    e.register_provider_factory(&name, move |_init, _opts| {
+                        Ok(Box::new(p.provider(nm)))
+                    })?;
+                }
+                BinKind::Driver => {
+                    let p = plugin.clone();
+                    let nm = name.clone();
+                    e.register_managed_driver_factory(&name, move |_init, _opts| {
+                        Ok(Box::new(p.managed_driver(nm)))
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load + register every `dylib:` plugin. One cdylib per distinct path is loaded
+/// in-process behind the stable ABI (ABI-checked via stabby type reports), and the
+/// provider + drivers it exports are registered under their own names. The engine
+/// then drives them through its normal traits at native speed.
+#[cfg(unix)]
+fn register_dylib_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut paths: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for en in file.providers.iter().chain(file.drivers.iter()) {
+        if let Some(d) = &en.dylib {
+            paths.insert(resolve_artifact_path(d.resolve(&en.name)?, root, home_dir)?);
+        }
+    }
+
+    let root_str = root.to_string_lossy().into_owned();
+    for path in paths {
+        let (provider, drivers) = hplugin_stabby::load_stable::load(&path, &root_str)
+            .with_context(|| format!("load plugin dylib {}", path.display()))?;
+        if let Some(p) = provider {
+            let name = p.name().to_string();
+            e.register_provider_factory(&name, move |_init, _opts| Ok(Box::new(p.clone())))?;
+        }
+        for (name, drv) in drivers {
+            e.register_managed_driver_factory(&name, move |_init, _opts| {
+                Ok(Box::new(drv.clone()))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn register_dylib_plugins(
+    _e: &mut engine::Engine,
+    _root: &std::path::Path,
+    _home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    if file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .any(|en| en.dylib.is_some())
+    {
+        anyhow::bail!("`dylib:` plugins are only supported on unix");
+    }
+    Ok(())
+}
+
+/// Resolve a loadable-artifact source to a concrete file path: a `path` is taken
+/// relative to the workspace `root`; a `url` is downloaded + cached (same fetch
+/// path as `bin:` urls).
+#[cfg(unix)]
+fn resolve_artifact_path(
+    src: config_yaml::ArtifactSource,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(match src {
+        config_yaml::ArtifactSource::Path(p) => root.join(p),
+        config_yaml::ArtifactSource::Url(u) => download_plugin(&u, home_dir)?,
+    })
+}
+
+/// Load + register every `wasm:` plugin. One wasm component per distinct path is
+/// loaded in-process via wasmtime (capability-sandboxed); the provider and/or
+/// driver it exports register under the config entry names that point at it.
+#[cfg(all(unix, feature = "wasm"))]
+fn register_wasm_plugins(
+    e: &mut engine::Engine,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+
+    // path -> (provider entry name, driver entry name)
+    let mut by_path: BTreeMap<std::path::PathBuf, (Option<String>, Option<String>)> =
+        BTreeMap::new();
+    for en in &file.providers {
+        if let Some(w) = &en.wasm {
+            let p = resolve_artifact_path(w.resolve(&en.name)?, root, home_dir)?;
+            by_path.entry(p).or_default().0 = Some(en.name.clone());
+        }
+    }
+    for en in &file.drivers {
+        if let Some(w) = &en.wasm {
+            let p = resolve_artifact_path(w.resolve(&en.name)?, root, home_dir)?;
+            by_path.entry(p).or_default().1 = Some(en.name.clone());
+        }
+    }
+
+    for (path, (prov, drv)) in by_path {
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("read wasm plugin {}", path.display()))?;
+        let plugin = hplugin_remote::wasm::WasmPlugin::load(
+            &bytes,
+            prov.clone().unwrap_or_default(),
+            drv.clone().unwrap_or_default(),
+        )
+        .with_context(|| format!("load wasm plugin {}", path.display()))?;
+        if let Some(name) = prov {
+            let pl = std::sync::Arc::clone(&plugin);
+            e.register_provider_factory(&name, move |_init, _opts| Ok(Box::new(pl.provider())))?;
+        }
+        if let Some(name) = drv {
+            let pl = std::sync::Arc::clone(&plugin);
+            e.register_driver_factory(&name, move |_init, _opts| Ok(Box::new(pl.driver())))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(all(unix, feature = "wasm")))]
+fn register_wasm_plugins(
+    _e: &mut engine::Engine,
+    _root: &std::path::Path,
+    _home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    if file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .any(|en| en.wasm.is_some())
+    {
+        anyhow::bail!("`wasm:` plugins require building heph with the `wasm` feature on unix");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn register_bin_plugins(
+    _e: &mut engine::Engine,
+    _root: &std::path::Path,
+    _home_dir: &std::path::Path,
+    file: &config_yaml::ConfigYaml,
+) -> anyhow::Result<()> {
+    if file
+        .providers
+        .iter()
+        .chain(file.drivers.iter())
+        .any(|en| en.bin.is_some())
+    {
+        anyhow::bail!("out-of-process `bin:` plugins are only supported on unix");
+    }
+    Ok(())
+}
+
+/// Resolve a [`config_yaml::BinConfig`] to a spawnable argv (`argv[0]` is the
+/// program). A relative `path` is resolved against the workspace `root` (so it
+/// doesn't depend on the process cwd); `exec` is used as-is (its program is
+/// PATH-resolved at spawn); `url` is downloaded + cached first.
+#[cfg(unix)]
+fn resolve_bin_argv(
+    bin: &config_yaml::BinConfig,
+    ctx: &str,
+    root: &std::path::Path,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    Ok(match bin.resolve(ctx)? {
+        config_yaml::BinSource::Path(p) => {
+            let pb = std::path::PathBuf::from(&p);
+            let abs = if pb.is_absolute() { pb } else { root.join(pb) };
+            vec![abs.to_string_lossy().into_owned()]
+        }
+        config_yaml::BinSource::Exec(argv) => argv,
+        config_yaml::BinSource::Url(url) => {
+            vec![
+                download_plugin(&url, home_dir)?
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        }
+    })
+}
+
+/// Substitute `{os}`/`{arch}` in a plugin download URL with the values used in
+/// published artifact names: os `linux`/`darwin` and arch `amd64`/`arm64`
+/// (mapped from the rust `std::env::consts` spellings `macos` and
+/// `x86_64`/`aarch64`). Unmapped hosts fall back to the raw consts value.
+fn substitute_os_arch(url: &str) -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    url.replace("{os}", os).replace("{arch}", arch)
+}
+
+/// Download a plugin binary from `url_tmpl` (after `{os}`/`{arch}` substitution),
+/// cache it under `<home>/plugins/<os>-<arch>/`, make it executable, and return
+/// its path. A previously-downloaded binary is reused (no re-fetch).
+#[cfg(unix)]
+fn download_plugin(
+    url_tmpl: &str,
+    home_dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let url = substitute_os_arch(url_tmpl);
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("plugin");
+    let dir = home_dir.join("plugins").join(format!(
+        "{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    let dest = dir.join(filename);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+
+    // reqwest::blocking spins up its own runtime; run it on a dedicated std
+    // thread so it is safe to call from within the async runtime new_engine runs
+    // on (a nested block_on would otherwise panic).
+    let url_for_thread = url.clone();
+    let bytes = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+        let resp = reqwest::blocking::get(&url_for_thread)
+            .with_context(|| format!("GET {url_for_thread}"))?
+            .error_for_status()
+            .with_context(|| format!("GET {url_for_thread}"))?;
+        Ok(resp.bytes()?.to_vec())
+    })
+    .join()
+    .map_err(|_e| anyhow::anyhow!("plugin download thread panicked"))??;
+
+    // Write to a temp path then rename so a partial download is never seen as a
+    // usable binary by a concurrent run.
+    let tmp = dir.join(format!(".{filename}.download"));
+    {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &dest)
+        .with_context(|| format!("install plugin to {}", dest.display()))?;
+    Ok(dest)
 }

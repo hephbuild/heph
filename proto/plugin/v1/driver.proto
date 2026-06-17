@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+// Driver-exported methods. Mirrors the hplugin::Driver trait.
+// NOTE: schema() (DriverSchema) is not yet modeled; added when needed.
+package heph.plugin.v1;
+
+import "plugin/v1/common.proto";
+import "plugin/v1/targetdef.proto";
+import "plugin/v1/callback.proto";
+
+message ParseRequest {
+  string request_id = 1;
+  TargetSpec target_spec = 2;
+  // Selects which driver on the plugin handles this (a plugin may expose
+  // several named drivers over one connection). Empty => the sole driver.
+  string driver = 3;
+}
+message ParseResponse {
+  TargetDef target_def = 1;
+}
+
+message ApplyTransitiveRequest {
+  string request_id = 1;
+  TargetDef target_def = 2;
+  Sandbox sandbox = 3;
+  string driver = 4;
+}
+message ApplyTransitiveResponse {
+  TargetDef target_def = 1;
+}
+
+// Run inputs are materialized dep artifacts — also abstract, so they cross as
+// ArtifactHandles; the host materializes them into the sandbox dir.
+message RunInput {
+  ArtifactHandle artifact = 1;
+  string origin_id = 2;
+  Addr source_addr = 3;
+  repeated string filters = 4;
+  map<string, string> annotations = 5;
+}
+
+message RunRequest {
+  string request_id = 1;
+  TargetDef target = 2;
+  string tree_root_path = 3;
+  repeated RunInput inputs = 4;
+  string hashin = 5;
+  string sandbox_dir = 6;
+  // stdio crosses as inherited fds at spawn, not through the RPC channel;
+  // these flags only say whether the host wired each stream.
+  bool has_stdin = 7;
+  bool has_stdout = 8;
+  bool has_stderr = 9;
+  // true => run_shell, false => run
+  bool shell = 10;
+}
+
+// fuse_slot_guards and sandbox_cleanup are non-transferable host RAII,
+// constructed host-side after the remote run returns.
+message RunResponse {
+  repeated OutputArtifactRef artifacts = 1;
+}
+
+// ---- Managed run (driver-support ManagedDriver layer) ----
+// The host's ManagedDriverBridge already materialized inputs into the shared
+// sandbox dirs, so a managed run carries only paths + metadata — never input
+// bytes. The guest executes in the sandbox and returns output artifacts.
+
+enum InputArtifactType {
+  INPUT_ARTIFACT_TYPE_UNSPECIFIED = 0;
+  INPUT_ARTIFACT_TYPE_DEP = 1;
+  INPUT_ARTIFACT_TYPE_SUPPORT = 2;
+}
+
+message ManagedRunInput {
+  InputArtifactType type = 1;
+  string origin_id = 2;
+  Addr source_addr = 3;
+  repeated string filters = 4;
+  map<string, string> annotations = 5;
+  // Where this input was unpacked on the shared filesystem.
+  string unpack_root = 6;
+  // List file for Dep inputs (absent for Support inputs).
+  optional string list_path = 7;
+}
+
+message ManagedRunRequest {
+  string request_id = 1;
+  TargetDef target = 2;
+  string tree_root_path = 3;
+  string hashin = 4;
+  string sandbox_dir = 5;
+  string sandbox_ws_dir = 6;
+  string sandbox_pkg_dir = 7;
+  repeated ManagedRunInput inputs = 8;
+  // true => run_shell
+  bool shell = 9;
+  string driver = 10;
+}
+
+message ManagedRunResponse {
+  repeated OutputArtifactRef artifacts = 1;
+}

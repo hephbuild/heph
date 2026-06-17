@@ -1,0 +1,15 @@
+package component:echo;
+
+/// Minimal de-risk world for the wasm transport slice.
+///
+/// `greet` (export) is called by the host; inside it the guest calls back into
+/// the host through `host-lookup` (import). This exercises BOTH directions —
+/// host→guest call and guest→host callback — which is the crux of the plugin
+/// design (the guest provider/driver calls back into the engine's executor).
+world echo {
+    /// Host-provided callback the guest invokes (stand-in for the AbiHost
+    /// executor surface: result/note_dep/query/...).
+    import host-lookup: func(key: string) -> string;
+
+    export greet: func(name: string) -> string;
+}

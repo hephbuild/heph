@@ -1,0 +1,310 @@
+//! Bidirectional, request-id-multiplexed frame mux over one connection.
+//!
+//! Symmetric: both ends use the same `Mux`. Each side issues ids for the
+//! requests *it* initiates and routes inbound *response* frames to its own
+//! pending table; inbound *request* frames are dispatched to the side's
+//! [`InboundHandler`]. Because a side only ever matches response-typed frames
+//! against ids it issued, the two id spaces never collide.
+//!
+//! On the host this carries plugin calls outbound + callbacks inbound; on the
+//! guest, the reverse.
+
+use crate::frame::{encode_frame_into, read_frame};
+use crate::pb;
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Notify, mpsc, oneshot};
+
+pub use pb::frame::Body;
+
+/// Handles inbound *request* frames (the calls this side serves). The handler
+/// sends its reply (and, for streamed methods, stream items + a stream-end)
+/// back through `mux` tagged with the same `id`.
+#[async_trait]
+pub trait InboundHandler: Send + Sync + 'static {
+    async fn handle(&self, id: u64, body: Body, mux: Arc<Mux>);
+
+    /// Fast path for cheap, synchronous, non-reentrant requests: if this body can
+    /// be served without awaiting (e.g. a `note_dep` edge insert), return the
+    /// reply to send inline — skipping the per-request `tokio::spawn` + task-hop
+    /// the async `handle` path costs. Return `Err(body)` to fall back to `handle`
+    /// (the body is boxed — it's a large prost enum). Default: everything async.
+    fn try_inline(&self, _id: u64, body: Body) -> Result<Body, Box<Body>> {
+        Err(Box::new(body))
+    }
+}
+
+enum Pending {
+    Unary(oneshot::Sender<Body>),
+    Stream(mpsc::UnboundedSender<Body>),
+}
+
+/// True for frames that complete (or feed) a request this side issued.
+fn is_response(body: &Body) -> bool {
+    matches!(
+        body,
+        Body::Hello(_)
+            | Body::Error(_)
+            | Body::StreamItem(_)
+            | Body::StreamEnd(_)
+            | Body::ConfigResp(_)
+            | Body::GetResp(_)
+            | Body::GetErr(_)
+            | Body::ProbeResp(_)
+            | Body::ParseResp(_)
+            | Body::ApplyTransitiveResp(_)
+            | Body::RunResp(_)
+            | Body::ManagedRunResp(_)
+            | Body::ResultResp(_)
+            | Body::NoteDepResp(_)
+            | Body::QueryResp(_)
+            | Body::WalkResp(_)
+            | Body::ConfigGetResp(_)
+            | Body::ReleaseLeaseResp(_)
+    )
+}
+
+fn is_stream_terminal(body: &Body) -> bool {
+    matches!(body, Body::StreamEnd(_) | Body::Error(_))
+}
+
+pub struct Mux {
+    out: mpsc::UnboundedSender<pb::Frame>,
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, Pending>>,
+    closed: AtomicBool,
+    closed_notify: Notify,
+}
+
+impl Mux {
+    /// Start the read and write tasks over the given half-streams, dispatching
+    /// inbound requests to `handler`. Returns a handle for issuing outbound
+    /// calls and sending responses.
+    pub fn start<R, W>(read: R, write: W, handler: Arc<dyn InboundHandler>) -> Arc<Mux>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<pb::Frame>();
+        let mux = Arc::new(Mux {
+            out: out_tx,
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            closed_notify: Notify::new(),
+        });
+
+        // writer task
+        tokio::spawn(writer_loop(write, out_rx));
+        // reader task — buffered so the length-prefix + body reads (and many
+        // pipelined frames) come from one syscall's worth of data.
+        let read = tokio::io::BufReader::with_capacity(64 * 1024, read);
+        tokio::spawn(reader_loop(read, Arc::clone(&mux), handler));
+
+        mux
+    }
+
+    fn alloc_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// True once the connection has closed (peer EOF or I/O error).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Resolves when the connection closes. A guest's `main` awaits this to
+    /// stay alive for the lifetime of the connection and exit on disconnect.
+    pub async fn wait_closed(&self) {
+        loop {
+            if self.is_closed() {
+                return;
+            }
+            let notified = self.closed_notify.notified();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Externally close the connection (e.g. a liveness watcher detected the
+    /// peer process died). Fails pending calls and ends `wait_closed`.
+    pub fn close(&self) {
+        self.mark_closed();
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+        // Drop every pending sender so in-flight unary calls observe
+        // RecvError (-> "connection closed") and streams end, instead of
+        // hanging forever when the peer dies mid-request (e.g. a plugin
+        // process that panicked/exited).
+        self.pending.lock().expect("mux pending").clear();
+        self.closed_notify.notify_waiters();
+    }
+
+    /// Send a frame with an explicit id (used by handlers to reply).
+    pub fn send_body(&self, id: u64, body: Body) {
+        drop(self.out.send(pb::Frame {
+            id,
+            body: Some(body),
+        }));
+    }
+
+    /// Issue a unary request and await its single response body.
+    pub async fn call(&self, body: Body) -> anyhow::Result<Body> {
+        self.call_cancellable(body, std::future::pending()).await
+    }
+
+    /// Like [`Mux::call`], but races the request against `cancel`. On cancel,
+    /// drops the pending waiter and sends a `Cancel` frame for the request id so
+    /// the serving side can abort, then returns an error. `cancel` is a bare
+    /// future (e.g. `ctoken.cancelled()`) so the mux needs no cancellation dep.
+    pub async fn call_cancellable<F>(&self, body: Body, cancel: F) -> anyhow::Result<Body>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        // Closing-the-connection race: if the peer dies after we insert the
+        // pending entry but the read loop already passed mark_closed, the entry
+        // would never be answered. Racing `wait_closed` guarantees the call
+        // returns instead of hanging.
+        if self.is_closed() {
+            anyhow::bail!("plugin connection closed");
+        }
+        let id = self.alloc_id();
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .expect("mux pending")
+            .insert(id, Pending::Unary(tx));
+        self.send_body(id, body);
+        tokio::pin!(cancel);
+        tokio::select! {
+            resp = rx => {
+                let resp = resp
+                    .map_err(|_e| anyhow::anyhow!("plugin connection closed before response"))?;
+                if let Body::Error(e) = resp {
+                    return Err(crate::error::WireError::from_pb(e).into());
+                }
+                Ok(resp)
+            }
+            () = &mut cancel => {
+                self.pending.lock().expect("mux pending").remove(&id);
+                self.send_body(id, Body::Cancel(pb::Cancel { request_id: id }));
+                anyhow::bail!("cancelled")
+            }
+            () = self.wait_closed() => {
+                self.pending.lock().expect("mux pending").remove(&id);
+                anyhow::bail!("plugin connection closed before response")
+            }
+        }
+    }
+
+    /// Issue a streaming request. The returned receiver yields response bodies
+    /// (`StreamItem`s) until a `StreamEnd`/`Error` arrives (which is forwarded
+    /// as the final body, then the channel closes).
+    pub fn call_stream(&self, body: Body) -> mpsc::UnboundedReceiver<Body> {
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending
+            .lock()
+            .expect("mux pending")
+            .insert(id, Pending::Stream(tx));
+        self.send_body(id, body);
+        rx
+    }
+
+    fn route_response(&self, id: u64, body: Body) {
+        let mut pending = self.pending.lock().expect("mux pending");
+        match pending.get(&id) {
+            Some(Pending::Unary(_)) => {
+                if let Some(Pending::Unary(tx)) = pending.remove(&id) {
+                    drop(tx.send(body));
+                }
+            }
+            Some(Pending::Stream(tx)) => {
+                let terminal = is_stream_terminal(&body);
+                drop(tx.send(body));
+                if terminal {
+                    pending.remove(&id);
+                }
+            }
+            None => {
+                tracing::warn!(id, "response for unknown request id");
+            }
+        }
+    }
+}
+
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut write: W,
+    mut rx: mpsc::UnboundedReceiver<pb::Frame>,
+) {
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Some(frame) = rx.recv().await {
+        // Coalesce every frame already queued into one buffer, so a burst of
+        // callbacks/responses costs a single write syscall instead of one each.
+        buf.clear();
+        if let Err(e) = encode_frame_into(&mut buf, &frame) {
+            tracing::warn!(error = %e, "frame encode failed; dropping");
+            continue;
+        }
+        while let Ok(frame) = rx.try_recv() {
+            if let Err(e) = encode_frame_into(&mut buf, &frame) {
+                tracing::warn!(error = %e, "frame encode failed; dropping");
+            }
+        }
+        if let Err(e) = write.write_all(&buf).await {
+            tracing::warn!(error = %e, "frame write failed; closing writer");
+            break;
+        }
+        if let Err(e) = write.flush().await {
+            tracing::warn!(error = %e, "frame flush failed; closing writer");
+            break;
+        }
+    }
+}
+
+async fn reader_loop<R: AsyncRead + Unpin>(
+    mut read: R,
+    mux: Arc<Mux>,
+    handler: Arc<dyn InboundHandler>,
+) {
+    loop {
+        match read_frame(&mut read).await {
+            Ok(Some(frame)) => {
+                let id = frame.id;
+                let Some(body) = frame.body else { continue };
+                if is_response(&body) {
+                    mux.route_response(id, body);
+                } else {
+                    // Inline cheap synchronous requests (no spawn, no task-hop);
+                    // spawn the rest so a slow/reentrant handler can't stall the
+                    // reader from draining further frames.
+                    match handler.try_inline(id, body) {
+                        Ok(reply) => mux.send_body(id, reply),
+                        Err(body) => {
+                            let mux = Arc::clone(&mux);
+                            let handler = Arc::clone(&handler);
+                            let body = *body;
+                            tokio::spawn(async move {
+                                handler.handle(id, body, mux).await;
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(None) => break, // peer closed
+            Err(e) => {
+                tracing::warn!(error = %e, "frame read failed; closing reader");
+                break;
+            }
+        }
+    }
+    mux.mark_closed();
+}

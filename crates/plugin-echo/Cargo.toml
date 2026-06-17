@@ -1,0 +1,24 @@
+[package]
+name = "plugin-echo"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "heph-plugin-echo"
+path = "src/main.rs"
+
+[dependencies]
+plugin-sdk = { path = "../plugin-sdk" }
+hplugin = { package = "plugin", path = "../plugin" }
+hmodel = { package = "model", path = "../model" }
+hcore = { package = "core", path = "../core" }
+anyhow = "1.0.102"
+futures = "0.3.32"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+plugin-remote = { path = "../plugin-remote" }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time"] }
