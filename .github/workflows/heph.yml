@@ -419,7 +419,10 @@ jobs:
   release:
     name: Release
     needs: [gen, upload_artifacts, lint, test]
-    if: github.ref == 'refs/heads/master'
+    # Disabled: `upload_artifacts` already publishes the build as a prerelease.
+    # This job promoted it to production + triggered the site deploy; turned off
+    # for now. Re-enable with `github.ref == 'refs/heads/master'`.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
