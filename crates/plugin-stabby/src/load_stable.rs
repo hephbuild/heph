@@ -49,6 +49,7 @@ pub type LoadedComponents = (
 pub fn load(
     path: &std::path::Path,
     root: &str,
+    home: &str,
     options: &[u8],
 ) -> anyhow::Result<LoadedComponents> {
     use crate::abi::PluginComponents;
@@ -68,6 +69,7 @@ pub fn load(
             .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
         create(CreateConfig {
             root: root.into(),
+            home: home.into(),
             options: stabby::vec::Vec::from(options),
         })
     };

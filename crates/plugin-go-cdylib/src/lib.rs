@@ -34,6 +34,7 @@ pub extern "C" fn heph_plugin_create(cfg: CreateConfig) -> PluginComponents {
 
 fn build(cfg: CreateConfig) -> anyhow::Result<PluginComponents> {
     let root = PathBuf::from(cfg.root.to_string());
+    let home = PathBuf::from(cfg.home.to_string());
 
     // Tunables come from the plugin's `options:` map (config yaml), decoded the
     // same way an in-process plugin reads its options.
@@ -43,8 +44,10 @@ fn build(cfg: CreateConfig) -> anyhow::Result<PluginComponents> {
     // rejects unknown keys (it knows only its provider options, e.g. `gotool`).
     let go_bin = hplugin::config::decode_opt::<String>(&options, "go", "go_bin")?
         .unwrap_or_else(|| "//@heph/bin:go".to_string());
+    // The walker db lives in the engine's home dir (e.g. `.heph3`), not the repo
+    // root — `home` comes from the engine, never hardcoded.
     let walk_db = hplugin::config::decode_opt::<PathBuf>(&options, "go", "walk_db")?
-        .unwrap_or_else(|| root.join(".heph-plugin-go-fswalk.db"));
+        .unwrap_or_else(|| home.join("heph-plugin-go-fswalk.db"));
     options.remove("go_bin");
     options.remove("walk_db");
 

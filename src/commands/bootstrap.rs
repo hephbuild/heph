@@ -247,11 +247,12 @@ fn load_dylib_plugins(
         return Ok(());
     }
     let root_str = root.to_string_lossy().into_owned();
+    let home_str = home_dir.to_string_lossy().into_owned();
     let loaded = manifests
         .into_par_iter()
         .map(|(src, options_pb)| -> anyhow::Result<_> {
             let dylib = resolve_manifest_dylib(&src, root, home_dir)?;
-            hplugin_stabby::load_stable::load(&dylib, &root_str, &options_pb)
+            hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, &options_pb)
                 .with_context(|| format!("load plugin dylib {}", dylib.display()))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;

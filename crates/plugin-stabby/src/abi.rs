@@ -144,13 +144,15 @@ pub type DynProvider = stabby::dynptr!(stabby::boxed::Box<dyn StableProvider + S
 pub type DynManagedDriver =
     stabby::dynptr!(stabby::boxed::Box<dyn StableManagedDriver + Send + Sync>);
 
-/// Config handed to a cdylib's create entry: the workspace root plus the
-/// plugin's `options:` map (from config yaml), encoded as a `plugin-abi`
-/// `pb::Value` map (prost bytes). The plugin decodes the options and instantiates
-/// its provider + drivers from them.
+/// Config handed to a cdylib's create entry: the workspace root, the engine's
+/// home dir (where a plugin should keep its state/scratch — e.g. `<root>/.heph3`,
+/// configurable; never hardcode it), and the plugin's `options:` map (from config
+/// yaml) encoded as a `plugin-abi` `pb::Value` map (prost bytes). The plugin
+/// decodes the options and instantiates its provider + drivers from them.
 #[stabby::stabby]
 pub struct CreateConfig {
     pub root: SString,
+    pub home: SString,
     pub options: SVec<u8>,
 }
 
