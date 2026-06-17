@@ -156,7 +156,7 @@ impl ManagedDriverFuse {
             return Ok(RunResponse {
                 artifacts: vec![],
                 sandbox_cleanup: sandbox_cleanup.take(),
-                fuse_slot_guards: erase(std::mem::take(&mut slot_guards)),
+                sandbox_guards: erase(std::mem::take(&mut slot_guards)),
             });
         }
 
@@ -165,7 +165,7 @@ impl ManagedDriverFuse {
         Ok(RunResponse {
             artifacts: res.artifacts,
             sandbox_cleanup: sandbox_cleanup.take(),
-            fuse_slot_guards: erase(slot_guards),
+            sandbox_guards: erase(slot_guards),
         })
     }
 }

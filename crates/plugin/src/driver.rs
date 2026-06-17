@@ -901,7 +901,7 @@ pub struct RunResponse {
     /// Result.rs holds them across `cache_locally` and drops them in the same
     /// defer that enqueues the sandbox-dir cleanup. Type-erased ([`SandboxGuard`])
     /// so the contract does not depend on the FUSE implementation.
-    pub fuse_slot_guards: Vec<SandboxGuard>,
+    pub sandbox_guards: Vec<SandboxGuard>,
 }
 
 /// One config field a driver accepts in a `target(...)` call, with its type and

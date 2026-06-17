@@ -103,7 +103,7 @@ impl ManagedDriverOs {
             return Ok(RunResponse {
                 artifacts: vec![],
                 sandbox_cleanup: sandbox_cleanup.take(),
-                fuse_slot_guards: Vec::new(),
+                sandbox_guards: Vec::new(),
             });
         }
 
@@ -112,7 +112,7 @@ impl ManagedDriverOs {
         Ok(RunResponse {
             artifacts: res.artifacts,
             sandbox_cleanup: sandbox_cleanup.take(),
-            fuse_slot_guards: Vec::new(),
+            sandbox_guards: Vec::new(),
         })
     }
 }

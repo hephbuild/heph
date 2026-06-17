@@ -3655,6 +3655,7 @@ dependencies = [
  "plugin-stabby",
  "prost 0.14.4",
  "stabby",
+ "tempfile",
  "tokio",
 ]
 

@@ -7,8 +7,9 @@
 //! direct calls — no mux, no channels, no task spawn (see ai-docs/PERFORMANCE.md).
 
 use crate::guest::GuestExecutor;
-use anyhow::Result;
-use hcore::hartifactcontent::{Content, WalkEntry};
+use anyhow::{Context, Result};
+use hcore::hartifactcontent::tar::TarPacker;
+use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::StdCancellationToken;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunInput, ManagedRunRequest};
 use hmodel::htpkg::PkgBuf;
@@ -398,9 +399,14 @@ fn run_input_from_pb(mi: &pb::ManagedRunInput) -> RunInput {
         artifact: inputartifact::InputArtifact {
             r#type: ty,
             origin_id: mi.origin_id.clone(),
-            // Input bytes live on the shared filesystem (unpack_root); read from
-            // disk, never from this Content.
-            content: Arc::new(NullContent),
+            // The host already materialized this input onto the shared filesystem
+            // before invoking the driver. Back the content by those on-disk files
+            // so a driver may read it (`walk`/`reader`) just like in-process —
+            // no bytes are re-shipped over the boundary.
+            content: Arc::new(DiskInputContent {
+                unpack_root: PathBuf::from(&mi.unpack_root),
+                list_path: mi.list_path.clone().map(PathBuf::from),
+            }),
         },
         origin_id: mi.origin_id.clone(),
         source_addr: convert::addr_from_pb(mi.source_addr.clone().unwrap_or_default()),
@@ -422,17 +428,179 @@ fn managed_input_from_pb(mi: pb::ManagedRunInput) -> ManagedRunInput {
     }
 }
 
-/// Placeholder Content for materialized run inputs — bytes live on the shared
-/// filesystem (unpack_root), so this is never read.
-struct NullContent;
-impl Content for NullContent {
+/// [`Content`] for a managed run input, backed by the files the host already
+/// materialized onto the shared filesystem under `unpack_root`. `list_path` (Dep
+/// inputs) names the exact absolute paths of this input's files; without it
+/// (Support inputs) the whole `unpack_root` tree is walked. `walk` reads those
+/// files from disk; `reader` re-tars them (artifacts are tar by convention).
+struct DiskInputContent {
+    unpack_root: PathBuf,
+    list_path: Option<PathBuf>,
+}
+
+impl DiskInputContent {
+    /// Absolute paths of this input's materialized files.
+    fn files(&self) -> Result<Vec<PathBuf>> {
+        if let Some(lp) = &self.list_path {
+            let data = std::fs::read_to_string(lp)
+                .with_context(|| format!("read input list file {}", lp.display()))?;
+            return Ok(data
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .collect());
+        }
+        // Support inputs carry no list file; walk the materialized tree.
+        let mut out = Vec::new();
+        let mut stack = vec![self.unpack_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("read dir {}", dir.display()));
+                }
+            };
+            for entry in rd {
+                let entry = entry?;
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    out.push(entry.path());
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Content for DiskInputContent {
     fn reader(&self) -> Result<Box<dyn Read>> {
-        anyhow::bail!("managed run input content is on disk (unpack_root), not streamed")
+        let mut packer = TarPacker::new();
+        for abs in self.files()? {
+            let rel = abs.strip_prefix(&self.unpack_root).unwrap_or(&abs);
+            packer.create_file(
+                abs.to_string_lossy().into_owned(),
+                rel.to_string_lossy().into_owned(),
+            );
+        }
+        let mut buf = Vec::new();
+        packer
+            .pack(&mut buf)
+            .context("pack managed input content")?;
+        Ok(Box::new(std::io::Cursor::new(buf)))
     }
+
     fn walk(&self) -> Result<Box<dyn Iterator<Item = Result<WalkEntry>> + '_>> {
-        anyhow::bail!("managed run input content is on disk (unpack_root), not streamed")
+        let root = self.unpack_root.clone();
+        let iter = self.files()?.into_iter().map(move |abs| {
+            let rel = abs.strip_prefix(&root).unwrap_or(&abs).to_path_buf();
+            let meta = std::fs::symlink_metadata(&abs)
+                .with_context(|| format!("stat input file {}", abs.display()))?;
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&abs)
+                    .with_context(|| format!("readlink {}", abs.display()))?;
+                return Ok(WalkEntry {
+                    path: rel,
+                    kind: WalkEntryKind::Symlink { target },
+                });
+            }
+            let x = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    false
+                }
+            };
+            let f = std::fs::File::open(&abs).with_context(|| format!("open {}", abs.display()))?;
+            Ok(WalkEntry {
+                path: rel,
+                kind: WalkEntryKind::File {
+                    data: Box::new(f),
+                    x,
+                },
+            })
+        });
+        Ok(Box::new(iter))
     }
+
     fn hashout(&self) -> Result<String> {
+        // The hashout isn't carried on the run wire; inputs are addressed by path
+        // here, not by content hash.
         Ok(String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::io::{Read as _, Write as _};
+
+    // A managed input's content is readable from the files the host materialized
+    // under unpack_root, scoped to this input's files via the list file.
+    #[test]
+    fn disk_input_content_walks_and_tars_listed_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir");
+        std::fs::write(root.join("a.txt"), b"alpha").expect("write a");
+        std::fs::write(root.join("sub/b.txt"), b"beta").expect("write b");
+        // A sibling file NOT in the list must be excluded (proves per-input scoping).
+        std::fs::write(root.join("other.txt"), b"nope").expect("write other");
+
+        let list = root.join("input.list");
+        {
+            let mut f = std::fs::File::create(&list).expect("list");
+            writeln!(f, "{}", root.join("a.txt").display()).expect("w");
+            writeln!(f, "{}", root.join("sub/b.txt").display()).expect("w");
+        }
+
+        let content = DiskInputContent {
+            unpack_root: root.clone(),
+            list_path: Some(list),
+        };
+
+        // walk(): exactly the listed files, with their bytes, relative to root.
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for e in content.walk().expect("walk") {
+            let mut e = e.expect("entry");
+            if let WalkEntryKind::File { data, .. } = &mut e.kind {
+                let mut s = String::new();
+                data.read_to_string(&mut s).expect("read");
+                seen.insert(e.path.to_string_lossy().into_owned(), s);
+            }
+        }
+        assert_eq!(seen.get("a.txt").map(String::as_str), Some("alpha"));
+        assert_eq!(seen.get("sub/b.txt").map(String::as_str), Some("beta"));
+        assert!(!seen.contains_key("other.txt"), "must scope to the list");
+
+        // reader(): a tar of the same files.
+        let mut buf = Vec::new();
+        content
+            .reader()
+            .expect("reader")
+            .read_to_end(&mut buf)
+            .expect("read tar");
+        let entries: BTreeMap<String, String> =
+            hcore::hartifactcontent::tar::TarWalker::new(std::io::Cursor::new(buf))
+                .expect("tar walker")
+                .map(|e| {
+                    let mut e = e.expect("tar entry");
+                    let mut s = String::new();
+                    if let WalkEntryKind::File { data, .. } = &mut e.kind {
+                        data.read_to_string(&mut s).expect("read tar file");
+                    }
+                    (e.path.to_string_lossy().into_owned(), s)
+                })
+                .collect();
+        assert_eq!(entries.get("a.txt").map(String::as_str), Some("alpha"));
+        assert_eq!(entries.get("sub/b.txt").map(String::as_str), Some("beta"));
+        assert!(!entries.contains_key("other.txt"));
     }
 }

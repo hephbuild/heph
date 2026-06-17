@@ -48,3 +48,4 @@ stabby = [
 # The guest↔host round-trip test exercises the host adapter too.
 hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }
 futures = "0.3.32"
+tempfile = "3"
