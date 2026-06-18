@@ -74,6 +74,160 @@ pub fn value_from_pb(v: pb::Value) -> Value {
     }
 }
 
+// ---- Provider functions (signature + def) ----
+//
+// A provider's BUILD-file functions cross the stable ABI as metadata (name /
+// signature / doc); the handler stays guest-side and is invoked via
+// `call_function`. The host reconstructs the `FnSignature` to enforce arity/type
+// and render it (`heph inspect functions`, LSP hover).
+
+use hcore::htvalue::signature::{FnSignature, Param, ParamType};
+
+pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
+    use pb::param_type::{Kind, Scalar, Union};
+    let kind = match t {
+        ParamType::String => Kind::Scalar(Scalar::String as i32),
+        ParamType::Bool => Kind::Scalar(Scalar::Bool as i32),
+        ParamType::Int => Kind::Scalar(Scalar::Int as i32),
+        ParamType::Uint => Kind::Scalar(Scalar::Uint as i32),
+        ParamType::Float => Kind::Scalar(Scalar::Float as i32),
+        ParamType::Null => Kind::Scalar(Scalar::Null as i32),
+        ParamType::List(inner) => Kind::List(Box::new(param_type_to_pb(inner))),
+        ParamType::Map(value) => Kind::Map(Box::new(param_type_to_pb(value))),
+        ParamType::Union(types) => Kind::Union(Union {
+            types: types.iter().map(param_type_to_pb).collect(),
+        }),
+    };
+    pb::ParamType { kind: Some(kind) }
+}
+
+pub fn param_type_from_pb(t: pb::ParamType) -> ParamType {
+    use pb::param_type::{Kind, Scalar};
+    match t.kind {
+        Some(Kind::Scalar(s)) => match Scalar::try_from(s).unwrap_or(Scalar::Unspecified) {
+            Scalar::String | Scalar::Unspecified => ParamType::String,
+            Scalar::Bool => ParamType::Bool,
+            Scalar::Int => ParamType::Int,
+            Scalar::Uint => ParamType::Uint,
+            Scalar::Float => ParamType::Float,
+            Scalar::Null => ParamType::Null,
+        },
+        Some(Kind::List(inner)) => ParamType::list(param_type_from_pb(*inner)),
+        Some(Kind::Map(value)) => ParamType::map(param_type_from_pb(*value)),
+        Some(Kind::Union(u)) => {
+            ParamType::union(u.types.into_iter().map(param_type_from_pb).collect())
+        }
+        None => ParamType::Null,
+    }
+}
+
+fn param_to_pb(p: &Param) -> pb::Param {
+    pb::Param {
+        name: p.name.to_string(),
+        ty: Some(param_type_to_pb(&p.ty)),
+        default: p.default.as_ref().map(value_to_pb),
+    }
+}
+
+fn param_from_pb(p: pb::Param) -> Param {
+    // `Param::name` is `&'static str` (in-process defs use string literals).
+    // A def reconstructed from the wire owns its name; leak it to obtain the
+    // 'static borrow. Functions are read once per process (registry wiring is a
+    // `Once`), so this is a bounded, one-time leak — not a per-call cost.
+    let name: &'static str = Box::leak(p.name.into_boxed_str());
+    let ty = p.ty.map(param_type_from_pb).unwrap_or(ParamType::Null);
+    match p.default {
+        Some(d) => Param::optional(name, ty, value_from_pb(d)),
+        None => Param::required(name, ty),
+    }
+}
+
+pub fn fn_signature_to_pb(s: &FnSignature) -> pb::FnSignature {
+    pb::FnSignature {
+        positional: s.positional.iter().map(param_to_pb).collect(),
+        named: s.named.iter().map(param_to_pb).collect(),
+        variadic: s.variadic.as_ref().map(param_to_pb),
+        returns: Some(param_type_to_pb(&s.returns)),
+    }
+}
+
+pub fn fn_signature_from_pb(s: pb::FnSignature) -> FnSignature {
+    FnSignature {
+        positional: s.positional.into_iter().map(param_from_pb).collect(),
+        named: s.named.into_iter().map(param_from_pb).collect(),
+        variadic: s.variadic.map(param_from_pb),
+        returns: s.returns.map(param_type_from_pb).unwrap_or(ParamType::Null),
+    }
+}
+
+// ---- Schemas (provider state + driver config) ----
+//
+// `provider::StateField`/`StateSchema` and `driver::DriverField`/`DriverSchema`
+// are the same declarative shape; both cross as `pb::SchemaField`/`pb::Schema`.
+
+use hplugin::driver::{DriverField, DriverSchema};
+use hplugin::provider::{StateField, StateSchema};
+
+pub fn state_schema_to_pb(s: &StateSchema) -> pb::Schema {
+    pb::Schema {
+        fields: s
+            .fields
+            .iter()
+            .map(|f| pb::SchemaField {
+                name: f.name.clone(),
+                ty: Some(param_type_to_pb(&f.ty)),
+                doc: f.doc.clone(),
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
+pub fn state_schema_from_pb(s: pb::Schema) -> StateSchema {
+    StateSchema {
+        fields: s
+            .fields
+            .into_iter()
+            .map(|f| StateField {
+                name: f.name,
+                ty: f.ty.map(param_type_from_pb).unwrap_or(ParamType::Null),
+                doc: f.doc,
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
+pub fn driver_schema_to_pb(s: &DriverSchema) -> pb::Schema {
+    pb::Schema {
+        fields: s
+            .fields
+            .iter()
+            .map(|f| pb::SchemaField {
+                name: f.name.clone(),
+                ty: Some(param_type_to_pb(&f.ty)),
+                doc: f.doc.clone(),
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
+pub fn driver_schema_from_pb(s: pb::Schema) -> DriverSchema {
+    DriverSchema {
+        fields: s
+            .fields
+            .into_iter()
+            .map(|f| DriverField {
+                name: f.name,
+                ty: f.ty.map(param_type_from_pb).unwrap_or(ParamType::Null),
+                doc: f.doc,
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
 // ---- Options (plugin config map) ----
 //
 // A plugin's `options:` map (`BTreeMap<String, serde_yaml::Value>`) crosses the

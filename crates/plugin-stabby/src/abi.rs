@@ -110,6 +110,21 @@ pub trait StableExecutor {
 /// plugin's `get`/`parse`.
 pub type DynExecutor = stabby::dynptr!(stabby::boxed::Box<dyn StableExecutor + Send + Sync>);
 
+/// The host's provider-function registry, called by a plugin that was handed the
+/// aggregate registry (via `set_function_registry`) and wants to invoke one of
+/// the functions in it. Mirrors a lookup + [`hplugin::provider::ProviderFn::call`]
+/// on the host side. `req` is raw `pb::CallRegisteredRequest` bytes; the reply is
+/// a `pb::Frame` carrying `CallFunctionResp` (the returned value) or `Error`.
+#[stabby::stabby]
+pub trait StableFunctionRegistry {
+    extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+}
+
+/// An owned, ABI-stable handle to the host's function registry — what the host
+/// passes into the plugin's `set_function_registry`.
+pub type DynFunctionRegistry =
+    stabby::dynptr!(stabby::boxed::Box<dyn StableFunctionRegistry + Send + Sync>);
+
 /// The cold provider surface, called by the host. Direct stabby vtable dispatch —
 /// no async mux, no channels, no duplex (that machinery was the entire cold-path
 /// cost; see ai-docs/PERFORMANCE.md). Requests/responses cross as prost-encoded
@@ -127,6 +142,24 @@ pub trait StableProvider {
     extern "C" fn list_packages<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
     extern "C" fn get<'a>(&'a self, req: SVec<u8>, exec: DynExecutor) -> DynFuture<'a, SVec<u8>>;
     extern "C" fn probe<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    /// The BUILD-file functions this provider exposes, as prost-encoded
+    /// `pb::FunctionsResponse` bytes (metadata only — handlers stay guest-side,
+    /// reached via `call_function`). Sync: it is provider-static metadata read
+    /// once during host registry wiring, not a per-request call.
+    extern "C" fn functions(&self) -> SVec<u8>;
+    /// Invoke one exposed function by name. `req` is raw `pb::CallFunctionRequest`
+    /// bytes; the reply is a `pb::Frame` carrying `CallFunctionResp` or `Error`.
+    extern "C" fn call_function<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    /// The provider's state schema (the kwargs of `provider_state(provider=…, …)`)
+    /// as prost-encoded `pb::Schema` bytes. An EMPTY `SVec` means the provider
+    /// declares no schema (`None`); an encoded (possibly fields-empty) `Schema`
+    /// means it does. Sync provider-static metadata, like `functions`.
+    extern "C" fn state_schema(&self) -> SVec<u8>;
+    /// Hand the provider the aggregate registry of every provider's functions:
+    /// `metadata` is prost `pb::FunctionRegistry` bytes (names/signatures/docs);
+    /// `reg` is the host callback used to actually invoke any of them. Called once
+    /// before the first dispatch, mirroring [`hplugin::provider::Provider::set_function_registry`].
+    extern "C" fn set_function_registry(&self, metadata: SVec<u8>, reg: DynFunctionRegistry);
 }
 
 /// The cold managed-driver surface (same transport contract as [`StableProvider`]).
@@ -137,6 +170,9 @@ pub trait StableManagedDriver {
     extern "C" fn apply_transitive<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
     /// `shell` selects `run_shell` over `run`.
     extern "C" fn run<'a>(&'a self, req: SVec<u8>, shell: bool) -> DynFuture<'a, SVec<u8>>;
+    /// The driver's config schema (the driver-specific kwargs of `target(...)`)
+    /// as prost-encoded `pb::Schema` bytes. Sync driver-static metadata.
+    extern "C" fn schema(&self) -> SVec<u8>;
 }
 
 /// Owned ABI-stable handles to a loaded plugin's components.

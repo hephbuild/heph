@@ -1,9 +1,9 @@
 syntax = "proto3";
 
 // Provider-exported methods. Mirrors the hplugin::Provider trait.
-// NOTE: functions()/state_schema() (BUILD-file Starlark integration) are not
-// yet modeled here; they are not on the remote data path and will be added
-// when the remote provider needs to surface provider functions.
+// NOTE: state_schema() (BUILD-file LSP integration) is not yet modeled here;
+// functions() (below) is, so dylib-wrapped providers surface their BUILD-file
+// functions to `heph inspect functions` and to BUILD evaluation.
 package heph.plugin.v1;
 
 import "plugin/v1/common.proto";
@@ -59,4 +59,119 @@ message ProbeRequest {
 }
 message ProbeResponse {
   repeated State states = 1;
+}
+
+// ---- Provider functions (BUILD-file Starlark integration) ----
+//
+// A provider exposes named functions to BUILD files as `heph.<provider>.<fn>`.
+// `functions()` returns their metadata (name/signature/doc) so the host can
+// register and render them; `call_function` invokes one by name.
+
+// Mirrors hcore::htvalue::signature::ParamType (recursive).
+message ParamType {
+  enum Scalar {
+    SCALAR_UNSPECIFIED = 0;
+    SCALAR_STRING = 1;
+    SCALAR_BOOL = 2;
+    SCALAR_INT = 3;
+    SCALAR_UINT = 4;
+    SCALAR_FLOAT = 5;
+    SCALAR_NULL = 6;
+  }
+  message Union {
+    repeated ParamType types = 1;
+  }
+  oneof kind {
+    Scalar scalar = 1;
+    ParamType list = 2; // homogeneous list element type
+    ParamType map = 3;  // string-keyed map value type
+    Union union = 4;
+  }
+}
+
+// Mirrors signature::Param. An unset `default` means the parameter is required.
+message Param {
+  string name = 1;
+  ParamType ty = 2;
+  optional Value default = 3;
+}
+
+// Mirrors signature::FnSignature.
+message FnSignature {
+  repeated Param positional = 1;
+  repeated Param named = 2;
+  optional Param variadic = 3;
+  ParamType returns = 4;
+}
+
+// Mirrors provider::ProviderFunctionDef sans its handler (which stays guest-side
+// and is reached via call_function).
+message ProviderFunctionDef {
+  string name = 1;
+  FnSignature signature = 2;
+  string doc = 3;
+}
+
+// Reply to the provider `functions()` ABI call.
+message FunctionsResponse {
+  repeated ProviderFunctionDef functions = 1;
+}
+
+// Invoke a provider function by name. `pkg`/`root` reconstruct the
+// FnCallContext; `positional`/`named` are the call arguments.
+message CallFunctionRequest {
+  string name = 1;
+  string pkg = 2;
+  string root = 3;
+  repeated Value positional = 4;
+  map<string, Value> named = 5;
+}
+message CallFunctionResponse {
+  Value value = 1;
+}
+
+// ---- Schemas (provider state + driver config) ----
+//
+// One declarative keyword-arg surface, shared by provider `state_schema()`
+// (the args of `provider_state(provider=…, …)`) and driver `schema()` (the
+// driver-specific kwargs of a `target(...)`). Consumed by the BUILD-file LSP.
+
+// Mirrors provider::StateField / driver::DriverField.
+message SchemaField {
+  string name = 1;
+  ParamType ty = 2;
+  string doc = 3;
+  bool required = 4;
+}
+// Mirrors provider::StateSchema / driver::DriverSchema.
+message Schema {
+  repeated SchemaField fields = 1;
+}
+
+// ---- Function registry injection (set_function_registry) ----
+//
+// The host hands a provider the aggregate of every provider's functions. The
+// metadata (below) crosses once; handlers are reached back over the host
+// callback (`call_registered`, mirroring the executor callback).
+
+// One registered function's metadata, addressed by `provider`.`name`.
+message RegisteredFunction {
+  string provider = 1;
+  string name = 2;
+  FnSignature signature = 3;
+  string doc = 4;
+}
+message FunctionRegistry {
+  repeated RegisteredFunction functions = 1;
+}
+
+// Invoke a registered function on the host (the inverse of CallFunctionRequest:
+// the addressing carries the owning `provider`).
+message CallRegisteredRequest {
+  string provider = 1;
+  string name = 2;
+  string pkg = 3;
+  string root = 4;
+  repeated Value positional = 5;
+  map<string, Value> named = 6;
 }
