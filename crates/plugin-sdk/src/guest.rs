@@ -143,9 +143,7 @@ impl Content for StableContent {
             self.reader()?,
         )?))
     }
-    fn seekable_reader(
-        &self,
-    ) -> Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>> {
+    fn seekable_reader(&self) -> Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>> {
         // A file-backed artifact is seekable directly; the stream handle is not.
         let p = self.handle.path();
         if p.is_empty() {

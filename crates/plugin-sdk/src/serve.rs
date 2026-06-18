@@ -27,17 +27,17 @@ use hplugin_stabby::abi::{
     DynExecutor, DynFunctionRegistry, DynItemStream, StableCancel, StableFunctionRegistryDyn,
     StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta, StableProvider,
 };
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use plugin_abi::convert;
 use plugin_abi::pb;
 use plugin_abi::pb::frame::Body;
 use prost::Message;
 use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::vec::Vec as SVec;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 /// The cdylib's own tokio runtime. A loaded cdylib's statically-linked tokio is a
 /// separate instance from the host's, so async work that touches the reactor (a
@@ -316,7 +316,10 @@ async fn provider_list_stream(provider: Arc<dyn Provider>, req: SVec<u8>) -> Dyn
     }
 }
 
-async fn provider_list_packages_stream(provider: Arc<dyn Provider>, req: SVec<u8>) -> DynItemStream {
+async fn provider_list_packages_stream(
+    provider: Arc<dyn Provider>,
+    req: SVec<u8>,
+) -> DynItemStream {
     let req = pb::ListPackagesRequest::decode(&req[..]).unwrap_or_default();
     let tok = StdCancellationToken::new();
     let lreq = ListPackagesRequest {
@@ -394,7 +397,10 @@ async fn provider_call_function(provider: Arc<dyn Provider>, req: SVec<u8>) -> S
         .into_iter()
         .find(|d| d.name == req.name);
     let Some(def) = def else {
-        return unary(err_body(format!("unknown provider function `{}`", req.name)));
+        return unary(err_body(format!(
+            "unknown provider function `{}`",
+            req.name
+        )));
     };
     let ctx = FnCallContext {
         pkg: &req.pkg,
@@ -457,7 +463,11 @@ fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
     }
 }
 
-fn provider_set_registry(provider: &Arc<dyn Provider>, metadata: SVec<u8>, reg: DynFunctionRegistry) {
+fn provider_set_registry(
+    provider: &Arc<dyn Provider>,
+    metadata: SVec<u8>,
+    reg: DynFunctionRegistry,
+) {
     let meta = pb::FunctionRegistry::decode(&metadata[..]).unwrap_or_default();
     // Shared across every proxy handler — each dispatches back over the host
     // callback to invoke the actual function.
@@ -1282,8 +1292,7 @@ mod tests {
             }
         }
 
-        let host =
-            StableRemoteProvider::new(make_dyn_provider(Arc::new(BlockingProbe)), "blocker");
+        let host = StableRemoteProvider::new(make_dyn_provider(Arc::new(BlockingProbe)), "blocker");
         let ct = StdCancellationToken::new();
         let preq = ProbeRequest {
             request_id: "rq-1".into(),
@@ -1362,7 +1371,9 @@ mod tests {
         }
     }
 
-    fn list_all(items: Vec<std::result::Result<&'static str, &'static str>>) -> Vec<Result<String>> {
+    fn list_all(
+        items: Vec<std::result::Result<&'static str, &'static str>>,
+    ) -> Vec<Result<String>> {
         use hcore::hasync::StdCancellationToken;
         use hplugin_stabby::load_stable::StableRemoteProvider;
 
@@ -1457,9 +1468,8 @@ mod tests {
         .encode_to_vec();
         let req_stream = make_item_stream(Box::new(std::iter::once(start)));
 
-        let resp = futures::executor::block_on(
-            dynd.invoke_bidi(pb::DriverMethod::Run as u32, req_stream),
-        );
+        let resp =
+            futures::executor::block_on(dynd.invoke_bidi(pb::DriverMethod::Run as u32, req_stream));
         // `next` blocks on the run task; drain on a thread.
         let frames = std::thread::spawn(move || {
             let mut out: Vec<Vec<u8>> = Vec::new();

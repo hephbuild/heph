@@ -314,7 +314,10 @@ impl Provider for StableRemoteProvider {
                 stream,
                 decode: decode_list_item,
                 done: false,
-            }) as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
+            })
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
 
@@ -340,7 +343,9 @@ impl Provider for StableRemoteProvider {
                 decode: decode_list_package_item,
                 done: false,
             })
-                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                >)
         })
     }
 
@@ -642,7 +647,10 @@ impl StableRemoteManagedDriver {
         .encode_to_vec();
         let resp_stream = self
             .inner
-            .invoke_bidi(pb::DriverMethod::Run as u32, host_item_stream(vec![in_frame]))
+            .invoke_bidi(
+                pb::DriverMethod::Run as u32,
+                host_item_stream(vec![in_frame]),
+            )
             .await;
         // The response stream's `next` blocks (on subprocess output), so drain it on
         // a dedicated thread and bridge the result back — while watching `ct` so a

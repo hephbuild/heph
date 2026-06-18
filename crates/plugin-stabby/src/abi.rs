@@ -159,8 +159,7 @@ pub trait StableItemStream {
 }
 
 /// An owned, ABI-stable item-stream handle (a request or response stream).
-pub type DynItemStream =
-    stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream + Send + Sync>);
+pub type DynItemStream = stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream + Send + Sync>);
 
 /// The cold provider surface as a FROZEN generic dispatch. The `method` id
 /// (`pb::ProviderMethod`) selects an RPC; payloads cross as prost-encoded
