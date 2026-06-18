@@ -58,6 +58,11 @@ message Error {
     KIND_CANCELLED = 2;
     KIND_NOT_FOUND = 3;
     KIND_CYCLE = 4;
+    // The plugin does not implement the dispatched method id. Returned by a
+    // plugin built against an older ABI minor when a newer host calls a method
+    // it predates — the host treats it as "capability absent" and falls back,
+    // never a hard failure. This is what makes added dispatch methods additive.
+    KIND_UNIMPLEMENTED = 5;
   }
   Kind kind = 1;
   string message = 2;

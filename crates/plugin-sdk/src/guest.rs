@@ -2,7 +2,7 @@
 //! ProviderExecutor`] so plugin code calls back exactly as in-process — the calls
 //! are direct stabby vtable dispatch into the host, no serialization.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hmodel::htaddr::Addr;
@@ -127,12 +127,31 @@ struct StableContent {
 
 impl Content for StableContent {
     fn reader(&self) -> Result<Box<dyn Read>> {
+        // In-process: if the host artifact is a real on-disk file, open it
+        // directly — no per-chunk hop across the seam. Empty path => stream over
+        // the handle (synthetic / non-file content).
+        let p = self.handle.path();
+        if !p.is_empty() {
+            return Ok(Box::new(
+                std::fs::File::open(&*p).with_context(|| format!("open artifact file {p}"))?,
+            ));
+        }
         Ok(Box::new(GuestRead::new(self.handle.open())))
     }
     fn walk(&self) -> Result<Box<dyn Iterator<Item = Result<WalkEntry>> + '_>> {
         Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
             self.reader()?,
         )?))
+    }
+    fn seekable_reader(&self) -> Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>> {
+        // A file-backed artifact is seekable directly; the stream handle is not.
+        let p = self.handle.path();
+        if p.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(
+            std::fs::File::open(&*p).with_context(|| format!("open artifact file {p}"))?,
+        )))
     }
     fn hashout(&self) -> Result<String> {
         Ok(self.handle.hashout().to_string())
@@ -267,6 +286,89 @@ mod tests {
             .unwrap()
             .read_to_end(&mut buf2)
             .unwrap();
+        assert_eq!(buf2, big_payload());
+    }
+
+    struct MockExecFile {
+        path: std::path::PathBuf,
+    }
+    impl ProviderExecutor for MockExecFile {
+        fn note_dep<'a>(&'a self, _addr: &'a Addr) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn result<'a>(&'a self, _addr: &'a Addr) -> BoxFuture<'a, Result<Arc<EResult>>> {
+            let path = self.path.clone();
+            Box::pin(async move {
+                Ok(Arc::new(EResult {
+                    artifacts: vec![Arc::new(FileBacked { path }) as Arc<dyn Content>],
+                    support_artifacts: vec![],
+                    artifacts_meta: vec![ArtifactMeta {
+                        hashout: "h2".into(),
+                    }],
+                }))
+            })
+        }
+        fn query<'a>(
+            &'a self,
+            _m: &'a Matcher,
+            _s: &'a [String],
+        ) -> BoxFuture<'a, Result<Vec<Addr>>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    /// A file-backed artifact: its byte stream deliberately errors, so reading it
+    /// at all proves the consumer went through `file_path`, not `reader()`/`open()`.
+    struct FileBacked {
+        path: std::path::PathBuf,
+    }
+    impl Content for FileBacked {
+        fn reader(&self) -> Result<Box<dyn Read>> {
+            anyhow::bail!("file-backed artifact must be read via file_path, not the stream")
+        }
+        fn walk(&self) -> Result<Box<dyn Iterator<Item = Result<WalkEntry>> + '_>> {
+            anyhow::bail!("no walk in test")
+        }
+        fn hashout(&self) -> Result<String> {
+            Ok("h2".into())
+        }
+        fn file_path(&self) -> Option<std::path::PathBuf> {
+            Some(self.path.clone())
+        }
+    }
+
+    // A file-backed result artifact crosses the seam as a PATH: the guest opens the
+    // real file directly rather than streaming chunks over the vtable. (The host
+    // Content's stream bails, so any successful read proves the path was used.)
+    #[test]
+    fn file_backed_artifact_reads_from_disk_not_stream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("art.bin");
+        std::fs::write(&path, big_payload()).expect("write artifact");
+
+        let mock = Arc::new(MockExecFile { path });
+        let dynexec = HostExecutor::wrap(mock as Arc<dyn ProviderExecutor>);
+        let guest = GuestExecutor::new(dynexec);
+        let addr = parse_addr("//pkg/a:b").expect("parse addr");
+
+        let eres = futures::executor::block_on(guest.result(&addr)).expect("result");
+        assert_eq!(eres.artifacts.len(), 1);
+
+        let mut buf = Vec::new();
+        eres.artifacts[0]
+            .reader()
+            .expect("reader opens the file directly")
+            .read_to_end(&mut buf)
+            .expect("read");
+        assert_eq!(buf, big_payload(), "bytes must match the on-disk file");
+
+        // seekable_reader() also serves the real file (enables tar-index/FUSE paths).
+        let mut seek = eres.artifacts[0]
+            .seekable_reader()
+            .expect("seekable_reader")
+            .expect("Some for file-backed");
+        let mut buf2 = Vec::new();
+        seek.read_to_end(&mut buf2).expect("read seekable");
         assert_eq!(buf2, big_payload());
     }
 }

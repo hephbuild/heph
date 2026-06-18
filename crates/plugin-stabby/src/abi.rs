@@ -60,6 +60,12 @@ pub trait StableArtifactContent {
     extern "C" fn hashout(&self) -> SString;
     /// Byte size hint; `u64::MAX` means unknown.
     extern "C" fn byte_size(&self) -> u64;
+    /// The artifact's on-disk path when it is a real local file (e.g. an on-disk
+    /// cache artifact). EMPTY means not file-backed (synthetic/in-memory). Since
+    /// host and guest share the process and filesystem, a non-empty path lets the
+    /// guest open the file directly instead of pulling its bytes chunk-by-chunk
+    /// through [`open`](StableArtifactContent::open) — no per-chunk vtable hop.
+    extern "C" fn path(&self) -> SString;
 }
 
 /// An owned, ABI-stable artifact handle.
@@ -125,72 +131,130 @@ pub trait StableFunctionRegistry {
 pub type DynFunctionRegistry =
     stabby::dynptr!(stabby::boxed::Box<dyn StableFunctionRegistry + Send + Sync>);
 
-/// The cold provider surface, called by the host. Direct stabby vtable dispatch —
-/// no async mux, no channels, no duplex (that machinery was the entire cold-path
-/// cost; see ai-docs/PERFORMANCE.md). Requests/responses cross as prost-encoded
-/// `pb::Frame` bytes (cheap, low-volume, lenient via protobuf); the host decodes
-/// the response `Body`. `get` additionally takes the native [`DynExecutor`] so the
-/// plugin's hot callbacks during resolution are direct calls.
+/// Static, request-less plugin metadata (config name, provider `functions` /
+/// `state_schema`, driver `schema`), kept in its OWN sync trait so the evolvable
+/// RPC dispatch surface ([`StableProvider`] / [`StableManagedDriver`]) stays
+/// purely the async method dispatch. Composed into both handle types. `kind` is a
+/// `pb::ProviderMethod` / `pb::DriverMethod` selecting which metadatum; the reply
+/// is that metadatum's prost bytes (an EMPTY `SVec` encodes "none", e.g. a
+/// provider with no `state_schema`). Sync because it is read once during registry
+/// wiring, never on a hot path. Same append-only contract as the async dispatch.
+#[stabby::stabby]
+pub trait StableMeta {
+    extern "C" fn meta(&self, kind: u32) -> SVec<u8>;
+}
+
+/// A pull stream of items across the seam (the streaming counterpart of the unary
+/// `SVec<u8>` reply). Each `next` yields one prost length-delimited `pb::Frame`
+/// (`StreamItem` for an item, or `StreamEnd{error}` to end with failure); an EMPTY
+/// `SVec` means the stream is exhausted cleanly. Used for BOTH directions — a
+/// request stream (host → plugin) and a response stream (plugin → host). `&self`
+/// (not `&mut`) so it dispatches over the stable vtable; implementors use interior
+/// mutability for the cursor. Unlike [`DynRead`], the handle is `Send + Sync`
+/// (`Mutex`-guarded cursor) because list results flow into the engine, which
+/// requires `Send` iterators.
+#[stabby::stabby]
+pub trait StableItemStream {
+    extern "C" fn next(&self) -> SVec<u8>;
+}
+
+/// An owned, ABI-stable item-stream handle (a request or response stream).
+pub type DynItemStream = stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream + Send + Sync>);
+
+/// The cold provider surface as a FROZEN generic dispatch. The `method` id
+/// (`pb::ProviderMethod`) selects an RPC; payloads cross as prost-encoded
+/// `pb::Frame` bytes (cheap, low-volume, lenient via protobuf). Adding an RPC is a
+/// new method id + a new guest match arm — the vtable is UNTOUCHED, so an older
+/// plugin and a newer host still load (stabby's type report is unchanged) and the
+/// old plugin answers an unknown id with `Error{Unimplemented}`. THIS is what
+/// makes the cold surface evolvable without an ABI break (see ABI_VERSIONING.md).
 ///
-/// Stream methods (`list`, `list_packages`) return all items length-delimited:
-/// a sequence of prost length-delimited `pb::Frame`s (StreamItem… then StreamEnd).
+/// The slots cover the four RPC cardinalities (request × response, each unary or
+/// streaming) plus the native-handle carriers (a `DynExecutor` / `DynFunctionRegistry`
+/// cannot ride prost bytes, so the method carrying one gets its own frozen slot):
+/// - [`invoke`](StableProvider::invoke) — unary → unary.
+/// - [`invoke_server_stream`](StableProvider::invoke_server_stream) — unary →
+///   stream (`list`, `list_packages`): the reply is pulled lazily, never buffered.
+/// - [`invoke_client_stream`](StableProvider::invoke_client_stream) — stream → unary.
+/// - [`invoke_bidi`](StableProvider::invoke_bidi) — stream → stream.
+/// - [`invoke_exec`](StableProvider::invoke_exec) — unary → unary + native
+///   [`DynExecutor`] (`get`, whose resolution makes hot callbacks).
+/// - [`invoke_registry`](StableProvider::invoke_registry) — unary → void + native
+///   [`DynFunctionRegistry`] (`set_function_registry`).
 #[stabby::stabby]
 pub trait StableProvider {
-    /// The provider's registered name.
-    extern "C" fn config(&self) -> SString;
-    extern "C" fn list<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn list_packages<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn get<'a>(&'a self, req: SVec<u8>, exec: DynExecutor) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn probe<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    /// The BUILD-file functions this provider exposes, as prost-encoded
-    /// `pb::FunctionsResponse` bytes (metadata only — handlers stay guest-side,
-    /// reached via `call_function`). Sync: it is provider-static metadata read
-    /// once during host registry wiring, not a per-request call.
-    extern "C" fn functions(&self) -> SVec<u8>;
-    /// Invoke one exposed function by name. `req` is raw `pb::CallFunctionRequest`
-    /// bytes; the reply is a `pb::Frame` carrying `CallFunctionResp` or `Error`.
-    extern "C" fn call_function<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    /// The provider's state schema (the kwargs of `provider_state(provider=…, …)`)
-    /// as prost-encoded `pb::Schema` bytes. An EMPTY `SVec` means the provider
-    /// declares no schema (`None`); an encoded (possibly fields-empty) `Schema`
-    /// means it does. Sync provider-static metadata, like `functions`.
-    extern "C" fn state_schema(&self) -> SVec<u8>;
-    /// Hand the provider the aggregate registry of every provider's functions:
-    /// `metadata` is prost `pb::FunctionRegistry` bytes (names/signatures/docs);
-    /// `reg` is the host callback used to actually invoke any of them. Called once
-    /// before the first dispatch, mirroring [`hplugin::provider::Provider::set_function_registry`].
-    extern "C" fn set_function_registry(&self, metadata: SVec<u8>, reg: DynFunctionRegistry);
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_server_stream<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, DynItemStream>;
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_bidi<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, DynItemStream>;
+    extern "C" fn invoke_exec<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+        exec: DynExecutor,
+    ) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry);
 }
 
-/// The cold managed-driver surface (same transport contract as [`StableProvider`]).
+/// The cold managed-driver surface, same frozen-dispatch contract and the same
+/// four cardinalities as [`StableProvider`]. `method` is a `pb::DriverMethod`.
+/// `run` rides [`invoke_bidi`](StableManagedDriver::invoke_bidi): the request
+/// stream carries the run request then live stdin (`pb::RunInFrame`), the response
+/// stream carries live stdout/stderr then the result (`pb::RunOutFrame`). No
+/// dedicated stdio slot — live IO is modeled as prost frames on the bidi stream,
+/// so wiring stdin/stdout/stderr later is additive (see ABI_VERSIONING.md).
 #[stabby::stabby]
 pub trait StableManagedDriver {
-    extern "C" fn config(&self) -> SString;
-    extern "C" fn parse<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn apply_transitive<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    /// `shell` selects `run_shell` over `run`.
-    extern "C" fn run<'a>(&'a self, req: SVec<u8>, shell: bool) -> DynFuture<'a, SVec<u8>>;
-    /// The driver's config schema (the driver-specific kwargs of `target(...)`)
-    /// as prost-encoded `pb::Schema` bytes. Sync driver-static metadata.
-    extern "C" fn schema(&self) -> SVec<u8>;
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_server_stream<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, DynItemStream>;
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_bidi<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, DynItemStream>;
 }
 
-/// Owned ABI-stable handles to a loaded plugin's components.
-pub type DynProvider = stabby::dynptr!(stabby::boxed::Box<dyn StableProvider + Send + Sync>);
-pub type DynManagedDriver =
-    stabby::dynptr!(stabby::boxed::Box<dyn StableManagedDriver + Send + Sync>);
-
-/// Config handed to a cdylib's create entry: the workspace root, the engine's
-/// home dir (where a plugin should keep its state/scratch — e.g. `<root>/.heph3`,
-/// configurable; never hardcode it), and the plugin's `options:` map (from config
-/// yaml) encoded as a `plugin-abi` `pb::Value` map (prost bytes). The plugin
-/// decodes the options and instantiates its provider + drivers from them.
+/// Cooperative cancellation, in its OWN trait (composed into both handles like
+/// [`StableMeta`]). The host calls `cancel(request_id)` when its own request token
+/// fires; the plugin looks up the in-flight call by `request_id` and trips the
+/// cancellation token it handed the provider/driver — so a long `get` or a running
+/// subprocess (`run`) stops, exactly as for an in-process target. `request_id` is
+/// the id carried in each request message; it must be unique per in-flight call.
 #[stabby::stabby]
-pub struct CreateConfig {
-    pub root: SString,
-    pub home: SString,
-    pub options: SVec<u8>,
+pub trait StableCancel {
+    extern "C" fn cancel(&self, request_id: SString);
 }
+
+/// Owned ABI-stable handles to a loaded plugin's components. Each composes
+/// [`StableMeta`] (static metadata) and [`StableCancel`] (cancellation) alongside
+/// its dispatch surface.
+pub type DynProvider = stabby::dynptr!(
+    stabby::boxed::Box<dyn StableProvider + StableMeta + StableCancel + Send + Sync>
+);
+pub type DynManagedDriver = stabby::dynptr!(
+    stabby::boxed::Box<dyn StableManagedDriver + StableMeta + StableCancel + Send + Sync>
+);
 
 /// A named managed driver in a plugin's component bundle.
 #[stabby::stabby]
@@ -202,16 +266,25 @@ pub struct NamedDriver {
 /// What a cdylib's create entry returns: a provider + named drivers, all as owned
 /// ABI-stable handles that the host wraps with [`crate::load_stable`]. (plugin-go
 /// always exports a provider; driver-only bundles can carry an empty name.)
+///
+/// `meta` is reserved, prost-encoded return-side metadata (empty today). It exists
+/// so a plugin can later report additive descriptive data (capabilities, abi
+/// minor, …) without changing this struct's layout — a layout change would break
+/// loading of older plugins. The handle fields must stay stabby (they carry the
+/// live native vtables); only the data rides prost.
 #[stabby::stabby]
 pub struct PluginComponents {
     pub provider_name: SString,
     pub provider: DynProvider,
     pub drivers: SVec<NamedDriver>,
+    pub meta: SVec<u8>,
 }
 
 /// The cdylib create-entry symbol name (exported with `#[stabby::export]`,
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
 
-/// The create entry's function-pointer type.
-pub type CreateFn = extern "C" fn(CreateConfig) -> PluginComponents;
+/// The create entry's function-pointer type. The config crosses as prost-encoded
+/// `pb::CreateConfig` bytes (not a stabby struct), so adding config fields is an
+/// additive change that does not break older plugins.
+pub type CreateFn = extern "C" fn(SVec<u8>) -> PluginComponents;

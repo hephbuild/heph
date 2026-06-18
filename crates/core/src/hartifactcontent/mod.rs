@@ -51,4 +51,13 @@ pub trait Content: Send + Sync {
     fn byte_size(&self) -> Option<u64> {
         None
     }
+    /// The on-disk path backing this content, when it is a real file on the
+    /// local filesystem (e.g. an on-disk cache artifact). `None` for synthetic
+    /// or non-file backends (in-memory, sqlite blobs). Lets an in-process
+    /// consumer open the file directly instead of streaming its bytes — notably
+    /// the stable-ABI seam, where a guest can read the file rather than pulling
+    /// it chunk-by-chunk across the vtable.
+    fn file_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }

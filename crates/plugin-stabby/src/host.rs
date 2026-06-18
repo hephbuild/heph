@@ -75,6 +75,15 @@ impl StableArtifactContent for HostArtifactContent {
     extern "C" fn byte_size(&self) -> u64 {
         self.content.byte_size().unwrap_or(u64::MAX)
     }
+
+    extern "C" fn path(&self) -> SString {
+        // Non-empty only when the content is a real on-disk file (e.g. cache
+        // artifact); the guest then reads it directly instead of streaming.
+        match self.content.file_path() {
+            Some(p) => SString::from(p.to_string_lossy().as_ref()),
+            None => SString::new(),
+        }
+    }
 }
 
 /// Encode a unary `pb::Frame` reply carrying `body`.

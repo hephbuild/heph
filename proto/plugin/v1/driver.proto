@@ -8,6 +8,18 @@ import "plugin/v1/common.proto";
 import "plugin/v1/targetdef.proto";
 import "plugin/v1/callback.proto";
 
+// Selects which driver RPC the stable-ABI dispatch (`StableManagedDriver::invoke*`)
+// should run. Same append-only contract as ProviderMethod. RUN carries the
+// native stdio handles (invoke_io). See crates/plugin-stabby/ABI_VERSIONING.md.
+enum DriverMethod {
+  DRIVER_METHOD_UNSPECIFIED = 0;
+  DRIVER_METHOD_PARSE = 1;
+  DRIVER_METHOD_APPLY_TRANSITIVE = 2;
+  DRIVER_METHOD_RUN = 3; // carries the native stdio (invoke_io)
+  DRIVER_METHOD_SCHEMA = 4; // sync metadata (StableMeta::meta)
+  DRIVER_METHOD_CONFIG = 5; // sync metadata (StableMeta::meta)
+}
+
 message ParseRequest {
   string request_id = 1;
   TargetSpec target_spec = 2;
@@ -100,4 +112,28 @@ message ManagedRunRequest {
 
 message ManagedRunResponse {
   repeated OutputArtifactRef artifacts = 1;
+}
+
+// ---- Bidi run streams (DriverMethod RUN over StableManagedDriver::invoke_bidi) ----
+//
+// A driver run is a bidirectional stream. The request stream (host -> driver)
+// carries the run request first, then live stdin; the response stream
+// (driver -> host) carries live stdout/stderr, then the terminal result. Each
+// rides one StreamItem (its `item` is an encoded RunInFrame / RunOutFrame). The
+// stdio variants are reserved — unused until live streaming is wired — so adding
+// them is an additive, prost-only change (no ABI break).
+message RunInFrame {
+  oneof msg {
+    ManagedRunRequest start = 1; // first item: the run request
+    bytes stdin_chunk = 2;       // live stdin bytes
+    bool stdin_close = 3;        // stdin EOF (value ignored)
+  }
+}
+message RunOutFrame {
+  oneof msg {
+    bytes stdout_chunk = 1;
+    bytes stderr_chunk = 2;
+    ManagedRunResponse response = 3; // terminal: artifacts
+    string error = 4;                // terminal: failure message
+  }
 }
