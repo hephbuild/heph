@@ -78,6 +78,12 @@ pub fn unpack(
         None => None,
     };
 
+    // Many entries share a parent dir; `create_dir_all` per entry re-walks those
+    // ancestors every time (a measurable chunk of unpack — see ai-docs/PERFORMANCE.md).
+    // Skip dirs already created this unpack.
+    let mut created_dirs: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+
     for entry in content
         .walk()
         .with_context(|| format!("walk content for unpack into {:?}", dst))?
@@ -90,7 +96,9 @@ pub fn unpack(
             continue;
         }
         let dest = dst.join(&entry.path);
-        if let Some(parent) = dest.parent() {
+        if let Some(parent) = dest.parent()
+            && created_dirs.insert(parent.to_path_buf())
+        {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
                     "create parent dir {:?} for unpack entry {:?} (existing={})",
