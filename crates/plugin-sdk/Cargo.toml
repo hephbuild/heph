@@ -1,0 +1,51 @@
+[package]
+name = "plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Author-facing contract — transport-agnostic. A plugin author writes against
+# these `hplugin` traits regardless of which transport carries the plugin.
+hplugin = { package = "plugin", path = "../plugin" }
+hmodel = { package = "model", path = "../model" }
+hcore = { package = "core", path = "../core" }
+anyhow = "1.0.102"
+
+# Transport: the in-process stable-ABI cdylib (stabby). Opt-in — a consumer
+# enables `features = ["stabby"]` to serve a plugin over it. Everything below is
+# gated so the bare SDK pulls no transport deps; future transports (proto/shm,
+# wasm) slot in as sibling features without disturbing the author surface.
+hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", default-features = false, optional = true }
+plugin-abi = { path = "../plugin-abi", features = ["convert"], optional = true }
+hdriver-support = { package = "driver-support", path = "../driver-support", optional = true }
+stabby = { version = "72.1.8", optional = true }
+async-trait = { version = "0.1.89", optional = true }
+futures = { version = "0.3.32", optional = true }
+prost = { version = "0.14", optional = true }
+# A loaded cdylib owns its own tokio runtime — its statically-linked tokio is
+# distinct from the host's, so async work that touches the reactor (e.g. plugin-go
+# shelling out to `go list` in a driver `run`) must execute on the cdylib's runtime.
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync"], optional = true }
+
+[features]
+# In-process stable-ABI cdylib transport. Pulls in the stabby guest serving
+# (`serve`) + host-callback adapter (`guest`) + the shared ABI contract.
+stabby = [
+    "dep:hplugin-stabby",
+    "dep:plugin-abi",
+    "dep:hdriver-support",
+    "dep:stabby",
+    "dep:async-trait",
+    "dep:futures",
+    "dep:prost",
+    "dep:tokio",
+]
+
+[dev-dependencies]
+# The guest↔host round-trip test exercises the host adapter too.
+hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }
+futures = "0.3.32"
+tempfile = "3"

@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p walk -p proc -p model -p sandboxfuse -p plugin -p builtins -p plugin-buildfile -p driver-support -p plugin-exec -p plugin-nix -p plugin-query -p plugin-go -p telemetry -p tui -p lock -p engine";
+  qualityCrates = "-p heph -p e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p plugin-exec -p plugin-nix -p plugin-query -p plugin-go -p telemetry -p tui -p lock -p engine";
 in
 {
   # https://devenv.sh/basics/
@@ -60,9 +60,26 @@ in
     go run . -seed 42 -out $DEVENV_ROOT/example/go/large -module example.com/large -pkgs 500 -max-depth 7
     cd $DEVENV_ROOT/example/go/large && go mod tidy
   '';
-  scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
+  # Set up the example workspace end to end: regenerate the large go repo and
+  # install the go plugin (cdylib + manifest) into ~/.heph/plugins/go via
+  # `install-go-plugin`. example/.hephconfig2 loads it in-process behind the
+  # stable ABI via `path: ~/.heph/plugins/go/heph-go-plugin.json` (native speed —
+  # see ai-docs/PERFORMANCE.md).
+  scripts.gen-example.exec = ''
+    gen
+    gen-go-large
+    install-go-plugin
+  '';
+  # Lint default-feature code, then again with every feature enabled (so
+  # feature-gated code — the stabby host loader — is covered too), then fmt-check
+  # all hand-written crates (qualityCrates; generated gen/proto is excluded).
+  scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> clippy --all-features' && cargo clippy --all-targets --all-features --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
-  scripts.tst.exec = "cargo test --locked --all";
+  # Test everything. The default pass covers all crates with default features; the
+  # targeted passes exercise the feature-gated transport code, off by default:
+  # the stabby host loader/adapters (plugin-stabby `host`) and the stabby guest
+  # serving (plugin-sdk `stabby` — the SDK is transport-agnostic by default).
+  scripts.tst.exec = "cargo test --locked --all && cargo test --locked -p plugin-stabby --features host && cargo test --locked -p plugin-sdk --features stabby";
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';
@@ -89,6 +106,31 @@ in
     mv /tmp/heph "${binLocation}"
   '';
 
+  # Install the go plugin (cdylib + manifest) into the user-global ~/.heph dir, so
+  # an installed `heph3` can load it from any workspace via
+  # `plugins: - { identifier: { path: ~/.heph/plugins/go/heph-go-plugin.json } }`.
+  # Always a release build — it's a runtime artifact. The cdylib keeps its native
+  # extension (.so on Linux, .dylib on macOS); the manifest (one host artifact,
+  # path = the sibling cdylib) is emitted by tools/pluginmanifest.
+  scripts.install-go-plugin.exec = ''
+    cargo build --release -p plugin-go-cdylib
+    if [ "$(uname -s)" = "Darwin" ]; then
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.dylib"
+      name="heph-go-plugin.dylib"
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
+    else
+      lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.so"
+      name="heph-go-plugin.so"
+    fi
+    dest="$HOME/.heph/plugins/go"
+    mkdir -p "$dest"
+    cp "$lib" "$dest/$name.new"
+    mv -f "$dest/$name.new" "$dest/$name"
+    ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
+        && go run . -name go -host-path "$name" -out "$dest/heph-go-plugin.json" )
+    echo "installed go plugin -> $dest"
+  '';
+
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")
@@ -96,6 +138,7 @@ in
     # holding the previous code-signature for that path and SIGKILLs the next run.
     cp $CARGO_TARGET_DIR/debug/heph "${binLocation}.new"
     mv -f "${binLocation}.new" "${binLocation}"
+    install-go-plugin
   '';
 
   scripts.install-release-build.exec = ''
@@ -114,6 +157,7 @@ in
     # Silicon. `mv` swaps the path to a fresh inode so AMFI re-validates.
     cp "$bin" "${binLocation}.new"
     mv -f "${binLocation}.new" "${binLocation}"
+    install-go-plugin
   '';
 
 

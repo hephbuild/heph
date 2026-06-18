@@ -1,5 +1,5 @@
 use crate::engine::config::Config;
-use crate::engine::config_yaml::{FuseConfig, Options, PluginEntry};
+use crate::engine::config_yaml::{FuseConfig, Options};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::local_cache::LocalCache;
@@ -690,50 +690,37 @@ impl Engine {
             .collect()
     }
 
-    /// Instantiates every provider/driver listed in the entries by looking up the
-    /// matching factory by name. Errors if any name has no registered factory.
-    /// Factories are consumed — calling twice on the same name will error.
-    pub fn apply_config(
-        &mut self,
-        providers: &[PluginEntry],
-        drivers: &[PluginEntry],
-    ) -> anyhow::Result<()> {
+    /// Instantiate one built-in plugin by name (a `plugins: - { builtin: <name> }`
+    /// entry), looking up its registered factory (provider, then driver, then
+    /// managed driver) and registering it with `options`. Errors if `name` has no
+    /// registered factory. Factories are consumed — applying the same name twice
+    /// errors.
+    pub fn apply_builtin(&mut self, name: &str, options: &Options) -> anyhow::Result<()> {
         let init = self.plugin_init_payload();
-        for entry in providers {
-            let factory = self
-                .provider_factories
-                .remove(&entry.name)
-                .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", entry.name))?;
-            let provider = factory(&init, &entry.options)?;
+        if let Some(factory) = self.provider_factories.remove(name) {
+            let provider = factory(&init, options)?;
             let resolved_name = provider.config(provider::ConfigRequest {})?.name;
-            if resolved_name != entry.name {
+            if resolved_name != name {
                 return Err(anyhow::anyhow!(
-                    "provider '{}' reported name '{}'; config/factory name mismatch",
-                    entry.name,
-                    resolved_name
+                    "provider '{name}' reported name '{resolved_name}'; config/factory name mismatch"
                 ));
             }
             self.register_provider(|_| provider)?;
-        }
-        for entry in drivers {
-            if let Some(factory) = self.driver_factories.remove(&entry.name) {
-                let driver = factory(&init, &entry.options)?;
-                let resolved_name = driver.config(driver::ConfigRequest {})?.name;
-                if resolved_name != entry.name {
-                    return Err(anyhow::anyhow!(
-                        "driver '{}' reported name '{}'; config/factory name mismatch",
-                        entry.name,
-                        resolved_name
-                    ));
-                }
-                self.insert_driver(driver)?;
-            } else if let Some(factory) = self.managed_driver_factories.remove(&entry.name) {
-                let managed = factory(&init, &entry.options)?;
-                let driver = self.new_managed_driver(managed);
-                self.insert_driver(Box::new(driver))?;
-            } else {
-                return Err(anyhow::anyhow!("unknown driver '{}'", entry.name));
+        } else if let Some(factory) = self.driver_factories.remove(name) {
+            let driver = factory(&init, options)?;
+            let resolved_name = driver.config(driver::ConfigRequest {})?.name;
+            if resolved_name != name {
+                return Err(anyhow::anyhow!(
+                    "driver '{name}' reported name '{resolved_name}'; config/factory name mismatch"
+                ));
             }
+            self.insert_driver(driver)?;
+        } else if let Some(factory) = self.managed_driver_factories.remove(name) {
+            let managed = factory(&init, options)?;
+            let driver = self.new_managed_driver(managed);
+            self.insert_driver(Box::new(driver))?;
+        } else {
+            return Err(anyhow::anyhow!("unknown builtin plugin '{name}'"));
         }
         Ok(())
     }
@@ -761,12 +748,16 @@ impl hplugin::lsp::LspEngine for Engine {
     }
 
     fn provider_options(&self, name: &str) -> hplugin::config::Options {
+        // Built-in providers carry their options on the matching `builtin:` plugin
+        // entry. (cdylib-plugin providers self-describe and aren't keyed by name
+        // in config, so they fall through to defaults here.)
+        use crate::engine::config_yaml::PluginIdentifier;
         crate::engine::config_yaml::load_from_root(self.root())
             .ok()
             .and_then(|cfg| {
-                cfg.providers
+                cfg.plugins
                     .into_iter()
-                    .find(|p| p.name == name)
+                    .find(|p| matches!(&p.identifier, PluginIdentifier::Builtin(b) if b == name))
                     .map(|p| p.options)
             })
             .unwrap_or_default()

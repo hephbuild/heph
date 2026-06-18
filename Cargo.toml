@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
+members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-stabby", "crates/plugin-sdk", "crates/plugin-go-cdylib", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/engine"]
 
 [profile.profiling]
 inherits = "release"
@@ -109,7 +109,6 @@ hdriver-support = { package = "driver-support", path = "crates/driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
 hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
-hplugin-go = { package = "plugin-go", path = "crates/plugin-go" }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
 htui = { package = "tui", path = "crates/tui" }
 hlock = { package = "lock", path = "crates/lock" }
@@ -128,7 +127,6 @@ async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
 tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
-rayon = "1.12.0"
 xxhash-rust = { version = "0.8.15" , features = ["xxh3", "std"]}
 itertools = "0.14.0"
 tar = "0.4"

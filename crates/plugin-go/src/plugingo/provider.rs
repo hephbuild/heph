@@ -1728,6 +1728,16 @@ impl ProviderInner {
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<GoPackage>> {
+        // Fast path: the package is already parsed plugin-side, so we only need
+        // to register the `parent → golist_addr` dep edge (the host's cycle
+        // check). That's a cheap edge-only `note_dep` instead of a full
+        // `result()`, which would re-run the engine's whole result pipeline plus
+        // a lease round-trip for every edge — the dominant cost on the remote
+        // resolve path (every transitive import hits this).
+        if let Some(cached) = self.pkg_cache.peek(golist_addr) {
+            executor.note_dep(golist_addr).await?;
+            return cached.map_err(unwrap_arc_err);
+        }
         let result = executor.result(golist_addr).await?;
         self.pkg_cache
             .once(
@@ -1778,9 +1788,13 @@ impl ProviderInner {
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<PackageAddrs>> {
-        // executor.result is called outside the once closure for the same
-        // reason as in `read_golist_package`: waiters must register the dep
-        // edge, not just the cache owner.
+        // executor.result is called outside the once closure so waiters register
+        // the dep edge, not just the cache owner. Cache hit: cheap edge-only
+        // note_dep (see read_golist_package).
+        if let Some(cached) = self.pkg_addrs_cache.peek(golist_addr) {
+            executor.note_dep(golist_addr).await?;
+            return cached.map_err(unwrap_arc_err);
+        }
         let result = executor.result(golist_addr).await?;
         self.pkg_addrs_cache
             .once(

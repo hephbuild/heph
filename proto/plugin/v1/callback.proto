@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+// Host-exported callback surface (the AbiHost). The plugin calls back into the
+// host while serving get()/parse(). Carries the bidirectional hot path.
+package heph.plugin.v1;
+
+import "plugin/v1/common.proto";
+
+// A handle to one result/input artifact. Result artifacts are ABSTRACT readers
+// (file / sqlite blob / in-mem / remote), NOT paths — so they cross as an
+// opaque handle + metadata; bytes are pulled lazily via OpenArtifact. The host
+// holds the underlying read-guard alive under the enclosing lease_id.
+message ArtifactHandle {
+  string handle_id = 1;
+  string group = 2;
+  string name = 3;
+  string hashout = 4;
+  uint64 byte_size = 5; // 0 if the backing can't answer cheaply
+  bool support = 6;     // support_artifact vs primary artifact
+}
+
+// executor.result(addr). Registers the parent->addr DepDag edge host-side
+// (cycle check) and returns artifact handles + a lease.
+message ResultRequest {
+  string request_id = 1;
+  Addr addr = 2;
+}
+message ResultResponse {
+  string lease_id = 1;
+  repeated ArtifactHandle artifacts = 2;
+}
+
+// Lazy byte access for an artifact handle. Reply streams bytes via the envelope
+// stream channel (StreamItem), keyed by the issuing frame id.
+message OpenArtifactRequest {
+  string lease_id = 1;
+  string handle_id = 2;
+  uint64 offset = 3;
+}
+
+// Cache-hit fast path: register the dep edge only (no lease, batchable).
+// Returns CycleError when the inserted edge closes a cycle.
+message NoteDepRequest {
+  string request_id = 1;
+  Addr parent = 2;
+  Addr addr = 3;
+}
+message NoteDepResponse {
+  bool ok = 1;
+  bool cycle = 2;
+  string message = 3;
+}
+
+// executor.query(matcher, extra_skip).
+message QueryRequest {
+  string request_id = 1;
+  Matcher matcher = 2;
+  repeated string extra_skip = 3;
+}
+message QueryResponse {
+  repeated Addr addrs = 1;
+}
+
+// The host-side CachedWalker (used by list_packages).
+message WalkRequest {
+  string dir = 1;
+}
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIR = 2;
+  ENTRY_KIND_SYMLINK = 3;
+  ENTRY_KIND_OTHER = 4;
+}
+message DirEntry {
+  string name = 1;
+  EntryKind kind = 2;
+}
+message WalkResponse {
+  repeated DirEntry entries = 1;
+}
+
+// Provider/driver config access.
+message ConfigGetRequest {
+  string key = 1;
+}
+message ConfigGetResponse {
+  Value value = 1;
+}
+
+// Drop the read-guards the host holds under lease_id.
+message ReleaseLeaseRequest {
+  string lease_id = 1;
+}
+message ReleaseLeaseResponse {}

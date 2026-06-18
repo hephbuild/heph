@@ -13,10 +13,12 @@ pub use hplugin::config::{Options, decode_opt, deny_unknown};
 pub struct ConfigYaml {
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
+    /// Every provider/driver — built-in or external — is declared as a single
+    /// `plugin`. A `builtin:` entry selects a compiled-in plugin by name; a
+    /// `path:`/`url:` entry points at a `*-plugin.json` manifest for a loadable
+    /// cdylib. Each carries an `options:` map passed to plugin construction.
     #[serde(default)]
-    pub providers: Vec<PluginEntry>,
-    #[serde(default)]
-    pub drivers: Vec<PluginEntry>,
+    pub plugins: Vec<PluginSpec>,
     #[serde(default)]
     pub mem_cache: Option<MemCacheConfig>,
     #[serde(default)]
@@ -147,8 +149,8 @@ impl ConfigYaml {
     /// Optional/scalar fields override only when present in `other` — a profile
     /// that omits a field leaves the base value untouched. `caches` deep-merge by
     /// key (each cache's fields are patched individually, so a profile can flip
-    /// `read`/`write` while inheriting the base `uri`), and `providers`/`drivers`
-    /// merge by name (matching entry replaced, new ones appended in order).
+    /// `read`/`write` while inheriting the base `uri`), and `plugins` merge by
+    /// identity (matching entry replaced, new ones appended in order).
     pub fn merge(&mut self, other: ConfigYaml) {
         if other.home_dir.is_some() {
             self.home_dir = other.home_dir;
@@ -181,16 +183,16 @@ impl ConfigYaml {
             self.caches.entry(name).or_default().merge(patch);
         }
 
-        merge_plugins(&mut self.providers, other.providers);
-        merge_plugins(&mut self.drivers, other.drivers);
+        merge_plugins(&mut self.plugins, other.plugins);
     }
 }
 
-/// Merge `inc` plugin entries into `base` by name: an entry whose name already
-/// exists replaces it in place; a new name is appended, preserving order.
-fn merge_plugins(base: &mut Vec<PluginEntry>, inc: Vec<PluginEntry>) {
+/// Merge `inc` plugin entries into `base` by `identifier`: an entry whose
+/// identifier already exists replaces it in place; a new one is appended,
+/// preserving order. Lets a profile override a plugin's options.
+fn merge_plugins(base: &mut Vec<PluginSpec>, inc: Vec<PluginSpec>) {
     for entry in inc {
-        match base.iter_mut().find(|e| e.name == entry.name) {
+        match base.iter_mut().find(|e| e.identifier == entry.identifier) {
             Some(existing) => *existing = entry,
             None => base.push(entry),
         }
@@ -330,12 +332,85 @@ pub enum LockBackendConfig {
     Mem,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginEntry {
-    pub name: String,
-    #[serde(default)]
+/// One `plugins:` entry. In YAML the plugin source is given inline as one of
+/// `builtin:` / `path:` / `url:` at the top of the entry, plus an optional
+/// `options:` config map passed to construction:
+///
+/// ```yaml
+/// plugins:
+///   - builtin: buildfile
+///     options: { patterns: [BUILD] }
+///   - path: .heph3/heph-go-plugin.json
+///   - url: https://…/heph-go-plugin.json
+/// ```
+///
+/// The source collapses to an internal [`PluginIdentifier`]; `identifier` is not
+/// a YAML key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginSpec {
+    pub identifier: PluginIdentifier,
     pub options: Options,
+}
+
+// Hand-rolled so the source kind (builtin/path/url) sits at the top of the entry
+// alongside `options`, exactly-one is enforced at parse time, and unknown keys
+// are rejected.
+impl<'de> Deserialize<'de> for PluginSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut map: BTreeMap<String, serde_yaml::Value> = BTreeMap::deserialize(d)?;
+
+        let options = match map.remove("options") {
+            Some(v) => serde_yaml::from_value(v)
+                .map_err(|e| D::Error::custom(format!("plugin `options`: {e}")))?,
+            None => Options::default(),
+        };
+
+        let mut source: Option<PluginIdentifier> = None;
+        for (key, value) in map {
+            let id = match key.as_str() {
+                "builtin" | "path" | "url" => {
+                    let s: String = serde_yaml::from_value(value).map_err(|e| {
+                        D::Error::custom(format!("plugin `{key}` must be a string: {e}"))
+                    })?;
+                    match key.as_str() {
+                        "builtin" => PluginIdentifier::Builtin(s),
+                        "path" => PluginIdentifier::Path(s),
+                        _ => PluginIdentifier::Url(s),
+                    }
+                }
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "unknown plugin field `{other}` (expected builtin/path/url/options)"
+                    )));
+                }
+            };
+            if source.replace(id).is_some() {
+                return Err(D::Error::custom(
+                    "plugin entry must set exactly one of builtin/path/url",
+                ));
+            }
+        }
+
+        let identifier = source
+            .ok_or_else(|| D::Error::custom("plugin entry must set one of builtin/path/url"))?;
+        Ok(PluginSpec {
+            identifier,
+            options,
+        })
+    }
+}
+
+/// What plugin to load — internal representation of an entry's inline
+/// `builtin:`/`path:`/`url:` source (see [`PluginSpec`]).
+/// - `builtin`: a compiled-in plugin by name (e.g. `buildfile`, `exec`).
+/// - `path`: a local `*-plugin.json` manifest (relative to the workspace root).
+/// - `url`: a remote `*-plugin.json` manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginIdentifier {
+    Builtin(String),
+    Path(String),
+    Url(String),
 }
 
 /// Canonical filename of the per-workspace config, located at the repo root.
@@ -444,24 +519,20 @@ memCache:
 tmpCache:
   perEntryBytes: 1048576
   capacityBytes: 134217728
-providers:
-  - name: buildfile
+plugins:
+  - builtin: buildfile
     options:
       patterns:
         - BUILD2
         - "*.BUILD2"
-  - name: go
-    options:
-      gotool: //tools/heph:go
-drivers:
-  - name: exec
+  - builtin: exec
     options:
       path:
         - /usr/sbin
         - /usr/bin
-  - name: bash
+  - path: .heph3/heph-go-plugin.json
     options:
-      path: [/usr/bin]
+      gotool: //tools/heph:go
 "#;
         let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".heph2")));
@@ -471,13 +542,19 @@ drivers:
         let tc = cfg.tmp_cache.expect("tmp_cache present");
         assert_eq!(tc.per_entry_bytes, 1048576);
         assert_eq!(tc.capacity_bytes, 134217728);
-        assert_eq!(cfg.providers.len(), 2);
-        assert_eq!(cfg.providers[0].name, "buildfile");
-        let patterns: Vec<String> = decode_opt(&cfg.providers[0].options, "buildfile", "patterns")
+        assert_eq!(cfg.plugins.len(), 3);
+        assert_eq!(
+            cfg.plugins[0].identifier,
+            PluginIdentifier::Builtin("buildfile".into())
+        );
+        let patterns: Vec<String> = decode_opt(&cfg.plugins[0].options, "buildfile", "patterns")
             .expect("decode")
             .expect("present");
         assert_eq!(patterns, vec!["BUILD2".to_string(), "*.BUILD2".to_string()]);
-        assert_eq!(cfg.drivers.len(), 2);
+        assert_eq!(
+            cfg.plugins[2].identifier,
+            PluginIdentifier::Path(".heph3/heph-go-plugin.json".into())
+        );
     }
 
     #[test]
@@ -587,8 +664,7 @@ caches:
         std::fs::write(&path, b"").expect("write");
         let cfg = load(&path).expect("load");
         assert!(cfg.home_dir.is_none());
-        assert!(cfg.providers.is_empty());
-        assert!(cfg.drivers.is_empty());
+        assert!(cfg.plugins.is_empty());
     }
 
     #[test]
@@ -692,7 +768,7 @@ caches:
 
     #[test]
     fn lock_config_omitted_is_none() {
-        let yaml = "providers: []\n";
+        let yaml = "plugins: []\n";
         let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         assert!(cfg.lock.is_none());
     }
@@ -714,7 +790,7 @@ caches:
     #[test]
     fn telemetry_defaults_enabled_when_omitted() {
         // Opt-out: no `telemetry:` block means telemetry stays on.
-        let cfg: ConfigYaml = serde_yaml::from_str("providers: []\n").expect("parse");
+        let cfg: ConfigYaml = serde_yaml::from_str("plugins: []\n").expect("parse");
         assert!(cfg.telemetry.is_none());
         assert!(cfg.telemetry_enabled());
     }
@@ -802,22 +878,30 @@ caches:
     }
 
     #[test]
-    fn merge_providers_by_name() {
+    fn merge_plugins_by_identity() {
         let mut base: ConfigYaml = serde_yaml::from_str(
-            "providers:\n  - name: buildfile\n    options:\n      patterns: [BUILD]\n  - name: go\n",
+            "plugins:\n  - builtin: buildfile\n    options:\n      patterns: [BUILD]\n  - builtin: go\n",
         )
         .expect("parse base");
         let overlay: ConfigYaml = serde_yaml::from_str(
-            "providers:\n  - name: buildfile\n    options:\n      patterns: [BUILD2]\n  - name: rust\n",
+            "plugins:\n  - builtin: buildfile\n    options:\n      patterns: [BUILD2]\n  - builtin: rust\n",
         )
         .expect("parse overlay");
 
         base.merge(overlay);
 
         // buildfile replaced, go kept, rust appended — order preserved.
-        let names: Vec<&str> = base.providers.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["buildfile", "go", "rust"]);
-        let patterns: Vec<String> = decode_opt(&base.providers[0].options, "buildfile", "patterns")
+        let ids: Vec<PluginIdentifier> =
+            base.plugins.iter().map(|p| p.identifier.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                PluginIdentifier::Builtin("buildfile".into()),
+                PluginIdentifier::Builtin("go".into()),
+                PluginIdentifier::Builtin("rust".into()),
+            ]
+        );
+        let patterns: Vec<String> = decode_opt(&base.plugins[0].options, "buildfile", "patterns")
             .expect("decode")
             .expect("present");
         assert_eq!(patterns, vec!["BUILD2".to_string()]);
@@ -957,6 +1041,52 @@ caches:
         assert_eq!(r.uri, "s3://b/p");
         assert!(r.read);
         assert!(!r.write);
+    }
+
+    #[test]
+    fn parses_plugin_identifier_variants() {
+        let yaml = r#"
+plugins:
+  - builtin: buildfile
+    options: { patterns: [BUILD] }
+  - path: .heph3/heph-go-plugin.json
+  - url: https://example.com/heph-go-plugin.json
+"#;
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(
+            cfg.plugins[0].identifier,
+            PluginIdentifier::Builtin("buildfile".into())
+        );
+        assert_eq!(
+            cfg.plugins[1].identifier,
+            PluginIdentifier::Path(".heph3/heph-go-plugin.json".into())
+        );
+        assert_eq!(
+            cfg.plugins[2].identifier,
+            PluginIdentifier::Url("https://example.com/heph-go-plugin.json".into())
+        );
+    }
+
+    #[test]
+    fn plugin_rejects_multiple_source_keys() {
+        // Exactly one of builtin/path/url: two sources is a deserialize error.
+        let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - builtin: go\n    path: /a\n")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn plugin_rejects_missing_source() {
+        let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - options: { x: 1 }\n")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("builtin/path/url"), "{err}");
+    }
+
+    #[test]
+    fn plugin_rejects_unknown_field() {
+        let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - bogus: x\n")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

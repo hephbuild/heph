@@ -6,9 +6,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 use crate::engine::config_yaml;
-use crate::{
-    engine, pluginbuildfile, pluginexec, plugingo, pluginhostbin, pluginnix, plugintextfile,
-};
+use crate::{engine, pluginbuildfile, pluginexec, pluginhostbin, pluginnix, plugintextfile};
 
 /// Builds the multi-thread runtime used by every command entry point.
 ///
@@ -97,7 +95,10 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_driver(|_| Box::new(plugintextfile::Driver))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
-    // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
+    // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
+    // <name> }` entry selects them. The go plugin is no longer compiled in: it
+    // ships as a separate cdylib loaded from a `path:`/`url:` manifest entry,
+    // under its own `go`/`go_*` names.
     e.register_provider_factory("buildfile", |init, opts| {
         Ok(Box::new(
             pluginbuildfile::Provider::from_options(
@@ -109,16 +110,6 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
             .with_walker(init.walker.clone()),
         ))
     })?;
-    e.register_provider_factory("go", |init, opts| {
-        Ok(Box::new(plugingo::Provider::from_options(
-            init.root.to_path_buf(),
-            &init.skip_dirs,
-            &init.skip_globs,
-            opts,
-            init.walker.clone(),
-        )?))
-    })?;
-
     e.register_managed_driver_factory("exec", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_exec(opts)?))
     })?;
@@ -128,20 +119,12 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_managed_driver_factory("sh", |_init, opts| {
         Ok(Box::new(pluginexec::Driver::from_options_sh(opts)?))
     })?;
-    e.register_managed_driver_factory("go_golist", |_init, opts| {
-        config_yaml::deny_unknown("go_golist driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
-    })?;
-    e.register_managed_driver_factory("go_embed", |_init, opts| {
-        config_yaml::deny_unknown("go_embed driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoEmbedDriver))
-    })?;
-    e.register_managed_driver_factory("go_testmain", |_init, opts| {
-        config_yaml::deny_unknown("go_testmain driver", opts, &[])?;
-        Ok(Box::new(plugingo::GoTestmainDriver))
-    })?;
 
-    e.apply_config(&file.providers, &file.drivers)?;
+    // Apply every `plugins:` entry: a `builtin:` instantiates the matching
+    // factory above; a `path:`/`url:` resolves a manifest, loads the cdylib, and
+    // registers the provider + drivers it exports. The engine owns the resolve +
+    // download + load machinery (see `engine::plugin_load`).
+    e.register_plugins(&file.plugins)?;
 
     let engine = Arc::new(e);
 
@@ -249,20 +232,27 @@ mod tests {
             Ok(Box::new(pluginexec::Driver::from_options_bash(opts)?))
         })?;
 
-        e.apply_config(&file.providers, &file.drivers)?;
+        // The helper exercises built-in plugins only (no cdylib loading).
+        for spec in &file.plugins {
+            match &spec.identifier {
+                config_yaml::PluginIdentifier::Builtin(name) => {
+                    e.apply_builtin(name, &spec.options)?
+                }
+                _ => anyhow::bail!("test helper supports only `builtin:` plugins"),
+            }
+        }
         Ok((dir, e))
     }
 
     #[test]
-    fn applies_listed_providers_and_drivers() {
+    fn applies_listed_builtins() {
         let yaml = r#"
-providers:
-  - name: buildfile
+plugins:
+  - builtin: buildfile
     options:
       patterns: [BUILD]
-drivers:
-  - name: exec
-  - name: bash
+  - builtin: exec
+  - builtin: bash
 "#;
         let (_dir, e) = build_engine_from_yaml(yaml).expect("engine");
         assert!(e.providers_by_name.contains_key("buildfile"));
@@ -302,23 +292,10 @@ fs:
     }
 
     #[test]
-    fn unknown_provider_errors() {
-        let yaml = r#"
-providers:
-  - name: nope
-"#;
+    fn unknown_builtin_errors() {
+        let yaml = "plugins:\n  - builtin: nope\n";
         let err = build_engine_from_yaml(yaml).err().expect("must error");
         assert!(err.to_string().contains("nope"), "{err}");
-    }
-
-    #[test]
-    fn unknown_driver_errors() {
-        let yaml = r#"
-drivers:
-  - name: ghost
-"#;
-        let err = build_engine_from_yaml(yaml).err().expect("must error");
-        assert!(err.to_string().contains("ghost"), "{err}");
     }
 
     #[test]

@@ -18,6 +18,8 @@ hdriver-support = { package = "driver-support", path = "../driver-support" }
 hbuiltins = { package = "builtins", path = "../builtins" }
 hplugin-exec = { package = "plugin-exec", path = "../plugin-exec" }
 hplugin-query = { package = "plugin-query", path = "../plugin-query" }
+hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }
+hplugin-abi = { package = "plugin-abi", path = "../plugin-abi", features = ["convert"] }
 htelemetry = { package = "telemetry", path = "../telemetry" }
 anyhow = "1.0.102"
 async-recursion = "1"
@@ -38,6 +40,10 @@ quick_cache = "0.6"
 r2d2 = "0.8"
 r2d2_sqlite = "0.34"
 rayon = "1.12.0"
+# Blocking HTTP client, used only to download `url:` plugin manifests/cdylibs.
+# rustls-tls avoids a system OpenSSL link; blocking runs on its own thread so it
+# is safe to call from inside the async runtime (see plugin_load::download_plugin).
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 rusqlite = { version = "0.39", features = ["bundled", "blob"] }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }

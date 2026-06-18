@@ -71,6 +71,15 @@ impl ProviderExecutor for EngineProviderExecutor {
         })
     }
 
+    fn note_dep<'a>(
+        &'a self,
+        addr: &'a Addr,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        // Edge-only: register parent → addr (the synchronous cycle check) without
+        // executing. parent is already set on `rs` by the enclosing result_addr.
+        Box::pin(async move { self.rs.track_dep(addr).map_err(anyhow::Error::new) })
+    }
+
     fn query<'a>(
         &'a self,
         m: &'a Matcher,
@@ -1477,7 +1486,7 @@ impl Engine {
                 key,
                 enclose!((self => engine, rs) move || async move {
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
-                    let (artifacts, sandbox_cleanup, fuse_slot_guards) = engine
+                    let (artifacts, sandbox_cleanup, sandbox_guards) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell)
                         .await
@@ -1502,7 +1511,7 @@ impl Engine {
                     let cleanup_label = format!("{addr}");
                     let bg_pending = rs.bg_pending();
                     defer! {
-                        drop(fuse_slot_guards);
+                        drop(sandbox_guards);
                         if let Some(job) = sandbox_cleanup {
                             crate::engine::sandbox_cleaner::enqueue(cleanup_label, job, bg_pending);
                         }
@@ -3912,7 +3921,7 @@ mod tests {
                     })
                     .collect(),
                 sandbox_cleanup: None,
-                fuse_slot_guards: vec![],
+                sandbox_guards: vec![],
             })
         }
         async fn run_shell<'a, 'io>(

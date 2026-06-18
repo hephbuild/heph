@@ -1,0 +1,22 @@
+[package]
+name = "plugin-go-cdylib"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+# Loadable plugin artifact: the go provider + drivers behind the stable ABI,
+# loaded in-process by the host via `hplugin_stabby::load_stable::load`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hplugin-go = { package = "plugin-go", path = "../plugin-go" }
+# Opt into the stabby cdylib transport — the SDK is transport-agnostic by default.
+plugin-sdk = { path = "../plugin-sdk", features = ["stabby"] }
+hplugin = { package = "plugin", path = "../plugin" }
+hwalk = { package = "walk", path = "../walk" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+stabby = "72.1.8"
+anyhow = "1.0.102"

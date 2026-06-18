@@ -468,6 +468,15 @@ where
         }
     }
 
+    /// Non-inserting peek: returns the memoized value only if it is already
+    /// *completed* (not in-flight, not absent). Lets a caller take a cheap path
+    /// on a cache hit (e.g. registering a dep edge with `note_dep` instead of a
+    /// full `result`) without disturbing the cache or deduping with in-flight work.
+    pub fn peek(&self, key: &K) -> Option<V> {
+        let cache = self.cache.lock().expect("memoizer lock poisoned");
+        cache.get(key).and_then(|shared| shared.peek().cloned())
+    }
+
     pub async fn process<F, Fut>(&self, key: K, f: F) -> V
     where
         F: FnOnce() -> Fut,

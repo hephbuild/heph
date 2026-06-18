@@ -1,16 +1,21 @@
-providers:
-  - name: buildfile
+# Every provider/driver is a `plugin`. A `builtin:` selects a compiled-in plugin
+# by name; `path:`/`url:` points at a `*-plugin.json` manifest for a loadable
+# cdylib (loaded in-process behind the stable ABI — native speed, no IPC). Each
+# entry's `options:` map is passed to the plugin's construction.
+plugins:
+  - builtin: buildfile
     options:
       patterns:
         - BUILD
-  - name: go
-drivers:
-  - name: exec
-  - name: bash
-  - name: sh
-  - name: go_golist
-  - name: go_embed
-  - name: go_testmain
+  - builtin: exec
+  - builtin: bash
+  - builtin: sh
+  # The go plugin: one manifest names the cdylib for this host. The provider + its
+  # go_* drivers all come from that one library. Installed to the user-global
+  # ~/.heph by the `gen-example` script (which runs `install-go-plugin`).
+  - path: ~/.heph/plugins/go/heph-go-plugin.json
+    options:
+      go_bin: "//@heph/bin:go"
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus

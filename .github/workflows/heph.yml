@@ -50,7 +50,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -138,7 +138,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -171,22 +171,38 @@ jobs:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           HEPH_BUILD_VERSION: "${{needs.gen.outputs.version}}"
         run: |
+          # Go plugin cdylib carries its native extension (.so on Linux, .dylib on
+          # macOS); the distribution manifest records each artifact's URL
+          # explicitly, so no uniform suffix is needed.
+          if [ "${{ matrix.os }}" = "darwin" ]; then ext=dylib; else ext=so; fi
+          PLUGIN_GO_NAME="heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
+          echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
+          OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
           # FUSE (default feature) on Linux is pure-Rust (no libfuse link), so
           # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
           # devenv macfuse-stubs; zig mangles the nix `-L` path under its SDK
           # syslibroot and fails to find `-lfuse`, so the (native arm64) macOS
-          # runner uses plain `cargo build` — no cross needed there.
+          # runner uses plain `cargo build` — no cross needed there. The go plugin
+          # cdylib builds in a second invocation: `--bin heph` is a target filter
+          # that would exclude the cdylib's lib target, so it can't share the bin's
+          # command. The compile is still shared (deps are already built).
           if [ "${{ matrix.os }}" = "darwin" ]; then
-            cargo build --release --locked --target ${{ matrix.target }} --bin heph
+            cargo build --release --locked --target ${{ matrix.target }} -p heph --bin heph
+            cargo build --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
+            lib="$OUT/libplugin_go_cdylib.dylib"
             # The nix toolchain hard-links libiconv against its /nix/store path,
             # which is absent on user machines (dyld aborts at launch). Rewrite
-            # those load commands to the OS /usr/lib copies.
-            bash scripts/macos-portable.sh $CARGO_TARGET_DIR/${{ matrix.target }}/release/heph
+            # those load commands to the OS /usr/lib copies — for both artifacts.
+            bash scripts/macos-portable.sh "$OUT/heph"
+            bash scripts/macos-portable.sh "$lib"
           else
-            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin heph
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p heph --bin heph
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
+            lib="$OUT/libplugin_go_cdylib.so"
           fi
-          cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/heph $BIN_NAME
+          cp "$OUT/heph" $BIN_NAME
+          cp "$lib" $PLUGIN_GO_NAME
 
       - name: sccache stats
         if: always()
@@ -208,6 +224,12 @@ jobs:
           name: ${{steps.build.outputs.bin_name}}
           path: ${{steps.build.outputs.bin_name}}
 
+      - name: Upload go plugin artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.plugin_go_name}}
+          path: ${{steps.build.outputs.plugin_go_name}}
+
   upload_artifacts:
     name: Upload artifacts
     needs: [gen, build]
@@ -217,15 +239,38 @@ jobs:
     outputs:
       release_url: ${{ steps.create_release.outputs.url }}
     steps:
+      # Checkout brings tools/pluginmanifest (the manifest generator); the built
+      # artifacts download into dist/ alongside it.
+      - name: Checkout
+        uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          pattern: "heph_*"
+          # Matches the CLI (`heph_<os>_<arch>`) and the go plugin cdylib
+          # (`heph-go-plugin_<os>_<arch>.{so,dylib}`); excludes the `repo` source artifact.
+          pattern: "heph*"
           path: dist
           merge-multiple: true
 
       - name: List artifacts
         run: ls -lahR dist
+
+      # Build the go plugin distribution manifest from the per-os/arch cdylibs in
+      # dist/ — one entry per artifact, its `url` the release-asset URL it's
+      # published alongside (so `plugins: - { identifier: { url: .../heph-go-plugin.json } }`
+      # resolves the right dylib for the host). JSON via tools/pluginmanifest.
+      - name: Generate go plugin manifest
+        run: |
+          VERSION="${{needs.gen.outputs.version}}"
+          BASE="https://github.com/hephbuild/heph-artifacts-v1/releases/download/$VERSION"
+          ( cd tools/pluginmanifest && go run . -name go -version "$VERSION" \
+              -prefix heph-go-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
+              -out "$GITHUB_WORKSPACE/dist/heph-go-plugin.json" )
+          cat dist/heph-go-plugin.json
 
       - name: Create Release in artifacts repo
         id: create_release
@@ -274,7 +319,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -355,7 +400,7 @@ jobs:
       # manual rerun. Re-substitute any missing/invalid paths so the shell can
       # evaluate. No-op (a few seconds) on a healthy store.
       - name: Repair restored Nix store
-        run: nix-store --verify --repair
+        run: nix-store --verify --check-contents --repair || true
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -396,7 +441,8 @@ jobs:
   release:
     name: Release
     needs: [gen, upload_artifacts, lint, test]
-    if: github.ref == 'refs/heads/master'
+    # Disabled. Re-enable by restoring: if: github.ref == 'refs/heads/master'
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

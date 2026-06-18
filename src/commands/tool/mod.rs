@@ -3,6 +3,7 @@ mod cache;
 mod completions;
 pub mod gc;
 mod gen_gitignore;
+mod resolve_plugins;
 
 use clap::{Args, Subcommand};
 
@@ -52,6 +53,15 @@ pub enum ToolCommands {
     /// Run the BUILD-file language server over stdio (used by editors).
     #[command(name = "build-lsp", hide = true)]
     BuildLsp(build_lsp::Args),
+    /// Download + verify every configured plugin is loadable
+    ///
+    /// Resolves each `plugins:` entry: built-ins are instantiated and each
+    /// `path:`/`url:` plugin's cdylib is fetched (to `~/.heph/plugins`) and
+    /// load-checked over the stable ABI. Fails if any plugin can't be loaded.
+    ///
+    /// Example: `heph tool resolve-plugins --force`
+    #[command(name = "resolve-plugins")]
+    ResolvePlugins(resolve_plugins::Args),
 }
 
 impl ToolArgs {
@@ -72,6 +82,7 @@ impl ToolCommands {
             ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Completions(args) => completions::execute(args),
             ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),
+            ToolCommands::ResolvePlugins(args) => resolve_plugins::execute(args, sink, global),
         }
     }
 }

@@ -65,7 +65,7 @@ impl GoGolistDriver {
     }
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct GoGolistDef {
     import_path: String,
     goos: String,
@@ -238,7 +238,7 @@ impl ManagedDriver for GoGolistDriver {
         req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let def = req.request.target.def::<GoGolistDef>();
+        let def = req.request.target.def_de::<GoGolistDef>();
 
         // Find go binary from the go_bin tool input list
         let go_bin = {

@@ -31,7 +31,7 @@ impl Engine {
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
         Option<crate::engine::sandbox_cleaner::SandboxCleanupJob>,
-        Vec<hsandboxfuse::SlotGuard>,
+        Vec<hplugin::driver::SandboxGuard>,
     )> {
         let driver = self
             .drivers_by_name
@@ -146,7 +146,7 @@ impl Engine {
                 // FUSE upper-side dir). Slot guards travel with the response
                 // so result.rs can drop them in the same defer that fires
                 // sandbox cleanup.
-                Ok((res.artifacts, res.sandbox_cleanup, res.fuse_slot_guards))
+                Ok((res.artifacts, res.sandbox_cleanup, res.sandbox_guards))
             },
         )
         .await;
