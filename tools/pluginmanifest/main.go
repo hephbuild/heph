@@ -91,6 +91,12 @@ func main() {
 
 // scan finds `<prefix>_<os>_<arch>.dylib` files in dir and maps each to a URL
 // under base. Sorted for a deterministic manifest.
+//
+// The `.dylib` suffix is a *uniform naming convention*, not OS-specific: CI
+// publishes every cdylib — including the Linux `.so` — under a `.dylib` name
+// (see .github/workflows/heph.yml) so one URL template resolves on every host.
+// libloading opens by path and is extension-agnostic, so the real file format
+// underneath is irrelevant. Hence matching only `.dylib` here is correct.
 func scan(dir, prefix, base string) []artifact {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
