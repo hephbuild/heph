@@ -64,7 +64,7 @@ jobs:
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     needs: gen
     strategy:
       fail-fast: false
