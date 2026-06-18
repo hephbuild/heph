@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: ["master"]
 
+# Cancel superseded runs on a branch/PR so a new push doesn't leave the old run
+# burning runners (and showing up as a noisy "cancelled"). master is never
+# cancelled — its runs publish releases and must always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 # sccache config shared by every compiling job. RUSTC_WRAPPER=sccache is set by
 # the devenv shell; here we pin the cache dir to a workspace path so actions/cache
 # can persist it, and disable incremental compilation (sccache cannot cache
@@ -28,31 +35,9 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: fallback = true
-      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
-      # Cold runners otherwise re-realize the whole toolchain every job, which
-      # intermittently fails to fetch/realize a rust-overlay patch
-      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
-      # Keyed on the devenv lock so a toolchain bump busts the cache.
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5368709120
-          gc-max-store-size-macos: 5368709120
-      # cache-nix-action occasionally restores a store with a registered-but-
-      # invalid path (e.g. a fixed-output patch source dropped by the store GC
-      # before save). The later `devenv shell` eval then hard-fails with
-      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
-      # manual rerun. Re-substitute any missing/invalid paths so the shell can
-      # evaluate. No-op (a few seconds) on a healthy store.
-      - name: Repair restored Nix store
-        run: nix-store --verify --check-contents --repair || true
-      - name: Install devenv.sh
-        run: nix profile add nixpkgs#devenv
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
 
       - name: Compute version
         id: version
@@ -116,52 +101,10 @@ jobs:
           name: repo
           path: .
 
-      - uses: cachix/install-nix-action@v31
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
         with:
-          extra_nix_config: fallback = true
-      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
-      # Cold runners otherwise re-realize the whole toolchain every job, which
-      # intermittently fails to fetch/realize a rust-overlay patch
-      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
-      # Keyed on the devenv lock so a toolchain bump busts the cache.
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5368709120
-          gc-max-store-size-macos: 5368709120
-      # cache-nix-action occasionally restores a store with a registered-but-
-      # invalid path (e.g. a fixed-output patch source dropped by the store GC
-      # before save). The later `devenv shell` eval then hard-fails with
-      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
-      # manual rerun. Re-substitute any missing/invalid paths so the shell can
-      # evaluate. No-op (a few seconds) on a healthy store.
-      - name: Repair restored Nix store
-        run: nix-store --verify --check-contents --repair || true
-      - name: Install devenv.sh
-        run: nix profile add nixpkgs#devenv
-
-      # Cargo registry/git only — crate downloads + index. Compiled artifacts are
-      # handled by sccache (below), so target/ is intentionally not cached here.
-      - name: Cargo registry cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ matrix.target }}-
-
-      - name: sccache cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ matrix.target }}-
+          cargo-target: ${{ matrix.target }}
 
       - name: Build
         id: build
@@ -297,50 +240,10 @@ jobs:
           name: repo
           path: .
 
-      - uses: cachix/install-nix-action@v31
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
         with:
-          extra_nix_config: fallback = true
-      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
-      # Cold runners otherwise re-realize the whole toolchain every job, which
-      # intermittently fails to fetch/realize a rust-overlay patch
-      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
-      # Keyed on the devenv lock so a toolchain bump busts the cache.
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5368709120
-          gc-max-store-size-macos: 5368709120
-      # cache-nix-action occasionally restores a store with a registered-but-
-      # invalid path (e.g. a fixed-output patch source dropped by the store GC
-      # before save). The later `devenv shell` eval then hard-fails with
-      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
-      # manual rerun. Re-substitute any missing/invalid paths so the shell can
-      # evaluate. No-op (a few seconds) on a healthy store.
-      - name: Repair restored Nix store
-        run: nix-store --verify --check-contents --repair || true
-      - name: Install devenv.sh
-        run: nix profile add nixpkgs#devenv
-
-      - name: Cargo registry cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-x86_64-unknown-linux-gnu-
-
-      - name: sccache cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            sccache-x86_64-unknown-linux-gnu-
+          cargo-target: x86_64-unknown-linux-gnu
 
       - name: Lint
         shell: devenv shell bash -- -e {0}
@@ -378,50 +281,11 @@ jobs:
           name: repo
           path: .
 
-      - uses: cachix/install-nix-action@v31
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
         with:
-          extra_nix_config: fallback = true
-      # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
-      # Cold runners otherwise re-realize the whole toolchain every job, which
-      # intermittently fails to fetch/realize a rust-overlay patch
-      # ("path '/nix/store/…fix-kill-doctest.patch' is not valid"), forcing reruns.
-      # Keyed on the devenv lock so a toolchain bump busts the cache.
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5368709120
-          gc-max-store-size-macos: 5368709120
-      # cache-nix-action occasionally restores a store with a registered-but-
-      # invalid path (e.g. a fixed-output patch source dropped by the store GC
-      # before save). The later `devenv shell` eval then hard-fails with
-      # "path '/nix/store/…' is not valid" instead of re-realizing it, forcing a
-      # manual rerun. Re-substitute any missing/invalid paths so the shell can
-      # evaluate. No-op (a few seconds) on a healthy store.
-      - name: Repair restored Nix store
-        run: nix-store --verify --check-contents --repair || true
-      - name: Install devenv.sh
-        run: nix profile add nixpkgs#devenv
-
-      - name: Cargo registry cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-${{ matrix.target }}-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ matrix.target }}-test-
-
-      - name: sccache cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-${{ matrix.target }}-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ matrix.target }}-test-
+          cargo-target: ${{ matrix.target }}
+          cache-suffix: "-test"
 
       # No macFUSE on the runner: the macOS binaries weak-link libfuse, so they
       # launch with the dylib absent. `support_check` finds no macfuse.fs and

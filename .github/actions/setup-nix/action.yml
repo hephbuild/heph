@@ -1,0 +1,101 @@
+name: Setup Nix + devenv
+description: >-
+  Install Nix, restore the persisted Nix store, repair/re-substitute any
+  invalid paths, install devenv, and warm the devenv shell with self-healing
+  retries so a partial or poisoned cache restore recovers instead of failing
+  the job. Optionally restores the cargo registry + sccache caches.
+
+inputs:
+  cargo-target:
+    description: >-
+      Rust target triple used to key the cargo registry + sccache caches. Leave
+      empty to skip those caches (e.g. the codegen job, which does not compile).
+    required: false
+    default: ""
+  cache-suffix:
+    description: >-
+      Extra suffix appended to the cargo/sccache cache keys so jobs that compile
+      different artifact sets (e.g. test vs build) do not clobber each other.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # download-attempts/timeouts make fixed-output fetches (e.g. rust-overlay
+    # patches) retry instead of hard-failing on a transient network blip, which
+    # was a recurring "path '/nix/store/…patch' is not valid" rerun trigger.
+    # narinfo negative-ttl=0 stops a momentary "not found" from being cached for
+    # the rest of the job.
+    - uses: cachix/install-nix-action@v31
+      with:
+        extra_nix_config: |
+          fallback = true
+          connect-timeout = 20
+          download-attempts = 5
+          stalled-download-timeout = 90
+          narinfo-cache-negative-ttl = 0
+
+    # Persist the Nix store (rust-overlay toolchain, devenv env, …) across runs.
+    # Cold runners otherwise re-realize the whole toolchain every job, which
+    # intermittently fails to fetch/realize a rust-overlay patch, forcing reruns.
+    # Keyed on the devenv lock so a toolchain bump busts the cache.
+    - name: Cache Nix store
+      uses: nix-community/cache-nix-action@v6
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+        gc-max-store-size-linux: 5368709120
+        gc-max-store-size-macos: 5368709120
+
+    - name: Install devenv.sh
+      shell: bash
+      run: nix profile add nixpkgs#devenv
+
+    # A restored cache can be partial or corrupt — on macOS the gtar restore
+    # itself sometimes aborts mid-extraction ("Failed to restore the cache"),
+    # and the store GC can drop a fixed-output source — leaving registered-but-
+    # invalid paths. `devenv shell` then hard-fails with "Failed to get drvPath
+    # from shell derivation" / "path '/nix/store/…' is not valid" and the job
+    # needs a manual rerun. Repair (re-substitute) the store, then warm the
+    # devenv shell with retries: each failed attempt repairs again and drops the
+    # local devenv eval cache so a poisoned restore self-heals in place. On a
+    # healthy store this is a few seconds and a no-op.
+    - name: Repair store + warm devenv shell
+      shell: bash
+      run: |
+        repair() { nix-store --verify --check-contents --repair || true; }
+        repair
+        for attempt in 1 2 3; do
+          if devenv shell true; then
+            exit 0
+          fi
+          echo "::warning title=devenv shell::eval failed (attempt $attempt); repairing store and retrying"
+          repair
+          rm -rf .devenv .devenv.flake.nix 2>/dev/null || true
+        done
+        # Surface the real error if the store is still broken after retries.
+        devenv shell true
+
+    # Cargo registry/git only — crate downloads + index. Compiled artifacts are
+    # handled by sccache (below), so target/ is intentionally not cached here.
+    - name: Cargo registry cache
+      if: inputs.cargo-target != ''
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: cargo-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-
+
+    - name: sccache cache
+      if: inputs.cargo-target != ''
+      uses: actions/cache@v5
+      with:
+        path: ${{ github.workspace }}/.sccache
+        key: sccache-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          sccache-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-
