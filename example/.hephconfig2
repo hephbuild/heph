@@ -11,8 +11,9 @@ plugins:
   - builtin: bash
   - builtin: sh
   # The go plugin: one manifest names the cdylib for this host. The provider + its
-  # go_* drivers all come from that one library. Built by the `gen-example` script.
-  - path: .heph3/heph-go-plugin.json
+  # go_* drivers all come from that one library. Installed to the user-global
+  # ~/.heph by the `gen-example` script (which runs `install-go-plugin`).
+  - path: ~/.heph/plugins/go/heph-go-plugin.json
     options:
       go_bin: "//@heph/bin:go"
 #fuse:
