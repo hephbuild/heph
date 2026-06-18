@@ -251,18 +251,6 @@ pub type DynManagedDriver = stabby::dynptr!(
     stabby::boxed::Box<dyn StableManagedDriver + StableMeta + StableCancel + Send + Sync>
 );
 
-/// Config handed to a cdylib's create entry: the workspace root, the engine's
-/// home dir (where a plugin should keep its state/scratch — e.g. `<root>/.heph3`,
-/// configurable; never hardcode it), and the plugin's `options:` map (from config
-/// yaml) encoded as a `plugin-abi` `pb::Value` map (prost bytes). The plugin
-/// decodes the options and instantiates its provider + drivers from them.
-#[stabby::stabby]
-pub struct CreateConfig {
-    pub root: SString,
-    pub home: SString,
-    pub options: SVec<u8>,
-}
-
 /// A named managed driver in a plugin's component bundle.
 #[stabby::stabby]
 pub struct NamedDriver {
@@ -273,16 +261,25 @@ pub struct NamedDriver {
 /// What a cdylib's create entry returns: a provider + named drivers, all as owned
 /// ABI-stable handles that the host wraps with [`crate::load_stable`]. (plugin-go
 /// always exports a provider; driver-only bundles can carry an empty name.)
+///
+/// `meta` is reserved, prost-encoded return-side metadata (empty today). It exists
+/// so a plugin can later report additive descriptive data (capabilities, abi
+/// minor, …) without changing this struct's layout — a layout change would break
+/// loading of older plugins. The handle fields must stay stabby (they carry the
+/// live native vtables); only the data rides prost.
 #[stabby::stabby]
 pub struct PluginComponents {
     pub provider_name: SString,
     pub provider: DynProvider,
     pub drivers: SVec<NamedDriver>,
+    pub meta: SVec<u8>,
 }
 
 /// The cdylib create-entry symbol name (exported with `#[stabby::export]`,
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
 
-/// The create entry's function-pointer type.
-pub type CreateFn = extern "C" fn(CreateConfig) -> PluginComponents;
+/// The create entry's function-pointer type. The config crosses as prost-encoded
+/// `pb::CreateConfig` bytes (not a stabby struct), so adding config fields is an
+/// additive change that does not break older plugins.
+pub type CreateFn = extern "C" fn(SVec<u8>) -> PluginComponents;

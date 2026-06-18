@@ -293,37 +293,29 @@ fn pb_to_yaml(v: pb::Value) -> serde_yaml::Value {
     }
 }
 
-/// Encode a plugin `options:` map to `pb::Value` (Map) prost bytes for the ABI.
-pub fn options_to_pb_bytes(opts: &BTreeMap<String, serde_yaml::Value>) -> Vec<u8> {
-    use prost::Message;
-    let map = pb::value::Map {
-        entries: opts
-            .iter()
-            .map(|(k, v)| (k.clone(), yaml_to_pb(v)))
-            .collect(),
-    };
-    pb::Value {
-        kind: Some(pb::value::Kind::MapVal(map)),
-    }
-    .encode_to_vec()
+/// A plugin `options:` map as structured `pb::CreateConfig.options` data (each
+/// value a `pb::Value`) — no nested encode, the map is a field of `CreateConfig`.
+pub fn options_to_pb_map(
+    opts: &BTreeMap<String, serde_yaml::Value>,
+) -> std::collections::HashMap<String, pb::Value> {
+    opts.iter()
+        .map(|(k, v)| (k.clone(), yaml_to_pb(v)))
+        .collect()
 }
 
-/// Decode ABI options bytes back into a plugin `options:` map. Non-map / empty
-/// payloads decode to an empty map.
-pub fn options_from_pb_bytes(bytes: &[u8]) -> anyhow::Result<BTreeMap<String, serde_yaml::Value>> {
+/// Convert the structured `CreateConfig.options` map back into a plugin
+/// `options:` map.
+pub fn options_from_pb_map(
+    map: std::collections::HashMap<String, pb::Value>,
+) -> BTreeMap<String, serde_yaml::Value> {
+    map.into_iter().map(|(k, v)| (k, pb_to_yaml(v))).collect()
+}
+
+/// Decode the cdylib create-entry config from its prost bytes (the SDK exposes
+/// this so plugin authors decode `CreateConfig` without depending on prost).
+pub fn create_config_from_bytes(bytes: &[u8]) -> anyhow::Result<pb::CreateConfig> {
     use prost::Message;
-    if bytes.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let v = pb::Value::decode(bytes).context("decode plugin options pb::Value")?;
-    match v.kind {
-        Some(pb::value::Kind::MapVal(m)) => Ok(m
-            .entries
-            .into_iter()
-            .map(|(k, v)| (k, pb_to_yaml(v)))
-            .collect()),
-        _ => Ok(BTreeMap::new()),
-    }
+    pb::CreateConfig::decode(bytes).context("decode CreateConfig")
 }
 
 // ---- State ----
@@ -878,9 +870,9 @@ mod tests {
     }
 
     #[test]
-    fn options_pb_bytes_roundtrip() {
-        // A plugin options map crosses the ABI as pb::Value bytes and decodes back
-        // unchanged — covering scalars, nesting, and a list.
+    fn options_pb_map_roundtrip() {
+        // A plugin options map crosses the ABI as structured CreateConfig.options
+        // and converts back unchanged — covering scalars, nesting, and a list.
         let yaml = r#"
 gotool: "//@heph/bin:go"
 parallel: 4
@@ -889,15 +881,15 @@ nested: { a: 1, b: [x, y] }
 "#;
         let opts: BTreeMap<String, serde_yaml::Value> =
             serde_yaml::from_str(yaml).expect("parse opts");
-        let bytes = options_to_pb_bytes(&opts);
-        let back = options_from_pb_bytes(&bytes).expect("decode opts");
+        let map = options_to_pb_map(&opts);
+        let back = options_from_pb_map(map);
         assert_eq!(back, opts);
 
         // Typed decode through the same path a plugin author uses.
         let gotool: String = serde_yaml::from_value(back["gotool"].clone()).expect("gotool");
         assert_eq!(gotool, "//@heph/bin:go");
 
-        // Empty payload decodes to an empty map (absent options).
-        assert!(options_from_pb_bytes(&[]).expect("empty").is_empty());
+        // Empty map converts to an empty options map (absent options).
+        assert!(options_from_pb_map(Default::default()).is_empty());
     }
 }

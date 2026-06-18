@@ -33,10 +33,11 @@ pub mod stabby {
     pub use crate::guest::GuestExecutor;
     pub use crate::serve::{make_dyn_managed_driver, make_dyn_provider};
 
-    /// Decode a plugin's `options:` map from the `CreateConfig.options` bytes
-    /// (a `pb::Value` map). Authors then read typed values via
-    /// [`hplugin::config::decode_opt`], exactly as in-process plugins do.
-    pub use plugin_abi::convert::options_from_pb_bytes;
+    /// Decode the cdylib create-entry config (`pb::CreateConfig`) from its prost
+    /// bytes, and convert its structured `options` map into a plugin `options:`
+    /// map. Authors then read typed values via [`hplugin::config::decode_opt`],
+    /// exactly as in-process plugins do.
+    pub use plugin_abi::convert::{create_config_from_bytes, options_from_pb_map};
 
     /// The ABI version this transport builds against.
     pub use plugin_abi::ABI_SEMVER;

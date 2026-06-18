@@ -11,16 +11,19 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{GoEmbedDriver, GoGolistDriver, GoTestmainDriver, Provider};
-use plugin_sdk::stabby::abi::{CreateConfig, NamedDriver, PluginComponents};
-use plugin_sdk::stabby::{make_dyn_managed_driver, make_dyn_provider};
+use plugin_sdk::stabby::abi::{NamedDriver, PluginComponents};
+use plugin_sdk::stabby::{
+    create_config_from_bytes, make_dyn_managed_driver, make_dyn_provider, options_from_pb_map,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
-/// host's `get_stabbied` checks for ABI compatibility.
+/// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
+/// `pb::CreateConfig` bytes, so config fields are additive across versions.
 #[stabby::export]
-pub extern "C" fn heph_plugin_create(cfg: CreateConfig) -> PluginComponents {
-    match build(cfg) {
+pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginComponents {
+    match build(&cfg) {
         Ok(c) => c,
         Err(e) => {
             // No safe way to surface an error through the stable bundle (it must
@@ -32,13 +35,14 @@ pub extern "C" fn heph_plugin_create(cfg: CreateConfig) -> PluginComponents {
     }
 }
 
-fn build(cfg: CreateConfig) -> anyhow::Result<PluginComponents> {
-    let root = PathBuf::from(cfg.root.to_string());
-    let home = PathBuf::from(cfg.home.to_string());
+fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
+    let cfg = create_config_from_bytes(cfg)?;
+    let root = PathBuf::from(cfg.root);
+    let home = PathBuf::from(cfg.home);
 
-    // Tunables come from the plugin's `options:` map (config yaml), decoded the
-    // same way an in-process plugin reads its options.
-    let mut options = plugin_sdk::stabby::options_from_pb_bytes(&cfg.options[..])?;
+    // Tunables come from the plugin's `options:` map (config yaml), carried as
+    // structured CreateConfig data — read the same way an in-process plugin does.
+    let mut options = options_from_pb_map(cfg.options);
     // The golist driver needs the same go binary addr the provider resolves from
     // its `gotool` option — peek it here (non-destructive; the provider still
     // reads it) so there's a single source of truth, no separate `go_bin` knob.
@@ -77,5 +81,7 @@ fn build(cfg: CreateConfig) -> anyhow::Result<PluginComponents> {
         provider_name: "go".into(),
         provider: make_dyn_provider(provider),
         drivers,
+        // No return-side metadata to report yet.
+        meta: stabby::vec::Vec::new(),
     })
 }

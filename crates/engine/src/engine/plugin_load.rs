@@ -16,17 +16,20 @@ impl Engine {
     /// host, and register the provider + drivers it exports (the plugin
     /// self-describes its names via `config()`).
     pub fn register_plugins(&mut self, plugins: &[config_yaml::PluginSpec]) -> anyhow::Result<()> {
-        let mut manifests: Vec<(config_yaml::PluginIdentifier, Vec<u8>)> = Vec::new();
+        let mut manifests: Vec<(
+            config_yaml::PluginIdentifier,
+            std::collections::HashMap<String, hplugin_abi::pb::Value>,
+        )> = Vec::new();
         for spec in plugins {
             match &spec.identifier {
                 config_yaml::PluginIdentifier::Builtin(name) => self
                     .apply_builtin(name, &spec.options)
                     .with_context(|| format!("apply builtin plugin `{name}`"))?,
-                // Manifest plugin: encode options once (pb::Value bytes) for the
-                // cdylib's create entry, resolve + load below.
+                // Manifest plugin: carry the options as structured pb map data for
+                // the cdylib's create entry (pb::CreateConfig), resolve + load below.
                 _ => manifests.push((
                     spec.identifier.clone(),
-                    hplugin_abi::convert::options_to_pb_bytes(&spec.options),
+                    hplugin_abi::convert::options_to_pb_map(&spec.options),
                 )),
             }
         }
@@ -64,7 +67,10 @@ fn load_dylib_plugins(
     e: &mut Engine,
     root: &std::path::Path,
     home_dir: &std::path::Path,
-    manifests: Vec<(config_yaml::PluginIdentifier, Vec<u8>)>,
+    manifests: Vec<(
+        config_yaml::PluginIdentifier,
+        std::collections::HashMap<String, hplugin_abi::pb::Value>,
+    )>,
 ) -> anyhow::Result<()> {
     use rayon::prelude::*;
 
@@ -75,9 +81,9 @@ fn load_dylib_plugins(
     let home_str = home_dir.to_string_lossy().into_owned();
     let loaded = manifests
         .into_par_iter()
-        .map(|(src, options_pb)| -> anyhow::Result<_> {
+        .map(|(src, options)| -> anyhow::Result<_> {
             let dylib = resolve_manifest_dylib(&src, root)?;
-            hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, &options_pb)
+            hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, options)
                 .with_context(|| format!("load plugin dylib {}", dylib.display()))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;

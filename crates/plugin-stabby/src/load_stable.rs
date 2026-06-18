@@ -5,9 +5,9 @@
 //! executor across natively (`HostExecutor`) so callbacks are direct.
 
 use crate::abi::{
-    CREATE_SYMBOL, CreateConfig, CreateFn, DynExecutor, DynItemStream, DynManagedDriver,
-    DynProvider, StableCancelDyn, StableItemStream, StableItemStreamDyn, StableManagedDriverDyn,
-    StableMetaDyn, StableProviderDyn,
+    CREATE_SYMBOL, CreateFn, DynExecutor, DynItemStream, DynManagedDriver, DynProvider,
+    StableCancelDyn, StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
+    StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use async_trait::async_trait;
@@ -54,11 +54,20 @@ pub fn load(
     path: &std::path::Path,
     root: &str,
     home: &str,
-    options: &[u8],
+    options: std::collections::HashMap<String, pb::Value>,
 ) -> anyhow::Result<LoadedComponents> {
     use crate::abi::PluginComponents;
     use anyhow::Context;
     use stabby::libloading::StabbyLibrary;
+
+    // The create config crosses as prost bytes so its fields are additive; build it
+    // once here from the structured options (no nested encode).
+    let cfg = pb::CreateConfig {
+        root: root.to_string(),
+        home: home.to_string(),
+        options,
+    }
+    .encode_to_vec();
 
     // SAFETY: loading a plugin dylib runs its initializers; the path is operator-
     // controlled config. The ABI of what we call is checked below via get_stabbied.
@@ -71,11 +80,7 @@ pub fn load(
         // `CreateFn` before returning it; calling it is then ABI-sound.
         let create = unsafe { lib.get_stabbied::<CreateFn>(CREATE_SYMBOL) }
             .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
-        create(CreateConfig {
-            root: root.into(),
-            home: home.into(),
-            options: stabby::vec::Vec::from(options),
-        })
+        create(sv(&cfg))
     };
     // Keep the dylib mapped for the process lifetime (the returned trait objects'
     // vtables point into its code); leaking the handle is intentional.
@@ -85,6 +90,8 @@ pub fn load(
         provider_name,
         provider,
         drivers,
+        // Reserved return-side metadata; nothing consumes it yet.
+        meta: _,
     } = comps;
     let pname = provider_name.to_string();
     let host_provider = if pname.is_empty() {
