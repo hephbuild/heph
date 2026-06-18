@@ -18,8 +18,8 @@ use hplugin::driver::{
     RunRequest, inputartifact,
 };
 use hplugin::provider::{
-    ConfigRequest, GetError, GetRequest, ListPackagesRequest, ListRequest, ProbeRequest, Provider,
-    ProviderExecutor,
+    ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
+    ProbeRequest, Provider, ProviderExecutor,
 };
 use hplugin_stabby::abi::{DynExecutor, StableManagedDriver, StableProvider};
 use plugin_abi::convert;
@@ -240,6 +240,58 @@ impl StableProvider for StableProviderImpl {
                     states: pr.states.iter().map(convert::state_to_pb).collect(),
                 }),
                 Err(e) => err_body(e.to_string()),
+            };
+            unary(body)
+        })
+        .into()
+    }
+
+    extern "C" fn functions(&self) -> SVec<u8> {
+        let functions = self
+            .provider
+            .functions()
+            .into_iter()
+            .map(|d| pb::ProviderFunctionDef {
+                name: d.name,
+                signature: Some(convert::fn_signature_to_pb(&d.signature)),
+                doc: d.doc,
+            })
+            .collect();
+        SVec::from(
+            pb::FunctionsResponse { functions }
+                .encode_to_vec()
+                .as_slice(),
+        )
+    }
+
+    extern "C" fn call_function<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+        let provider = Arc::clone(&self.provider);
+        stabby::boxed::Box::new(async move {
+            let req = pb::CallFunctionRequest::decode(&req[..]).unwrap_or_default();
+            // Re-derive the def each call (cheap; provider functions are static
+            // metadata). The handler is not transmissible, so it must be invoked
+            // here on the guest side.
+            let def = provider.functions().into_iter().find(|d| d.name == req.name);
+            let Some(def) = def else {
+                return unary(err_body(format!("unknown provider function `{}`", req.name)));
+            };
+            let ctx = FnCallContext {
+                pkg: &req.pkg,
+                root: std::path::Path::new(&req.root),
+            };
+            let args = FnArgs {
+                positional: req.positional.into_iter().map(convert::value_from_pb).collect(),
+                named: req
+                    .named
+                    .into_iter()
+                    .map(|(k, v)| (k, convert::value_from_pb(v)))
+                    .collect(),
+            };
+            let body = match def.func.call(&ctx, args).await {
+                Ok(v) => Body::CallFunctionResp(pb::CallFunctionResponse {
+                    value: Some(convert::value_to_pb(&v)),
+                }),
+                Err(e) => err_body(format!("{e:#}")),
             };
             unary(body)
         })
@@ -540,7 +592,7 @@ impl Content for DiskInputContent {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
 
     // A managed input's content is readable from the files the host materialized
     // under unpack_root, scoped to this input's files via the list file.
@@ -602,5 +654,142 @@ mod tests {
         assert_eq!(entries.get("a.txt").map(String::as_str), Some("alpha"));
         assert_eq!(entries.get("sub/b.txt").map(String::as_str), Some("beta"));
         assert!(!entries.contains_key("other.txt"));
+    }
+
+    use hcore::hasync::Cancellable;
+    use hcore::htvalue::Value;
+    use hcore::htvalue::signature::{FnSignature, Param, ParamType};
+    use hplugin::provider::{
+        ConfigResponse, GetResponse, ListPackageResponse, ListResponse, ProbeResponse, ProviderFn,
+        ProviderFunctionDef,
+    };
+    use std::path::Path;
+
+    // A provider exposing one function `echo(msg, times=1)` whose handler reads
+    // the call context's `pkg` — so the test proves both the call arguments and
+    // the FnCallContext cross the seam, not just the metadata.
+    struct FnProvider;
+
+    struct EchoFn;
+    #[async_trait::async_trait]
+    impl ProviderFn for EchoFn {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+            let msg = match args.positional.first() {
+                Some(Value::String(s)) => s.clone(),
+                _ => anyhow::bail!("echo: `msg` must be a string"),
+            };
+            let times = match args.named.get("times") {
+                Some(Value::Int(n)) => *n,
+                _ => 1,
+            };
+            Ok(Value::String(format!(
+                "{}:{}",
+                ctx.pkg,
+                msg.repeat(usize::try_from(times).unwrap_or(0))
+            )))
+        }
+    }
+
+    impl Provider for FnProvider {
+        fn config(&self, _req: ConfigRequest) -> Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "mock".into(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+        fn functions(&self) -> Vec<ProviderFunctionDef> {
+            vec![ProviderFunctionDef {
+                name: "echo".into(),
+                signature: FnSignature {
+                    positional: vec![Param::required("msg", ParamType::String)],
+                    named: vec![Param::optional("times", ParamType::Int, Value::Int(1))],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: "Echo `msg` `times` times, prefixed by the calling package.".into(),
+                func: Arc::new(EchoFn),
+            }]
+        }
+    }
+
+    // Provider functions survive the guest→host stable-ABI round trip: the host
+    // sees the same name/signature/doc, and invoking the proxied handler carries
+    // both the arguments and the FnCallContext across the seam.
+    #[test]
+    fn provider_functions_roundtrip() {
+        use hplugin_stabby::load_stable::StableRemoteProvider;
+
+        let dynp = make_dyn_provider(Arc::new(FnProvider) as Arc<dyn Provider>);
+        let host = StableRemoteProvider::new(dynp, "mock");
+
+        // Metadata crosses: exactly one function, rendered as declared.
+        let defs = host.functions();
+        assert_eq!(defs.len(), 1);
+        let def = &defs[0];
+        assert_eq!(def.name, "echo");
+        assert_eq!(def.signature.render("echo"), "echo(msg: string, times?: int) -> string");
+        assert!(def.doc.contains("Echo `msg`"));
+
+        let root = std::path::PathBuf::from("/ws");
+        let ctx = FnCallContext {
+            pkg: "mypkg",
+            root: Path::new(&root),
+        };
+        // Default `times` (omitted) → 1; the handler reads ctx.pkg.
+        let out = futures::executor::block_on(def.func.call(
+            &ctx,
+            FnArgs {
+                positional: vec![Value::String("hi".into())],
+                named: Default::default(),
+            },
+        ))
+        .expect("call echo");
+        assert_eq!(out, Value::String("mypkg:hi".into()));
+
+        // Named arg crosses and is honored.
+        let mut named = std::collections::HashMap::new();
+        named.insert("times".to_string(), Value::Int(3));
+        let out = futures::executor::block_on(def.func.call(
+            &ctx,
+            FnArgs {
+                positional: vec![Value::String("ab".into())],
+                named,
+            },
+        ))
+        .expect("call echo times=3");
+        assert_eq!(out, Value::String("mypkg:ababab".into()));
     }
 }

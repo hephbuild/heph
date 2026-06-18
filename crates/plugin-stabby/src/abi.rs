@@ -127,6 +127,14 @@ pub trait StableProvider {
     extern "C" fn list_packages<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
     extern "C" fn get<'a>(&'a self, req: SVec<u8>, exec: DynExecutor) -> DynFuture<'a, SVec<u8>>;
     extern "C" fn probe<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    /// The BUILD-file functions this provider exposes, as prost-encoded
+    /// `pb::FunctionsResponse` bytes (metadata only — handlers stay guest-side,
+    /// reached via `call_function`). Sync: it is provider-static metadata read
+    /// once during host registry wiring, not a per-request call.
+    extern "C" fn functions(&self) -> SVec<u8>;
+    /// Invoke one exposed function by name. `req` is raw `pb::CallFunctionRequest`
+    /// bytes; the reply is a `pb::Frame` carrying `CallFunctionResp` or `Error`.
+    extern "C" fn call_function<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
 }
 
 /// The cold managed-driver surface (same transport contract as [`StableProvider`]).

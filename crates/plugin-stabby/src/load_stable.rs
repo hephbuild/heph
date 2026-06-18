@@ -21,9 +21,11 @@ use hplugin::driver::{
     ConfigResponse as DriverConfigResponse, DriverSchema, ParseRequest, ParseResponse,
     inputartifact,
 };
+use hcore::htvalue::Value;
 use hplugin::provider::{
-    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
-    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
+    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
+    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
+    ProbeResponse, Provider, ProviderFn, ProviderFunctionDef,
 };
 use plugin_abi::pb::frame::Body;
 use plugin_abi::{convert, pb};
@@ -288,6 +290,64 @@ impl Provider for StableRemoteProvider {
                 other => anyhow::bail!("unexpected probe response: {other:?}"),
             }
         })
+    }
+
+    fn functions(&self) -> Vec<ProviderFunctionDef> {
+        // Sync metadata call across the seam; decode the plugin's function defs
+        // and wrap each handler in a proxy that dispatches back over the ABI.
+        let bytes = self.inner.functions();
+        let resp = match pb::FunctionsResponse::decode(&bytes[..]) {
+            Ok(r) => r,
+            // A decode failure here would be an ABI bug; surface no functions
+            // rather than poison registry wiring (which has no error channel).
+            Err(_) => return Vec::new(),
+        };
+        resp.functions
+            .into_iter()
+            .filter_map(|d| {
+                Some(ProviderFunctionDef {
+                    signature: convert::fn_signature_from_pb(d.signature?),
+                    doc: d.doc,
+                    func: Arc::new(StableRemoteFn {
+                        inner: Arc::clone(&self.inner),
+                        name: d.name.clone(),
+                    }),
+                    name: d.name,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Proxy handler for a dylib provider function: each call encodes its args and
+/// the `FnCallContext`, dispatches `call_function` over the stable ABI, and
+/// decodes the returned [`Value`].
+struct StableRemoteFn {
+    inner: Arc<DynProvider>,
+    name: String,
+}
+
+#[async_trait]
+impl ProviderFn for StableRemoteFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let pb_req = pb::CallFunctionRequest {
+            name: self.name.clone(),
+            pkg: ctx.pkg.to_string(),
+            root: ctx.root.to_string_lossy().into_owned(),
+            positional: args.positional.iter().map(convert::value_to_pb).collect(),
+            named: args
+                .named
+                .iter()
+                .map(|(k, v)| (k.clone(), convert::value_to_pb(v)))
+                .collect(),
+        }
+        .encode_to_vec();
+        let bytes = self.inner.call_function(sv(&pb_req)).await;
+        match decode_unary(&bytes)? {
+            Body::CallFunctionResp(r) => Ok(convert::value_from_pb(r.value.unwrap_or_default())),
+            Body::Error(e) => anyhow::bail!("{}", e.message),
+            other => anyhow::bail!("unexpected call_function response: {other:?}"),
+        }
     }
 }
 
