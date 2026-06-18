@@ -4,7 +4,8 @@
 //! the contract-level driver-support crate must not have.
 
 use crate::engine::Engine;
-use hdriver_support::driver_managed::{FuseSlot, ManagedDriver, ManagedDriverBridge};
+use hdriver_bridge::{FuseSlot, ManagedDriverBridge};
+use hdriver_support::driver_managed::ManagedDriver;
 
 impl Engine {
     pub fn new_managed_driver(&self, driver: Box<dyn ManagedDriver>) -> ManagedDriverBridge {

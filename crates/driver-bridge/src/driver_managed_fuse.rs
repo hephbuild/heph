@@ -1,11 +1,11 @@
-use crate::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, list_path_for,
-    resolve_unpack_root, write_source_map,
-};
 use anyhow::Context;
 use hcore::hartifactcontent;
 use hcore::hartifactcontent::tar_index::TarIndex;
 use hcore::hasync::Cancellable;
+use hdriver_support::driver_managed::{
+    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, list_path_for,
+    resolve_unpack_root, write_source_map,
+};
 use hplugin::driver::{RunInput, RunRequest, RunResponse, SandboxGuard};
 use hsandboxfuse as sandboxfuse;
 use std::collections::BTreeMap;

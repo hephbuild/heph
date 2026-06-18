@@ -48,11 +48,12 @@ pub use result::OutputMatcher;
 pub use result::ResultOptions;
 pub use result::{InteractiveInner, InteractiveWrapper};
 pub use spec::EngineTargetSpec;
-// The managed-driver base moved to `heph-driver-support`; re-export at the old
-// engine paths. `managed_register` adds `Engine::new_managed_driver` (engine
-// state + the pluginexec shell fallback).
+// The managed-driver contract lives in fuse-free `heph-driver-support`; the
+// FUSE backend + routing bridge live in `heph-driver-bridge`. Re-export both at
+// the old engine paths. `managed_register` adds `Engine::new_managed_driver`
+// (engine state + the pluginexec shell fallback).
+pub use hdriver_bridge::driver_managed_fuse;
 pub use hdriver_support::driver_managed;
-pub use hdriver_support::driver_managed_fuse;
 pub use hdriver_support::driver_managed_os;
 mod execute;
 mod managed_register;
