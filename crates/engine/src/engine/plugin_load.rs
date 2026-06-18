@@ -114,14 +114,16 @@ fn load_dylib_plugins(
 /// unchanged when `HOME` is unset.
 #[cfg(unix)]
 fn expand_tilde(p: &str) -> std::path::PathBuf {
-    let rest = if p == "~" {
-        Some("")
-    } else {
-        p.strip_prefix("~/")
+    let Some(home) = std::env::var_os("HOME") else {
+        return std::path::PathBuf::from(p);
     };
-    match (rest, std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => std::path::PathBuf::from(home).join(rest),
-        _ => std::path::PathBuf::from(p),
+    if p == "~" {
+        std::path::PathBuf::from(home)
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        // Only here — a real `~/` prefix — do we join onto $HOME.
+        std::path::PathBuf::from(home).join(rest)
+    } else {
+        std::path::PathBuf::from(p)
     }
 }
 
