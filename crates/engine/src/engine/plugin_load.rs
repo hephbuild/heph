@@ -276,6 +276,21 @@ pub fn clear_plugin_cache() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cache-entry filename for a download URL: `<hash16>-<basename>`. Keyed by a
+/// hash of the *full* URL (not just the basename) so a version bump — which
+/// changes the URL (e.g. `.../v1.2.3/x.so` → `.../v1.2.4/x.so`) even when the
+/// basename is identical — auto-invalidates instead of silently reusing the old
+/// artifact. The basename is kept for readability + a correct extension.
+fn cache_entry_name(url: &str) -> String {
+    let basename = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("plugin");
+    let key = xxhash_rust::xxh3::xxh3_64(url.as_bytes());
+    format!("{key:016x}-{basename}")
+}
+
 /// Download a plugin file from `url`, cache it under
 /// `~/.heph/plugins/<os>-<arch>/`, make it executable, and return its path. A
 /// previously-downloaded file is reused (no re-fetch). The URL is used verbatim —
@@ -285,13 +300,9 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
-    let filename = url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("plugin");
+    let name = cache_entry_name(url);
     let dir = plugin_cache_dir()?;
-    let dest = dir.join(filename);
+    let dest = dir.join(&name);
     if dest.exists() {
         return Ok(dest);
     }
@@ -300,7 +311,7 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
     // Serialize concurrent downloads of this artifact (across processes too): hold
     // an exclusive lock for the fetch, then re-check — another run may have just
     // installed it while we waited.
-    let _lock = lock_exclusive(&dir.join(format!("{filename}.lock")))?;
+    let _lock = lock_exclusive(&dir.join(format!("{name}.lock")))?;
     if dest.exists() {
         return Ok(dest);
     }
@@ -321,7 +332,7 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
 
     // Write to a temp path then rename so a partial download is never seen as a
     // usable binary by a concurrent run.
-    let tmp = dir.join(format!(".{filename}.download"));
+    let tmp = dir.join(format!(".{name}.download"));
     {
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
@@ -336,6 +347,21 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_entry_name_keys_on_full_url() {
+        use super::cache_entry_name;
+        let a = cache_entry_name("https://h/v1.2.3/heph-go-plugin_linux_amd64.so");
+        let b = cache_entry_name("https://h/v1.2.4/heph-go-plugin_linux_amd64.so");
+        // Same basename, different version → different cache entry (auto-invalidate).
+        assert_ne!(a, b);
+        assert!(a.ends_with("-heph-go-plugin_linux_amd64.so"), "{a}");
+        // Stable for the same URL.
+        assert_eq!(
+            a,
+            cache_entry_name("https://h/v1.2.3/heph-go-plugin_linux_amd64.so")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_path_expands_tilde_and_anchors_relatives() {
