@@ -108,22 +108,27 @@ fn load_dylib_plugins(
     }
 }
 
-/// Expand a leading `~` / `~/` to `$HOME` so config and manifest paths can point
-/// at the user-global plugin dir (`~/.heph/plugins/...`). A bare `~` or `~/rest`
-/// expands; `~user` and embedded `~` are left untouched. Returns the input
-/// unchanged when `HOME` is unset.
+/// Normalize a config/manifest path to an absolute path against `base`. First
+/// expand a leading `~` / `~/` to `$HOME` (a bare `~` or `~/rest`; `~user` and
+/// embedded `~` are left untouched, and so is everything if `HOME` is unset),
+/// then if the result is still relative join it onto `base`.
+///
+/// So `~/.heph/x` → `$HOME/.heph/x`, `/abs` → `/abs`, `rel` → `base/rel`.
 #[cfg(unix)]
-fn expand_tilde(p: &str) -> std::path::PathBuf {
-    let Some(home) = std::env::var_os("HOME") else {
-        return std::path::PathBuf::from(p);
+fn resolve_path(p: &str, base: &std::path::Path) -> std::path::PathBuf {
+    let expanded = match std::env::var_os("HOME") {
+        Some(home) if p == "~" => std::path::PathBuf::from(home),
+        // Only a real `~/` prefix joins onto $HOME.
+        Some(home) => match p.strip_prefix("~/") {
+            Some(rest) => std::path::PathBuf::from(home).join(rest),
+            None => std::path::PathBuf::from(p),
+        },
+        None => std::path::PathBuf::from(p),
     };
-    if p == "~" {
-        std::path::PathBuf::from(home)
-    } else if let Some(rest) = p.strip_prefix("~/") {
-        // Only here — a real `~/` prefix — do we join onto $HOME.
-        std::path::PathBuf::from(home).join(rest)
+    if expanded.is_absolute() {
+        expanded
     } else {
-        std::path::PathBuf::from(p)
+        base.join(expanded)
     }
 }
 
@@ -138,8 +143,7 @@ fn resolve_manifest_dylib(
 ) -> anyhow::Result<std::path::PathBuf> {
     let (manifest_bytes, manifest_dir) = match src {
         config_yaml::PluginIdentifier::Path(p) => {
-            let pb = expand_tilde(p);
-            let mp = if pb.is_absolute() { pb } else { root.join(pb) };
+            let mp = resolve_path(p, root);
             let bytes = std::fs::read(&mp)
                 .with_context(|| format!("read plugin manifest {}", mp.display()))?;
             let dir = mp
@@ -178,14 +182,7 @@ fn resolve_manifest_dylib(
             )
         })?;
     match (&art.path, &art.url) {
-        (Some(p), None) => {
-            let pb = expand_tilde(p);
-            Ok(if pb.is_absolute() {
-                pb
-            } else {
-                manifest_dir.join(pb)
-            })
-        }
+        (Some(p), None) => Ok(resolve_path(p, &manifest_dir)),
         (None, Some(u)) => download_plugin(u),
         _ => anyhow::bail!(
             "plugin `{}` artifact for {os}/{arch} must set exactly one of `path`/`url`",
@@ -341,25 +338,25 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn expand_tilde_expands_home_prefix_only() {
-        use super::expand_tilde;
+    fn resolve_path_expands_tilde_and_anchors_relatives() {
+        use super::resolve_path;
+        let base = std::path::Path::new("/base");
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .expect("HOME");
+        // `~/` and bare `~` expand to $HOME (absolute → base ignored).
         assert_eq!(
-            expand_tilde("~/.heph/plugins/go.json"),
+            resolve_path("~/.heph/plugins/go.json", base),
             home.join(".heph/plugins/go.json")
         );
-        assert_eq!(expand_tilde("~"), home);
-        // No leading `~/`: left untouched (absolute, relative, and `~user`).
+        assert_eq!(resolve_path("~", base), home);
+        // Absolute stays as-is; `~user`/embedded `~` are not tilde-expanded.
         assert_eq!(
-            expand_tilde("/abs/path"),
+            resolve_path("/abs/path", base),
             std::path::PathBuf::from("/abs/path")
         );
-        assert_eq!(
-            expand_tilde("rel/path"),
-            std::path::PathBuf::from("rel/path")
-        );
-        assert_eq!(expand_tilde("~bob/x"), std::path::PathBuf::from("~bob/x"));
+        // Relative (incl. `~user`) anchors onto base.
+        assert_eq!(resolve_path("rel/path", base), base.join("rel/path"));
+        assert_eq!(resolve_path("~bob/x", base), base.join("~bob/x"));
     }
 }
