@@ -24,9 +24,11 @@ use hplugin::provider::{
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
-    DynExecutor, DynFunctionRegistry, DynItemStream, RunIo, StableFunctionRegistryDyn,
-    StableItemStream, StableManagedDriver, StableMeta, StableProvider,
+    DynExecutor, DynFunctionRegistry, DynItemStream, StableCancel, StableFunctionRegistryDyn,
+    StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta, StableProvider,
 };
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use plugin_abi::convert;
 use plugin_abi::pb;
 use plugin_abi::pb::frame::Body;
@@ -171,19 +173,112 @@ fn get_error_kind(e: &anyhow::Error) -> pb::get_error::Kind {
 /// Wrap a real provider as an ABI-stable [`hplugin_stabby::abi::DynProvider`] handle
 /// (in-process; the cdylib entry produces the same handle across the boundary).
 pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::DynProvider {
-    stabby::boxed::Box::new(StableProviderImpl { provider }).into()
+    stabby::boxed::Box::new(StableProviderImpl {
+        provider,
+        cancels: Arc::new(CancelRegistry::default()),
+    })
+    .into()
 }
 
 /// Wrap a real managed driver as an ABI-stable [`hplugin_stabby::abi::DynManagedDriver`].
 pub fn make_dyn_managed_driver(
     driver: Arc<dyn ManagedDriver>,
 ) -> hplugin_stabby::abi::DynManagedDriver {
-    stabby::boxed::Box::new(StableManagedDriverImpl { driver }).into()
+    stabby::boxed::Box::new(StableManagedDriverImpl {
+        driver,
+        cancels: Arc::new(CancelRegistry::default()),
+    })
+    .into()
+}
+
+/// In-flight calls keyed by `request_id`, so [`StableCancel::cancel`] can trip the
+/// token a running call handed the provider/driver. A cancel that races ahead of
+/// its call (arrives before the call registers) is parked in `precancelled` and
+/// applied when the call enters — so it is never lost.
+#[derive(Default)]
+struct CancelRegistry {
+    inflight: Mutex<HashMap<String, StdCancellationToken>>,
+    precancelled: Mutex<HashSet<String>>,
+}
+
+impl CancelRegistry {
+    /// Register a fresh token for `id` and return a guard that deregisters on drop.
+    /// An empty id (no cancellation wired for this call) is a no-op passthrough.
+    fn enter(self: &Arc<Self>, id: &str) -> CancelGuard {
+        let token = StdCancellationToken::new();
+        if !id.is_empty() {
+            if self
+                .precancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id)
+            {
+                token.cancel();
+            }
+            self.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string(), token.clone());
+        }
+        CancelGuard {
+            reg: Arc::clone(self),
+            id: id.to_string(),
+            token,
+        }
+    }
+
+    fn cancel(&self, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        let map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = map.get(id) {
+            t.cancel();
+        } else {
+            drop(map);
+            self.precancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string());
+        }
+    }
+}
+
+/// Holds a call's cancellation token registered; deregisters on drop.
+struct CancelGuard {
+    reg: Arc<CancelRegistry>,
+    id: String,
+    token: StdCancellationToken,
+}
+
+impl CancelGuard {
+    fn token(&self) -> &StdCancellationToken {
+        &self.token
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if !self.id.is_empty() {
+            self.reg
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.id);
+        }
+    }
 }
 
 /// Wraps an author `Provider` as a [`StableProvider`].
 pub struct StableProviderImpl {
     pub provider: Arc<dyn Provider>,
+    cancels: Arc<CancelRegistry>,
+}
+
+impl StableCancel for StableProviderImpl {
+    extern "C" fn cancel(&self, request_id: stabby::string::String) {
+        self.cancels.cancel(&request_id);
+    }
 }
 
 /// Unary reply for a dispatch method the plugin does not implement. A newer host
@@ -238,17 +333,22 @@ async fn provider_list_packages_stream(provider: Arc<dyn Provider>, req: SVec<u8
     }
 }
 
-async fn provider_get(provider: Arc<dyn Provider>, req: SVec<u8>, exec: DynExecutor) -> SVec<u8> {
+async fn provider_get(
+    provider: Arc<dyn Provider>,
+    req: SVec<u8>,
+    exec: DynExecutor,
+    cancels: Arc<CancelRegistry>,
+) -> SVec<u8> {
     let req = pb::GetRequest::decode(&req[..]).unwrap_or_default();
     let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
-    let tok = StdCancellationToken::new();
+    let guard = cancels.enter(&req.request_id);
     let greq = GetRequest {
         request_id: req.request_id,
         addr: convert::addr_from_pb(req.addr.unwrap_or_default()),
         states: req.states.into_iter().map(convert::state_from_pb).collect(),
         executor,
     };
-    let body = match provider.get(greq, &tok).await {
+    let body = match provider.get(greq, guard.token()).await {
         Ok(gr) => Body::GetResp(pb::GetResponse {
             target_spec: Some(convert::target_spec_to_pb(&gr.target_spec)),
         }),
@@ -264,14 +364,18 @@ async fn provider_get(provider: Arc<dyn Provider>, req: SVec<u8>, exec: DynExecu
     unary(body)
 }
 
-async fn provider_probe(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
+async fn provider_probe(
+    provider: Arc<dyn Provider>,
+    req: SVec<u8>,
+    cancels: Arc<CancelRegistry>,
+) -> SVec<u8> {
     let req = pb::ProbeRequest::decode(&req[..]).unwrap_or_default();
-    let tok = StdCancellationToken::new();
+    let guard = cancels.enter(&req.request_id);
     let preq = ProbeRequest {
         request_id: req.request_id,
         package: PkgBuf::from(req.package),
     };
-    let body = match provider.probe(preq, &tok).await {
+    let body = match provider.probe(preq, guard.token()).await {
         Ok(pr) => Body::ProbeResp(pb::ProbeResponse {
             states: pr.states.iter().map(convert::state_to_pb).collect(),
         }),
@@ -400,9 +504,10 @@ impl StableMeta for StableProviderImpl {
 impl StableProvider for StableProviderImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
+        let cancels = Arc::clone(&self.cancels);
         stabby::boxed::Box::new(async move {
             match pb::ProviderMethod::try_from(method as i32) {
-                Ok(pb::ProviderMethod::Probe) => provider_probe(provider, req).await,
+                Ok(pb::ProviderMethod::Probe) => provider_probe(provider, req, cancels).await,
                 Ok(pb::ProviderMethod::CallFunction) => provider_call_function(provider, req).await,
                 _ => unimplemented(method),
             }
@@ -452,9 +557,10 @@ impl StableProvider for StableProviderImpl {
         exec: DynExecutor,
     ) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
+        let cancels = Arc::clone(&self.cancels);
         stabby::boxed::Box::new(async move {
             match pb::ProviderMethod::try_from(method as i32) {
-                Ok(pb::ProviderMethod::Get) => provider_get(provider, req, exec).await,
+                Ok(pb::ProviderMethod::Get) => provider_get(provider, req, exec, cancels).await,
                 _ => unimplemented(method),
             }
         })
@@ -522,6 +628,13 @@ fn stream_err(message: String) -> Body {
 /// Wraps an author `ManagedDriver` as a [`StableManagedDriver`].
 pub struct StableManagedDriverImpl {
     pub driver: Arc<dyn ManagedDriver>,
+    cancels: Arc<CancelRegistry>,
+}
+
+impl StableCancel for StableManagedDriverImpl {
+    extern "C" fn cancel(&self, request_id: stabby::string::String) {
+        self.cancels.cancel(&request_id);
+    }
 }
 
 fn driver_config(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
@@ -540,16 +653,20 @@ fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
     )
 }
 
-async fn driver_parse(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8> {
+async fn driver_parse(
+    driver: Arc<dyn ManagedDriver>,
+    req: SVec<u8>,
+    cancels: Arc<CancelRegistry>,
+) -> SVec<u8> {
     let req = pb::ParseRequest::decode(&req[..]).unwrap_or_default();
-    let tok = StdCancellationToken::new();
+    let guard = cancels.enter(&req.request_id);
     let preq = ParseRequest {
         request_id: req.request_id,
         target_spec: Arc::new(convert::target_spec_from_pb(
             req.target_spec.unwrap_or_default(),
         )),
     };
-    let body = match driver.parse(preq, &tok).await {
+    let body = match driver.parse(preq, guard.token()).await {
         Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
             Ok(td) => Body::ParseResp(pb::ParseResponse {
                 target_def: Some(td),
@@ -561,9 +678,13 @@ async fn driver_parse(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8>
     unary(body)
 }
 
-async fn driver_apply_transitive(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8> {
+async fn driver_apply_transitive(
+    driver: Arc<dyn ManagedDriver>,
+    req: SVec<u8>,
+    cancels: Arc<CancelRegistry>,
+) -> SVec<u8> {
     let req = pb::ApplyTransitiveRequest::decode(&req[..]).unwrap_or_default();
-    let tok = StdCancellationToken::new();
+    let guard = cancels.enter(&req.request_id);
     let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default()) {
         Ok(td) => td,
         Err(e) => return unary(err_body(e.to_string())),
@@ -573,7 +694,7 @@ async fn driver_apply_transitive(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) 
         target_def,
         sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
     };
-    let body = match driver.apply_transitive(areq, &tok).await {
+    let body = match driver.apply_transitive(areq, guard.token()).await {
         Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
             Ok(td) => Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
                 target_def: Some(td),
@@ -598,11 +719,12 @@ impl StableMeta for StableManagedDriverImpl {
 impl StableManagedDriver for StableManagedDriverImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
+        let cancels = Arc::clone(&self.cancels);
         stabby::boxed::Box::new(async move {
             match pb::DriverMethod::try_from(method as i32) {
-                Ok(pb::DriverMethod::Parse) => driver_parse(driver, req).await,
+                Ok(pb::DriverMethod::Parse) => driver_parse(driver, req, cancels).await,
                 Ok(pb::DriverMethod::ApplyTransitive) => {
-                    driver_apply_transitive(driver, req).await
+                    driver_apply_transitive(driver, req, cancels).await
                 }
                 _ => unimplemented(method),
             }
@@ -610,8 +732,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
         .into()
     }
 
-    // No streaming driver RPC yet; the cardinality slots are frozen and provisioned,
-    // answering Unimplemented until a method id rides them.
+    // No unary->stream or stream->unary driver RPC yet; provisioned, Unimplemented.
     extern "C" fn invoke_server_stream<'a>(
         &'a self,
         method: u32,
@@ -628,52 +749,100 @@ impl StableManagedDriver for StableManagedDriverImpl {
         stabby::boxed::Box::new(async move { unimplemented(method) }).into()
     }
 
+    // `run` is the one bidi RPC: request stream = RunInFrame (run request, then live
+    // stdin), response stream = RunOutFrame (live stdout/stderr, then the result).
     extern "C" fn invoke_bidi<'a>(
         &'a self,
         method: u32,
-        _req: DynItemStream,
+        req: DynItemStream,
     ) -> DynFuture<'a, DynItemStream> {
-        stabby::boxed::Box::new(async move { unimplemented_item_stream(method) }).into()
-    }
-
-    extern "C" fn invoke_io<'a>(
-        &'a self,
-        method: u32,
-        req: SVec<u8>,
-        // The native stdio rails. Frozen and accepted now; live stdin/stdout/stderr
-        // streaming will populate these (see RunIo). Today's `run` inherits stdio at
-        // spawn, so the handles are unused and dropped here.
-        _io: RunIo,
-    ) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
+        let cancels = Arc::clone(&self.cancels);
         stabby::boxed::Box::new(async move {
             match pb::DriverMethod::try_from(method as i32) {
-                Ok(pb::DriverMethod::Run) => {
-                    // `run` shells out via the reactor — execute on the cdylib's own
-                    // runtime, bridge the result back to the host's polling task.
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    cdylib_runtime().spawn(async move {
-                        // Receiver dropped only if the host gave up; ignore send failure.
-                        drop(tx.send(run_impl(driver, req).await));
-                    });
-                    rx.await
-                        .unwrap_or_else(|_| unary(err_body("cdylib run task dropped".into())))
-                }
-                _ => unimplemented(method),
+                Ok(pb::DriverMethod::Run) => run_bidi(driver, req, cancels).await,
+                _ => unimplemented_item_stream(method),
             }
         })
         .into()
     }
 }
 
-async fn run_impl(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8> {
-    let req = pb::ManagedRunRequest::decode(&req[..]).unwrap_or_default();
-    let tok = StdCancellationToken::new();
-    // `shell` selects run_shell over run; it rides the request now (not a slot arg).
+/// Guest-side response stream backed by an mpsc the run task feeds. `blocking_recv`
+/// is sound because the host drains run output on a blocking task (it cannot ride
+/// the host's async workers), matching how `run` already parks threads per chunk.
+struct ChannelItemStream {
+    rx: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+}
+
+impl StableItemStream for ChannelItemStream {
+    extern "C" fn next(&self) -> SVec<u8> {
+        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        match rx.blocking_recv() {
+            Some(bytes) => SVec::from(bytes.as_slice()),
+            None => SVec::new(),
+        }
+    }
+}
+
+fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> DynItemStream {
+    stabby::boxed::Box::new(ChannelItemStream { rx: Mutex::new(rx) }).into()
+}
+
+fn run_out_err(msg: String) -> pb::RunOutFrame {
+    pb::RunOutFrame {
+        msg: Some(pb::run_out_frame::Msg::Error(msg)),
+    }
+}
+
+/// A run response stream that fails immediately (one `RunOutFrame{error}`).
+fn run_error_stream(msg: String) -> DynItemStream {
+    make_item_stream(Box::new(std::iter::once(run_out_err(msg).encode_to_vec())))
+}
+
+/// Pull the first request-stream item: the run request (`RunInFrame{start}`).
+fn pull_run_start(req: &DynItemStream) -> Option<pb::ManagedRunRequest> {
+    let bytes = req.next();
+    if bytes.is_empty() {
+        return None;
+    }
+    match pb::RunInFrame::decode(&bytes[..]).ok()?.msg {
+        Some(pb::run_in_frame::Msg::Start(s)) => Some(s),
+        _ => None,
+    }
+}
+
+async fn run_bidi(
+    driver: Arc<dyn ManagedDriver>,
+    req: DynItemStream,
+    cancels: Arc<CancelRegistry>,
+) -> DynItemStream {
+    let Some(start) = pull_run_start(&req) else {
+        return run_error_stream("run: missing start frame".into());
+    };
+    // The run shells out via the reactor — execute on the cdylib's own runtime,
+    // feeding RunOutFrames into a channel the host drains. (Live stdin/stdout will
+    // ride `req` / the channel later; today only the terminal result is sent.)
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    cdylib_runtime().spawn(async move {
+        let guard = cancels.enter(&start.request_id);
+        let out = run_once(driver, start, guard.token()).await;
+        // Host gone => receiver dropped; ignore send failure.
+        drop(tx.send(out.encode_to_vec()).await);
+    });
+    make_channel_item_stream(rx)
+}
+
+async fn run_once(
+    driver: Arc<dyn ManagedDriver>,
+    req: pb::ManagedRunRequest,
+    ct: &StdCancellationToken,
+) -> pb::RunOutFrame {
+    // `shell` selects run_shell over run; it rides the request.
     let shell = req.shell;
     let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
         Ok(t) => t,
-        Err(e) => return unary(err_body(e.to_string())),
+        Err(e) => return run_out_err(e.to_string()),
     };
     let request_id = req.request_id;
     let hashin = req.hashin;
@@ -700,21 +869,22 @@ async fn run_impl(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8> {
         inputs: managed_inputs,
     };
     let result = if shell {
-        driver.run_shell(mrr, &tok).await
+        driver.run_shell(mrr, ct).await
     } else {
-        driver.run(mrr, &tok).await
+        driver.run(mrr, ct).await
     };
-    let body = match result {
-        Ok(resp) => Body::ManagedRunResp(pb::ManagedRunResponse {
-            artifacts: resp
-                .artifacts
-                .iter()
-                .map(convert::output_artifact_to_pb)
-                .collect(),
-        }),
-        Err(e) => err_body(e.to_string()),
-    };
-    unary(body)
+    match result {
+        Ok(resp) => pb::RunOutFrame {
+            msg: Some(pb::run_out_frame::Msg::Response(pb::ManagedRunResponse {
+                artifacts: resp
+                    .artifacts
+                    .iter()
+                    .map(convert::output_artifact_to_pb)
+                    .collect(),
+            })),
+        },
+        Err(e) => run_out_err(e.to_string()),
+    }
 }
 
 fn run_input_from_pb(mi: &pb::ManagedRunInput) -> RunInput {
@@ -1054,6 +1224,82 @@ mod tests {
         }
     }
 
+    // Cancellation propagates host -> plugin: a `probe` that blocks until its token
+    // trips returns only once the host's request token is cancelled. The host wires
+    // `ct` -> StableCancel::cancel(request_id) -> the guest token the provider holds.
+    // (If the wiring were missing the provider would block forever and this hangs.)
+    #[test]
+    fn cancellation_propagates_to_plugin() {
+        use hcore::hasync::StdCancellationToken;
+        use hplugin_stabby::load_stable::StableRemoteProvider;
+
+        struct BlockingProbe;
+        impl Provider for BlockingProbe {
+            fn config(&self, _r: ConfigRequest) -> Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "blocker".into(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                _r: ListRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _r: ListPackagesRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _r: GetRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
+            {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            // Blocks until the (guest) token trips, then returns — proving the host
+            // cancel reached the token this provider was handed.
+            fn probe<'a>(
+                &'a self,
+                _r: ProbeRequest,
+                ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+                Box::pin(async move {
+                    ct.cancelled().await;
+                    Ok(ProbeResponse { states: vec![] })
+                })
+            }
+        }
+
+        let host =
+            StableRemoteProvider::new(make_dyn_provider(Arc::new(BlockingProbe)), "blocker");
+        let ct = StdCancellationToken::new();
+        let preq = ProbeRequest {
+            request_id: "rq-1".into(),
+            package: PkgBuf::from("p"),
+        };
+        // Drive the probe and the cancel concurrently; completing at all proves the
+        // cancel unblocked the provider.
+        let out = futures::executor::block_on(async {
+            let probe = host.probe(preq, &ct);
+            let cancel = async { ct.cancel() };
+            let (r, ()) = futures::future::join(probe, cancel).await;
+            r
+        });
+        out.expect("probe returns after cancellation");
+    }
+
     // A provider whose `list` yields a scripted sequence of items (Ok) and an
     // optional terminal error — used to prove server-streaming delivers every item
     // and surfaces a mid-stream error across the seam.
@@ -1153,6 +1399,95 @@ mod tests {
         assert!(got[0].is_ok());
         let err = got[1].as_ref().expect_err("second item is the error");
         assert!(err.to_string().contains("boom"));
+    }
+
+    // `run` over invoke_bidi: the request stream (RunInFrame) is consumed and the
+    // response stream yields exactly one terminal RunOutFrame. Proves the bidi
+    // plumbing — request pulled, run spawned, result delivered over the channel.
+    #[test]
+    fn run_bidi_yields_one_terminal_frame() {
+        use hcore::hasync::Cancellable;
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+        use hplugin_stabby::abi::{StableItemStreamDyn, StableManagedDriverDyn};
+
+        struct NoopDriver;
+        #[async_trait::async_trait]
+        impl ManagedDriver for NoopDriver {
+            fn config(
+                &self,
+                _r: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                Ok(hplugin::driver::ConfigResponse {
+                    name: "noop".into(),
+                })
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                hplugin::driver::DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _r: hplugin::driver::ParseRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn apply_transitive(
+                &self,
+                _r: hplugin::driver::ApplyTransitiveRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _r: ManagedRunRequest<'a, 'io>,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                Ok(ManagedRunResponse { artifacts: vec![] })
+            }
+        }
+
+        let dynd = make_dyn_managed_driver(Arc::new(NoopDriver) as Arc<dyn ManagedDriver>);
+        let start = pb::RunInFrame {
+            msg: Some(pb::run_in_frame::Msg::Start(pb::ManagedRunRequest {
+                request_id: "r".into(),
+                ..Default::default()
+            })),
+        }
+        .encode_to_vec();
+        let req_stream = make_item_stream(Box::new(std::iter::once(start)));
+
+        let resp = futures::executor::block_on(
+            dynd.invoke_bidi(pb::DriverMethod::Run as u32, req_stream),
+        );
+        // `next` blocks on the run task; drain on a thread.
+        let frames = std::thread::spawn(move || {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let b = resp.next();
+                if b.is_empty() {
+                    break;
+                }
+                out.push(b.to_vec());
+            }
+            out
+        })
+        .join()
+        .expect("drain thread");
+
+        assert_eq!(frames.len(), 1, "exactly one terminal RunOutFrame then end");
+        let frame = pb::RunOutFrame::decode(&frames[0][..]).expect("decode RunOutFrame");
+        // A terminal frame (Response or Error) — proves the request was consumed and
+        // the run task's output crossed the response stream. (The default target
+        // fails conversion, so this run terminates as Error; the plumbing is the point.)
+        assert!(
+            matches!(
+                frame.msg,
+                Some(pb::run_out_frame::Msg::Response(_)) | Some(pb::run_out_frame::Msg::Error(_))
+            ),
+            "expected a terminal RunOutFrame, got {:?}",
+            frame.msg
+        );
     }
 
     // Provider functions survive the guest→host stable-ABI round trip: the host

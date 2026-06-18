@@ -6,8 +6,8 @@
 
 use crate::abi::{
     CREATE_SYMBOL, CreateConfig, CreateFn, DynExecutor, DynItemStream, DynManagedDriver,
-    DynProvider, RunIo, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
-    StableProviderDyn,
+    DynProvider, StableCancelDyn, StableItemStream, StableItemStreamDyn, StableManagedDriverDyn,
+    StableMetaDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use async_trait::async_trait;
@@ -173,6 +173,89 @@ fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
     })
 }
 
+/// Host-side request stream: yields a fixed sequence of pre-encoded items (today a
+/// single `RunInFrame{start}`; live stdin would push more), empty == end.
+struct HostItemStream {
+    items: std::sync::Mutex<std::vec::IntoIter<Vec<u8>>>,
+}
+
+impl StableItemStream for HostItemStream {
+    extern "C" fn next(&self) -> stabby::vec::Vec<u8> {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        match items.next() {
+            Some(b) => stabby::vec::Vec::from(b.as_slice()),
+            None => stabby::vec::Vec::new(),
+        }
+    }
+}
+
+fn host_item_stream(items: Vec<Vec<u8>>) -> DynItemStream {
+    stabby::boxed::Box::new(HostItemStream {
+        items: std::sync::Mutex::new(items.into_iter()),
+    })
+    .into()
+}
+
+/// Drain a bidi `run` response stream to its terminal result. Blocking (called on a
+/// blocking task) because the stream's `next` blocks on subprocess output. stdout/
+/// stderr chunks are reserved — routed to host stdio once live streaming is wired.
+fn drain_run(stream: DynItemStream) -> anyhow::Result<ManagedRunResponse> {
+    loop {
+        let bytes = stream.next();
+        if bytes.is_empty() {
+            anyhow::bail!("run stream ended without a result");
+        }
+        match pb::RunOutFrame::decode(&bytes[..])?.msg {
+            Some(pb::run_out_frame::Msg::Response(r)) => {
+                return Ok(ManagedRunResponse {
+                    artifacts: r
+                        .artifacts
+                        .into_iter()
+                        .map(convert::output_artifact_from_pb)
+                        .collect(),
+                });
+            }
+            Some(pb::run_out_frame::Msg::Error(e)) => anyhow::bail!("{e}"),
+            // stdout/stderr chunks: not yet surfaced; ignore and keep draining.
+            _ => {}
+        }
+    }
+}
+
+/// Await `fut`, but if `ct` fires first, run `on_cancel` (signal the plugin to
+/// cancel this request) and keep awaiting — the call then returns its cancelled
+/// result. The plugin trips the token it gave the provider/driver, so a long `get`
+/// or a running subprocess stops, exactly as for an in-process target.
+async fn await_with_cancel<T>(
+    ct: &(dyn Cancellable + Send + Sync),
+    on_cancel: impl FnOnce() + Send,
+    fut: impl std::future::Future<Output = T> + Send,
+) -> T {
+    use futures::future::Either;
+    futures::pin_mut!(fut);
+    match futures::future::select(fut, ct.cancelled()).await {
+        Either::Left((out, _)) => out,
+        Either::Right(((), fut)) => {
+            on_cancel();
+            fut.await
+        }
+    }
+}
+
+/// The cancel signal for a provider call: trip the plugin's in-flight `request_id`.
+fn provider_cancel(inner: &Arc<DynProvider>, request_id: &str) -> impl FnOnce() + Send {
+    let inner = Arc::clone(inner);
+    let id = request_id.to_string();
+    move || inner.cancel(id.into())
+}
+
+/// The cancel signal for a driver call.
+fn driver_cancel(inner: &Arc<DynManagedDriver>, request_id: &str) -> impl FnOnce() + Send {
+    let inner = Arc::clone(inner);
+    let id = request_id.to_string();
+    move || inner.cancel(id.into())
+}
+
 /// Host handle to a loaded plugin's provider. `Clone` (cheap — shares the loaded
 /// component) so the engine's provider factory can mint handles.
 #[derive(Clone)]
@@ -257,7 +340,7 @@ impl Provider for StableRemoteProvider {
     fn get<'a>(
         &'a self,
         req: GetRequest,
-        _ct: &'a (dyn Cancellable + Send + Sync),
+        ct: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, std::result::Result<GetResponse, GetError>> {
         Box::pin(async move {
             let pb_req = pb::GetRequest {
@@ -267,10 +350,11 @@ impl Provider for StableRemoteProvider {
             }
             .encode_to_vec();
             let exec: DynExecutor = HostExecutor::wrap(Arc::clone(&req.executor));
-            let bytes = self
+            let fut = self
                 .inner
-                .invoke_exec(pb::ProviderMethod::Get as u32, sv(&pb_req), exec)
-                .await;
+                .invoke_exec(pb::ProviderMethod::Get as u32, sv(&pb_req), exec);
+            let bytes =
+                await_with_cancel(ct, provider_cancel(&self.inner, &req.request_id), fut).await;
             let body = decode_unary(&bytes).map_err(GetError::Other)?;
             match body {
                 Body::GetResp(gr) => Ok(GetResponse {
@@ -301,18 +385,19 @@ impl Provider for StableRemoteProvider {
     fn probe<'a>(
         &'a self,
         req: ProbeRequest,
-        _ct: &'a (dyn Cancellable + Send + Sync),
+        ct: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
+            let request_id = req.request_id.clone();
             let pb_req = pb::ProbeRequest {
                 request_id: req.request_id,
                 package: req.package.as_str().to_string(),
             }
             .encode_to_vec();
-            let bytes = self
+            let fut = self
                 .inner
-                .invoke(pb::ProviderMethod::Probe as u32, sv(&pb_req))
-                .await;
+                .invoke(pb::ProviderMethod::Probe as u32, sv(&pb_req));
+            let bytes = await_with_cancel(ct, provider_cancel(&self.inner, &request_id), fut).await;
             match decode_unary(&bytes)? {
                 Body::ProbeResp(pr) => Ok(ProbeResponse {
                     states: pr.states.into_iter().map(convert::state_from_pb).collect(),
@@ -453,18 +538,19 @@ impl ManagedDriver for StableRemoteManagedDriver {
     async fn parse(
         &self,
         req: ParseRequest,
-        _ct: &(dyn Cancellable + Send + Sync),
+        ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
+        let request_id = req.request_id.clone();
         let pb_req = pb::ParseRequest {
             request_id: req.request_id,
             target_spec: Some(convert::target_spec_to_pb(req.target_spec.as_ref())),
             driver: self.name.clone(),
         }
         .encode_to_vec();
-        let bytes = self
+        let fut = self
             .inner
-            .invoke(pb::DriverMethod::Parse as u32, sv(&pb_req))
-            .await;
+            .invoke(pb::DriverMethod::Parse as u32, sv(&pb_req));
+        let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
         match decode_unary(&bytes)? {
             Body::ParseResp(pr) => Ok(ParseResponse {
                 target_def: convert::target_def_from_pb(pr.target_def.unwrap_or_default())?,
@@ -477,8 +563,9 @@ impl ManagedDriver for StableRemoteManagedDriver {
     async fn apply_transitive(
         &self,
         req: ApplyTransitiveRequest,
-        _ct: &(dyn Cancellable + Send + Sync),
+        ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ApplyTransitiveResponse> {
+        let request_id = req.request_id.clone();
         let pb_req = pb::ApplyTransitiveRequest {
             request_id: req.request_id,
             target_def: Some(convert::target_def_to_pb(&req.target_def)?),
@@ -486,10 +573,10 @@ impl ManagedDriver for StableRemoteManagedDriver {
             driver: self.name.clone(),
         }
         .encode_to_vec();
-        let bytes = self
+        let fut = self
             .inner
-            .invoke(pb::DriverMethod::ApplyTransitive as u32, sv(&pb_req))
-            .await;
+            .invoke(pb::DriverMethod::ApplyTransitive as u32, sv(&pb_req));
+        let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
         match decode_unary(&bytes)? {
             Body::ApplyTransitiveResp(r) => Ok(ApplyTransitiveResponse {
                 target_def: convert::target_def_from_pb(r.target_def.unwrap_or_default())?,
@@ -506,17 +593,17 @@ impl ManagedDriver for StableRemoteManagedDriver {
     async fn run<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
-        _ct: &(dyn Cancellable + Send + Sync),
+        ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        self.dispatch_run(req, false).await
+        self.dispatch_run(req, false, ct).await
     }
 
     async fn run_shell<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
-        _ct: &(dyn Cancellable + Send + Sync),
+        ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        self.dispatch_run(req, true).await
+        self.dispatch_run(req, true, ct).await
     }
 }
 
@@ -525,8 +612,10 @@ impl StableRemoteManagedDriver {
         &self,
         req: ManagedRunRequest<'_, '_>,
         shell: bool,
+        ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let pb_req = pb::ManagedRunRequest {
+        let request_id = req.request.request_id.clone();
+        let pmrr = pb::ManagedRunRequest {
             request_id: req.request.request_id.clone(),
             target: Some(convert::target_def_to_pb(req.request.target)?),
             tree_root_path: req.request.tree_root_path.to_string_lossy().into_owned(),
@@ -537,29 +626,28 @@ impl StableRemoteManagedDriver {
             inputs: req.inputs.iter().map(managed_input_to_pb).collect(),
             shell,
             driver: self.name.clone(),
+        };
+        // `run` is bidi: the request stream carries the run request (RunInFrame),
+        // the response stream carries the result (RunOutFrame). `shell` rides pmrr.
+        let in_frame = pb::RunInFrame {
+            msg: Some(pb::run_in_frame::Msg::Start(pmrr)),
         }
         .encode_to_vec();
-        // stdio rails are frozen but unused today (the subprocess inherits stdio at
-        // spawn); pass all-None. `shell` already rides pb_req (set above).
-        let io = RunIo {
-            stdin: Default::default(),
-            stdout: Default::default(),
-            stderr: Default::default(),
-        };
-        let bytes = self
+        let resp_stream = self
             .inner
-            .invoke_io(pb::DriverMethod::Run as u32, sv(&pb_req), io)
+            .invoke_bidi(pb::DriverMethod::Run as u32, host_item_stream(vec![in_frame]))
             .await;
-        match decode_unary(&bytes)? {
-            Body::ManagedRunResp(r) => Ok(ManagedRunResponse {
-                artifacts: r
-                    .artifacts
-                    .into_iter()
-                    .map(convert::output_artifact_from_pb)
-                    .collect(),
-            }),
-            Body::Error(e) => anyhow::bail!("{}", e.message),
-            other => anyhow::bail!("unexpected managed run response: {other:?}"),
+        // The response stream's `next` blocks (on subprocess output), so drain it on
+        // a dedicated thread and bridge the result back — while watching `ct` so a
+        // cancel trips the plugin's run token (which stops the subprocess).
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            // Receiver dropped only if the caller gave up; ignore send failure.
+            drop(tx.send(drain_run(resp_stream)));
+        });
+        match await_with_cancel(ct, driver_cancel(&self.inner, &request_id), rx).await {
+            Ok(result) => result,
+            Err(_canceled) => anyhow::bail!("run drain thread dropped"),
         }
     }
 }
