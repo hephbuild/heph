@@ -728,7 +728,7 @@ mod tests {
         // A plugin options map crosses the ABI as pb::Value bytes and decodes back
         // unchanged — covering scalars, nesting, and a list.
         let yaml = r#"
-go_bin: "//@heph/bin:go"
+gotool: "//@heph/bin:go"
 parallel: 4
 flag: true
 nested: { a: 1, b: [x, y] }
@@ -740,8 +740,8 @@ nested: { a: 1, b: [x, y] }
         assert_eq!(back, opts);
 
         // Typed decode through the same path a plugin author uses.
-        let go_bin: String = serde_yaml::from_value(back["go_bin"].clone()).expect("go_bin");
-        assert_eq!(go_bin, "//@heph/bin:go");
+        let gotool: String = serde_yaml::from_value(back["gotool"].clone()).expect("gotool");
+        assert_eq!(gotool, "//@heph/bin:go");
 
         // Empty payload decodes to an empty map (absent options).
         assert!(options_from_pb_bytes(&[]).expect("empty").is_empty());
