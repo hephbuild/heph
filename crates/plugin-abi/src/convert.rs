@@ -160,6 +160,74 @@ pub fn fn_signature_from_pb(s: pb::FnSignature) -> FnSignature {
     }
 }
 
+// ---- Schemas (provider state + driver config) ----
+//
+// `provider::StateField`/`StateSchema` and `driver::DriverField`/`DriverSchema`
+// are the same declarative shape; both cross as `pb::SchemaField`/`pb::Schema`.
+
+use hplugin::driver::{DriverField, DriverSchema};
+use hplugin::provider::{StateField, StateSchema};
+
+pub fn state_schema_to_pb(s: &StateSchema) -> pb::Schema {
+    pb::Schema {
+        fields: s
+            .fields
+            .iter()
+            .map(|f| pb::SchemaField {
+                name: f.name.clone(),
+                ty: Some(param_type_to_pb(&f.ty)),
+                doc: f.doc.clone(),
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
+pub fn state_schema_from_pb(s: pb::Schema) -> StateSchema {
+    StateSchema {
+        fields: s
+            .fields
+            .into_iter()
+            .map(|f| StateField {
+                name: f.name,
+                ty: f.ty.map(param_type_from_pb).unwrap_or(ParamType::Null),
+                doc: f.doc,
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
+pub fn driver_schema_to_pb(s: &DriverSchema) -> pb::Schema {
+    pb::Schema {
+        fields: s
+            .fields
+            .iter()
+            .map(|f| pb::SchemaField {
+                name: f.name.clone(),
+                ty: Some(param_type_to_pb(&f.ty)),
+                doc: f.doc.clone(),
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
+pub fn driver_schema_from_pb(s: pb::Schema) -> DriverSchema {
+    DriverSchema {
+        fields: s
+            .fields
+            .into_iter()
+            .map(|f| DriverField {
+                name: f.name,
+                ty: f.ty.map(param_type_from_pb).unwrap_or(ParamType::Null),
+                doc: f.doc,
+                required: f.required,
+            })
+            .collect(),
+    }
+}
+
 // ---- Options (plugin config map) ----
 //
 // A plugin's `options:` map (`BTreeMap<String, serde_yaml::Value>`) crosses the

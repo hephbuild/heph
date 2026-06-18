@@ -12,6 +12,7 @@ use crate::host::HostExecutor;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
+use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{
     ManagedDriver, ManagedRunInput, ManagedRunRequest, ManagedRunResponse,
 };
@@ -21,11 +22,11 @@ use hplugin::driver::{
     ConfigResponse as DriverConfigResponse, DriverSchema, ParseRequest, ParseResponse,
     inputartifact,
 };
-use hcore::htvalue::Value;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
     ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
-    ProbeResponse, Provider, ProviderFn, ProviderFunctionDef,
+    ProbeResponse, Provider, ProviderFn, ProviderFunctionDef, ProviderFunctionRegistry,
+    StateSchema,
 };
 use plugin_abi::pb::frame::Body;
 use plugin_abi::{convert, pb};
@@ -317,6 +318,35 @@ impl Provider for StableRemoteProvider {
             })
             .collect()
     }
+
+    fn state_schema(&self) -> Option<StateSchema> {
+        // An empty SVec encodes `None`; any encoded `Schema` (even fields-empty)
+        // encodes `Some`.
+        let bytes = self.inner.state_schema();
+        if bytes.is_empty() {
+            return None;
+        }
+        pb::Schema::decode(&bytes[..])
+            .ok()
+            .map(convert::state_schema_from_pb)
+    }
+
+    fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
+        // Cross the metadata once, and hand the plugin a callback to invoke any
+        // function in the aggregate registry (handlers are not transmissible).
+        let functions = reg
+            .iter()
+            .map(|(provider, name, rf)| pb::RegisteredFunction {
+                provider: provider.to_string(),
+                name: name.to_string(),
+                signature: Some(convert::fn_signature_to_pb(&rf.signature)),
+                doc: rf.doc.clone(),
+            })
+            .collect();
+        let metadata = pb::FunctionRegistry { functions }.encode_to_vec();
+        let cb = crate::host::HostFunctionRegistry::wrap(reg);
+        self.inner.set_function_registry(sv(&metadata), cb);
+    }
 }
 
 /// Proxy handler for a dylib provider function: each call encodes its args and
@@ -377,7 +407,10 @@ impl ManagedDriver for StableRemoteManagedDriver {
     }
 
     fn schema(&self) -> DriverSchema {
-        DriverSchema::default()
+        let bytes = self.inner.schema();
+        pb::Schema::decode(&bytes[..])
+            .map(convert::driver_schema_from_pb)
+            .unwrap_or_default()
     }
 
     async fn parse(

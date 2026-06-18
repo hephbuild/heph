@@ -129,3 +129,49 @@ message CallFunctionRequest {
 message CallFunctionResponse {
   Value value = 1;
 }
+
+// ---- Schemas (provider state + driver config) ----
+//
+// One declarative keyword-arg surface, shared by provider `state_schema()`
+// (the args of `provider_state(provider=…, …)`) and driver `schema()` (the
+// driver-specific kwargs of a `target(...)`). Consumed by the BUILD-file LSP.
+
+// Mirrors provider::StateField / driver::DriverField.
+message SchemaField {
+  string name = 1;
+  ParamType ty = 2;
+  string doc = 3;
+  bool required = 4;
+}
+// Mirrors provider::StateSchema / driver::DriverSchema.
+message Schema {
+  repeated SchemaField fields = 1;
+}
+
+// ---- Function registry injection (set_function_registry) ----
+//
+// The host hands a provider the aggregate of every provider's functions. The
+// metadata (below) crosses once; handlers are reached back over the host
+// callback (`call_registered`, mirroring the executor callback).
+
+// One registered function's metadata, addressed by `provider`.`name`.
+message RegisteredFunction {
+  string provider = 1;
+  string name = 2;
+  FnSignature signature = 3;
+  string doc = 4;
+}
+message FunctionRegistry {
+  repeated RegisteredFunction functions = 1;
+}
+
+// Invoke a registered function on the host (the inverse of CallFunctionRequest:
+// the addressing carries the owning `provider`).
+message CallRegisteredRequest {
+  string provider = 1;
+  string name = 2;
+  string pkg = 3;
+  string root = 4;
+  repeated Value positional = 5;
+  map<string, Value> named = 6;
+}

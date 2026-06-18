@@ -2,18 +2,22 @@
 //! a loaded plugin can call back via direct stabby vtable dispatch.
 
 use crate::abi::{
-    DynArtifact, DynExecutor, DynRead, NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr,
-    StableArtifactContent, StableExecutor, StableRead,
+    DynArtifact, DynExecutor, DynFunctionRegistry, DynRead, NoteDepOutcome, QueryOutcome,
+    ResultOutcome, StableAddr, StableArtifactContent, StableExecutor, StableFunctionRegistry,
+    StableRead,
 };
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
-use hplugin::provider::ProviderExecutor;
+use hplugin::provider::{FnArgs, FnCallContext, ProviderExecutor, ProviderFunctionRegistry};
+use plugin_abi::pb::frame::Body;
+use plugin_abi::{convert, pb};
 use prost::Message;
 use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::string::String as SString;
 use stabby::vec::Vec as SVec;
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Chunk size for streaming an artifact across the seam — bounds peak memory per
@@ -70,6 +74,79 @@ impl StableArtifactContent for HostArtifactContent {
 
     extern "C" fn byte_size(&self) -> u64 {
         self.content.byte_size().unwrap_or(u64::MAX)
+    }
+}
+
+/// Encode a unary `pb::Frame` reply carrying `body`.
+fn unary(body: Body) -> SVec<u8> {
+    SVec::from(
+        pb::Frame {
+            id: 0,
+            body: Some(body),
+        }
+        .encode_to_vec()
+        .as_slice(),
+    )
+}
+
+fn err_body(message: String) -> Body {
+    Body::Error(pb::Error {
+        kind: pb::error::Kind::Other as i32,
+        message,
+    })
+}
+
+/// Wraps the host's aggregate function registry; handed to a plugin as a
+/// [`DynFunctionRegistry`] so it can invoke any registered function.
+pub struct HostFunctionRegistry {
+    inner: Arc<ProviderFunctionRegistry>,
+}
+
+impl HostFunctionRegistry {
+    /// Wrap the aggregate registry as an ABI-stable [`DynFunctionRegistry`].
+    pub fn wrap(inner: Arc<ProviderFunctionRegistry>) -> DynFunctionRegistry {
+        stabby::boxed::Box::new(HostFunctionRegistry { inner }).into()
+    }
+}
+
+impl StableFunctionRegistry for HostFunctionRegistry {
+    extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+        stabby::boxed::Box::new(async move {
+            let req = match pb::CallRegisteredRequest::decode(&req[..]) {
+                Ok(r) => r,
+                Err(e) => return unary(err_body(format!("call_registered decode: {e}"))),
+            };
+            let Some(rf) = self.inner.get(&req.provider, &req.name) else {
+                return unary(err_body(format!(
+                    "unknown registered function `{}.{}`",
+                    req.provider, req.name
+                )));
+            };
+            let root = std::path::PathBuf::from(req.root);
+            let ctx = FnCallContext {
+                pkg: &req.pkg,
+                root: Path::new(&root),
+            };
+            let args = FnArgs {
+                positional: req
+                    .positional
+                    .into_iter()
+                    .map(convert::value_from_pb)
+                    .collect(),
+                named: req
+                    .named
+                    .into_iter()
+                    .map(|(k, v)| (k, convert::value_from_pb(v)))
+                    .collect(),
+            };
+            match rf.func.call(&ctx, args).await {
+                Ok(v) => unary(Body::CallFunctionResp(pb::CallFunctionResponse {
+                    value: Some(convert::value_to_pb(&v)),
+                })),
+                Err(e) => unary(err_body(format!("{e:#}"))),
+            }
+        })
+        .into()
     }
 }
 

@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use hcore::hartifactcontent::tar::TarPacker;
 use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::StdCancellationToken;
+use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunInput, ManagedRunRequest};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::{
@@ -19,9 +20,13 @@ use hplugin::driver::{
 };
 use hplugin::provider::{
     ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
-    ProbeRequest, Provider, ProviderExecutor,
+    ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
+    ProviderFunctionRegistry,
 };
-use hplugin_stabby::abi::{DynExecutor, StableManagedDriver, StableProvider};
+use hplugin_stabby::abi::{
+    DynExecutor, DynFunctionRegistry, StableFunctionRegistryDyn, StableManagedDriver,
+    StableProvider,
+};
 use plugin_abi::convert;
 use plugin_abi::pb;
 use plugin_abi::pb::frame::Body;
@@ -271,16 +276,26 @@ impl StableProvider for StableProviderImpl {
             // Re-derive the def each call (cheap; provider functions are static
             // metadata). The handler is not transmissible, so it must be invoked
             // here on the guest side.
-            let def = provider.functions().into_iter().find(|d| d.name == req.name);
+            let def = provider
+                .functions()
+                .into_iter()
+                .find(|d| d.name == req.name);
             let Some(def) = def else {
-                return unary(err_body(format!("unknown provider function `{}`", req.name)));
+                return unary(err_body(format!(
+                    "unknown provider function `{}`",
+                    req.name
+                )));
             };
             let ctx = FnCallContext {
                 pkg: &req.pkg,
                 root: std::path::Path::new(&req.root),
             };
             let args = FnArgs {
-                positional: req.positional.into_iter().map(convert::value_from_pb).collect(),
+                positional: req
+                    .positional
+                    .into_iter()
+                    .map(convert::value_from_pb)
+                    .collect(),
                 named: req
                     .named
                     .into_iter()
@@ -296,6 +311,84 @@ impl StableProvider for StableProviderImpl {
             unary(body)
         })
         .into()
+    }
+
+    extern "C" fn state_schema(&self) -> SVec<u8> {
+        // Empty SVec == `None`; an encoded Schema == `Some` (see the ABI doc).
+        match self.provider.state_schema() {
+            Some(s) => SVec::from(convert::state_schema_to_pb(&s).encode_to_vec().as_slice()),
+            None => SVec::new(),
+        }
+    }
+
+    extern "C" fn set_function_registry(&self, metadata: SVec<u8>, reg: DynFunctionRegistry) {
+        let meta = pb::FunctionRegistry::decode(&metadata[..]).unwrap_or_default();
+        // Shared across every proxy handler — each dispatches back over the host
+        // callback to invoke the actual function.
+        let reg = Arc::new(reg);
+        let mut by_provider: std::collections::HashMap<String, Vec<ProviderFunctionDef>> =
+            std::collections::HashMap::new();
+        for f in meta.functions {
+            let Some(signature) = f.signature.map(convert::fn_signature_from_pb) else {
+                continue;
+            };
+            by_provider
+                .entry(f.provider.clone())
+                .or_default()
+                .push(ProviderFunctionDef {
+                    name: f.name.clone(),
+                    signature,
+                    doc: f.doc,
+                    func: Arc::new(GuestRegisteredFn {
+                        reg: Arc::clone(&reg),
+                        provider: f.provider,
+                        name: f.name,
+                    }),
+                });
+        }
+        let mut registry = ProviderFunctionRegistry::default();
+        for (provider, defs) in by_provider {
+            registry.insert_provider(&provider, defs);
+        }
+        self.provider.set_function_registry(Arc::new(registry));
+    }
+}
+
+/// Guest-side proxy for a function in the host's aggregate registry: dispatches
+/// `call_registered` back over the host callback, decoding the returned value.
+struct GuestRegisteredFn {
+    reg: Arc<DynFunctionRegistry>,
+    provider: String,
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl ProviderFn for GuestRegisteredFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+        let pb_req = pb::CallRegisteredRequest {
+            provider: self.provider.clone(),
+            name: self.name.clone(),
+            pkg: ctx.pkg.to_string(),
+            root: ctx.root.to_string_lossy().into_owned(),
+            positional: args.positional.iter().map(convert::value_to_pb).collect(),
+            named: args
+                .named
+                .iter()
+                .map(|(k, v)| (k.clone(), convert::value_to_pb(v)))
+                .collect(),
+        }
+        .encode_to_vec();
+        let bytes = self
+            .reg
+            .call_registered(SVec::from(pb_req.as_slice()))
+            .await;
+        match pb::Frame::decode(&bytes[..])?.body {
+            Some(Body::CallFunctionResp(r)) => {
+                Ok(convert::value_from_pb(r.value.unwrap_or_default()))
+            }
+            Some(Body::Error(e)) => anyhow::bail!("{}", e.message),
+            other => anyhow::bail!("unexpected call_registered response: {other:?}"),
+        }
     }
 }
 
@@ -320,6 +413,14 @@ impl StableManagedDriver for StableManagedDriverImpl {
             .map(|r| r.name)
             .unwrap_or_default()
             .into()
+    }
+
+    extern "C" fn schema(&self) -> SVec<u8> {
+        SVec::from(
+            convert::driver_schema_to_pb(&self.driver.schema())
+                .encode_to_vec()
+                .as_slice(),
+        )
     }
 
     extern "C" fn parse<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
@@ -743,6 +844,17 @@ mod tests {
                 func: Arc::new(EchoFn),
             }]
         }
+        fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
+            use hplugin::provider::{StateField, StateSchema};
+            Some(StateSchema {
+                fields: vec![StateField {
+                    name: "verbose".into(),
+                    ty: ParamType::Bool,
+                    doc: "Enable verbose output for this package.".into(),
+                    required: false,
+                }],
+            })
+        }
     }
 
     // Provider functions survive the guest→host stable-ABI round trip: the host
@@ -760,7 +872,10 @@ mod tests {
         assert_eq!(defs.len(), 1);
         let def = &defs[0];
         assert_eq!(def.name, "echo");
-        assert_eq!(def.signature.render("echo"), "echo(msg: string, times?: int) -> string");
+        assert_eq!(
+            def.signature.render("echo"),
+            "echo(msg: string, times?: int) -> string"
+        );
         assert!(def.doc.contains("Echo `msg`"));
 
         let root = std::path::PathBuf::from("/ws");
@@ -791,5 +906,178 @@ mod tests {
         ))
         .expect("call echo times=3");
         assert_eq!(out, Value::String("mypkg:ababab".into()));
+
+        // The provider's state schema crosses too (Some, with its one field).
+        let schema = host.state_schema().expect("state schema crosses as Some");
+        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields[0].name, "verbose");
+        assert_eq!(schema.fields[0].ty, ParamType::Bool);
+        assert!(schema.fields[0].doc.contains("verbose output"));
+        assert!(!schema.fields[0].required);
+    }
+
+    // The host's aggregate function registry is injected into a dylib provider:
+    // the provider receives proxy handlers that dispatch back over the host
+    // callback, so invoking one reaches the real (host-side) function — args and
+    // FnCallContext included.
+    #[test]
+    fn function_registry_injection_roundtrip() {
+        use hplugin_stabby::load_stable::StableRemoteProvider;
+        use std::sync::Mutex;
+
+        // A provider that records the registry it is handed.
+        struct Recorder {
+            stored: Arc<Mutex<Option<Arc<ProviderFunctionRegistry>>>>,
+        }
+        impl Provider for Recorder {
+            fn config(&self, _req: ConfigRequest) -> Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "recorder".into(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                _req: ListRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
+            {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _req: ProbeRequest,
+                _ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+            fn set_function_registry(&self, reg: Arc<ProviderFunctionRegistry>) {
+                *self.stored.lock().unwrap() = Some(reg);
+            }
+        }
+
+        let stored = Arc::new(Mutex::new(None));
+        let recorder = Arc::new(Recorder {
+            stored: Arc::clone(&stored),
+        });
+        let dynp = make_dyn_provider(recorder as Arc<dyn Provider>);
+        let host = StableRemoteProvider::new(dynp, "recorder");
+
+        // A host-side aggregate registry holding one function under "greeter".
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "greeter",
+            vec![ProviderFunctionDef {
+                name: "echo".into(),
+                signature: FnSignature {
+                    positional: vec![Param::required("msg", ParamType::String)],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: "echo".into(),
+                func: Arc::new(EchoFn),
+            }],
+        );
+        host.set_function_registry(Arc::new(reg));
+
+        // The recorder received a registry; its proxy resolves back to the host
+        // EchoFn, carrying both the arg and ctx.pkg across the (reverse) seam.
+        let received = stored.lock().unwrap().clone().expect("registry injected");
+        let rf = received.get("greeter", "echo").expect("echo registered");
+        let root = std::path::PathBuf::from("/ws");
+        let ctx = FnCallContext {
+            pkg: "callerpkg",
+            root: Path::new(&root),
+        };
+        let out = futures::executor::block_on(rf.func.call(
+            &ctx,
+            FnArgs {
+                positional: vec![Value::String("yo".into())],
+                named: Default::default(),
+            },
+        ))
+        .expect("call proxied echo");
+        assert_eq!(out, Value::String("callerpkg:yo".into()));
+    }
+
+    // A managed driver's config schema survives the round trip (LSP kwargs).
+    #[test]
+    fn driver_schema_roundtrip() {
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+        use hplugin::driver::{DriverField, DriverSchema};
+        use hplugin_stabby::load_stable::StableRemoteManagedDriver;
+
+        struct SchemaDriver;
+        #[async_trait::async_trait]
+        impl ManagedDriver for SchemaDriver {
+            fn config(
+                &self,
+                _req: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                Ok(hplugin::driver::ConfigResponse {
+                    name: "mockdrv".into(),
+                })
+            }
+            fn schema(&self) -> DriverSchema {
+                DriverSchema {
+                    fields: vec![DriverField {
+                        name: "args".into(),
+                        ty: ParamType::list(ParamType::String),
+                        doc: "Command arguments.".into(),
+                        required: true,
+                    }],
+                }
+            }
+            async fn parse(
+                &self,
+                _req: hplugin::driver::ParseRequest,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn apply_transitive(
+                &self,
+                _req: hplugin::driver::ApplyTransitiveRequest,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _req: ManagedRunRequest<'a, 'io>,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                anyhow::bail!("unused")
+            }
+        }
+
+        let dynd = make_dyn_managed_driver(Arc::new(SchemaDriver) as Arc<dyn ManagedDriver>);
+        let host = StableRemoteManagedDriver::new(dynd, "mockdrv");
+        let schema = host.schema();
+        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields[0].name, "args");
+        assert_eq!(schema.fields[0].ty, ParamType::list(ParamType::String));
+        assert!(schema.fields[0].required);
+        assert!(schema.fields[0].doc.contains("Command arguments"));
     }
 }
