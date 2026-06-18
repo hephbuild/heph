@@ -15,5 +15,6 @@
 
 pub mod bridge;
 pub mod driver_managed_fuse;
+pub mod fuseconfig;
 
 pub use bridge::{FuseSlot, ManagedDriverBridge};

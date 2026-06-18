@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ShellFallback};
 use hdriver_support::driver_managed_os::ManagedDriverOs;
-use hdriver_support::fuseconfig::FuseMode;
+use crate::fuseconfig::FuseMode;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver,
     ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse,

@@ -247,10 +247,10 @@ pub struct MemCacheConfig {
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
 /// default to off; FUSE is opt-in.
-// The resolved decision the bridge acts on lives in `heph-driver-support`; the
+// The resolved decision the bridge acts on lives in `heph-driver-bridge`; the
 // YAML shape + parsing is owned here (central config), and `FuseConfig::mode()`
 // resolves to it.
-pub use hdriver_support::fuseconfig::FuseMode;
+pub use hdriver_bridge::fuseconfig::FuseMode;
 
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
