@@ -5,8 +5,8 @@
 //! executor across natively (`HostExecutor`) so callbacks are direct.
 
 use crate::abi::{
-    CREATE_SYMBOL, CreateConfig, CreateFn, DynExecutor, DynManagedDriver, DynProvider,
-    StableManagedDriverDyn, StableProviderDyn,
+    CREATE_SYMBOL, CreateConfig, CreateFn, DynExecutor, DynManagedDriver, DynProvider, RunIo,
+    StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use async_trait::async_trait;
@@ -163,7 +163,10 @@ impl Provider for StableRemoteProvider {
                 states: req.states.iter().map(convert::state_to_pb).collect(),
             }
             .encode_to_vec();
-            let bytes = self.inner.list(sv(&pb_req)).await;
+            let bytes = self
+                .inner
+                .invoke(pb::ProviderMethod::List as u32, sv(&pb_req))
+                .await;
             let mut out: Vec<anyhow::Result<ListResponse>> = Vec::new();
             for b in decode_stream(&bytes)? {
                 match b {
@@ -203,7 +206,10 @@ impl Provider for StableRemoteProvider {
                 prefix: req.prefix.as_str().to_string(),
             }
             .encode_to_vec();
-            let bytes = self.inner.list_packages(sv(&pb_req)).await;
+            let bytes = self
+                .inner
+                .invoke(pb::ProviderMethod::ListPackages as u32, sv(&pb_req))
+                .await;
             let mut out: Vec<anyhow::Result<ListPackageResponse>> = Vec::new();
             for b in decode_stream(&bytes)? {
                 match b {
@@ -243,7 +249,10 @@ impl Provider for StableRemoteProvider {
             }
             .encode_to_vec();
             let exec: DynExecutor = HostExecutor::wrap(Arc::clone(&req.executor));
-            let bytes = self.inner.get(sv(&pb_req), exec).await;
+            let bytes = self
+                .inner
+                .invoke_exec(pb::ProviderMethod::Get as u32, sv(&pb_req), exec)
+                .await;
             let body = decode_unary(&bytes).map_err(GetError::Other)?;
             match body {
                 Body::GetResp(gr) => Ok(GetResponse {
@@ -282,7 +291,10 @@ impl Provider for StableRemoteProvider {
                 package: req.package.as_str().to_string(),
             }
             .encode_to_vec();
-            let bytes = self.inner.probe(sv(&pb_req)).await;
+            let bytes = self
+                .inner
+                .invoke(pb::ProviderMethod::Probe as u32, sv(&pb_req))
+                .await;
             match decode_unary(&bytes)? {
                 Body::ProbeResp(pr) => Ok(ProbeResponse {
                     states: pr.states.into_iter().map(convert::state_from_pb).collect(),
@@ -296,7 +308,7 @@ impl Provider for StableRemoteProvider {
     fn functions(&self) -> Vec<ProviderFunctionDef> {
         // Sync metadata call across the seam; decode the plugin's function defs
         // and wrap each handler in a proxy that dispatches back over the ABI.
-        let bytes = self.inner.functions();
+        let bytes = self.inner.meta(pb::ProviderMethod::Functions as u32);
         let resp = match pb::FunctionsResponse::decode(&bytes[..]) {
             Ok(r) => r,
             // A decode failure here would be an ABI bug; surface no functions
@@ -322,7 +334,7 @@ impl Provider for StableRemoteProvider {
     fn state_schema(&self) -> Option<StateSchema> {
         // An empty SVec encodes `None`; any encoded `Schema` (even fields-empty)
         // encodes `Some`.
-        let bytes = self.inner.state_schema();
+        let bytes = self.inner.meta(pb::ProviderMethod::StateSchema as u32);
         if bytes.is_empty() {
             return None;
         }
@@ -345,7 +357,11 @@ impl Provider for StableRemoteProvider {
             .collect();
         let metadata = pb::FunctionRegistry { functions }.encode_to_vec();
         let cb = crate::host::HostFunctionRegistry::wrap(reg);
-        self.inner.set_function_registry(sv(&metadata), cb);
+        self.inner.invoke_registry(
+            pb::ProviderMethod::SetFunctionRegistry as u32,
+            sv(&metadata),
+            cb,
+        );
     }
 }
 
@@ -372,7 +388,10 @@ impl ProviderFn for StableRemoteFn {
                 .collect(),
         }
         .encode_to_vec();
-        let bytes = self.inner.call_function(sv(&pb_req)).await;
+        let bytes = self
+            .inner
+            .invoke(pb::ProviderMethod::CallFunction as u32, sv(&pb_req))
+            .await;
         match decode_unary(&bytes)? {
             Body::CallFunctionResp(r) => Ok(convert::value_from_pb(r.value.unwrap_or_default())),
             Body::Error(e) => anyhow::bail!("{}", e.message),
@@ -407,7 +426,7 @@ impl ManagedDriver for StableRemoteManagedDriver {
     }
 
     fn schema(&self) -> DriverSchema {
-        let bytes = self.inner.schema();
+        let bytes = self.inner.meta(pb::DriverMethod::Schema as u32);
         pb::Schema::decode(&bytes[..])
             .map(convert::driver_schema_from_pb)
             .unwrap_or_default()
@@ -424,7 +443,10 @@ impl ManagedDriver for StableRemoteManagedDriver {
             driver: self.name.clone(),
         }
         .encode_to_vec();
-        let bytes = self.inner.parse(sv(&pb_req)).await;
+        let bytes = self
+            .inner
+            .invoke(pb::DriverMethod::Parse as u32, sv(&pb_req))
+            .await;
         match decode_unary(&bytes)? {
             Body::ParseResp(pr) => Ok(ParseResponse {
                 target_def: convert::target_def_from_pb(pr.target_def.unwrap_or_default())?,
@@ -446,7 +468,10 @@ impl ManagedDriver for StableRemoteManagedDriver {
             driver: self.name.clone(),
         }
         .encode_to_vec();
-        let bytes = self.inner.apply_transitive(sv(&pb_req)).await;
+        let bytes = self
+            .inner
+            .invoke(pb::DriverMethod::ApplyTransitive as u32, sv(&pb_req))
+            .await;
         match decode_unary(&bytes)? {
             Body::ApplyTransitiveResp(r) => Ok(ApplyTransitiveResponse {
                 target_def: convert::target_def_from_pb(r.target_def.unwrap_or_default())?,
@@ -496,7 +521,17 @@ impl StableRemoteManagedDriver {
             driver: self.name.clone(),
         }
         .encode_to_vec();
-        let bytes = self.inner.run(sv(&pb_req), shell).await;
+        // stdio rails are frozen but unused today (the subprocess inherits stdio at
+        // spawn); pass all-None. `shell` already rides pb_req (set above).
+        let io = RunIo {
+            stdin: Default::default(),
+            stdout: Default::default(),
+            stderr: Default::default(),
+        };
+        let bytes = self
+            .inner
+            .invoke_io(pb::DriverMethod::Run as u32, sv(&pb_req), io)
+            .await;
         match decode_unary(&bytes)? {
             Body::ManagedRunResp(r) => Ok(ManagedRunResponse {
                 artifacts: r

@@ -14,6 +14,24 @@ message ConfigResponse {
   string name = 1;
 }
 
+// Selects which provider RPC the stable-ABI dispatch (`StableProvider::invoke*`)
+// should run. The numeric value is the `method` argument crossing the dylib
+// seam. Append-only: a new RPC is a NEW value here + a NEW match arm guest-side;
+// the frozen vtable is untouched, so it is an additive (minor) ABI change. Never
+// renumber or reuse a value. See crates/plugin-stabby/ABI_VERSIONING.md.
+enum ProviderMethod {
+  PROVIDER_METHOD_UNSPECIFIED = 0;
+  PROVIDER_METHOD_LIST = 1;
+  PROVIDER_METHOD_LIST_PACKAGES = 2;
+  PROVIDER_METHOD_GET = 3; // carries the native executor (invoke_exec)
+  PROVIDER_METHOD_PROBE = 4;
+  PROVIDER_METHOD_FUNCTIONS = 5;
+  PROVIDER_METHOD_CALL_FUNCTION = 6;
+  PROVIDER_METHOD_STATE_SCHEMA = 7;
+  PROVIDER_METHOD_SET_FUNCTION_REGISTRY = 8; // carries the registry (invoke_registry)
+  PROVIDER_METHOD_CONFIG = 9; // sync metadata (StableMeta::meta)
+}
+
 message ListRequest {
   string request_id = 1;
   string package = 2;

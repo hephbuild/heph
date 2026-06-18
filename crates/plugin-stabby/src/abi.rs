@@ -125,60 +125,99 @@ pub trait StableFunctionRegistry {
 pub type DynFunctionRegistry =
     stabby::dynptr!(stabby::boxed::Box<dyn StableFunctionRegistry + Send + Sync>);
 
-/// The cold provider surface, called by the host. Direct stabby vtable dispatch —
-/// no async mux, no channels, no duplex (that machinery was the entire cold-path
-/// cost; see ai-docs/PERFORMANCE.md). Requests/responses cross as prost-encoded
-/// `pb::Frame` bytes (cheap, low-volume, lenient via protobuf); the host decodes
-/// the response `Body`. `get` additionally takes the native [`DynExecutor`] so the
-/// plugin's hot callbacks during resolution are direct calls.
+/// Static, request-less plugin metadata (config name, provider `functions` /
+/// `state_schema`, driver `schema`), kept in its OWN sync trait so the evolvable
+/// RPC dispatch surface ([`StableProvider`] / [`StableManagedDriver`]) stays
+/// purely the async method dispatch. Composed into both handle types. `kind` is a
+/// `pb::ProviderMethod` / `pb::DriverMethod` selecting which metadatum; the reply
+/// is that metadatum's prost bytes (an EMPTY `SVec` encodes "none", e.g. a
+/// provider with no `state_schema`). Sync because it is read once during registry
+/// wiring, never on a hot path. Same append-only contract as the async dispatch.
+#[stabby::stabby]
+pub trait StableMeta {
+    extern "C" fn meta(&self, kind: u32) -> SVec<u8>;
+}
+
+/// A streaming byte sink across the seam — the mirror of [`StableRead`]. The host
+/// owns the sink (e.g. a driver's stdout/stderr); the guest pushes chunks into it.
+/// `write_chunk` returns the bytes accepted; `0` means the sink is closed and the
+/// guest should stop writing.
+#[stabby::stabby]
+pub trait StableWrite {
+    extern "C" fn write_chunk(&self, buf: SVec<u8>) -> u64;
+}
+
+/// An owned, ABI-stable streaming sink handle. Not `Send` for the same reason as
+/// [`DynRead`]: opened and consumed on one thread.
+pub type DynWrite = stabby::dynptr!(stabby::boxed::Box<dyn StableWrite + Send + Sync>);
+
+/// The live stdio streams handed to a driver `run` as native streaming handles
+/// (same family as artifact streaming, NOT prost bytes — live IO can't be unary).
+/// Each is optional: `None` means the host did not wire that stream. Frozen at the
+/// three subprocess fds, so adding live stdin/stdout/stderr streaming later just
+/// populates these handles — an additive change needing no ABI bump.
+#[stabby::stabby]
+pub struct RunIo {
+    /// host -> driver (process stdin).
+    pub stdin: stabby::option::Option<DynRead>,
+    /// driver -> host (process stdout).
+    pub stdout: stabby::option::Option<DynWrite>,
+    /// driver -> host (process stderr).
+    pub stderr: stabby::option::Option<DynWrite>,
+}
+
+/// The cold provider surface as a FROZEN generic dispatch. The `method` id
+/// (`pb::ProviderMethod`) selects an RPC; request/response cross as prost-encoded
+/// `pb::Frame` bytes (cheap, low-volume, lenient via protobuf). Adding an RPC is a
+/// new method id + a new guest match arm — the vtable is UNTOUCHED, so an older
+/// plugin and a newer host still load (stabby's type report is unchanged) and the
+/// old plugin answers an unknown id with `Error{Unimplemented}`. THIS is what
+/// makes the cold surface evolvable without an ABI break (see ABI_VERSIONING.md).
 ///
-/// Stream methods (`list`, `list_packages`) return all items length-delimited:
-/// a sequence of prost length-delimited `pb::Frame`s (StreamItem… then StreamEnd).
+/// Three slots cover the call shapes; native handles cannot ride prost bytes, so a
+/// method that carries one gets its own (also frozen) slot:
+/// - [`invoke`](StableProvider::invoke) — plain prost in/out.
+/// - [`invoke_exec`](StableProvider::invoke_exec) — also passes the native
+///   [`DynExecutor`] (`get`, whose resolution makes hot callbacks).
+/// - [`invoke_registry`](StableProvider::invoke_registry) — also passes the native
+///   [`DynFunctionRegistry`] (`set_function_registry`).
+///
+/// Replies follow the prior contract: unary methods return one prost `pb::Frame`;
+/// stream methods (`list`, `list_packages`) return length-delimited `pb::Frame`s
+/// (StreamItem… then StreamEnd).
 #[stabby::stabby]
 pub trait StableProvider {
-    /// The provider's registered name.
-    extern "C" fn config(&self) -> SString;
-    extern "C" fn list<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn list_packages<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn get<'a>(&'a self, req: SVec<u8>, exec: DynExecutor) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn probe<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    /// The BUILD-file functions this provider exposes, as prost-encoded
-    /// `pb::FunctionsResponse` bytes (metadata only — handlers stay guest-side,
-    /// reached via `call_function`). Sync: it is provider-static metadata read
-    /// once during host registry wiring, not a per-request call.
-    extern "C" fn functions(&self) -> SVec<u8>;
-    /// Invoke one exposed function by name. `req` is raw `pb::CallFunctionRequest`
-    /// bytes; the reply is a `pb::Frame` carrying `CallFunctionResp` or `Error`.
-    extern "C" fn call_function<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    /// The provider's state schema (the kwargs of `provider_state(provider=…, …)`)
-    /// as prost-encoded `pb::Schema` bytes. An EMPTY `SVec` means the provider
-    /// declares no schema (`None`); an encoded (possibly fields-empty) `Schema`
-    /// means it does. Sync provider-static metadata, like `functions`.
-    extern "C" fn state_schema(&self) -> SVec<u8>;
-    /// Hand the provider the aggregate registry of every provider's functions:
-    /// `metadata` is prost `pb::FunctionRegistry` bytes (names/signatures/docs);
-    /// `reg` is the host callback used to actually invoke any of them. Called once
-    /// before the first dispatch, mirroring [`hplugin::provider::Provider::set_function_registry`].
-    extern "C" fn set_function_registry(&self, metadata: SVec<u8>, reg: DynFunctionRegistry);
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_exec<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+        exec: DynExecutor,
+    ) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry);
 }
 
-/// The cold managed-driver surface (same transport contract as [`StableProvider`]).
+/// The cold managed-driver surface, same frozen-dispatch contract as
+/// [`StableProvider`]. `method` is a `pb::DriverMethod`. `run` rides
+/// [`invoke_io`](StableManagedDriver::invoke_io), which additionally carries the
+/// native [`RunIo`] stdio handles.
 #[stabby::stabby]
 pub trait StableManagedDriver {
-    extern "C" fn config(&self) -> SString;
-    extern "C" fn parse<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    extern "C" fn apply_transitive<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
-    /// `shell` selects `run_shell` over `run`.
-    extern "C" fn run<'a>(&'a self, req: SVec<u8>, shell: bool) -> DynFuture<'a, SVec<u8>>;
-    /// The driver's config schema (the driver-specific kwargs of `target(...)`)
-    /// as prost-encoded `pb::Schema` bytes. Sync driver-static metadata.
-    extern "C" fn schema(&self) -> SVec<u8>;
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_io<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+        io: RunIo,
+    ) -> DynFuture<'a, SVec<u8>>;
 }
 
-/// Owned ABI-stable handles to a loaded plugin's components.
-pub type DynProvider = stabby::dynptr!(stabby::boxed::Box<dyn StableProvider + Send + Sync>);
+/// Owned ABI-stable handles to a loaded plugin's components. Each composes
+/// [`StableMeta`] (static metadata) alongside its dispatch surface.
+pub type DynProvider =
+    stabby::dynptr!(stabby::boxed::Box<dyn StableProvider + StableMeta + Send + Sync>);
 pub type DynManagedDriver =
-    stabby::dynptr!(stabby::boxed::Box<dyn StableManagedDriver + Send + Sync>);
+    stabby::dynptr!(stabby::boxed::Box<dyn StableManagedDriver + StableMeta + Send + Sync>);
 
 /// Config handed to a cdylib's create entry: the workspace root, the engine's
 /// home dir (where a plugin should keep its state/scratch — e.g. `<root>/.heph3`,

@@ -24,15 +24,14 @@ use hplugin::provider::{
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
-    DynExecutor, DynFunctionRegistry, StableFunctionRegistryDyn, StableManagedDriver,
-    StableProvider,
+    DynExecutor, DynFunctionRegistry, RunIo, StableFunctionRegistryDyn, StableManagedDriver,
+    StableMeta, StableProvider,
 };
 use plugin_abi::convert;
 use plugin_abi::pb;
 use plugin_abi::pb::frame::Body;
 use prost::Message;
 use stabby::future::DynFutureUnsync as DynFuture;
-use stabby::string::String as SString;
 use stabby::vec::Vec as SVec;
 use std::io::Read;
 use std::path::PathBuf;
@@ -120,237 +119,281 @@ pub struct StableProviderImpl {
     pub provider: Arc<dyn Provider>,
 }
 
-impl StableProvider for StableProviderImpl {
-    extern "C" fn config(&self) -> SString {
-        self.provider
-            .config(ConfigRequest {})
-            .map(|r| r.name)
-            .unwrap_or_default()
-            .into()
-    }
+/// Unary reply for a dispatch method the plugin does not implement. A newer host
+/// calling a method this (older) plugin predates gets this back and falls back —
+/// the mechanism that keeps added dispatch methods additive (see ABI_VERSIONING.md).
+fn unimplemented(method: u32) -> SVec<u8> {
+    unary(Body::Error(pb::Error {
+        kind: pb::error::Kind::Unimplemented as i32,
+        message: format!("dispatch method {method} not implemented"),
+    }))
+}
 
-    extern "C" fn list<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        let provider = Arc::clone(&self.provider);
-        stabby::boxed::Box::new(async move {
-            let req = pb::ListRequest::decode(&req[..]).unwrap_or_default();
-            let tok = StdCancellationToken::new();
-            let lreq = ListRequest {
-                request_id: req.request_id,
-                package: PkgBuf::from(req.package),
-                states: req.states.into_iter().map(convert::state_from_pb).collect(),
-            };
-            let mut bodies = Vec::new();
-            match provider.list(lreq, &tok).await {
-                Ok(iter) => {
-                    for item in iter {
-                        match item {
-                            Ok(lr) => bodies.push(Body::StreamItem(pb::StreamItem {
-                                item: pb::ListResponse {
-                                    addr: Some(convert::addr_to_pb(&lr.addr)),
-                                }
-                                .encode_to_vec()
-                                .into(),
-                            })),
-                            Err(e) => {
-                                bodies.push(stream_err(e.to_string()));
-                                return stream(bodies);
-                            }
+// ---- Provider RPC bodies (moved verbatim out of the old per-method vtable slots
+// into helpers; the dispatch impls below route method ids to them) ----
+
+async fn provider_list(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
+    let req = pb::ListRequest::decode(&req[..]).unwrap_or_default();
+    let tok = StdCancellationToken::new();
+    let lreq = ListRequest {
+        request_id: req.request_id,
+        package: PkgBuf::from(req.package),
+        states: req.states.into_iter().map(convert::state_from_pb).collect(),
+    };
+    let mut bodies = Vec::new();
+    match provider.list(lreq, &tok).await {
+        Ok(iter) => {
+            for item in iter {
+                match item {
+                    Ok(lr) => bodies.push(Body::StreamItem(pb::StreamItem {
+                        item: pb::ListResponse {
+                            addr: Some(convert::addr_to_pb(&lr.addr)),
                         }
+                        .encode_to_vec()
+                        .into(),
+                    })),
+                    Err(e) => {
+                        bodies.push(stream_err(e.to_string()));
+                        return stream(bodies);
                     }
-                    bodies.push(Body::StreamEnd(pb::StreamEnd { error: None }));
                 }
-                Err(e) => bodies.push(stream_err(e.to_string())),
             }
-            stream(bodies)
-        })
-        .into()
+            bodies.push(Body::StreamEnd(pb::StreamEnd { error: None }));
+        }
+        Err(e) => bodies.push(stream_err(e.to_string())),
     }
+    stream(bodies)
+}
 
-    extern "C" fn list_packages<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        let provider = Arc::clone(&self.provider);
-        stabby::boxed::Box::new(async move {
-            let req = pb::ListPackagesRequest::decode(&req[..]).unwrap_or_default();
-            let tok = StdCancellationToken::new();
-            let lreq = ListPackagesRequest {
-                prefix: PkgBuf::from(req.prefix),
-            };
-            let mut bodies = Vec::new();
-            match provider.list_packages(lreq, &tok).await {
-                Ok(iter) => {
-                    for item in iter {
-                        match item {
-                            Ok(lpr) => bodies.push(Body::StreamItem(pb::StreamItem {
-                                item: pb::ListPackageResponse {
-                                    pkg: lpr.pkg.as_str().to_string(),
-                                }
-                                .encode_to_vec()
-                                .into(),
-                            })),
-                            Err(e) => {
-                                bodies.push(stream_err(e.to_string()));
-                                return stream(bodies);
-                            }
+async fn provider_list_packages(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
+    let req = pb::ListPackagesRequest::decode(&req[..]).unwrap_or_default();
+    let tok = StdCancellationToken::new();
+    let lreq = ListPackagesRequest {
+        prefix: PkgBuf::from(req.prefix),
+    };
+    let mut bodies = Vec::new();
+    match provider.list_packages(lreq, &tok).await {
+        Ok(iter) => {
+            for item in iter {
+                match item {
+                    Ok(lpr) => bodies.push(Body::StreamItem(pb::StreamItem {
+                        item: pb::ListPackageResponse {
+                            pkg: lpr.pkg.as_str().to_string(),
                         }
+                        .encode_to_vec()
+                        .into(),
+                    })),
+                    Err(e) => {
+                        bodies.push(stream_err(e.to_string()));
+                        return stream(bodies);
                     }
-                    bodies.push(Body::StreamEnd(pb::StreamEnd { error: None }));
                 }
-                Err(e) => bodies.push(stream_err(e.to_string())),
             }
-            stream(bodies)
-        })
-        .into()
+            bodies.push(Body::StreamEnd(pb::StreamEnd { error: None }));
+        }
+        Err(e) => bodies.push(stream_err(e.to_string())),
     }
+    stream(bodies)
+}
 
-    extern "C" fn get<'a>(&'a self, req: SVec<u8>, exec: DynExecutor) -> DynFuture<'a, SVec<u8>> {
-        let provider = Arc::clone(&self.provider);
-        stabby::boxed::Box::new(async move {
-            let req = pb::GetRequest::decode(&req[..]).unwrap_or_default();
-            let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
-            let tok = StdCancellationToken::new();
-            let greq = GetRequest {
-                request_id: req.request_id,
-                addr: convert::addr_from_pb(req.addr.unwrap_or_default()),
-                states: req.states.into_iter().map(convert::state_from_pb).collect(),
-                executor,
-            };
-            let body = match provider.get(greq, &tok).await {
-                Ok(gr) => Body::GetResp(pb::GetResponse {
-                    target_spec: Some(convert::target_spec_to_pb(&gr.target_spec)),
-                }),
-                Err(GetError::NotFound) => Body::GetErr(pb::GetError {
-                    kind: pb::get_error::Kind::NotFound as i32,
-                    message: String::new(),
-                }),
-                Err(GetError::Other(e)) => Body::GetErr(pb::GetError {
-                    kind: get_error_kind(&e) as i32,
-                    message: e.to_string(),
-                }),
-            };
-            unary(body)
-        })
-        .into()
-    }
+async fn provider_get(provider: Arc<dyn Provider>, req: SVec<u8>, exec: DynExecutor) -> SVec<u8> {
+    let req = pb::GetRequest::decode(&req[..]).unwrap_or_default();
+    let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
+    let tok = StdCancellationToken::new();
+    let greq = GetRequest {
+        request_id: req.request_id,
+        addr: convert::addr_from_pb(req.addr.unwrap_or_default()),
+        states: req.states.into_iter().map(convert::state_from_pb).collect(),
+        executor,
+    };
+    let body = match provider.get(greq, &tok).await {
+        Ok(gr) => Body::GetResp(pb::GetResponse {
+            target_spec: Some(convert::target_spec_to_pb(&gr.target_spec)),
+        }),
+        Err(GetError::NotFound) => Body::GetErr(pb::GetError {
+            kind: pb::get_error::Kind::NotFound as i32,
+            message: String::new(),
+        }),
+        Err(GetError::Other(e)) => Body::GetErr(pb::GetError {
+            kind: get_error_kind(&e) as i32,
+            message: e.to_string(),
+        }),
+    };
+    unary(body)
+}
 
-    extern "C" fn probe<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        let provider = Arc::clone(&self.provider);
-        stabby::boxed::Box::new(async move {
-            let req = pb::ProbeRequest::decode(&req[..]).unwrap_or_default();
-            let tok = StdCancellationToken::new();
-            let preq = ProbeRequest {
-                request_id: req.request_id,
-                package: PkgBuf::from(req.package),
-            };
-            let body = match provider.probe(preq, &tok).await {
-                Ok(pr) => Body::ProbeResp(pb::ProbeResponse {
-                    states: pr.states.iter().map(convert::state_to_pb).collect(),
-                }),
-                Err(e) => err_body(e.to_string()),
-            };
-            unary(body)
-        })
-        .into()
-    }
+async fn provider_probe(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
+    let req = pb::ProbeRequest::decode(&req[..]).unwrap_or_default();
+    let tok = StdCancellationToken::new();
+    let preq = ProbeRequest {
+        request_id: req.request_id,
+        package: PkgBuf::from(req.package),
+    };
+    let body = match provider.probe(preq, &tok).await {
+        Ok(pr) => Body::ProbeResp(pb::ProbeResponse {
+            states: pr.states.iter().map(convert::state_to_pb).collect(),
+        }),
+        Err(e) => err_body(e.to_string()),
+    };
+    unary(body)
+}
 
-    extern "C" fn functions(&self) -> SVec<u8> {
-        let functions = self
-            .provider
-            .functions()
+async fn provider_call_function(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
+    let req = pb::CallFunctionRequest::decode(&req[..]).unwrap_or_default();
+    // Re-derive the def each call (cheap; provider functions are static
+    // metadata). The handler is not transmissible, so it must be invoked
+    // here on the guest side.
+    let def = provider
+        .functions()
+        .into_iter()
+        .find(|d| d.name == req.name);
+    let Some(def) = def else {
+        return unary(err_body(format!("unknown provider function `{}`", req.name)));
+    };
+    let ctx = FnCallContext {
+        pkg: &req.pkg,
+        root: std::path::Path::new(&req.root),
+    };
+    let args = FnArgs {
+        positional: req
+            .positional
             .into_iter()
-            .map(|d| pb::ProviderFunctionDef {
-                name: d.name,
-                signature: Some(convert::fn_signature_to_pb(&d.signature)),
-                doc: d.doc,
-            })
-            .collect();
-        SVec::from(
-            pb::FunctionsResponse { functions }
-                .encode_to_vec()
-                .as_slice(),
-        )
-    }
+            .map(convert::value_from_pb)
+            .collect(),
+        named: req
+            .named
+            .into_iter()
+            .map(|(k, v)| (k, convert::value_from_pb(v)))
+            .collect(),
+    };
+    let body = match def.func.call(&ctx, args).await {
+        Ok(v) => Body::CallFunctionResp(pb::CallFunctionResponse {
+            value: Some(convert::value_to_pb(&v)),
+        }),
+        Err(e) => err_body(format!("{e:#}")),
+    };
+    unary(body)
+}
 
-    extern "C" fn call_function<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+// Sync metadata helpers. Each returns the metadatum's RAW prost bytes (NOT a
+// `Frame` — matching the prior `functions()`/`state_schema()`/`config()` wire).
+
+fn provider_config(provider: &Arc<dyn Provider>) -> SVec<u8> {
+    let name = provider
+        .config(ConfigRequest {})
+        .map(|r| r.name)
+        .unwrap_or_default();
+    SVec::from(pb::ConfigResponse { name }.encode_to_vec().as_slice())
+}
+
+fn provider_functions(provider: &Arc<dyn Provider>) -> SVec<u8> {
+    let functions = provider
+        .functions()
+        .into_iter()
+        .map(|d| pb::ProviderFunctionDef {
+            name: d.name,
+            signature: Some(convert::fn_signature_to_pb(&d.signature)),
+            doc: d.doc,
+        })
+        .collect();
+    SVec::from(
+        pb::FunctionsResponse { functions }
+            .encode_to_vec()
+            .as_slice(),
+    )
+}
+
+fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
+    // Empty SVec == `None`; an encoded Schema == `Some` (see the ABI doc).
+    match provider.state_schema() {
+        Some(s) => SVec::from(convert::state_schema_to_pb(&s).encode_to_vec().as_slice()),
+        None => SVec::new(),
+    }
+}
+
+fn provider_set_registry(provider: &Arc<dyn Provider>, metadata: SVec<u8>, reg: DynFunctionRegistry) {
+    let meta = pb::FunctionRegistry::decode(&metadata[..]).unwrap_or_default();
+    // Shared across every proxy handler — each dispatches back over the host
+    // callback to invoke the actual function.
+    let reg = Arc::new(reg);
+    let mut by_provider: std::collections::HashMap<String, Vec<ProviderFunctionDef>> =
+        std::collections::HashMap::new();
+    for f in meta.functions {
+        let Some(signature) = f.signature.map(convert::fn_signature_from_pb) else {
+            continue;
+        };
+        by_provider
+            .entry(f.provider.clone())
+            .or_default()
+            .push(ProviderFunctionDef {
+                name: f.name.clone(),
+                signature,
+                doc: f.doc,
+                func: Arc::new(GuestRegisteredFn {
+                    reg: Arc::clone(&reg),
+                    provider: f.provider,
+                    name: f.name,
+                }),
+            });
+    }
+    let mut registry = ProviderFunctionRegistry::default();
+    for (provider_name, defs) in by_provider {
+        registry.insert_provider(&provider_name, defs);
+    }
+    provider.set_function_registry(Arc::new(registry));
+}
+
+impl StableMeta for StableProviderImpl {
+    extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
+        match pb::ProviderMethod::try_from(kind as i32) {
+            Ok(pb::ProviderMethod::Config) => provider_config(&self.provider),
+            Ok(pb::ProviderMethod::Functions) => provider_functions(&self.provider),
+            Ok(pb::ProviderMethod::StateSchema) => provider_state_schema(&self.provider),
+            // Unknown sync metadatum: empty == "none", never a hard failure.
+            _ => SVec::new(),
+        }
+    }
+}
+
+impl StableProvider for StableProviderImpl {
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
         stabby::boxed::Box::new(async move {
-            let req = pb::CallFunctionRequest::decode(&req[..]).unwrap_or_default();
-            // Re-derive the def each call (cheap; provider functions are static
-            // metadata). The handler is not transmissible, so it must be invoked
-            // here on the guest side.
-            let def = provider
-                .functions()
-                .into_iter()
-                .find(|d| d.name == req.name);
-            let Some(def) = def else {
-                return unary(err_body(format!(
-                    "unknown provider function `{}`",
-                    req.name
-                )));
-            };
-            let ctx = FnCallContext {
-                pkg: &req.pkg,
-                root: std::path::Path::new(&req.root),
-            };
-            let args = FnArgs {
-                positional: req
-                    .positional
-                    .into_iter()
-                    .map(convert::value_from_pb)
-                    .collect(),
-                named: req
-                    .named
-                    .into_iter()
-                    .map(|(k, v)| (k, convert::value_from_pb(v)))
-                    .collect(),
-            };
-            let body = match def.func.call(&ctx, args).await {
-                Ok(v) => Body::CallFunctionResp(pb::CallFunctionResponse {
-                    value: Some(convert::value_to_pb(&v)),
-                }),
-                Err(e) => err_body(format!("{e:#}")),
-            };
-            unary(body)
+            match pb::ProviderMethod::try_from(method as i32) {
+                Ok(pb::ProviderMethod::List) => provider_list(provider, req).await,
+                Ok(pb::ProviderMethod::ListPackages) => provider_list_packages(provider, req).await,
+                Ok(pb::ProviderMethod::Probe) => provider_probe(provider, req).await,
+                Ok(pb::ProviderMethod::CallFunction) => provider_call_function(provider, req).await,
+                _ => unimplemented(method),
+            }
         })
         .into()
     }
 
-    extern "C" fn state_schema(&self) -> SVec<u8> {
-        // Empty SVec == `None`; an encoded Schema == `Some` (see the ABI doc).
-        match self.provider.state_schema() {
-            Some(s) => SVec::from(convert::state_schema_to_pb(&s).encode_to_vec().as_slice()),
-            None => SVec::new(),
-        }
+    extern "C" fn invoke_exec<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+        exec: DynExecutor,
+    ) -> DynFuture<'a, SVec<u8>> {
+        let provider = Arc::clone(&self.provider);
+        stabby::boxed::Box::new(async move {
+            match pb::ProviderMethod::try_from(method as i32) {
+                Ok(pb::ProviderMethod::Get) => provider_get(provider, req, exec).await,
+                _ => unimplemented(method),
+            }
+        })
+        .into()
     }
 
-    extern "C" fn set_function_registry(&self, metadata: SVec<u8>, reg: DynFunctionRegistry) {
-        let meta = pb::FunctionRegistry::decode(&metadata[..]).unwrap_or_default();
-        // Shared across every proxy handler — each dispatches back over the host
-        // callback to invoke the actual function.
-        let reg = Arc::new(reg);
-        let mut by_provider: std::collections::HashMap<String, Vec<ProviderFunctionDef>> =
-            std::collections::HashMap::new();
-        for f in meta.functions {
-            let Some(signature) = f.signature.map(convert::fn_signature_from_pb) else {
-                continue;
-            };
-            by_provider
-                .entry(f.provider.clone())
-                .or_default()
-                .push(ProviderFunctionDef {
-                    name: f.name.clone(),
-                    signature,
-                    doc: f.doc,
-                    func: Arc::new(GuestRegisteredFn {
-                        reg: Arc::clone(&reg),
-                        provider: f.provider,
-                        name: f.name,
-                    }),
-                });
+    extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry) {
+        // Only SetFunctionRegistry rides this slot today; an unknown id has no
+        // return channel, so the handle is simply dropped.
+        if let Ok(pb::ProviderMethod::SetFunctionRegistry) =
+            pb::ProviderMethod::try_from(method as i32)
+        {
+            provider_set_registry(&self.provider, req, reg);
         }
-        let mut registry = ProviderFunctionRegistry::default();
-        for (provider, defs) in by_provider {
-            registry.insert_provider(&provider, defs);
-        }
-        self.provider.set_function_registry(Arc::new(registry));
     }
 }
 
@@ -406,96 +449,127 @@ pub struct StableManagedDriverImpl {
     pub driver: Arc<dyn ManagedDriver>,
 }
 
+fn driver_config(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
+    let name = driver
+        .config(DriverConfigRequest {})
+        .map(|r| r.name)
+        .unwrap_or_default();
+    SVec::from(pb::ConfigResponse { name }.encode_to_vec().as_slice())
+}
+
+fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
+    SVec::from(
+        convert::driver_schema_to_pb(&driver.schema())
+            .encode_to_vec()
+            .as_slice(),
+    )
+}
+
+async fn driver_parse(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8> {
+    let req = pb::ParseRequest::decode(&req[..]).unwrap_or_default();
+    let tok = StdCancellationToken::new();
+    let preq = ParseRequest {
+        request_id: req.request_id,
+        target_spec: Arc::new(convert::target_spec_from_pb(
+            req.target_spec.unwrap_or_default(),
+        )),
+    };
+    let body = match driver.parse(preq, &tok).await {
+        Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+            Ok(td) => Body::ParseResp(pb::ParseResponse {
+                target_def: Some(td),
+            }),
+            Err(e) => err_body(e.to_string()),
+        },
+        Err(e) => err_body(e.to_string()),
+    };
+    unary(body)
+}
+
+async fn driver_apply_transitive(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8> {
+    let req = pb::ApplyTransitiveRequest::decode(&req[..]).unwrap_or_default();
+    let tok = StdCancellationToken::new();
+    let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default()) {
+        Ok(td) => td,
+        Err(e) => return unary(err_body(e.to_string())),
+    };
+    let areq = ApplyTransitiveRequest {
+        request_id: req.request_id,
+        target_def,
+        sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
+    };
+    let body = match driver.apply_transitive(areq, &tok).await {
+        Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+            Ok(td) => Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
+                target_def: Some(td),
+            }),
+            Err(e) => err_body(e.to_string()),
+        },
+        Err(e) => err_body(e.to_string()),
+    };
+    unary(body)
+}
+
+impl StableMeta for StableManagedDriverImpl {
+    extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
+        match pb::DriverMethod::try_from(kind as i32) {
+            Ok(pb::DriverMethod::Config) => driver_config(&self.driver),
+            Ok(pb::DriverMethod::Schema) => driver_schema(&self.driver),
+            _ => SVec::new(),
+        }
+    }
+}
+
 impl StableManagedDriver for StableManagedDriverImpl {
-    extern "C" fn config(&self) -> SString {
-        self.driver
-            .config(DriverConfigRequest {})
-            .map(|r| r.name)
-            .unwrap_or_default()
-            .into()
-    }
-
-    extern "C" fn schema(&self) -> SVec<u8> {
-        SVec::from(
-            convert::driver_schema_to_pb(&self.driver.schema())
-                .encode_to_vec()
-                .as_slice(),
-        )
-    }
-
-    extern "C" fn parse<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+    extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
         stabby::boxed::Box::new(async move {
-            let req = pb::ParseRequest::decode(&req[..]).unwrap_or_default();
-            let tok = StdCancellationToken::new();
-            let preq = ParseRequest {
-                request_id: req.request_id,
-                target_spec: Arc::new(convert::target_spec_from_pb(
-                    req.target_spec.unwrap_or_default(),
-                )),
-            };
-            let body = match driver.parse(preq, &tok).await {
-                Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
-                    Ok(td) => Body::ParseResp(pb::ParseResponse {
-                        target_def: Some(td),
-                    }),
-                    Err(e) => err_body(e.to_string()),
-                },
-                Err(e) => err_body(e.to_string()),
-            };
-            unary(body)
+            match pb::DriverMethod::try_from(method as i32) {
+                Ok(pb::DriverMethod::Parse) => driver_parse(driver, req).await,
+                Ok(pb::DriverMethod::ApplyTransitive) => {
+                    driver_apply_transitive(driver, req).await
+                }
+                _ => unimplemented(method),
+            }
         })
         .into()
     }
 
-    extern "C" fn apply_transitive<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+    extern "C" fn invoke_io<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+        // The native stdio rails. Frozen and accepted now; live stdin/stdout/stderr
+        // streaming will populate these (see RunIo). Today's `run` inherits stdio at
+        // spawn, so the handles are unused and dropped here.
+        _io: RunIo,
+    ) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
         stabby::boxed::Box::new(async move {
-            let req = pb::ApplyTransitiveRequest::decode(&req[..]).unwrap_or_default();
-            let tok = StdCancellationToken::new();
-            let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default()) {
-                Ok(td) => td,
-                Err(e) => return unary(err_body(e.to_string())),
-            };
-            let areq = ApplyTransitiveRequest {
-                request_id: req.request_id,
-                target_def,
-                sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
-            };
-            let body = match driver.apply_transitive(areq, &tok).await {
-                Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
-                    Ok(td) => Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
-                        target_def: Some(td),
-                    }),
-                    Err(e) => err_body(e.to_string()),
-                },
-                Err(e) => err_body(e.to_string()),
-            };
-            unary(body)
-        })
-        .into()
-    }
-
-    extern "C" fn run<'a>(&'a self, req: SVec<u8>, shell: bool) -> DynFuture<'a, SVec<u8>> {
-        let driver = Arc::clone(&self.driver);
-        stabby::boxed::Box::new(async move {
-            // `run` shells out via the reactor — execute on the cdylib's own
-            // runtime, bridge the result back to the host's polling task.
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            cdylib_runtime().spawn(async move {
-                // Receiver dropped only if the host gave up; ignore send failure.
-                drop(tx.send(run_impl(driver, req, shell).await));
-            });
-            rx.await
-                .unwrap_or_else(|_| unary(err_body("cdylib run task dropped".into())))
+            match pb::DriverMethod::try_from(method as i32) {
+                Ok(pb::DriverMethod::Run) => {
+                    // `run` shells out via the reactor — execute on the cdylib's own
+                    // runtime, bridge the result back to the host's polling task.
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    cdylib_runtime().spawn(async move {
+                        // Receiver dropped only if the host gave up; ignore send failure.
+                        drop(tx.send(run_impl(driver, req).await));
+                    });
+                    rx.await
+                        .unwrap_or_else(|_| unary(err_body("cdylib run task dropped".into())))
+                }
+                _ => unimplemented(method),
+            }
         })
         .into()
     }
 }
 
-async fn run_impl(driver: Arc<dyn ManagedDriver>, req: SVec<u8>, shell: bool) -> SVec<u8> {
+async fn run_impl(driver: Arc<dyn ManagedDriver>, req: SVec<u8>) -> SVec<u8> {
     let req = pb::ManagedRunRequest::decode(&req[..]).unwrap_or_default();
     let tok = StdCancellationToken::new();
+    // `shell` selects run_shell over run; it rides the request now (not a slot arg).
+    let shell = req.shell;
     let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => return unary(err_body(e.to_string())),
@@ -854,6 +928,28 @@ mod tests {
                     required: false,
                 }],
             })
+        }
+    }
+
+    // The additive-compat contract: a dispatch method id this plugin does not
+    // know (a newer host calling a method this build predates) returns
+    // Error{Unimplemented} rather than crashing. This is what lets the host add
+    // RPC methods without an ABI break — the frozen vtable still loads, and the
+    // old guest answers unknown ids gracefully.
+    #[test]
+    fn unknown_dispatch_method_is_unimplemented() {
+        use hplugin_stabby::abi::StableProviderDyn;
+
+        let dynp = make_dyn_provider(Arc::new(FnProvider) as Arc<dyn Provider>);
+        // 9999 is not a ProviderMethod value (none assigned).
+        let bytes = futures::executor::block_on(dynp.invoke(9999, SVec::new()));
+        match pb::Frame::decode(&bytes[..]).expect("frame").body {
+            Some(Body::Error(e)) => assert_eq!(
+                e.kind,
+                pb::error::Kind::Unimplemented as i32,
+                "unknown method must report Unimplemented"
+            ),
+            other => panic!("expected Unimplemented error, got {other:?}"),
         }
     }
 
