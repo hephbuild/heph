@@ -31,6 +31,11 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/testkit/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tui/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/walk/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/driver-bridge/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-abi/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-go-cdylib/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-sdk/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/plugin-stabby/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.devenv" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/.claude/worktrees" />
