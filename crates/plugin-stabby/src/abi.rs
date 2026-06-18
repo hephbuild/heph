@@ -166,28 +166,62 @@ pub struct RunIo {
     pub stderr: stabby::option::Option<DynWrite>,
 }
 
+/// A pull stream of items across the seam (the streaming counterpart of the unary
+/// `SVec<u8>` reply). Each `next` yields one prost length-delimited `pb::Frame`
+/// (`StreamItem` for an item, or `StreamEnd{error}` to end with failure); an EMPTY
+/// `SVec` means the stream is exhausted cleanly. Used for BOTH directions — a
+/// request stream (host → plugin) and a response stream (plugin → host). `&self`
+/// (not `&mut`) so it dispatches over the stable vtable; implementors use interior
+/// mutability for the cursor. Unlike [`DynRead`], the handle is `Send + Sync`
+/// (`Mutex`-guarded cursor) because list results flow into the engine, which
+/// requires `Send` iterators.
+#[stabby::stabby]
+pub trait StableItemStream {
+    extern "C" fn next(&self) -> SVec<u8>;
+}
+
+/// An owned, ABI-stable item-stream handle (a request or response stream).
+pub type DynItemStream =
+    stabby::dynptr!(stabby::boxed::Box<dyn StableItemStream + Send + Sync>);
+
 /// The cold provider surface as a FROZEN generic dispatch. The `method` id
-/// (`pb::ProviderMethod`) selects an RPC; request/response cross as prost-encoded
+/// (`pb::ProviderMethod`) selects an RPC; payloads cross as prost-encoded
 /// `pb::Frame` bytes (cheap, low-volume, lenient via protobuf). Adding an RPC is a
 /// new method id + a new guest match arm — the vtable is UNTOUCHED, so an older
 /// plugin and a newer host still load (stabby's type report is unchanged) and the
 /// old plugin answers an unknown id with `Error{Unimplemented}`. THIS is what
 /// makes the cold surface evolvable without an ABI break (see ABI_VERSIONING.md).
 ///
-/// Three slots cover the call shapes; native handles cannot ride prost bytes, so a
-/// method that carries one gets its own (also frozen) slot:
-/// - [`invoke`](StableProvider::invoke) — plain prost in/out.
-/// - [`invoke_exec`](StableProvider::invoke_exec) — also passes the native
+/// The slots cover the four RPC cardinalities (request × response, each unary or
+/// streaming) plus the native-handle carriers (a `DynExecutor` / `DynFunctionRegistry`
+/// cannot ride prost bytes, so the method carrying one gets its own frozen slot):
+/// - [`invoke`](StableProvider::invoke) — unary → unary.
+/// - [`invoke_server_stream`](StableProvider::invoke_server_stream) — unary →
+///   stream (`list`, `list_packages`): the reply is pulled lazily, never buffered.
+/// - [`invoke_client_stream`](StableProvider::invoke_client_stream) — stream → unary.
+/// - [`invoke_bidi`](StableProvider::invoke_bidi) — stream → stream.
+/// - [`invoke_exec`](StableProvider::invoke_exec) — unary → unary + native
 ///   [`DynExecutor`] (`get`, whose resolution makes hot callbacks).
-/// - [`invoke_registry`](StableProvider::invoke_registry) — also passes the native
+/// - [`invoke_registry`](StableProvider::invoke_registry) — unary → void + native
 ///   [`DynFunctionRegistry`] (`set_function_registry`).
-///
-/// Replies follow the prior contract: unary methods return one prost `pb::Frame`;
-/// stream methods (`list`, `list_packages`) return length-delimited `pb::Frame`s
-/// (StreamItem… then StreamEnd).
 #[stabby::stabby]
 pub trait StableProvider {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_server_stream<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, DynItemStream>;
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_bidi<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, DynItemStream>;
     extern "C" fn invoke_exec<'a>(
         &'a self,
         method: u32,
@@ -197,13 +231,28 @@ pub trait StableProvider {
     extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry);
 }
 
-/// The cold managed-driver surface, same frozen-dispatch contract as
-/// [`StableProvider`]. `method` is a `pb::DriverMethod`. `run` rides
-/// [`invoke_io`](StableManagedDriver::invoke_io), which additionally carries the
-/// native [`RunIo`] stdio handles.
+/// The cold managed-driver surface, same frozen-dispatch contract and the same
+/// four cardinalities as [`StableProvider`]. `method` is a `pb::DriverMethod`.
+/// `run` rides [`invoke_io`](StableManagedDriver::invoke_io), which additionally
+/// carries the native [`RunIo`] stdio handles.
 #[stabby::stabby]
 pub trait StableManagedDriver {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_server_stream<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, DynItemStream>;
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>>;
+    extern "C" fn invoke_bidi<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, DynItemStream>;
     extern "C" fn invoke_io<'a>(
         &'a self,
         method: u32,

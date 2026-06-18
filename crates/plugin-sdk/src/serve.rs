@@ -24,8 +24,8 @@ use hplugin::provider::{
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
-    DynExecutor, DynFunctionRegistry, RunIo, StableFunctionRegistryDyn, StableManagedDriver,
-    StableMeta, StableProvider,
+    DynExecutor, DynFunctionRegistry, DynItemStream, RunIo, StableFunctionRegistryDyn,
+    StableItemStream, StableManagedDriver, StableMeta, StableProvider,
 };
 use plugin_abi::convert;
 use plugin_abi::pb;
@@ -66,18 +66,85 @@ fn unary(body: Body) -> SVec<u8> {
     SVec::from(f.encode_to_vec().as_slice())
 }
 
-fn stream(bodies: Vec<Body>) -> SVec<u8> {
-    let mut buf = Vec::new();
-    for b in bodies {
-        let f = pb::Frame {
-            id: 0,
-            body: Some(b),
-        };
-        // Encoding into a growable Vec is infallible; bind the Result to satisfy
-        // #[must_use] without an explicit drop (the value is Copy).
-        let _encoded = f.encode_length_delimited(&mut buf);
+/// Encode one `pb::Frame` carrying `body` (one frame per stream `next`).
+fn frame_bytes(body: Body) -> Vec<u8> {
+    pb::Frame {
+        id: 0,
+        body: Some(body),
     }
-    SVec::from(buf.as_slice())
+    .encode_to_vec()
+}
+
+/// Guest-side response stream: pulls items from a provider iterator lazily and
+/// frames each on demand — nothing is buffered at the seam. `Mutex` (not `RefCell`
+/// like [`HostRead`]) so the handle is `Send + Sync`, since list results flow into
+/// the host engine, which requires `Send`.
+struct GuestItemStream {
+    frames: std::sync::Mutex<Box<dyn Iterator<Item = Vec<u8>> + Send>>,
+}
+
+impl StableItemStream for GuestItemStream {
+    extern "C" fn next(&self) -> SVec<u8> {
+        let mut frames = self.frames.lock().unwrap_or_else(|e| e.into_inner());
+        // Empty == stream exhausted; otherwise one encoded `pb::Frame`.
+        match frames.next() {
+            Some(bytes) => SVec::from(bytes.as_slice()),
+            None => SVec::new(),
+        }
+    }
+}
+
+fn make_item_stream(frames: Box<dyn Iterator<Item = Vec<u8>> + Send>) -> DynItemStream {
+    stabby::boxed::Box::new(GuestItemStream {
+        frames: std::sync::Mutex::new(frames),
+    })
+    .into()
+}
+
+/// Lazily map a provider's fallible item iterator into encoded `StreamItem` frames,
+/// terminating with a `StreamEnd{error}` frame if an item errors. A clean end emits
+/// no terminal frame (the empty `next` signals it).
+fn frame_iter<T: 'static>(
+    mut iter: Box<dyn Iterator<Item = Result<T>> + Send>,
+    encode_item: fn(T) -> Vec<u8>,
+) -> Box<dyn Iterator<Item = Vec<u8>> + Send> {
+    let mut done = false;
+    Box::new(std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        match iter.next() {
+            Some(Ok(t)) => Some(frame_bytes(Body::StreamItem(pb::StreamItem {
+                item: encode_item(t).into(),
+            }))),
+            Some(Err(e)) => {
+                done = true;
+                Some(frame_bytes(stream_err(e.to_string())))
+            }
+            None => {
+                done = true;
+                None
+            }
+        }
+    }))
+}
+
+/// A response stream that fails immediately with `msg` (one `StreamEnd{error}`).
+fn error_item_stream(msg: String) -> DynItemStream {
+    make_item_stream(Box::new(std::iter::once(frame_bytes(stream_err(msg)))))
+}
+
+/// A response stream for an unimplemented streaming method — the stream-shaped
+/// counterpart of [`unimplemented`], carrying `Error{Unimplemented}` so a newer
+/// host falls back instead of failing hard.
+fn unimplemented_item_stream(method: u32) -> DynItemStream {
+    let body = Body::StreamEnd(pb::StreamEnd {
+        error: Some(pb::Error {
+            kind: pb::error::Kind::Unimplemented as i32,
+            message: format!("dispatch method {method} not implemented"),
+        }),
+    });
+    make_item_stream(Box::new(std::iter::once(frame_bytes(body))))
 }
 
 fn err_body(message: String) -> Body {
@@ -132,7 +199,10 @@ fn unimplemented(method: u32) -> SVec<u8> {
 // ---- Provider RPC bodies (moved verbatim out of the old per-method vtable slots
 // into helpers; the dispatch impls below route method ids to them) ----
 
-async fn provider_list(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
+// Server-streaming: the provider's iterator is pulled lazily across the seam (one
+// item per `StableItemStream::next`), never materialized into one blob.
+
+async fn provider_list_stream(provider: Arc<dyn Provider>, req: SVec<u8>) -> DynItemStream {
     let req = pb::ListRequest::decode(&req[..]).unwrap_or_default();
     let tok = StdCancellationToken::new();
     let lreq = ListRequest {
@@ -140,60 +210,32 @@ async fn provider_list(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
         package: PkgBuf::from(req.package),
         states: req.states.into_iter().map(convert::state_from_pb).collect(),
     };
-    let mut bodies = Vec::new();
     match provider.list(lreq, &tok).await {
-        Ok(iter) => {
-            for item in iter {
-                match item {
-                    Ok(lr) => bodies.push(Body::StreamItem(pb::StreamItem {
-                        item: pb::ListResponse {
-                            addr: Some(convert::addr_to_pb(&lr.addr)),
-                        }
-                        .encode_to_vec()
-                        .into(),
-                    })),
-                    Err(e) => {
-                        bodies.push(stream_err(e.to_string()));
-                        return stream(bodies);
-                    }
-                }
+        Ok(iter) => make_item_stream(frame_iter(iter, |lr| {
+            pb::ListResponse {
+                addr: Some(convert::addr_to_pb(&lr.addr)),
             }
-            bodies.push(Body::StreamEnd(pb::StreamEnd { error: None }));
-        }
-        Err(e) => bodies.push(stream_err(e.to_string())),
+            .encode_to_vec()
+        })),
+        Err(e) => error_item_stream(e.to_string()),
     }
-    stream(bodies)
 }
 
-async fn provider_list_packages(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
+async fn provider_list_packages_stream(provider: Arc<dyn Provider>, req: SVec<u8>) -> DynItemStream {
     let req = pb::ListPackagesRequest::decode(&req[..]).unwrap_or_default();
     let tok = StdCancellationToken::new();
     let lreq = ListPackagesRequest {
         prefix: PkgBuf::from(req.prefix),
     };
-    let mut bodies = Vec::new();
     match provider.list_packages(lreq, &tok).await {
-        Ok(iter) => {
-            for item in iter {
-                match item {
-                    Ok(lpr) => bodies.push(Body::StreamItem(pb::StreamItem {
-                        item: pb::ListPackageResponse {
-                            pkg: lpr.pkg.as_str().to_string(),
-                        }
-                        .encode_to_vec()
-                        .into(),
-                    })),
-                    Err(e) => {
-                        bodies.push(stream_err(e.to_string()));
-                        return stream(bodies);
-                    }
-                }
+        Ok(iter) => make_item_stream(frame_iter(iter, |lpr| {
+            pb::ListPackageResponse {
+                pkg: lpr.pkg.as_str().to_string(),
             }
-            bodies.push(Body::StreamEnd(pb::StreamEnd { error: None }));
-        }
-        Err(e) => bodies.push(stream_err(e.to_string())),
+            .encode_to_vec()
+        })),
+        Err(e) => error_item_stream(e.to_string()),
     }
-    stream(bodies)
 }
 
 async fn provider_get(provider: Arc<dyn Provider>, req: SVec<u8>, exec: DynExecutor) -> SVec<u8> {
@@ -360,14 +402,47 @@ impl StableProvider for StableProviderImpl {
         let provider = Arc::clone(&self.provider);
         stabby::boxed::Box::new(async move {
             match pb::ProviderMethod::try_from(method as i32) {
-                Ok(pb::ProviderMethod::List) => provider_list(provider, req).await,
-                Ok(pb::ProviderMethod::ListPackages) => provider_list_packages(provider, req).await,
                 Ok(pb::ProviderMethod::Probe) => provider_probe(provider, req).await,
                 Ok(pb::ProviderMethod::CallFunction) => provider_call_function(provider, req).await,
                 _ => unimplemented(method),
             }
         })
         .into()
+    }
+
+    extern "C" fn invoke_server_stream<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+    ) -> DynFuture<'a, DynItemStream> {
+        let provider = Arc::clone(&self.provider);
+        stabby::boxed::Box::new(async move {
+            match pb::ProviderMethod::try_from(method as i32) {
+                Ok(pb::ProviderMethod::List) => provider_list_stream(provider, req).await,
+                Ok(pb::ProviderMethod::ListPackages) => {
+                    provider_list_packages_stream(provider, req).await
+                }
+                _ => unimplemented_item_stream(method),
+            }
+        })
+        .into()
+    }
+
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        // No client-streaming provider RPC yet; the request stream is dropped.
+        _req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>> {
+        stabby::boxed::Box::new(async move { unimplemented(method) }).into()
+    }
+
+    extern "C" fn invoke_bidi<'a>(
+        &'a self,
+        method: u32,
+        _req: DynItemStream,
+    ) -> DynFuture<'a, DynItemStream> {
+        stabby::boxed::Box::new(async move { unimplemented_item_stream(method) }).into()
     }
 
     extern "C" fn invoke_exec<'a>(
@@ -533,6 +608,32 @@ impl StableManagedDriver for StableManagedDriverImpl {
             }
         })
         .into()
+    }
+
+    // No streaming driver RPC yet; the cardinality slots are frozen and provisioned,
+    // answering Unimplemented until a method id rides them.
+    extern "C" fn invoke_server_stream<'a>(
+        &'a self,
+        method: u32,
+        _req: SVec<u8>,
+    ) -> DynFuture<'a, DynItemStream> {
+        stabby::boxed::Box::new(async move { unimplemented_item_stream(method) }).into()
+    }
+
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        _req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>> {
+        stabby::boxed::Box::new(async move { unimplemented(method) }).into()
+    }
+
+    extern "C" fn invoke_bidi<'a>(
+        &'a self,
+        method: u32,
+        _req: DynItemStream,
+    ) -> DynFuture<'a, DynItemStream> {
+        stabby::boxed::Box::new(async move { unimplemented_item_stream(method) }).into()
     }
 
     extern "C" fn invoke_io<'a>(
@@ -951,6 +1052,107 @@ mod tests {
             ),
             other => panic!("expected Unimplemented error, got {other:?}"),
         }
+    }
+
+    // A provider whose `list` yields a scripted sequence of items (Ok) and an
+    // optional terminal error — used to prove server-streaming delivers every item
+    // and surfaces a mid-stream error across the seam.
+    struct ListProvider {
+        items: Vec<std::result::Result<&'static str, &'static str>>,
+    }
+    impl Provider for ListProvider {
+        fn config(&self, _req: ConfigRequest) -> Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "lister".into(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+        > {
+            let items: Vec<Result<ListResponse>> = self
+                .items
+                .iter()
+                .map(|it| match it {
+                    Ok(name) => Ok(ListResponse {
+                        addr: convert::addr_from_pb(pb::Addr {
+                            package: "p".into(),
+                            name: (*name).into(),
+                            args: Default::default(),
+                        }),
+                    }),
+                    Err(msg) => Err(anyhow::anyhow!("{msg}")),
+                })
+                .collect();
+            Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ct: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    fn list_all(items: Vec<std::result::Result<&'static str, &'static str>>) -> Vec<Result<String>> {
+        use hcore::hasync::StdCancellationToken;
+        use hplugin_stabby::load_stable::StableRemoteProvider;
+
+        let dynp = make_dyn_provider(Arc::new(ListProvider { items }) as Arc<dyn Provider>);
+        let host = StableRemoteProvider::new(dynp, "lister");
+        let tok = StdCancellationToken::new();
+        let iter = futures::executor::block_on(host.list(
+            ListRequest {
+                request_id: String::new(),
+                package: PkgBuf::from("p"),
+                states: vec![],
+            },
+            &tok,
+        ))
+        .expect("list ok");
+        iter.map(|r| r.map(|lr| lr.addr.to_string())).collect()
+    }
+
+    // Server-streaming list delivers every item across the seam, in order.
+    #[test]
+    fn list_streams_all_items() {
+        let got = list_all(vec![Ok("x"), Ok("y"), Ok("z")]);
+        let names: Vec<String> = got.into_iter().map(|r| r.expect("item")).collect();
+        assert_eq!(names.len(), 3, "all three items must arrive");
+        assert!(names[0].ends_with("x"));
+        assert!(names[2].ends_with("z"));
+    }
+
+    // A mid-stream provider error surfaces as a failed item, and the stream ends.
+    #[test]
+    fn list_stream_propagates_midstream_error() {
+        let got = list_all(vec![Ok("x"), Err("boom")]);
+        assert_eq!(got.len(), 2, "the ok item then the error");
+        assert!(got[0].is_ok());
+        let err = got[1].as_ref().expect_err("second item is the error");
+        assert!(err.to_string().contains("boom"));
     }
 
     // Provider functions survive the guest→host stable-ABI round trip: the host

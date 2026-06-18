@@ -5,8 +5,9 @@
 //! executor across natively (`HostExecutor`) so callbacks are direct.
 
 use crate::abi::{
-    CREATE_SYMBOL, CreateConfig, CreateFn, DynExecutor, DynManagedDriver, DynProvider, RunIo,
-    StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
+    CREATE_SYMBOL, CreateConfig, CreateFn, DynExecutor, DynItemStream, DynManagedDriver,
+    DynProvider, RunIo, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
+    StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use async_trait::async_trait;
@@ -109,17 +110,67 @@ fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {
         .ok_or_else(|| anyhow::anyhow!("empty stable response frame"))
 }
 
-fn decode_stream(bytes: &[u8]) -> anyhow::Result<Vec<Body>> {
-    use prost::bytes::Buf;
-    let mut cur = bytes;
-    let mut out = Vec::new();
-    while cur.has_remaining() {
-        let f = pb::Frame::decode_length_delimited(&mut cur)?;
-        if let Some(b) = f.body {
-            out.push(b);
+/// Host-side lazy adapter over a plugin response stream: each `next` pulls one
+/// frame across the seam (`StableItemStream::next`) and decodes it, so items flow
+/// incrementally and the full set is never buffered. `Send` (the stream handle is
+/// `Send + Sync`, `decode` is a fn pointer) so it satisfies the engine's `Provider`
+/// iterator bound.
+struct ItemStreamIter<T> {
+    stream: DynItemStream,
+    decode: fn(&[u8]) -> anyhow::Result<T>,
+    done: bool,
+}
+
+impl<T> Iterator for ItemStreamIter<T> {
+    type Item = anyhow::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let bytes = self.stream.next();
+        // Empty == the stream is exhausted cleanly.
+        if bytes.is_empty() {
+            self.done = true;
+            return None;
+        }
+        let frame = match pb::Frame::decode(&bytes[..]) {
+            Ok(f) => f,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(anyhow::anyhow!("stream frame decode: {e}")));
+            }
+        };
+        match frame.body {
+            Some(Body::StreamItem(si)) => Some((self.decode)(&si.item)),
+            Some(Body::StreamEnd(se)) => {
+                self.done = true;
+                se.error.map(|e| Err(anyhow::anyhow!("{}", e.message)))
+            }
+            Some(Body::Error(e)) => {
+                self.done = true;
+                Some(Err(anyhow::anyhow!("{}", e.message)))
+            }
+            _ => {
+                self.done = true;
+                None
+            }
         }
     }
-    Ok(out)
+}
+
+fn decode_list_item(b: &[u8]) -> anyhow::Result<ListResponse> {
+    let lr = pb::ListResponse::decode(b)?;
+    Ok(ListResponse {
+        addr: convert::addr_from_pb(lr.addr.unwrap_or_default()),
+    })
+}
+
+fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
+    let lpr = pb::ListPackageResponse::decode(b)?;
+    Ok(ListPackageResponse {
+        pkg: PkgBuf::from(lpr.pkg),
+    })
 }
 
 /// Host handle to a loaded plugin's provider. `Clone` (cheap — shares the loaded
@@ -163,33 +214,17 @@ impl Provider for StableRemoteProvider {
                 states: req.states.iter().map(convert::state_to_pb).collect(),
             }
             .encode_to_vec();
-            let bytes = self
+            // Server-streaming: pull items lazily across the seam — the whole list
+            // is never materialized on either side.
+            let stream = self
                 .inner
-                .invoke(pb::ProviderMethod::List as u32, sv(&pb_req))
+                .invoke_server_stream(pb::ProviderMethod::List as u32, sv(&pb_req))
                 .await;
-            let mut out: Vec<anyhow::Result<ListResponse>> = Vec::new();
-            for b in decode_stream(&bytes)? {
-                match b {
-                    Body::StreamItem(si) => {
-                        let lr = pb::ListResponse::decode(&si.item[..])?;
-                        out.push(Ok(ListResponse {
-                            addr: convert::addr_from_pb(lr.addr.unwrap_or_default()),
-                        }));
-                    }
-                    Body::StreamEnd(se) => {
-                        if let Some(e) = se.error {
-                            anyhow::bail!("{}", e.message);
-                        }
-                        break;
-                    }
-                    Body::Error(e) => anyhow::bail!("{}", e.message),
-                    _ => {}
-                }
-            }
-            Ok(Box::new(out.into_iter())
-                as Box<
-                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
-                >)
+            Ok(Box::new(ItemStreamIter {
+                stream,
+                decode: decode_list_item,
+                done: false,
+            }) as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>)
         })
     }
 
@@ -206,33 +241,16 @@ impl Provider for StableRemoteProvider {
                 prefix: req.prefix.as_str().to_string(),
             }
             .encode_to_vec();
-            let bytes = self
+            let stream = self
                 .inner
-                .invoke(pb::ProviderMethod::ListPackages as u32, sv(&pb_req))
+                .invoke_server_stream(pb::ProviderMethod::ListPackages as u32, sv(&pb_req))
                 .await;
-            let mut out: Vec<anyhow::Result<ListPackageResponse>> = Vec::new();
-            for b in decode_stream(&bytes)? {
-                match b {
-                    Body::StreamItem(si) => {
-                        let lpr = pb::ListPackageResponse::decode(&si.item[..])?;
-                        out.push(Ok(ListPackageResponse {
-                            pkg: PkgBuf::from(lpr.pkg),
-                        }));
-                    }
-                    Body::StreamEnd(se) => {
-                        if let Some(e) = se.error {
-                            anyhow::bail!("{}", e.message);
-                        }
-                        break;
-                    }
-                    Body::Error(e) => anyhow::bail!("{}", e.message),
-                    _ => {}
-                }
-            }
-            Ok(Box::new(out.into_iter())
-                as Box<
-                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
-                >)
+            Ok(Box::new(ItemStreamIter {
+                stream,
+                decode: decode_list_package_item,
+                done: false,
+            })
+                as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>)
         })
     }
 
