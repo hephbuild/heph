@@ -125,6 +125,12 @@ pub trait LocalCache: Send + Sync {
     ) -> anyhow::Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
         Ok(None)
     }
+    /// The on-disk path of a cached artifact when the backend is a real
+    /// filesystem (so an in-process consumer can open it directly). `None` for
+    /// non-file backends. Defaults to `None`.
+    fn file_path(&self, _addr: &Addr, _hashin: &str, _name: &str) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +188,10 @@ impl hartifactcontent::Content for CacheArtifact {
 
     fn byte_size(&self) -> Option<u64> {
         Some(self.size)
+    }
+
+    fn file_path(&self) -> Option<std::path::PathBuf> {
+        self.cache.file_path(&self.addr, &self.hashin, &self.name)
     }
 }
 

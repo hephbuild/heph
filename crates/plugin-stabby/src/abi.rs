@@ -60,6 +60,12 @@ pub trait StableArtifactContent {
     extern "C" fn hashout(&self) -> SString;
     /// Byte size hint; `u64::MAX` means unknown.
     extern "C" fn byte_size(&self) -> u64;
+    /// The artifact's on-disk path when it is a real local file (e.g. an on-disk
+    /// cache artifact). EMPTY means not file-backed (synthetic/in-memory). Since
+    /// host and guest share the process and filesystem, a non-empty path lets the
+    /// guest open the file directly instead of pulling its bytes chunk-by-chunk
+    /// through [`open`](StableArtifactContent::open) — no per-chunk vtable hop.
+    extern "C" fn path(&self) -> SString;
 }
 
 /// An owned, ABI-stable artifact handle.

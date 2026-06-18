@@ -138,6 +138,10 @@ impl LocalCache for LocalCacheFS {
             }
         }
     }
+
+    fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<PathBuf> {
+        Some(self.get_path(addr, hashin, name))
+    }
 }
 
 /// Recursively walk `dir`; for each `__target_*` directory (one per target),
