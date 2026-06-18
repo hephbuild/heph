@@ -1,30 +1,9 @@
-//! The managed-driver base shared by the exec-family plugins (exec/go/nix): the
-//! `ManagedDriver` trait and the `ManagedDriverBridge` that materializes a
-//! sandbox (FUSE overlay or copy) and dispatches `parse`/`run`/`run_shell` to
-//! the inner driver. Depends only on the contract + FUSE crate; the engine wires
-//! it (`Engine::new_managed_driver`) and supplies the pluginexec shell fallback.
-#![cfg_attr(
-    test,
-    expect(
-        clippy::get_unwrap,
-        clippy::panic_in_result_fn,
-        clippy::assertions_on_result_states,
-        clippy::unwrap_used,
-        clippy::unwrap_in_result,
-        clippy::unimplemented,
-        clippy::undocumented_unsafe_blocks,
-        clippy::unreachable,
-        clippy::let_underscore_must_use,
-        clippy::float_cmp,
-        clippy::assertions_on_constants,
-        clippy::cloned_ref_to_slice_refs,
-        clippy::err_expect,
-        unused_imports,
-        reason = "restriction/style lints scoped to production code; tests are exempt"
-    )
-)]
-
+//! The managed-driver contract shared by the exec-family plugins (exec/go/nix):
+//! the `ManagedDriver` trait, its request/response shapes, the OS-copy sandbox
+//! runner (`ManagedDriverOs`), and the shared output/source-map helpers. This
+//! crate is deliberately **fuse-free** so plugins that merely implement
+//! `ManagedDriver` don't link `fuser`/libfuse. The FUSE backend and the
+//! `ManagedDriverBridge` that routes between OS and FUSE live in
+//! `heph-driver-bridge`, which the engine wires via `Engine::new_managed_driver`.
 pub mod driver_managed;
-pub mod driver_managed_fuse;
 pub mod driver_managed_os;
-pub mod fuseconfig;

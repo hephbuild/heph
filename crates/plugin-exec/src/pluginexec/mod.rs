@@ -2557,13 +2557,14 @@ mod tests {
     /// the produced paths to the same `input_<origin_id>.list`. The tool
     /// symlinker must end up with one symlink per binary in bin/.
     ///
-    /// This goes through `ManagedDriverBridge::run` (the real path) with N
-    /// real tar artifacts, not pre-built list files, so it exercises the
+    /// This goes through `ManagedDriverOs::run_inner` (the OS-copy sandbox
+    /// path — what the bridge dispatches to with FUSE off) with N real tar
+    /// artifacts, not pre-built list files, so it exercises the
     /// unpack-then-symlink flow that production hits.
     #[tokio::test]
     async fn test_multi_output_tool_via_bridge() -> anyhow::Result<()> {
-        use hdriver_support::driver_managed::ManagedDriverBridge;
-        use hplugin::driver::{Driver as _, RunInput, inputartifact, outputartifact};
+        use hdriver_support::driver_managed_os::ManagedDriverOs;
+        use hplugin::driver::{RunInput, inputartifact, outputartifact};
 
         let ctoken = StdCancellationToken::new();
         let tmp = tempfile::tempdir()?;
@@ -2574,7 +2575,7 @@ mod tests {
         let names = ["node", "npm", "npx", "yarn"];
 
         // Build 4 tar artifacts, each containing one file at `pkg/bin/<name>`.
-        // Mirrors what ManagedDriverBridge::run_inner packs at the end of run.
+        // Mirrors what ManagedDriverOs::run_inner packs at the end of run.
         let tar_dir = tmp.path().join("tars");
         std::fs::create_dir_all(&tar_dir)?;
         let origin_id = "tool||0";
@@ -2654,11 +2655,9 @@ mod tests {
         let sandbox = tmp.path().join("sandbox");
         std::fs::create_dir_all(&sandbox)?;
 
-        let bridge = ManagedDriverBridge::new(
+        let os = ManagedDriverOs::new(
             Box::new(Driver::new_bash()),
             Driver::default_exec_shell_fallback(),
-            hdriver_support::fuseconfig::FuseMode::Off,
-            None,
         );
 
         let request_id = "test".to_string();
@@ -2674,7 +2673,7 @@ mod tests {
             sandbox_dir: sandbox.clone(),
         };
 
-        bridge.run(req, &ctoken).await?;
+        os.run_inner(req, &ctoken, false).await?;
 
         let bin_dir = sandbox.join("bin");
         let listed: Vec<_> = std::fs::read_dir(&bin_dir)

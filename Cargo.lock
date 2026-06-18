@@ -1217,6 +1217,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "model",
+ "plugin",
+ "rayon",
+ "sandboxfuse",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "driver-support"
 version = "0.1.0"
 dependencies = [
@@ -1226,8 +1242,6 @@ dependencies = [
  "glob",
  "model",
  "plugin",
- "rayon",
- "sandboxfuse",
  "serde",
  "serde_json",
  "tar",
@@ -1318,6 +1332,7 @@ dependencies = [
  "core",
  "crossbeam-channel",
  "derivative",
+ "driver-bridge",
  "driver-support",
  "enclose",
  "flate2",

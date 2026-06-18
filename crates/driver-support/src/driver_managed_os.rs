@@ -14,12 +14,23 @@ use std::sync::Arc;
 /// OS-backed managed driver: materializes every input artifact to disk via
 /// `hartifactcontent::unpack`. No FUSE involvement.
 pub struct ManagedDriverOs {
-    pub(crate) driver: Arc<Box<dyn ManagedDriver>>,
-    pub(crate) shell_fallback: Arc<ShellFallback>,
+    pub driver: Arc<Box<dyn ManagedDriver>>,
+    pub shell_fallback: Arc<ShellFallback>,
 }
 
 impl ManagedDriverOs {
-    pub(crate) async fn run_inner<'a, 'io>(
+    /// Construct a standalone OS-copy runner. The `ManagedDriverBridge` (in
+    /// `heph-driver-bridge`) builds its `os` field directly to share one
+    /// `Arc<driver>` with the FUSE runner; this is for callers that only want
+    /// the OS path (e.g. tests).
+    pub fn new(driver: Box<dyn ManagedDriver>, shell_fallback: Arc<ShellFallback>) -> Self {
+        Self {
+            driver: Arc::new(driver),
+            shell_fallback,
+        }
+    }
+
+    pub async fn run_inner<'a, 'io>(
         &self,
         mut req: RunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),

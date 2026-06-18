@@ -1,0 +1,27 @@
+[package]
+name = "driver-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hplugin = { package = "plugin", path = "../plugin" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+# The FUSE machinery (and its `fuser`/libfuse link) lives behind this crate so
+# the contract-level `driver-support` — and therefore every plugin — stays
+# fuse-free. Only crates that orchestrate the sandbox (this crate + the engine)
+# link fuse. `default-features = false`: the `fuse-sandbox`/`fuser` mount path is
+# enabled at the engine/`heph` bin; the types used here (LayeredFs, Layer,
+# SlotGuard) are feature-independent.
+hsandboxfuse = { package = "sandboxfuse", path = "../sandboxfuse", default-features = false }
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+rayon = "1.12.0"
+
+[dev-dependencies]
+hmodel = { package = "model", path = "../model" }
+tempfile = "3"
+tokio = { version = "1.52.3", features = ["rt", "macros", "io-util", "fs"] }
