@@ -332,19 +332,77 @@ pub enum LockBackendConfig {
     Mem,
 }
 
-/// One `plugins:` entry: an `identifier` selecting the plugin source, plus an
-/// `options` config map passed to construction.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+/// One `plugins:` entry. In YAML the plugin source is given inline as one of
+/// `builtin:` / `path:` / `url:` at the top of the entry, plus an optional
+/// `options:` config map passed to construction:
+///
+/// ```yaml
+/// plugins:
+///   - builtin: buildfile
+///     options: { patterns: [BUILD] }
+///   - path: .heph3/heph-go-plugin.json
+///   - url: https://…/heph-go-plugin.json
+/// ```
+///
+/// The source collapses to an internal [`PluginIdentifier`]; `identifier` is not
+/// a YAML key.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PluginSpec {
     pub identifier: PluginIdentifier,
-    #[serde(default)]
     pub options: Options,
 }
 
-/// What plugin to load. In YAML it's a single-key map:
-/// `identifier: { builtin: buildfile }` / `{ path: ./x-plugin.json }` /
-/// `{ url: https://…/x-plugin.json }`.
+// Hand-rolled so the source kind (builtin/path/url) sits at the top of the entry
+// alongside `options`, exactly-one is enforced at parse time, and unknown keys
+// are rejected.
+impl<'de> Deserialize<'de> for PluginSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut map: BTreeMap<String, serde_yaml::Value> = BTreeMap::deserialize(d)?;
+
+        let options = match map.remove("options") {
+            Some(v) => serde_yaml::from_value(v)
+                .map_err(|e| D::Error::custom(format!("plugin `options`: {e}")))?,
+            None => Options::default(),
+        };
+
+        let mut source: Option<PluginIdentifier> = None;
+        for (key, value) in map {
+            let id = match key.as_str() {
+                "builtin" | "path" | "url" => {
+                    let s: String = serde_yaml::from_value(value).map_err(|e| {
+                        D::Error::custom(format!("plugin `{key}` must be a string: {e}"))
+                    })?;
+                    match key.as_str() {
+                        "builtin" => PluginIdentifier::Builtin(s),
+                        "path" => PluginIdentifier::Path(s),
+                        _ => PluginIdentifier::Url(s),
+                    }
+                }
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "unknown plugin field `{other}` (expected builtin/path/url/options)"
+                    )));
+                }
+            };
+            if source.replace(id).is_some() {
+                return Err(D::Error::custom(
+                    "plugin entry must set exactly one of builtin/path/url",
+                ));
+            }
+        }
+
+        let identifier = source
+            .ok_or_else(|| D::Error::custom("plugin entry must set one of builtin/path/url"))?;
+        Ok(PluginSpec {
+            identifier,
+            options,
+        })
+    }
+}
+
+/// What plugin to load — internal representation of an entry's inline
+/// `builtin:`/`path:`/`url:` source (see [`PluginSpec`]).
 /// - `builtin`: a compiled-in plugin by name (e.g. `buildfile`, `exec`).
 /// - `path`: a local `*-plugin.json` manifest (relative to the workspace root).
 /// - `url`: a remote `*-plugin.json` manifest.
@@ -353,33 +411,6 @@ pub enum PluginIdentifier {
     Builtin(String),
     Path(String),
     Url(String),
-}
-
-// Hand-rolled so the YAML is a conventional single-key map (`{ builtin: x }`)
-// rather than serde_yaml's external-tag form (`!builtin x`), and so exactly-one
-// is enforced at parse time (no separate runtime check).
-impl<'de> Deserialize<'de> for PluginIdentifier {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
-        let map: BTreeMap<String, String> = BTreeMap::deserialize(d)?;
-        let mut it = map.into_iter();
-        let (kind, value) = it.next().ok_or_else(|| {
-            D::Error::custom("plugin `identifier` must set one of builtin/path/url")
-        })?;
-        if it.next().is_some() {
-            return Err(D::Error::custom(
-                "plugin `identifier` must set exactly one of builtin/path/url",
-            ));
-        }
-        match kind.as_str() {
-            "builtin" => Ok(PluginIdentifier::Builtin(value)),
-            "path" => Ok(PluginIdentifier::Path(value)),
-            "url" => Ok(PluginIdentifier::Url(value)),
-            other => Err(D::Error::custom(format!(
-                "unknown plugin identifier kind `{other}` (expected builtin/path/url)"
-            ))),
-        }
-    }
 }
 
 /// Canonical filename of the per-workspace config, located at the repo root.
@@ -489,17 +520,17 @@ tmpCache:
   perEntryBytes: 1048576
   capacityBytes: 134217728
 plugins:
-  - identifier: { builtin: buildfile }
+  - builtin: buildfile
     options:
       patterns:
         - BUILD2
         - "*.BUILD2"
-  - identifier: { builtin: exec }
+  - builtin: exec
     options:
       path:
         - /usr/sbin
         - /usr/bin
-  - identifier: { path: .heph3/heph-go-plugin.json }
+  - path: .heph3/heph-go-plugin.json
     options:
       gotool: //tools/heph:go
 "#;
@@ -849,11 +880,11 @@ caches:
     #[test]
     fn merge_plugins_by_identity() {
         let mut base: ConfigYaml = serde_yaml::from_str(
-            "plugins:\n  - identifier: { builtin: buildfile }\n    options:\n      patterns: [BUILD]\n  - identifier: { builtin: go }\n",
+            "plugins:\n  - builtin: buildfile\n    options:\n      patterns: [BUILD]\n  - builtin: go\n",
         )
         .expect("parse base");
         let overlay: ConfigYaml = serde_yaml::from_str(
-            "plugins:\n  - identifier: { builtin: buildfile }\n    options:\n      patterns: [BUILD2]\n  - identifier: { builtin: rust }\n",
+            "plugins:\n  - builtin: buildfile\n    options:\n      patterns: [BUILD2]\n  - builtin: rust\n",
         )
         .expect("parse overlay");
 
@@ -1016,10 +1047,10 @@ caches:
     fn parses_plugin_identifier_variants() {
         let yaml = r#"
 plugins:
-  - identifier: { builtin: buildfile }
+  - builtin: buildfile
     options: { patterns: [BUILD] }
-  - identifier: { path: .heph3/heph-go-plugin.json }
-  - identifier: { url: https://example.com/heph-go-plugin.json }
+  - path: .heph3/heph-go-plugin.json
+  - url: https://example.com/heph-go-plugin.json
 "#;
         let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(
@@ -1037,25 +1068,23 @@ plugins:
     }
 
     #[test]
-    fn plugin_rejects_multiple_identifier_keys() {
-        // The enum is single-key by construction: two keys is a deserialize error.
-        let err = serde_yaml::from_str::<ConfigYaml>(
-            "plugins:\n  - identifier: { builtin: go, path: /a }\n",
-        )
-        .expect_err("must reject");
-        assert!(!err.to_string().is_empty(), "{err}");
+    fn plugin_rejects_multiple_source_keys() {
+        // Exactly one of builtin/path/url: two sources is a deserialize error.
+        let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - builtin: go\n    path: /a\n")
+            .expect_err("must reject");
+        assert!(err.to_string().contains("exactly one"), "{err}");
     }
 
     #[test]
-    fn plugin_rejects_missing_identifier() {
+    fn plugin_rejects_missing_source() {
         let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - options: { x: 1 }\n")
             .expect_err("must reject");
-        assert!(err.to_string().contains("identifier"), "{err}");
+        assert!(err.to_string().contains("builtin/path/url"), "{err}");
     }
 
     #[test]
-    fn plugin_rejects_unknown_identifier_kind() {
-        let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - identifier: { bogus: x }\n")
+    fn plugin_rejects_unknown_field() {
+        let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - bogus: x\n")
             .expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
     }

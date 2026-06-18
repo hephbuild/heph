@@ -16,7 +16,7 @@ pub fn execute(args: &Args, _sink: LogSink, _global: &GlobalOptions) -> anyhow::
 
 async fn execute_async(args: Args) -> anyhow::Result<()> {
     if args.force {
-        bootstrap::clear_plugin_cache()?;
+        crate::engine::clear_plugin_cache()?;
     }
 
     // Building the engine resolves every `plugins:` entry end to end: built-ins

@@ -12,6 +12,8 @@ pub use config::DEFAULT_SPILL_THRESHOLD_BYTES;
 pub use config::MemCacheOptions;
 pub mod config_yaml;
 pub use config_yaml::{FuseConfig, FuseMode};
+mod plugin_load;
+pub use plugin_load::clear_plugin_cache;
 mod cwd;
 mod result;
 pub use cwd::get_cwd;

@@ -1,7 +1,9 @@
 //! The build/execution engine: provider/driver registries, the result + execute
 //! pipeline, local + remote caches, GC, request state, sandbox cleanup. The
-//! engine owns the registry and wires the always-on builtins; the bin registers
-//! the heavy/optional plugins.
+//! engine owns the registry, wires the always-on builtins, and resolves the
+//! `plugins:` config (applying built-ins + downloading/loading cdylib plugins —
+//! see `engine::plugin_load`); the bin registers the in-process plugin factories
+//! before handing the plugin list to the engine.
 #![cfg_attr(
     test,
     expect(

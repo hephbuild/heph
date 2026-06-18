@@ -109,10 +109,6 @@ hdriver-support = { package = "driver-support", path = "crates/driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
 hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
-# The go plugin is no longer compiled in; it ships as a separate cdylib loaded
-# via `dylib:`. The host needs the stable-ABI loader (`host` feature).
-hplugin-stabby = { package = "plugin-stabby", path = "crates/plugin-stabby", features = ["host"] }
-hplugin-abi = { package = "plugin-abi", path = "crates/plugin-abi", features = ["convert"] }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
 htui = { package = "tui", path = "crates/tui" }
 hlock = { package = "lock", path = "crates/lock" }
@@ -131,7 +127,6 @@ async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
 tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
-rayon = "1.12.0"
 xxhash-rust = { version = "0.8.15" , features = ["xxh3", "std"]}
 itertools = "0.14.0"
 tar = "0.4"
@@ -165,10 +160,6 @@ uuid = { version = "1.23.3", features = ["v4"] }
 object_store = { version = "0.13.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 url = "2.5.8"
 flate2 = "1.1.9"
-# Blocking HTTP client, used only to download `dylib: { url }` plugins. rustls-tls
-# avoids a system OpenSSL link; blocking runs on its own thread so it is safe to
-# call from inside the async runtime (see bootstrap::download_plugin).
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 
 [features]
 # FUSE sandbox is on by default. The FUSE machinery (and its `fuser`/libfuse
