@@ -248,23 +248,6 @@ fn lock_exclusive(path: &std::path::Path) -> anyhow::Result<FileLock> {
     Ok(FileLock { file })
 }
 
-/// Substitute `{os}`/`{arch}` in a plugin download URL with the values used in
-/// published artifact names: os `linux`/`darwin` and arch `amd64`/`arm64`
-/// (mapped from the rust `std::env::consts` spellings `macos` and
-/// `x86_64`/`aarch64`). Unmapped hosts fall back to the raw consts value.
-fn substitute_os_arch(url: &str) -> String {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    };
-    url.replace("{os}", os).replace("{arch}", arch)
-}
-
 /// The user-global plugin download cache: `~/.heph/plugins/<os>-<arch>/`. Plugins
 /// are workspace-independent, so they're cached once per user (not per repo).
 #[cfg(unix)]
@@ -296,15 +279,15 @@ pub fn clear_plugin_cache() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Download a plugin file from `url_tmpl` (after `{os}`/`{arch}` substitution),
-/// cache it under `~/.heph/plugins/<os>-<arch>/`, make it executable, and return
-/// its path. A previously-downloaded file is reused (no re-fetch).
+/// Download a plugin file from `url`, cache it under
+/// `~/.heph/plugins/<os>-<arch>/`, make it executable, and return its path. A
+/// previously-downloaded file is reused (no re-fetch). The URL is used verbatim —
+/// the manifest carries fully-qualified per-os/arch artifact URLs.
 #[cfg(unix)]
-fn download_plugin(url_tmpl: &str) -> anyhow::Result<std::path::PathBuf> {
+fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
-    let url = substitute_os_arch(url_tmpl);
     let filename = url
         .rsplit('/')
         .next()
@@ -328,7 +311,7 @@ fn download_plugin(url_tmpl: &str) -> anyhow::Result<std::path::PathBuf> {
     // reqwest::blocking spins up its own runtime; run it on a dedicated std
     // thread so it is safe to call from within the async runtime new_engine runs
     // on (a nested block_on would otherwise panic).
-    let url_for_thread = url.clone();
+    let url_for_thread = url.to_string();
     let bytes = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
         let resp = reqwest::blocking::get(&url_for_thread)
             .with_context(|| format!("GET {url_for_thread}"))?
@@ -356,16 +339,6 @@ fn download_plugin(url_tmpl: &str) -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn substitute_os_arch_replaces_placeholders() {
-        let out = super::substitute_os_arch("https://x/heph-{os}-{arch}.bin");
-        assert!(!out.contains("{os}") && !out.contains("{arch}"), "{out}");
-        // arch uses the published spelling (amd64/arm64), never the rust consts.
-        assert!(!out.contains("x86_64") && !out.contains("aarch64"), "{out}");
-        // os uses darwin, never the rust `macos` spelling.
-        assert!(!out.contains("macos"), "{out}");
-    }
-
     #[cfg(unix)]
     #[test]
     fn expand_tilde_expands_home_prefix_only() {

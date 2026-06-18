@@ -169,12 +169,13 @@ jobs:
         env:
           CARGO_TARGET_DIR: "./target"
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
-          # Go plugin cdylib. Named with a uniform `.dylib` suffix on every OS
-          # (libloading opens by path, ext-agnostic) so a single `dylib: { url:
-          # ".../heph-go-plugin_{os}_{arch}.dylib" }` template resolves everywhere.
-          PLUGIN_GO_NAME: "heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.dylib"
           HEPH_BUILD_VERSION: "${{needs.gen.outputs.version}}"
         run: |
+          # Go plugin cdylib carries its native extension (.so on Linux, .dylib on
+          # macOS); the distribution manifest records each artifact's URL
+          # explicitly, so no uniform suffix is needed.
+          if [ "${{ matrix.os }}" = "darwin" ]; then ext=dylib; else ext=so; fi
+          PLUGIN_GO_NAME="heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
           OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
@@ -250,7 +251,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           # Matches the CLI (`heph_<os>_<arch>`) and the go plugin cdylib
-          # (`heph-go-plugin_<os>_<arch>.dylib`); excludes the `repo` source artifact.
+          # (`heph-go-plugin_<os>_<arch>.{so,dylib}`); excludes the `repo` source artifact.
           pattern: "heph*"
           path: dist
           merge-multiple: true

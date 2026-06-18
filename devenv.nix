@@ -109,22 +109,25 @@ in
   # Install the go plugin (cdylib + manifest) into the user-global ~/.heph dir, so
   # an installed `heph3` can load it from any workspace via
   # `plugins: - { identifier: { path: ~/.heph/plugins/go/heph-go-plugin.json } }`.
-  # Always a release build — it's a runtime artifact. The manifest (one host
-  # artifact, path = the sibling dylib) is emitted by tools/pluginmanifest.
+  # Always a release build — it's a runtime artifact. The cdylib keeps its native
+  # extension (.so on Linux, .dylib on macOS); the manifest (one host artifact,
+  # path = the sibling cdylib) is emitted by tools/pluginmanifest.
   scripts.install-go-plugin.exec = ''
     cargo build --release -p plugin-go-cdylib
     if [ "$(uname -s)" = "Darwin" ]; then
       lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.dylib"
+      name="heph-go-plugin.dylib"
       bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
     else
       lib="$CARGO_TARGET_DIR/release/libplugin_go_cdylib.so"
+      name="heph-go-plugin.so"
     fi
     dest="$HOME/.heph/plugins/go"
     mkdir -p "$dest"
-    cp "$lib" "$dest/heph-go-plugin.dylib.new"
-    mv -f "$dest/heph-go-plugin.dylib.new" "$dest/heph-go-plugin.dylib"
+    cp "$lib" "$dest/$name.new"
+    mv -f "$dest/$name.new" "$dest/$name"
     ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
-        && go run . -name go -host-path heph-go-plugin.dylib -out "$dest/heph-go-plugin.json" )
+        && go run . -name go -host-path "$name" -out "$dest/heph-go-plugin.json" )
     echo "installed go plugin -> $dest"
   '';
 

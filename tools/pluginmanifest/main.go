@@ -44,7 +44,7 @@ func main() {
 	version := flag.String("version", "dev", "plugin version")
 	out := flag.String("out", "", "output file (default stdout)")
 	hostPath := flag.String("host-path", "", "single-artifact mode: local dylib path for the build host")
-	fromDir := flag.String("from-dir", "", "scan mode: dir of <prefix>_<os>_<arch>.dylib artifacts")
+	fromDir := flag.String("from-dir", "", "scan mode: dir of <prefix>_<os>_<arch>.{so,dylib} artifacts")
 	prefix := flag.String("prefix", "", "scan mode: artifact filename prefix (e.g. heph-go-plugin)")
 	urlBase := flag.String("url-base", "", "scan mode: URL base each artifact is published under")
 	flag.Parse()
@@ -63,7 +63,7 @@ func main() {
 		}
 		arts = scan(*fromDir, *prefix, *urlBase)
 		if len(arts) == 0 {
-			fatal("no %s_<os>_<arch>.dylib artifacts found in %s", *prefix, *fromDir)
+			fatal("no %s_<os>_<arch>.{so,dylib} artifacts found in %s", *prefix, *fromDir)
 		}
 	default:
 		fatal("need -host-path or -from-dir")
@@ -89,14 +89,10 @@ func main() {
 	}
 }
 
-// scan finds `<prefix>_<os>_<arch>.dylib` files in dir and maps each to a URL
-// under base. Sorted for a deterministic manifest.
-//
-// The `.dylib` suffix is a *uniform naming convention*, not OS-specific: CI
-// publishes every cdylib — including the Linux `.so` — under a `.dylib` name
-// (see .github/workflows/heph.yml) so one URL template resolves on every host.
-// libloading opens by path and is extension-agnostic, so the real file format
-// underneath is irrelevant. Hence matching only `.dylib` here is correct.
+// scan finds `<prefix>_<os>_<arch>.{so,dylib}` files in dir and maps each to a
+// URL under base. Sorted for a deterministic manifest. Each artifact keeps its
+// native cdylib extension (Linux `.so` / macOS `.dylib`); the manifest records
+// each one's URL explicitly, so the host resolver never has to guess the suffix.
 func scan(dir, prefix, base string) []artifact {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -111,8 +107,14 @@ func scan(dir, prefix, base string) []artifact {
 		if !ok {
 			continue
 		}
-		mid, ok = strings.CutSuffix(mid, ".dylib")
-		if !ok {
+		// Native cdylib extension per OS: `.so` (Linux) / `.dylib` (macOS).
+		var found bool
+		for _, ext := range []string{".so", ".dylib"} {
+			if mid, found = strings.CutSuffix(mid, ext); found {
+				break
+			}
+		}
+		if !found {
 			continue
 		}
 		goos, arch, ok := strings.Cut(mid, "_")
