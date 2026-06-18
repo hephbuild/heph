@@ -228,6 +228,22 @@ jobs:
           prerelease: true
           files: dist/*
 
+  abi:
+    name: ABI guard
+    # PR-only: it diffs the branch against the PR base. Pure git + bash, so it
+    # skips the devenv toolchain and runs in seconds.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Full history so merge-base with the PR base resolves.
+          fetch-depth: 0
+      - name: Check plugin ABI version
+        run: scripts/abi-check.sh "origin/${{ github.base_ref }}"
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
