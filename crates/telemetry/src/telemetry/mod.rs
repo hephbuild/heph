@@ -3,9 +3,9 @@
 //! Reports coarse usage shape to PostHog (EU region) to guide development.
 //! Every event is *personless* (`$process_person_profile: false` — no person
 //! profile is ever created) and carries only os (`$os`/`$os_version`, stamped by
-//! posthog-rs), arch, and version plus aggregate run
-//! counters — never target addresses, labels, filesystem paths, or any user
-//! identifier. The `distinct_id` is a random per-install UUID stored in the
+//! posthog-rs), arch, version, an anonymous repo fingerprint (a one-way hash of
+//! the git root commit — see [`repo`]), plus aggregate run counters — never
+//! target addresses, labels, filesystem paths, or any user identifier. The `distinct_id` is a random per-install UUID stored in the
 //! machine's config dir (or the constant `"ci"` on CI runners, where ephemeral
 //! machines would otherwise mint a fake install per job); it identifies an
 //! installation, not a person.
@@ -25,6 +25,7 @@
 //! and never affects the command's exit.
 
 mod collector;
+mod repo;
 mod spool;
 
 pub use collector::{TelemetryCollector, TelemetrySnapshot};
@@ -317,9 +318,12 @@ struct ReportContext<'a> {
 fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     let stats = COLLECTOR.snapshot();
     let plugins = PLUGINS.get().cloned().unwrap_or_default();
-    let props = build_props(&ctx, &stats, plugins);
 
     let dir = config_dir()?;
+    // Best-effort, cached repo fingerprint; absent when it can't be determined.
+    let fingerprint = repo::repo_fingerprint(&dir);
+    let props = build_props(&ctx, &stats, plugins, fingerprint.as_deref());
+
     let event = SpooledEvent {
         uuid: uuid::Uuid::new_v4().to_string(),
         distinct_id: distinct_id(&dir)?,
@@ -336,6 +340,7 @@ fn build_props(
     ctx: &ReportContext<'_>,
     stats: &TelemetrySnapshot,
     plugins: Plugins,
+    repo_fingerprint: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut props = serde_json::Map::new();
     let mut put = |k: &str, v: serde_json::Value| drop(props.insert(k.to_string(), v));
@@ -363,6 +368,12 @@ fn build_props(
         }
     }
     put("ci", is_ci().into());
+    // Stable per-repo id (SHA-256 of the root commit), grouping events by project
+    // without identifying it. Absent when not in a git repo / git is unavailable
+    // / a shallow clone can't reach the root.
+    if let Some(fp) = repo_fingerprint {
+        put("repo_fingerprint", fp.into());
+    }
     // Command + selector shape + the set of flags used (names only).
     put("command", ctx.command.into());
     put("request_shape", ctx.request_shape.into());
@@ -554,7 +565,7 @@ mod tests {
             failure: None,
             duration_ms: 1,
         };
-        let props = build_props(&ctx, &snapshot, Plugins::default());
+        let props = build_props(&ctx, &snapshot, Plugins::default(), Some("deadbeef"));
 
         // posthog-rs stamps `$os` / `$os_version` itself, so build_props must
         // not carry an `os` of its own (nor the `$`-prefixed keys).
@@ -566,6 +577,14 @@ mod tests {
             props.get("arch").and_then(|v| v.as_str()),
             Some(std::env::consts::ARCH)
         );
+        // The repo fingerprint is carried through when present.
+        assert_eq!(
+            props.get("repo_fingerprint").and_then(|v| v.as_str()),
+            Some("deadbeef")
+        );
+        // ...and omitted entirely when it can't be determined.
+        let absent = build_props(&ctx, &snapshot, Plugins::default(), None);
+        assert!(!absent.contains_key("repo_fingerprint"));
     }
 
     #[test]
