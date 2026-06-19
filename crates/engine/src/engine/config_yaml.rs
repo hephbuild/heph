@@ -342,14 +342,24 @@ pub enum LockBackendConfig {
 ///     options: { patterns: [BUILD] }
 ///   - path: .heph3/heph-go-plugin.json
 ///   - url: https://…/heph-go-plugin.json
+///     checksum: sha256:9f86d0…
 /// ```
 ///
 /// The source collapses to an internal [`PluginIdentifier`]; `identifier` is not
 /// a YAML key.
+///
+/// `checksum` pins the *manifest* fetched from a `url:` source (format
+/// `sha256:<hex>`). It is only meaningful for remote manifests, so it is rejected
+/// alongside `builtin:`/`path:`. Per-host artifact (cdylib) integrity is pinned
+/// separately by the manifest itself (`artifacts[].checksum`), giving a full
+/// trust chain: config pins the manifest, the manifest pins each artifact.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginSpec {
     pub identifier: PluginIdentifier,
     pub options: Options,
+    /// Expected checksum of the downloaded manifest (`sha256:<hex>`), for `url:`
+    /// sources only. `None` skips manifest verification.
+    pub checksum: Option<String>,
 }
 
 // Hand-rolled so the source kind (builtin/path/url) sits at the top of the entry
@@ -364,6 +374,13 @@ impl<'de> Deserialize<'de> for PluginSpec {
             Some(v) => serde_yaml::from_value(v)
                 .map_err(|e| D::Error::custom(format!("plugin `options`: {e}")))?,
             None => Options::default(),
+        };
+
+        let checksum = match map.remove("checksum") {
+            Some(v) => Some(serde_yaml::from_value::<String>(v).map_err(|e| {
+                D::Error::custom(format!("plugin `checksum` must be a string: {e}"))
+            })?),
+            None => None,
         };
 
         let mut source: Option<PluginIdentifier> = None;
@@ -381,7 +398,7 @@ impl<'de> Deserialize<'de> for PluginSpec {
                 }
                 other => {
                     return Err(D::Error::custom(format!(
-                        "unknown plugin field `{other}` (expected builtin/path/url/options)"
+                        "unknown plugin field `{other}` (expected builtin/path/url/options/checksum)"
                     )));
                 }
             };
@@ -394,9 +411,16 @@ impl<'de> Deserialize<'de> for PluginSpec {
 
         let identifier = source
             .ok_or_else(|| D::Error::custom("plugin entry must set one of builtin/path/url"))?;
+        // `checksum` pins a downloaded manifest, so it only applies to `url:`.
+        if checksum.is_some() && !matches!(identifier, PluginIdentifier::Url(_)) {
+            return Err(D::Error::custom(
+                "plugin `checksum` is only valid with a `url:` source",
+            ));
+        }
         Ok(PluginSpec {
             identifier,
             options,
+            checksum,
         })
     }
 }
@@ -1064,6 +1088,33 @@ plugins:
         assert_eq!(
             cfg.plugins[2].identifier,
             PluginIdentifier::Url("https://example.com/heph-go-plugin.json".into())
+        );
+    }
+
+    #[test]
+    fn plugin_parses_url_checksum() {
+        let yaml = "plugins:\n  - url: https://e/x.json\n    checksum: sha256:abc123\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.plugins[0].checksum.as_deref(), Some("sha256:abc123"));
+    }
+
+    #[test]
+    fn plugin_checksum_defaults_none() {
+        let yaml = "plugins:\n  - url: https://e/x.json\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        assert!(cfg.plugins[0].checksum.is_none());
+    }
+
+    #[test]
+    fn plugin_rejects_checksum_without_url() {
+        // checksum pins a downloaded manifest, so it is only valid with `url:`.
+        let err = serde_yaml::from_str::<ConfigYaml>(
+            "plugins:\n  - path: ./x.json\n    checksum: sha256:abc\n",
+        )
+        .expect_err("must reject");
+        assert!(
+            err.to_string().contains("only valid with a `url:`"),
+            "{err}"
         );
     }
 

@@ -9,6 +9,15 @@ use anyhow::Context;
 use super::Engine;
 use super::config_yaml;
 
+/// One resolved `path:`/`url:` plugin entry awaiting dylib load: its source, the
+/// optional manifest checksum (`url:` only), and the structured options for the
+/// cdylib's create entry.
+struct ManifestPlugin {
+    identifier: config_yaml::PluginIdentifier,
+    checksum: Option<String>,
+    options: std::collections::HashMap<String, hplugin_abi::pb::Value>,
+}
+
 impl Engine {
     /// Apply every `plugins:` entry. `builtin:` entries instantiate the matching
     /// in-process factory (registered before this call); `path:`/`url:` entries
@@ -16,10 +25,7 @@ impl Engine {
     /// host, and register the provider + drivers it exports (the plugin
     /// self-describes its names via `config()`).
     pub fn register_plugins(&mut self, plugins: &[config_yaml::PluginSpec]) -> anyhow::Result<()> {
-        let mut manifests: Vec<(
-            config_yaml::PluginIdentifier,
-            std::collections::HashMap<String, hplugin_abi::pb::Value>,
-        )> = Vec::new();
+        let mut manifests: Vec<ManifestPlugin> = Vec::new();
         for spec in plugins {
             match &spec.identifier {
                 config_yaml::PluginIdentifier::Builtin(name) => self
@@ -27,10 +33,11 @@ impl Engine {
                     .with_context(|| format!("apply builtin plugin `{name}`"))?,
                 // Manifest plugin: carry the options as structured pb map data for
                 // the cdylib's create entry (pb::CreateConfig), resolve + load below.
-                _ => manifests.push((
-                    spec.identifier.clone(),
-                    hplugin_abi::convert::options_to_pb_map(&spec.options),
-                )),
+                _ => manifests.push(ManifestPlugin {
+                    identifier: spec.identifier.clone(),
+                    checksum: spec.checksum.clone(),
+                    options: hplugin_abi::convert::options_to_pb_map(&spec.options),
+                }),
             }
         }
         let root = self.cfg.root.clone();
@@ -58,6 +65,11 @@ struct ManifestArtifact {
     path: Option<String>,
     #[serde(default)]
     url: Option<String>,
+    /// Expected checksum of the resolved artifact (`sha256:<hex>`). When set, the
+    /// loaded dylib bytes are verified against it before use. `None` skips the
+    /// check. Applies to both `path:` and `url:` artifacts.
+    #[serde(default)]
+    checksum: Option<String>,
 }
 
 /// Resolve each manifest to a host dylib, load it (parallel — loading constructs
@@ -67,10 +79,7 @@ fn load_dylib_plugins(
     e: &mut Engine,
     root: &std::path::Path,
     home_dir: &std::path::Path,
-    manifests: Vec<(
-        config_yaml::PluginIdentifier,
-        std::collections::HashMap<String, hplugin_abi::pb::Value>,
-    )>,
+    manifests: Vec<ManifestPlugin>,
 ) -> anyhow::Result<()> {
     use rayon::prelude::*;
 
@@ -81,9 +90,9 @@ fn load_dylib_plugins(
     let home_str = home_dir.to_string_lossy().into_owned();
     let loaded = manifests
         .into_par_iter()
-        .map(|(src, options)| -> anyhow::Result<_> {
-            let dylib = resolve_manifest_dylib(&src, root)?;
-            hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, options)
+        .map(|m| -> anyhow::Result<_> {
+            let dylib = resolve_manifest_dylib(&m.identifier, m.checksum.as_deref(), root)?;
+            hplugin_stabby::load_stable::load(&dylib, &root_str, &home_str, m.options)
                 .with_context(|| format!("load plugin dylib {}", dylib.display()))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -105,7 +114,7 @@ fn load_dylib_plugins(
     _e: &mut Engine,
     _root: &std::path::Path,
     _home_dir: &std::path::Path,
-    manifests: Vec<(config_yaml::PluginIdentifier, Vec<u8>)>,
+    manifests: Vec<ManifestPlugin>,
 ) -> anyhow::Result<()> {
     if manifests.is_empty() {
         Ok(())
@@ -145,6 +154,7 @@ fn resolve_path(p: &str, base: &std::path::Path) -> std::path::PathBuf {
 #[cfg(unix)]
 fn resolve_manifest_dylib(
     src: &config_yaml::PluginIdentifier,
+    manifest_checksum: Option<&str>,
     root: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     let (manifest_bytes, manifest_dir) = match src {
@@ -174,6 +184,12 @@ fn resolve_manifest_dylib(
         }
     };
 
+    // Verify the manifest against the config-pinned checksum before trusting any
+    // artifact URL/checksum it declares — the manifest is the root of the chain.
+    if let Some(expected) = manifest_checksum {
+        verify_checksum(&manifest_bytes, expected).context("verify plugin manifest checksum")?;
+    }
+
     let manifest: PluginManifest =
         serde_json::from_slice(&manifest_bytes).context("parse plugin manifest json")?;
     let (os, arch) = host_os_arch();
@@ -187,14 +203,53 @@ fn resolve_manifest_dylib(
                 manifest.name
             )
         })?;
-    match (&art.path, &art.url) {
-        (Some(p), None) => Ok(resolve_path(p, &manifest_dir)),
-        (None, Some(u)) => download_plugin(u),
+    let dylib = match (&art.path, &art.url) {
+        (Some(p), None) => resolve_path(p, &manifest_dir),
+        (None, Some(u)) => download_plugin(u)?,
         _ => anyhow::bail!(
             "plugin `{}` artifact for {os}/{arch} must set exactly one of `path`/`url`",
             manifest.name
         ),
+    };
+
+    // Verify the resolved dylib (downloaded or local) against the manifest's
+    // per-artifact checksum, if one is declared.
+    if let Some(expected) = art.checksum.as_deref() {
+        let bytes = std::fs::read(&dylib)
+            .with_context(|| format!("read plugin artifact {} for checksum", dylib.display()))?;
+        verify_checksum(&bytes, expected).with_context(|| {
+            format!(
+                "verify checksum of plugin `{}` artifact {}",
+                manifest.name,
+                dylib.display()
+            )
+        })?;
     }
+    Ok(dylib)
+}
+
+/// Verify `bytes` against an `algo:hex` checksum spec (currently only
+/// `sha256:<hex>`). Errors on an unknown/malformed spec or a digest mismatch.
+#[cfg(unix)]
+fn verify_checksum(bytes: &[u8], expected: &str) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let (algo, want_hex) = expected
+        .split_once(':')
+        .with_context(|| format!("checksum must be `algo:hex`, got {expected:?}"))?;
+    if !algo.eq_ignore_ascii_case("sha256") {
+        anyhow::bail!("unsupported checksum algorithm {algo:?} (only sha256)");
+    }
+    let want = hex::decode(want_hex)
+        .with_context(|| format!("checksum hex is not valid hex: {want_hex:?}"))?;
+    let got = Sha256::digest(bytes);
+    if got.as_slice() != want.as_slice() {
+        anyhow::bail!(
+            "checksum mismatch: expected sha256:{want_hex}, got sha256:{}",
+            hex::encode(got)
+        );
+    }
+    Ok(())
 }
 
 /// Host os/arch in the published-artifact spelling (`darwin`/`linux`,
@@ -366,6 +421,46 @@ mod tests {
             a,
             cache_entry_name("https://h/v1.2.3/heph-go-plugin_linux_amd64.so")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_checksum_accepts_matching_sha256() {
+        use super::verify_checksum;
+        use sha2::Digest;
+        let bytes = b"test";
+        let hex = hex::encode(sha2::Sha256::digest(bytes));
+        verify_checksum(bytes, &format!("sha256:{hex}")).expect("match");
+        // case-insensitive algo tolerated.
+        verify_checksum(bytes, &format!("SHA256:{hex}")).expect("match ci");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_checksum_rejects_mismatch() {
+        use super::verify_checksum;
+        let err = verify_checksum(b"test", "sha256:00").expect_err("mismatch");
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_checksum_rejects_unknown_algo() {
+        use super::verify_checksum;
+        let err = verify_checksum(b"x", "md5:abc").expect_err("bad algo");
+        assert!(err.to_string().contains("unsupported"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_checksum_rejects_malformed_spec() {
+        use super::verify_checksum;
+        // No `algo:hex` separator.
+        let err = verify_checksum(b"x", "deadbeef").expect_err("no colon");
+        assert!(err.to_string().contains("algo:hex"), "{err}");
+        // Non-hex digest.
+        let err = verify_checksum(b"x", "sha256:zz").expect_err("bad hex");
+        assert!(err.to_string().contains("hex"), "{err}");
     }
 
     #[cfg(unix)]
