@@ -41,7 +41,7 @@ runs:
     # intermittently fails to fetch/realize a rust-overlay patch, forcing reruns.
     # Keyed on the devenv lock so a toolchain bump busts the cache.
     - name: Cache Nix store
-      uses: nix-community/cache-nix-action@v6
+      uses: nix-community/cache-nix-action@v7
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
