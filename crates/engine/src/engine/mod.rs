@@ -8,18 +8,21 @@ pub use engine::EngineFuse;
 pub use engine::PluginInit;
 pub mod config;
 pub use config::Config;
+pub use config::ConfigYamlExt;
 pub use config::DEFAULT_SPILL_THRESHOLD_BYTES;
 pub use config::MemCacheOptions;
-pub mod config_yaml;
-pub use config_yaml::{FuseConfig, FuseMode};
+// The YAML config shape + loader + workspace-root discovery now live in the
+// engine-free `config` crate (so layers that run before the engine — e.g. the
+// self-upgrade check — can read it). Re-export under the original paths so
+// `crate::engine::config_yaml::…`, `engine::get_root`, `engine::get_cwd` resolve
+// unchanged across the monolith.
+pub use hconfig as config_yaml;
+pub use hconfig::{FuseConfig, FuseMode, get_cwd, get_root};
 mod plugin_load;
 pub use plugin_load::clear_plugin_cache;
 mod cwd;
 mod result;
-pub use cwd::get_cwd;
 pub use cwd::get_cwp;
-mod root;
-pub use root::get_root;
 // The plugin contract (driver/provider/error + targetdef/eresult/htspec) now
 // lives in the `heph-plugin` crate; re-export at the original engine paths so
 // `crate::engine::driver::…` etc. resolve unchanged across engine + plugins.

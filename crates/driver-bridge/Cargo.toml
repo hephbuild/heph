@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 hcore = { package = "core", path = "../core" }
+hconfig = { package = "config", path = "../config" }
 hplugin = { package = "plugin", path = "../plugin" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 # The FUSE machinery (and its `fuser`/libfuse link) lives behind this crate so

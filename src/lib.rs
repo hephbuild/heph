@@ -35,6 +35,7 @@ pub use hplugin_query::pluginquery;
 pub use hproc::process_watcher;
 pub use hproc::{proc_exec, process_supervisor};
 pub use hsandboxfuse as sandboxfuse;
+pub use hselfupdate as selfupdate;
 pub use htelemetry::telemetry;
 pub use htui::tui;
 pub use hwalk as htwalk;

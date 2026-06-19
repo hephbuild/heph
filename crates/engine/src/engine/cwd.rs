@@ -1,28 +1,17 @@
-use crate::engine::get_root;
 use anyhow::anyhow;
+use hconfig::{get_cwd, get_root};
 use hmodel::htpkg::PkgBuf;
 use memoize::memoize;
-use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-pub fn get_cwd() -> anyhow::Result<PathBuf> {
-    get_cwd_inner().map_err(|e| anyhow!(e))
-}
-
-#[memoize]
-pub fn get_cwd_inner() -> Result<PathBuf, String> {
-    match env::var_os("HEPH_CWD") {
-        Some(v) => Ok(Path::new(&v).to_path_buf()),
-        None => Ok(env::current_dir().map_err(|e| e.to_string())?),
-    }
-}
-
+/// Current working *package*: the cwd expressed relative to the workspace root.
+/// Empty when cwd is the root itself or lies outside it.
 pub fn get_cwp() -> anyhow::Result<PkgBuf> {
     get_cwp_inner().map_err(|e| anyhow!(e))
 }
 
 #[memoize]
-pub fn get_cwp_inner() -> Result<PkgBuf, String> {
+fn get_cwp_inner() -> Result<PkgBuf, String> {
     let cwd = get_cwd().map_err(|e| e.to_string())?;
     let root = get_root().map_err(|e| e.to_string())?;
 

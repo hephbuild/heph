@@ -5,6 +5,7 @@ use anyhow::Context;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
+use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
 use crate::{engine, pluginbuildfile, pluginexec, pluginhostbin, pluginnix, plugintextfile};
 

@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 hcore = { package = "core", path = "../core" }
+hconfig = { package = "config", path = "../config" }
 hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }
 hproc = { package = "proc", path = "../proc" }

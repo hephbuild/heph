@@ -57,21 +57,46 @@ fn main() -> ExitCode {
     let sink = log::init();
     heph::tui::panic::install(sink.clone());
 
+    // Self-upgrade BEFORE matching the command. A workspace can pin a newer heph
+    // that defines subcommands this binary doesn't, and `get_matches()` below
+    // hard-exits on an "unrecognized subcommand" — so if the upgrade ran after
+    // matching, `heph <newcmd>` would die before the upgrade that adds <newcmd>
+    // ever fired. Do a *soft* parse first (tolerates an unknown command), upgrade
+    // (a successful upgrade re-execs into the pin and never returns), then do the
+    // real parse below in whichever binary ends up running. The upgrade also runs
+    // *before* the supervisor fork so a re-exec can't orphan a sidecar.
+    //
+    // A missing-workspace (`NoConfig`) result is fatal only when this binary
+    // positively recognizes a real, non-`version` command: `version` must work
+    // outside a workspace, and an unrecognized command (the forward-compat case)
+    // falls through so the real parse can emit clap's canonical diagnostic.
+    let soft_match = Cli::command().try_get_matches();
+    match heph::selfupdate::maybe_self_upgrade() {
+        Ok(()) => {}
+        Err(heph::selfupdate::SelfUpgradeError::NoConfig) if no_config_tolerable(&soft_match) => {}
+        Err(e) => {
+            error!(error = %format!("{e:#}"), "Self-upgrade failed");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Real parse — by here we've either re-exec'd into the pinned version (never
+    // returns) or stayed on this binary. Hard-exits with clap's canonical
+    // diagnostic on a genuinely unknown command or bad flags. Keeping the matches
+    // also lets the telemetry reporter enumerate the exact args/flags set —
+    // generically, for every command, with no per-command list.
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+
     // Fork the supervisor sidecar that will SIGKILL every tracked child
     // process group when this binary exits — including hard-kill scenarios.
     if let Err(e) = heph::process_supervisor::init() {
         error!(error = %format!("{e:#}"), "Failed to start process supervisor");
         return ExitCode::FAILURE;
     }
-
-    // Parse once into `ArgMatches`, then into the typed `Cli`. Keeping the
-    // matches lets the telemetry reporter enumerate the exact args/flags that
-    // were set — generically, for every command, with no per-command list.
-    let matches = Cli::command().get_matches();
-    let cli = match Cli::from_arg_matches(&matches) {
-        Ok(cli) => cli,
-        Err(e) => e.exit(),
-    };
 
     // Telemetry decision is taken up front (config read), but the flush happens
     // at exit: this run's event is spooled, then we try to send it (plus any
@@ -188,4 +213,49 @@ fn parse_supervisor_args() -> Option<i32> {
         return None;
     }
     args.next()?.parse::<i32>().ok()
+}
+
+/// Whether a `NoConfig` (not-in-a-workspace) self-upgrade result may be tolerated
+/// for this invocation, decided from a soft pre-parse of the CLI args.
+///
+/// Tolerated unless the args name a real, workspace-requiring command. `version`
+/// runs anywhere, and an *unrecognized* command (the `Err` case — a workspace pin
+/// may add it) falls through to the real parse, which surfaces clap's canonical
+/// error. A recognized non-`version` command legitimately needs a workspace, so
+/// its `NoConfig` stays fatal.
+fn no_config_tolerable(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
+    match soft_match {
+        Ok(m) => m.subcommand_name() == Some("version"),
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn soft(args: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
+        Cli::command().try_get_matches_from(args)
+    }
+
+    #[test]
+    fn version_tolerates_missing_workspace() {
+        // `heph version` must keep working outside a workspace.
+        assert!(no_config_tolerable(&soft(&["heph", "version"])));
+    }
+
+    #[test]
+    fn unknown_command_tolerates_missing_workspace() {
+        // Forward-compat: a workspace pin may add this command. Upgrading is the
+        // whole point, so a NoConfig here must not be fatal — the real parse
+        // afterward surfaces clap's "unrecognized subcommand" diagnostic.
+        assert!(no_config_tolerable(&soft(&["heph", "totally-new-cmd"])));
+    }
+
+    #[test]
+    fn real_command_requires_workspace() {
+        // A recognized, non-`version` command run outside a workspace is a genuine
+        // error — keep NoConfig fatal so it isn't silently tolerated.
+        assert!(!no_config_tolerable(&soft(&["heph", "validate"])));
+    }
 }
