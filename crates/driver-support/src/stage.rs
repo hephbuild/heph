@@ -70,8 +70,11 @@ pub async fn stage_and_link(
         // predicate is built and consumed entirely before the first await, so
         // it never crosses a suspension point.
         let pred = |rel: &Path| filters.iter().any(|f| Path::new(f) == rel);
-        let predicate: Option<&dyn Fn(&Path) -> bool> =
-            if filters.is_empty() { None } else { Some(&pred) };
+        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
+            None
+        } else {
+            Some(&pred)
+        };
         return unpack::unpack(content, link_root, list_path, predicate)
             .with_context(|| format!("unshared unpack into {:?} (no content hash)", link_root));
     }
@@ -180,8 +183,7 @@ fn link_tree(
         link_one(ent.path(), &dst, ent.file_type().is_symlink())
             .with_context(|| format!("link {:?} -> {:?}", dst, ent.path()))?;
         if let Some(list) = list.as_mut() {
-            writeln!(list, "{}", dst.display())
-                .with_context(|| "append to stage list file")?;
+            writeln!(list, "{}", dst.display()).with_context(|| "append to stage list file")?;
         }
     }
     Ok(())
@@ -203,8 +205,7 @@ fn link_one(staged: &Path, dst: &Path, is_symlink: bool) -> anyhow::Result<()> {
     match attempt() {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(dst)
-                .with_context(|| format!("remove stale link {:?}", dst))?;
+            std::fs::remove_file(dst).with_context(|| format!("remove stale link {:?}", dst))?;
             attempt().with_context(|| format!("relink {:?} -> {:?}", dst, staged))
         }
         Err(e) => Err(e).with_context(|| format!("link {:?} -> {:?}", dst, staged)),
@@ -413,7 +414,11 @@ mod tests {
             let p = link.join("pkg/lib.txt");
             let md = std::fs::symlink_metadata(&p).expect("lstat link");
             assert!(md.file_type().is_file(), "{:?} must be a regular file", p);
-            assert!(!md.file_type().is_symlink(), "{:?} must not be a symlink", p);
+            assert!(
+                !md.file_type().is_symlink(),
+                "{:?} must not be a symlink",
+                p
+            );
             assert_eq!(md.ino(), ino1, "{:?} must hardlink the staged inode", p);
             assert_eq!(std::fs::read_to_string(&p).expect("read"), "hello");
         }
@@ -519,8 +524,14 @@ mod tests {
 
         let l = link.join("link.txt");
         let md = std::fs::symlink_metadata(&l).expect("lstat");
-        assert!(md.file_type().is_symlink(), "staged symlink must stay a symlink");
-        assert_eq!(std::fs::read_link(&l).expect("readlink"), Path::new("target.txt"));
+        assert!(
+            md.file_type().is_symlink(),
+            "staged symlink must stay a symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(&l).expect("readlink"),
+            Path::new("target.txt")
+        );
         assert_eq!(std::fs::read_to_string(&l).expect("read"), "hi");
     }
 
