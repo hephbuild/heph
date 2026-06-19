@@ -228,7 +228,7 @@ mod imp {
         }
 
         let url = download_url(tag, os, arch);
-        tracing::info!(%url, dest = %dest.display(), "downloading heph {tag}");
+        tracing::info!("downloading heph {tag}");
         let bytes = download(&url)?;
         install_atomic(&dir, &dest, &bytes)?;
         Ok(dest)
