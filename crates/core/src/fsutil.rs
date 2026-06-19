@@ -15,7 +15,7 @@ use std::path::Path;
 pub fn remove_dir_all(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir) {
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            make_dirs_read_write(dir);
+            make_readwrite_tree(dir);
             fs::remove_dir_all(dir)
         }
         other => other,
@@ -31,7 +31,7 @@ pub fn remove_dir_all(dir: &Path) -> io::Result<()> {
 /// the tree can be deleted. Kept side by side so the two halves of the
 /// read-only lifecycle stay in sync.
 #[cfg(unix)]
-pub fn make_dirs_read_write(dir: &Path) {
+pub fn make_readwrite_tree(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
     fn walk(path: &Path) {
@@ -55,7 +55,7 @@ pub fn make_dirs_read_write(dir: &Path) {
 }
 
 #[cfg(not(unix))]
-pub fn make_dirs_read_write(_dir: &Path) {}
+pub fn make_readwrite_tree(_dir: &Path) {}
 
 /// Recursively strip write bits from every file and directory under `root`
 /// (dirs become `0o555`, files keep their mode minus `0o222`), publishing a
@@ -64,7 +64,7 @@ pub fn make_dirs_read_write(_dir: &Path) {}
 /// permission needed to descend is never lost. Symlinks are left untouched
 /// (`set_permissions` would follow them; the target's own mode governs).
 ///
-/// Inverse of [`make_dirs_read_write`]; the two live together so a change to
+/// Inverse of [`make_readwrite_tree`]; the two live together so a change to
 /// one prompts a matching change to the other.
 #[cfg(unix)]
 pub fn make_readonly_tree(root: &Path) -> io::Result<()> {

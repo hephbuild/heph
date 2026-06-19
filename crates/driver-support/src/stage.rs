@@ -121,7 +121,7 @@ fn materialize(content: &dyn Content, entry: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("unpack into stage entry {:?}", entry))?;
     // Publish read-only (Go-module-cache style) so no consumer can corrupt the
     // shared copy. `make_readonly_tree` lives next to its inverse
-    // `make_dirs_read_write` (used by GC teardown) in `hcore::fsutil`.
+    // `make_readwrite_tree` (used by GC teardown) in `hcore::fsutil`.
     hcore::fsutil::make_readonly_tree(entry)
         .with_context(|| format!("mark stage entry read-only {:?}", entry))?;
     Ok(())
