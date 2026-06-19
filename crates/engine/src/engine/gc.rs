@@ -44,6 +44,9 @@ pub struct GcStats {
     /// Rows pruned from the shared filesystem-walk cache (stale past the TTL or
     /// orphaned because their path no longer exists).
     pub fswalk_rows_removed: usize,
+    /// Staged read-only input entries (`<home>/stage/`) reclaimed because their
+    /// content hash is no longer referenced by any surviving manifest.
+    pub stage_entries_removed: usize,
 }
 
 /// Per-target result of a GC pass, accumulated into [`GcStats`].
@@ -85,6 +88,14 @@ impl Engine {
             .delete(addr, hashin, MANIFEST_V1)
             .with_context(|| format!("delete manifest for {addr} {hashin}"))?;
         Ok(bytes)
+    }
+
+    /// Clear all staged read-only inputs under `<home>/stage/`. Delegates to
+    /// [`hdriver_support::stage::clear_stage`] — the staging mechanism and its
+    /// teardown live together in `driver-support`. Returns
+    /// `(entries_removed, bytes_freed)`.
+    fn gc_stage(&self) -> (usize, u64) {
+        hdriver_support::stage::clear_stage(&self.home.join("stage"))
     }
 
     /// Trim `addr`'s revisions to the `keep` newest (by `created_at_nanos`),
@@ -239,6 +250,14 @@ impl Engine {
             Ok(n) => stats.fswalk_rows_removed = n,
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "fswalk prune failed"),
         }
+
+        // Clear staged read-only inputs — a pure cache, re-materialized on
+        // demand — respecting each entry's advisory lock.
+        let engine = Arc::clone(&self);
+        let (stage_removed, stage_bytes) =
+            hproc::process_supervisor::block_or_inline(move || engine.gc_stage());
+        stats.stage_entries_removed = stage_removed;
+        stats.bytes_removed = stats.bytes_removed.saturating_add(stage_bytes);
 
         Ok(stats)
     }
@@ -811,6 +830,29 @@ mod tests {
         // The FS-spilled blob and its manifest are gone from the cache.
         assert!(!engine.local_cache.exists(&a, "h1", name).expect("exists"));
         assert!(!present(&engine, &a, "h1"));
+    }
+
+    /// Create a stage entry `<home>/stage/<group>/<hash>/blob` plus its
+    /// `<hash>.ready` witness, returning the entry dir.
+    fn stage_entry(engine: &Engine, group: &str, hash: &str) -> std::path::PathBuf {
+        let gdir = engine.home.join("stage").join(group);
+        let entry = gdir.join(hash);
+        std::fs::create_dir_all(&entry).expect("mkdir stage entry");
+        std::fs::write(entry.join("blob"), b"staged-bytes").expect("write blob");
+        std::fs::write(gdir.join(format!("{hash}.ready")), b"").expect("ready");
+        entry
+    }
+
+    #[tokio::test]
+    async fn gc_all_clears_stage() {
+        let (engine, _dir) = test_engine();
+        let staged = stage_entry(&engine, "__pkg_ghost", "abcd");
+
+        let rs = engine.new_state();
+        let stats = Arc::clone(&engine).gc_all(rs).await.expect("gc_all");
+
+        assert_eq!(stats.stage_entries_removed, 1);
+        assert!(!staged.exists(), "stage cleared by sweep");
     }
 
     #[tokio::test]

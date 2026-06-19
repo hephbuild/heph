@@ -15,7 +15,7 @@ use std::path::Path;
 pub fn remove_dir_all(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir) {
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            make_dirs_read_write(dir);
+            make_readwrite_tree(dir);
             fs::remove_dir_all(dir)
         }
         other => other,
@@ -25,8 +25,13 @@ pub fn remove_dir_all(dir: &Path) -> io::Result<()> {
 /// Recursively make every directory under `dir` writable (`0777`) so its
 /// contents can be removed. Errors walking the tree are ignored — this is
 /// a best-effort prelude to a removal retry, mirroring Go's helper.
+///
+/// Inverse of [`make_readonly_tree`]: that one strips write bits to publish a
+/// read-only shared tree (à la the Go module cache); this one restores them so
+/// the tree can be deleted. Kept side by side so the two halves of the
+/// read-only lifecycle stay in sync.
 #[cfg(unix)]
-fn make_dirs_read_write(dir: &Path) {
+pub fn make_readwrite_tree(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
     fn walk(path: &Path) {
@@ -50,4 +55,43 @@ fn make_dirs_read_write(dir: &Path) {
 }
 
 #[cfg(not(unix))]
-fn make_dirs_read_write(_dir: &Path) {}
+pub fn make_readwrite_tree(_dir: &Path) {}
+
+/// Recursively strip write bits from every file and directory under `root`
+/// (dirs become `0o555`, files keep their mode minus `0o222`), publishing a
+/// read-only tree the way the Go module cache marks downloaded modules
+/// read-only. Children are processed before their parents so the traversal
+/// permission needed to descend is never lost. Symlinks are left untouched
+/// (`set_permissions` would follow them; the target's own mode governs).
+///
+/// Inverse of [`make_readwrite_tree`]; the two live together so a change to
+/// one prompts a matching change to the other.
+#[cfg(unix)]
+pub fn make_readonly_tree(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn walk(path: &Path) -> io::Result<()> {
+        let md = fs::symlink_metadata(path)?;
+        let ft = md.file_type();
+        if ft.is_symlink() {
+            return Ok(());
+        }
+        if ft.is_dir() {
+            for entry in fs::read_dir(path)? {
+                walk(&entry?.path())?;
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555))?;
+        } else {
+            let mode = md.permissions().mode() & !0o222;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    }
+
+    walk(root)
+}
+
+#[cfg(not(unix))]
+pub fn make_readonly_tree(_root: &Path) -> io::Result<()> {
+    Ok(())
+}

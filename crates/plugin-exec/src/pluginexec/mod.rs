@@ -641,7 +641,17 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 r#ref: tool.r#ref.clone(),
                 mode: InputMode::Tool,
                 origin_id: tool.id.clone(),
-                annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+                // Tools are consumed read-only (executables on PATH, never
+                // mutated by the target), so let the OS sandbox runner stage
+                // them once into the shared stage dir and symlink them in
+                // rather than copying every tool into every sandbox.
+                annotations: BTreeMap::from([
+                    ("unpack_root".to_string(), "tools".to_string()),
+                    (
+                        hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                        "true".to_string(),
+                    ),
+                ]),
                 hashed: tool.hash,
                 runtime: true,
             };
