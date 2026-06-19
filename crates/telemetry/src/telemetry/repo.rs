@@ -10,130 +10,104 @@
 //! so the fingerprint is opaque: it cannot be reversed to look up the actual
 //! commit/repo, while still being deterministic across clones.
 //!
-//! On a shallow clone whose history can't reach the root (the default depth-1
-//! GitHub Actions checkout), the root is unavailable, so we fall back to a hash
-//! of `GITHUB_REPOSITORY_ID` — GitHub's immutable numeric repo id (rename- and
-//! transfer-safe). That is a *different namespace* than the root-commit hash, so
-//! every fingerprint also carries a [`Fingerprint::source`] tag and the two are
-//! never conflated.
+//! Sources for the root commit, in order:
+//! 1. Local git: `git rev-list --max-parents=0 HEAD`.
+//! 2. On a shallow clone whose history can't reach the root (the default depth-1
+//!    GitHub Actions checkout), the GitHub REST API: ask for one commit, read the
+//!    `Link` header to jump to the last page, and read the first commit's SHA
+//!    from there. Because this yields the *same* root SHA a full clone would, the
+//!    fingerprint is identical to one computed locally — same namespace, no
+//!    special-casing downstream. Gated to GitHub Actions with a token present.
 //!
-//! Everything here is strictly best-effort. No git, not a repo, an unreadable
-//! cache — any of these just yields `None`, and the attrs are omitted.
+//! Everything here is strictly best-effort. No git, not a repo, no token, a
+//! failed API call, an unreadable cache — any of these just yields `None`, and
+//! the attr is omitted. API failures are logged at `trace`.
 //!
-//! The `git rev-list` walk is O(history) and never runs on the exit path: a
-//! startup warmer ([`prewarm`]) computes and caches it on a detached thread,
-//! while the exit path ([`cached`]) only ever reads the cache. A cold cache just
-//! omits the attr for that run; it lands on the next.
+//! The work never runs on the exit path: a startup warmer ([`prewarm`]) computes
+//! and caches the fingerprint on a detached thread, while the exit path
+//! ([`cached`]) only ever reads the cache. A cold cache just omits the attr for
+//! that run; it lands on the next.
 //!
 //! Caching (under the config dir, keyed by the working directory):
-//! - A success is cached forever, so the walk runs at most once per repo per
-//!   machine.
+//! - A success is cached forever, so the (O(history) git walk or two API hops)
+//!   runs at most once per repo per machine.
 //! - A *failure* is cached too, with a timestamp and a [`NEGATIVE_TTL`]: a huge
-//!   monorepo whose root walk keeps hitting [`GIT_TIMEOUT`] would otherwise re-pay
-//!   the walk on every warm-up. The negative entry expires so a later full fetch
-//!   is eventually picked up.
+//!   monorepo whose root walk keeps hitting [`GIT_TIMEOUT`], or a transient API
+//!   failure, would otherwise re-pay the cost on every warm-up. The negative
+//!   entry expires so a later full fetch / fixed token is eventually picked up.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Cap on a single git subprocess. Telemetry runs on the exit path and must not
-/// stall a real command — on a giant monorepo the root walk can be slow, so we
-/// bound it and give up rather than block.
+/// Cap on a single git subprocess. On a giant monorepo the root walk can be slow,
+/// so we bound it and give up rather than block the warmer indefinitely.
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Cap on the GitHub API round-trips, so a hung endpoint can't pin the warmer.
+const API_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long a cached *failure* suppresses recomputation. Keeps a repo whose root
-/// walk keeps timing out from re-paying it every run, while still letting a later
-/// full fetch be picked up within a day.
+/// walk keeps timing out (or whose API call keeps failing) from re-paying it
+/// every run, while still letting a later full fetch be picked up within a day.
 const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Where the fingerprint came from — recorded alongside the value so the two
-/// namespaces (root commit vs CI repo id) are never silently mixed in analysis.
-mod source {
-    /// SHA-256 of the git root commit(s). The portable, cross-machine identity.
-    pub const ROOT_COMMIT: &str = "root_commit";
-    /// SHA-256 of `GITHUB_REPOSITORY_ID`. Shallow-CI fallback only.
-    pub const GITHUB_REPO_ID: &str = "github_repo_id";
-
-    /// Whether `s` is a tag we wrote (guards against a corrupt cache file).
-    pub fn is_known(s: &str) -> bool {
-        s == ROOT_COMMIT || s == GITHUB_REPO_ID
-    }
-}
-
-/// A computed fingerprint plus the kind of identity it was derived from.
-#[derive(Debug, Clone)]
-pub struct Fingerprint {
-    pub value: String,
-    pub source: &'static str,
-}
+/// Default GitHub REST API host (overridden by `GITHUB_API_URL`, e.g. on GHES).
+const API_DEFAULT: &str = "https://api.github.com";
 
 /// Read-only lookup for the exit path: the cached fingerprint if one was already
-/// computed (by a prior run or this run's [`prewarm`]). Never runs git, never
-/// blocks — a cold cache just yields `None` and the attr is omitted this run,
-/// then appears once the warmer lands.
-pub fn cached(config_dir: &Path) -> Option<Fingerprint> {
+/// computed (by a prior run or this run's [`prewarm`]). Never runs git or the
+/// network, never blocks — a cold cache just yields `None` and the attr is
+/// omitted this run, then appears once the warmer lands.
+pub fn cached(config_dir: &Path) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     match read_cache(&cache_path_for(config_dir, &cwd), now_ms()) {
-        Cached::Hit(fp) => Some(fp),
+        Cached::Hit(value) => Some(value),
         Cached::FreshMiss | Cached::Stale | Cached::Absent => None,
     }
 }
 
 /// Compute the fingerprint for the process's working directory and cache it.
 /// Meant to run off the hot path (a startup warmer thread) so the exit path only
-/// ever reads the cache. Honors the cache, so it's free once warm. Reads
-/// `GITHUB_REPOSITORY_ID` for the shallow-CI fallback.
+/// ever reads the cache. Honors the cache, so it's free once warm. Falls back to
+/// the GitHub API (see [`github_root_commit`]) only when local git can't reach
+/// the root.
 pub fn prewarm(config_dir: &Path) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
-    let ci_repo_id = std::env::var("GITHUB_REPOSITORY_ID").ok();
-    let _ = fingerprint_in(config_dir, &cwd, ci_repo_id.as_deref(), now_ms());
+    let _ = fingerprint_in(config_dir, &cwd, github_root_commit, now_ms());
 }
 
-/// Inner form taking the working directory, the CI repo id, and the current time
-/// explicitly (the public entry supplies the process cwd / env / clock). Split
-/// out so tests can target a specific repo and clock without global state.
+/// Inner form taking the working directory, a lazy GitHub-API fallback, and the
+/// current time explicitly (the public entries supply the process cwd / env /
+/// clock). Split out so tests can target a specific repo, fallback, and clock
+/// without global state. The fallback is invoked only when local git fails.
 fn fingerprint_in(
     config_dir: &Path,
     work_dir: &Path,
-    ci_repo_id: Option<&str>,
+    gh_root: impl FnOnce() -> Option<String>,
     now: u64,
-) -> Option<Fingerprint> {
+) -> Option<String> {
     let cache_path = cache_path_for(config_dir, work_dir);
 
     match read_cache(&cache_path, now) {
-        Cached::Hit(fp) => return Some(fp),
+        Cached::Hit(value) => return Some(value),
         Cached::FreshMiss => return None,
         Cached::Stale | Cached::Absent => {}
     }
 
-    let computed = compute(work_dir, ci_repo_id);
-    write_cache(&cache_path, computed.as_ref(), now);
+    let computed = compute(work_dir, gh_root);
+    write_cache(&cache_path, computed.as_deref(), now);
     computed
 }
 
-/// Compute the fingerprint from scratch: the git root commit if reachable,
-/// otherwise the CI repo id, otherwise nothing.
-fn compute(work_dir: &Path, ci_repo_id: Option<&str>) -> Option<Fingerprint> {
-    if let Some(root) = root_commit(work_dir) {
-        return Some(Fingerprint {
-            value: hex(&Sha256::digest(root.as_bytes())),
-            source: source::ROOT_COMMIT,
-        });
-    }
-    // Shallow CI: the root is unreachable, so fall back to GitHub's immutable
-    // numeric repo id (a different namespace — tagged accordingly).
-    let id = ci_repo_id?.trim();
-    if id.is_empty() {
-        return None;
-    }
-    Some(Fingerprint {
-        value: hex(&Sha256::digest(id.as_bytes())),
-        source: source::GITHUB_REPO_ID,
-    })
+/// Compute the fingerprint from scratch: hash the root commit id(s) from local
+/// git, or — when those are unreachable — from the GitHub API fallback.
+fn compute(work_dir: &Path, gh_root: impl FnOnce() -> Option<String>) -> Option<String> {
+    let root = root_commit(work_dir).or_else(gh_root)?;
+    Some(hex(&Sha256::digest(root.as_bytes())))
 }
 
 /// The cache file for a working directory: `<config_dir>/repo-fingerprints/<h>`,
@@ -150,7 +124,7 @@ fn cache_path_for(config_dir: &Path, work_dir: &Path) -> PathBuf {
 /// Outcome of consulting the on-disk cache.
 enum Cached {
     /// A previously computed fingerprint.
-    Hit(Fingerprint),
+    Hit(String),
     /// A recent failure — still within the negative TTL, so don't recompute.
     FreshMiss,
     /// A failure older than the TTL — recompute.
@@ -160,29 +134,20 @@ enum Cached {
 }
 
 /// Parse the cache file. Two record shapes, tab-separated:
-/// - `ok\t<source>\t<value>` — a computed fingerprint.
+/// - `ok\t<value>` — a computed fingerprint.
 /// - `none\t<unix_ms>` — a failure, stamped so it can expire.
 fn read_cache(path: &Path, now: u64) -> Cached {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Cached::Absent;
     };
     let line = raw.trim();
-    if let Some(rest) = line.strip_prefix("ok\t") {
-        if let Some((src, value)) = rest.split_once('\t')
-            && source::is_known(src)
-            && !value.is_empty()
-        {
-            let source = if src == source::ROOT_COMMIT {
-                source::ROOT_COMMIT
-            } else {
-                source::GITHUB_REPO_ID
-            };
-            return Cached::Hit(Fingerprint {
-                value: value.to_string(),
-                source,
-            });
-        }
-        return Cached::Absent;
+    if let Some(value) = line.strip_prefix("ok\t") {
+        let value = value.trim();
+        return if value.is_empty() {
+            Cached::Absent
+        } else {
+            Cached::Hit(value.to_string())
+        };
     }
     if let Some(ts) = line.strip_prefix("none\t") {
         return match ts.trim().parse::<u64>() {
@@ -197,10 +162,10 @@ fn read_cache(path: &Path, now: u64) -> Cached {
 }
 
 /// Persist the computation outcome. Best-effort — a failure here just means the
-/// next run recomputes.
-fn write_cache(path: &Path, computed: Option<&Fingerprint>, now: u64) {
-    let body = match computed {
-        Some(fp) => format!("ok\t{}\t{}", fp.source, fp.value),
+/// next warm-up recomputes.
+fn write_cache(path: &Path, value: Option<&str>, now: u64) {
+    let body = match value {
+        Some(v) => format!("ok\t{v}"),
         None => format!("none\t{now}"),
     };
     if let Some(parent) = path.parent()
@@ -218,8 +183,8 @@ fn write_cache(path: &Path, computed: Option<&Fingerprint>, now: u64) {
 /// Shallow-aware: a default `actions/checkout` is a depth-1 clone, where the
 /// grafted boundary commit *masquerades* as a root. Those grafts (listed in
 /// `.git/shallow`) are filtered out, so a shallow clone yields the true root only
-/// when its history actually reaches it — otherwise `None`, never a per-checkout
-/// value that would shatter one repo into thousands of fingerprints.
+/// when its history actually reaches it — otherwise `None`, and the caller falls
+/// back to the GitHub API.
 fn root_commit(work_dir: &Path) -> Option<String> {
     let out = git(work_dir, &["rev-list", "--max-parents=0", "HEAD"])?;
     let mut roots: Vec<&str> = out
@@ -311,6 +276,129 @@ fn git(work_dir: &Path, args: &[&str]) -> Option<String> {
     Some(buf.trim().to_string())
 }
 
+/// The repository's root commit SHA via the GitHub REST API — the shallow-CI
+/// fallback. Returns `None` unless we're in GitHub Actions with a token and a
+/// known `owner/repo`; every failure is logged at `trace` and swallowed.
+///
+/// Two hops: GET one commit, read the `Link` header's `rel="last"` URL (the
+/// oldest commit's page), then GET that and read its SHA. A repo with a single
+/// page (≤1 commit) has no `Link` header, so the first response already holds it.
+fn github_root_commit() -> Option<String> {
+    if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
+        return None;
+    }
+    let token = nonempty_env("GITHUB_TOKEN")?;
+    let repo = nonempty_env("GITHUB_REPOSITORY")?; // "owner/name"
+    let api = nonempty_env("GITHUB_API_URL").unwrap_or_else(|| API_DEFAULT.to_string());
+
+    // reqwest::blocking spins up its own runtime; we're already on a dedicated
+    // warmer thread (never the async runtime), so this is safe.
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(API_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::trace!(error = %e, "telemetry: github api client build failed");
+            return None;
+        }
+    };
+
+    root_via_api(|url| gh_get(&client, url, &token), &api, &repo)
+}
+
+/// A trimmed, non-empty env var, or `None`.
+fn nonempty_env(name: &str) -> Option<String> {
+    let v = std::env::var(name).ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// The bits of an HTTP response we care about: the `Link` header and the body.
+struct HttpResp {
+    link: Option<String>,
+    body: String,
+}
+
+/// Orchestrate the two-hop root-commit lookup over an injected fetcher (so the
+/// pagination/JSON logic is testable without the network).
+fn root_via_api(fetch: impl Fn(&str) -> Option<HttpResp>, api: &str, repo: &str) -> Option<String> {
+    let first_url = format!(
+        "{}/repos/{}/commits?per_page=1",
+        api.trim_end_matches('/'),
+        repo
+    );
+    let first = fetch(&first_url)?;
+    let body = match first.link.as_deref().and_then(parse_rel_last) {
+        // Jump straight to the last page — its single commit is the root.
+        Some(last) => fetch(&last)?.body,
+        // No pagination => ≤1 commit total => the first page already holds it.
+        None => first.body,
+    };
+    first_sha(&body)
+}
+
+/// Perform one authenticated GitHub API GET. Logs failures at `trace`.
+fn gh_get(client: &reqwest::blocking::Client, url: &str, token: &str) -> Option<HttpResp> {
+    let resp = match client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "heph-telemetry")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .bearer_auth(token)
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::trace!(error = %e, url, "telemetry: github api request failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::trace!(status = %resp.status(), url, "telemetry: github api non-success");
+        return None;
+    }
+    let link = resp
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    match resp.text() {
+        Ok(body) => Some(HttpResp { link, body }),
+        Err(e) => {
+            tracing::trace!(error = %e, "telemetry: github api body read failed");
+            None
+        }
+    }
+}
+
+/// Extract the `rel="last"` URL from a GitHub `Link` header, if present.
+fn parse_rel_last(link: &str) -> Option<String> {
+    link.split(',')
+        .map(str::trim)
+        .find(|part| part.contains("rel=\"last\""))
+        .and_then(|part| {
+            let after = part.split_once('<')?.1;
+            let url = after.split_once('>')?.0;
+            Some(url.to_string())
+        })
+}
+
+/// The `sha` of the first commit in a GitHub commits-list JSON body.
+fn first_sha(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let sha = v.as_array()?.first()?.get("sha")?.as_str()?;
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
 /// Current wall-clock as unix milliseconds (for stamping negative cache entries).
 fn now_ms() -> u64 {
     hcore::events::now_unix_ms()
@@ -334,6 +422,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::process::Command;
 
     fn run(dir: &Path, args: &[&str]) {
@@ -363,20 +452,24 @@ mod tests {
 
     const T0: u64 = 1_000_000_000_000;
 
+    /// A gh fallback that must never be called.
+    fn no_gh() -> Option<String> {
+        None
+    }
+
     #[test]
     fn fingerprint_is_stable_and_hashed() {
         let cfg = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path(), 3);
 
-        let fp = fingerprint_in(cfg.path(), repo.path(), None, T0).expect("fingerprint");
+        let fp = fingerprint_in(cfg.path(), repo.path(), no_gh, T0).expect("fingerprint");
         // SHA-256 hex is 64 chars, and is *not* the raw 40-char commit hash.
-        assert_eq!(fp.value.len(), 64);
-        assert_eq!(fp.source, source::ROOT_COMMIT);
+        assert_eq!(fp.len(), 64);
 
         // Same answer on a repeat call (now served from cache).
-        let again = fingerprint_in(cfg.path(), repo.path(), None, T0).expect("fingerprint");
-        assert_eq!(fp.value, again.value);
+        let again = fingerprint_in(cfg.path(), repo.path(), no_gh, T0).expect("fingerprint");
+        assert_eq!(fp, again);
     }
 
     #[test]
@@ -398,9 +491,9 @@ mod tests {
             &["clone", "-q", origin.path().to_str().unwrap(), "."],
         );
 
-        let fa = fingerprint_in(cfg.path(), a.path(), None, T0).expect("a");
-        let fb = fingerprint_in(cfg.path(), b.path(), None, T0).expect("b");
-        assert_eq!(fa.value, fb.value);
+        let fa = fingerprint_in(cfg.path(), a.path(), no_gh, T0).expect("a");
+        let fb = fingerprint_in(cfg.path(), b.path(), no_gh, T0).expect("b");
+        assert_eq!(fa, fb);
     }
 
     #[test]
@@ -409,25 +502,26 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path(), 1);
 
-        let fp = fingerprint_in(cfg.path(), repo.path(), None, T0).expect("fingerprint");
+        let fp = fingerprint_in(cfg.path(), repo.path(), no_gh, T0).expect("fingerprint");
         // Destroy the repo: a non-cached path would now fail. The cache (keyed
         // by work dir) must still return the original value.
         std::fs::remove_dir_all(repo.path().join(".git")).unwrap();
-        let cached = fingerprint_in(cfg.path(), repo.path(), None, T0).expect("cached");
-        assert_eq!(fp.value, cached.value);
+        let cached = fingerprint_in(cfg.path(), repo.path(), no_gh, T0).expect("cached");
+        assert_eq!(fp, cached);
     }
 
     #[test]
     fn non_repo_yields_none() {
         let cfg = tempfile::tempdir().unwrap();
         let plain = tempfile::tempdir().unwrap();
-        assert!(fingerprint_in(cfg.path(), plain.path(), None, T0).is_none());
+        assert!(fingerprint_in(cfg.path(), plain.path(), no_gh, T0).is_none());
     }
 
     #[test]
     fn shallow_clone_without_root_yields_none() {
         // A depth-1 clone (the GitHub Actions default) can't reach the root: the
-        // grafted boundary commit must not be reported as a fingerprint.
+        // grafted boundary commit must not be reported, and with no API fallback
+        // there is nothing to report.
         let cfg = tempfile::tempdir().unwrap();
         let origin = tempfile::tempdir().unwrap();
         init_repo(origin.path(), 5);
@@ -447,37 +541,42 @@ mod tests {
         );
 
         assert!(is_shallow(shallow.path()), "expected a shallow clone");
-        assert!(fingerprint_in(cfg.path(), shallow.path(), None, T0).is_none());
+        assert!(fingerprint_in(cfg.path(), shallow.path(), no_gh, T0).is_none());
     }
 
     #[test]
-    fn shallow_clone_falls_back_to_github_repo_id() {
-        // When the root is unreachable but the CI repo id is present, fall back
-        // to it — tagged as a distinct source.
+    fn github_api_root_used_when_local_git_fails() {
+        // No local root reachable -> the API fallback supplies the root SHA, and
+        // it hashes into the *same namespace* as a local clone would.
         let cfg = tempfile::tempdir().unwrap();
-        let plain = tempfile::tempdir().unwrap(); // not a repo -> no root commit
+        let plain = tempfile::tempdir().unwrap(); // not a repo
+        let api_sha = "e83c5163316f89bfbde7d9ab23ca2e25604af290";
 
-        let fp =
-            fingerprint_in(cfg.path(), plain.path(), Some("123456"), T0).expect("github fallback");
-        assert_eq!(fp.source, source::GITHUB_REPO_ID);
-        assert_eq!(fp.value, hex(&Sha256::digest(b"123456")));
-
-        // Same id anywhere -> same fingerprint (stable across CI runs).
-        let other = tempfile::tempdir().unwrap();
-        let fp2 = fingerprint_in(cfg.path(), other.path(), Some("123456"), T0).expect("again");
-        assert_eq!(fp.value, fp2.value);
+        let fp = fingerprint_in(cfg.path(), plain.path(), || Some(api_sha.to_string()), T0)
+            .expect("api fallback");
+        assert_eq!(fp, hex(&Sha256::digest(api_sha.as_bytes())));
     }
 
     #[test]
-    fn root_commit_wins_over_github_id() {
-        // A real root is the portable identity and takes precedence over the
-        // CI-only fallback even when both are available.
+    fn local_root_wins_and_skips_github() {
+        // A real local root takes precedence; the API fallback must not run.
         let cfg = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path(), 1);
 
-        let fp = fingerprint_in(cfg.path(), repo.path(), Some("999"), T0).expect("root");
-        assert_eq!(fp.source, source::ROOT_COMMIT);
+        let called = Cell::new(false);
+        let fp = fingerprint_in(
+            cfg.path(),
+            repo.path(),
+            || {
+                called.set(true);
+                Some("unused".to_string())
+            },
+            T0,
+        )
+        .expect("local root");
+        assert!(!called.get(), "github fallback should not be consulted");
+        assert_eq!(fp.len(), 64);
     }
 
     #[test]
@@ -491,12 +590,12 @@ mod tests {
         // A *fresh* negative entry short-circuits computation: even though the
         // repo has a perfectly good root, we honor the recent failure and skip.
         std::fs::write(&cache, format!("none\t{T0}")).unwrap();
-        assert!(fingerprint_in(cfg.path(), repo.path(), None, T0).is_none());
+        assert!(fingerprint_in(cfg.path(), repo.path(), no_gh, T0).is_none());
 
         // Past the TTL the entry is stale -> recompute, and now we get a value.
         let later = T0 + NEGATIVE_TTL.as_millis() as u64 + 1;
-        let fp = fingerprint_in(cfg.path(), repo.path(), None, later).expect("recomputed");
-        assert_eq!(fp.source, source::ROOT_COMMIT);
+        let fp = fingerprint_in(cfg.path(), repo.path(), no_gh, later).expect("recomputed");
+        assert_eq!(fp.len(), 64);
     }
 
     #[test]
@@ -511,7 +610,7 @@ mod tests {
         assert!(matches!(read_cache(&path, T0), Cached::Absent));
 
         // Warm it (the prewarm path), then the read-only lookup hits.
-        fingerprint_in(cfg.path(), repo.path(), None, T0).expect("warm");
+        fingerprint_in(cfg.path(), repo.path(), no_gh, T0).expect("warm");
         assert!(matches!(read_cache(&path, T0), Cached::Hit(_)));
     }
 
@@ -519,12 +618,76 @@ mod tests {
     fn failure_is_negatively_cached() {
         let cfg = tempfile::tempdir().unwrap();
         let plain = tempfile::tempdir().unwrap();
-        assert!(fingerprint_in(cfg.path(), plain.path(), None, T0).is_none());
+        assert!(fingerprint_in(cfg.path(), plain.path(), no_gh, T0).is_none());
 
         // The miss is recorded so a giant repo that keeps timing out doesn't
         // re-pay the walk every run.
         let cache = cache_path_for(cfg.path(), plain.path());
         let body = std::fs::read_to_string(&cache).expect("negative entry written");
         assert!(body.starts_with("none\t"), "got: {body}");
+    }
+
+    #[test]
+    fn parse_rel_last_extracts_last_url() {
+        let header = "<https://api.github.com/repositories/123/commits?per_page=1&page=2>; \
+             rel=\"next\", \
+             <https://api.github.com/repositories/123/commits?per_page=1&page=845>; rel=\"last\"";
+        assert_eq!(
+            parse_rel_last(header).as_deref(),
+            Some("https://api.github.com/repositories/123/commits?per_page=1&page=845")
+        );
+        // No `last` relation (single page) -> nothing to jump to.
+        assert!(parse_rel_last("<https://x/y>; rel=\"self\"").is_none());
+    }
+
+    #[test]
+    fn first_sha_reads_array_head() {
+        assert_eq!(
+            first_sha(r#"[{"sha":"abc123","commit":{}}]"#).as_deref(),
+            Some("abc123")
+        );
+        assert!(first_sha("[]").is_none());
+        assert!(first_sha("not json").is_none());
+    }
+
+    #[test]
+    fn root_via_api_jumps_to_last_page() {
+        // Multi-page: the first hop yields a `last` link; the second hop's body
+        // carries the root commit.
+        let last_url = "https://api.test/repositories/9/commits?per_page=1&page=42";
+        let fetch = |url: &str| {
+            if url.ends_with("/repos/o/r/commits?per_page=1") {
+                Some(HttpResp {
+                    link: Some(format!("<{last_url}>; rel=\"last\"")),
+                    body: r#"[{"sha":"newest"}]"#.to_string(),
+                })
+            } else if url == last_url {
+                Some(HttpResp {
+                    link: None,
+                    body: r#"[{"sha":"rootsha"}]"#.to_string(),
+                })
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            root_via_api(fetch, "https://api.test", "o/r").as_deref(),
+            Some("rootsha")
+        );
+    }
+
+    #[test]
+    fn root_via_api_single_page_uses_first_body() {
+        // One-commit repo: no `Link` header, so the first response is the root.
+        let fetch = |_url: &str| {
+            Some(HttpResp {
+                link: None,
+                body: r#"[{"sha":"only"}]"#.to_string(),
+            })
+        };
+        assert_eq!(
+            root_via_api(fetch, "https://api.test", "o/r").as_deref(),
+            Some("only")
+        );
     }
 }

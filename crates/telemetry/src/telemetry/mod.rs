@@ -339,10 +339,10 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     let plugins = PLUGINS.get().cloned().unwrap_or_default();
 
     let dir = config_dir()?;
-    // Read-only: the startup warmer (see `prewarm`) does the git work off the hot
-    // path, so the exit path never blocks. Absent on a cold cache; lands next run.
+    // Read-only: the startup warmer (see `prewarm`) does the git/API work off the
+    // hot path, so the exit path never blocks. Absent on a cold cache; lands next.
     let fingerprint = repo::cached(&dir);
-    let props = build_props(&ctx, &stats, plugins, fingerprint.as_ref());
+    let props = build_props(&ctx, &stats, plugins, fingerprint.as_deref());
 
     let event = SpooledEvent {
         uuid: uuid::Uuid::new_v4().to_string(),
@@ -360,7 +360,7 @@ fn build_props(
     ctx: &ReportContext<'_>,
     stats: &TelemetrySnapshot,
     plugins: Plugins,
-    repo_fingerprint: Option<&repo::Fingerprint>,
+    repo_fingerprint: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut props = serde_json::Map::new();
     let mut put = |k: &str, v: serde_json::Value| drop(props.insert(k.to_string(), v));
@@ -388,14 +388,12 @@ fn build_props(
         }
     }
     put("ci", is_ci().into());
-    // Stable per-repo id grouping events by project without identifying it, plus
-    // the identity it was derived from (root commit vs CI repo id — kept distinct
-    // so the two namespaces aren't conflated). Absent when not in a git repo /
-    // git is unavailable / a shallow clone can't reach the root and there's no CI
-    // repo id.
+    // Stable per-repo id (one-way hash of the git root commit) grouping events by
+    // project without identifying it. Absent when not in a git repo / git is
+    // unavailable / a shallow clone can't reach the root and the GitHub API
+    // fallback didn't apply.
     if let Some(fp) = repo_fingerprint {
-        put("repo_fingerprint", fp.value.clone().into());
-        put("repo_fingerprint_source", fp.source.into());
+        put("repo_fingerprint", fp.into());
     }
     // Command + selector shape + the set of flags used (names only).
     put("command", ctx.command.into());
@@ -588,11 +586,7 @@ mod tests {
             failure: None,
             duration_ms: 1,
         };
-        let fp = repo::Fingerprint {
-            value: "deadbeef".to_string(),
-            source: "root_commit",
-        };
-        let props = build_props(&ctx, &snapshot, Plugins::default(), Some(&fp));
+        let props = build_props(&ctx, &snapshot, Plugins::default(), Some("deadbeef"));
 
         // posthog-rs stamps `$os` / `$os_version` itself, so build_props must
         // not carry an `os` of its own (nor the `$`-prefixed keys).
@@ -604,21 +598,14 @@ mod tests {
             props.get("arch").and_then(|v| v.as_str()),
             Some(std::env::consts::ARCH)
         );
-        // The repo fingerprint + its source are carried through when present.
+        // The repo fingerprint is carried through when present.
         assert_eq!(
             props.get("repo_fingerprint").and_then(|v| v.as_str()),
             Some("deadbeef")
         );
-        assert_eq!(
-            props
-                .get("repo_fingerprint_source")
-                .and_then(|v| v.as_str()),
-            Some("root_commit")
-        );
         // ...and omitted entirely when it can't be determined.
         let absent = build_props(&ctx, &snapshot, Plugins::default(), None);
         assert!(!absent.contains_key("repo_fingerprint"));
-        assert!(!absent.contains_key("repo_fingerprint_source"));
     }
 
     #[test]

@@ -5340,6 +5340,7 @@ dependencies = [
  "core",
  "plugin",
  "posthog-rs",
+ "reqwest 0.13.4",
  "rusqlite",
  "serde",
  "serde_json",
