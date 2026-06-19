@@ -464,8 +464,15 @@ impl ProviderTrait for Provider {
                 ),
                 field(
                     "test",
-                    ParamType::map(ParamType::Bool),
-                    "Test settings for this package, e.g. `{\"skip\": True}` to skip its tests.",
+                    ParamType::map(ParamType::union(vec![
+                        ParamType::Bool,
+                        ParamType::map(ParamType::String),
+                        ParamType::list(ParamType::String),
+                    ])),
+                    "Test settings for this package. `{\"skip\": True}` skips its tests \
+                     (inherited by descendants). `env`/`runtime_env` (map[string]) and \
+                     `pass_env`/`runtime_pass_env` (list[string]) are plumbed onto the \
+                     generated `test`/`xtest` run targets and apply only to this package.",
                 ),
             ],
         })
@@ -810,6 +817,59 @@ fn pick_test_skip(states: &[State]) -> bool {
         return false;
     };
     matches!(test_map.get("skip"), Some(Value::Bool(true)))
+}
+
+/// Parse a `map[string]string` Starlark value into a sorted map. Rejects
+/// non-string values so a typo (e.g. an int) surfaces as a clear error rather
+/// than being silently dropped.
+fn parse_str_map(v: &Value) -> anyhow::Result<BTreeMap<String, String>> {
+    let Value::Map(m) = v else {
+        anyhow::bail!("expected map[string], got: {v:?}");
+    };
+    m.iter()
+        .map(|(k, val)| match val {
+            Value::String(s) => Ok((k.clone(), s.clone())),
+            other => Err(anyhow::anyhow!(
+                "expected string value for key `{k}`, got: {other:?}"
+            )),
+        })
+        .collect()
+}
+
+/// Collect the test env knobs (`env`, `runtime_env`, `pass_env`,
+/// `runtime_pass_env`) from a `test = {...}` provider_state declared in the
+/// *exact* package of the target.
+///
+/// Unlike `skip` (which inherits down the package tree via [`pick_test_skip`]),
+/// these apply only to the package that declares them — a state at `//foo` does
+/// not leak into `//foo/bar`'s test targets. The engine pre-filters states by
+/// provider name, so callers only see Go states.
+fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test::TestEnv> {
+    let mut out = target_test::TestEnv::default();
+    for state in states.iter().filter(|s| s.package.as_str() == addr_pkg) {
+        let Some(Value::Map(test_map)) = state.state.get("test") else {
+            continue;
+        };
+        if let Some(v) = test_map.get("env") {
+            out.env
+                .extend(parse_str_map(v).context("parsing test env from go provider_state")?);
+        }
+        if let Some(v) = test_map.get("runtime_env") {
+            out.runtime_env.extend(
+                parse_str_map(v).context("parsing test runtime_env from go provider_state")?,
+            );
+        }
+        if let Some(v) = test_map.get("pass_env") {
+            out.pass_env
+                .extend(parse_strings(v).context("parsing test pass_env from go provider_state")?);
+        }
+        if let Some(v) = test_map.get("runtime_pass_env") {
+            out.runtime_pass_env.extend(
+                parse_strings(v).context("parsing test runtime_pass_env from go provider_state")?,
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Pick the closest (deepest) ancestor state carrying `go_codegen_deps`.
@@ -1558,7 +1618,14 @@ impl ProviderInner {
                 ))
                 .context("build go_test_data query addr")
                 .map_err(GetError::Other)?;
-                let spec = target_test::test_spec(addr.clone(), build_test_addr, &data_query_addr);
+                let test_env =
+                    pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
+                let spec = target_test::test_spec(
+                    addr.clone(),
+                    build_test_addr,
+                    &data_query_addr,
+                    &test_env,
+                );
                 Ok(GetResponse { target_spec: spec })
             }
             // Run the EXTERNAL (xtest) test bin.
@@ -1575,7 +1642,14 @@ impl ProviderInner {
                 ))
                 .context("build go_test_data query addr")
                 .map_err(GetError::Other)?;
-                let spec = target_test::test_spec(addr.clone(), build_xtest_addr, &data_query_addr);
+                let test_env =
+                    pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
+                let spec = target_test::test_spec(
+                    addr.clone(),
+                    build_xtest_addr,
+                    &data_query_addr,
+                    &test_env,
+                );
                 Ok(GetResponse { target_spec: spec })
             }
             "embed" => {
@@ -4060,6 +4134,98 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             state: m,
         }];
         assert!(!pick_test_skip(&states));
+    }
+
+    fn test_env_is_empty(env: &target_test::TestEnv) -> bool {
+        env.env.is_empty()
+            && env.runtime_env.is_empty()
+            && env.pass_env.is_empty()
+            && env.runtime_pass_env.is_empty()
+    }
+
+    fn state_with_test_map(pkg: &str, entries: Vec<(&str, Value)>) -> State {
+        let test_map: HashMap<String, Value> = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let mut m = HashMap::new();
+        m.insert("test".to_string(), Value::Map(test_map));
+        State {
+            package: PkgBuf::from(pkg),
+            provider: "go".to_string(),
+            state: m,
+        }
+    }
+
+    #[test]
+    fn pick_test_env_empty_when_no_states() {
+        let env = pick_test_env(&[], "foo").unwrap();
+        assert!(test_env_is_empty(&env));
+    }
+
+    #[test]
+    fn pick_test_env_reads_all_four_knobs() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![
+                (
+                    "env",
+                    Value::Map(HashMap::from([(
+                        "FOO".to_string(),
+                        Value::String("1".to_string()),
+                    )])),
+                ),
+                (
+                    "runtime_env",
+                    Value::Map(HashMap::from([(
+                        "BAR".to_string(),
+                        Value::String("2".to_string()),
+                    )])),
+                ),
+                (
+                    "pass_env",
+                    Value::List(vec![Value::String("HOME".to_string())]),
+                ),
+                (
+                    "runtime_pass_env",
+                    Value::List(vec![Value::String("PATH".to_string())]),
+                ),
+            ],
+        )];
+        let env = pick_test_env(&states, "foo").unwrap();
+        assert_eq!(env.env.get("FOO").map(String::as_str), Some("1"));
+        assert_eq!(env.runtime_env.get("BAR").map(String::as_str), Some("2"));
+        assert_eq!(env.pass_env, vec!["HOME".to_string()]);
+        assert_eq!(env.runtime_pass_env, vec!["PATH".to_string()]);
+    }
+
+    #[test]
+    fn pick_test_env_applies_only_to_exact_package_not_ancestors() {
+        // State at ancestor `foo` must NOT leak into `foo/bar`'s test targets.
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![(
+                "env",
+                Value::Map(HashMap::from([(
+                    "FOO".to_string(),
+                    Value::String("1".to_string()),
+                )])),
+            )],
+        )];
+        let env = pick_test_env(&states, "foo/bar").unwrap();
+        assert!(test_env_is_empty(&env));
+    }
+
+    #[test]
+    fn pick_test_env_errors_on_non_string_env_value() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![(
+                "env",
+                Value::Map(HashMap::from([("FOO".to_string(), Value::Int(3))])),
+            )],
+        )];
+        assert!(pick_test_env(&states, "foo").is_err());
     }
 
     #[tokio::test]
