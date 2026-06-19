@@ -119,41 +119,12 @@ fn materialize(content: &dyn Content, entry: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(entry).with_context(|| format!("create stage entry {:?}", entry))?;
     unpack::unpack(content, entry, None, None)
         .with_context(|| format!("unpack into stage entry {:?}", entry))?;
-    make_readonly_tree(entry).with_context(|| format!("mark stage entry read-only {:?}", entry))?;
+    // Publish read-only (Go-module-cache style) so no consumer can corrupt the
+    // shared copy. `make_readonly_tree` lives next to its inverse
+    // `make_dirs_read_write` (used by GC teardown) in `hcore::fsutil`.
+    hcore::fsutil::make_readonly_tree(entry)
+        .with_context(|| format!("mark stage entry read-only {:?}", entry))?;
     Ok(())
-}
-
-/// Strip write bits from every file and directory under `root` (dirs become
-/// `0o555`), mirroring the Go module cache. Children are processed before their
-/// parents so we never lose the traversal permission needed to descend.
-#[cfg(unix)]
-fn make_readonly_tree(root: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    for entry in walkdir::WalkDir::new(root).contents_first(true) {
-        let entry = entry.with_context(|| format!("walk stage tree under {:?}", root))?;
-        let md = entry
-            .metadata()
-            .with_context(|| format!("stat {:?} for read-only chmod", entry.path()))?;
-        let ft = md.file_type();
-        // Symlink perms are irrelevant (the target's mode governs) and
-        // `set_permissions` would follow the link — skip.
-        if ft.is_symlink() {
-            continue;
-        }
-        let mode = if ft.is_dir() {
-            0o555
-        } else {
-            md.permissions().mode() & !0o222
-        };
-        std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("chmod read-only {:?}", entry.path()))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_readonly_tree(_root: &Path) -> anyhow::Result<()> {
-    anyhow::bail!("read-only input staging is only supported on unix")
 }
 
 /// Replicate the directory structure of `entry` inside `link_root`,

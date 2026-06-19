@@ -23,7 +23,9 @@ use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::ResultWriteGuard;
 use anyhow::{Context, Result};
 use hcore::hmemoizer::downcast_chain_ref;
+use hlock::hlock::{FLock, Lock};
 use hmodel::htaddr::{Addr, parse_addr};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -44,6 +46,9 @@ pub struct GcStats {
     /// Rows pruned from the shared filesystem-walk cache (stale past the TTL or
     /// orphaned because their path no longer exists).
     pub fswalk_rows_removed: usize,
+    /// Staged read-only input entries (`<home>/stage/`) reclaimed because their
+    /// content hash is no longer referenced by any surviving manifest.
+    pub stage_entries_removed: usize,
 }
 
 /// Per-target result of a GC pass, accumulated into [`GcStats`].
@@ -85,6 +90,77 @@ impl Engine {
             .delete(addr, hashin, MANIFEST_V1)
             .with_context(|| format!("delete manifest for {addr} {hashin}"))?;
         Ok(bytes)
+    }
+
+    /// Delete every staged read-only input under `<home>/stage/`. Stage entries
+    /// are a pure cache — a future consumer re-materializes whatever it needs —
+    /// so GC simply clears them all. Each entry is removed under its advisory
+    /// lock so an in-flight materialization is never deleted mid-write;
+    /// contended entries are left for the next sweep. Best-effort: per-entry
+    /// failures are logged and skipped. Returns `(entries_removed, bytes_freed)`.
+    fn gc_stage(&self) -> (usize, u64) {
+        let stage_root = self.home.join("stage");
+        let groups = match std::fs::read_dir(&stage_root) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), path = %stage_root.display(), "gc stage: read stage root");
+                return (0, 0);
+            }
+        };
+        let mut removed = 0usize;
+        let mut bytes = 0u64;
+        for group in groups.flatten() {
+            if !group.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let gpath = group.path();
+            let entries = match std::fs::read_dir(&gpath) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), path = %gpath.display(), "gc stage: read group");
+                    continue;
+                }
+            };
+            for ent in entries.flatten() {
+                // Only the `<hash>` dirs are entries; the `.ready`/`.lock`
+                // sidecars are reclaimed alongside their dir.
+                if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let hash = ent.file_name().to_string_lossy().into_owned();
+                // Non-blocking: a held lock means a materializer is mid-write —
+                // skip and let the next sweep reclaim it.
+                let lock = FLock::new(gpath.join(format!("{hash}.lock")));
+                let _guard = match lock.try_lock() {
+                    Ok(Some(g)) => g,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), %hash, "gc stage: lock entry");
+                        continue;
+                    }
+                };
+                let entry_dir = ent.path();
+                let freed = dir_size(&entry_dir);
+                if let Err(e) = hcore::fsutil::remove_dir_all(&entry_dir) {
+                    tracing::warn!(error = %format!("{e:#}"), path = %entry_dir.display(), "gc stage: remove entry");
+                    continue;
+                }
+                // Drop the readiness witness; the `.lock` is removed when the
+                // guard releases (write-unlock deletes its lock file).
+                let ready = gpath.join(format!("{hash}.ready"));
+                match std::fs::remove_file(&ready) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), path = %ready.display(), "gc stage: remove ready")
+                    }
+                }
+                removed += 1;
+                bytes = bytes.saturating_add(freed);
+            }
+        }
+        (removed, bytes)
     }
 
     /// Trim `addr`'s revisions to the `keep` newest (by `created_at_nanos`),
@@ -239,6 +315,14 @@ impl Engine {
             Ok(n) => stats.fswalk_rows_removed = n,
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "fswalk prune failed"),
         }
+
+        // Clear staged read-only inputs — a pure cache, re-materialized on
+        // demand — respecting each entry's advisory lock.
+        let engine = Arc::clone(&self);
+        let (stage_removed, stage_bytes) =
+            hproc::process_supervisor::block_or_inline(move || engine.gc_stage());
+        stats.stage_entries_removed = stage_removed;
+        stats.bytes_removed = stats.bytes_removed.saturating_add(stage_bytes);
 
         Ok(stats)
     }
@@ -451,6 +535,28 @@ fn push_decision(
         }
         None => {}
     }
+}
+
+/// Best-effort recursive byte size of `dir` (regular files only), for GC byte
+/// accounting. Errors are swallowed — a miscount never blocks a reclaim.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return total;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        } else if ft.is_file()
+            && let Ok(md) = entry.metadata()
+        {
+            total = total.saturating_add(md.len());
+        }
+    }
+    total
 }
 
 /// Emit one `GcTargetSwept` so the TUI's "targets explored" count advances.
@@ -811,6 +917,65 @@ mod tests {
         // The FS-spilled blob and its manifest are gone from the cache.
         assert!(!engine.local_cache.exists(&a, "h1", name).expect("exists"));
         assert!(!present(&engine, &a, "h1"));
+    }
+
+    /// Create a stage entry `<home>/stage/<group>/<hash>/blob` plus its
+    /// `<hash>.ready` witness, returning the entry dir.
+    fn stage_entry(engine: &Engine, group: &str, hash: &str) -> std::path::PathBuf {
+        let gdir = engine.home.join("stage").join(group);
+        let entry = gdir.join(hash);
+        std::fs::create_dir_all(&entry).expect("mkdir stage entry");
+        std::fs::write(entry.join("blob"), b"staged-bytes").expect("write blob");
+        std::fs::write(gdir.join(format!("{hash}.ready")), b"").expect("ready");
+        entry
+    }
+
+    #[tokio::test]
+    async fn gc_stage_deletes_all_entries() {
+        let (engine, _dir) = test_engine();
+        let a = stage_entry(&engine, "__pkg_t", "aaaa");
+        let b = stage_entry(&engine, "__pkg_u", "bbbb");
+
+        let (removed, bytes) = engine.gc_stage();
+
+        assert_eq!(removed, 2, "every stage entry is cleared");
+        assert_eq!(bytes, 2 * b"staged-bytes".len() as u64);
+        assert!(!a.exists());
+        assert!(!b.exists());
+        // Sidecars gone too.
+        assert!(!engine.home.join("stage/__pkg_t/aaaa.ready").exists());
+        assert!(!engine.home.join("stage/__pkg_t/aaaa.lock").exists());
+    }
+
+    #[tokio::test]
+    async fn gc_stage_skips_locked_entry() {
+        use hlock::hlock::Lock as _;
+        let (engine, _dir) = test_engine();
+        let busy = stage_entry(&engine, "__pkg_t", "held");
+
+        // Hold the entry's lock: a materializer is mid-write → GC must skip it.
+        let lock = FLock::new(engine.home.join("stage/__pkg_t/held.lock"));
+        let _held = lock
+            .lock(&StdCancellationToken::new())
+            .await
+            .expect("hold lock");
+
+        let (removed, _bytes) = engine.gc_stage();
+
+        assert_eq!(removed, 0, "locked entry not reclaimed");
+        assert!(busy.exists(), "in-flight stage entry survives");
+    }
+
+    #[tokio::test]
+    async fn gc_all_clears_stage() {
+        let (engine, _dir) = test_engine();
+        let staged = stage_entry(&engine, "__pkg_ghost", "abcd");
+
+        let rs = engine.new_state();
+        let stats = Arc::clone(&engine).gc_all(rs).await.expect("gc_all");
+
+        assert_eq!(stats.stage_entries_removed, 1);
+        assert!(!staged.exists(), "stage cleared by sweep");
     }
 
     #[tokio::test]
