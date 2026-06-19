@@ -13,9 +13,17 @@ use std::sync::Arc;
 
 /// OS-backed managed driver: materializes every input artifact to disk via
 /// `hartifactcontent::unpack`. No FUSE involvement.
+///
+/// Inputs flagged read-only (see [`crate::stage::READ_ONLY_ANNOTATION`]) are
+/// staged once into the shared `stage_dir` and symlinked in, rather than copied
+/// fresh into every consuming sandbox.
 pub struct ManagedDriverOs {
     pub driver: Arc<Box<dyn ManagedDriver>>,
     pub shell_fallback: Arc<ShellFallback>,
+    /// Shared `<home>/stage` root for read-only input staging. `None` disables
+    /// staging (read-only inputs fall back to the plain copy path) — used by
+    /// the standalone [`ManagedDriverOs::new`] constructor.
+    pub stage_dir: Option<PathBuf>,
 }
 
 impl ManagedDriverOs {
@@ -27,6 +35,7 @@ impl ManagedDriverOs {
         Self {
             driver: Arc::new(driver),
             shell_fallback,
+            stage_dir: None,
         }
     }
 
@@ -60,26 +69,50 @@ impl ManagedDriverOs {
                 .with_context(|| format!("create unpack root {:?}", unpack_root))?;
             for input in group {
                 let list_path = list_path_for(&input, &list_dir);
-                let filters = input.filters.clone();
-                let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
-                    None
-                } else {
-                    Some(&|rel: &Path| filters.iter().any(|f| Path::new(f) == rel))
-                };
-                hartifactcontent::unpack::unpack(
-                    input.artifact.content.as_ref(),
-                    unpack_root.as_path(),
-                    list_path.as_deref(),
-                    predicate,
-                )
-                .with_context(|| {
-                    format!(
-                        "unpack input origin_id={} source_addr={} into {:?}",
-                        input.origin_id,
-                        input.source_addr.format(),
-                        unpack_root,
-                    )
-                })?;
+                match self.stage_dir.as_deref() {
+                    Some(stage_dir) if crate::stage::is_read_only(&input.annotations) => {
+                        crate::stage::stage_and_link(
+                            input.artifact.content.as_ref(),
+                            stage_dir,
+                            &input.source_addr.format(),
+                            unpack_root.as_path(),
+                            list_path.as_deref(),
+                            &input.filters,
+                            ctoken,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "stage read-only input origin_id={} source_addr={} into {:?}",
+                                input.origin_id,
+                                input.source_addr.format(),
+                                unpack_root,
+                            )
+                        })?;
+                    }
+                    _ => {
+                        let filters = input.filters.clone();
+                        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
+                            None
+                        } else {
+                            Some(&|rel: &Path| filters.iter().any(|f| Path::new(f) == rel))
+                        };
+                        hartifactcontent::unpack::unpack(
+                            input.artifact.content.as_ref(),
+                            unpack_root.as_path(),
+                            list_path.as_deref(),
+                            predicate,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "unpack input origin_id={} source_addr={} into {:?}",
+                                input.origin_id,
+                                input.source_addr.format(),
+                                unpack_root,
+                            )
+                        })?;
+                    }
+                }
                 inputs.push(ManagedRunInput {
                     input,
                     list_path,

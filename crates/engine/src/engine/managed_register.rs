@@ -21,6 +21,7 @@ impl Engine {
             driver,
             hplugin_exec::pluginexec::Driver::default_exec_shell_fallback(),
             self.cfg.fuse.mode(),
+            self.home.clone(),
             fuse,
         )
     }

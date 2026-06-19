@@ -43,12 +43,14 @@ impl ManagedDriverBridge {
         driver: Box<dyn ManagedDriver>,
         shell_fallback: Arc<ShellFallback>,
         cfg: FuseMode,
+        home: PathBuf,
         fuse: Option<FuseSlot>,
     ) -> Self {
         let driver = Arc::new(driver);
         let os = ManagedDriverOs {
             driver: driver.clone(),
             shell_fallback: shell_fallback.clone(),
+            stage_dir: Some(home.join("stage")),
         };
         let fuse = fuse.map(|f| ManagedDriverFuse {
             driver: driver.clone(),
@@ -73,6 +75,7 @@ impl ManagedDriverBridge {
             os: ManagedDriverOs {
                 driver: Arc::new(driver),
                 shell_fallback,
+                stage_dir: None,
             },
             fuse: None,
         }

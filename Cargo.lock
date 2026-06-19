@@ -1253,6 +1253,7 @@ dependencies = [
  "async-trait",
  "core",
  "glob",
+ "lock",
  "model",
  "plugin",
  "serde",
