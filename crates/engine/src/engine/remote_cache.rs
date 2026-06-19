@@ -53,9 +53,6 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::OnceCell;
 use tracing::warn;
 
-/// Default per-cache request-concurrency cap (object_store [`LimitStore`]).
-pub const DEFAULT_CACHE_CONCURRENCY: usize = 10;
-
 /// A streaming object store. The set layers cache semantics (manifest affinity,
 /// ordering, parallel fan-out) on top; a backend only moves bytes.
 #[async_trait]
@@ -913,6 +910,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hconfig::DEFAULT_CACHE_CONCURRENCY;
 
     fn def(name: &str, uri: &str, read: bool, write: bool) -> RemoteCacheDef {
         RemoteCacheDef {

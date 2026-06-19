@@ -104,7 +104,17 @@ impl MemCacheOptions {
     }
 }
 
-impl ConfigYaml {
+/// Resolve a [`ConfigYaml`] into the engine's runtime [`Config`].
+///
+/// [`ConfigYaml`] lives in the engine-free `config` crate, so this resolution —
+/// which produces engine-only types ([`Config`], [`LockBackend`],
+/// [`RemoteCacheDef`]) — is exposed as an extension trait on the engine side
+/// rather than an inherent method. Bring it into scope to call `cfg.resolve(..)`.
+pub trait ConfigYamlExt {
+    fn resolve(&self, root: &Path) -> anyhow::Result<Config>;
+}
+
+impl ConfigYamlExt for ConfigYaml {
     /// Resolve this optional, profile-layered YAML into the engine's runtime
     /// [`Config`], applying every default in one place. This is the single
     /// boundary between the all-optional config-file shape and the
@@ -114,7 +124,7 @@ impl ConfigYaml {
     /// `providers`/`drivers` are intentionally *not* part of [`Config`] (they are
     /// applied to the engine registry separately, post-construction), so they
     /// stay on the [`ConfigYaml`].
-    pub fn resolve(&self, root: &Path) -> anyhow::Result<Config> {
+    fn resolve(&self, root: &Path) -> anyhow::Result<Config> {
         let mem_cache_opts = |c: &MemCacheConfig| MemCacheOptions {
             per_entry_bytes: c.per_entry_bytes,
             capacity_bytes: c.capacity_bytes,
@@ -166,5 +176,56 @@ impl ConfigYaml {
                 })
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::result_lock::LockBackend;
+
+    #[test]
+    fn resolve_applies_defaults_for_empty_yaml() {
+        // An empty config resolves to the engine defaults, with home_dir
+        // root-joined to `.heph3`.
+        let yaml = ConfigYaml::default();
+        let root = Path::new("/repo");
+        let cfg = yaml.resolve(root).expect("resolve");
+
+        let defaults = Config::default();
+        assert_eq!(cfg.root, root);
+        assert_eq!(cfg.home_dir, root.join(".heph3"));
+        assert_eq!(cfg.mem_cache, defaults.mem_cache);
+        assert_eq!(cfg.tmp_cache, defaults.tmp_cache);
+        assert_eq!(cfg.lock_backend, defaults.lock_backend);
+        assert_eq!(cfg.spill_threshold_bytes, defaults.spill_threshold_bytes);
+        assert!(cfg.telemetry_enabled);
+        assert!(cfg.remote_caches.is_empty());
+    }
+
+    #[test]
+    fn resolve_overrides_present_fields() {
+        let yaml: ConfigYaml = serde_yaml::from_str(
+            "homeDir: .custom\nlock:\n  backend: mem\ntelemetry:\n  enabled: false\ncaches:\n  r:\n    uri: s3://b/p\n    write: false\n",
+        )
+        .expect("parse");
+        let cfg = yaml.resolve(Path::new("/repo")).expect("resolve");
+
+        assert_eq!(cfg.home_dir, Path::new("/repo/.custom"));
+        assert_eq!(cfg.lock_backend, LockBackend::Mem);
+        assert!(!cfg.telemetry_enabled);
+        assert_eq!(cfg.remote_caches.len(), 1);
+        let r = &cfg.remote_caches[0];
+        assert_eq!(r.uri, "s3://b/p");
+        assert!(r.read);
+        assert!(!r.write);
+    }
+
+    #[test]
+    fn resolve_errors_on_cache_missing_uri() {
+        let yaml: ConfigYaml =
+            serde_yaml::from_str("caches:\n  r:\n    write: false\n").expect("parse");
+        let err = yaml.resolve(Path::new("/repo")).expect_err("must error");
+        assert!(format!("{err:#}").contains("uri"), "{err}");
     }
 }

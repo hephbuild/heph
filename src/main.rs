@@ -57,6 +57,14 @@ fn main() -> ExitCode {
     let sink = log::init();
     heph::tui::panic::install(sink.clone());
 
+    // Self-upgrade to the workspace-pinned version before anything else of
+    // substance. On a successful upgrade this re-execs and never returns; it runs
+    // *before* the supervisor fork so a re-exec can't orphan a sidecar. A failure
+    // is non-fatal — warn and carry on with the current binary.
+    if let Err(e) = heph::selfupdate::maybe_self_upgrade() {
+        warn!(error = %format!("{e:#}"), "Self-upgrade failed; continuing with current binary");
+    }
+
     // Fork the supervisor sidecar that will SIGKILL every tracked child
     // process group when this binary exits — including hard-kill scenarios.
     if let Err(e) = heph::process_supervisor::init() {

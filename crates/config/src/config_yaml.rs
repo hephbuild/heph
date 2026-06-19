@@ -4,13 +4,24 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-// The engine-free plugin option helpers now live in the contract crate;
-// re-export so `config_yaml::{Options, decode_opt, deny_unknown}` keep resolving.
+// The engine-free plugin option helpers live in the contract crate;
+// re-export so `{Options, decode_opt, deny_unknown}` keep resolving.
 pub use hplugin::config::{Options, decode_opt, deny_unknown};
+
+/// Default cap on in-flight requests to one remote cache (object_store
+/// `LimitStore`). Lives here because the YAML layer applies it as the default for
+/// an omitted `concurrency`; the engine re-exports it for its own callers.
+pub const DEFAULT_CACHE_CONCURRENCY: usize = 10;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConfigYaml {
+    /// Pinned heph version (or, in future, a version constraint) this workspace
+    /// expects. When set and it differs from the running binary, the self-upgrade
+    /// check downloads the pinned release and re-execs into it. Omit to disable
+    /// self-upgrade for the workspace.
+    #[serde(default)]
+    pub version: Option<String>,
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     /// Every provider/driver — built-in or external — is declared as a single
@@ -107,13 +118,9 @@ impl RemoteCacheConfigPatch {
             uri,
             read: self.read.unwrap_or(true),
             write: self.write.unwrap_or(true),
-            concurrency: self.concurrency.unwrap_or_else(default_cache_concurrency),
+            concurrency: self.concurrency.unwrap_or(DEFAULT_CACHE_CONCURRENCY),
         })
     }
-}
-
-fn default_cache_concurrency() -> usize {
-    crate::engine::remote_cache::DEFAULT_CACHE_CONCURRENCY
 }
 
 /// Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.
@@ -144,7 +151,7 @@ impl ConfigYaml {
     }
 
     /// Apply `other` on top of `self`, mutating in place. Used to layer profile
-    /// configs over the base `.hephconfig2` (see [`load_from_root`]).
+    /// configs over the base `.hephconfig` (see [`load_from_root`]).
     ///
     /// Optional/scalar fields override only when present in `other` — a profile
     /// that omits a field leaves the base value untouched. `caches` deep-merge by
@@ -152,6 +159,9 @@ impl ConfigYaml {
     /// `read`/`write` while inheriting the base `uri`), and `plugins` merge by
     /// identity (matching entry replaced, new ones appended in order).
     pub fn merge(&mut self, other: ConfigYaml) {
+        if other.version.is_some() {
+            self.version = other.version;
+        }
         if other.home_dir.is_some() {
             self.home_dir = other.home_dir;
         }
@@ -447,11 +457,10 @@ pub const CONFIG_FILE_NAME: &str = ".hephconfig";
 pub const CONFIG_FILE_NAME_LEGACY: &str = ".hephconfig2";
 
 /// Candidate config filenames in priority order. The single source of truth for
-/// these names — [`load_from_root`] and the root discovery in
-/// [`crate::engine::get_root`] both build on it. The migration `.hephconfig2`
-/// wins when both exist; the canonical `.hephconfig` is read only when no
-/// `.hephconfig2` is present. The chosen name also drives the profile filenames
-/// (see [`load_with_profiles`]).
+/// these names — [`load_from_root`] and the root discovery in [`get_root`] both
+/// build on it. The migration `.hephconfig2` wins when both exist; the canonical
+/// `.hephconfig` is read only when no `.hephconfig2` is present. The chosen name
+/// also drives the profile filenames (see [`load_with_profiles`]).
 pub const CONFIG_FILE_NAMES: &[&str] = &[CONFIG_FILE_NAME_LEGACY, CONFIG_FILE_NAME];
 
 /// Pick the config filename present at `root`, preferring the migration
@@ -528,7 +537,6 @@ pub fn load(path: &Path) -> anyhow::Result<ConfigYaml> {
     Ok(cfg)
 }
 
-/// Decode a single option value into `T`. Returns the default if the key is absent.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +587,32 @@ plugins:
             cfg.plugins[2].identifier,
             PluginIdentifier::Path(".heph3/heph-go-plugin.json".into())
         );
+    }
+
+    #[test]
+    fn parses_version_field() {
+        let cfg: ConfigYaml = serde_yaml::from_str("version: v1.2.3\n").expect("parse");
+        assert_eq!(cfg.version.as_deref(), Some("v1.2.3"));
+    }
+
+    #[test]
+    fn version_omitted_is_none() {
+        let cfg: ConfigYaml = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        assert!(cfg.version.is_none());
+    }
+
+    #[test]
+    fn merge_overrides_version_only_when_present() {
+        let mut base: ConfigYaml = serde_yaml::from_str("version: v1.0.0\n").expect("parse base");
+        // Overlay without `version` leaves the base pin untouched.
+        let overlay: ConfigYaml = serde_yaml::from_str("homeDir: .prof\n").expect("parse overlay");
+        base.merge(overlay);
+        assert_eq!(base.version.as_deref(), Some("v1.0.0"));
+
+        // Overlay with `version` wins.
+        let overlay2: ConfigYaml = serde_yaml::from_str("version: v2.0.0\n").expect("parse o2");
+        base.merge(overlay2);
+        assert_eq!(base.version.as_deref(), Some("v2.0.0"));
     }
 
     #[test]
@@ -981,6 +1015,17 @@ caches:
     }
 
     #[test]
+    fn version_layered_by_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join(".hephconfig"), "version: v1.0.0\n").expect("write base");
+        std::fs::write(root.join("ci.hephconfig"), "version: v2.0.0\n").expect("write profile");
+
+        let cfg = load_with_profiles(root, &["ci"]).expect("load");
+        assert_eq!(cfg.version.as_deref(), Some("v2.0.0"));
+    }
+
+    #[test]
     fn config_file_name_prefers_legacy_then_canonical() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
@@ -1028,43 +1073,6 @@ caches:
 
         let cfg = load_with_profiles(root, &["a"]).expect("load");
         assert_eq!(cfg.home_dir.as_deref(), Some(Path::new(".a")));
-    }
-
-    #[test]
-    fn resolve_applies_defaults_for_empty_yaml() {
-        // An empty config resolves to the engine defaults, with home_dir
-        // root-joined to `.heph3`.
-        let yaml = ConfigYaml::default();
-        let root = Path::new("/repo");
-        let cfg = yaml.resolve(root).expect("resolve");
-
-        let defaults = crate::engine::Config::default();
-        assert_eq!(cfg.root, root);
-        assert_eq!(cfg.home_dir, root.join(".heph3"));
-        assert_eq!(cfg.mem_cache, defaults.mem_cache);
-        assert_eq!(cfg.tmp_cache, defaults.tmp_cache);
-        assert_eq!(cfg.lock_backend, defaults.lock_backend);
-        assert_eq!(cfg.spill_threshold_bytes, defaults.spill_threshold_bytes);
-        assert!(cfg.telemetry_enabled);
-        assert!(cfg.remote_caches.is_empty());
-    }
-
-    #[test]
-    fn resolve_overrides_present_fields() {
-        let yaml: ConfigYaml = serde_yaml::from_str(
-            "homeDir: .custom\nlock:\n  backend: mem\ntelemetry:\n  enabled: false\ncaches:\n  r:\n    uri: s3://b/p\n    write: false\n",
-        )
-        .expect("parse");
-        let cfg = yaml.resolve(Path::new("/repo")).expect("resolve");
-
-        assert_eq!(cfg.home_dir, Path::new("/repo/.custom"));
-        assert_eq!(cfg.lock_backend, crate::engine::LockBackend::Mem);
-        assert!(!cfg.telemetry_enabled);
-        assert_eq!(cfg.remote_caches.len(), 1);
-        let r = &cfg.remote_caches[0];
-        assert_eq!(r.uri, "s3://b/p");
-        assert!(r.read);
-        assert!(!r.write);
     }
 
     #[test]
@@ -1138,13 +1146,5 @@ plugins:
         let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - bogus: x\n")
             .expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
-    }
-
-    #[test]
-    fn resolve_errors_on_cache_missing_uri() {
-        let yaml: ConfigYaml =
-            serde_yaml::from_str("caches:\n  r:\n    write: false\n").expect("parse");
-        let err = yaml.resolve(Path::new("/repo")).expect_err("must error");
-        assert!(format!("{err:#}").contains("uri"), "{err}");
     }
 }
