@@ -33,6 +33,22 @@
 
 use hcore::version;
 
+/// Why a self-upgrade attempt could not complete. Lets the caller treat a
+/// missing workspace config differently from a genuine upgrade failure (the
+/// `version` command tolerates [`NoConfig`](SelfUpgradeError::NoConfig) so it
+/// still works outside a workspace).
+#[derive(Debug, thiserror::Error)]
+pub enum SelfUpgradeError {
+    /// No `.hephconfig` was found in this or any parent directory — not in a
+    /// heph workspace, so there is no version pin to act on.
+    #[error("no .hephconfig found in this or any parent directory")]
+    NoConfig,
+    /// The pin was read but the upgrade itself failed (config parse, download,
+    /// install, or exec).
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
 /// Base URL of the published release artifacts. Each release tags a set of
 /// `heph_<os>_<arch>` binaries under `<base>/<tag>/`.
 const ARTIFACTS_BASE: &str = "https://github.com/hephbuild/heph-artifacts-v1/releases/download";
@@ -70,17 +86,15 @@ enum Decision {
 /// never be fatal: the caller is expected to warn and continue with the current
 /// binary.
 #[cfg(unix)]
-pub fn maybe_self_upgrade() -> anyhow::Result<()> {
+pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
     if env_opts_out() {
         return Ok(());
     }
 
     let current = version::VERSION;
-    let root = match hconfig::get_root() {
-        Ok(root) => root,
-        // Not inside a heph workspace: no config, nothing to pin against.
-        Err(_) => return Ok(()),
-    };
+    // Not inside a heph workspace: no config, nothing to pin against. Surfaced as
+    // a distinct error so the caller can tolerate it for `heph version`.
+    let root = hconfig::get_root().map_err(|_e| SelfUpgradeError::NoConfig)?;
     let cfg = hconfig::load_from_root(&root)?;
     let Some(pin) = cfg.version.as_deref() else {
         return Ok(());
@@ -96,13 +110,14 @@ pub fn maybe_self_upgrade() -> anyhow::Result<()> {
             tracing::info!(from = current, to = %target, "self-upgrading heph");
             let binary = imp::ensure_binary(&target)?;
             // Replaces the process image; only returns on failure.
-            imp::exec_into(&binary)
+            imp::exec_into(&binary)?;
+            Ok(())
         }
     }
 }
 
 #[cfg(not(unix))]
-pub fn maybe_self_upgrade() -> anyhow::Result<()> {
+pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
     // Self-upgrade relies on `execv`/`flock`; heph only ships on unix.
     Ok(())
 }

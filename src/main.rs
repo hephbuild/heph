@@ -57,12 +57,30 @@ fn main() -> ExitCode {
     let sink = log::init();
     heph::tui::panic::install(sink.clone());
 
+    // Parse once into `ArgMatches`, then into the typed `Cli`. Done before the
+    // self-upgrade so we can tell whether this is `version` (which must keep
+    // working outside a workspace). Keeping the matches also lets the telemetry
+    // reporter enumerate the exact args/flags set — generically, for every
+    // command, with no per-command list.
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+
     // Self-upgrade to the workspace-pinned version before anything else of
     // substance. On a successful upgrade this re-execs and never returns; it runs
-    // *before* the supervisor fork so a re-exec can't orphan a sidecar. A failure
-    // is non-fatal — warn and carry on with the current binary.
-    if let Err(e) = heph::selfupdate::maybe_self_upgrade() {
-        warn!(error = %format!("{e:#}"), "Self-upgrade failed; continuing with current binary");
+    // *before* the supervisor fork so a re-exec can't orphan a sidecar. An upgrade
+    // failure is fatal — except `heph version`, which must run outside a workspace,
+    // so it tolerates a missing `.hephconfig` (but not a genuine upgrade failure).
+    match heph::selfupdate::maybe_self_upgrade() {
+        Ok(()) => {}
+        Err(heph::selfupdate::SelfUpgradeError::NoConfig)
+            if matches!(cli.command, commands::Commands::Version(_)) => {}
+        Err(e) => {
+            error!(error = %format!("{e:#}"), "Self-upgrade failed");
+            return ExitCode::FAILURE;
+        }
     }
 
     // Fork the supervisor sidecar that will SIGKILL every tracked child
@@ -71,15 +89,6 @@ fn main() -> ExitCode {
         error!(error = %format!("{e:#}"), "Failed to start process supervisor");
         return ExitCode::FAILURE;
     }
-
-    // Parse once into `ArgMatches`, then into the typed `Cli`. Keeping the
-    // matches lets the telemetry reporter enumerate the exact args/flags that
-    // were set — generically, for every command, with no per-command list.
-    let matches = Cli::command().get_matches();
-    let cli = match Cli::from_arg_matches(&matches) {
-        Ok(cli) => cli,
-        Err(e) => e.exit(),
-    };
 
     // Telemetry decision is taken up front (config read), but the flush happens
     // at exit: this run's event is spooled, then we try to send it (plus any

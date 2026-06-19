@@ -10,6 +10,7 @@ workspace = true
 hconfig = { package = "config", path = "../config" }
 hcore = { package = "core", path = "../core" }
 anyhow = "1.0.102"
+thiserror = "2.0.18"
 tracing = "0.1"
 # Blocking HTTP client, used only to download the pinned release binary. rustls
 # avoids a system OpenSSL link; blocking runs on its own thread (matches the
