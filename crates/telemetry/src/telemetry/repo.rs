@@ -13,11 +13,13 @@
 //! Sources for the root commit, in order:
 //! 1. Local git: `git rev-list --max-parents=0 HEAD`.
 //! 2. On a shallow clone whose history can't reach the root (the default depth-1
-//!    GitHub Actions checkout), the GitHub REST API: ask for one commit, read the
-//!    `Link` header to jump to the last page, and read the first commit's SHA
-//!    from there. Because this yields the *same* root SHA a full clone would, the
-//!    fingerprint is identical to one computed locally — same namespace, no
-//!    special-casing downstream. Gated to GitHub Actions with a token present.
+//!    GitHub Actions checkout), the GitHub REST API: ask for one commit (starting
+//!    from `GITHUB_SHA`/HEAD so the walk follows HEAD's ancestry, matching local
+//!    git), read the `Link` header to jump to the last page, and read the first
+//!    commit's SHA from there. Because this yields the *same* root SHA a full
+//!    clone would, the fingerprint is identical to one computed locally — same
+//!    namespace, no special-casing downstream. Gated to GitHub Actions with a
+//!    token present.
 //!
 //! Everything here is strictly best-effort. No git, not a repo, no token, a
 //! failed API call, an unreadable cache — any of these just yields `None`, and
@@ -280,9 +282,10 @@ fn git(work_dir: &Path, args: &[&str]) -> Option<String> {
 /// fallback. Returns `None` unless we're in GitHub Actions with a token and a
 /// known `owner/repo`; every failure is logged at `trace` and swallowed.
 ///
-/// Two hops: GET one commit, read the `Link` header's `rel="last"` URL (the
-/// oldest commit's page), then GET that and read its SHA. A repo with a single
-/// page (≤1 commit) has no `Link` header, so the first response already holds it.
+/// Two hops: GET one commit (starting from `GITHUB_SHA`/HEAD when known), read
+/// the `Link` header's `rel="last"` URL (the oldest commit's page), then GET that
+/// and read its SHA. A repo with a single page (≤1 commit) has no `Link` header,
+/// so the first response already holds it.
 fn github_root_commit() -> Option<String> {
     if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
         return None;
@@ -290,6 +293,10 @@ fn github_root_commit() -> Option<String> {
     let token = nonempty_env("GITHUB_TOKEN")?;
     let repo = nonempty_env("GITHUB_REPOSITORY")?; // "owner/name"
     let api = nonempty_env("GITHUB_API_URL").unwrap_or_else(|| API_DEFAULT.to_string());
+    // Walk HEAD's own ancestry (so the root matches local `rev-list HEAD`), not
+    // the default branch's. `GITHUB_SHA` is the checked-out commit; absent, the
+    // API defaults to the default branch.
+    let head = nonempty_env("GITHUB_SHA");
 
     // reqwest::blocking spins up its own runtime; we're already on a dedicated
     // warmer thread (never the async runtime), so this is safe.
@@ -304,7 +311,12 @@ fn github_root_commit() -> Option<String> {
         }
     };
 
-    root_via_api(|url| gh_get(&client, url, &token), &api, &repo)
+    root_via_api(
+        |url| gh_get(&client, url, &token),
+        &api,
+        &repo,
+        head.as_deref(),
+    )
 }
 
 /// A trimmed, non-empty env var, or `None`.
@@ -325,13 +337,23 @@ struct HttpResp {
 }
 
 /// Orchestrate the two-hop root-commit lookup over an injected fetcher (so the
-/// pagination/JSON logic is testable without the network).
-fn root_via_api(fetch: impl Fn(&str) -> Option<HttpResp>, api: &str, repo: &str) -> Option<String> {
-    let first_url = format!(
+/// pagination/JSON logic is testable without the network). When `head` is set,
+/// the listing starts from it (HEAD's ancestry) instead of the default branch.
+fn root_via_api(
+    fetch: impl Fn(&str) -> Option<HttpResp>,
+    api: &str,
+    repo: &str,
+    head: Option<&str>,
+) -> Option<String> {
+    let mut first_url = format!(
         "{}/repos/{}/commits?per_page=1",
         api.trim_end_matches('/'),
         repo
     );
+    if let Some(head) = head {
+        first_url.push_str("&sha=");
+        first_url.push_str(head);
+    }
     let first = fetch(&first_url)?;
     let body = match first.link.as_deref().and_then(parse_rel_last) {
         // Jump straight to the last page — its single commit is the root.
@@ -671,7 +693,7 @@ mod tests {
             }
         };
         assert_eq!(
-            root_via_api(fetch, "https://api.test", "o/r").as_deref(),
+            root_via_api(fetch, "https://api.test", "o/r", None).as_deref(),
             Some("rootsha")
         );
     }
@@ -686,8 +708,29 @@ mod tests {
             })
         };
         assert_eq!(
-            root_via_api(fetch, "https://api.test", "o/r").as_deref(),
+            root_via_api(fetch, "https://api.test", "o/r", None).as_deref(),
             Some("only")
         );
+    }
+
+    #[test]
+    fn root_via_api_pins_to_head_sha() {
+        // A HEAD ref is threaded into the listing as `&sha=`, so the walk follows
+        // HEAD's ancestry rather than the default branch.
+        let seen = Cell::new(false);
+        let fetch = |url: &str| {
+            if url.contains("&sha=headref") {
+                seen.set(true);
+            }
+            Some(HttpResp {
+                link: None,
+                body: r#"[{"sha":"root"}]"#.to_string(),
+            })
+        };
+        assert_eq!(
+            root_via_api(fetch, "https://api.test", "o/r", Some("headref")).as_deref(),
+            Some("root")
+        );
+        assert!(seen.get(), "request must pin to the HEAD sha");
     }
 }
