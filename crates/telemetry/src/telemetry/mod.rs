@@ -216,6 +216,25 @@ fn distinct_id(dir: &std::path::Path) -> anyhow::Result<String> {
 /// CI (ephemeral, no next run) blocks to completion. The single entry point the
 /// CLI calls at exit; everything below is best-effort and never affects the
 /// command's outcome.
+/// Kick off background computation of the repo fingerprint so the exit path
+/// never runs git. Fire-and-forget: spawns a detached thread and returns at once.
+/// Call once at startup when telemetry is enabled; the result is cached and read
+/// back (best-effort) by [`record_invocation`]. If the command exits before the
+/// warmer finishes, the attr is simply absent this run and lands on the next.
+pub fn prewarm() {
+    let spawned = std::thread::Builder::new()
+        .name("heph-telemetry-warm".to_string())
+        .spawn(|| match config_dir() {
+            Ok(dir) => repo::prewarm(&dir),
+            Err(e) => tracing::debug!(error = %format!("{e:#}"), "telemetry prewarm skipped"),
+        });
+    // A failure to even spawn the warmer is ignored — strictly best-effort. The
+    // JoinHandle is intentionally dropped (detached); we never join it.
+    if let Err(e) = spawned {
+        tracing::debug!(error = %format!("{e:#}"), "telemetry prewarm thread not spawned");
+    }
+}
+
 pub fn record_invocation(matches: &ArgMatches, error: Option<&anyhow::Error>, took: Duration) {
     // Full subcommand path ("inspect deps", "tool gc"), plus the args set at
     // every nesting level.
@@ -320,9 +339,10 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<()> {
     let plugins = PLUGINS.get().cloned().unwrap_or_default();
 
     let dir = config_dir()?;
-    // Best-effort, cached repo fingerprint; absent when it can't be determined.
-    let fingerprint = repo::repo_fingerprint(&dir);
-    let props = build_props(&ctx, &stats, plugins, fingerprint.as_deref());
+    // Read-only: the startup warmer (see `prewarm`) does the git work off the hot
+    // path, so the exit path never blocks. Absent on a cold cache; lands next run.
+    let fingerprint = repo::cached(&dir);
+    let props = build_props(&ctx, &stats, plugins, fingerprint.as_ref());
 
     let event = SpooledEvent {
         uuid: uuid::Uuid::new_v4().to_string(),
@@ -340,7 +360,7 @@ fn build_props(
     ctx: &ReportContext<'_>,
     stats: &TelemetrySnapshot,
     plugins: Plugins,
-    repo_fingerprint: Option<&str>,
+    repo_fingerprint: Option<&repo::Fingerprint>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut props = serde_json::Map::new();
     let mut put = |k: &str, v: serde_json::Value| drop(props.insert(k.to_string(), v));
@@ -368,11 +388,14 @@ fn build_props(
         }
     }
     put("ci", is_ci().into());
-    // Stable per-repo id (SHA-256 of the root commit), grouping events by project
-    // without identifying it. Absent when not in a git repo / git is unavailable
-    // / a shallow clone can't reach the root.
+    // Stable per-repo id grouping events by project without identifying it, plus
+    // the identity it was derived from (root commit vs CI repo id — kept distinct
+    // so the two namespaces aren't conflated). Absent when not in a git repo /
+    // git is unavailable / a shallow clone can't reach the root and there's no CI
+    // repo id.
     if let Some(fp) = repo_fingerprint {
-        put("repo_fingerprint", fp.into());
+        put("repo_fingerprint", fp.value.clone().into());
+        put("repo_fingerprint_source", fp.source.into());
     }
     // Command + selector shape + the set of flags used (names only).
     put("command", ctx.command.into());
@@ -565,7 +588,11 @@ mod tests {
             failure: None,
             duration_ms: 1,
         };
-        let props = build_props(&ctx, &snapshot, Plugins::default(), Some("deadbeef"));
+        let fp = repo::Fingerprint {
+            value: "deadbeef".to_string(),
+            source: "root_commit",
+        };
+        let props = build_props(&ctx, &snapshot, Plugins::default(), Some(&fp));
 
         // posthog-rs stamps `$os` / `$os_version` itself, so build_props must
         // not carry an `os` of its own (nor the `$`-prefixed keys).
@@ -577,14 +604,21 @@ mod tests {
             props.get("arch").and_then(|v| v.as_str()),
             Some(std::env::consts::ARCH)
         );
-        // The repo fingerprint is carried through when present.
+        // The repo fingerprint + its source are carried through when present.
         assert_eq!(
             props.get("repo_fingerprint").and_then(|v| v.as_str()),
             Some("deadbeef")
         );
+        assert_eq!(
+            props
+                .get("repo_fingerprint_source")
+                .and_then(|v| v.as_str()),
+            Some("root_commit")
+        );
         // ...and omitted entirely when it can't be determined.
         let absent = build_props(&ctx, &snapshot, Plugins::default(), None);
         assert!(!absent.contains_key("repo_fingerprint"));
+        assert!(!absent.contains_key("repo_fingerprint_source"));
     }
 
     #[test]
