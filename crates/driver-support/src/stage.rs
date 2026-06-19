@@ -420,6 +420,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_removal_succeeds_over_readonly_hardlinks() {
+        // Regression: a sandbox holds hardlinks to read-only staged files.
+        // Removing the sandbox must succeed (unlink needs write on the sandbox
+        // dir, not on the read-only inode) and must NOT destroy the staged copy
+        // (its inode survives via the remaining stage-side link).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let sandbox = tmp.path().join("sandbox/ws");
+        let c = content("rm1", &[("d/f.txt", "x", true)]); // +x → 0o555 staged
+
+        stage_and_link(&c, &stage, "k", &sandbox, None, &[], &ct())
+            .await
+            .expect("stage");
+
+        let staged = stage.join("k").join("rm1").join("d/f.txt");
+        assert!(sandbox.join("d/f.txt").exists());
+
+        // The OS sandbox cleaner uses exactly this call.
+        hcore::fsutil::remove_dir_all(&sandbox).expect("sandbox removal must succeed");
+
+        assert!(!sandbox.exists(), "sandbox gone");
+        assert!(staged.exists(), "staged copy survives the sandbox teardown");
+    }
+
+    #[tokio::test]
     async fn staged_tree_is_read_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
