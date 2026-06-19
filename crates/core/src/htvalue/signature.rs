@@ -27,6 +27,18 @@ pub enum ParamType {
     /// Accepts any one of several types, e.g. `cache` being `bool | map[bool]`.
     /// Rendered as the members joined by ` | `; matches if any member matches.
     Union(Vec<ParamType>),
+    /// A record with named, heterogeneously-typed fields. Unlike [`ParamType::Map`]
+    /// (homogeneous value type, arbitrary keys), a struct fixes a known set of
+    /// field names, each with its own type. All fields are optional: a value
+    /// matches if every present key names a known field of matching type.
+    Struct(Vec<StructField>),
+}
+
+/// One named field of a [`ParamType::Struct`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructField {
+    pub name: String,
+    pub ty: ParamType,
 }
 
 impl ParamType {
@@ -45,6 +57,19 @@ impl ParamType {
         ParamType::Union(types)
     }
 
+    /// Convenience: a struct with the given `(name, type)` fields.
+    pub fn strukt(fields: Vec<(&str, ParamType)>) -> ParamType {
+        ParamType::Struct(
+            fields
+                .into_iter()
+                .map(|(name, ty)| StructField {
+                    name: name.to_string(),
+                    ty,
+                })
+                .collect(),
+        )
+    }
+
     /// Human-readable name used in rendered signatures and error messages.
     pub fn render(&self) -> String {
         match self {
@@ -61,6 +86,14 @@ impl ParamType {
                 .map(ParamType::render)
                 .collect::<Vec<_>>()
                 .join(" | "),
+            ParamType::Struct(fields) => {
+                let rendered = fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, f.ty.render()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("struct({rendered})")
+            }
         }
     }
 
@@ -79,6 +112,14 @@ impl ParamType {
             (ParamType::Null, Value::Null()) => true,
             (ParamType::List(inner), Value::List(items)) => items.iter().all(|e| inner.matches(e)),
             (ParamType::Map(value), Value::Map(m)) => m.values().all(|e| value.matches(e)),
+            // Every present key must name a known field whose type matches.
+            // Fields are optional, so missing keys are fine; unknown keys fail.
+            (ParamType::Struct(fields), Value::Map(m)) => m.iter().all(|(k, v)| {
+                fields
+                    .iter()
+                    .find(|f| &f.name == k)
+                    .is_some_and(|f| f.ty.matches(v))
+            }),
             _ => false,
         }
     }
@@ -294,6 +335,60 @@ mod tests {
             Value::Bool(true)
         )]))));
         assert!(!ty.matches(&Value::Int(3)));
+    }
+
+    #[test]
+    fn struct_renders_fields_in_order() {
+        let ty = ParamType::strukt(vec![
+            ("env", ParamType::map(ParamType::String)),
+            ("pass_env", ParamType::list(ParamType::String)),
+        ]);
+        assert_eq!(
+            ty.render(),
+            "struct(env: map[string], pass_env: list[string])"
+        );
+    }
+
+    #[test]
+    fn struct_matches_subset_of_known_fields_and_rejects_unknown() {
+        use std::collections::HashMap;
+        let ty = ParamType::strukt(vec![
+            ("env", ParamType::map(ParamType::String)),
+            ("pass_env", ParamType::list(ParamType::String)),
+        ]);
+        // Empty map and a subset both match (fields optional).
+        assert!(ty.matches(&Value::Map(HashMap::new())));
+        assert!(ty.matches(&Value::Map(HashMap::from([(
+            "pass_env".to_string(),
+            Value::List(vec![Value::String("HOME".to_string())])
+        )]))));
+        // Wrong value type for a known field fails.
+        assert!(!ty.matches(&Value::Map(HashMap::from([(
+            "env".to_string(),
+            Value::Bool(true)
+        )]))));
+        // Unknown key fails.
+        assert!(!ty.matches(&Value::Map(HashMap::from([(
+            "nope".to_string(),
+            Value::String("x".to_string())
+        )]))));
+    }
+
+    #[test]
+    fn bool_or_struct_union_accepts_both_forms() {
+        use std::collections::HashMap;
+        let ty = ParamType::union(vec![
+            ParamType::Bool,
+            ParamType::strukt(vec![("env", ParamType::map(ParamType::String))]),
+        ]);
+        assert!(ty.matches(&Value::Bool(false)));
+        assert!(ty.matches(&Value::Map(HashMap::from([(
+            "env".to_string(),
+            Value::Map(HashMap::from([(
+                "K".to_string(),
+                Value::String("v".to_string())
+            )]))
+        )]))));
     }
 
     #[test]

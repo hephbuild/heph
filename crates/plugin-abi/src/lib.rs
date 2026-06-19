@@ -17,7 +17,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 
 /// ABI semantic version. Major must match exactly between host and plugin;
 /// minor is negotiated to `min(host, plugin)` at handshake.
-pub const ABI_SEMVER: &str = "0.1.0";
+pub const ABI_SEMVER: &str = "0.2.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

@@ -13,6 +13,18 @@ pub struct GoEnv<'a> {
     pub gocache: &'a str,
 }
 
+/// Extra environment configuration plumbed onto the `test`/`xtest` run targets
+/// from a package's `provider_state(provider="go", test={...})`. Mirrors the
+/// exec driver's env knobs: `env`/`pass_env` are hashed (affect cache),
+/// `runtime_env`/`runtime_pass_env` are runtime-only (not hashed).
+#[derive(Debug, Default, Clone)]
+pub struct TestEnv {
+    pub env: BTreeMap<String, String>,
+    pub runtime_env: BTreeMap<String, String>,
+    pub pass_env: Vec<String>,
+    pub runtime_pass_env: Vec<String>,
+}
+
 /// Compile the test package (GoFiles + TestGoFiles) with `go tool compile` in test mode.
 ///
 /// Output: `<pkgname>_test.a`
@@ -229,7 +241,12 @@ pub fn build_test_spec(
 /// `data_query_addr` is a `@heph/query` addr selecting sibling targets labeled
 /// `go_test_data`. The engine expands the query lazily, so this provider does
 /// not need to scan the package itself.
-pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> TargetSpec {
+pub fn test_spec(
+    addr: Addr,
+    build_test_addr: Addr,
+    data_query_addr: &Addr,
+    test_env: &TestEnv,
+) -> TargetSpec {
     // exec driver passes argv literally — no shell expansion. The engine
     // stages dep outputs at <pkg>/<file> under ws_dir, and the process cwd
     // is the target's package dir (engine/driver_managed_os.rs:78). The
@@ -256,6 +273,28 @@ pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> T
     config.insert("run".to_string(), Value::List(run));
     config.insert("deps".to_string(), Value::Map(deps_map));
     config.insert("out".to_string(), Value::Map(HashMap::new()));
+
+    // Plumb package-scoped test env from provider_state. Omitted keys keep the
+    // spec minimal so cache fingerprints are unchanged for the common case.
+    if !test_env.env.is_empty() {
+        config.insert("env".to_string(), str_map_value(&test_env.env));
+    }
+    if !test_env.runtime_env.is_empty() {
+        config.insert(
+            "runtime_env".to_string(),
+            str_map_value(&test_env.runtime_env),
+        );
+    }
+    if !test_env.pass_env.is_empty() {
+        config.insert("pass_env".to_string(), str_list_value(&test_env.pass_env));
+    }
+    if !test_env.runtime_pass_env.is_empty() {
+        config.insert(
+            "runtime_pass_env".to_string(),
+            str_list_value(&test_env.runtime_pass_env),
+        );
+    }
+
     TargetSpec {
         addr,
         driver: "exec".to_string(),
@@ -266,6 +305,18 @@ pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> T
 }
 
 // ---- helpers ----
+
+fn str_map_value(m: &BTreeMap<String, String>) -> Value {
+    Value::Map(
+        m.iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect(),
+    )
+}
+
+fn str_list_value(v: &[String]) -> Value {
+    Value::List(v.iter().cloned().map(Value::String).collect())
+}
 
 fn compile_run_script(
     p_flag: &str,
@@ -783,6 +834,7 @@ mod tests {
             mk_addr("mypkg", "test"),
             build_addr.clone(),
             &query_addr("mypkg"),
+            &TestEnv::default(),
         );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m.clone(),
@@ -802,6 +854,7 @@ mod tests {
             mk_addr("mypkg", "test"),
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
+            &TestEnv::default(),
         );
         assert_eq!(spec.driver, "exec");
         let run = match spec.config.get("run").expect("run present") {
@@ -819,6 +872,64 @@ mod tests {
             argv,
             vec!["./test_binary".to_string(), "-test.v".to_string()]
         );
+    }
+
+    #[test]
+    fn test_test_spec_omits_env_keys_when_test_env_empty() {
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+            &TestEnv::default(),
+        );
+        assert!(!spec.config.contains_key("env"));
+        assert!(!spec.config.contains_key("runtime_env"));
+        assert!(!spec.config.contains_key("pass_env"));
+        assert!(!spec.config.contains_key("runtime_pass_env"));
+    }
+
+    #[test]
+    fn test_test_spec_plumbs_all_env_knobs() {
+        let test_env = TestEnv {
+            env: BTreeMap::from([("FOO".to_string(), "1".to_string())]),
+            runtime_env: BTreeMap::from([("BAR".to_string(), "2".to_string())]),
+            pass_env: vec!["HOME".to_string()],
+            runtime_pass_env: vec!["PATH".to_string()],
+        };
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+            &test_env,
+        );
+
+        let env = match spec.config.get("env").expect("env present") {
+            Value::Map(m) => m.clone(),
+            _ => panic!("env must be a map"),
+        };
+        assert!(matches!(env.get("FOO"), Some(Value::String(s)) if s == "1"));
+
+        let renv = match spec.config.get("runtime_env").expect("runtime_env present") {
+            Value::Map(m) => m.clone(),
+            _ => panic!("runtime_env must be a map"),
+        };
+        assert!(matches!(renv.get("BAR"), Some(Value::String(s)) if s == "2"));
+
+        let pass = match spec.config.get("pass_env").expect("pass_env present") {
+            Value::List(v) => v.clone(),
+            _ => panic!("pass_env must be a list"),
+        };
+        assert!(matches!(&pass[0], Value::String(s) if s == "HOME"));
+
+        let rpass = match spec
+            .config
+            .get("runtime_pass_env")
+            .expect("runtime_pass_env present")
+        {
+            Value::List(v) => v.clone(),
+            _ => panic!("runtime_pass_env must be a list"),
+        };
+        assert!(matches!(&rpass[0], Value::String(s) if s == "PATH"));
     }
 
     #[test]
@@ -890,6 +1001,7 @@ mod tests {
             mk_addr("mypkg", "test"),
             mk_addr("mypkg", "build_test"),
             &query_addr("mypkg"),
+            &TestEnv::default(),
         );
         assert!(spec.labels.contains(&"test".to_string()));
         assert!(spec.labels.contains(&"go-test".to_string()));
@@ -902,6 +1014,7 @@ mod tests {
             mk_addr("mypkg", "test"),
             mk_addr("mypkg", "build_test"),
             &qa,
+            &TestEnv::default(),
         );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m.clone(),

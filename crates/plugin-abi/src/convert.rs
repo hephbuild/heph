@@ -81,10 +81,10 @@ pub fn value_from_pb(v: pb::Value) -> Value {
 // `call_function`. The host reconstructs the `FnSignature` to enforce arity/type
 // and render it (`heph inspect functions`, LSP hover).
 
-use hcore::htvalue::signature::{FnSignature, Param, ParamType};
+use hcore::htvalue::signature::{FnSignature, Param, ParamType, StructField};
 
 pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
-    use pb::param_type::{Kind, Scalar, Union};
+    use pb::param_type::{Kind, Scalar, Struct, Union, r#struct};
     let kind = match t {
         ParamType::String => Kind::Scalar(Scalar::String as i32),
         ParamType::Bool => Kind::Scalar(Scalar::Bool as i32),
@@ -96,6 +96,15 @@ pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
         ParamType::Map(value) => Kind::Map(Box::new(param_type_to_pb(value))),
         ParamType::Union(types) => Kind::Union(Union {
             types: types.iter().map(param_type_to_pb).collect(),
+        }),
+        ParamType::Struct(fields) => Kind::Struct(Struct {
+            fields: fields
+                .iter()
+                .map(|f| r#struct::Field {
+                    name: f.name.clone(),
+                    ty: Some(param_type_to_pb(&f.ty)),
+                })
+                .collect(),
         }),
     };
     pb::ParamType { kind: Some(kind) }
@@ -117,6 +126,15 @@ pub fn param_type_from_pb(t: pb::ParamType) -> ParamType {
         Some(Kind::Union(u)) => {
             ParamType::union(u.types.into_iter().map(param_type_from_pb).collect())
         }
+        Some(Kind::Struct(s)) => ParamType::Struct(
+            s.fields
+                .into_iter()
+                .map(|f| StructField {
+                    name: f.name,
+                    ty: f.ty.map(param_type_from_pb).unwrap_or(ParamType::Null),
+                })
+                .collect(),
+        ),
         None => ParamType::Null,
     }
 }
@@ -811,6 +829,20 @@ mod tests {
             ),
         ]));
         assert_eq!(value_from_pb(value_to_pb(&v)), v);
+    }
+
+    #[test]
+    fn param_type_struct_roundtrip() {
+        // `bool | struct(env: map[string], pass_env: list[string])` — exercises
+        // the Struct wire kind and its nested ParamTypes.
+        let ty = ParamType::union(vec![
+            ParamType::Bool,
+            ParamType::strukt(vec![
+                ("env", ParamType::map(ParamType::String)),
+                ("pass_env", ParamType::list(ParamType::String)),
+            ]),
+        ]);
+        assert_eq!(param_type_from_pb(param_type_to_pb(&ty)), ty);
     }
 
     #[test]
