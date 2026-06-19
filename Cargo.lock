@@ -744,9 +744,7 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "driver-bridge",
  "memoize",
- "plugin",
  "serde",
  "serde_yaml",
  "tempfile",
@@ -1236,6 +1234,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "config",
  "core",
  "driver-support",
  "model",
@@ -3519,6 +3518,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "config",
  "core",
  "erased-serde 0.4.10",
  "futures",

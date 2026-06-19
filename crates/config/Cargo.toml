@@ -7,8 +7,6 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-hplugin = { package = "plugin", path = "../plugin" }
-hdriver-bridge = { package = "driver-bridge", path = "../driver-bridge" }
 anyhow = "1.0.102"
 memoize = "0.6.0"
 serde = { version = "1", features = ["derive"] }

@@ -1,15 +1,6 @@
 //! The resolved FUSE-overlay decision the managed-driver bridge acts on. The
-//! YAML parsing (`fuse: { enabled: true | false | auto }`) lives in the engine's
-//! central config module (`engine::config_yaml`), which resolves it to one of
-//! these.
+//! type and the YAML parsing (`fuse: { enabled: true | false | auto }`) both
+//! live in the foundational `config` crate (`hconfig`); re-exported here so the
+//! bridge keeps importing `fuseconfig::FuseMode`.
 
-/// Resolved decision used by the engine + bridge. Independent of YAML shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FuseMode {
-    /// Forced on. Probe must succeed; mount errors propagate.
-    On,
-    /// Forced off.
-    Off,
-    /// Engine decides per-target by walking inputs.
-    Auto,
-}
+pub use hconfig::FuseMode;

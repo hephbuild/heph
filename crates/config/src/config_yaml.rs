@@ -4,9 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-// The engine-free plugin option helpers live in the contract crate;
-// re-export so `{Options, decode_opt, deny_unknown}` keep resolving.
-pub use hplugin::config::{Options, decode_opt, deny_unknown};
+use crate::options::Options;
 
 /// Default cap on in-flight requests to one remote cache (object_store
 /// `LimitStore`). Lives here because the YAML layer applies it as the default for
@@ -254,14 +252,23 @@ pub struct MemCacheConfig {
     pub capacity_bytes: u64,
 }
 
+/// The resolved FUSE-overlay decision the managed-driver bridge acts on,
+/// independent of the YAML shape. Owned here (central config) since
+/// [`FuseConfig::mode`] resolves to it; `hdriver_bridge::fuseconfig` re-exports
+/// it for the bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseMode {
+    /// Forced on. Probe must succeed; mount errors propagate.
+    On,
+    /// Forced off.
+    Off,
+    /// Engine decides per-target by walking inputs.
+    Auto,
+}
+
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
 /// default to off; FUSE is opt-in.
-// The resolved decision the bridge acts on lives in `heph-driver-bridge`; the
-// YAML shape + parsing is owned here (central config), and `FuseConfig::mode()`
-// resolves to it.
-pub use hdriver_bridge::fuseconfig::FuseMode;
-
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FuseConfig {
@@ -540,6 +547,7 @@ pub fn load(path: &Path) -> anyhow::Result<ConfigYaml> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::{decode_opt, deny_unknown};
 
     #[test]
     fn parses_full_example() {

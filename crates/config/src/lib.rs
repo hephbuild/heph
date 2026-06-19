@@ -26,7 +26,9 @@
 )]
 
 mod config_yaml;
+mod options;
 mod root;
 
 pub use config_yaml::*;
+pub use options::{Options, decode_opt, deny_unknown};
 pub use root::{get_cwd, get_root};
