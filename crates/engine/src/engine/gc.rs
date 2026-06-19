@@ -23,9 +23,7 @@ use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::ResultWriteGuard;
 use anyhow::{Context, Result};
 use hcore::hmemoizer::downcast_chain_ref;
-use hlock::hlock::{FLock, Lock};
 use hmodel::htaddr::{Addr, parse_addr};
-use std::path::Path;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -92,75 +90,12 @@ impl Engine {
         Ok(bytes)
     }
 
-    /// Delete every staged read-only input under `<home>/stage/`. Stage entries
-    /// are a pure cache — a future consumer re-materializes whatever it needs —
-    /// so GC simply clears them all. Each entry is removed under its advisory
-    /// lock so an in-flight materialization is never deleted mid-write;
-    /// contended entries are left for the next sweep. Best-effort: per-entry
-    /// failures are logged and skipped. Returns `(entries_removed, bytes_freed)`.
+    /// Clear all staged read-only inputs under `<home>/stage/`. Delegates to
+    /// [`hdriver_support::stage::clear_stage`] — the staging mechanism and its
+    /// teardown live together in `driver-support`. Returns
+    /// `(entries_removed, bytes_freed)`.
     fn gc_stage(&self) -> (usize, u64) {
-        let stage_root = self.home.join("stage");
-        let groups = match std::fs::read_dir(&stage_root) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), path = %stage_root.display(), "gc stage: read stage root");
-                return (0, 0);
-            }
-        };
-        let mut removed = 0usize;
-        let mut bytes = 0u64;
-        for group in groups.flatten() {
-            if !group.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let gpath = group.path();
-            let entries = match std::fs::read_dir(&gpath) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), path = %gpath.display(), "gc stage: read group");
-                    continue;
-                }
-            };
-            for ent in entries.flatten() {
-                // Only the `<hash>` dirs are entries; the `.ready`/`.lock`
-                // sidecars are reclaimed alongside their dir.
-                if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let hash = ent.file_name().to_string_lossy().into_owned();
-                // Non-blocking: a held lock means a materializer is mid-write —
-                // skip and let the next sweep reclaim it.
-                let lock = FLock::new(gpath.join(format!("{hash}.lock")));
-                let _guard = match lock.try_lock() {
-                    Ok(Some(g)) => g,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), %hash, "gc stage: lock entry");
-                        continue;
-                    }
-                };
-                let entry_dir = ent.path();
-                let freed = dir_size(&entry_dir);
-                if let Err(e) = hcore::fsutil::remove_dir_all(&entry_dir) {
-                    tracing::warn!(error = %format!("{e:#}"), path = %entry_dir.display(), "gc stage: remove entry");
-                    continue;
-                }
-                // Drop the readiness witness; the `.lock` is removed when the
-                // guard releases (write-unlock deletes its lock file).
-                let ready = gpath.join(format!("{hash}.ready"));
-                match std::fs::remove_file(&ready) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), path = %ready.display(), "gc stage: remove ready")
-                    }
-                }
-                removed += 1;
-                bytes = bytes.saturating_add(freed);
-            }
-        }
-        (removed, bytes)
+        hdriver_support::stage::clear_stage(&self.home.join("stage"))
     }
 
     /// Trim `addr`'s revisions to the `keep` newest (by `created_at_nanos`),
@@ -537,28 +472,6 @@ fn push_decision(
     }
 }
 
-/// Best-effort recursive byte size of `dir` (regular files only), for GC byte
-/// accounting. Errors are swallowed — a miscount never blocks a reclaim.
-fn dir_size(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return total;
-    };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if ft.is_dir() {
-            total = total.saturating_add(dir_size(&entry.path()));
-        } else if ft.is_file()
-            && let Ok(md) = entry.metadata()
-        {
-            total = total.saturating_add(md.len());
-        }
-    }
-    total
-}
-
 /// Emit one `GcTargetSwept` so the TUI's "targets explored" count advances.
 fn emit_gc_target_swept(rs: &RequestState, revisions_removed: usize, bytes_removed: u64) {
     rs.emit(crate::engine::event::BuildEventKind::GcTargetSwept {
@@ -928,42 +841,6 @@ mod tests {
         std::fs::write(entry.join("blob"), b"staged-bytes").expect("write blob");
         std::fs::write(gdir.join(format!("{hash}.ready")), b"").expect("ready");
         entry
-    }
-
-    #[tokio::test]
-    async fn gc_stage_deletes_all_entries() {
-        let (engine, _dir) = test_engine();
-        let a = stage_entry(&engine, "__pkg_t", "aaaa");
-        let b = stage_entry(&engine, "__pkg_u", "bbbb");
-
-        let (removed, bytes) = engine.gc_stage();
-
-        assert_eq!(removed, 2, "every stage entry is cleared");
-        assert_eq!(bytes, 2 * b"staged-bytes".len() as u64);
-        assert!(!a.exists());
-        assert!(!b.exists());
-        // Sidecars gone too.
-        assert!(!engine.home.join("stage/__pkg_t/aaaa.ready").exists());
-        assert!(!engine.home.join("stage/__pkg_t/aaaa.lock").exists());
-    }
-
-    #[tokio::test]
-    async fn gc_stage_skips_locked_entry() {
-        use hlock::hlock::Lock as _;
-        let (engine, _dir) = test_engine();
-        let busy = stage_entry(&engine, "__pkg_t", "held");
-
-        // Hold the entry's lock: a materializer is mid-write → GC must skip it.
-        let lock = FLock::new(engine.home.join("stage/__pkg_t/held.lock"));
-        let _held = lock
-            .lock(&StdCancellationToken::new())
-            .await
-            .expect("hold lock");
-
-        let (removed, _bytes) = engine.gc_stage();
-
-        assert_eq!(removed, 0, "locked entry not reclaimed");
-        assert!(busy.exists(), "in-flight stage entry survives");
     }
 
     #[tokio::test]
