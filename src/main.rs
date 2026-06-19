@@ -79,6 +79,11 @@ fn main() -> ExitCode {
     // spool — is ephemeral, so there is no "next run" to defer to.
     let telemetry_on =
         heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
+    // Warm the repo fingerprint off the hot path: the git root walk runs on a
+    // detached thread now so the exit-time flush only reads the cached result.
+    if telemetry_on {
+        heph::telemetry::prewarm();
+    }
     let started_at = std::time::Instant::now();
 
     let pprof_guard = if cli.global.pprof_cpu.is_some() {
