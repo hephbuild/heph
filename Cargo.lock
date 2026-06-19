@@ -5338,6 +5338,7 @@ dependencies = [
  "chrono",
  "clap",
  "core",
+ "hex",
  "plugin",
  "posthog-rs",
  "reqwest 0.13.4",

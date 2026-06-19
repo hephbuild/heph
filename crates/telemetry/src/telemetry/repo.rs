@@ -109,7 +109,7 @@ fn fingerprint_in(
 /// git, or — when those are unreachable — from the GitHub API fallback.
 fn compute(work_dir: &Path, gh_root: impl FnOnce() -> Option<String>) -> Option<String> {
     let root = root_commit(work_dir).or_else(gh_root)?;
-    Some(hex(&Sha256::digest(root.as_bytes())))
+    Some(hex::encode(Sha256::digest(root.as_bytes())))
 }
 
 /// The cache file for a working directory: `<config_dir>/repo-fingerprints/<h>`,
@@ -118,7 +118,7 @@ fn compute(work_dir: &Path, gh_root: impl FnOnce() -> Option<String>) -> Option<
 fn cache_path_for(config_dir: &Path, work_dir: &Path) -> PathBuf {
     config_dir
         .join("repo-fingerprints")
-        .join(hex(&Sha256::digest(
+        .join(hex::encode(Sha256::digest(
             work_dir.as_os_str().as_encoded_bytes(),
         )))
 }
@@ -426,21 +426,6 @@ fn now_ms() -> u64 {
     hcore::events::now_unix_ms()
 }
 
-/// Lowercase hex encoding of a byte slice.
-fn hex(bytes: &[u8]) -> String {
-    // A single nibble (0..=15) as a lowercase hex digit. No indexing/Result, so
-    // it trips neither the panic nor the must-use lints.
-    fn nibble(n: u8) -> char {
-        (if n < 10 { b'0' + n } else { b'a' + n - 10 }) as char
-    }
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(nibble(b >> 4));
-        s.push(nibble(b & 0x0f));
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,7 +561,7 @@ mod tests {
 
         let fp = fingerprint_in(cfg.path(), plain.path(), || Some(api_sha.to_string()), T0)
             .expect("api fallback");
-        assert_eq!(fp, hex(&Sha256::digest(api_sha.as_bytes())));
+        assert_eq!(fp, hex::encode(Sha256::digest(api_sha.as_bytes())));
     }
 
     #[test]
