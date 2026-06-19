@@ -99,11 +99,21 @@ message ParamType {
   message Union {
     repeated ParamType types = 1;
   }
+  // A record with named, heterogeneously-typed fields (e.g. `test`'s struct
+  // form). Distinct from `map` (which is homogeneous and arbitrary-keyed).
+  message Struct {
+    message Field {
+      string name = 1;
+      ParamType ty = 2;
+    }
+    repeated Field fields = 1;
+  }
   oneof kind {
     Scalar scalar = 1;
     ParamType list = 2; // homogeneous list element type
     ParamType map = 3;  // string-keyed map value type
     Union union = 4;
+    Struct struct = 5;  // named heterogeneous fields
   }
 }
 

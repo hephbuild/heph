@@ -133,6 +133,12 @@ pub(crate) fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
         ParamType::List(inner) => Ty::list(param_type_to_ty(inner)),
         ParamType::Map(value) => Ty::dict(Ty::string(), param_type_to_ty(value)),
         ParamType::Union(types) => Ty::unions(types.iter().map(param_type_to_ty).collect()),
+        // Starlark has no record type; model a struct as a string-keyed dict
+        // whose value type is the union of the field types.
+        ParamType::Struct(fields) => Ty::dict(
+            Ty::string(),
+            Ty::unions(fields.iter().map(|f| param_type_to_ty(&f.ty)).collect()),
+        ),
     }
 }
 

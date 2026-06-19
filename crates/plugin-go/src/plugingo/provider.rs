@@ -464,15 +464,21 @@ impl ProviderTrait for Provider {
                 ),
                 field(
                     "test",
-                    ParamType::map(ParamType::union(vec![
+                    ParamType::union(vec![
                         ParamType::Bool,
-                        ParamType::map(ParamType::String),
-                        ParamType::list(ParamType::String),
-                    ])),
-                    "Test settings for this package. `{\"skip\": True}` skips its tests \
-                     (inherited by descendants). `env`/`runtime_env` (map[string]) and \
-                     `pass_env`/`runtime_pass_env` (list[string]) are plumbed onto the \
-                     generated `test`/`xtest` run targets and apply only to this package.",
+                        ParamType::strukt(vec![
+                            ("env", ParamType::map(ParamType::String)),
+                            ("pass_env", ParamType::list(ParamType::String)),
+                            ("runtime_env", ParamType::map(ParamType::String)),
+                            ("runtime_pass_env", ParamType::list(ParamType::String)),
+                        ]),
+                    ]),
+                    "Test settings for this package. `test = False` skips its tests \
+                     (inherited by descendants); `test = True` (or unset) runs them. \
+                     The struct form sets env on the generated `test`/`xtest` run \
+                     targets — `env`/`runtime_env` (map[string]) and \
+                     `pass_env`/`runtime_pass_env` (list[string]) — and applies only \
+                     to this package.",
                 ),
             ],
         })
@@ -802,9 +808,9 @@ fn pick_xtest_p_lib_name(pkg: &GoPackage) -> Option<&'static str> {
 }
 
 /// Return true if the closest (deepest) ancestor `provider_state(provider="go", ...)`
-/// that carries a `test = {...}` map sets `skip = True`. Deeper states fully
-/// override shallower ones — a `test = {"skip": False}` closer to the target
-/// re-enables tests even if a root-level state disabled them.
+/// disables tests via `test = False`. Deeper states fully override shallower ones —
+/// a `test = True` (or the struct form, which implies tests run) closer to the
+/// target re-enables tests even if a root-level state disabled them.
 fn pick_test_skip(states: &[State]) -> bool {
     let Some(state) = states
         .iter()
@@ -813,10 +819,9 @@ fn pick_test_skip(states: &[State]) -> bool {
     else {
         return false;
     };
-    let Some(Value::Map(test_map)) = state.state.get("test") else {
-        return false;
-    };
-    matches!(test_map.get("skip"), Some(Value::Bool(true)))
+    // Skip only when the closest `test` state is the bool `False`. `True` and the
+    // struct form (env config) both leave tests enabled.
+    matches!(state.state.get("test"), Some(Value::Bool(false)))
 }
 
 /// Parse a `map[string]string` Starlark value into a sorted map. Rejects
@@ -1028,10 +1033,10 @@ impl ProviderInner {
             return Err(GetError::NotFound);
         }
 
-        // provider_state(provider="go", test={"skip": True}) opts the package
-        // (and all descendants) out of test-target generation. Gate every test
-        // variant before the `_golist` resolve below so a skipped pkg never
-        // forces a `go list` round-trip purely to learn there are no tests.
+        // provider_state(provider="go", test=False) opts the package (and all
+        // descendants) out of test-target generation. Gate every test variant
+        // before the `_golist` resolve below so a skipped pkg never forces a
+        // `go list` round-trip purely to learn there are no tests.
         if is_test_target_name(&addr.name) && pick_test_skip(&req.states) {
             return Err(GetError::NotFound);
         }
@@ -4091,11 +4096,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert_eq!(picked.package.as_str(), "");
     }
 
+    /// `skip = true` → `test = False` (disabled); `skip = false` → `test = True`.
     fn state_with_test_skip(pkg: &str, skip: bool) -> State {
-        let mut test_map = HashMap::new();
-        test_map.insert("skip".to_string(), Value::Bool(skip));
         let mut m = HashMap::new();
-        m.insert("test".to_string(), Value::Map(test_map));
+        m.insert("test".to_string(), Value::Bool(!skip));
         State {
             package: PkgBuf::from(pkg),
             provider: "go".to_string(),
@@ -4116,10 +4120,30 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
     #[test]
     fn pick_test_skip_deeper_state_overrides_shallower() {
-        // Root says skip=True; deeper pkg says skip=False → tests must run.
+        // Root says test=False (skip); deeper pkg says test=True → tests must run.
         let states = vec![
             state_with_test_skip("", true),
             state_with_test_skip("src/foo", false),
+        ];
+        assert!(!pick_test_skip(&states));
+    }
+
+    #[test]
+    fn pick_test_skip_struct_form_leaves_tests_enabled() {
+        // A deeper struct-form `test = {env: ...}` re-enables tests even when a
+        // root state disabled them — the struct implies tests run.
+        let states = vec![
+            state_with_test_skip("", true),
+            state_with_test_map(
+                "src/foo",
+                vec![(
+                    "env",
+                    Value::Map(HashMap::from([(
+                        "FOO".to_string(),
+                        Value::String("1".to_string()),
+                    )])),
+                )],
+            ),
         ];
         assert!(!pick_test_skip(&states));
     }
