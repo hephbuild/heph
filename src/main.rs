@@ -215,17 +215,24 @@ fn parse_supervisor_args() -> Option<i32> {
     args.next()?.parse::<i32>().ok()
 }
 
+/// Commands that run outside a workspace. They neither read `.hephconfig` nor
+/// touch the build graph, so a missing workspace must not block them: `version`
+/// prints the build string, `gen-docs` emits the CLI reference from clap.
+const NO_CONFIG_COMMANDS: &[&str] = &["version", "gen-docs"];
+
 /// Whether a `NoConfig` (not-in-a-workspace) self-upgrade result may be tolerated
 /// for this invocation, decided from a soft pre-parse of the CLI args.
 ///
-/// Tolerated unless the args name a real, workspace-requiring command. `version`
-/// runs anywhere, and an *unrecognized* command (the `Err` case — a workspace pin
-/// may add it) falls through to the real parse, which surfaces clap's canonical
-/// error. A recognized non-`version` command legitimately needs a workspace, so
-/// its `NoConfig` stays fatal.
+/// Tolerated unless the args name a real, workspace-requiring command. The
+/// commands in `NO_CONFIG_COMMANDS` run anywhere, and an *unrecognized* command
+/// (the `Err` case — a workspace pin may add it) falls through to the real parse,
+/// which surfaces clap's canonical error. Any other recognized command
+/// legitimately needs a workspace, so its `NoConfig` stays fatal.
 fn no_config_tolerable(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
     match soft_match {
-        Ok(m) => m.subcommand_name() == Some("version"),
+        Ok(m) => m
+            .subcommand_name()
+            .is_some_and(|name| NO_CONFIG_COMMANDS.contains(&name)),
         Err(_) => true,
     }
 }
@@ -242,6 +249,12 @@ mod tests {
     fn version_tolerates_missing_workspace() {
         // `heph version` must keep working outside a workspace.
         assert!(no_config_tolerable(&soft(&["heph", "version"])));
+    }
+
+    #[test]
+    fn gen_docs_tolerates_missing_workspace() {
+        // `heph gen-docs` only renders clap's CLI reference — no workspace needed.
+        assert!(no_config_tolerable(&soft(&["heph", "gen-docs"])));
     }
 
     #[test]
