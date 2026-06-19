@@ -205,7 +205,10 @@ jobs:
       # Build the go plugin distribution manifest from the per-os/arch cdylibs in
       # dist/ — one entry per artifact, its `url` the release-asset URL it's
       # published alongside (so `plugins: - { identifier: { url: .../heph-go-plugin.json } }`
-      # resolves the right dylib for the host). JSON via tools/pluginmanifest.
+      # resolves the right dylib for the host). Each entry carries the artifact's
+      # `sha256:` checksum; a `<manifest>.sha256` sidecar (published too) holds the
+      # manifest's own checksum for consumers to pin as `plugins[].checksum`.
+      # JSON via tools/pluginmanifest.
       - name: Generate go plugin manifest
         run: |
           VERSION="${{needs.gen.outputs.version}}"
@@ -214,6 +217,7 @@ jobs:
               -prefix heph-go-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
               -out "$GITHUB_WORKSPACE/dist/heph-go-plugin.json" )
           cat dist/heph-go-plugin.json
+          echo "manifest checksum: $(cat dist/heph-go-plugin.json.sha256)"
 
       - name: Create Release in artifacts repo
         id: create_release

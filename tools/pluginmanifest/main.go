@@ -16,6 +16,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,6 +33,9 @@ type artifact struct {
 	Arch string `json:"arch"`
 	Path string `json:"path,omitempty"`
 	URL  string `json:"url,omitempty"`
+	// Checksum of the artifact bytes (`sha256:<hex>`), matched by heph's resolver
+	// against the downloaded/local cdylib before it is loaded.
+	Checksum string `json:"checksum,omitempty"`
 }
 
 type manifest struct {
@@ -56,7 +61,7 @@ func main() {
 	var arts []artifact
 	switch {
 	case *hostPath != "":
-		arts = []artifact{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: *hostPath}}
+		arts = []artifact{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: *hostPath, Checksum: checksumFile(*hostPath)}}
 	case *fromDir != "":
 		if *prefix == "" || *urlBase == "" {
 			fatal("-from-dir requires -prefix and -url-base")
@@ -75,6 +80,12 @@ func main() {
 	}
 	b = append(b, '\n')
 
+	// Checksum of the exact manifest bytes, for consumers to pin in their
+	// `.hephconfig` as `plugins[].checksum`. Emitted as a `<out>.sha256` sidecar
+	// (released alongside the manifest) and echoed to stderr.
+	manifestSum := "sha256:" + hex.EncodeToString(sha256Bytes(b))
+	fmt.Fprintf(os.Stderr, "pluginmanifest: manifest checksum %s\n", manifestSum)
+
 	if *out == "" || *out == "-" {
 		os.Stdout.Write(b)
 		return
@@ -87,6 +98,23 @@ func main() {
 	if err := os.WriteFile(*out, b, 0o644); err != nil {
 		fatal("write %s: %v", *out, err)
 	}
+	if err := os.WriteFile(*out+".sha256", []byte(manifestSum+"\n"), 0o644); err != nil {
+		fatal("write %s.sha256: %v", *out, err)
+	}
+}
+
+// checksumFile returns the `sha256:<hex>` digest of the file at path.
+func checksumFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fatal("read %s for checksum: %v", path, err)
+	}
+	return "sha256:" + hex.EncodeToString(sha256Bytes(data))
+}
+
+func sha256Bytes(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
 }
 
 // scan finds `<prefix>_<os>_<arch>.{so,dylib}` files in dir and maps each to a
@@ -121,7 +149,7 @@ func scan(dir, prefix, base string) []artifact {
 		if !ok || goos == "" || arch == "" {
 			continue
 		}
-		arts = append(arts, artifact{OS: goos, Arch: arch, URL: base + "/" + fn})
+		arts = append(arts, artifact{OS: goos, Arch: arch, URL: base + "/" + fn, Checksum: checksumFile(filepath.Join(dir, fn))})
 	}
 	sort.Slice(arts, func(i, j int) bool {
 		return arts[i].OS+"/"+arts[i].Arch < arts[j].OS+"/"+arts[j].Arch
