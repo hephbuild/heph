@@ -5,7 +5,7 @@
 //! (tools, hermetic SDKs, …) that copy is pure waste: the same artifact is
 //! unpacked once per consuming target. Staging hoists that work out — an
 //! artifact is materialized **once** into a content-addressed, read-only stage
-//! dir under `<home>/stage/`, and every consumer gets cheap symlinks into its
+//! dir under `<home>/stage/`, and every consumer gets cheap hardlinks into its
 //! sandbox instead of a fresh byte-for-byte copy. This is the common-
 //! subexpression elimination the FUSE path gets for free via its in-memory
 //! union filesystem.
@@ -156,11 +156,15 @@ fn make_readonly_tree(_root: &Path) -> anyhow::Result<()> {
     anyhow::bail!("read-only input staging is only supported on unix")
 }
 
-/// Replicate the directory structure of `entry` inside `link_root`, pointing
-/// every file/symlink at its staged counterpart with an absolute symlink.
-/// Directories are created as real dirs so multiple inputs can merge into a
-/// shared `link_root`. Parents are visited before children (walkdir's default
-/// order) so each symlink's parent dir already exists.
+/// Replicate the directory structure of `entry` inside `link_root`,
+/// **hardlinking** every staged file into place so the consumer sees a plain
+/// regular file (no symlink resolution, sharing the staged inode and its
+/// read-only mode). Staged symlinks are recreated as symlinks — a hardlink to
+/// a symlink has inconsistent cross-platform semantics. Directories are created
+/// as real dirs so multiple inputs can merge into a shared `link_root`. The
+/// stage and the sandbox both live under `<home>`, i.e. one filesystem, so
+/// `hard_link` never hits `EXDEV`. Parents are visited before children
+/// (walkdir's default order) so each link's parent dir already exists.
 #[cfg(unix)]
 fn link_tree(
     entry: &Path,
@@ -202,25 +206,38 @@ fn link_tree(
         }
         // A prior input may have linked the same relative path into a shared
         // root; the staged bytes are identical, so replace it.
-        match std::os::unix::fs::symlink(ent.path(), &dst) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::remove_file(&dst)
-                    .with_context(|| format!("remove stale link {:?}", dst))?;
-                std::os::unix::fs::symlink(ent.path(), &dst)
-                    .with_context(|| format!("relink {:?} -> {:?}", dst, ent.path()))?;
-            }
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("symlink {:?} -> {:?}", dst, ent.path()));
-            }
-        }
+        link_one(ent.path(), &dst, ent.file_type().is_symlink())
+            .with_context(|| format!("link {:?} -> {:?}", dst, ent.path()))?;
         if let Some(list) = list.as_mut() {
             writeln!(list, "{}", dst.display())
                 .with_context(|| "append to stage list file")?;
         }
     }
     Ok(())
+}
+
+/// Materialize one staged entry at `dst`: hardlink a regular file, or recreate
+/// a symlink (copying its target). Replaces any existing entry at `dst` so
+/// inputs sharing a `link_root` can overwrite each other's identical bytes.
+#[cfg(unix)]
+fn link_one(staged: &Path, dst: &Path, is_symlink: bool) -> anyhow::Result<()> {
+    let attempt = || -> std::io::Result<()> {
+        if is_symlink {
+            let target = std::fs::read_link(staged)?;
+            std::os::unix::fs::symlink(target, dst)
+        } else {
+            std::fs::hard_link(staged, dst)
+        }
+    };
+    match attempt() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(dst)
+                .with_context(|| format!("remove stale link {:?}", dst))?;
+            attempt().with_context(|| format!("relink {:?} -> {:?}", dst, staged))
+        }
+        Err(e) => Err(e).with_context(|| format!("link {:?} -> {:?}", dst, staged)),
+    }
 }
 
 #[cfg(not(unix))]
@@ -327,17 +344,15 @@ mod tests {
         let ino2 = std::fs::metadata(&staged).expect("stat staged").ino();
         assert_eq!(ino1, ino2, "stage entry must be materialized exactly once");
 
-        // Both sandboxes see the content through symlinks into the stage.
+        // Both sandboxes see a plain file hardlinked to the shared staged
+        // inode (same ino, not a symlink, content readable).
         for link in [&link_a, &link_b] {
             let p = link.join("pkg/lib.txt");
             let md = std::fs::symlink_metadata(&p).expect("lstat link");
-            assert!(md.file_type().is_symlink(), "{:?} must be a symlink", p);
+            assert!(md.file_type().is_file(), "{:?} must be a regular file", p);
+            assert!(!md.file_type().is_symlink(), "{:?} must not be a symlink", p);
+            assert_eq!(md.ino(), ino1, "{:?} must hardlink the staged inode", p);
             assert_eq!(std::fs::read_to_string(&p).expect("read"), "hello");
-            assert_eq!(
-                std::fs::canonicalize(&p).expect("canon"),
-                std::fs::canonicalize(&staged).expect("canon staged"),
-                "symlink must resolve into the shared stage"
-            );
         }
     }
 
@@ -382,6 +397,43 @@ mod tests {
             .expect("exec linked script");
         assert!(out.status.success(), "script failed: {out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
+
+    #[tokio::test]
+    async fn staged_symlink_is_recreated_as_symlink() {
+        use std::os::unix::fs::symlink;
+        // Build content holding a file and a relative symlink to it.
+        let src = tempfile::tempdir().expect("src");
+        std::fs::write(src.path().join("target.txt"), b"hi").expect("write");
+        symlink("target.txt", src.path().join("link.txt")).expect("symlink");
+        let mut packer = TarPacker::new();
+        packer.create_file(
+            src.path().join("target.txt").to_str().unwrap().to_string(),
+            "target.txt".to_string(),
+        );
+        packer.create_file(
+            src.path().join("link.txt").to_str().unwrap().to_string(),
+            "link.txt".to_string(),
+        );
+        let mut bytes = Vec::new();
+        packer.pack(&mut bytes).expect("pack");
+        let c = TarBytes {
+            bytes,
+            hash: "sym1".to_string(),
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        stage_and_link(&c, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect("stage");
+
+        let l = link.join("link.txt");
+        let md = std::fs::symlink_metadata(&l).expect("lstat");
+        assert!(md.file_type().is_symlink(), "staged symlink must stay a symlink");
+        assert_eq!(std::fs::read_link(&l).expect("readlink"), Path::new("target.txt"));
+        assert_eq!(std::fs::read_to_string(&l).expect("read"), "hi");
     }
 
     #[tokio::test]
