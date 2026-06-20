@@ -140,9 +140,13 @@ impl ConfiguredCache {
     /// trip the breaker after [`FAILURE_THRESHOLD`] consecutive failures.
     fn note_err(&self, op: &str, e: &anyhow::Error) {
         if !self.health.warned.swap(true, Ordering::Relaxed) {
+            // `{e:#}` is anyhow's alternate Display: the cause chain on one line,
+            // no backtrace. (`{e:?}` would dump the full `Caused by:` ladder plus
+            // a process backtrace — useless noise for the user.)
             warn!(
-                cache = %self.def.name, op, error = ?e,
-                "remote cache error; further warnings for this cache are suppressed",
+                cache = %self.def.name,
+                op,
+                "remote cache unavailable, skipping it for {op}: {e:#}. Further errors for this cache are suppressed.",
             );
         }
         let n = self
