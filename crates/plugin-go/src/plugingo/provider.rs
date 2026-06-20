@@ -869,7 +869,7 @@ fn pick_codegen_deps(states: &[State]) -> Option<&State> {
 /// glob. Includes:
 /// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
 ///    non-Go sources (e.g. embed targets).
-/// 2. `q@label=go_src,tree_output_to=pkg` query — unpacks the full output tree
+/// 2. `query("label(go_src) && tree_output(pkg) && …")` — unpacks the full output tree
 ///    of any codegen target labelled `go_src` into the pkg dir, so both
 ///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
 ///    land in the sandbox.
@@ -879,6 +879,26 @@ fn pick_codegen_deps(states: &[State]) -> Option<&State> {
 /// Shared between `_golist` (so `go list` can resolve `//go:embed` patterns
 /// into `EmbedFiles`) and `embed` (so the driver's runtime re-glob of
 /// `embed_patterns` against `sandbox_pkg_dir` matches Go's resolution).
+/// Query-language pattern selecting exactly the package `pkg` (`//` for root).
+fn pkg_pattern(pkg: &str) -> String {
+    format!("//{pkg}")
+}
+
+/// Query-language pattern selecting every package under `pkg` (`//...` for root).
+fn pkg_prefix_pattern(pkg: &str) -> String {
+    if pkg.is_empty() {
+        "//...".to_string()
+    } else {
+        format!("//{pkg}/...")
+    }
+}
+
+/// The `@heph/query` addr selecting `go_test_data`-labelled targets in `pkg`.
+fn go_test_data_query_addr(pkg: &str) -> Addr {
+    let expr = format!("{} && label(go_test_data)", pkg_pattern(pkg));
+    hplugin_query::pluginquery::query_addr(&expr, "", &[])
+}
+
 fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
     let non_go_glob = if pkg_str.is_empty() {
         "**/*".to_string()
@@ -889,26 +909,14 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     let mut addrs = vec![non_go_glob_addr.format()];
 
     let codegen_root = pick_codegen_root(states);
-    let mut q_args = BTreeMap::from([
-        ("label".to_string(), "go_src".to_string()),
-        ("tree_output_to".to_string(), pkg_str.to_string()),
-    ]);
-    match codegen_root {
-        Some(root) => {
-            q_args.insert(
-                "package_prefix".to_string(),
-                root.package.as_str().to_string(),
-            );
-        }
-        None => {
-            q_args.insert("package".to_string(), pkg_str.to_string());
-        }
-    }
-    let go_src_query_addr = Addr::new(
-        hmodel::htpkg::PkgBuf::from(hplugin_query::pluginquery::PACKAGE),
-        "q".to_string(),
-        q_args,
-    );
+    // Scope: every package under the codegen root if one is declared, else just
+    // the target's own package.
+    let scope = match codegen_root {
+        Some(root) => pkg_prefix_pattern(root.package.as_str()),
+        None => pkg_pattern(pkg_str),
+    };
+    let go_src_expr = format!("label(go_src) && tree_output({pkg_str}) && {scope}");
+    let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &[]);
     addrs.push(go_src_query_addr.format());
 
     if let Some(deps_state) = pick_codegen_deps(states)
@@ -972,7 +980,7 @@ impl ProviderInner {
         // Reject names this provider doesn't own as early as possible — before any
         // special-case handler or `go list`. A foreign name (e.g. a buildfile
         // codegen target sharing a Go package dir) would otherwise drag `go list`
-        // and its `q@label=go_src` query into resolution and trip a cycle. On by
+        // and its `label(go_src)` query into resolution and trip a cycle. On by
         // default (perf/clarity); the engine contains the cycle regardless (cyclic
         // provider attempts fall through to the next provider), so tests exercising
         // that path disable it via `Config::foreign_name_guard`. Owned names —
@@ -1595,13 +1603,7 @@ impl ProviderInner {
                 }
                 let build_test_addr =
                     self.make_addr_with_name(&addr.package, "build_test", &factors);
-                let data_query_addr = hmodel::htaddr::parse_addr(&format!(
-                    "//{}:q@package={},label=go_test_data",
-                    hplugin_query::pluginquery::PACKAGE,
-                    addr.package.as_str(),
-                ))
-                .context("build go_test_data query addr")
-                .map_err(GetError::Other)?;
+                let data_query_addr = go_test_data_query_addr(addr.package.as_str());
                 let test_env =
                     pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
                 let spec = target_test::test_spec(
@@ -1619,13 +1621,7 @@ impl ProviderInner {
                 }
                 let build_xtest_addr =
                     self.make_addr_with_name(&addr.package, "build_xtest", &factors);
-                let data_query_addr = hmodel::htaddr::parse_addr(&format!(
-                    "//{}:q@package={},label=go_test_data",
-                    hplugin_query::pluginquery::PACKAGE,
-                    addr.package.as_str(),
-                ))
-                .context("build go_test_data query addr")
-                .map_err(GetError::Other)?;
+                let data_query_addr = go_test_data_query_addr(addr.package.as_str());
                 let test_env =
                     pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
                 let spec = target_test::test_spec(
@@ -3052,7 +3048,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
     // Regression: a target name the go provider doesn't own (e.g. a buildfile
     // codegen target sharing a Go package dir) must resolve to NotFound WITHOUT
-    // resolving `_golist`. Otherwise the `q@label=go_src` query that `_golist`
+    // resolving `_golist`. Otherwise the `label(go_src)` query that `_golist`
     // pulls in re-enters get_spec for this same addr, trips a false CycleError,
     // and `Engine::query` silently drops the target — so `q codegen .` misses
     // targets that `q all .` (addr-only match, no get_spec) finds. No `go`
@@ -3065,7 +3061,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
         // `Provider::new` enables the foreign-name guard by default, so a name
         // this provider doesn't own resolves to NotFound without touching the
-        // executor (no `go list`, no `q@label=go_src` query).
+        // executor (no `go list`, no `label(go_src)` query).
         struct BailExecutor {
             calls: Arc<std::sync::atomic::AtomicUsize>,
         }
@@ -4323,15 +4319,17 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let srcfiles = extract_srcfiles(&resp);
         let go_src_query = srcfiles
             .iter()
-            .find(|s| s.contains("label=go_src"))
+            .find(|s| s.contains("label(go_src)"))
             .expect("go_src query addr present");
+        // Default scope is the target's exact package — a bare `//pkg` pattern,
+        // never a `/...` prefix.
         assert!(
-            go_src_query.contains("package="),
-            "default must use package= matcher, got: {go_src_query}"
+            !go_src_query.contains("..."),
+            "default must select an exact package (no prefix), got: {go_src_query}"
         );
         assert!(
-            !go_src_query.contains("package_prefix="),
-            "default must not use package_prefix, got: {go_src_query}"
+            go_src_query.contains("tree_output("),
+            "go_src query must carry tree_output, got: {go_src_query}"
         );
     }
 
@@ -4364,15 +4362,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let srcfiles = extract_srcfiles(&resp);
         let go_src_query = srcfiles
             .iter()
-            .find(|s| s.contains("label=go_src"))
+            .find(|s| s.contains("label(go_src)"))
             .expect("go_src query addr present");
+        // codegen_root widens the scope to a `/...` (here root `//...`) prefix.
         assert!(
-            go_src_query.contains("package_prefix="),
-            "codegen_root must use package_prefix matcher, got: {go_src_query}"
-        );
-        assert!(
-            !go_src_query.contains(",package="),
-            "codegen_root must drop package= matcher, got: {go_src_query}"
+            go_src_query.contains("..."),
+            "codegen_root must widen to a package prefix, got: {go_src_query}"
         );
         assert!(
             srcfiles.iter().any(|s| s == "//codegen:gen"),

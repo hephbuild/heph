@@ -22,7 +22,9 @@ target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt", labels
 "#,
     );
 
-    let spec = ws.get_spec(&format!("//{PACKAGE}:q@label=lint")).await?;
+    let spec = ws
+        .get_spec(&format!("//{PACKAGE}:q@expr=label(lint)"))
+        .await?;
 
     assert_eq!(spec.driver, heph::plugingroup::DRIVER_NAME);
     let deps = match spec.config.get("deps") {
@@ -67,7 +69,7 @@ target(name = "z", driver = "bash", run = "echo z > $OUT", out = "z.txt")
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@package=exact/pkg"))
+        .get_spec(&format!("//{PACKAGE}:q@expr=package(exact/pkg)"))
         .await?;
 
     let deps = match spec.config.get("deps") {
@@ -106,7 +108,7 @@ target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt")
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@package_prefix=src/alpha"))
+        .get_spec(&format!("//{PACKAGE}:q@expr=package_prefix(src/alpha)"))
         .await?;
 
     let deps = match spec.config.get("deps") {
@@ -134,7 +136,9 @@ target(name = "skip", driver = "bash", run = "echo skip_val > $OUT", out = "skip
 "#,
     );
 
-    let result = ws.run(&format!("//{PACKAGE}:q@label=collect")).await?;
+    let result = ws
+        .run(&format!("//{PACKAGE}:q@expr=label(collect)"))
+        .await?;
     let content = common::artifact_string(&result);
     assert!(content.contains("p_val"), "missing p_val, got: {content:?}");
     assert!(content.contains("q_val"), "missing q_val, got: {content:?}");
@@ -161,7 +165,7 @@ target(
     driver = "bash",
     run = "cat $SRC_LIBS > $OUT",
     out = "result.txt",
-    deps = {"libs": ["//@heph/query:q@label=lib,exclude_provider=__none__"]},
+    deps = {"libs": ["//@heph/query:q@expr=label(lib),exclude_provider=__none__"]},
 )
 "#,
     );
@@ -191,7 +195,7 @@ target(name = "t", driver = "bash", run = "echo x > $OUT", out = "x.txt")
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@label=nonexistent"))
+        .get_spec(&format!("//{PACKAGE}:q@expr=label(nonexistent)"))
         .await?;
 
     let deps = match spec.config.get("deps") {
@@ -224,7 +228,9 @@ target(name = "z", driver = "bash", run = "echo z > $OUT", out = "z.txt", labels
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@package=inter/a,label=tag"))
+        .get_spec(&format!(
+            "//{PACKAGE}:q@expr=\"package(inter/a) && label(tag)\""
+        ))
         .await?;
 
     let deps = match spec.config.get("deps") {

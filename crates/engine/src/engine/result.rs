@@ -2831,7 +2831,7 @@ mod tests {
         let engine = engine_with(vec![static_target(
             "//pkg:a",
             &[],
-            &["//@heph/query:q@label=foo"],
+            &["//@heph/query:q@expr=label(foo)"],
         )])?;
         let addr_a = hmodel::htaddr::parse_addr("//pkg:a")?;
         let rs = engine.new_state();
@@ -2860,7 +2860,7 @@ mod tests {
         let engine = engine_with(vec![static_target(
             "//pkg:a",
             &[],
-            &["//@heph/query:q@label=foo"],
+            &["//@heph/query:q@expr=label(foo)"],
         )])?;
         let addr_a = hmodel::htaddr::parse_addr("//pkg:a")?;
         let def = engine.clone().get_def(engine.new_state(), &addr_a).await?;
@@ -2886,7 +2886,7 @@ mod tests {
         let engine = engine_with(vec![static_target(
             "//pkg:a",
             &[],
-            &["//@heph/query:q@label=foo,exclude_provider=__user__"],
+            &["//@heph/query:q@expr=label(foo),exclude_provider=__user__"],
         )])?;
         let addr_a = hmodel::htaddr::parse_addr("//pkg:a")?;
         let def = engine.clone().get_def(engine.new_state(), &addr_a).await?;
@@ -2930,7 +2930,7 @@ mod tests {
         // candidate enumeration here.
         // Matcher pkg is `pkg/gen` because the codegen output of a target at
         // `//pkg:*` with DirPath `gen/` lands in package `pkg/gen`.
-        let q = "//@heph/query:q@tree_output_to=pkg/gen,exclude_provider=__none__";
+        let q = "//@heph/query:q@expr=tree_output(pkg/gen),exclude_provider=__none__";
         let engine = engine_with(vec![
             codegen_target("//pkg:a", &[], "gen", &[q]),
             codegen_target("//pkg:b", &[], "gen", &[]),
@@ -2991,7 +2991,7 @@ mod tests {
         //
         // `exclude_provider=__none__` opts out of the auto-injected exclusion
         // — we want both same-provider candidates to be enumerable.
-        let q = "//@heph/query:q@tree_output_to=pkg/gen,exclude_provider=__none__";
+        let q = "//@heph/query:q@expr=tree_output(pkg/gen),exclude_provider=__none__";
         let engine = engine_with(vec![
             codegen_target("//pkg:a", &[], "gen", &[q]),
             codegen_target("//pkg:b", &[], "gen", &[q]),

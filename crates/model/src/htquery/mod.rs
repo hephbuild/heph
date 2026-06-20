@@ -272,12 +272,18 @@ impl<'a> Parser<'a> {
                 // A word immediately followed by `(` is a function call.
                 if matches!(self.peek(), Some(Tok::LParen)) {
                     self.bump();
-                    let arg = match self.bump() {
-                        Some(Tok::Word(a)) => a.clone(),
-                        Some(other) => {
-                            bail!("expected argument to `{w}()`, found `{}`", other.describe())
+                    // An empty arg list (`tree_output()`) is allowed: it denotes
+                    // the root package for the package-shaped functions.
+                    let arg = if matches!(self.peek(), Some(Tok::RParen)) {
+                        String::new()
+                    } else {
+                        match self.bump() {
+                            Some(Tok::Word(a)) => a.clone(),
+                            Some(other) => {
+                                bail!("expected argument to `{w}()`, found `{}`", other.describe())
+                            }
+                            None => bail!("missing argument to `{w}()`"),
                         }
-                        None => bail!("missing argument to `{w}()`"),
                     };
                     match self.bump() {
                         Some(Tok::RParen) => {}
@@ -606,7 +612,18 @@ mod tests {
     }
 
     #[test]
-    fn err_missing_func_arg() {
-        assert!(parse("label()", &base()).is_err());
+    fn empty_func_arg_means_root_pkg() {
+        assert_eq!(p("tree_output()"), Matcher::TreeOutputTo(PkgBuf::from("")));
+        assert_eq!(p("package()"), Matcher::Package(PkgBuf::from("")));
+        assert_eq!(
+            p("package_prefix()"),
+            Matcher::PackagePrefix(PkgBuf::from(""))
+        );
+    }
+
+    #[test]
+    fn err_empty_addr_func_arg() {
+        // `addr()` still needs a real address.
+        assert!(parse("addr()", &base()).is_err());
     }
 }

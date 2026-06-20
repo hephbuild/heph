@@ -73,48 +73,19 @@ fn is_reserved_key(k: &str) -> bool {
 }
 
 pub fn build_matcher(args: &std::collections::BTreeMap<String, String>) -> anyhow::Result<Matcher> {
-    let mut matchers: Vec<Matcher> = vec![];
-
-    // `expr` is the full query language; the discrete `label`/`package`/… keys
-    // remain for callers that compose matchers field-by-field. An `expr` may be
-    // combined with them (all ANDed together).
-    if let Some(expr) = args.get(EXPR_ARG) {
-        let base = args.get(BASE_ARG).map(String::as_str).unwrap_or("");
-        matchers.push(
-            htquery::parse(expr, &PkgBuf::from(base))
-                .with_context(|| format!("parsing query expr {expr:?}"))?,
-        );
-    }
-    if let Some(label) = args.get("label") {
-        matchers.push(Matcher::Label(label.clone()));
-    }
-    if let Some(pkg) = args.get("package") {
-        matchers.push(Matcher::Package(PkgBuf::from(pkg.as_str())));
-    }
-    if let Some(prefix) = args.get("package_prefix") {
-        matchers.push(Matcher::PackagePrefix(PkgBuf::from(prefix.as_str())));
-    }
-    if let Some(out) = args.get("tree_output_to") {
-        matchers.push(Matcher::TreeOutputTo(PkgBuf::from(out.as_str())));
-    }
-
-    if matchers.is_empty() {
+    let Some(expr) = args.get(EXPR_ARG) else {
         // Sanity-check the args: an arg with no recognised key + no reserved
         // key is a typo we should surface, not silently match everything.
         let unknown: Vec<&String> = args.keys().filter(|k| !is_reserved_key(k)).collect();
         if !unknown.is_empty() {
             anyhow::bail!("query target has unknown args: {:?}", unknown);
         }
-        anyhow::bail!(
-            "query target requires at least one matcher arg (expr, label, package, package_prefix, tree_output_to)"
-        );
-    }
+        anyhow::bail!("query target requires an `expr` arg (the query-language expression)");
+    };
 
-    if matchers.len() == 1 {
-        Ok(matchers.remove(0))
-    } else {
-        Ok(Matcher::And(matchers))
-    }
+    let base = args.get(BASE_ARG).map(String::as_str).unwrap_or("");
+    htquery::parse(expr, &PkgBuf::from(base))
+        .with_context(|| format!("parsing query expr {expr:?}"))
 }
 
 /// Parse `exclude_provider=a;b;c` into a `Vec<String>`. Empty when the arg is
@@ -271,14 +242,19 @@ mod tests {
     }
 
     #[test]
-    fn build_matcher_ands_expr_with_discrete_keys() {
-        let mut args = query_addr("//foo/...", "", &[]).args.clone();
-        args.insert("label".to_string(), "test".to_string());
-        let m = build_matcher(&args).unwrap();
-        match m {
-            Matcher::And(children) => assert_eq!(children.len(), 2),
-            other => panic!("expected And, got {other:?}"),
-        }
+    fn build_matcher_requires_expr() {
+        let err = build_matcher(&std::collections::BTreeMap::new())
+            .err()
+            .expect("expected error");
+        assert!(format!("{err:#}").contains("requires an `expr`"));
+    }
+
+    #[test]
+    fn build_matcher_rejects_legacy_keys() {
+        // Legacy discrete keys are gone — they read as unknown args now.
+        let args = std::collections::BTreeMap::from([("label".to_string(), "x".to_string())]);
+        let err = build_matcher(&args).err().expect("expected error");
+        assert!(format!("{err:#}").contains("unknown args"));
     }
 
     #[test]

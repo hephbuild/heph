@@ -102,7 +102,7 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
 // Regression for whole-graph `heph r build ./...`: with a `go_codegen_root`
 // (provider_state) covering the whole module, building a binary whose package
 // graph spans multiple first-party packages must succeed. Each package's
-// `_golist` issues a broad `q@label=go_src,package_prefix=<root>` query; that
+// `_golist` issues a broad `query("label(go_src) && //<root>/...")` query; that
 // query `get_spec`s every sibling `build_lib`/`_golist` to read labels, which
 // re-enters the in-flight computations and (pre-fix) trips a FALSE
 // `build_lib -> _golist` cycle that fails the build.
@@ -148,7 +148,7 @@ async fn test_codegen_root_build_with_generated_pkg_skipped() -> anyhow::Result<
 // Regression for a whole-graph false cycle (`heph r build ./...` with codegen
 // labelled `go_src`): building the whole graph concurrently must NOT trip a false
 // cycle. A shared library imported by two binaries has its `build_lib` in-flight
-// while a sibling package's `q@label=go_src,package_prefix=<root>` query (run for
+// while a sibling package's `query("label(go_src) && //<root>/...")` query (run for
 // its `_golist`) `get_spec`s candidate targets to evaluate the matcher. A
 // rejected candidate (e.g. a `build`-labelled dist target) must leave no edge in
 // the request DAG — otherwise that phantom edge closes a false cycle. Fixed by
@@ -207,7 +207,7 @@ async fn test_codegencycle_single_target_builds() -> anyhow::Result<()> {
 // `q <label> .` must still find a buildfile codegen target (`//:gen`, labeled
 // `go_src`) that lives in a Go package dir. `get_spec(//:gen)` asks the go
 // provider first; it over-claims the name, drags in `go list` + its
-// `q@label=go_src` query, and that closes a cycle. The engine must contain that
+// `label(go_src)` query, and that closes a cycle. The engine must contain that
 // cycle (fall through to the buildfile provider), not drop the target — `q all`
 // finds it (addr-only match, no get_spec), so `q go_src` must too.
 #[tokio::test]
