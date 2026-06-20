@@ -75,6 +75,13 @@ fn render_command(cmd: &clap::Command, parent_path: &str, out: &mut String) {
         out.push('\n');
     }
 
+    // The after-help block (e.g. `run`/`query`'s query-language reference) is
+    // help-only in clap; surface it in the generated docs as a fenced block so
+    // the markdown reference is as complete as `--help`.
+    if let Some(after) = cmd.get_after_long_help().or_else(|| cmd.get_after_help()) {
+        out.push_str(&format!("```text\n{after}\n```\n\n"));
+    }
+
     for child in cmd.get_subcommands() {
         render_command(child, &path, out);
     }
@@ -176,6 +183,16 @@ mod tests {
         assert!(
             md.contains("`-e`, `--exclude`"),
             "missing short+long exclude flag row"
+        );
+
+        // The query-language after-help reference is surfaced in the docs.
+        assert!(
+            md.contains("`-q`, `--query`"),
+            "missing query flag row:\n{md}"
+        );
+        assert!(
+            md.contains("Query language (-q / --query):"),
+            "query language after-help reference missing from docs:\n{md}"
         );
     }
 

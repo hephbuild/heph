@@ -28,3 +28,4 @@
 pub mod htaddr;
 pub mod htmatcher;
 pub mod htpkg;
+pub mod htquery;

@@ -7,22 +7,34 @@ use futures::TryStreamExt;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
-use crate::commands::utils::matcher_from_args;
+use crate::commands::run::QUERY_LANG_HELP;
+use crate::commands::utils::resolve_matcher;
 use crate::engine::{Engine, get_cwp};
 use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 #[command(
-    override_usage = "heph query <TARGET_ADDRESS>\n       heph query <LABEL> <PACKAGE_MATCHER>"
+    override_usage = "heph query <TARGET_ADDRESS>\n       heph query <LABEL> <PACKAGE_MATCHER>\n       heph query -q <QUERY>",
+    after_long_help = QUERY_LANG_HELP
 )]
 pub struct Args {
     /// Target address (e.g., //pkg:name) OR Label
     #[arg(value_name = "TARGET_ADDRESS/LABEL", add = ArgValueCompleter::new(complete_target_addr))]
-    pub arg1: String,
+    pub arg1: Option<String>,
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
+    /// Select targets with a query expression, e.g. -q '//pkg/... && label(foo)'.
+    /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
+    /// Mutually exclusive with the positional TARGET arguments.
+    #[arg(
+        short = 'q',
+        long = "query",
+        value_name = "QUERY",
+        conflicts_with = "arg1"
+    )]
+    pub query: Option<String>,
     /// Exclude target address (repeatable, e.g. -e //pkg:target)
     #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS", add = ArgValueCompleter::new(complete_target_addr))]
     pub exclude: Vec<String>,
@@ -79,7 +91,14 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
-    let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &cwp, true)?;
+    let m = resolve_matcher(
+        &args.query,
+        &args.arg1,
+        &args.arg2,
+        &args.exclude,
+        &cwp,
+        true,
+    )?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = QueryApp {
         engine,
