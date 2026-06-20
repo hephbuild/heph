@@ -47,9 +47,9 @@ pub struct Config {
     pub go_version: String,
     /// Expected SHA-256 of each hermetic SDK tarball, keyed by
     /// [`toolchain::checksum_key`] (`"<version>/<goos>/<goarch>"`). Populated
-    /// from the optional `checksums` provider option; there is no built-in
-    /// table, so a hermetic `gotool` whose host triple is absent here fails the
-    /// build closed (no unverified download). Empty for `gotool = "host"`.
+    /// from the optional `checksums` provider option. Optional: a host triple
+    /// absent here downloads unverified (the toolchain driver warns); supply an
+    /// entry to enforce verification. Empty for `gotool = "host"`.
     pub sdk_checksums: HashMap<String, String>,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
@@ -934,13 +934,13 @@ impl ProviderInner {
         {
             let (goos, goarch) = (current_goos(), current_goarch());
             let key = toolchain::checksum_key(version, &goos, &goarch);
-            let sha256 = self.sdk_checksums.get(&key).ok_or_else(|| {
-                GetError::Other(anyhow::anyhow!(
-                    "no SDK checksum for Go {version} on {goos}/{goarch}; add it to the go \
-                     plugin's `checksums` option in your config, keyed \"{key}\" \
-                     (sha256 from https://go.dev/dl/?mode=json)"
-                ))
-            })?;
+            // Checksum is optional: absent → unverified download (the driver
+            // warns). An empty sha256 threads through to the toolchain target.
+            let sha256 = self
+                .sdk_checksums
+                .get(&key)
+                .map(String::as_str)
+                .unwrap_or("");
             let spec = toolchain::build_spec(addr.clone(), version, &goos, &goarch, sha256);
             return Ok(GetResponse { target_spec: spec });
         }

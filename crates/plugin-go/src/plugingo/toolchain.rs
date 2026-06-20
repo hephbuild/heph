@@ -50,9 +50,10 @@ use xxhash_rust::xxh3::Xxh3Default;
 /// A convenient pinned Go release for tests and as a documented example. The
 /// provider requires the toolchain to be chosen explicitly (`gotool` option),
 /// so this is not an implicit default for real builds — only a constant the
-/// test helpers and examples reference. Any hermetic version must have its
-/// tarball SHA-256 supplied via the provider's `checksums` config option (see
-/// [`checksum_key`]); there is no built-in checksum table.
+/// test helpers and examples reference. A hermetic version's tarball SHA-256 may
+/// be supplied via the provider's optional `checksums` config option (see
+/// [`checksum_key`]) to enforce verification; there is no built-in checksum
+/// table, and an absent entry downloads unverified.
 pub const DEFAULT_GO_VERSION: &str = "1.26.4";
 
 /// Sentinel toolchain spec selecting the **host** `go` (read from `PATH` /
@@ -101,11 +102,12 @@ fn toolchain_entries() -> Vec<String> {
 
 /// Lookup key for a tarball SHA-256 in the provider's `checksums` config map:
 /// `"<version>/<goos>/<goarch>"`, e.g. `"1.26.4/darwin/arm64"`. There is no
-/// built-in checksum table — each hermetic version's checksum is supplied via
-/// config (`checksums:` under the go plugin's `options:`), keeping the binary
-/// free of release-specific data and letting users pin new versions without a
-/// source change. A missing checksum fails the build closed (no silent
-/// unverified download). Sourced from <https://go.dev/dl/?mode=json>.
+/// built-in checksum table — each version's checksum is supplied via config
+/// (`checksums:` under the go plugin's `options:`), keeping the binary free of
+/// release-specific data and letting users pin new versions without a source
+/// change. Checksums are **optional**: a missing entry downloads the SDK
+/// unverified (the driver logs a warning); supply one to enforce verification.
+/// Sourced from <https://go.dev/dl/?mode=json>.
 pub fn checksum_key(version: &str, goos: &str, goarch: &str) -> String {
     format!("{version}/{goos}/{goarch}")
 }
@@ -202,7 +204,8 @@ struct GoToolchainSpec {
     /// Host GOARCH the SDK runs on.
     #[spec(required)]
     goarch: String,
-    /// Expected SHA-256 of the downloaded tarball (hex).
+    /// Expected SHA-256 of the downloaded tarball (hex). Empty = download
+    /// unverified (no `checksums` entry was configured for this version/platform).
     #[spec(required)]
     sha256: String,
     /// Declared outputs, grouped by name → list of output paths.
@@ -387,11 +390,7 @@ fn download_verify_extract(
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let got = format!("{:x}", hasher.finalize());
-    if got != expected_sha256 {
-        anyhow::bail!(
-            "Go {version} SDK checksum mismatch for {url}: expected {expected_sha256}, got {got}"
-        );
-    }
+    verify_checksum(expected_sha256, &got, version, url)?;
 
     let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.as_ref()));
     let mut archive = tar::Archive::new(gz);
@@ -408,6 +407,31 @@ fn download_verify_extract(
     Ok(())
 }
 
+/// Compare the downloaded tarball's `got` SHA-256 against the `expected` one.
+/// Checksum verification is optional: an empty `expected` (no `checksums` entry
+/// configured for this version/platform) means the SDK is downloaded
+/// **unverified** — allowed, but logged as a warning since it drops the
+/// supply-chain guarantee. A non-empty `expected` that doesn't match fails the
+/// build closed.
+fn verify_checksum(expected: &str, got: &str, version: &str, url: &str) -> anyhow::Result<()> {
+    if expected.is_empty() {
+        tracing::warn!(
+            version,
+            url,
+            "downloading Go {version} SDK without checksum verification — no `checksums` entry \
+             configured for this version/platform; add one (sha256 from \
+             https://go.dev/dl/?mode=json) to restore the supply-chain guarantee"
+        );
+        return Ok(());
+    }
+    if got != expected {
+        anyhow::bail!(
+            "Go {version} SDK checksum mismatch for {url}: expected {expected}, got {got}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +442,19 @@ mod tests {
             checksum_key("1.26.4", "darwin", "arm64"),
             "1.26.4/darwin/arm64"
         );
+    }
+
+    #[test]
+    fn test_verify_checksum_empty_expected_skips() {
+        // No configured checksum → unverified download is allowed (warns).
+        assert!(verify_checksum("", "anything", "1.26.4", "http://x").is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksum_match_ok_mismatch_fails() {
+        assert!(verify_checksum("abc", "abc", "1.26.4", "http://x").is_ok());
+        let err = verify_checksum("abc", "def", "1.26.4", "http://x").unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
     }
 
     #[test]
