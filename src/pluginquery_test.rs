@@ -44,7 +44,7 @@ mod tests {
         ])?;
 
         let rs = engine.new_state();
-        let addr = parse_addr(&format!("//{PACKAGE}:q@label=//labels:lint"))?;
+        let addr = parse_addr(&format!("//{PACKAGE}:q@expr=label(//labels:lint)"))?;
         let spec = engine.get_spec(rs, &addr).await?;
 
         assert_eq!(spec.driver, crate::plugingroup::DRIVER_NAME);
@@ -74,7 +74,7 @@ mod tests {
         ])?;
 
         let rs = engine.new_state();
-        let addr = parse_addr(&format!("//{PACKAGE}:q@package=pkg/a"))?;
+        let addr = parse_addr(&format!("//{PACKAGE}:q@expr=package(pkg/a)"))?;
         let spec = engine.get_spec(rs, &addr).await?;
 
         assert_eq!(spec.driver, crate::plugingroup::DRIVER_NAME);
@@ -95,7 +95,7 @@ mod tests {
         ])?;
 
         let rs = engine.new_state();
-        let addr = parse_addr(&format!("//{PACKAGE}:q@package_prefix=src/foo"))?;
+        let addr = parse_addr(&format!("//{PACKAGE}:q@expr=package_prefix(src/foo)"))?;
         let spec = engine.get_spec(rs, &addr).await?;
 
         assert_eq!(spec.driver, crate::plugingroup::DRIVER_NAME);
@@ -117,7 +117,7 @@ mod tests {
 
         let rs = engine.new_state();
         let addr = parse_addr(&format!(
-            "//{PACKAGE}:q@package=src/foo,label=//labels:lint"
+            "//{PACKAGE}:q@expr=\"package(src/foo) && label(//labels:lint)\""
         ))?;
         let spec = engine.get_spec(rs, &addr).await?;
 
@@ -138,7 +138,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("at least one matcher arg")
+                .contains("requires an `expr`")
         );
     }
 
@@ -192,11 +192,11 @@ mod tests {
     fn build_matcher_ignores_exclude_provider() {
         // exclude_provider is a reserved key and must not contribute to matching.
         let args = std::collections::BTreeMap::from([
-            ("label".to_string(), "x".to_string()),
+            ("expr".to_string(), "label(x)".to_string()),
             ("exclude_provider".to_string(), "go".to_string()),
         ]);
         let m = build_matcher(&args).expect("matcher should build");
-        // Single matcher arm — Label only.
+        // Built purely from the expr — Label only.
         assert!(matches!(m, Matcher::Label(_)));
     }
 
@@ -220,7 +220,7 @@ mod tests {
 
         let rs = engine.new_state();
         let addr = parse_addr(&format!(
-            "//{PACKAGE}:q@label=//labels:lint,exclude_provider=pluginstatictarget"
+            "//{PACKAGE}:q@expr=label(//labels:lint),exclude_provider=pluginstatictarget"
         ))?;
         let spec = engine.get_spec(rs, &addr).await?;
 

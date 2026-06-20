@@ -24,7 +24,8 @@ pub enum Commands {
     /// Resolves the matched target(s), builds their dependency graph, and runs
     /// them — reusing cached results when inputs are unchanged. A single
     /// argument is a target address; two arguments are a label followed by a
-    /// package matcher, selecting every target carrying that label.
+    /// package matcher, selecting every target carrying that label. For richer
+    /// selection use `-e '<expr>'` with the query language (see `--help`).
     ///
     /// Examples:
     ///
@@ -34,7 +35,9 @@ pub enum Commands {
     ///
     /// `heph run //cmd/server:bin --shell` — open a shell in the target sandbox
     ///
-    /// `heph run build //... -e //vendor/...` — run, excluding a subtree
+    /// `heph run -e '//cmd/... && label(test)'` — run via a query expression
+    ///
+    /// `heph run -e '//... && !//vendor/...'` — run, excluding a subtree
     #[command(visible_alias = "r")]
     Run(run::RunArgs),
     /// Inspect targets, packages, hashes, and deps
@@ -57,8 +60,8 @@ pub enum Commands {
     ///
     /// Prints the address of every target matched by the argument(s), one per
     /// line. Accepts the same address / label+matcher forms as `run`, plus
-    /// `-e` to exclude addresses. Useful for scripting and for previewing what
-    /// a matcher selects before running it.
+    /// `-e '<expr>'` for the query language (see `--help`). Useful for scripting
+    /// and for previewing what a selection matches before running it.
     ///
     /// Examples:
     ///
@@ -66,7 +69,9 @@ pub enum Commands {
     ///
     /// `heph query test //cmd/...`
     ///
-    /// `heph query //... -e //vendor/...`
+    /// `heph query -e '//... && !//vendor/...'` — select with exclusion
+    ///
+    /// `heph query -e '//cmd/... && !label(slow)'` — select via a query
     #[command(visible_alias = "q")]
     Query(query::Args),
     /// Validate all targets (link graph + check codegen outputs)

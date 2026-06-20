@@ -3,7 +3,7 @@
 # trips `build_lib -> _golist` self-package cycles.
 #
 # Mechanism: with `go_codegen_root`, every package's `_golist` issues a broad
-# `q@label=go_src,package_prefix=<root>` query. That query `get_spec`s every
+# `query("label(go_src) && //<root>/...")`. That query `get_spec`s every
 # sibling target to read its labels. When a shared library's `build_lib` is
 # already in-flight via a real consumer (here both `cmd/a` and `cmd/b` import
 # `shared`), the query re-enters that in-flight `build_lib`, closing a FALSE

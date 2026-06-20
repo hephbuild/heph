@@ -700,6 +700,28 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         Ok(hbuiltins::pluginfs::glob_addr(&resolved, &excludes_ref).format())
     }
 
+    /// Reference every target matching a query `expr` as a dependency address.
+    /// Uses the heph query language (the same one `heph run -e` accepts):
+    /// `&&`, `||`, `!`, parentheses, the `label()`/`tree_output()` functions,
+    /// and `//pkg` / `//pkg/...` / `//pkg:name` patterns. Relative patterns
+    /// (`./x`, `..`, `.`) resolve against the current package. Returns a
+    /// `@heph/query` provider address that expands to the matched group.
+    ///
+    /// Opts out of the engine's auto-exclusion of the requesting provider so the
+    /// query sees sibling BUILD-file targets (the common intent in a BUILD file).
+    fn query<'v>(eval: &mut Evaluator<'v, '_, '_>, expr: &str) -> starlark::Result<String> {
+        use hplugin_query::pluginquery;
+        let extra = eval
+            .extra
+            .expect("evaluator extra must be set before calling query()")
+            .downcast_ref::<Extra>()
+            .expect("evaluator extra must be of type Extra");
+        Ok(
+            pluginquery::query_addr(expr, extra.pkg, &[pluginquery::NO_PROVIDER_EXCLUSION])
+                .format(),
+        )
+    }
+
     /// Build a struct (dict) from keyword arguments, for nested target config.
     fn r#struct<'v>(
         eval: &mut Evaluator<'v, '_, '_>,

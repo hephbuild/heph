@@ -8,20 +8,63 @@ use clap_complete::engine::ArgValueCompleter;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
-use crate::commands::utils::matcher_from_args;
+use crate::commands::utils::resolve_matcher;
 use crate::engine::{Engine, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp};
 use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, LogSink};
 
+/// Long help shared by `run` and `query`, documenting the `-e` query language.
+pub const QUERY_LANG_HELP: &str = "\
+Selecting targets:
+  heph run //pkg:name                 a single target address
+  heph run <label> //pkg/...          all targets with <label> under //pkg
+  heph run -e '<expr>'                a query expression (see below)
+
+Query language (-e / --expr):
+  Patterns:
+    //pkg                package //pkg
+    //pkg/...            every package under //pkg
+    //pkg:name           one target address
+    ./sub, ../x, .       relative to the current package
+  Functions:
+    label(x)             targets carrying label x   (e.g. label(\"//tag:release\"))
+    tree_output(pkg)     targets whose codegen tree writes into pkg
+    addr(//pkg:name)     an explicit target address
+    package(//pkg)       an explicit package
+    package_prefix(//pkg) every package under //pkg
+  Operators (precedence ! > && > ||, group with parentheses):
+    a && b               both          a || b   either          !a   negate
+  Evaluation follows grouping then left-to-right, bailing as early as possible.
+
+  Examples:
+    heph run -e '//some/... && label(foo)'
+    heph run -e '//app/... && !label(slow)'
+    heph run -e '//... && !//vendor/...'
+    heph run -e '(//a/... || //b/...) && tree_output(gen)'
+";
+
 #[derive(Args, Clone)]
-#[command(override_usage = "heph run <TARGET_ADDRESS>\n       heph run <LABEL> <PACKAGE_MATCHER>")]
+#[command(
+    override_usage = "heph run <TARGET_ADDRESS>\n       heph run <LABEL> <PACKAGE_MATCHER>\n       heph run -e <EXPR>",
+    after_long_help = QUERY_LANG_HELP
+)]
 pub struct RunArgs {
     /// Target address (e.g., //pkg:name) OR Label
     #[arg(value_name = "TARGET_ADDRESS/LABEL", add = ArgValueCompleter::new(complete_target_addr))]
-    pub arg1: String,
+    pub arg1: Option<String>,
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
+    /// Select targets with a query expression, e.g. -e '//pkg/... && !//vendor/...'.
+    /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
+    /// Mutually exclusive with the positional TARGET arguments.
+    #[arg(
+        short = 'e',
+        long = "expr",
+        value_name = "EXPR",
+        conflicts_with = "arg1"
+    )]
+    pub expr: Option<String>,
     /// Force execution, ignoring any cached result
     #[arg(long = "force")]
     pub force: bool,
@@ -34,9 +77,6 @@ pub struct RunArgs {
     /// Print output file list to stdout
     #[arg(long = "list-out")]
     pub list_out: bool,
-    /// Exclude target address (repeatable, e.g. -e //pkg:target)
-    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS", add = ArgValueCompleter::new(complete_target_addr))]
-    pub exclude: Vec<String>,
     /// Fail if generated output differs from the tree (CI check)
     #[arg(long = "frozen")]
     pub frozen: bool,
@@ -53,7 +93,7 @@ impl RunApp {
     fn progress_label(&self) -> String {
         match &self.matcher {
             Matcher::Addr(a) => format!("Running {}", a.format()),
-            other => format!("Running {other:?}"),
+            other => format!("Running {}", crate::htquery::format(other)),
         }
     }
 }
@@ -168,7 +208,7 @@ pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow:
 
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
-    let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &base_pkg, false)?;
+    let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
         args,

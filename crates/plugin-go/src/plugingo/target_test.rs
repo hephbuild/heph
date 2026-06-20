@@ -763,12 +763,7 @@ mod tests {
     // ---- test_spec ----
 
     fn query_addr(pkg: &str) -> Addr {
-        hmodel::htaddr::parse_addr(&format!(
-            "//{}:q@package={},label=go_test_data",
-            hplugin_query::pluginquery::PACKAGE,
-            pkg,
-        ))
-        .expect("parse query addr")
+        hplugin_query::pluginquery::query_addr(&format!("//{pkg} && label(go_test_data)"), "", &[])
     }
 
     #[test]
@@ -972,10 +967,10 @@ mod tests {
             "data dep must be query addr: {s}"
         );
         assert!(
-            s.contains("label=go_test_data"),
+            s.contains("label(go_test_data)"),
             "must filter by label: {s}"
         );
-        assert!(s.contains("package=mypkg"), "must filter by package: {s}");
+        assert!(s.contains("//mypkg"), "must filter by package: {s}");
         assert_eq!(s, qa.format());
     }
 }

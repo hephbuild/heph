@@ -25,7 +25,7 @@ pub use hcore::{
 };
 pub use hengine::engine;
 pub use hlock::hlock;
-pub use hmodel::{htaddr, htmatcher, htpkg};
+pub use hmodel::{htaddr, htmatcher, htpkg, htquery};
 pub use hplugin::htspec;
 pub use hplugin_buildfile::pluginbuildfile;
 pub use hplugin_exec::pluginexec;

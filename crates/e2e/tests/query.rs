@@ -22,7 +22,9 @@ target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt", labels
 "#,
     );
 
-    let spec = ws.get_spec(&format!("//{PACKAGE}:q@label=lint")).await?;
+    let spec = ws
+        .get_spec(&format!("//{PACKAGE}:q@expr=label(lint)"))
+        .await?;
 
     assert_eq!(spec.driver, heph::plugingroup::DRIVER_NAME);
     let deps = match spec.config.get("deps") {
@@ -67,7 +69,7 @@ target(name = "z", driver = "bash", run = "echo z > $OUT", out = "z.txt")
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@package=exact/pkg"))
+        .get_spec(&format!("//{PACKAGE}:q@expr=package(exact/pkg)"))
         .await?;
 
     let deps = match spec.config.get("deps") {
@@ -106,7 +108,7 @@ target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt")
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@package_prefix=src/alpha"))
+        .get_spec(&format!("//{PACKAGE}:q@expr=package_prefix(src/alpha)"))
         .await?;
 
     let deps = match spec.config.get("deps") {
@@ -134,7 +136,9 @@ target(name = "skip", driver = "bash", run = "echo skip_val > $OUT", out = "skip
 "#,
     );
 
-    let result = ws.run(&format!("//{PACKAGE}:q@label=collect")).await?;
+    let result = ws
+        .run(&format!("//{PACKAGE}:q@expr=label(collect)"))
+        .await?;
     let content = common::artifact_string(&result);
     assert!(content.contains("p_val"), "missing p_val, got: {content:?}");
     assert!(content.contains("q_val"), "missing q_val, got: {content:?}");
@@ -161,7 +165,7 @@ target(
     driver = "bash",
     run = "cat $SRC_LIBS > $OUT",
     out = "result.txt",
-    deps = {"libs": ["//@heph/query:q@label=lib,exclude_provider=__none__"]},
+    deps = {"libs": ["//@heph/query:q@expr=label(lib),exclude_provider=__none__"]},
 )
 "#,
     );
@@ -191,7 +195,7 @@ target(name = "t", driver = "bash", run = "echo x > $OUT", out = "x.txt")
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@label=nonexistent"))
+        .get_spec(&format!("//{PACKAGE}:q@expr=label(nonexistent)"))
         .await?;
 
     let deps = match spec.config.get("deps") {
@@ -224,7 +228,9 @@ target(name = "z", driver = "bash", run = "echo z > $OUT", out = "z.txt", labels
     );
 
     let spec = ws
-        .get_spec(&format!("//{PACKAGE}:q@package=inter/a,label=tag"))
+        .get_spec(&format!(
+            "//{PACKAGE}:q@expr=\"package(inter/a) && label(tag)\""
+        ))
         .await?;
 
     let deps = match spec.config.get("deps") {
@@ -240,6 +246,85 @@ target(name = "z", driver = "bash", run = "echo z > $OUT", out = "z.txt", labels
         matches!(&deps[0], TargetSpecValue::String(s) if s == "//inter/a:x"),
         "expected //inter/a:x, got: {:?}",
         deps[0]
+    );
+    Ok(())
+}
+
+// Query by expr arg parses the query language and resolves to matching targets.
+#[tokio::test]
+async fn test_query_by_expr_spec() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "qx",
+        r#"
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt", labels = ["lint"])
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt")
+"#,
+    );
+    ws.write_build_file(
+        "qx/vendor",
+        r#"
+target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt", labels = ["lint"])
+"#,
+    );
+
+    // Every lint target under //qx, excluding the vendored subtree.
+    let spec = ws
+        .get_spec(&format!(
+            "//{PACKAGE}:q@expr=\"//qx/... && label(lint) && !//qx/vendor/...\""
+        ))
+        .await?;
+
+    let deps = match spec.config.get("deps") {
+        Some(TargetSpecValue::List(l)) => l,
+        _ => panic!("expected deps list, got: {:?}", spec.config.get("deps")),
+    };
+    let dep_strs: Vec<&str> = deps
+        .iter()
+        .map(|v| match v {
+            TargetSpecValue::String(s) => s.as_str(),
+            _ => panic!("expected string dep"),
+        })
+        .collect();
+    assert_eq!(dep_strs, vec!["//qx:a"], "got: {dep_strs:?}");
+    Ok(())
+}
+
+// The BUILD-file `query(...)` builtin composes a @heph/query dep that a group
+// expands to the matched targets — same shape as `file()`/`glob()`.
+#[tokio::test]
+async fn test_buildfile_query_builtin_resolves() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "qb",
+        r#"
+target(name = "a", driver = "bash", run = "echo a_value > $OUT", out = "a.txt", labels = ["lint"])
+target(name = "b", driver = "bash", run = "echo b_value > $OUT", out = "b.txt")
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "g", driver = "group", deps = [query("//qb/... && label(lint)")])
+target(
+    name = "consumer",
+    driver = "bash",
+    run = "cat $SRC_G > $OUT",
+    out = "result.txt",
+    deps = {"g": ["//app:g"]},
+)
+"#,
+    );
+
+    let result = ws.run("//app:consumer").await?;
+    let content = common::artifact_string(&result);
+    assert!(
+        content.contains("a_value"),
+        "expected lint target output, got: {content:?}"
+    );
+    assert!(
+        !content.contains("b_value"),
+        "unlabeled target must not be selected, got: {content:?}"
     );
     Ok(())
 }
