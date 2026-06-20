@@ -170,6 +170,7 @@ fn make_workspace_ordered(
                     codegen: None,
                     deps: Default::default(),
                     labels: vec![],
+                    ..Default::default()
                 }])
                 .expect("static provider"),
             )

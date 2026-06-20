@@ -125,6 +125,7 @@ mod tests {
             codegen: None,
             deps: HashMap::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 

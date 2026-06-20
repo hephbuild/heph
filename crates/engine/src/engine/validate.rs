@@ -192,6 +192,7 @@ mod tests {
             codegen: Some(codegen.to_string()),
             deps: HashMap::new(),
             labels: vec![],
+            ..Default::default()
         }
     }
 
