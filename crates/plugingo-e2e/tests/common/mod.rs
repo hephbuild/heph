@@ -60,6 +60,42 @@ pub const HERMETIC_GO: &str = "1.26.4";
 /// `gotool` sentinel selecting the host `go` (mirrors `plugingo::toolchain::HOST`).
 pub const HOST_GO: &str = "host";
 
+/// SDK tarball checksums for [`HERMETIC_GO`], keyed `"<version>/<goos>/<goarch>"`
+/// (see `plugingo::toolchain::checksum_key`). The provider has no built-in table
+/// — hermetic builds must supply these via the `checksums` config option — so
+/// the suite injects them for the host platforms CI runs on. Sourced from
+/// <https://go.dev/dl/?mode=json>.
+const HERMETIC_GO_CHECKSUMS: &[(&str, &str)] = &[
+    (
+        "1.26.4/linux/amd64",
+        "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+    ),
+    (
+        "1.26.4/linux/arm64",
+        "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768",
+    ),
+    (
+        "1.26.4/darwin/amd64",
+        "05dc9b5f9997744520aaebb3d5deaa7c755371aebbfb7f97c2511a9f3367538d",
+    ),
+    (
+        "1.26.4/darwin/arm64",
+        "b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53",
+    ),
+];
+
+/// Checksums to put in the go provider `Config` for a given `gotool`: the
+/// hermetic set for a pinned version, empty for `host` (no SDK download).
+fn sdk_checksums_for(gotool: &str) -> std::collections::HashMap<String, String> {
+    if gotool == HOST_GO {
+        return std::collections::HashMap::new();
+    }
+    HERMETIC_GO_CHECKSUMS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
 }
@@ -112,6 +148,7 @@ fn make_workspace_ordered(
                     init.root.to_path_buf(),
                     plugingo::Config {
                         foreign_name_guard,
+                        sdk_checksums: sdk_checksums_for(&gotool),
                         go_version: gotool,
                         ..Default::default()
                     },
@@ -146,6 +183,7 @@ fn make_workspace_ordered(
                     init.root.to_path_buf(),
                     plugingo::Config {
                         foreign_name_guard,
+                        sdk_checksums: sdk_checksums_for(&gotool),
                         go_version: gotool,
                         ..Default::default()
                     },

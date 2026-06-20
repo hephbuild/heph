@@ -45,6 +45,12 @@ pub struct Config {
     /// or [`toolchain::HOST`] (use the host `go`). Set via the required `gotool`
     /// provider option; programmatic callers (tests) set it here directly.
     pub go_version: String,
+    /// Expected SHA-256 of each hermetic SDK tarball, keyed by
+    /// [`toolchain::checksum_key`] (`"<version>/<goos>/<goarch>"`). Populated
+    /// from the optional `checksums` provider option; there is no built-in
+    /// table, so a hermetic `gotool` whose host triple is absent here fails the
+    /// build closed (no unverified download). Empty for `gotool = "host"`.
+    pub sdk_checksums: HashMap<String, String>,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
@@ -69,6 +75,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
+            sdk_checksums: HashMap::new(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -87,6 +94,9 @@ pub(crate) struct ProviderInner {
     workspace_root: PathBuf,
     /// Go release the hermetic toolchain is pinned to (see [`Config::go_version`]).
     go_version: String,
+    /// Expected SDK tarball checksums by [`toolchain::checksum_key`] (see
+    /// [`Config::sdk_checksums`]).
+    sdk_checksums: HashMap<String, String>,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
@@ -209,7 +219,7 @@ impl Provider {
         //     inside the sandbox; non-hermetic, see [`toolchain::HOST`]), or
         //   - a pinned version like `"1.26.4"` → download + manage that SDK
         //     hermetically (`//@heph/go/toolchain/<version>:go`).
-        hplugin::config::deny_unknown("go provider", opts, &["gotool", "skip"])?;
+        hplugin::config::deny_unknown("go provider", opts, &["gotool", "skip", "checksums"])?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -218,6 +228,12 @@ impl Provider {
                     toolchain::DEFAULT_GO_VERSION
                 )
             })?;
+        // Optional: SDK tarball checksums keyed `"<version>/<goos>/<goarch>"`
+        // (see `toolchain::checksum_key`). Required in practice only for a
+        // hermetic `gotool` — resolved lazily when the toolchain target is built,
+        // so `gotool = "host"` needs none.
+        let sdk_checksums: HashMap<String, String> =
+            hplugin::config::decode_opt(opts, "go provider", "checksums")?.unwrap_or_default();
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
@@ -229,6 +245,7 @@ impl Provider {
             workspace_root,
             Config {
                 go_version,
+                sdk_checksums,
                 skip,
                 walker,
                 ..Default::default()
@@ -241,6 +258,7 @@ impl Provider {
             inner: Arc::new(ProviderInner {
                 workspace_root,
                 go_version: config.go_version,
+                sdk_checksums: config.sdk_checksums,
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
@@ -914,9 +932,16 @@ impl ProviderInner {
         if addr.name == toolchain::TOOLCHAIN_NAME
             && let Some(version) = toolchain::version_from_pkg(addr.package.as_str())
         {
-            let spec =
-                toolchain::build_spec(addr.clone(), version, &current_goos(), &current_goarch())
-                    .map_err(GetError::Other)?;
+            let (goos, goarch) = (current_goos(), current_goarch());
+            let key = toolchain::checksum_key(version, &goos, &goarch);
+            let sha256 = self.sdk_checksums.get(&key).ok_or_else(|| {
+                GetError::Other(anyhow::anyhow!(
+                    "no SDK checksum for Go {version} on {goos}/{goarch}; add it to the go \
+                     plugin's `checksums` option in your config, keyed \"{key}\" \
+                     (sha256 from https://go.dev/dl/?mode=json)"
+                ))
+            })?;
+            let spec = toolchain::build_spec(addr.clone(), version, &goos, &goarch, sha256);
             return Ok(GetResponse { target_spec: spec });
         }
 

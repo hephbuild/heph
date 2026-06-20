@@ -18,6 +18,16 @@ plugins:
       # Required. A pinned version → hermetic SDK download (reads nothing from
       # the host); or "host" → use the host `go` from PATH.
       gotool: "1.26.4"
+      # SDK tarball SHA-256s, keyed "<version>/<goos>/<goarch>". Required for a
+      # hermetic `gotool` (no built-in table — keeps the binary free of
+      # release-specific data); the host platform's entry must be present or the
+      # toolchain build fails closed. Add a version by adding its rows here
+      # (sha256 from https://go.dev/dl/?mode=json). Unused for gotool: "host".
+      checksums:
+        "1.26.4/linux/amd64": "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f"
+        "1.26.4/linux/arm64": "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768"
+        "1.26.4/darwin/amd64": "05dc9b5f9997744520aaebb3d5deaa7c755371aebbfb7f97c2511a9f3367538d"
+        "1.26.4/darwin/arm64": "b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53"
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus
