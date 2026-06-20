@@ -20,6 +20,12 @@ pub(crate) struct TargetSpec {
     pub hash_deps: HashMap<String, Vec<String>>,
     /// Dependencies materialized at runtime but excluded from the input hash.
     pub runtime_deps: HashMap<String, Vec<String>>,
+    /// Names of `deps`/`runtime_deps` groups staged **read-only**: materialized
+    /// once into the shared stage and hardlinked into each sandbox instead of
+    /// byte-copied per consumer. Use for deps a target only reads and never
+    /// mutates (e.g. a hermetic toolchain). No effect under the FUSE sandbox,
+    /// which already shares inputs lazily.
+    pub read_only_deps: Vec<String>,
     /// Build tools, grouped by name → list of target addresses; symlinked under `tools/`.
     pub tools: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths the target writes.
@@ -147,6 +153,7 @@ mod tests {
             "deps",
             "hash_deps",
             "runtime_deps",
+            "read_only_deps",
             "tools",
             "env",
             "pass_env",

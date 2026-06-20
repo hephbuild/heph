@@ -28,6 +28,14 @@ borsh = { version = "1.6.1", features = ["derive"] }
 glob = "0.3"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
+# Hermetic Go toolchain provisioning: download (reqwest), checksum (sha2),
+# and extract (flate2 + tar) the pinned Go SDK tarball so the build never
+# reads a `go` binary or GOROOT from the host.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+sha2 = "0.10"
+flate2 = "1.1.9"
+tar = "0.4"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

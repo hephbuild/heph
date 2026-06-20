@@ -1,3 +1,4 @@
+use crate::plugingo::addr_util::go_sdk_dep;
 use crate::plugingo::factors::Factors;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
@@ -12,7 +13,7 @@ pub fn build_spec_firstparty(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    goroot: &str,
+    go_version: &str,
     go_mod_addr: &Addr,
     go_src_addr: &Addr,
     go_src_query_addr: Option<&Addr>,
@@ -27,7 +28,7 @@ pub fn build_spec_firstparty(
         addr,
         import_path,
         factors,
-        goroot,
+        go_version,
         &[
             ("modfiles", &[go_mod_addr.format()][..]),
             ("srcfiles", &srcfiles),
@@ -39,16 +40,16 @@ pub fn build_spec_stdlib(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    goroot: &str,
+    go_version: &str,
 ) -> anyhow::Result<TargetSpec> {
-    build_spec_inner(addr, import_path, factors, goroot, &[])
+    build_spec_inner(addr, import_path, factors, go_version, &[])
 }
 
 pub fn build_spec_thirdparty(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    goroot: &str,
+    go_version: &str,
     go_mod_addr: &Addr,
     download_addr: &Addr,
 ) -> anyhow::Result<TargetSpec> {
@@ -56,7 +57,7 @@ pub fn build_spec_thirdparty(
         addr,
         import_path,
         factors,
-        goroot,
+        go_version,
         &[("modfiles", &[go_mod_addr.format()][..])],
     )?;
     // Threaded through to the driver so `resolve_package_addrs` can emit
@@ -73,7 +74,7 @@ fn build_spec_inner(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    goroot: &str,
+    go_version: &str,
     extra_deps: &[(&str, &[String])],
 ) -> anyhow::Result<TargetSpec> {
     let mut deps: HashMap<String, Value> = HashMap::new();
@@ -82,6 +83,12 @@ fn build_spec_inner(
             group.to_string(),
             Value::List(dep_addrs.iter().map(|a| Value::String(a.clone())).collect()),
         );
+    }
+    // Hermetic toolchain: stage the SDK into the golist sandbox; the driver
+    // derives GOROOT from its staged path. Host toolchain (`gotool = "host"`):
+    // no SDK dep — the driver resolves the host `go`/GOROOT at run time.
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
     }
 
     let mut config: HashMap<String, Value> = HashMap::new();
@@ -94,7 +101,11 @@ fn build_spec_inner(
         "goarch".to_string(),
         Value::String(factors.goarch.to_string()),
     );
-    config.insert("goroot".to_string(), Value::String(goroot.to_string()));
+    // The driver resolves GOROOT to the SDK staged for this version.
+    config.insert(
+        "go_version".to_string(),
+        Value::String(go_version.to_string()),
+    );
     if !factors.build_tags.is_empty() {
         config.insert(
             "build_tags".to_string(),
@@ -138,6 +149,9 @@ mod tests {
     use super::*;
     use hmodel::htpkg::PkgBuf;
 
+    /// Go version under test.
+    const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
+
     fn test_addr() -> Addr {
         Addr::new(
             PkgBuf::from("mylib"),
@@ -172,7 +186,7 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -188,7 +202,7 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -209,7 +223,7 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -226,12 +240,12 @@ mod tests {
     }
 
     #[test]
-    fn test_config_has_goos_goarch_goroot() {
+    fn test_config_has_goos_goarch_no_host_goroot() {
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -246,10 +260,32 @@ mod tests {
             spec.config.get("goarch"),
             Some(Value::String(s)) if s == "amd64"
         ));
-        assert!(matches!(
-            spec.config.get("goroot"),
-            Some(Value::String(s)) if s == "/usr/local/go"
-        ));
+        // GOROOT is no longer threaded from the host; the driver derives it from
+        // the staged hermetic SDK.
+        assert!(
+            !spec.config.contains_key("goroot"),
+            "golist spec must not carry a host goroot"
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let sdk = deps
+            .get(crate::plugingo::addr_util::GO_SDK_DEP_GROUP)
+            .expect("golist must dep on the hermetic SDK");
+        // `go list` resolves std imports against GOROOT/src — must take the full
+        // (default, unsuffixed) toolchain group, not the trimmed `tool` group.
+        let sdk_ref = match sdk {
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.as_str(),
+                _ => panic!("sdk dep entry not a string"),
+            },
+            _ => panic!("sdk dep not a list"),
+        };
+        assert!(
+            !sdk_ref.contains('|'),
+            "golist needs GOROOT/src — must select the full SDK group: {sdk_ref}"
+        );
     }
 
     #[test]
@@ -258,7 +294,7 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -282,7 +318,7 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -300,7 +336,7 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &go_src_addr(),
             None,
@@ -335,7 +371,7 @@ mod tests {
             test_addr(),
             "github.com/foo/bar",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &tp_download_addr(),
         )
@@ -366,7 +402,7 @@ mod tests {
             test_addr(),
             "github.com/foo/bar",
             &test_factors(),
-            "/usr/local/go",
+            V,
             &go_mod_addr(),
             &tp_download_addr(),
         )
@@ -392,7 +428,7 @@ mod tests {
             goarch: "amd64".into(),
             build_tags: vec!["integration".to_string()],
         };
-        let spec = build_spec_stdlib(test_addr(), "fmt", &factors, "/usr/local/go").unwrap();
+        let spec = build_spec_stdlib(test_addr(), "fmt", &factors, V).unwrap();
         assert!(
             matches!(
                 spec.config.get("build_tags"),
@@ -404,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_no_build_tags_key_when_empty() {
-        let spec = build_spec_stdlib(test_addr(), "fmt", &test_factors(), "/usr/local/go").unwrap();
+        let spec = build_spec_stdlib(test_addr(), "fmt", &test_factors(), V).unwrap();
         assert!(
             !spec.config.contains_key("build_tags"),
             "build_tags must not appear when empty"

@@ -10,7 +10,9 @@
 //! root crosses in [`CreateConfig`].
 
 use hdriver_support::driver_managed::ManagedDriver;
-use hplugin_go::plugingo::{GoEmbedDriver, GoGolistDriver, GoTestmainDriver, Provider};
+use hplugin_go::plugingo::{
+    GoEmbedDriver, GoGolistDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+};
 use plugin_sdk::stabby::abi::{NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
     create_config_from_bytes, make_dyn_managed_driver, make_dyn_provider, options_from_pb_map,
@@ -43,11 +45,6 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // Tunables come from the plugin's `options:` map (config yaml), carried as
     // structured CreateConfig data — read the same way an in-process plugin does.
     let mut options = options_from_pb_map(cfg.options);
-    // The golist driver needs the same go binary addr the provider resolves from
-    // its `gotool` option — peek it here (non-destructive; the provider still
-    // reads it) so there's a single source of truth, no separate `go_bin` knob.
-    let go_bin = hplugin::config::decode_opt::<String>(&options, "go", "gotool")?
-        .unwrap_or_else(|| "//@heph/bin:go".to_string());
     // The walker db lives in the engine's home dir (e.g. `.heph3`), not the repo
     // root — `home` comes from the engine, never hardcoded. It's this cdylib's own
     // option — consume it so it's kept out of the provider's map, whose
@@ -61,10 +58,17 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         Arc::new(Provider::from_options(root, &[], &[], &options, walker)?);
 
     let mut drivers = stabby::vec::Vec::new();
-    let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::new(go_bin));
+    let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::new());
     drivers.push(NamedDriver {
         name: "go_golist".into(),
         driver: make_dyn_managed_driver(golist),
+    });
+    // Hermetic Go toolchain: downloads + extracts the pinned SDK that backs
+    // every Go build/list/test target.
+    let toolchain: Arc<dyn ManagedDriver> = Arc::new(GoToolchainDriver);
+    drivers.push(NamedDriver {
+        name: "go_toolchain".into(),
+        driver: make_dyn_managed_driver(toolchain),
     });
     let embed: Arc<dyn ManagedDriver> = Arc::new(GoEmbedDriver);
     drivers.push(NamedDriver {

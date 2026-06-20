@@ -293,15 +293,137 @@ pub fn dep_group_env_var(group: &str) -> String {
     format!("SRC_{}", group.to_uppercase())
 }
 
-/// Build the `tools` config value exposing the go binary as `tool={go: <addr>}`.
+/// Dep group carrying the hermetic Go SDK tree into a build/test sandbox.
+/// Unused as an `$SRC_*` reference — the SDK is reached via the deterministic
+/// [`toolchain::staged_goroot`] path — but the dep edge is what makes the engine
+/// stage the SDK files into the sandbox.
+pub const GO_SDK_DEP_GROUP: &str = "gosdk";
+
+/// `(group, value)` dep entry staging the hermetic Go SDK for `go_version` into
+/// the sandbox at [`toolchain::staged_goroot`]. A single SDK output (the full
+/// tree, incl. `GOROOT/src`) serves every consumer: it is staged read-only and
+/// exposed via a directory symlink, so its size costs nothing per consumer.
+/// Pair with [`go_sdk_read_only_config`] on `sh`/exec targets.
 ///
-/// The exec driver symlinks the tool into `bin/` and sets `$TOOL_GO` to its
-/// path (group "go" → `TOOL_GO`), so run scripts invoke `"$TOOL_GO" tool ...`.
-pub fn go_bin_tools_config(go_bin_addr: &str) -> Value {
-    Value::Map(HashMap::from([(
-        "go".to_string(),
-        Value::List(vec![Value::String(go_bin_addr.to_string())]),
-    )]))
+/// Returns `None` for the host toolchain ([`toolchain::HOST`]) — the host `go`
+/// is read from the sandbox's `PATH`/`GOROOT`, not staged as a dep.
+pub fn go_sdk_dep(go_version: &str) -> Option<(String, Value)> {
+    if crate::plugingo::toolchain::is_host(go_version) {
+        return None;
+    }
+    Some((
+        GO_SDK_DEP_GROUP.to_string(),
+        Value::List(vec![Value::String(
+            crate::plugingo::toolchain::toolchain_addr(go_version).format(),
+        )]),
+    ))
+}
+
+/// `(key, value)` config entry marking the `gosdk` dep group for read-only
+/// staging on the `sh`/exec driver: the SDK is materialized once into the
+/// shared stage and exposed to each sandbox via a directory symlink instead of
+/// byte-copied per consumer. `None` for the host toolchain (no SDK dep to mark).
+pub fn go_sdk_read_only_config(go_version: &str) -> Option<(String, Value)> {
+    if crate::plugingo::toolchain::is_host(go_version) {
+        return None;
+    }
+    Some((
+        "read_only_deps".to_string(),
+        Value::List(vec![Value::String(GO_SDK_DEP_GROUP.to_string())]),
+    ))
+}
+
+/// Host env vars to pass through (at runtime, unhashed) so the host toolchain
+/// works inside the sandbox: `PATH` to find `go`, plus the Go/module cache and
+/// proxy knobs `go` consults. Empty for a hermetic toolchain (reads nothing from
+/// the host). Insert the names under the exec `runtime_pass_env` config key.
+pub fn go_host_runtime_pass_env(go_version: &str) -> Vec<String> {
+    if crate::plugingo::toolchain::is_host(go_version) {
+        [
+            "PATH",
+            "HOME",
+            "GOPATH",
+            "GOMODCACHE",
+            "GOPROXY",
+            "GOFLAGS",
+            "GOPRIVATE",
+            "GONOSUMDB",
+            "GONOSUMCHECK",
+            "GOSUMDB",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// `(key, value)` entry adding [`go_host_runtime_pass_env`] under the exec
+/// `runtime_pass_env` config key, or `None` for a hermetic toolchain.
+pub fn go_host_pass_env_config(go_version: &str) -> Option<(String, Value)> {
+    let names = go_host_runtime_pass_env(go_version);
+    if names.is_empty() {
+        return None;
+    }
+    Some((
+        "runtime_pass_env".to_string(),
+        Value::List(names.into_iter().map(Value::String).collect()),
+    ))
+}
+
+/// Prelude pointing `GOROOT` at the Go toolchain for `go_version` and exposing
+/// its `go` binary on `PATH` and as `$GO`.
+///
+/// Hermetic: `GOROOT` is the staged SDK ([`toolchain::staged_goroot`]) — reads
+/// nothing from the host; pair with [`go_sdk_dep`]. Host ([`toolchain::HOST`]):
+/// `GOROOT` is resolved in-shell via the host `go env GOROOT` (so `go` must be
+/// on the passed-through `PATH`, see [`go_host_runtime_pass_env`]).
+pub fn go_goroot_prelude(go_version: &str) -> Vec<String> {
+    if crate::plugingo::toolchain::is_host(go_version) {
+        return vec![
+            // Host `go` from PATH; pin GOROOT to its own report so `go tool`
+            // invocations resolve the compiler/linker consistently.
+            "export GOROOT=\"$(go env GOROOT)\"".to_string(),
+            "export PATH=\"$GOROOT/bin:$PATH\"".to_string(),
+            "GO=\"$GOROOT/bin/go\"".to_string(),
+        ];
+    }
+    vec![
+        format!(
+            "export GOROOT=\"$WORKSPACE_ROOT/{}\"",
+            crate::plugingo::toolchain::staged_goroot(go_version)
+        ),
+        "export PATH=\"$GOROOT/bin:$PATH\"".to_string(),
+        "GO=\"$GOROOT/bin/go\"".to_string(),
+    ]
+}
+
+/// Shell prelude every Go *compile/link/list* script runs first:
+/// [`go_goroot_prelude`] plus a sandbox-local `GOCACHE` so the build cache is
+/// neither read from nor written to the host.
+///
+/// Not for glob/tree-output targets (the download target's `**/*` would capture
+/// the cache dir) — those use [`go_goroot_prelude`] directly.
+pub fn go_run_prelude(go_version: &str) -> Vec<String> {
+    let mut p = go_goroot_prelude(go_version);
+    p.push("export GOCACHE=\"$PWD/.heph-gocache\"".to_string());
+    p
+}
+
+/// Hashed `env` map shared by Go compile/link targets: disable cgo, pin the
+/// toolchain to the (hermetic) local SDK, and ignore any workspace `go.work`.
+/// GOOS/GOARCH stay in `runtime_env` (the target addr's factor args already key
+/// the cache per platform).
+pub fn go_build_env() -> Value {
+    Value::Map(HashMap::from([
+        ("CGO_ENABLED".to_string(), Value::String("0".to_string())),
+        (
+            "GOTOOLCHAIN".to_string(),
+            Value::String("local".to_string()),
+        ),
+        ("GOWORK".to_string(), Value::String("off".to_string())),
+    ]))
 }
 
 /// Wrap a list of shell commands into the `run` config value. The exec driver

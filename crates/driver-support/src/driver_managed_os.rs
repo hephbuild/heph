@@ -78,6 +78,7 @@ impl ManagedDriverOs {
                             unpack_root.as_path(),
                             list_path.as_deref(),
                             &input.filters,
+                            crate::stage::is_per_file(&input.annotations),
                             ctoken,
                         )
                         .await

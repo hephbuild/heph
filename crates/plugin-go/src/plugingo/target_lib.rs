@@ -1,5 +1,6 @@
 use crate::plugingo::addr_util::{
-    go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
+    go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
 use crate::plugingo::target_std::archive_filename;
@@ -19,9 +20,7 @@ pub fn build_spec(
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
     src_addrs: &[String],
-    go_bin_addr: &str,
-    goroot: &str,
-    gocache: &str,
+    go_version: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
 ) -> TargetSpec {
@@ -33,7 +32,13 @@ pub fn build_spec(
     } else {
         import_path
     };
-    let run = generate_run_script(p_flag, transitive_libs, &out_file, embed_addr.is_some());
+    let mut run = go_run_prelude(go_version);
+    run.extend(generate_run_script(
+        p_flag,
+        transitive_libs,
+        &out_file,
+        embed_addr.is_some(),
+    ));
 
     // Default dep group ("") → $SRC / $LIST_SRC populated with the package source files.
     // Named lib_* groups carry compiled archives for the importcfg.
@@ -70,11 +75,19 @@ pub fn build_spec(
             ),
         );
     }
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
-    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
+    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
+        config.insert(ro_k, ro_v);
+    }
+    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
+        config.insert(pe_k, pe_v);
+    }
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -87,25 +100,11 @@ pub fn build_spec(
         Value::Map(HashMap::from([
             ("GOOS".to_string(), Value::String(factors.goos.clone())),
             ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-            ("GOROOT".to_string(), Value::String(goroot.to_string())),
-            // go tool {compile,asm,link} need GOCACHE on startup for build IDs.
-            ("GOCACHE".to_string(), Value::String(gocache.to_string())),
         ])),
     );
-    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
-    // cache lookups. `runtime_env` is intentionally excluded from the def hash
-    // (see pluginexec/mod.rs:70).
-    config.insert(
-        "env".to_string(),
-        Value::Map(HashMap::from([(
-            "CGO_ENABLED".to_string(),
-            Value::String("0".to_string()),
-        )])),
-    );
-    config.insert(
-        "pass_env".to_string(),
-        Value::List(vec![Value::String("GOROOT".to_string())]),
-    );
+    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
+    // cache lookups. `runtime_env` is excluded from the def hash (pluginexec/mod.rs:70).
+    config.insert("env".to_string(), go_build_env());
 
     TargetSpec {
         addr,
@@ -133,7 +132,7 @@ fn generate_run_script(
     // helpers in transitive deps may fail to link with "relocation target X
     // not defined". Cheap to set unconditionally — Go's own build does so.
     lines.push(format!(
-        "\"$TOOL_GO\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
+        "\"$GO\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
     ));
     lines
 }
@@ -143,6 +142,9 @@ mod tests {
     use super::*;
     use hbuiltins::pluginfs;
     use hmodel::htpkg::PkgBuf;
+
+    /// Go version under test.
+    const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
 
     fn run_str(spec: &TargetSpec) -> String {
         match spec.config.get("run").unwrap() {
@@ -191,9 +193,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -209,9 +209,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -229,9 +227,7 @@ mod tests {
             &test_factors(),
             &[],
             &addrs,
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -262,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_has_go_group() {
+    fn test_deps_include_hermetic_sdk() {
         let spec = build_spec(
             test_addr(),
             "example.com/mylib",
@@ -270,24 +266,62 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
-        let tools = match spec.config.get("tools").unwrap() {
+        let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
         };
-        let go = match tools.get("go").expect("tools must have go group") {
-            Value::List(v) => v,
-            _ => panic!("expected list"),
+        let sdk = deps
+            .get(crate::plugingo::addr_util::GO_SDK_DEP_GROUP)
+            .expect("lib compile must dep on the hermetic SDK");
+        // A single SDK output serves every consumer (symlinked in read-only),
+        // so the dep is the bare toolchain addr — no output-group selector.
+        let sdk_ref = match sdk {
+            Value::List(v) => match &v[0] {
+                Value::String(s) => s.as_str(),
+                _ => panic!("sdk dep entry not a string"),
+            },
+            _ => panic!("sdk dep not a list"),
         };
         assert!(
-            matches!(&go[0], Value::String(s) if s.contains("@heph/bin")),
-            "go tool should reference go bin addr: {:?}",
-            go
+            !sdk_ref.contains('|'),
+            "SDK dep must reference the single toolchain output, no selector: {sdk_ref}"
+        );
+        assert!(
+            !spec.config.contains_key("tools"),
+            "no host go tool should be referenced"
+        );
+    }
+
+    #[test]
+    fn test_sdk_dep_marked_read_only() {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/mylib",
+            "mylib",
+            &test_factors(),
+            &[],
+            &src_addrs(),
+            V,
+            None,
+            &[],
+        );
+        // The SDK is read-only — staged once, hardlinked into each sandbox.
+        let ro = match spec
+            .config
+            .get("read_only_deps")
+            .expect("read_only_deps set")
+        {
+            Value::List(v) => v,
+            _ => panic!("read_only_deps must be a list"),
+        };
+        assert!(
+            ro.iter().any(|e| matches!(e, Value::String(s)
+                if s == crate::plugingo::addr_util::GO_SDK_DEP_GROUP)),
+            "the gosdk group must be marked read-only: {ro:?}"
         );
     }
 
@@ -300,9 +334,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -313,8 +345,8 @@ mod tests {
             run
         );
         assert!(
-            run.contains("TOOL_GO"),
-            "run script should use $TOOL_GO: {}",
+            run.contains("\"$GO\""),
+            "run script should invoke the hermetic $GO: {}",
             run
         );
         assert!(run.contains("tool compile"));
@@ -334,21 +366,19 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
         let run = run_str(&spec);
         assert!(
-            run.contains("\"$TOOL_GO\""),
-            "run script must use \"$TOOL_GO\" (quoted): {}",
+            run.contains("\"$GO\""),
+            "run script must use the hermetic \"$GO\" (quoted): {}",
             run
         );
         assert!(
-            !run.contains("^go "),
-            "run script must not invoke bare `go` command: {}",
+            !run.contains("TOOL_GO"),
+            "run script must not use the host go tool: {}",
             run
         );
     }
@@ -362,9 +392,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -396,9 +424,7 @@ mod tests {
             &test_factors(),
             &transitive_libs,
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -422,9 +448,7 @@ mod tests {
             &test_factors(),
             &transitive_libs,
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -464,9 +488,7 @@ mod tests {
             &test_factors(),
             &addrs,
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -477,9 +499,7 @@ mod tests {
             &test_factors(),
             &addrs_rev,
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -498,9 +518,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -524,9 +542,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -552,9 +568,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -583,9 +597,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             Some(&embed_addr()),
             &[],
         );
@@ -618,9 +630,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             Some(&embed_addr()),
             &[],
         );
@@ -644,9 +654,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );
@@ -666,9 +674,7 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
             None,
             &[],
         );

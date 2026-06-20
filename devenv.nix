@@ -126,8 +126,12 @@ in
     mkdir -p "$dest"
     cp "$lib" "$dest/$name.new"
     mv -f "$dest/$name.new" "$dest/$name"
+    # `-host-path` is the sibling basename recorded in the manifest (heph
+    # resolves it against the manifest dir); `-checksum-from` is the real file
+    # to hash — the just-installed dylib at $dest, which is NOT under this tool's
+    # cwd, so the two must be passed separately.
     ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
-        && go run . -name go -host-path "$name" -out "$dest/heph-go-plugin.json" )
+        && go run . -name go -host-path "$name" -checksum-from "$dest/$name" -out "$dest/heph-go-plugin.json" )
     echo "installed go plugin -> $dest"
   '';
 

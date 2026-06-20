@@ -1,17 +1,12 @@
 use crate::plugingo::addr_util::{
-    go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
+    go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
 use std::collections::{BTreeMap, HashMap};
-
-pub struct GoEnv<'a> {
-    pub gomodcache: &'a str,
-    pub gopath: &'a str,
-    pub gocache: &'a str,
-}
 
 /// Extra environment configuration plumbed onto the `test`/`xtest` run targets
 /// from a package's `provider_state(provider="go", test={...})`. Mirrors the
@@ -37,11 +32,9 @@ pub fn build_test_lib_spec(
     transitive_libs: &[(String, Addr)],
     src_addrs: &[String],
     test_src_addrs: &[String],
-    go_bin_addr: &str,
-    goroot: &str,
-    gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    go_version: &str,
 ) -> TargetSpec {
     let out_file = format!("{}_test.a", package_name);
     let run = compile_run_script(
@@ -56,13 +49,11 @@ pub fn build_test_lib_spec(
         factors,
         transitive_libs,
         src_addrs.iter().chain(test_src_addrs.iter()).cloned(),
-        go_bin_addr,
-        goroot,
-        gocache,
         embed_addr,
         embed_file_addrs,
         run,
         out_file,
+        go_version,
     )
 }
 
@@ -77,11 +68,9 @@ pub fn build_xtest_lib_spec(
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
     xtest_src_addrs: &[String],
-    go_bin_addr: &str,
-    goroot: &str,
-    gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    go_version: &str,
 ) -> TargetSpec {
     // xtest package import path is "<import_path>_test"
     let xtest_import_path = format!("{}_test", import_path);
@@ -98,13 +87,11 @@ pub fn build_xtest_lib_spec(
         factors,
         transitive_libs,
         xtest_src_addrs.iter().cloned(),
-        go_bin_addr,
-        goroot,
-        gocache,
         embed_addr,
         embed_file_addrs,
         run,
         out_file,
+        go_version,
     )
 }
 
@@ -116,9 +103,7 @@ pub fn build_testmain_lib_spec(
     factors: &Factors,
     testmain_src_addr: &Addr,
     testmain_libs: &[(String, Addr)],
-    go_bin_addr: &str,
-    goroot: &str,
-    gocache: &str,
+    go_version: &str,
 ) -> TargetSpec {
     let out_file = "testmain_main.a".to_string();
     let run = compile_run_script("main", testmain_libs, &out_file, false);
@@ -128,13 +113,11 @@ pub fn build_testmain_lib_spec(
         factors,
         testmain_libs,
         std::iter::once(testmain_src_addr.format()),
-        go_bin_addr,
-        goroot,
-        gocache,
         None,
         &[],
         run,
         out_file,
+        go_version,
     )
 }
 
@@ -159,14 +142,14 @@ pub fn build_testmain_lib_spec(
 pub fn build_test_spec(
     addr: Addr,
     factors: &Factors,
-    go_bin_addr: &str,
-    go_env: &GoEnv<'_>,
     testmain_lib_addr: &Addr,
     all_libs: &[(String, Addr)],
+    go_version: &str,
 ) -> TargetSpec {
-    let mut script = write_importcfg_script(all_libs, None);
+    let mut script = go_run_prelude(go_version);
+    script.extend(write_importcfg_script(all_libs, None));
     script.push(
-        "\"$TOOL_GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"".to_string(),
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"".to_string(),
     );
 
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
@@ -178,11 +161,19 @@ pub fn build_test_spec(
         let group = import_path_to_dep_group(import_path);
         deps.insert(group, Value::List(vec![Value::String(lib_addr.format())]));
     }
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(script));
-    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
+    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
+        config.insert(ro_k, ro_v);
+    }
+    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
+        config.insert(pe_k, pe_v);
+    }
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -195,37 +186,11 @@ pub fn build_test_spec(
         Value::Map(HashMap::from([
             ("GOOS".to_string(), Value::String(factors.goos.clone())),
             ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-            (
-                "GOMODCACHE".to_string(),
-                Value::String(go_env.gomodcache.to_string()),
-            ),
-            (
-                "GOPATH".to_string(),
-                Value::String(go_env.gopath.to_string()),
-            ),
-            (
-                "GOCACHE".to_string(),
-                Value::String(go_env.gocache.to_string()),
-            ),
         ])),
     );
-    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
+    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert(
-        "env".to_string(),
-        Value::Map(HashMap::from([(
-            "CGO_ENABLED".to_string(),
-            Value::String("0".to_string()),
-        )])),
-    );
-    config.insert(
-        "pass_env".to_string(),
-        Value::List(vec![
-            Value::String("GOROOT".to_string()),
-            Value::String("GOMODCACHE".to_string()),
-            Value::String("GOPATH".to_string()),
-        ]),
-    );
+    config.insert("env".to_string(), go_build_env());
 
     TargetSpec {
         addr,
@@ -332,7 +297,7 @@ fn compile_run_script(
     };
 
     lines.push(format!(
-        "\"$TOOL_GO\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
+        "\"$GO\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
     ));
 
     lines
@@ -347,13 +312,11 @@ fn build_lib_spec_inner(
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
     src_addrs: impl Iterator<Item = String>,
-    go_bin_addr: &str,
-    goroot: &str,
-    gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
     run: Vec<String>,
     out_file: String,
+    go_version: &str,
 ) -> TargetSpec {
     let mut deps: BTreeMap<String, Value> = transitive_libs
         .iter()
@@ -386,11 +349,22 @@ fn build_lib_spec_inner(
             ),
         );
     }
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
+
+    let mut full_run = go_run_prelude(go_version);
+    full_run.extend(run);
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), to_run_value(run));
-    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
+    config.insert("run".to_string(), to_run_value(full_run));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
+    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
+        config.insert(ro_k, ro_v);
+    }
+    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
+        config.insert(pe_k, pe_v);
+    }
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -403,23 +377,11 @@ fn build_lib_spec_inner(
         Value::Map(HashMap::from([
             ("GOOS".to_string(), Value::String(factors.goos.clone())),
             ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-            ("GOROOT".to_string(), Value::String(goroot.to_string())),
-            ("GOCACHE".to_string(), Value::String(gocache.to_string())),
         ])),
     );
-    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
+    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert(
-        "env".to_string(),
-        Value::Map(HashMap::from([(
-            "CGO_ENABLED".to_string(),
-            Value::String("0".to_string()),
-        )])),
-    );
-    config.insert(
-        "pass_env".to_string(),
-        Value::List(vec![Value::String("GOROOT".to_string())]),
-    );
+    config.insert("env".to_string(), go_build_env());
 
     TargetSpec {
         addr,
@@ -435,6 +397,9 @@ mod tests {
     use super::*;
     use hbuiltins::pluginfs;
     use hmodel::htpkg::PkgBuf;
+
+    /// Go version under test.
+    const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
 
     fn run_str(spec: &TargetSpec) -> String {
         match spec.config.get("run").unwrap() {
@@ -463,14 +428,6 @@ mod tests {
         }
     }
 
-    fn go_env() -> GoEnv<'static> {
-        GoEnv {
-            gomodcache: "/go/pkg/mod",
-            gopath: "/go",
-            gocache: "/tmp/gocache",
-        }
-    }
-
     fn src_addrs(pkg: &str) -> Vec<String> {
         vec![pluginfs::file_addr(&format!("{}/foo.go", pkg)).format()]
     }
@@ -487,11 +444,9 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         assert_eq!(spec.driver, "sh");
     }
@@ -506,11 +461,9 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -541,11 +494,9 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         let run = run_str(&spec);
         assert!(
@@ -569,11 +520,9 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs("pkg"),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -603,11 +552,9 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs("pkg"),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         let run = run_str(&spec);
         assert!(
@@ -626,9 +573,7 @@ mod tests {
             &test_factors(),
             &testmain_src,
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -653,9 +598,7 @@ mod tests {
             &test_factors(),
             &testmain_src,
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
         );
         let run = run_str(&spec);
         assert!(
@@ -672,10 +615,9 @@ mod tests {
         let spec = build_test_spec(
             mk_addr("pkg", "build_test"),
             &test_factors(),
-            "//@heph/bin:go",
-            &go_env(),
             &testmain_lib,
             &[],
+            V,
         );
         assert_eq!(spec.driver, "sh");
     }
@@ -686,10 +628,9 @@ mod tests {
         let spec = build_test_spec(
             mk_addr("pkg", "build_test"),
             &test_factors(),
-            "//@heph/bin:go",
-            &go_env(),
             &testmain_lib,
             &[],
+            V,
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -707,10 +648,9 @@ mod tests {
         let spec = build_test_spec(
             mk_addr("pkg", "build_test"),
             &test_factors(),
-            "//@heph/bin:go",
-            &go_env(),
             &testmain_lib,
             &[],
+            V,
         );
         let run = run_str(&spec);
         assert!(
@@ -729,10 +669,9 @@ mod tests {
         let spec = build_test_spec(
             mk_addr("pkg", "build_test"),
             &test_factors(),
-            "//@heph/bin:go",
-            &go_env(),
             &testmain_lib,
             &[],
+            V,
         );
         let env = match spec.config.get("env").unwrap() {
             Value::Map(m) => m,
@@ -755,11 +694,9 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         let env = match spec.config.get("env").unwrap() {
             Value::Map(m) => m,
@@ -778,10 +715,9 @@ mod tests {
         let spec = build_test_spec(
             mk_addr("pkg", "build_test"),
             &test_factors(),
-            "//@heph/bin:go",
-            &go_env(),
             &testmain_lib,
             &[],
+            V,
         );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -795,24 +731,32 @@ mod tests {
     }
 
     #[test]
-    fn test_build_test_spec_tools_has_go() {
+    fn test_build_test_spec_uses_hermetic_sdk() {
         let testmain_lib = mk_addr("pkg", "build_testmain_lib");
         let spec = build_test_spec(
             mk_addr("pkg", "build_test"),
             &test_factors(),
-            "//@heph/bin:go",
-            &go_env(),
             &testmain_lib,
             &[],
+            V,
         );
-        let tools = match spec.config.get("tools").unwrap() {
+        let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
-            _ => panic!("expected tools map"),
+            _ => panic!("expected deps map"),
         };
         assert!(
-            tools.contains_key("go"),
-            "tools must have go group: {:?}",
-            tools.keys().collect::<Vec<_>>()
+            deps.contains_key(crate::plugingo::addr_util::GO_SDK_DEP_GROUP),
+            "test link must dep on the hermetic SDK: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !spec.config.contains_key("tools"),
+            "no host go tool should be referenced"
+        );
+        let run = run_str(&spec);
+        assert!(
+            run.contains("\"$GO\""),
+            "must link with hermetic $GO: {run}"
         );
     }
 
@@ -942,11 +886,9 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         assert!(
             spec.labels.contains(&"go-build".to_string()),
@@ -964,11 +906,9 @@ mod tests {
             &test_factors(),
             &[],
             &src_addrs("pkg"),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
             None,
             &[],
+            V,
         );
         assert!(
             spec.labels.contains(&"go-build".to_string()),
@@ -984,9 +924,7 @@ mod tests {
             &test_factors(),
             &mk_addr("pkg", "_testmain_src"),
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-            "/tmp/gocache",
+            V,
         );
         assert!(
             spec.labels.contains(&"go-build".to_string()),
