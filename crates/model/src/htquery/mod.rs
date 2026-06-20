@@ -21,6 +21,77 @@ use crate::htmatcher::Matcher;
 use crate::htpkg::{self, PkgBuf};
 use anyhow::{Context, Result, bail};
 
+/// Render a [`Matcher`] back into query-language syntax — the inverse of
+/// [`parse`]. Round-trips (re-parsing the output yields an equivalent matcher),
+/// with parentheses inserted only where precedence (`!` > `&&` > `||`) demands.
+/// Used for human-facing display (e.g. the TUI progress label).
+pub fn format(m: &Matcher) -> String {
+    let mut out = String::new();
+    fmt_prec(m, 0, &mut out);
+    out
+}
+
+/// Binding strength used to decide parenthesisation: `||` binds loosest, then
+/// `&&`, then unary/atoms.
+fn prec(m: &Matcher) -> u8 {
+    match m {
+        Matcher::Or(_) => 1,
+        Matcher::And(_) => 2,
+        _ => 3,
+    }
+}
+
+fn fmt_prec(m: &Matcher, parent_prec: u8, out: &mut String) {
+    let needs_paren = prec(m) < parent_prec;
+    if needs_paren {
+        out.push('(');
+    }
+    match m {
+        Matcher::Addr(a) => out.push_str(&a.format()),
+        Matcher::Package(p) => {
+            out.push_str("//");
+            out.push_str(p.as_str());
+        }
+        Matcher::PackagePrefix(p) => {
+            out.push_str("//");
+            if p.as_str().is_empty() {
+                out.push_str("...");
+            } else {
+                out.push_str(p.as_str());
+                out.push_str("/...");
+            }
+        }
+        Matcher::Label(l) => {
+            out.push_str("label(");
+            out.push_str(l);
+            out.push(')');
+        }
+        Matcher::TreeOutputTo(p) => {
+            out.push_str("tree_output(");
+            out.push_str(p.as_str());
+            out.push(')');
+        }
+        Matcher::And(children) => fmt_join(children, " && ", 2, out),
+        Matcher::Or(children) => fmt_join(children, " || ", 1, out),
+        Matcher::Not(inner) => {
+            out.push('!');
+            fmt_prec(inner, 3, out);
+        }
+    }
+    if needs_paren {
+        out.push(')');
+    }
+}
+
+fn fmt_join(children: &[Matcher], sep: &str, child_prec: u8, out: &mut String) {
+    for (i, c) in children.iter().enumerate() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        fmt_prec(c, child_prec, out);
+    }
+}
+
 /// Parse a query expression into a [`Matcher`]. Relative patterns resolve
 /// against `base` (the current working package).
 pub fn parse(input: &str, base: &PkgBuf) -> Result<Matcher> {
@@ -442,6 +513,46 @@ mod tests {
                 Matcher::Label("foo".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn format_atoms() {
+        assert_eq!(format(&p("//foo/bar")), "//foo/bar");
+        assert_eq!(format(&p("//foo/...")), "//foo/...");
+        assert_eq!(format(&p("//...")), "//...");
+        assert_eq!(format(&p("//foo:bar")), "//foo:bar");
+        assert_eq!(format(&p("label(test)")), "label(test)");
+        assert_eq!(format(&p("tree_output(gen)")), "tree_output(gen)");
+    }
+
+    #[test]
+    fn format_inserts_parens_only_where_needed() {
+        // && binds tighter than || → no parens needed here.
+        assert_eq!(format(&p("//a && //b || //c")), "//a && //b || //c");
+        // grouping that overrides precedence must be preserved.
+        assert_eq!(format(&p("//a && (//b || //c)")), "//a && (//b || //c)");
+        // ! over a group keeps the parens.
+        assert_eq!(format(&p("!(//a || //b)")), "!(//a || //b)");
+        // ! over an atom needs none.
+        assert_eq!(format(&p("!//a")), "!//a");
+    }
+
+    #[test]
+    fn format_round_trips() {
+        let base = base();
+        for src in [
+            "//foo/... && label(test)",
+            "//a && //b || //c",
+            "//a && (//b || //c)",
+            "!(//a || //b) && //c",
+            "//app/... && !label(slow)",
+            "(//a/... || //b/...) && tree_output(gen)",
+        ] {
+            let m1 = parse(src, &base).expect("parse src");
+            let rendered = format(&m1);
+            let m2 = parse(&rendered, &base).expect("parse rendered");
+            assert_eq!(m1, m2, "round-trip mismatch: {src:?} -> {rendered:?}");
+        }
     }
 
     #[test]

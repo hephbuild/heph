@@ -15,7 +15,7 @@ use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 #[command(
-    override_usage = "heph query <TARGET_ADDRESS>\n       heph query <LABEL> <PACKAGE_MATCHER>\n       heph query -q <QUERY>",
+    override_usage = "heph query <TARGET_ADDRESS>\n       heph query <LABEL> <PACKAGE_MATCHER>\n       heph query -e <EXPR>",
     after_long_help = QUERY_LANG_HELP
 )]
 pub struct Args {
@@ -25,19 +25,16 @@ pub struct Args {
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
-    /// Select targets with a query expression, e.g. -q '//pkg/... && label(foo)'.
+    /// Select targets with a query expression, e.g. -e '//pkg/... && !//vendor/...'.
     /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
     /// Mutually exclusive with the positional TARGET arguments.
     #[arg(
-        short = 'q',
-        long = "query",
-        value_name = "QUERY",
+        short = 'e',
+        long = "expr",
+        value_name = "EXPR",
         conflicts_with = "arg1"
     )]
-    pub query: Option<String>,
-    /// Exclude target address (repeatable, e.g. -e //pkg:target)
-    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS", add = ArgValueCompleter::new(complete_target_addr))]
-    pub exclude: Vec<String>,
+    pub expr: Option<String>,
 }
 
 struct QueryApp {
@@ -53,11 +50,17 @@ impl App for QueryApp {
     type CiView = crate::tui::CiProgressView;
 
     fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("Querying {:?}", self.matcher))
+        crate::tui::TuiProgressView::new(format!(
+            "Querying {}",
+            crate::htquery::format(&self.matcher)
+        ))
     }
 
     fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("Querying {:?}", self.matcher))
+        crate::tui::CiProgressView::new(format!(
+            "Querying {}",
+            crate::htquery::format(&self.matcher)
+        ))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
@@ -91,14 +94,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
-    let m = resolve_matcher(
-        &args.query,
-        &args.arg1,
-        &args.arg2,
-        &args.exclude,
-        &cwp,
-        true,
-    )?;
+    let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &cwp, true)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = QueryApp {
         engine,

@@ -1,16 +1,62 @@
+use anyhow::Context;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
+use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
+use hmodel::htquery;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
     Provider as EProvider, TargetSpec,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const PACKAGE: &str = "@heph/query";
+
+/// Addr arg holding a query-language expression (see [`htquery`]).
+pub const EXPR_ARG: &str = "expr";
+
+/// Addr arg holding the package an `expr` query's relative patterns
+/// (`./x`, `..`, `.`) resolve against. `_`-prefixed so it is treated as an
+/// addr-identity-only field, never a matcher arg.
+pub const BASE_ARG: &str = "_base";
+
+/// Addr arg naming providers to skip when resolving the query (`;`-separated).
+pub const EXCLUDE_PROVIDER_ARG: &str = "exclude_provider";
+
+/// `exclude_provider` sentinel that opts OUT of the engine's automatic
+/// exclusion of the requesting target's own provider, letting a query enumerate
+/// sibling targets from that same provider — e.g. a BUILD-file `query()` that
+/// must see other BUILD-file targets. No real provider is named this, so it
+/// excludes nothing.
+pub const NO_PROVIDER_EXCLUSION: &str = "__none__";
+
+/// Compose the `@heph/query` address for a query-language expression, mirroring
+/// [`hbuiltins::pluginfs::file_addr`]/`glob_addr`. `base` is the package that
+/// relative patterns in `expr` resolve against (pass `""` for root).
+/// `exclude_providers` names providers the resolution skips (pass `&[]` for the
+/// engine's default behaviour, or `&[NO_PROVIDER_EXCLUSION]` to opt out of the
+/// auto-exclusion). Resolves to a group of every matching target.
+pub fn query_addr(expr: &str, base: &str, exclude_providers: &[&str]) -> Addr {
+    let mut args = BTreeMap::from([(EXPR_ARG.to_string(), expr.to_string())]);
+    if !base.is_empty() {
+        args.insert(BASE_ARG.to_string(), base.to_string());
+    }
+    if !exclude_providers.is_empty() {
+        args.insert(
+            EXCLUDE_PROVIDER_ARG.to_string(),
+            exclude_providers.join(";"),
+        );
+    }
+    Addr::new(PkgBuf::from(PACKAGE), "query".to_string(), args)
+}
+
+/// Returns `true` if `addr` refers to a query target.
+pub fn is_query_addr(addr: &Addr) -> bool {
+    addr.package.as_str() == PACKAGE
+}
 
 pub struct Provider;
 
@@ -20,7 +66,7 @@ pub struct Provider;
 /// the latter is consumed below to limit which providers the engine iterates).
 /// `_`-prefixed keys are also ignored as a convention for addr-identity-only
 /// fields.
-const RESERVED_ARG_KEYS: &[&str] = &["exclude_provider"];
+const RESERVED_ARG_KEYS: &[&str] = &[EXCLUDE_PROVIDER_ARG];
 
 fn is_reserved_key(k: &str) -> bool {
     k.starts_with('_') || RESERVED_ARG_KEYS.contains(&k)
@@ -29,6 +75,16 @@ fn is_reserved_key(k: &str) -> bool {
 pub fn build_matcher(args: &std::collections::BTreeMap<String, String>) -> anyhow::Result<Matcher> {
     let mut matchers: Vec<Matcher> = vec![];
 
+    // `expr` is the full query language; the discrete `label`/`package`/… keys
+    // remain for callers that compose matchers field-by-field. An `expr` may be
+    // combined with them (all ANDed together).
+    if let Some(expr) = args.get(EXPR_ARG) {
+        let base = args.get(BASE_ARG).map(String::as_str).unwrap_or("");
+        matchers.push(
+            htquery::parse(expr, &PkgBuf::from(base))
+                .with_context(|| format!("parsing query expr {expr:?}"))?,
+        );
+    }
     if let Some(label) = args.get("label") {
         matchers.push(Matcher::Label(label.clone()));
     }
@@ -50,7 +106,7 @@ pub fn build_matcher(args: &std::collections::BTreeMap<String, String>) -> anyho
             anyhow::bail!("query target has unknown args: {:?}", unknown);
         }
         anyhow::bail!(
-            "query target requires at least one matcher arg (label, package, package_prefix, tree_output_to)"
+            "query target requires at least one matcher arg (expr, label, package, package_prefix, tree_output_to)"
         );
     }
 
@@ -64,7 +120,7 @@ pub fn build_matcher(args: &std::collections::BTreeMap<String, String>) -> anyho
 /// Parse `exclude_provider=a;b;c` into a `Vec<String>`. Empty when the arg is
 /// absent. Empty fragments (e.g. `a;;b`) are dropped.
 pub fn parse_exclude_providers(args: &std::collections::BTreeMap<String, String>) -> Vec<String> {
-    args.get("exclude_provider")
+    args.get(EXCLUDE_PROVIDER_ARG)
         .map(|s| {
             s.split(';')
                 .filter(|p| !p.is_empty())
@@ -155,5 +211,82 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_addr_roundtrips_expr_and_base() {
+        let addr = query_addr("//foo/... && label(test)", "cwd/pkg", &[]);
+        assert_eq!(addr.package.as_str(), PACKAGE);
+        assert_eq!(addr.name, "query");
+        assert_eq!(addr.args.get(EXPR_ARG).unwrap(), "//foo/... && label(test)");
+        assert_eq!(addr.args.get(BASE_ARG).unwrap(), "cwd/pkg");
+        assert!(is_query_addr(&addr));
+    }
+
+    #[test]
+    fn query_addr_omits_empty_base() {
+        let addr = query_addr("//foo", "", &[]);
+        assert!(!addr.args.contains_key(BASE_ARG));
+        assert!(!addr.args.contains_key(EXCLUDE_PROVIDER_ARG));
+    }
+
+    #[test]
+    fn query_addr_encodes_exclude_providers() {
+        let addr = query_addr("//foo", "", &[NO_PROVIDER_EXCLUSION]);
+        assert_eq!(
+            addr.args.get(EXCLUDE_PROVIDER_ARG).unwrap(),
+            NO_PROVIDER_EXCLUSION
+        );
+        // The sentinel names no real provider, so nothing is excluded.
+        assert_eq!(
+            parse_exclude_providers(&addr.args),
+            vec![NO_PROVIDER_EXCLUSION]
+        );
+    }
+
+    #[test]
+    fn build_matcher_parses_expr() {
+        let addr = query_addr("//foo/... && !//foo/vendor/...", "", &[]);
+        let m = build_matcher(&addr.args).unwrap();
+        match m {
+            Matcher::And(children) => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(children[0], Matcher::PackagePrefix(_)));
+                assert!(matches!(children[1], Matcher::Not(_)));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_matcher_resolves_expr_relative_to_base() {
+        let addr = query_addr("./sub", "cwd/pkg", &[]);
+        let m = build_matcher(&addr.args).unwrap();
+        assert_eq!(m, Matcher::Package(PkgBuf::from("cwd/pkg/sub")));
+    }
+
+    #[test]
+    fn build_matcher_ands_expr_with_discrete_keys() {
+        let mut args = query_addr("//foo/...", "", &[]).args.clone();
+        args.insert("label".to_string(), "test".to_string());
+        let m = build_matcher(&args).unwrap();
+        match m {
+            Matcher::And(children) => assert_eq!(children.len(), 2),
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_matcher_surfaces_bad_expr() {
+        let addr = query_addr("bogus(x)", "", &[]);
+        let err = build_matcher(&addr.args)
+            .err()
+            .expect("expected parse error");
+        assert!(format!("{err:#}").contains("parsing query expr"));
     }
 }

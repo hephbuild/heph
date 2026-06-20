@@ -3567,6 +3567,7 @@ dependencies = [
  "lsp-types",
  "model",
  "plugin",
+ "plugin-query",
  "proc",
  "serde",
  "serde_json",

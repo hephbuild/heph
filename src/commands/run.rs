@@ -13,14 +13,14 @@ use crate::engine::{Engine, InteractiveWrapper, OutputMatcher, ResultOptions, ge
 use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, LogSink};
 
-/// Long help shared by `run` and `query`, documenting the `-q` query language.
+/// Long help shared by `run` and `query`, documenting the `-e` query language.
 pub const QUERY_LANG_HELP: &str = "\
 Selecting targets:
   heph run //pkg:name                 a single target address
   heph run <label> //pkg/...          all targets with <label> under //pkg
-  heph run -q '<expr>'                a query expression (see below)
+  heph run -e '<expr>'                a query expression (see below)
 
-Query language (-q / --query):
+Query language (-e / --expr):
   Patterns:
     //pkg                package //pkg
     //pkg/...            every package under //pkg
@@ -37,14 +37,15 @@ Query language (-q / --query):
   Evaluation follows grouping then left-to-right, bailing as early as possible.
 
   Examples:
-    heph run -q '//some/... && label(foo)'
-    heph run -q '//app/... && !label(slow)'
-    heph run -q '(//a/... || //b/...) && tree_output(gen)'
+    heph run -e '//some/... && label(foo)'
+    heph run -e '//app/... && !label(slow)'
+    heph run -e '//... && !//vendor/...'
+    heph run -e '(//a/... || //b/...) && tree_output(gen)'
 ";
 
 #[derive(Args, Clone)]
 #[command(
-    override_usage = "heph run <TARGET_ADDRESS>\n       heph run <LABEL> <PACKAGE_MATCHER>\n       heph run -q <QUERY>",
+    override_usage = "heph run <TARGET_ADDRESS>\n       heph run <LABEL> <PACKAGE_MATCHER>\n       heph run -e <EXPR>",
     after_long_help = QUERY_LANG_HELP
 )]
 pub struct RunArgs {
@@ -54,16 +55,16 @@ pub struct RunArgs {
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
-    /// Select targets with a query expression, e.g. -q '//pkg/... && label(foo)'.
+    /// Select targets with a query expression, e.g. -e '//pkg/... && !//vendor/...'.
     /// Supports &&, ||, !, parentheses, and the label()/tree_output() functions.
     /// Mutually exclusive with the positional TARGET arguments.
     #[arg(
-        short = 'q',
-        long = "query",
-        value_name = "QUERY",
+        short = 'e',
+        long = "expr",
+        value_name = "EXPR",
         conflicts_with = "arg1"
     )]
-    pub query: Option<String>,
+    pub expr: Option<String>,
     /// Force execution, ignoring any cached result
     #[arg(long = "force")]
     pub force: bool,
@@ -76,9 +77,6 @@ pub struct RunArgs {
     /// Print output file list to stdout
     #[arg(long = "list-out")]
     pub list_out: bool,
-    /// Exclude target address (repeatable, e.g. -e //pkg:target)
-    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS", add = ArgValueCompleter::new(complete_target_addr))]
-    pub exclude: Vec<String>,
     /// Fail if generated output differs from the tree (CI check)
     #[arg(long = "frozen")]
     pub frozen: bool,
@@ -95,7 +93,7 @@ impl RunApp {
     fn progress_label(&self) -> String {
         match &self.matcher {
             Matcher::Addr(a) => format!("Running {}", a.format()),
-            other => format!("Running {other:?}"),
+            other => format!("Running {}", crate::htquery::format(other)),
         }
     }
 }
@@ -210,14 +208,7 @@ pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow:
 
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
-    let m = resolve_matcher(
-        &args.query,
-        &args.arg1,
-        &args.arg2,
-        &args.exclude,
-        &base_pkg,
-        false,
-    )?;
+    let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
         args,

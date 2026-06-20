@@ -180,18 +180,14 @@ mod tests {
 
         // Flags from the real command structs land in the tables.
         assert!(md.contains("`--force`"), "missing --force flag row");
-        assert!(
-            md.contains("`-e`, `--exclude`"),
-            "missing short+long exclude flag row"
-        );
 
-        // The query-language after-help reference is surfaced in the docs.
+        // The query-language flag and after-help reference are surfaced in docs.
         assert!(
-            md.contains("`-q`, `--query`"),
-            "missing query flag row:\n{md}"
+            md.contains("`-e`, `--expr`"),
+            "missing expr flag row:\n{md}"
         );
         assert!(
-            md.contains("Query language (-q / --query):"),
+            md.contains("Query language (-e / --expr):"),
             "query language after-help reference missing from docs:\n{md}"
         );
     }
