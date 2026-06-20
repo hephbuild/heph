@@ -239,8 +239,7 @@ fn place_entry(
                 && std::fs::read_link(dst).map(|t| t == *src).unwrap_or(false) =>
         {
             if let Some(list) = list.as_mut() {
-                writeln!(list, "{}", dst.display())
-                    .with_context(|| "append to stage list file")?;
+                writeln!(list, "{}", dst.display()).with_context(|| "append to stage list file")?;
             }
         }
         // Existing real directory shared with an earlier input → merge.
@@ -297,8 +296,7 @@ fn place_entry(
             // (see the idempotent-symlink arm above for why skipping the write
             // would starve a tool consumer's per-input file list).
             if let Some(list) = list.as_mut() {
-                writeln!(list, "{}", dst.display())
-                    .with_context(|| "append to stage list file")?;
+                writeln!(list, "{}", dst.display()).with_context(|| "append to stage list file")?;
             }
         }
         // Irreconcilable type mismatch (e.g. a directory where a file already sits).
@@ -911,7 +909,10 @@ mod tests {
         // Unfiltered (empty filters), but per_file = true.
         let c = content(
             "tool1",
-            &[("tools/bin/node", "NODE", true), ("tools/bin/npm", "NPM", true)],
+            &[
+                ("tools/bin/node", "NODE", true),
+                ("tools/bin/npm", "NPM", true),
+            ],
         );
 
         stage_and_link(&c, &stage, "nodejs24", &link, Some(&list), &[], true, &ct())
@@ -1179,7 +1180,10 @@ mod tests {
         // node → identical skip (must still be listed), npm → new symlink.
         let b = content(
             "hb",
-            &[("tools/bin/node", "NODE", true), ("tools/bin/npm", "NPM", true)],
+            &[
+                ("tools/bin/node", "NODE", true),
+                ("tools/bin/npm", "NPM", true),
+            ],
         );
         stage_and_link(&b, &stage, "t", &link, Some(&list_b), &[], false, &ct())
             .await
