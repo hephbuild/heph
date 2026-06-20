@@ -1164,23 +1164,29 @@ impl Engine {
                 // (only when a readable cache exists) so a slow download shows as
                 // a single `↓` op in the per-target timeline — never one per
                 // blob/cache.
-                let downloaded = if self.remote_caches.has_readable() {
-                    let addr_s = addr.format();
-                    crate::engine::event::emit_scope(
-                        &rs,
-                        crate::engine::event::BuildEventKind::RemoteCacheReadStart {
-                            addr: addr_s.clone(),
-                        },
-                        move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
-                            addr: addr_s,
-                            error,
-                        },
-                        self.download_from_remote(ctoken, addr, opts.hashin.as_str()),
-                    )
-                    .await?
-                } else {
-                    None
-                };
+                // Honor the target's `remote_enabled`: drivers whose output
+                // embeds host-local paths (e.g. the nix driver bakes absolute
+                // `/nix/store/...` wrapper paths) set it false so a wrapper built
+                // on one machine is never pulled onto another that lacks that
+                // store path — which would `exec` a missing path (status 127).
+                let downloaded =
+                    if def.target.cache.remote_enabled && self.remote_caches.has_readable() {
+                        let addr_s = addr.format();
+                        crate::engine::event::emit_scope(
+                            &rs,
+                            crate::engine::event::BuildEventKind::RemoteCacheReadStart {
+                                addr: addr_s.clone(),
+                            },
+                            move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
+                                addr: addr_s,
+                                error,
+                            },
+                            self.download_from_remote(ctoken, addr, opts.hashin.as_str()),
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
                 match downloaded {
                     Some(manifest) => (None, Some(Arc::new(manifest))),
                     None => {
@@ -1537,7 +1543,11 @@ impl Engine {
                     // Remote push: fire-and-forget on a background task (tracked
                     // by `bg_pending`, so the CLI/TUI stays open until it drains).
                     // Cacheable revisions only — tmp/uncacheable are never shared.
-                    if out.is_ok() && !use_tmp_cache {
+                    // `remote_enabled` gates it too: a target whose output embeds
+                    // host-local paths (nix wrappers) must never be uploaded, or
+                    // another machine pulls a wrapper pointing at a store path it
+                    // doesn't have.
+                    if out.is_ok() && !use_tmp_cache && def.target.cache.remote_enabled {
                         engine.spawn_remote_upload(&rs, addr.clone(), hashin.clone());
                     }
 
@@ -2549,6 +2559,7 @@ mod tests {
             codegen: None,
             deps: deps_map,
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -2567,6 +2578,7 @@ mod tests {
             codegen: None,
             deps: deps_map,
             labels: vec![],
+            ..Default::default()
         }
     }
 
@@ -2594,6 +2606,7 @@ mod tests {
             codegen: Some("copy".to_string()),
             deps: deps_map,
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -2610,6 +2623,207 @@ mod tests {
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok(Arc::new(engine))
+    }
+
+    /// Like [`engine_with_home`] but wired to a read+write remote cache at
+    /// `remote_uri` (a `file://` dir). Used to assert the per-target
+    /// `remote_enabled` gate on remote upload/download. The returned `TempDir`
+    /// backs the engine's home/lock dirs and must be held alive for the test.
+    fn engine_with_remote(
+        targets: Vec<pluginstatictarget::Target>,
+        remote_uri: &str,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            remote_caches: vec![crate::engine::RemoteCacheDef {
+                name: "shared".to_string(),
+                uri: remote_uri.to_string(),
+                read: true,
+                write: true,
+                concurrency: 10,
+            }],
+            ..Default::default()
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        let provider = pluginstatictarget::Provider::new(targets)?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
+    }
+
+    /// Exec target that keeps local caching on but disables the remote cache
+    /// (`cache = {enabled: true, remote: false}`) — the shape the nix driver
+    /// emits because its output embeds host-local `/nix/store` paths.
+    fn no_remote_target(addr: &str) -> pluginstatictarget::Target {
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            run: Some("true".to_string()),
+            cache: Some(hcore::htvalue::Value::Map(HashMap::from([
+                ("enabled".to_string(), hcore::htvalue::Value::Bool(true)),
+                ("remote".to_string(), hcore::htvalue::Value::Bool(false)),
+            ]))),
+            ..Default::default()
+        }
+    }
+
+    /// Count regular files under `dir`, recursively. An empty count means the
+    /// remote cache received nothing.
+    fn count_files(dir: &std::path::Path) -> usize {
+        let mut n = 0;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                n += count_files(&path);
+            } else {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Drain background uploads tracked by the request's `bg_pending` counter so
+    /// the remote-cache assertions observe a settled state.
+    async fn drain_bg(rs: &Arc<crate::engine::request_state::RequestState>) {
+        let bg = rs.bg_pending();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while bg.load(Ordering::Acquire) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bg_pending never drained"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A target that disables its remote cache (`remote_enabled = false`) must
+    /// never be uploaded to the remote — otherwise another machine pulls an
+    /// artifact whose host-local paths it lacks (the nix-wrapper `exit 127`
+    /// bug). The control target (remote on) proves the path is otherwise live.
+    #[tokio::test]
+    async fn remote_upload_honors_per_target_remote_enabled() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+
+        // Remote-disabled target: must leave the remote empty.
+        let (engine, _home) = engine_with_remote(vec![no_remote_target("//pkg:off")], &remote_uri)?;
+        let addr_off = hmodel::htaddr::parse_addr("//pkg:off")?;
+        let rs = engine.new_state();
+        engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr_off,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drain_bg(&rs).await;
+        assert_eq!(
+            count_files(remote.path()),
+            0,
+            "remote_enabled=false target must not be uploaded to the remote cache"
+        );
+
+        // Control: a default (remote-on) target with the same shape DOES upload,
+        // proving the assertion above is the gate doing its job, not a dead path.
+        let remote_on = tempdir()?;
+        let remote_on_uri = format!("file://{}", remote_on.path().display());
+        let (engine, _home) =
+            engine_with_remote(vec![static_target("//pkg:on", &[], &[])], &remote_on_uri)?;
+        let addr_on = hmodel::htaddr::parse_addr("//pkg:on")?;
+        let rs = engine.new_state();
+        engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr_on,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drain_bg(&rs).await;
+        assert!(
+            count_files(remote_on.path()) > 0,
+            "remote-enabled target must upload to the remote cache"
+        );
+        Ok(())
+    }
+
+    /// The symmetric download gate: even when the remote *has* a matching
+    /// revision, a `remote_enabled = false` target must execute locally rather
+    /// than pull it — pulling would land an artifact whose host-local paths this
+    /// machine lacks. Exec's def hash excludes the cache config, so the on/off
+    /// targets share a `hashin` and the seeded entry is a genuine candidate.
+    #[tokio::test]
+    async fn remote_download_honors_per_target_remote_enabled() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+
+        // Seed the remote: a default target executes and uploads.
+        let (seeder, _seeder_home) =
+            engine_with_remote(vec![static_target("//pkg:t", &[], &[])], &remote_uri)?;
+        let rs = seeder.new_state();
+        seeder
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drain_bg(&rs).await;
+        assert!(
+            count_files(remote.path()) > 0,
+            "seed must populate the remote"
+        );
+
+        // Cold engine, same addr but remote disabled: must execute, never pull.
+        let (off, _off_home) = engine_with_remote(vec![no_remote_target("//pkg:t")], &remote_uri)?;
+        let (res, events) = resolve_collecting_events(&off, &addr).await;
+        res.expect("remote-off target must resolve");
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
+            ),
+            "remote-off target must execute locally, not pull: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::RemoteCacheReadStart { addr } if addr == "//pkg:t"
+            )),
+            "remote-off target must not attempt a remote pull: {events:?}"
+        );
+
+        // Control: cold engine, default target, same addr — pulls the seeded
+        // entry instead of executing, proving the entry was a live candidate.
+        let (on, _on_home) =
+            engine_with_remote(vec![static_target("//pkg:t", &[], &[])], &remote_uri)?;
+        let (res, events) = resolve_collecting_events(&on, &addr).await;
+        res.expect("remote-on target must resolve");
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::RemoteCacheReadStart { addr } if addr == "//pkg:t"
+            )),
+            "remote-on target must attempt a remote pull: {events:?}"
+        );
+        assert!(
+            !events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
+            ),
+            "remote-on target must use the remote hit, not execute: {events:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3475,6 +3689,7 @@ mod tests {
             codegen: None,
             deps: HashMap::new(),
             labels: vec![],
+            ..Default::default()
         }
     }
 
@@ -4406,6 +4621,7 @@ mod tests {
             codegen: Some(codegen.to_string()),
             deps,
             labels: vec![],
+            ..Default::default()
         }
     }
 
@@ -4569,6 +4785,7 @@ mod tests {
                 codegen: None,
                 deps: HashMap::from([("".to_string(), vec!["//pkg:fmt".to_string()])]),
                 labels: vec![],
+                ..Default::default()
             },
         ])?;
         let pkg_dir = root.path().join("pkg");
@@ -4923,6 +5140,7 @@ mod tests {
                 vec!["//@heph/introspect:outputs".to_string()],
             )]),
             labels: vec![],
+            ..Default::default()
         };
         let (engine, root) = engine_with_home_fs(vec![target])?;
         let pkg_dir = root.path().join("pkg");

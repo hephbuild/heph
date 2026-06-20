@@ -20,6 +20,7 @@ fn target(addr: &str, run: &str, out: Option<&str>) -> Target {
         codegen: None,
         deps: HashMap::new(),
         labels: vec![],
+        ..Default::default()
     }
 }
 
@@ -37,6 +38,7 @@ fn target_with_deps(
         codegen: None,
         deps,
         labels: vec![],
+        ..Default::default()
     }
 }
 

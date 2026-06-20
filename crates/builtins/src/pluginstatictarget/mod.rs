@@ -11,6 +11,7 @@ use hplugin::provider::{
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+#[derive(Default)]
 pub struct Target {
     pub addr: String,
     pub driver: String,
@@ -21,6 +22,10 @@ pub struct Target {
     pub codegen: Option<String>,
     pub deps: HashMap<String, Vec<String>>,
     pub labels: Vec<String>,
+    /// Optional `cache` config passed through verbatim to the driver (bool
+    /// shorthand or `{enabled, remote, history}` dict). `None` lets the driver
+    /// default it (exec: local+remote on).
+    pub cache: Option<Value>,
 }
 
 pub struct Provider {
@@ -50,6 +55,9 @@ impl Provider {
                 }
                 if let Some(codegen) = t.codegen {
                     config.insert("codegen".to_string(), Value::String(codegen));
+                }
+                if let Some(cache) = t.cache {
+                    config.insert("cache".to_string(), cache);
                 }
                 if !t.deps.is_empty() {
                     let map = t
