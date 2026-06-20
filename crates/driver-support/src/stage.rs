@@ -217,6 +217,35 @@ fn place_entry(
         Ok(md) if md.file_type().is_dir() && src_is_dir => {
             merge_dir(src, dst, list)?;
         }
+        // An earlier input symlinked this path to *its own* content root, but
+        // we (a different staged tree) also own a directory here — e.g. two
+        // tool groups that each populate `tools/heph/bin`. Explode the symlink
+        // into a real directory, re-link the earlier input's subtree, then
+        // merge ours, so both coexist instead of colliding. Recursion descends
+        // to the first level where the two trees actually diverge; a genuine
+        // different-content file collision still bails below.
+        Ok(md) if md.file_type().is_symlink() && src_is_dir => {
+            let existing = std::fs::read_link(dst)
+                .with_context(|| format!("readlink existing symlink {:?}", dst))?;
+            let existing_is_dir = std::fs::metadata(&existing)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !existing_is_dir {
+                anyhow::bail!(
+                    "staged input collides with existing sandbox entry at {:?} \
+                     (existing symlink -> {:?} is not a directory, staged src={:?})",
+                    dst,
+                    existing,
+                    src,
+                );
+            }
+            std::fs::remove_file(dst)
+                .with_context(|| format!("remove symlink before exploding {:?}", dst))?;
+            std::fs::create_dir_all(dst)
+                .with_context(|| format!("create real dir over exploded symlink {:?}", dst))?;
+            merge_dir(&existing, dst, list)?;
+            merge_dir(src, dst, list)?;
+        }
         // Two inputs claim the same path with different content.
         Ok(md) => {
             anyhow::bail!(
@@ -876,6 +905,75 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(link.join("shared/new.txt")).unwrap(),
             "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_inputs_sharing_a_symlinked_dir_are_merged() {
+        // Regression: two distinct read-only inputs (e.g. two tool output
+        // groups of the same `nodejs24` tool) both own a directory at the same
+        // sandbox path `tools/heph/bin`, with different content. The first
+        // symlinks `tools/heph/bin` whole; the second must explode that symlink
+        // into a real dir and merge both subtrees instead of bailing with a
+        // collision.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+
+        // `tools/heph` is a single-child chain (real dirs); `tools/heph/bin`
+        // is each input's content root.
+        let a = content("toolA", &[("tools/heph/bin/node", "node", true)]);
+        let b = content("toolB", &[("tools/heph/bin/npm", "npm", true)]);
+
+        stage_and_link(&a, &stage, "nodejs24", &link, None, &[], &ct())
+            .await
+            .expect("first tool group");
+        stage_and_link(&b, &stage, "nodejs24", &link, None, &[], &ct())
+            .await
+            .expect("second tool group must merge, not collide");
+
+        // `tools/heph/bin` is now a real directory holding both binaries.
+        assert!(
+            std::fs::symlink_metadata(link.join("tools/heph/bin"))
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "shared content dir must be exploded into a real directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("tools/heph/bin/node")).unwrap(),
+            "node"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("tools/heph/bin/npm")).unwrap(),
+            "npm"
+        );
+
+        // Teardown still works and leaves both stage entries intact.
+        std::fs::remove_dir_all(&link).expect("teardown");
+        assert!(stage.join("nodejs24/toolA/tools/heph/bin/node").exists());
+        assert!(stage.join("nodejs24/toolB/tools/heph/bin/npm").exists());
+    }
+
+    #[tokio::test]
+    async fn genuine_file_collision_still_bails() {
+        // Exploding symlinked dirs must not mask a real conflict: two inputs
+        // claiming the same *file* path with different bytes is an error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let a = content("ca", &[("d/f", "one", false)]);
+        let b = content("cb", &[("d/f", "two", false)]);
+
+        stage_and_link(&a, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect("first");
+        let err = stage_and_link(&b, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect_err("conflicting file content must bail");
+        assert!(
+            format!("{err:#}").contains("collides"),
+            "expected a collision error, got: {err:#}"
         );
     }
 

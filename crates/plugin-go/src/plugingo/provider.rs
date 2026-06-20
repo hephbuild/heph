@@ -789,12 +789,29 @@ fn parse_str_map(v: &Value) -> anyhow::Result<BTreeMap<String, String>> {
 /// these apply only to the package that declares them — a state at `//foo` does
 /// not leak into `//foo/bar`'s test targets. The engine pre-filters states by
 /// provider name, so callers only see Go states.
+/// Keys accepted inside a `test = {...}` go provider_state map. Used to reject
+/// typos / unsupported knobs (the `test` map only configures env, never
+/// enable/disable — that's the bool `test = False`).
+const TEST_STATE_KEYS: &[&str] = &["env", "runtime_env", "pass_env", "runtime_pass_env"];
+
 fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test::TestEnv> {
     let mut out = target_test::TestEnv::default();
     for state in states.iter().filter(|s| s.package.as_str() == addr_pkg) {
         let Some(Value::Map(test_map)) = state.state.get("test") else {
             continue;
         };
+        // Reject typos / unsupported knobs instead of silently dropping them —
+        // e.g. `test = {"skip": True}` (tests are disabled with `test = False`,
+        // not a `skip` key). Fail closed so the BUILD author sees the mistake.
+        for key in test_map.keys() {
+            if !TEST_STATE_KEYS.contains(&key.as_str()) {
+                anyhow::bail!(
+                    "unknown key `{key}` in go provider_state `test` map (allowed: {}); \
+                     to disable tests use `test = False`",
+                    TEST_STATE_KEYS.join(", "),
+                );
+            }
+        }
         if let Some(v) = test_map.get("env") {
             out.env
                 .extend(parse_str_map(v).context("parsing test env from go provider_state")?);
@@ -4158,6 +4175,24 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             )],
         )];
         assert!(pick_test_env(&states, "foo").is_err());
+    }
+
+    #[test]
+    fn pick_test_env_errors_on_unknown_key() {
+        // `test = {"skip": True}` is a mistake — tests are disabled with the
+        // bool `test = False`, not a `skip` key. Must fail closed, not silently
+        // ignore the typo.
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![("skip", Value::Bool(true))],
+        )];
+        let err = pick_test_env(&states, "foo").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("skip"), "error must name the bad key: {msg}");
+        assert!(
+            msg.contains("test = False"),
+            "error must point to the correct disable syntax: {msg}"
+        );
     }
 
     #[tokio::test]
