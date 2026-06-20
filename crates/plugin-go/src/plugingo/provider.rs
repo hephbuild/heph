@@ -40,9 +40,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct Config {
-    /// Go release every build/test/list target resolves its hermetic toolchain
-    /// against (`//@heph/go/toolchain/<go_version>:go`). Defaults to
-    /// [`toolchain::DEFAULT_GO_VERSION`]; set via the `goversion` provider option.
+    /// Toolchain spec every build/test/list target resolves against. Either a
+    /// pinned version (hermetic SDK at `//@heph/go/toolchain/<go_version>:go`)
+    /// or [`toolchain::HOST`] (use the host `go`). Set via the required `gotool`
+    /// provider option; programmatic callers (tests) set it here directly.
     pub go_version: String,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
@@ -202,13 +203,21 @@ impl Provider {
         opts: &hplugin::config::Options,
         walker: Arc<CachedWalker>,
     ) -> anyhow::Result<Self> {
-        // `gotool` is accepted but ignored: the Go toolchain is now hermetic
-        // (`//@heph/go/toolchain/<version>:go`, a pinned SDK download), so there
-        // is no host go-binary knob to configure. `goversion` selects which
-        // pinned release to download (default [`toolchain::DEFAULT_GO_VERSION`]).
-        hplugin::config::deny_unknown("go provider", opts, &["gotool", "goversion", "skip"])?;
-        let go_version: String = hplugin::config::decode_opt(opts, "go provider", "goversion")?
-            .unwrap_or_else(|| toolchain::DEFAULT_GO_VERSION.to_string());
+        // `gotool` selects the Go toolchain and is REQUIRED — there is no
+        // implicit default. Set it to:
+        //   - `"host"` → use the host `go` (read from PATH / `go env GOROOT`
+        //     inside the sandbox; non-hermetic, see [`toolchain::HOST`]), or
+        //   - a pinned version like `"1.26.4"` → download + manage that SDK
+        //     hermetically (`//@heph/go/toolchain/<version>:go`).
+        hplugin::config::deny_unknown("go provider", opts, &["gotool", "skip"])?;
+        let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "go provider: `gotool` is required — set it to \"host\" (use the host go) \
+                     or a pinned version like \"{}\" (hermetic SDK download)",
+                    toolchain::DEFAULT_GO_VERSION
+                )
+            })?;
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();

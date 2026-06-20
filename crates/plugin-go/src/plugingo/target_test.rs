@@ -1,6 +1,6 @@
 use crate::plugingo::addr_util::{
-    go_build_env, go_run_prelude, go_sdk_dep, go_sdk_read_only_config, import_path_to_dep_group,
-    to_run_value, write_importcfg_script,
+    go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
 use hcore::htvalue::Value;
@@ -161,14 +161,19 @@ pub fn build_test_spec(
         let group = import_path_to_dep_group(import_path);
         deps.insert(group, Value::List(vec![Value::String(lib_addr.format())]));
     }
-    let (sdk_group, sdk_val) = go_sdk_dep(go_version);
-    deps.insert(sdk_group, sdk_val);
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(script));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
-    let (ro_k, ro_v) = go_sdk_read_only_config();
-    config.insert(ro_k, ro_v);
+    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
+        config.insert(ro_k, ro_v);
+    }
+    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
+        config.insert(pe_k, pe_v);
+    }
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -344,8 +349,9 @@ fn build_lib_spec_inner(
             ),
         );
     }
-    let (sdk_group, sdk_val) = go_sdk_dep(go_version);
-    deps.insert(sdk_group, sdk_val);
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
 
     let mut full_run = go_run_prelude(go_version);
     full_run.extend(run);
@@ -353,8 +359,12 @@ fn build_lib_spec_inner(
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(full_run));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
-    let (ro_k, ro_v) = go_sdk_read_only_config();
-    config.insert(ro_k, ro_v);
+    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
+        config.insert(ro_k, ro_v);
+    }
+    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
+        config.insert(pe_k, pe_v);
+    }
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(

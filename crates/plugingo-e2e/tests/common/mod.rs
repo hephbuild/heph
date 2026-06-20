@@ -54,15 +54,27 @@ fn go_bin_path() -> String {
     format!("{goroot}/bin/go")
 }
 
+/// Pinned hermetic Go toolchain version the e2e suite builds against. Mirrors
+/// `plugingo::toolchain::DEFAULT_GO_VERSION`.
+pub const HERMETIC_GO: &str = "1.26.4";
+/// `gotool` sentinel selecting the host `go` (mirrors `plugingo::toolchain::HOST`).
+pub const HOST_GO: &str = "host";
+
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, &[])
+    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
+}
+
+/// Build the workspace using the **host** `go` (gotool = "host") instead of a
+/// hermetic SDK. Requires `go` on PATH (guard call sites with `require_go!`).
+pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
+    make_workspace_ordered(dir, false, true, &[], HOST_GO)
 }
 
 /// Like [`make_workspace`] but with `fs.skip` entries, mirroring a config file's
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
 /// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, skip)
+    make_workspace_ordered(dir, false, true, skip, HERMETIC_GO)
 }
 
 /// Same as [`make_workspace`] but registers the **go provider before** the
@@ -77,7 +89,7 @@ pub fn make_workspace_go_first(
     dir: TempDir,
     foreign_name_guard: bool,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, true, foreign_name_guard, &[])
+    make_workspace_ordered(dir, true, foreign_name_guard, &[], HERMETIC_GO)
 }
 
 fn make_workspace_ordered(
@@ -85,18 +97,22 @@ fn make_workspace_ordered(
     go_first: bool,
     foreign_name_guard: bool,
     fs_skip: &[&str],
+    gotool: &str,
 ) -> anyhow::Result<Workspace> {
+    let gotool = gotool.to_string();
     let go_bin = go_bin_path();
     // `fs` is auto-registered by `Engine::new`.
     let mut b = WorkspaceBuilder::from_dir(dir).with_fs_skip(fs_skip.iter().copied());
 
     if go_first {
+        let gotool = gotool.clone();
         b = b.with_provider(move |init| {
             Box::new(
                 plugingo::Provider::with_config(
                     init.root.to_path_buf(),
                     plugingo::Config {
                         foreign_name_guard,
+                        go_version: gotool,
                         ..Default::default()
                     },
                 )
@@ -123,12 +139,14 @@ fn make_workspace_ordered(
         });
 
     if !go_first {
+        let gotool = gotool.clone();
         b = b.with_provider(move |init| {
             Box::new(
                 plugingo::Provider::with_config(
                     init.root.to_path_buf(),
                     plugingo::Config {
                         foreign_name_guard,
+                        go_version: gotool,
                         ..Default::default()
                     },
                 )

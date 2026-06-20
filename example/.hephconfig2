@@ -15,7 +15,9 @@ plugins:
   # ~/.heph by the `gen-example` script (which runs `install-go-plugin`).
   - path: ~/.heph/plugins/go/heph-go-plugin.json
     options:
-      gotool: "//@heph/bin:go"
+      # Required. A pinned version → hermetic SDK download (reads nothing from
+      # the host); or "host" → use the host `go` from PATH.
+      gotool: "1.26.4"
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus

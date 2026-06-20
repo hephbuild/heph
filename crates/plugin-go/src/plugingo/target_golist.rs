@@ -84,10 +84,12 @@ fn build_spec_inner(
             Value::List(dep_addrs.iter().map(|a| Value::String(a.clone())).collect()),
         );
     }
-    // The hermetic Go SDK is staged into the golist sandbox; the driver derives
-    // GOROOT from its staged path (no host `go`/GOROOT).
-    let (sdk_group, sdk_val) = go_sdk_dep(go_version);
-    deps.insert(sdk_group, sdk_val);
+    // Hermetic toolchain: stage the SDK into the golist sandbox; the driver
+    // derives GOROOT from its staged path. Host toolchain (`gotool = "host"`):
+    // no SDK dep — the driver resolves the host `go`/GOROOT at run time.
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert(

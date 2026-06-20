@@ -1,5 +1,6 @@
 use crate::plugingo::addr_util::{
-    factors_to_args, go_run_prelude, go_sdk_dep, go_sdk_read_only_config, to_run_value,
+    factors_to_args, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
+    to_run_value,
 };
 use crate::plugingo::factors::Factors;
 use hcore::htvalue::Value;
@@ -62,8 +63,12 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
         // leave LGOROOT pointing back at it (so `chmod -R u+w` would try to
         // mutate the cache). BSD/macOS `cp` also copies xattrs and trips EPERM
         // on the FUSE overlay; `cp -X` suppresses that (GNU `cp -X` differs, so
-        // branch on uname).
-        "if [ \"$(uname)\" = Darwin ]; then CP=\"cp -RLX\"; else CP=\"cp -RL\"; fi".to_string(),
+        // branch on uname). Use the absolute system `cp` (`/bin/cp`) so the flag
+        // set matches the platform regardless of `$PATH` — under the host
+        // toolchain (`gotool = "host"`) the sandbox inherits the host `PATH`,
+        // which may put a GNU `cp` (no `-X`) ahead of the BSD system one.
+        "if [ \"$(uname)\" = Darwin ]; then CP=\"/bin/cp -RLX\"; else CP=\"/bin/cp -RL\"; fi"
+            .to_string(),
         "LGOROOT=\"$PWD/goroot\"".to_string(),
         "rm -rf \"$LGOROOT\"".to_string(),
         "$CP \"$GOROOT\" \"$LGOROOT\"".to_string(),
@@ -76,14 +81,19 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
     ]);
 
     let mut deps: HashMap<String, Value> = HashMap::new();
-    let (sdk_group, sdk_val) = go_sdk_dep(go_version);
-    deps.insert(sdk_group, sdk_val);
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
     config.insert("deps".to_string(), Value::Map(deps));
-    let (ro_k, ro_v) = go_sdk_read_only_config();
-    config.insert(ro_k, ro_v);
+    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
+        config.insert(ro_k, ro_v);
+    }
+    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
+        config.insert(pe_k, pe_v);
+    }
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([

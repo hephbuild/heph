@@ -1,13 +1,17 @@
 //! Hermetic Go toolchain provisioning.
 //!
-//! The Go provider no longer reads a `go` binary, `GOROOT`, or any `go env`
-//! value from the host. Instead it synthesizes a `//@heph/go/toolchain/<version>:go`
-//! target that downloads a *pinned* Go SDK tarball for the host platform from
-//! `go.dev/dl`, verifies its SHA-256, and extracts the SDK tree as a cacheable
-//! directory output. The version is configurable (the `goversion` provider
-//! option, default [`DEFAULT_GO_VERSION`]). Every build/list/test target then
-//! takes that SDK as a dependency and points `GOROOT` at the staged tree
-//! (see [`addr_util::go_sdk_dep`] / [`addr_util::go_run_prelude`]).
+//! The toolchain is chosen by the required `gotool` provider option. With a
+//! pinned version (e.g. `gotool = "1.26.4"`) the provider is fully hermetic: it
+//! synthesizes a `//@heph/go/toolchain/<version>:go` target that downloads that
+//! Go SDK tarball for the host platform from `go.dev/dl`, verifies its SHA-256,
+//! and extracts the SDK tree as a cacheable directory output; every
+//! build/list/test target deps that SDK and points `GOROOT` at the staged tree
+//! (see [`addr_util::go_sdk_dep`] / [`addr_util::go_run_prelude`]) — reading no
+//! `go`/`GOROOT`/`go env` from the host.
+//!
+//! With `gotool = "host"` ([`HOST`]) the provider instead uses the host `go`
+//! (resolved from `PATH` / `go env GOROOT` inside the sandbox): no SDK target,
+//! no `gosdk` dep, host env passed through. Non-hermetic by construction.
 //!
 //! The SDK is one cacheable output (the full tree: `go` + `pkg/tool` + `lib` +
 //! `src` + version/env metadata; `api/test/doc/misc` excluded — nothing reads
@@ -43,11 +47,24 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-/// Default Go release when no version is requested. Override per-build via the
-/// `goversion` provider option or by addressing a versioned toolchain package
-/// directly (`//@heph/go/toolchain/<version>:go`). Any requested version must
-/// have checksums in [`SDK_CHECKSUMS`].
+/// A convenient pinned Go release for tests and as a documented example. The
+/// provider requires the toolchain to be chosen explicitly (`gotool` option),
+/// so this is not an implicit default for real builds — only a constant the
+/// test helpers and examples reference. Any hermetic version must have checksums
+/// in [`SDK_CHECKSUMS`].
 pub const DEFAULT_GO_VERSION: &str = "1.26.4";
+
+/// Sentinel toolchain spec selecting the **host** `go` (read from `PATH` /
+/// `go env GOROOT` inside the sandbox) instead of a hermetic pinned SDK. Chosen
+/// via `gotool = "host"`. Any other `gotool` value is taken as a pinned hermetic
+/// version. Threaded as the `go_version` string everywhere a toolchain is wired;
+/// branch on it with [`is_host`].
+pub const HOST: &str = "host";
+
+/// Whether `spec` selects the host toolchain (vs. a hermetic pinned version).
+pub fn is_host(spec: &str) -> bool {
+    spec == HOST
+}
 
 /// Base provider package for the hermetic toolchain. The concrete target lives
 /// at `{TOOLCHAIN_PKG_PREFIX}/<version>` (e.g. `@heph/go/toolchain/1.26.4`).
