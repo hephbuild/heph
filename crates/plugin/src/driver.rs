@@ -870,6 +870,11 @@ pub struct RunRequest<'a, 'io> {
     pub stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub sandbox_dir: std::path::PathBuf,
+    /// Build-progress event sink, plumbed from the engine's per-request state.
+    /// The driver bridge emits `SandboxCreate{Start,End}` around the sandbox
+    /// build step so it renders as a per-target op in the TUI. `None` when no
+    /// consumer is attached (e.g. tests), making the emit a no-op.
+    pub events: Option<hcore::events::EventSender>,
 }
 /// Cleanup closure a driver returns for the engine to run after `cache_locally`.
 /// The FUSE/OS sandbox layers each supply their own teardown; the engine's

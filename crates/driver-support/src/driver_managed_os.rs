@@ -51,82 +51,111 @@ impl ManagedDriverOs {
             Some(Box::new(move || {
                 hcore::fsutil::remove_dir_all(&cleanup_dir)
             }));
-        let ws_dir = sandbox_dir.join("ws");
-        fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
 
-        let list_dir = sandbox_dir.join("list");
-        fs::create_dir_all(&list_dir).with_context(|| format!("create list dir {:?}", list_dir))?;
+        // Build the sandbox (create dirs + materialize every input) under a
+        // SandboxCreate scope so it renders as a per-target op in the TUI and is
+        // flagged slow when it runs long. The scope covers only the build — not
+        // the subprocess run that follows (that is the Execute op).
+        let events = req.events.clone();
+        let addr = req.target.addr.format();
+        let pkg = req.target.addr.package.as_str().to_owned();
+        let inputs_taken = std::mem::take(&mut req.inputs);
+        let stage_dir = self.stage_dir.clone();
+        let sandbox_dir_scope = sandbox_dir.clone();
+        let (inputs, ws_dir, sandbox_pkg_dir) = hcore::events::emit_scope_tx(
+            events,
+            hcore::events::BuildEventKind::SandboxCreateStart { addr: addr.clone() },
+            move |error| hcore::events::BuildEventKind::SandboxCreateEnd { addr, error },
+            async move {
+                let sandbox_dir = sandbox_dir_scope;
+                let ws_dir = sandbox_dir.join("ws");
+                fs::create_dir_all(&ws_dir)
+                    .with_context(|| format!("create ws dir {:?}", ws_dir))?;
 
-        let mut groups: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
-        for input in std::mem::take(&mut req.inputs) {
-            let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
-            groups.entry(unpack_root).or_default().push(input);
-        }
+                let list_dir = sandbox_dir.join("list");
+                fs::create_dir_all(&list_dir)
+                    .with_context(|| format!("create list dir {:?}", list_dir))?;
 
-        let mut inputs: Vec<ManagedRunInput> = Vec::new();
-        for (unpack_root, group) in groups {
-            fs::create_dir_all(&unpack_root)
-                .with_context(|| format!("create unpack root {:?}", unpack_root))?;
-            for input in group {
-                let list_path = list_path_for(&input, &list_dir);
-                match self.stage_dir.as_deref() {
-                    Some(stage_dir) if crate::stage::is_read_only(&input.annotations) => {
-                        crate::stage::stage_and_link(
-                            input.artifact.content.as_ref(),
-                            stage_dir,
-                            &input.source_addr.format(),
-                            unpack_root.as_path(),
-                            list_path.as_deref(),
-                            &input.filters,
-                            crate::stage::is_per_file(&input.annotations),
-                            ctoken,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "stage read-only input origin_id={} source_addr={} into {:?}",
-                                input.origin_id,
-                                input.source_addr.format(),
-                                unpack_root,
-                            )
-                        })?;
-                    }
-                    _ => {
-                        let filters = input.filters.clone();
-                        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
-                            None
-                        } else {
-                            Some(&|rel: &Path| filters.iter().any(|f| Path::new(f) == rel))
-                        };
-                        hartifactcontent::unpack::unpack(
-                            input.artifact.content.as_ref(),
-                            unpack_root.as_path(),
-                            list_path.as_deref(),
-                            predicate,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "unpack input origin_id={} source_addr={} into {:?}",
-                                input.origin_id,
-                                input.source_addr.format(),
-                                unpack_root,
-                            )
-                        })?;
+                let mut groups: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
+                for input in inputs_taken {
+                    let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
+                    groups.entry(unpack_root).or_default().push(input);
+                }
+
+                let mut inputs: Vec<ManagedRunInput> = Vec::new();
+                for (unpack_root, group) in groups {
+                    fs::create_dir_all(&unpack_root)
+                        .with_context(|| format!("create unpack root {:?}", unpack_root))?;
+                    for input in group {
+                        let list_path = list_path_for(&input, &list_dir);
+                        match stage_dir.as_deref() {
+                            Some(stage_dir)
+                                if crate::stage::is_read_only(&input.annotations) =>
+                            {
+                                crate::stage::stage_and_link(
+                                    input.artifact.content.as_ref(),
+                                    stage_dir,
+                                    &input.source_addr.format(),
+                                    unpack_root.as_path(),
+                                    list_path.as_deref(),
+                                    &input.filters,
+                                    crate::stage::is_per_file(&input.annotations),
+                                    ctoken,
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "stage read-only input origin_id={} source_addr={} into {:?}",
+                                        input.origin_id,
+                                        input.source_addr.format(),
+                                        unpack_root,
+                                    )
+                                })?;
+                            }
+                            _ => {
+                                let filters = input.filters.clone();
+                                let predicate: Option<&dyn Fn(&Path) -> bool> =
+                                    if filters.is_empty() {
+                                        None
+                                    } else {
+                                        Some(&|rel: &Path| {
+                                            filters.iter().any(|f| Path::new(f) == rel)
+                                        })
+                                    };
+                                hartifactcontent::unpack::unpack(
+                                    input.artifact.content.as_ref(),
+                                    unpack_root.as_path(),
+                                    list_path.as_deref(),
+                                    predicate,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "unpack input origin_id={} source_addr={} into {:?}",
+                                        input.origin_id,
+                                        input.source_addr.format(),
+                                        unpack_root,
+                                    )
+                                })?;
+                            }
+                        }
+                        inputs.push(ManagedRunInput {
+                            input,
+                            list_path,
+                            unpack_root: unpack_root.clone(),
+                        });
                     }
                 }
-                inputs.push(ManagedRunInput {
-                    input,
-                    list_path,
-                    unpack_root: unpack_root.clone(),
-                });
-            }
-        }
 
-        let sandbox_pkg_dir = ws_dir.join(req.target.addr.package.as_str());
-        fs::create_dir_all(&sandbox_pkg_dir)
-            .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
+                let sandbox_pkg_dir = ws_dir.join(&pkg);
+                fs::create_dir_all(&sandbox_pkg_dir)
+                    .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
-        write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir)?;
+                write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir)?;
+
+                Ok((inputs, ws_dir, sandbox_pkg_dir))
+            },
+        )
+        .await?;
 
         let target = req.target;
         let hashin = req.hashin;

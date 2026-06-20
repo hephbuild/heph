@@ -321,6 +321,7 @@ impl HeaderItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Op {
     RemoteCacheRead,
+    SandboxCreate,
     Execute,
     LocalCacheWrite,
     RemoteCacheWrite,
@@ -333,6 +334,7 @@ impl Op {
     fn icon(self) -> char {
         match self {
             Op::RemoteCacheRead => '↓',
+            Op::SandboxCreate => '⊞',
             Op::Execute => '▶',
             Op::LocalCacheWrite => '⊕',
             Op::RemoteCacheWrite => '↑',
@@ -340,13 +342,14 @@ impl Op {
     }
 
     /// Pipeline ordinal for stable left-to-right ordering of the breakdown:
-    /// remote download → execute → local-cache write → remote upload.
+    /// remote download → sandbox build → execute → local-cache write → remote upload.
     fn order(self) -> u8 {
         match self {
             Op::RemoteCacheRead => 0,
-            Op::Execute => 1,
-            Op::LocalCacheWrite => 2,
-            Op::RemoteCacheWrite => 3,
+            Op::SandboxCreate => 1,
+            Op::Execute => 2,
+            Op::LocalCacheWrite => 3,
+            Op::RemoteCacheWrite => 4,
         }
     }
 }
@@ -380,6 +383,12 @@ struct OpTimeline {
 /// into the shared per-target timeline; a new op needs one arm here.
 fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
     match kind {
+        BuildEventKind::SandboxCreateStart { addr } => {
+            Some((addr, Op::SandboxCreate, Boundary::Start))
+        }
+        BuildEventKind::SandboxCreateEnd { addr, .. } => {
+            Some((addr, Op::SandboxCreate, Boundary::End))
+        }
         BuildEventKind::ExecuteStart { addr, .. } => Some((addr, Op::Execute, Boundary::Start)),
         BuildEventKind::ExecuteEnd { addr, .. } => Some((addr, Op::Execute, Boundary::End)),
         BuildEventKind::LocalCacheWriteStart { addr } => {
@@ -561,7 +570,9 @@ impl BuildState {
             | BuildEventKind::RemoteCacheWriteStart { .. }
             | BuildEventKind::RemoteCacheWriteEnd { .. }
             | BuildEventKind::LocalCacheWriteStart { .. }
-            | BuildEventKind::LocalCacheWriteEnd { .. } => {}
+            | BuildEventKind::LocalCacheWriteEnd { .. }
+            | BuildEventKind::SandboxCreateStart { .. }
+            | BuildEventKind::SandboxCreateEnd { .. } => {}
             // GC progress is tracked by GcHeader, not the build counters. The
             // elapsed-clock anchor at the top of `apply` still runs, so the
             // clock works during a gc sweep.
@@ -1653,6 +1664,58 @@ mod tests {
         assert_eq!(
             long[0].2,
             vec![(Op::Execute, 3_000), (Op::LocalCacheWrite, 6_000)]
+        );
+    }
+
+    #[test]
+    fn op_timeline_records_sandbox_create_before_execute() {
+        // SandboxCreate runs 0→4s (completed), then Execute opens at 4s and is
+        // still live at now=11s. The breakdown carries both, ordered with the
+        // sandbox build ahead of execute.
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::SandboxCreateStart {
+                addr: "//a:b".into(),
+            },
+        ));
+        s.apply(&ev(
+            4_000,
+            BuildEventKind::SandboxCreateEnd {
+                addr: "//a:b".into(),
+                error: None,
+            },
+        ));
+        s.apply(&ev(4_000, execute_start("//a:b")));
+
+        let long = s.long_running(11_000, 5_000);
+        assert_eq!(long.len(), 1);
+        assert_eq!(long[0].0, "//a:b");
+        assert_eq!(long[0].1, 7_000); // active Execute elapsed
+        assert_eq!(
+            long[0].2,
+            vec![(Op::SandboxCreate, 4_000), (Op::Execute, 7_000)]
+        );
+    }
+
+    #[test]
+    fn long_slow_sandbox_create_surfaces_on_its_own() {
+        // A sandbox build that stays open past the threshold shows as a slow row
+        // with the SandboxCreate icon, before any execute starts.
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::SandboxCreateStart {
+                addr: "//slow:sbx".into(),
+            },
+        ));
+        let long = s.long_running(7_000, 5_000);
+        assert_eq!(long.len(), 1);
+        assert_eq!(long[0].0, "//slow:sbx");
+        let line = format!("{}", s.slow_rows(7_000)[0]);
+        assert!(
+            line.contains(&format!("({} ", Op::SandboxCreate.icon())),
+            "{line}"
         );
     }
 

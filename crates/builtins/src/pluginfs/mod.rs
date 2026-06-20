@@ -1283,6 +1283,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: root,
+            events: None,
         }
     }
 

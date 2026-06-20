@@ -288,6 +288,117 @@ mod shell_fallback_tests {
         }
     }
 
+    struct RunOkDriver;
+
+    #[async_trait]
+    impl ManagedDriver for RunOkDriver {
+        fn config(&self, _: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "runok".to_string(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _: ParseRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            unimplemented!()
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _: ManagedRunRequest<'a, 'io>,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_emits_sandbox_create_start_and_end() -> anyhow::Result<()> {
+        // With an EventSender attached, the OS bridge brackets the sandbox build
+        // with SandboxCreate{Start,End} so the TUI can render it as a step.
+        let mut config: std::collections::HashMap<String, hcore::htvalue::Value> =
+            std::collections::HashMap::new();
+        config.insert("run".to_string(), hcore::htvalue::Value::List(vec![]));
+        let fallback = Arc::new(ShellFallback {
+            driver: Arc::new(RunOkDriver),
+            spec_template: Arc::new(TargetSpec {
+                addr: Default::default(),
+                driver: "exec".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            }),
+        });
+        let bridge = ManagedDriverBridge::new_os_for_test_with_shell_fallback(
+            Box::new(RunOkDriver),
+            fallback,
+        );
+
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+        let sandbox = tmp.path().join("sandbox");
+        fs::create_dir_all(&sandbox)?;
+
+        let target_def = TargetDef {
+            addr: Default::default(),
+            labels: vec![],
+            raw_def: Arc::new(()),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: hplugin::driver::targetdef::CacheConfig::off(),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+        let request_id = "sandbox-create-test".to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: tmp.path().to_path_buf(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+            events: Some(tx),
+        };
+
+        bridge.run(req, &ctoken).await?;
+
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(ev.kind);
+        }
+        let expected = target_def.addr.format();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    hcore::events::BuildEventKind::SandboxCreateStart { addr: a },
+                    hcore::events::BuildEventKind::SandboxCreateEnd { addr: b, error: None },
+                ] if *a == expected && *b == expected
+            ),
+            "expected sandbox create start+end for {expected}, got {kinds:?}",
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn run_shell_dispatches_to_fallback_when_driver_does_not_support() -> anyhow::Result<()> {
         let parse_called = Arc::new(AtomicBool::new(false));
@@ -341,6 +452,7 @@ mod shell_fallback_tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox.clone(),
+            events: None,
         };
 
         bridge.run_shell(req, &ctoken).await?;

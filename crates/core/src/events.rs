@@ -52,6 +52,19 @@ pub enum BuildEventKind {
         addr: String,
         error: Option<String>,
     },
+    /// Start of building the target's sandbox: creating the sandbox dir and
+    /// materializing every declared input into it (unpack / hardlink-stage /
+    /// FUSE-slot register) before the subprocess spawns. Emitted by the driver
+    /// bridge, which owns the create step. Surfaced as one op in the per-target
+    /// timeline and marked slow if it runs long (large inputs, cold stage).
+    /// Paired with `SandboxCreateEnd` (fires on completion, `?`, or cancel).
+    SandboxCreateStart {
+        addr: String,
+    },
+    SandboxCreateEnd {
+        addr: String,
+        error: Option<String>,
+    },
     LocalCacheHit {
         addr: String,
     },
@@ -130,4 +143,163 @@ pub fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Stamp + send one event on `tx`. A closed receiver (consumer gone, e.g. TUI
+/// shut down) is expected — events are best-effort, so the send result is
+/// dropped intentionally.
+fn send_stamped(tx: &EventSender, kind: BuildEventKind) {
+    drop(tx.send(BuildEvent {
+        at_unix_ms: now_unix_ms(),
+        kind,
+    }));
+}
+
+/// Drop-guard so the `*End` event fires on early-return (`?`) **and** on
+/// cancellation (the awaited future is dropped mid-flight). Once armed, it emits
+/// exactly one end event when dropped.
+struct EndGuard {
+    tx: Option<EventSender>,
+    make_end: Option<Box<dyn FnOnce(Option<String>) -> BuildEventKind + Send>>,
+    error: Option<String>,
+}
+
+impl Drop for EndGuard {
+    fn drop(&mut self) {
+        if let (Some(tx), Some(make_end)) = (self.tx.take(), self.make_end.take()) {
+            send_stamped(&tx, make_end(self.error.take()));
+        }
+    }
+}
+
+/// Emit `start`, run `fut`, then emit `make_end(error)` on completion,
+/// early-return (`?`), or cancellation — given a raw `EventSender` rather than
+/// the engine's `RequestState`. Used by layers below the engine (the driver
+/// bridge) that hold an `Option<EventSender>` plumbed through the request. A
+/// `None` sender makes this a transparent pass-through (no events, no overhead).
+///
+/// The end event is produced by an internal drop-guard armed before the await,
+/// so it fires even if `fut` is cancelled mid-await. `at_unix_ms` is stamped on
+/// both the start and end events.
+pub async fn emit_scope_tx<T>(
+    events: Option<EventSender>,
+    start: BuildEventKind,
+    make_end: impl FnOnce(Option<String>) -> BuildEventKind + Send + 'static,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    if let Some(tx) = &events {
+        send_stamped(tx, start);
+    }
+    let mut guard = EndGuard {
+        tx: events,
+        make_end: Some(Box::new(make_end)),
+        error: None,
+    };
+    let out = fut.await; // guard still armed if this is cancelled mid-await
+    if let Err(e) = &out {
+        guard.error = Some(format!("{e:#}"));
+    }
+    out // guard drops here → emits *End
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(rx: &mut EventReceiver) -> Vec<BuildEventKind> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev.kind);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn emit_scope_tx_emits_start_then_end_on_success() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let out: anyhow::Result<u32> = emit_scope_tx(
+            Some(tx),
+            BuildEventKind::SandboxCreateStart {
+                addr: "//a:b".into(),
+            },
+            |error| BuildEventKind::SandboxCreateEnd {
+                addr: "//a:b".into(),
+                error,
+            },
+            async { Ok(7) },
+        )
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        match kinds(&mut rx).as_slice() {
+            [
+                BuildEventKind::SandboxCreateStart { addr: a },
+                BuildEventKind::SandboxCreateEnd {
+                    addr: b,
+                    error: None,
+                },
+            ] => {
+                assert_eq!(a, "//a:b");
+                assert_eq!(b, "//a:b");
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_scope_tx_captures_error_in_end_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let out: anyhow::Result<()> = emit_scope_tx(
+            Some(tx),
+            BuildEventKind::SandboxCreateStart {
+                addr: "//a:b".into(),
+            },
+            |error| BuildEventKind::SandboxCreateEnd {
+                addr: "//a:b".into(),
+                error,
+            },
+            async { Err(anyhow::anyhow!("boom")) },
+        )
+        .await;
+        assert!(out.is_err());
+        let end = kinds(&mut rx).pop().expect("end event");
+        match end {
+            BuildEventKind::SandboxCreateEnd {
+                error: Some(msg), ..
+            } => assert!(msg.contains("boom"), "{msg}"),
+            other => panic!("expected end-with-error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_scope_tx_emits_end_on_cancellation() {
+        // Dropping the future mid-await must still fire the end event via the
+        // armed drop-guard — the slow-sandbox case where the build is cancelled.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let fut = emit_scope_tx(
+            Some(tx),
+            BuildEventKind::SandboxCreateStart {
+                addr: "//a:b".into(),
+            },
+            |error| BuildEventKind::SandboxCreateEnd {
+                addr: "//a:b".into(),
+                error,
+            },
+            std::future::pending::<anyhow::Result<()>>(),
+        );
+        // Poll once to emit Start + arm the guard, then drop without completing.
+        let mut boxed = Box::pin(fut);
+        let _ = futures::poll!(boxed.as_mut());
+        drop(boxed);
+        let observed = kinds(&mut rx);
+        assert!(
+            matches!(
+                observed.as_slice(),
+                [
+                    BuildEventKind::SandboxCreateStart { .. },
+                    BuildEventKind::SandboxCreateEnd { error: None, .. },
+                ]
+            ),
+            "expected start+end on cancel, got {observed:?}"
+        );
+    }
 }
