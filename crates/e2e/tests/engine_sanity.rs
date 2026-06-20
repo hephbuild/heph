@@ -17,6 +17,7 @@ fn bash(addr: &str, run: &str, out: &str) -> Target {
         codegen: None,
         deps: Default::default(),
         labels: vec![],
+        ..Default::default()
     }
 }
 
