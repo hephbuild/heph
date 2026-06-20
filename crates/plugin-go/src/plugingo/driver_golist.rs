@@ -82,7 +82,7 @@ struct GoGolistDef {
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
 /// output format (package.bin layout, package_addrs.bin schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 12;
+const GO_GOLIST_FORMAT_VERSION: u32 = 13;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -369,9 +369,7 @@ impl ManagedDriver for GoGolistDriver {
             .context("parse go list output")?;
         pkgs.retain(|p| p.import_path == def.import_path);
         for p in &mut pkgs {
-            if let Some(dir) = &p.dir {
-                p.dir = Some(normalize_dir(dir, &ws_prefix));
-            }
+            normalize_pkg_paths(p, &ws_prefix);
         }
 
         let pkg = pkgs.into_iter().next().ok_or_else(|| {
@@ -406,6 +404,24 @@ impl ManagedDriver for GoGolistDriver {
             .context("write package_addrs.bin")?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+/// Strip every absolute path out of a `go list` package so the cached
+/// `package.bin` is byte-identical across machines (and sandboxes). go reports
+/// absolute paths in two places:
+/// - `Dir`: rewritten repo-root-relative (it lives under the sandbox ws).
+/// - `Module.Dir`: an absolute sandbox-ws path (first-party) or host
+///   GOMODCACHE path (thirdparty). Nothing downstream reads it — only
+///   `Module.Path` matters — so it's dropped. Left in, its per-machine
+///   absolute value would make this output (and every consumer's hashin)
+///   differ across machines, defeating the cache.
+fn normalize_pkg_paths(p: &mut GoPackage, ws_prefix: &str) {
+    if let Some(dir) = &p.dir {
+        p.dir = Some(normalize_dir(dir, ws_prefix));
+    }
+    if let Some(m) = &mut p.module {
+        m.dir = None;
     }
 }
 
@@ -463,6 +479,7 @@ fn host_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugingo::pkg_analysis::GoModule;
     use hmodel::htpkg::PkgBuf;
 
     fn driver() -> GoGolistDriver {
@@ -742,5 +759,26 @@ mod tests {
     fn test_normalize_dir_leaves_third_party_unchanged() {
         let dir = "/home/user/go/pkg/mod/github.com/foo/bar@v1.0.0";
         assert_eq!(normalize_dir(dir, "/sandbox/ws"), dir);
+    }
+
+    #[test]
+    fn test_normalize_pkg_paths_drops_absolute_module_dir() {
+        // Module.Dir is an absolute per-machine path; dropping it keeps
+        // package.bin byte-identical across sandboxes/machines.
+        let mut pkg = GoPackage {
+            import_path: "example.com/m/lib".to_string(),
+            dir: Some("/sandbox/ws/lib".to_string()),
+            module: Some(GoModule {
+                path: "example.com/m".to_string(),
+                version: None,
+                dir: Some("/sandbox/ws".to_string()),
+            }),
+            ..Default::default()
+        };
+        normalize_pkg_paths(&mut pkg, "/sandbox/ws");
+        assert_eq!(pkg.dir.as_deref(), Some("lib"));
+        let m = pkg.module.expect("module retained");
+        assert_eq!(m.path, "example.com/m", "Module.Path must survive");
+        assert_eq!(m.dir, None, "absolute Module.Dir must be dropped");
     }
 }
