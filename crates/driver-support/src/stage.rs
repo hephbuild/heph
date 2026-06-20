@@ -103,8 +103,168 @@ pub async fn stage_and_link(
         }
     }
 
-    link_tree(&entry, link_root, list_path, filters)
-        .with_context(|| format!("link staged {:?} into {:?}", entry, link_root))
+    // Unfiltered inputs (the common case: a whole self-contained read-only tree
+    // like the Go SDK) get the *largest non-colliding subtree* symlinked in —
+    // O(depth) symlinks instead of O(files) hardlinks. The Go SDK is ~11k tiny
+    // files; per-file hardlinking is metadata-syscall-bound and no cheaper than
+    // copying. A directory symlink makes both staging *and* sandbox teardown
+    // O(1) (teardown removes one symlink, not 11k read-only files). Filtered
+    // inputs must select individual files, so they keep the per-file hardlink
+    // path.
+    if filters.is_empty() {
+        link_symlinked(&entry, link_root, list_path)
+            .with_context(|| format!("symlink staged {:?} into {:?}", entry, link_root))
+    } else {
+        link_tree(&entry, link_root, list_path, filters)
+            .with_context(|| format!("link staged {:?} into {:?}", entry, link_root))
+    }
+}
+
+/// Expose the staged tree under `link_root` by symlinking the deepest subtrees
+/// that this input *exclusively* owns. Shared path prefixes — directories on a
+/// single-child chain, which sibling inputs (or the consumer's own package dir)
+/// also live under — are recreated as real directories so they stay writable;
+/// the first directory that branches (multiple entries, or a file) is the
+/// content root and gets one symlink covering its entire subtree.
+///
+/// Example (the Go SDK): `@heph/go/toolchain/<ver>` is a single-child chain, so
+/// each level is a real dir; `…/<ver>/go` (bin, pkg, src, …) is symlinked whole.
+/// A sibling like `@heph/go/std/fmt` (a consumer's own package) can then be
+/// created under the real `@heph/go` without hitting the read-only stage.
+///
+/// Symlink targets are absolute paths into the persistent read-only stage, so
+/// they outlive the sandbox and teardown just unlinks them. `list_path`, when
+/// present, records each created symlink (not every file behind it).
+#[cfg(unix)]
+fn link_symlinked(entry: &Path, link_root: &Path, list_path: Option<&Path>) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all(link_root)
+        .with_context(|| format!("create link root {:?}", link_root))?;
+    let mut list = match list_path {
+        Some(p) => Some(std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .with_context(|| format!("open list file {:?} (append)", p))?,
+        )),
+        None => None,
+    };
+    // `link_root` is a real (shared) directory: merge each staged child into it.
+    merge_dir(entry, link_root, &mut list)?;
+    if let Some(mut l) = list {
+        l.flush().with_context(|| "flush stage list file")?;
+    }
+    Ok(())
+}
+
+/// `dst` is a real directory shared with other inputs; place each child of the
+/// staged `src` directory into it.
+#[cfg(unix)]
+fn merge_dir(
+    src: &Path,
+    dst: &Path,
+    list: &mut Option<std::io::BufWriter<std::fs::File>>,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("create real dir {:?}", dst))?;
+    for ent in std::fs::read_dir(src).with_context(|| format!("read staged dir {:?}", src))? {
+        let ent = ent.with_context(|| format!("read entry under {:?}", src))?;
+        let name = ent.file_name();
+        place_entry(&src.join(&name), &dst.join(&name), list)?;
+    }
+    Ok(())
+}
+
+/// Place one staged entry `src` at sandbox path `dst`: symlink the whole subtree
+/// when `dst` is free and `src` is exclusively owned, recreate a real directory
+/// and recurse on a shared single-child prefix, merge into an existing real dir,
+/// or skip an identical existing symlink.
+#[cfg(unix)]
+fn place_entry(
+    src: &Path,
+    dst: &Path,
+    list: &mut Option<std::io::BufWriter<std::fs::File>>,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let src_is_dir = std::fs::metadata(src).map(|m| m.is_dir()).unwrap_or(false);
+    match std::fs::symlink_metadata(dst) {
+        // Free slot.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A directory on a single-child chain is a shared prefix (siblings —
+            // other inputs or the consumer's own package dir — live alongside
+            // it), so keep it a real, writable directory and descend. Anything
+            // else (a branching dir, or a file/symlink) is this input's own
+            // content root → one symlink exposes the whole subtree.
+            if src_is_dir && single_child_dir(src)?.is_some() {
+                merge_dir(src, dst, list)?;
+            } else {
+                std::os::unix::fs::symlink(src, dst)
+                    .with_context(|| format!("symlink {:?} -> {:?}", dst, src))?;
+                if let Some(list) = list.as_mut() {
+                    writeln!(list, "{}", dst.display())
+                        .with_context(|| "append to stage list file")?;
+                }
+            }
+        }
+        // Already symlinked to this very staged path (identical content from an
+        // earlier input, e.g. several `gosdk` deps) → idempotent, skip.
+        Ok(md)
+            if md.file_type().is_symlink()
+                && std::fs::read_link(dst).map(|t| t == *src).unwrap_or(false) => {}
+        // Existing real directory shared with an earlier input → merge.
+        Ok(md) if md.file_type().is_dir() && src_is_dir => {
+            merge_dir(src, dst, list)?;
+        }
+        // Two inputs claim the same path with different content.
+        Ok(md) => {
+            anyhow::bail!(
+                "staged input collides with existing sandbox entry at {:?} \
+                 (existing={:?} -> {:?}, staged src={:?})",
+                dst,
+                md.file_type(),
+                std::fs::read_link(dst).ok(),
+                src,
+            );
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("stat sandbox entry {:?}", dst));
+        }
+    }
+    Ok(())
+}
+
+/// If `dir` contains exactly one entry and it is a directory, return its path —
+/// marking `dir` as a single-child chain link (a shared path prefix) rather than
+/// a content root.
+#[cfg(unix)]
+fn single_child_dir(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let mut it = std::fs::read_dir(dir).with_context(|| format!("read staged dir {:?}", dir))?;
+    let Some(first) = it.next() else {
+        return Ok(None); // empty dir → treat as content root (symlink it)
+    };
+    let first = first.with_context(|| format!("read entry under {:?}", dir))?;
+    if it.next().is_some() {
+        return Ok(None); // more than one entry → branch point
+    }
+    if std::fs::metadata(first.path())
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        Ok(Some(first.path()))
+    } else {
+        Ok(None) // single child is a file → content root
+    }
+}
+
+#[cfg(not(unix))]
+fn link_symlinked(
+    _entry: &Path,
+    _link_root: &Path,
+    _list_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("read-only input staging is only supported on unix")
 }
 
 /// Unpack `content` into a fresh `entry` and strip write permissions from the
@@ -495,7 +655,10 @@ mod tests {
     #[tokio::test]
     async fn staged_symlink_is_recreated_as_symlink() {
         use std::os::unix::fs::symlink;
-        // Build content holding a file and a relative symlink to it.
+        // Filtered inputs take the per-file hardlink path (`link_tree`), which
+        // recreates a staged symlink as a symlink preserving its target. (The
+        // unfiltered path instead symlinks whole subtrees — see
+        // `unfiltered_input_is_directory_symlinked`.)
         let src = tempfile::tempdir().expect("src");
         std::fs::write(src.path().join("target.txt"), b"hi").expect("write");
         symlink("target.txt", src.path().join("link.txt")).expect("symlink");
@@ -518,7 +681,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
-        stage_and_link(&c, &stage, "k", &link, None, &[], &ct())
+        let keep = ["target.txt".to_string(), "link.txt".to_string()];
+        stage_and_link(&c, &stage, "k", &link, None, &keep, &ct())
             .await
             .expect("stage");
 
@@ -556,6 +720,163 @@ mod tests {
         let entry = stage.join("k").join("f1");
         assert!(entry.join("a.txt").exists());
         assert!(entry.join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn unfiltered_input_is_directory_symlinked() {
+        // An unfiltered read-only tree is exposed by symlinking its top-level
+        // subtree (O(depth)) rather than hardlinking every file. The Go SDK is
+        // the real-world case: ~11k files behind one symlink.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let c = content(
+            "tree1",
+            &[
+                ("goroot/bin/go", "bin", true),
+                ("goroot/src/fmt/x.go", "src", false),
+            ],
+        );
+
+        stage_and_link(&c, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect("stage");
+
+        // The single top-level entry is a symlink into the stage — not 11k
+        // hardlinks — so the whole subtree is reachable through it.
+        let top = link.join("goroot");
+        let md = std::fs::symlink_metadata(&top).expect("lstat top");
+        assert!(
+            md.file_type().is_symlink(),
+            "unfiltered tree must be exposed as a directory symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("goroot/src/fmt/x.go"))
+                .expect("read through symlink"),
+            "src"
+        );
+
+        // Sandbox teardown is O(1) and unaffected by the read-only (0o555)
+        // staged tree: removing the sandbox just unlinks the symlink, leaving
+        // the shared stage intact.
+        std::fs::remove_dir_all(&link).expect("sandbox teardown over symlink");
+        assert!(!link.exists());
+        assert!(
+            stage.join("k").join("tree1").join("goroot/bin/go").exists(),
+            "staged copy survives teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn symlinking_same_content_twice_is_idempotent() {
+        // Several inputs in one sandbox can resolve to the same stage entry
+        // (e.g. multiple `gosdk` deps → one SDK). Re-linking the same content
+        // into the same root must be a no-op, not a collision error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        // `goroot` branches (bin + pkg), so it is the content root and is
+        // symlinked whole.
+        let c = content(
+            "dup1",
+            &[("goroot/bin/go", "x", true), ("goroot/pkg/y.a", "y", false)],
+        );
+
+        stage_and_link(&c, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect("first link");
+        stage_and_link(&c, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect("second link must be idempotent");
+
+        assert!(
+            std::fs::symlink_metadata(link.join("goroot"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("goroot/bin/go")).unwrap(),
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_child_prefix_stays_writable_for_siblings() {
+        // Regression: the Go SDK lives at @heph/go/toolchain/<v>/go while a
+        // consumer's own package dir is @heph/go/std/fmt. Symlinking the whole
+        // @heph would make the consumer's pkg dir fall inside the read-only
+        // stage. The single-child chain must stay real dirs so the sibling path
+        // is creatable.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let c = content(
+            "sdk",
+            &[
+                ("a/b/c/go/bin/go", "bin", true),
+                ("a/b/c/go/src/fmt/x.go", "src", false),
+            ],
+        );
+
+        stage_and_link(&c, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect("stage");
+
+        // The chain a/b/c is real dirs; only …/c/go (branching) is a symlink.
+        for chain in ["a", "a/b", "a/b/c"] {
+            assert!(
+                std::fs::symlink_metadata(link.join(chain))
+                    .unwrap()
+                    .file_type()
+                    .is_dir(),
+                "{chain} must stay a real directory"
+            );
+        }
+        assert!(
+            std::fs::symlink_metadata(link.join("a/b/c/go"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the content root must be symlinked"
+        );
+        // A sibling package dir under the real prefix is creatable (would fail
+        // EACCES if the prefix were a read-only symlink).
+        std::fs::create_dir_all(link.join("a/b/std/fmt")).expect("sibling pkg dir creatable");
+    }
+
+    #[tokio::test]
+    async fn symlink_descends_into_colliding_prefix() {
+        // When an earlier input already placed a real directory at a shared
+        // prefix, the symlink path descends so neither input is shadowed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        // Pre-existing content from a notional earlier input.
+        std::fs::create_dir_all(link.join("shared")).expect("mkdir");
+        std::fs::write(link.join("shared/existing.txt"), b"old").expect("write");
+
+        let c = content("c1", &[("shared/new.txt", "new", false)]);
+        stage_and_link(&c, &stage, "k", &link, None, &[], &ct())
+            .await
+            .expect("stage");
+
+        // `shared` stayed a real dir (descended); both files coexist.
+        assert!(
+            std::fs::symlink_metadata(link.join("shared"))
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "colliding prefix must stay a real directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("shared/existing.txt")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("shared/new.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[tokio::test]

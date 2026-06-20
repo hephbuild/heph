@@ -1,5 +1,6 @@
 use crate::plugingo::addr_util::{
-    go_bin_tools_config, import_path_to_dep_group, to_run_value, write_importcfg_script,
+    go_build_env, go_run_prelude, go_sdk_dep, go_sdk_read_only_config, import_path_to_dep_group,
+    to_run_value, write_importcfg_script,
 };
 use crate::plugingo::factors::Factors;
 use hcore::htvalue::Value;
@@ -13,8 +14,7 @@ pub fn build_spec(
     factors: &Factors,
     // All transitive libs including own build_lib at index 0
     transitive_libs: &[(String, Addr)],
-    go_bin_addr: &str,
-    goroot: &str,
+    go_version: &str,
 ) -> TargetSpec {
     let binary_name = import_path
         .rsplit('/')
@@ -22,23 +22,31 @@ pub fn build_spec(
         .unwrap_or(import_path)
         .to_string();
 
-    let run = generate_link_script(import_path, &binary_name, transitive_libs);
+    let mut run = go_run_prelude(go_version);
+    run.extend(generate_link_script(
+        import_path,
+        &binary_name,
+        transitive_libs,
+    ));
 
-    let deps: BTreeMap<String, Value> = transitive_libs
+    let mut deps: BTreeMap<String, Value> = transitive_libs
         .iter()
         .map(|(dep_import_path, dep_addr)| {
             let group = import_path_to_dep_group(dep_import_path);
             (group, Value::List(vec![Value::String(dep_addr.format())]))
         })
         .collect();
+    let (sdk_group, sdk_val) = go_sdk_dep(go_version);
+    deps.insert(sdk_group, sdk_val);
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
-    config.insert("tools".to_string(), go_bin_tools_config(go_bin_addr));
     config.insert(
         "deps".to_string(),
         Value::Map(deps.into_iter().collect::<HashMap<_, _>>()),
     );
+    let (ro_k, ro_v) = go_sdk_read_only_config();
+    config.insert(ro_k, ro_v);
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -47,26 +55,15 @@ pub fn build_spec(
         )])),
     );
     config.insert(
-        "pass_env".to_string(),
-        Value::List(vec![Value::String("GOROOT".to_string())]),
-    );
-    config.insert(
         "runtime_env".to_string(),
         Value::Map(HashMap::from([
             ("GOOS".to_string(), Value::String(factors.goos.clone())),
             ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-            ("GOROOT".to_string(), Value::String(goroot.to_string())),
         ])),
     );
-    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
+    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert(
-        "env".to_string(),
-        Value::Map(HashMap::from([(
-            "CGO_ENABLED".to_string(),
-            Value::String("0".to_string()),
-        )])),
-    );
+    config.insert("env".to_string(), go_build_env());
 
     TargetSpec {
         addr,
@@ -90,7 +87,7 @@ fn generate_link_script(
     // platforms). Libs were compiled with -shared, so the link must agree on
     // PIE — otherwise asm relocations from transitive deps fail to resolve.
     lines.push(format!(
-        "\"$TOOL_GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"",
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"",
         binary_name, self_env_var
     ));
     lines
@@ -100,6 +97,9 @@ fn generate_link_script(
 mod tests {
     use super::*;
     use hmodel::htpkg::PkgBuf;
+
+    /// Go version under test.
+    const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
 
     fn run_str(spec: &TargetSpec) -> String {
         match spec.config.get("run").unwrap() {
@@ -138,14 +138,7 @@ mod tests {
 
     #[test]
     fn test_driver_is_bash() {
-        let spec = build_spec(
-            test_addr(),
-            "example.com/cmd",
-            &test_factors(),
-            &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
         assert_eq!(spec.driver, "sh");
     }
 
@@ -156,8 +149,7 @@ mod tests {
             "example.com/myapp/cmd",
             &test_factors(),
             &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
+            V,
         );
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
@@ -176,73 +168,53 @@ mod tests {
             ("example.com/cmd".to_string(), lib_addr("cmd")),
             ("fmt".to_string(), lib_addr("@heph/go/std/fmt")),
         ];
-        let spec = build_spec(
-            test_addr(),
-            "example.com/cmd",
-            &test_factors(),
-            &libs,
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, V);
         let run = run_str(&spec);
-        assert!(run.contains("TOOL_GO"));
         assert!(run.contains("tool link"));
         assert!(run.contains("importcfg"));
     }
 
     #[test]
-    fn test_run_uses_tool_go() {
-        let spec = build_spec(
-            test_addr(),
-            "example.com/cmd",
-            &test_factors(),
-            &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
+    fn test_run_uses_hermetic_go() {
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
         let run = run_str(&spec);
         assert!(
-            run.contains("\"$TOOL_GO\""),
-            "link script must use \"$TOOL_GO\" (quoted): {}",
-            run
+            run.contains("\"$GO\""),
+            "link script must invoke the hermetic \"$GO\": {run}"
+        );
+        assert!(
+            run.contains(&format!(
+                "$WORKSPACE_ROOT/{}",
+                crate::plugingo::toolchain::staged_goroot(V)
+            )),
+            "GOROOT must point at the staged hermetic SDK: {run}"
+        );
+        assert!(
+            !run.contains("TOOL_GO"),
+            "must not use the host go tool: {run}"
         );
     }
 
     #[test]
-    fn test_tools_has_go_group() {
-        let spec = build_spec(
-            test_addr(),
-            "example.com/cmd",
-            &test_factors(),
-            &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
-        let tools = match spec.config.get("tools").unwrap() {
+    fn test_deps_include_hermetic_sdk() {
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
+        let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
         };
-        let go = match tools.get("go").expect("tools must have go group") {
-            Value::List(v) => v,
-            _ => panic!("expected list"),
-        };
         assert!(
-            matches!(&go[0], Value::String(s) if s.contains("@heph/bin")),
-            "go tool should reference go bin addr: {:?}",
-            go
+            deps.contains_key(crate::plugingo::addr_util::GO_SDK_DEP_GROUP),
+            "bin link must dep on the hermetic SDK: {deps:?}"
+        );
+        assert!(
+            !spec.config.contains_key("tools"),
+            "no host tool should be referenced"
         );
     }
 
     #[test]
     fn test_env_pins_cgo_disabled() {
-        let spec = build_spec(
-            test_addr(),
-            "example.com/cmd",
-            &test_factors(),
-            &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
         let env = match spec.config.get("env").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
@@ -255,38 +227,13 @@ mod tests {
     }
 
     #[test]
-    fn test_run_no_src_hash_comment() {
-        let spec = build_spec(
-            test_addr(),
-            "example.com/cmd",
-            &test_factors(),
-            &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
-        let run = run_str(&spec);
-        assert!(
-            !run.contains("src_hash"),
-            "link script must not embed src_hash (dep chain handles invalidation): {}",
-            run
-        );
-    }
-
-    #[test]
     fn test_run_self_not_in_importcfg() {
         // The main package is passed as a positional arg to the linker, not via importcfg.
         let libs = vec![
             ("example.com/cmd".to_string(), lib_addr("cmd")),
             ("fmt".to_string(), lib_addr("@heph/go/std/fmt")),
         ];
-        let spec = build_spec(
-            test_addr(),
-            "example.com/cmd",
-            &test_factors(),
-            &libs,
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, V);
         let run = run_str(&spec);
         assert!(
             !run.contains("packagefile example.com/cmd="),

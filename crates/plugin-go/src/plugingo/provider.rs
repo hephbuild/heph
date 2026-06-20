@@ -15,6 +15,7 @@ use crate::plugingo::target_modfiles;
 use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
+use crate::plugingo::toolchain;
 use anyhow::Context;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -38,10 +39,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
-
 pub struct Config {
-    pub go_bin_addr: String,
+    /// Go release every build/test/list target resolves its hermetic toolchain
+    /// against (`//@heph/go/toolchain/<go_version>:go`). Defaults to
+    /// [`toolchain::DEFAULT_GO_VERSION`]; set via the `goversion` provider option.
+    pub go_version: String,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
@@ -65,7 +67,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            go_bin_addr: DEFAULT_GO_BIN_ADDR.to_string(),
+            go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -82,11 +84,8 @@ pub struct Provider {
 
 pub(crate) struct ProviderInner {
     workspace_root: PathBuf,
-    goroot: String,
-    gomodcache: String,
-    gopath: String,
-    gocache: String,
-    go_bin_addr: String,
+    /// Go release the hermetic toolchain is pinned to (see [`Config::go_version`]).
+    go_version: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
@@ -203,9 +202,13 @@ impl Provider {
         opts: &hplugin::config::Options,
         walker: Arc<CachedWalker>,
     ) -> anyhow::Result<Self> {
-        hplugin::config::deny_unknown("go provider", opts, &["gotool", "skip"])?;
-        let go_bin_addr: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
-            .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
+        // `gotool` is accepted but ignored: the Go toolchain is now hermetic
+        // (`//@heph/go/toolchain/<version>:go`, a pinned SDK download), so there
+        // is no host go-binary knob to configure. `goversion` selects which
+        // pinned release to download (default [`toolchain::DEFAULT_GO_VERSION`]).
+        hplugin::config::deny_unknown("go provider", opts, &["gotool", "goversion", "skip"])?;
+        let go_version: String = hplugin::config::decode_opt(opts, "go provider", "goversion")?
+            .unwrap_or_else(|| toolchain::DEFAULT_GO_VERSION.to_string());
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
@@ -216,7 +219,7 @@ impl Provider {
         Self::with_config(
             workspace_root,
             Config {
-                go_bin_addr,
+                go_version,
                 skip,
                 walker,
                 ..Default::default()
@@ -224,27 +227,11 @@ impl Provider {
         )
     }
 
-    pub fn go_bin_addr(&self) -> &str {
-        &self.inner.go_bin_addr
-    }
-
     pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
-        // One `go env` round-trip for all four variables instead of four spawns.
-        let env = resolve_go_env_vars(&["GOROOT", "GOMODCACHE", "GOPATH", "GOCACHE"])?;
-        let [goroot, gomodcache, gopath, gocache] = <[String; 4]>::try_from(env).map_err(|v| {
-            anyhow::anyhow!(
-                "resolve_go_env_vars returned {} values, expected 4",
-                v.len()
-            )
-        })?;
         Ok(Self {
             inner: Arc::new(ProviderInner {
                 workspace_root,
-                goroot,
-                gomodcache,
-                gopath,
-                gocache,
-                go_bin_addr: config.go_bin_addr,
+                go_version: config.go_version,
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
@@ -256,62 +243,6 @@ impl Provider {
             }),
         })
     }
-}
-
-/// Resolve several `go env` variables in a single subprocess, in the order
-/// requested. A process env var of the same name overrides (matching go's own
-/// precedence); only the names not already set are fetched, via one
-/// `go env A B C` round-trip rather than one `go` spawn per variable. Each
-/// spawn is ~15-20 ms, and the go provider needs four of these at construction,
-/// so batching removes ~3 subprocess spawns from every invocation's startup.
-fn resolve_go_env_vars(names: &[&str]) -> anyhow::Result<Vec<String>> {
-    // Per name: `Some` if satisfied from the process environment, else `None`
-    // (must come from `go env`). `missing` preserves request order.
-    let mut from_env: Vec<Option<String>> = Vec::with_capacity(names.len());
-    let mut missing: Vec<&str> = Vec::new();
-    for name in names {
-        match std::env::var(name) {
-            Ok(val) if !val.is_empty() => from_env.push(Some(val)),
-            _ => {
-                from_env.push(None);
-                missing.push(name);
-            }
-        }
-    }
-
-    let mut fetched: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
-    if !missing.is_empty() {
-        let output = std::process::Command::new("go")
-            .arg("env")
-            .args(&missing)
-            .output()
-            .map_err(|e| anyhow::anyhow!("failed to run `go env {}`: {}", missing.join(" "), e))?;
-        if !output.status.success() {
-            anyhow::bail!("go env {} failed", missing.join(" "));
-        }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|e| anyhow::anyhow!("go env output not utf-8: {}", e))?;
-        // `go env A B C` prints one value per line, in the requested order.
-        let lines: Vec<&str> = stdout.lines().collect();
-        if lines.len() != missing.len() {
-            anyhow::bail!(
-                "go env returned {} lines for {} variables",
-                lines.len(),
-                missing.len()
-            );
-        }
-        for (name, line) in missing.iter().zip(lines) {
-            fetched.insert(name, line.trim().to_string());
-        }
-    }
-
-    Ok(names
-        .iter()
-        .zip(from_env)
-        .map(|(name, env_val)| {
-            env_val.unwrap_or_else(|| fetched.get(name).cloned().unwrap_or_default())
-        })
-        .collect())
 }
 
 /// Recursively enumerate directories at or below `dir` that live under a
@@ -951,6 +882,27 @@ impl ProviderInner {
         let addr = &req.addr;
         let factors = Factors::from_addr(addr);
 
+        // Hermetic Go toolchain: `//@heph/go/toolchain/<version>:go` downloads
+        // the pinned SDK for the host platform. This replaces the former
+        // host-PATH go.
+        if addr.name == toolchain::TOOLCHAIN_NAME
+            && let Some(version) = toolchain::version_from_pkg(addr.package.as_str())
+        {
+            let spec =
+                toolchain::build_spec(addr.clone(), version, &current_goos(), &current_goarch())
+                    .map_err(GetError::Other)?;
+            return Ok(GetResponse { target_spec: spec });
+        }
+
+        // Standard library install: `@heph/go/std:install` builds all of std from
+        // source once (per factor); per-package `build_lib` extracts archives from
+        // its output. Lives at the bare `@heph/go/std` package, which does not
+        // decode as a Stdlib import path, so handle it before `decode_package`.
+        if addr.package.as_str() == target_std::STD_PKG && addr.name == "install" {
+            let spec = target_std::install_spec(addr.clone(), &factors, &self.go_version);
+            return Ok(GetResponse { target_spec: spec });
+        }
+
         let kind = match decode_package(&addr.package, &self.workspace_root) {
             Some(k) => k,
             None => return Err(GetError::NotFound),
@@ -1025,8 +977,7 @@ impl ProviderInner {
                     addr.clone(),
                     module,
                     version,
-                    &self.go_bin_addr,
-                    &self.goroot,
+                    &self.go_version,
                 );
                 return Ok(GetResponse { target_spec: spec });
             }
@@ -1127,9 +1078,7 @@ impl ProviderInner {
                         &pkg_addrs.h_files,
                         embed_addr.as_ref(),
                         &pkg_addrs.embed_files,
-                        &self.go_bin_addr,
-                        &self.goroot,
-                        &self.gocache,
+                        &self.go_version,
                     ),
                     _ => target_lib::build_spec(
                         addr.clone(),
@@ -1138,9 +1087,7 @@ impl ProviderInner {
                         &factors,
                         &transitive.libs,
                         &pkg_addrs.go_files,
-                        &self.go_bin_addr,
-                        &self.goroot,
-                        &self.gocache,
+                        &self.go_version,
                         embed_addr.as_ref(),
                         &pkg_addrs.embed_files,
                     ),
@@ -1172,8 +1119,7 @@ impl ProviderInner {
                     &import_path,
                     &factors,
                     &transitive.libs,
-                    &self.go_bin_addr,
-                    &self.goroot,
+                    &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1262,11 +1208,9 @@ impl ProviderInner {
                     &transitive.libs,
                     &pkg_addrs.go_files,
                     &pkg_addrs.test_go_files,
-                    &self.go_bin_addr,
-                    &self.goroot,
-                    &self.gocache,
                     embed_addr.as_ref(),
                     &test_embed_files,
+                    &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1356,11 +1300,9 @@ impl ProviderInner {
                     &factors,
                     &rewritten_libs,
                     &pkg_addrs.xtest_go_files,
-                    &self.go_bin_addr,
-                    &self.goroot,
-                    &self.gocache,
                     xtest_embed_addr.as_ref(),
                     &pkg_addrs.xtest_embed_files,
+                    &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1397,9 +1339,7 @@ impl ProviderInner {
                     &factors,
                     &testmain_src_addr,
                     &transitive.libs,
-                    &self.go_bin_addr,
-                    &self.goroot,
-                    &self.gocache,
+                    &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1438,9 +1378,7 @@ impl ProviderInner {
                     &factors,
                     &testmain_src_addr,
                     &transitive.libs,
-                    &self.go_bin_addr,
-                    &self.goroot,
-                    &self.gocache,
+                    &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1494,14 +1432,9 @@ impl ProviderInner {
                 let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
-                    &self.go_bin_addr,
-                    &target_test::GoEnv {
-                        gomodcache: &self.gomodcache,
-                        gopath: &self.gopath,
-                        gocache: &self.gocache,
-                    },
                     &testmain_lib_addr,
                     &all_libs,
+                    &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1598,14 +1531,9 @@ impl ProviderInner {
                 let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
-                    &self.go_bin_addr,
-                    &target_test::GoEnv {
-                        gomodcache: &self.gomodcache,
-                        gopath: &self.gopath,
-                        gocache: &self.gocache,
-                    },
                     &testmain_lib_addr,
                     &all_libs,
+                    &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1728,7 +1656,7 @@ impl ProviderInner {
                     addr,
                     import_path,
                     factors,
-                    &self.goroot,
+                    &self.go_version,
                     &go_mod_addr,
                     &go_src_glob_addr,
                     None,
@@ -1760,13 +1688,13 @@ impl ProviderInner {
                     addr,
                     &import_path,
                     factors,
-                    &self.goroot,
+                    &self.go_version,
                     &go_mod_addr,
                     &download_addr,
                 )?
             }
             GoPackageKind::Stdlib { import_path } => {
-                target_golist::build_spec_stdlib(addr, import_path, factors, &self.goroot)?
+                target_golist::build_spec_stdlib(addr, import_path, factors, &self.go_version)?
             }
         };
         Ok(GetResponse { target_spec: spec })
@@ -1780,13 +1708,7 @@ impl ProviderInner {
     ) -> Result<GetResponse, GetError> {
         match addr.name.as_str() {
             "build_lib" => {
-                let spec = target_std::build_spec(
-                    addr,
-                    import_path,
-                    factors,
-                    &self.go_bin_addr,
-                    &self.goroot,
-                );
+                let spec = target_std::build_spec(addr, import_path, factors);
                 Ok(GetResponse { target_spec: spec })
             }
             _ => Err(GetError::NotFound),
@@ -2902,29 +2824,6 @@ mod tests {
         let merged = compose_closures(&[a, b], None);
         let ips: Vec<&str> = merged.iter().map(|(ip, _)| ip.as_ref()).collect();
         assert_eq!(ips, ["x", "y", "z"], "diamond 'y' deduped, order preserved");
-    }
-
-    #[test]
-    fn resolve_go_env_vars_batches_in_request_order() {
-        require_go!();
-        // One value per requested name, in request order, matching individual
-        // `go env` calls — the batched single-spawn path must not reorder or drop.
-        let vals = resolve_go_env_vars(&["GOROOT", "GOCACHE", "GOMODCACHE"]).expect("go env");
-        assert_eq!(vals.len(), 3, "one value per requested variable");
-        let single = |name: &str| {
-            let out = std::process::Command::new("go")
-                .args(["env", name])
-                .output()
-                .unwrap();
-            String::from_utf8(out.stdout).unwrap().trim().to_string()
-        };
-        assert_eq!(vals[0], single("GOROOT"), "GOROOT stays in slot 0");
-        assert_eq!(vals[1], single("GOCACHE"), "GOCACHE stays in slot 1");
-        assert_eq!(vals[2], single("GOMODCACHE"), "GOMODCACHE stays in slot 2");
-        assert!(
-            !vals[0].is_empty() && !vals[1].is_empty(),
-            "GOROOT/GOCACHE resolve to non-empty paths"
-        );
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {

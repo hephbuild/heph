@@ -476,23 +476,38 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 
         let pkg = req.target_spec.addr.package.clone();
 
+        // Dep groups opted into read-only staging (stage once, hardlink in)
+        // rather than copied into every sandbox.
+        let read_only_groups: std::collections::HashSet<String> =
+            spec.read_only_deps.iter().cloned().collect();
+
         let build_dep_inputs = |deps: HashMap<String, Vec<String>>,
                                 origin_prefix: &'static str,
                                 hashed: bool,
                                 runtime: bool|
          -> anyhow::Result<Vec<(String, Input)>> {
+            let read_only_groups = &read_only_groups;
             deps.into_iter()
                 .flat_map(|(k, v)| {
                     let pkg = pkg.clone();
+                    let read_only = read_only_groups.contains(&k);
                     v.into_iter().enumerate().map(
                         move |(i, v)| -> anyhow::Result<(String, Input)> {
+                            let annotations = if read_only {
+                                BTreeMap::from([(
+                                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                                    "true".to_string(),
+                                )])
+                            } else {
+                                BTreeMap::new()
+                            };
                             Ok((
                                 k.parse()?,
                                 Input {
                                     r#ref: TargetAddr::parse(&v, &pkg)?,
                                     mode: InputMode::Standard,
                                     origin_id: format!("{}|{}|{}", origin_prefix, k, i),
-                                    annotations: BTreeMap::new(),
+                                    annotations,
                                     hashed,
                                     runtime,
                                 },
@@ -2131,6 +2146,56 @@ mod tests {
             .expect("hash_dep input present");
         assert!(hash_dep_input.hashed);
         assert!(!hash_dep_input.runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_read_only_deps_annotates_only_listed_groups() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let extra = HashMap::from([
+            (
+                "deps".to_string(),
+                Value::Map(HashMap::from([
+                    (
+                        "gosdk".to_string(),
+                        Value::List(vec![Value::String("//sdk:go".to_string())]),
+                    ),
+                    (
+                        "src".to_string(),
+                        Value::List(vec![Value::String("//pkg:src".to_string())]),
+                    ),
+                ])),
+            ),
+            (
+                "read_only_deps".to_string(),
+                Value::List(vec![Value::String("gosdk".to_string())]),
+            ),
+        ]);
+        let td = parse_with(extra).await?;
+
+        let sdk = td
+            .inputs
+            .iter()
+            .find(|i| i.origin_id.starts_with("dep|gosdk|"))
+            .expect("gosdk dep input present");
+        assert_eq!(
+            sdk.annotations
+                .get(hdriver_support::stage::READ_ONLY_ANNOTATION)
+                .map(String::as_str),
+            Some("true"),
+            "listed group must be marked read-only"
+        );
+
+        let src = td
+            .inputs
+            .iter()
+            .find(|i| i.origin_id.starts_with("dep|src|"))
+            .expect("src dep input present");
+        assert!(
+            !src.annotations
+                .contains_key(hdriver_support::stage::READ_ONLY_ANNOTATION),
+            "unlisted group must not be marked read-only"
+        );
         Ok(())
     }
 
