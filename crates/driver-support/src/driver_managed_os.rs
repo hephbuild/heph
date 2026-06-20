@@ -51,88 +51,115 @@ impl ManagedDriverOs {
             Some(Box::new(move || {
                 hcore::fsutil::remove_dir_all(&cleanup_dir)
             }));
-        let ws_dir = sandbox_dir.join("ws");
-        fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
 
-        let list_dir = sandbox_dir.join("list");
-        fs::create_dir_all(&list_dir).with_context(|| format!("create list dir {:?}", list_dir))?;
+        // Build the sandbox (create dirs + materialize every input) under a
+        // SandboxCreate scope so it renders as a per-target op in the TUI and is
+        // flagged slow when it runs long. The scope covers only the build — not
+        // the subprocess run that follows (that is the Execute op).
+        let events = req.events.clone();
+        let addr = req.target.addr.format();
+        let addr_for_ctx = addr.clone();
+        let pkg = req.target.addr.package.as_str().to_owned();
+        let inputs_taken = std::mem::take(&mut req.inputs);
+        let stage_dir = self.stage_dir.clone();
+        let sandbox_dir_scope = sandbox_dir.clone();
+        let (inputs, ws_dir, sandbox_pkg_dir) = hcore::events::emit_scope_tx(
+            events,
+            hcore::events::BuildEventKind::SandboxCreateStart { addr: addr.clone() },
+            move |error| hcore::events::BuildEventKind::SandboxCreateEnd { addr, error },
+            async move {
+                let sandbox_dir = sandbox_dir_scope;
+                let ws_dir = sandbox_dir.join("ws");
+                fs::create_dir_all(&ws_dir)
+                    .with_context(|| format!("create ws dir {:?}", ws_dir))?;
 
-        let mut groups: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
-        for input in std::mem::take(&mut req.inputs) {
-            let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
-            groups.entry(unpack_root).or_default().push(input);
-        }
+                let list_dir = sandbox_dir.join("list");
+                fs::create_dir_all(&list_dir)
+                    .with_context(|| format!("create list dir {:?}", list_dir))?;
 
-        // Reject two distinct targets producing the same sandbox file before we
-        // materialize anything — the copy path would otherwise silently
-        // last-write-wins. Off the worker: the check enumerates every input's
-        // entry paths, which for a cache-backed input is a header scan over a
-        // sqlite blob and can park on that key's queued write.
-        let groups = detect_output_collisions_blocking(groups)
-            .await
-            .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
+                let mut groups: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
+                for input in inputs_taken {
+                    let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
+                    groups.entry(unpack_root).or_default().push(input);
+                }
 
-        let mut inputs: Vec<ManagedRunInput> = Vec::new();
-        for (unpack_root, group) in groups {
-            fs::create_dir_all(&unpack_root)
-                .with_context(|| format!("create unpack root {:?}", unpack_root))?;
-            for input in group {
-                let list_path = list_path_for(&input, &list_dir);
-                match self.stage_dir.as_deref() {
-                    Some(stage_dir) if crate::stage::is_read_only(&input.annotations) => {
-                        crate::stage::stage_and_link(
-                            &input.artifact.content,
-                            stage_dir,
-                            &input.source_addr.format(),
-                            unpack_root.as_path(),
-                            list_path.as_deref(),
-                            &input.filters,
-                            crate::stage::is_per_file(&input.annotations),
-                            ctoken,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "stage read-only input origin_id={} source_addr={} into {:?}",
-                                input.origin_id,
-                                input.source_addr.format(),
-                                unpack_root,
-                            )
-                        })?;
-                    }
-                    _ => {
-                        // Writes the input's entire tree to disk — off the
-                        // worker, see `unpack_blocking`.
-                        unpack_blocking(
-                            Arc::clone(&input.artifact.content),
-                            unpack_root.clone(),
-                            list_path.clone(),
-                            input.filters.clone(),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "unpack input origin_id={} source_addr={} into {:?}",
-                                input.origin_id,
-                                input.source_addr.format(),
-                                unpack_root,
-                            )
-                        })?;
+                // Reject two distinct targets producing the same sandbox file before we
+                // materialize anything — the copy path would otherwise silently
+                // last-write-wins. Off the worker: the check enumerates every input's
+                // entry paths, which for a cache-backed input is a header scan over a
+                // sqlite blob and can park on that key's queued write.
+                let groups = detect_output_collisions_blocking(groups)
+                    .await
+                    .with_context(|| format!("output-collision check for {addr_for_ctx}"))?;
+
+                let mut inputs: Vec<ManagedRunInput> = Vec::new();
+                for (unpack_root, group) in groups {
+                    fs::create_dir_all(&unpack_root)
+                        .with_context(|| format!("create unpack root {:?}", unpack_root))?;
+                    for input in group {
+                        let list_path = list_path_for(&input, &list_dir);
+                        match stage_dir.as_deref() {
+                            Some(stage_dir)
+                                if crate::stage::is_read_only(&input.annotations) =>
+                            {
+                                crate::stage::stage_and_link(
+                                    &input.artifact.content,
+                                    stage_dir,
+                                    &input.source_addr.format(),
+                                    unpack_root.as_path(),
+                                    list_path.as_deref(),
+                                    &input.filters,
+                                    crate::stage::is_per_file(&input.annotations),
+                                    ctoken,
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "stage read-only input origin_id={} source_addr={} into {:?}",
+                                        input.origin_id,
+                                        input.source_addr.format(),
+                                        unpack_root,
+                                    )
+                                })?;
+                            }
+                            _ => {
+                                // Writes the input's entire tree to disk — off the
+                                // worker, see `unpack_blocking`.
+                                unpack_blocking(
+                                    Arc::clone(&input.artifact.content),
+                                    unpack_root.clone(),
+                                    list_path.clone(),
+                                    input.filters.clone(),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "unpack input origin_id={} source_addr={} into {:?}",
+                                        input.origin_id,
+                                        input.source_addr.format(),
+                                        unpack_root,
+                                    )
+                                })?;
+                            }
+                        }
+                        inputs.push(ManagedRunInput {
+                            input,
+                            list_path,
+                            unpack_root: unpack_root.clone(),
+                        });
                     }
                 }
-                inputs.push(ManagedRunInput {
-                    input,
-                    list_path,
-                    unpack_root: unpack_root.clone(),
-                });
-            }
-        }
 
-        let sandbox_pkg_dir = ws_dir.join(req.target.addr.package.as_str());
-        fs::create_dir_all(&sandbox_pkg_dir)
-            .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
+                let sandbox_pkg_dir = ws_dir.join(&pkg);
+                fs::create_dir_all(&sandbox_pkg_dir)
+                    .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
-        let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir).await?;
+                let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir).await?;
+
+                Ok((inputs, ws_dir, sandbox_pkg_dir))
+            },
+        )
+        .await?;
 
         let target = req.target;
         let hashin = req.hashin;
