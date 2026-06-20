@@ -2,6 +2,8 @@
 name = "heph"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/hephbuild/heph"
 
 [workspace]
 members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/config", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-stabby", "crates/plugin-sdk", "crates/plugin-go-cdylib", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/driver-bridge", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/telemetry", "crates/tui", "crates/lock", "crates/selfupdate", "crates/engine"]
