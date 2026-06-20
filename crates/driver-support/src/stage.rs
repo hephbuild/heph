@@ -246,7 +246,25 @@ fn place_entry(
             merge_dir(&existing, dst, list)?;
             merge_dir(src, dst, list)?;
         }
-        // Two inputs claim the same path with different content.
+        // Leaf collision: we're placing a file/symlink and `dst` already holds a
+        // non-directory. Two staged trees that differ overall can still share an
+        // identical file — e.g. two `nodejs24` tool variants carrying the same
+        // `bin/node` binary but diverging elsewhere, so they land in distinct
+        // stage entries (keyed by whole-artifact hash) yet collide at the shared
+        // leaf. Identical bytes are a no-op; differing bytes are a real conflict.
+        Ok(md) if !src_is_dir && !md.file_type().is_dir() => {
+            if !files_identical(src, dst).unwrap_or(false) {
+                anyhow::bail!(
+                    "staged input collides with existing sandbox entry at {:?} \
+                     (existing={:?} -> {:?}, staged src={:?}; differing content)",
+                    dst,
+                    md.file_type(),
+                    std::fs::read_link(dst).ok(),
+                    src,
+                );
+            }
+        }
+        // Irreconcilable type mismatch (e.g. a directory where a file already sits).
         Ok(md) => {
             anyhow::bail!(
                 "staged input collides with existing sandbox entry at {:?} \
@@ -262,6 +280,47 @@ fn place_entry(
         }
     }
     Ok(())
+}
+
+/// Whether the regular files at `a` and `b` have byte-identical content.
+/// Follows symlinks. Returns `false` (not an error) if either side isn't a
+/// regular file or their sizes differ — those are "not identical", which the
+/// caller turns into a collision. Only invoked on the rare collision path, so a
+/// streaming compare (no full read into memory) keeps a large shared binary
+/// cheap to confirm.
+#[cfg(unix)]
+fn files_identical(a: &Path, b: &Path) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+
+    let (ma, mb) = match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => (ma, mb),
+        _ => return Ok(false),
+    };
+    if !ma.is_file() || !mb.is_file() || ma.len() != mb.len() {
+        return Ok(false);
+    }
+    let mut fa = std::io::BufReader::new(
+        std::fs::File::open(a).with_context(|| format!("open {:?} for compare", a))?,
+    );
+    let mut fb = std::io::BufReader::new(
+        std::fs::File::open(b).with_context(|| format!("open {:?} for compare", b))?,
+    );
+    let mut ba = [0u8; 16 * 1024];
+    let mut bb = [0u8; 16 * 1024];
+    loop {
+        let na = fa.read(&mut ba).with_context(|| format!("read {:?}", a))?;
+        if na == 0 {
+            return Ok(true); // equal lengths → both exhausted together
+        }
+        // `na <= buf.len()`, so these splits never panic (and dodge the
+        // indexing-slicing lint). Sizes match, so `b` has `na` more bytes.
+        let (hb, _) = bb.split_at_mut(na);
+        fb.read_exact(hb).with_context(|| format!("read {:?}", b))?;
+        let (ha, _) = ba.split_at(na);
+        if ha != hb {
+            return Ok(false);
+        }
+    }
 }
 
 /// If `dir` contains exactly one entry and it is a directory, return its path —
@@ -953,6 +1012,82 @@ mod tests {
         std::fs::remove_dir_all(&link).expect("teardown");
         assert!(stage.join("nodejs24/toolA/tools/heph/bin/node").exists());
         assert!(stage.join("nodejs24/toolB/tools/heph/bin/npm").exists());
+    }
+
+    #[tokio::test]
+    async fn two_inputs_sharing_an_identical_leaf_file_coexist() {
+        // Two read-only variants of the same tool carry a byte-identical
+        // `bin/node` but diverge elsewhere, so they hash to different stage
+        // entries and collide at the shared leaf. Identical bytes must be a
+        // no-op, not a collision. (One side is placed as a real file by the
+        // filtered hardlink path; the other arrives via the unfiltered symlink
+        // path — the real-world exec_tools shape.)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+
+        // First input, filtered → hardlinks a real `bin/node` file into place.
+        let a = content("nodeA", &[("tools/heph/bin/node", "NODE", true)]);
+        stage_and_link(
+            &a,
+            &stage,
+            "nodejs24",
+            &link,
+            None,
+            &["tools/heph/bin/node".to_string()],
+            &ct(),
+        )
+        .await
+        .expect("filtered input places a real node file");
+        assert!(
+            !std::fs::symlink_metadata(link.join("tools/heph/bin/node"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "filtered leaf is a real (hardlinked) file"
+        );
+
+        // Second input, unfiltered → symlink path, same node bytes + extra file.
+        let b = content(
+            "nodeB",
+            &[
+                ("tools/heph/bin/node", "NODE", true),
+                ("tools/heph/bin/npm", "NPM", true),
+            ],
+        );
+        stage_and_link(&b, &stage, "nodejs24", &link, None, &[], &ct())
+            .await
+            .expect("identical shared leaf must not collide");
+
+        assert_eq!(
+            std::fs::read_to_string(link.join("tools/heph/bin/node")).unwrap(),
+            "NODE"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("tools/heph/bin/npm")).unwrap(),
+            "NPM"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_inputs_with_differing_leaf_file_bail() {
+        // Same path, different bytes → a genuine collision that must surface.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let a = content("v1", &[("tools/bin/node", "ONE", true)]);
+        let b = content("v2", &[("tools/bin/node", "TWO", true)]);
+
+        stage_and_link(&a, &stage, "t", &link, None, &[], &ct())
+            .await
+            .expect("first");
+        let err = stage_and_link(&b, &stage, "t", &link, None, &[], &ct())
+            .await
+            .expect_err("differing leaf must bail");
+        assert!(
+            format!("{err:#}").contains("differing content"),
+            "expected differing-content collision, got: {err:#}"
+        );
     }
 
     #[tokio::test]
