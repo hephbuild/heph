@@ -4,8 +4,12 @@
 //
 // Two modes:
 //
-//	# one local artifact for the build host (devenv gen-example):
-//	go run . -name go -host-path heph-go-plugin.dylib -out .heph3/heph-go-plugin.json
+//	# one local artifact for the build host (devenv gen-example). `-host-path` is
+//	# the sibling basename heph resolves against the manifest dir; `-checksum-from`
+//	# points at the actual file on disk to hash (here the install dir):
+//	go run . -name go -host-path heph-go-plugin.dylib \
+//	    -checksum-from ~/.heph/plugins/go/heph-go-plugin.dylib \
+//	    -out ~/.heph/plugins/go/heph-go-plugin.json
 //
 //	# every per-os/arch artifact in a release dir, by URL (CI upload_artifacts):
 //	go run . -name go -version "$V" -prefix heph-go-plugin \
@@ -48,7 +52,8 @@ func main() {
 	name := flag.String("name", "", "plugin name (manifest `name`)")
 	version := flag.String("version", "dev", "plugin version")
 	out := flag.String("out", "", "output file (default stdout)")
-	hostPath := flag.String("host-path", "", "single-artifact mode: local dylib path for the build host")
+	hostPath := flag.String("host-path", "", "single-artifact mode: the artifact `path` recorded in the manifest (resolved by heph relative to the manifest dir, so normally just the sibling basename)")
+	checksumFrom := flag.String("checksum-from", "", "single-artifact mode: local file to read for the checksum (defaults to -host-path). Use when the dylib lives elsewhere than the host-path the manifest should record, e.g. an install dir distinct from this tool's cwd")
 	fromDir := flag.String("from-dir", "", "scan mode: dir of <prefix>_<os>_<arch>.{so,dylib} artifacts")
 	prefix := flag.String("prefix", "", "scan mode: artifact filename prefix (e.g. heph-go-plugin)")
 	urlBase := flag.String("url-base", "", "scan mode: URL base each artifact is published under")
@@ -61,7 +66,16 @@ func main() {
 	var arts []artifact
 	switch {
 	case *hostPath != "":
-		arts = []artifact{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: *hostPath, Checksum: checksumFile(*hostPath)}}
+		// The manifest records `host-path` verbatim (heph resolves it relative to
+		// the manifest dir), but the checksum must come from a file that actually
+		// exists at generation time — which may be a different location (e.g. the
+		// install dir, while host-path is just the sibling basename). Default the
+		// checksum source to host-path for the simple same-dir case.
+		csFrom := *checksumFrom
+		if csFrom == "" {
+			csFrom = *hostPath
+		}
+		arts = []artifact{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: *hostPath, Checksum: checksumFile(csFrom)}}
 	case *fromDir != "":
 		if *prefix == "" || *urlBase == "" {
 			fatal("-from-dir requires -prefix and -url-base")
