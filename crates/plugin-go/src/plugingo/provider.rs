@@ -413,12 +413,14 @@ impl ProviderTrait for Provider {
                 field(
                     "go_codegen_root",
                     ParamType::Bool,
-                    "Mark this package (and descendants) as a Go codegen root.",
+                    "Mark this package (and descendants) as a Go codegen root. Always applies \
+                     to descendants, independent of `recursive`.",
                 ),
                 field(
                     "go_codegen_deps",
                     ParamType::list(ParamType::String),
-                    "Extra dependencies (target addresses) injected into generated Go targets.",
+                    "Extra dependencies (target addresses) injected into generated Go targets. \
+                     Always applies to descendants, independent of `recursive`.",
                 ),
                 field(
                     "test",
@@ -432,8 +434,8 @@ impl ProviderTrait for Provider {
                             ("pre_run", ParamType::list(ParamType::String)),
                         ]),
                     ]),
-                    "Test settings for this package. `test = False` skips its tests \
-                     (inherited by descendants); `test = True` (or unset) runs them. \
+                    "Test settings for this package. `test = False` skips its tests, \
+                     `test = True` (or unset) runs them. \
                      The struct form configures the generated `test`/`xtest` run \
                      targets — `env`/`runtime_env` (map[string]) and \
                      `pass_env`/`runtime_pass_env` (list[string]) set env, and \
@@ -459,10 +461,10 @@ impl ProviderTrait for Provider {
                 field(
                     "recursive",
                     ParamType::Bool,
-                    "Apply this state's per-package config (the `test = {...}` struct \
-                     and `link = {...}`) to descendant packages, not just the exact \
-                     declaring package. The `test = False`/`True` toggle and \
-                     `go_codegen_*` settings always inherit regardless of this flag.",
+                    "Apply this state's config (the `test` toggle/struct and `link = {...}`) \
+                     to descendant packages, not just the exact declaring package. \
+                     `go_codegen_root`/`go_codegen_deps` are unaffected — they always \
+                     apply to descendants.",
                 ),
             ],
         })
@@ -617,7 +619,7 @@ impl ProviderInner {
                     // under a go.mod (decode_package guarantees that). Each
                     // variant is filtered at `get` time by inspecting the
                     // `_golist` result — no filesystem scan needed.
-                    let skip_tests = pick_test_skip(&req.states);
+                    let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     let names: &[&str] = if skip_tests {
                         &["_golist", "build_lib", "build", "embed"]
                     } else {
@@ -791,16 +793,14 @@ fn pick_xtest_p_lib_name(pkg: &GoPackage) -> Option<&'static str> {
     }
 }
 
-/// Return true if the closest (deepest) ancestor `provider_state(provider="go", ...)`
-/// disables tests via `test = False`. Deeper states fully override shallower ones —
-/// a `test = True` (or the struct form, which implies tests run) closer to the
-/// target re-enables tests even if a root-level state disabled them.
-fn pick_test_skip(states: &[State]) -> bool {
-    let Some(state) = states
-        .iter()
-        .filter(|s| s.state.contains_key("test"))
-        .max_by_key(|s| s.package.as_str().len())
-    else {
+/// Return true if the closest `test` state applying to `addr_pkg` disables tests
+/// via `test = False`. Like the other per-package knobs, a `test` state applies
+/// to its exact package by default and reaches descendants only when it carries
+/// `recursive = True`. Deeper states fully override shallower ones — a
+/// `test = True` (or the struct form, which implies tests run) closer to the
+/// target re-enables tests even if a recursive ancestor disabled them.
+fn pick_test_skip(states: &[State], addr_pkg: &str) -> bool {
+    let Some(state) = applicable_states(states, addr_pkg, "test").into_iter().last() else {
         return false;
     };
     // Skip only when the closest `test` state is the bool `False`. `True` and the
@@ -1151,7 +1151,7 @@ impl ProviderInner {
         // descendants) out of test-target generation. Gate every test variant
         // before the `_golist` resolve below so a skipped pkg never forces a
         // `go list` round-trip purely to learn there are no tests.
-        if is_test_target_name(&addr.name) && pick_test_skip(&req.states) {
+        if is_test_target_name(&addr.name) && pick_test_skip(&req.states, addr.package.as_str()) {
             return Err(GetError::NotFound);
         }
 
@@ -4163,31 +4163,45 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
     #[test]
     fn pick_test_skip_false_when_no_states() {
-        assert!(!pick_test_skip(&[]));
+        assert!(!pick_test_skip(&[], "foo"));
     }
 
     #[test]
-    fn pick_test_skip_true_when_root_state_sets_skip() {
+    fn pick_test_skip_true_when_state_sets_skip_for_own_package() {
         let states = vec![state_with_test_skip("", true)];
-        assert!(pick_test_skip(&states));
+        assert!(pick_test_skip(&states, ""));
     }
 
     #[test]
-    fn pick_test_skip_deeper_state_overrides_shallower() {
-        // Root says test=False (skip); deeper pkg says test=True → tests must run.
+    fn pick_test_skip_non_recursive_does_not_reach_descendants() {
+        // `test = False` at `foo` only disables `foo`'s own tests; `foo/bar` runs.
+        let states = vec![state_with_test_skip("foo", true)];
+        assert!(pick_test_skip(&states, "foo"));
+        assert!(!pick_test_skip(&states, "foo/bar"));
+    }
+
+    #[test]
+    fn pick_test_skip_recursive_reaches_descendants() {
+        let states = vec![with_recursive(state_with_test_skip("foo", true))];
+        assert!(pick_test_skip(&states, "foo/bar"));
+    }
+
+    #[test]
+    fn pick_test_skip_deeper_state_overrides_recursive_ancestor() {
+        // Recursive root says test=False (skip); deeper pkg says test=True → run.
         let states = vec![
-            state_with_test_skip("", true),
+            with_recursive(state_with_test_skip("", true)),
             state_with_test_skip("src/foo", false),
         ];
-        assert!(!pick_test_skip(&states));
+        assert!(!pick_test_skip(&states, "src/foo"));
     }
 
     #[test]
     fn pick_test_skip_struct_form_leaves_tests_enabled() {
         // A deeper struct-form `test = {env: ...}` re-enables tests even when a
-        // root state disabled them — the struct implies tests run.
+        // recursive root disabled them — the struct implies tests run.
         let states = vec![
-            state_with_test_skip("", true),
+            with_recursive(state_with_test_skip("", true)),
             state_with_test_map(
                 "src/foo",
                 vec![(
@@ -4199,7 +4213,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 )],
             ),
         ];
-        assert!(!pick_test_skip(&states));
+        assert!(!pick_test_skip(&states, "src/foo"));
     }
 
     #[test]
@@ -4211,7 +4225,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             provider: "go".to_string(),
             state: m,
         }];
-        assert!(!pick_test_skip(&states));
+        assert!(!pick_test_skip(&states, ""));
     }
 
     fn test_env_is_empty(env: &target_test::TestEnv) -> bool {
@@ -4493,7 +4507,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = ListRequest {
             request_id: "test".to_string(),
             package: PkgBuf::from("pkg"),
-            states: vec![state_with_test_skip("", true)],
+            states: vec![with_recursive(state_with_test_skip("", true))],
         };
         let names: Vec<String> = p
             .list(req, &ctoken)
@@ -4522,7 +4536,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             let req = GetRequest {
                 request_id: "test".to_string(),
                 addr: make_addr("pkg", name),
-                states: vec![state_with_test_skip("", true)],
+                states: vec![with_recursive(state_with_test_skip("", true))],
                 executor: test_executor(sandbox.path()),
             };
             let res = p.get(req, &ctoken).await;
@@ -4543,7 +4557,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             request_id: "test".to_string(),
             addr: make_addr("pkg", "build_test"),
             states: vec![
-                state_with_test_skip("", true),
+                with_recursive(state_with_test_skip("", true)),
                 state_with_test_skip("pkg", false),
             ],
             executor: test_executor(sandbox.path()),
