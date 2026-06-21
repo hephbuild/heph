@@ -34,8 +34,8 @@ use object_store::{
 };
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::OnceCell;
 use tokio_util::io::StreamReader;
