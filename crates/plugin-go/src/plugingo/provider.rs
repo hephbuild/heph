@@ -800,7 +800,10 @@ fn pick_xtest_p_lib_name(pkg: &GoPackage) -> Option<&'static str> {
 /// `test = True` (or the struct form, which implies tests run) closer to the
 /// target re-enables tests even if a recursive ancestor disabled them.
 fn pick_test_skip(states: &[State], addr_pkg: &str) -> bool {
-    let Some(state) = applicable_states(states, addr_pkg, "test").into_iter().last() else {
+    let Some(state) = applicable_states(states, addr_pkg, "test")
+        .into_iter()
+        .last()
+    else {
         return false;
     };
     // Skip only when the closest `test` state is the bool `False`. `True` and the
@@ -4400,8 +4403,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     fn state_with_link_map(pkg: &str, entries: Vec<(&str, Value)>) -> State {
-        let link_map: HashMap<String, Value> =
-            entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let link_map: HashMap<String, Value> = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
         let mut m = HashMap::new();
         m.insert("link".to_string(), Value::Map(link_map));
         State {
@@ -4445,7 +4450,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "foo",
             vec![
                 ("flags", Value::List(vec![Value::String("-s".to_string())])),
-                ("deps", Value::List(vec![Value::String("//a:b".to_string())])),
+                (
+                    "deps",
+                    Value::List(vec![Value::String("//a:b".to_string())]),
+                ),
                 (
                     "runtime_deps",
                     Value::List(vec![Value::String("//c:d".to_string())]),
@@ -4490,7 +4498,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
     #[test]
     fn pick_link_errors_on_unknown_key() {
-        let states = vec![state_with_link_map("foo", vec![("bogus", Value::Bool(true))])];
+        let states = vec![state_with_link_map(
+            "foo",
+            vec![("bogus", Value::Bool(true))],
+        )];
         let err = pick_link(&states, "foo").unwrap_err();
         assert!(
             format!("{err:#}").contains("bogus"),

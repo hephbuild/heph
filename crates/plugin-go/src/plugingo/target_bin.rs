@@ -192,7 +192,14 @@ mod tests {
 
     #[test]
     fn test_driver_is_bash() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
         assert_eq!(spec.driver, "sh");
     }
 
@@ -223,7 +230,14 @@ mod tests {
             ("example.com/cmd".to_string(), lib_addr("cmd")),
             ("fmt".to_string(), lib_addr("@heph/go/std/fmt")),
         ];
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, &LinkConfig::default(), V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &libs,
+            &LinkConfig::default(),
+            V,
+        );
         let run = run_str(&spec);
         assert!(run.contains("tool link"));
         assert!(run.contains("importcfg"));
@@ -231,7 +245,14 @@ mod tests {
 
     #[test]
     fn test_run_uses_hermetic_go() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
         let run = run_str(&spec);
         assert!(
             run.contains("\"$GO\""),
@@ -252,7 +273,14 @@ mod tests {
 
     #[test]
     fn test_deps_include_hermetic_sdk() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
@@ -269,7 +297,14 @@ mod tests {
 
     #[test]
     fn test_env_pins_cgo_disabled() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
         let env = match spec.config.get("env").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
@@ -287,7 +322,14 @@ mod tests {
             flags: vec!["-X main.version=1.2.3".to_string(), "-s".to_string()],
             ..Default::default()
         };
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &link, V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &link,
+            V,
+        );
         let run = run_str(&spec);
         let link_line = run
             .lines()
@@ -308,7 +350,14 @@ mod tests {
             deps: vec!["//some:target".to_string()],
             ..Default::default()
         };
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &link, V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &link,
+            V,
+        );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected deps map"),
@@ -326,8 +375,19 @@ mod tests {
             runtime_deps: vec!["//some:rt".to_string()],
             ..Default::default()
         };
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &link, V);
-        let rdeps = match spec.config.get("runtime_deps").expect("runtime_deps present") {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &link,
+            V,
+        );
+        let rdeps = match spec
+            .config
+            .get("runtime_deps")
+            .expect("runtime_deps present")
+        {
             Value::Map(m) => m,
             _ => panic!("expected runtime_deps map"),
         };
@@ -372,7 +432,14 @@ mod tests {
             ("example.com/cmd".to_string(), lib_addr("cmd")),
             ("fmt".to_string(), lib_addr("@heph/go/std/fmt")),
         ];
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, &LinkConfig::default(), V);
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &libs,
+            &LinkConfig::default(),
+            V,
+        );
         let run = run_str(&spec);
         assert!(
             !run.contains("packagefile example.com/cmd="),
