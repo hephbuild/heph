@@ -875,4 +875,33 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
             "self-contained asm must not stage any cross-package header: {got:?}"
         );
     }
+
+    /// Borsh is not self-describing: adding/removing/reordering a `PackageAddrs`
+    /// field silently breaks decode of artifacts cached under the old layout
+    /// ("Unexpected length of input"). This golden locks the on-disk layout — if
+    /// it fails, the struct changed and `GO_GOLIST_FORMAT_VERSION`
+    /// (driver_golist.rs) MUST be bumped to invalidate stale `_golist` caches.
+    #[test]
+    fn test_package_addrs_borsh_layout_is_frozen() {
+        // One marker entry per Vec field; each field encodes to
+        // u32(len=1) + [ u32(len=1) + b"x" ] = 01 00 00 00 01 00 00 00 78.
+        let addrs = PackageAddrs {
+            go_files: vec!["x".to_string()],
+            s_files: vec!["x".to_string()],
+            h_files: vec!["x".to_string()],
+            extra_h_files: vec!["x".to_string()],
+            test_go_files: vec!["x".to_string()],
+            xtest_go_files: vec!["x".to_string()],
+            embed_files: vec!["x".to_string()],
+            test_embed_files: vec!["x".to_string()],
+            xtest_embed_files: vec!["x".to_string()],
+        };
+        let field = [0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78];
+        let golden: Vec<u8> = std::iter::repeat(field).take(9).flatten().collect();
+        let got = encode_package_addrs(&addrs).expect("encode");
+        assert_eq!(
+            got, golden,
+            "PackageAddrs borsh layout changed — bump GO_GOLIST_FORMAT_VERSION in driver_golist.rs"
+        );
+    }
 }
