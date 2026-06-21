@@ -1322,10 +1322,16 @@ impl Driver {
             .context("wait task panicked")?
             .context("wait for child process")?;
         if !status.success() {
-            let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
+            // Carry a lazy handle to the log file rather than its bytes; the
+            // diagnostic reads only the last N lines (the request's `--log-lines`)
+            // at classification time. The file outlives the read — a failed
+            // target's sandbox is reclaimed only at its next run.
+            let log: std::sync::Arc<dyn hcore::hartifactcontent::Content> = std::sync::Arc::new(
+                hcore::hartifactcontent::FileContent::new(output_log_path.clone()),
+            );
             return Err(hplugin::error::ProcessFailed {
                 status: status.to_string(),
-                log_tail: hplugin::error::last_n_lines(&log, 10),
+                log,
             }
             .into());
         }

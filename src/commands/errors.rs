@@ -24,16 +24,20 @@ fn cause_chain(source: &anyhow::Error, addr: &str) -> String {
 
 /// Render the log tail inside a framed box, indented two spaces. The `▶` of the
 /// header sits in the same column as the `│` gutter bar so they connect. With
-/// `color`: border + `[log]` white, line numbers dim.
+/// `color`: border + `[log]` white, line numbers dim. Line numbers start at
+/// `start_line` — the real position of the first shown line in the full log — so
+/// the last 10 lines of a 100-line log read 91–100, not 1–10.
 /// ```text
 ///   ╭─▶[log]
-///   1 │  line one
-///   2 │  line two
+///   91 │  line one
+///   92 │  line two
 ///   ╰────
 /// ```
-fn render_log_box(out: &mut String, log: &str, color: bool) {
+fn render_log_box(out: &mut String, log: &str, start_line: usize, color: bool) {
     let lines: Vec<&str> = log.lines().collect();
-    let width = lines.len().to_string().len();
+    // Width is driven by the largest (last) line number, not the line count.
+    let last_no = start_line + lines.len().saturating_sub(1);
+    let width = last_no.to_string().len();
     // The line-number gutter sits OUTSIDE the box; the box corners/border line up
     // one column past it (number field + the separating space).
     let pad = " ".repeat(width + 1);
@@ -44,7 +48,7 @@ fn render_log_box(out: &mut String, log: &str, color: bool) {
         out.push_str(&format!("  {pad}╭─[log]\n"));
     }
     for (i, line) in lines.iter().enumerate() {
-        let num = format!("{:>width$}", i + 1, width = width);
+        let num = format!("{:>width$}", start_line + i, width = width);
         if color {
             out.push_str(&format!("  {} {} {line}\n", num.dim(), "│".white()));
         } else {
@@ -133,7 +137,7 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
         out.push_str(&format!("{arrow} {cause}\n"));
     }
     if let Some(log) = &f.log_tail {
-        render_log_box(&mut out, log, color);
+        render_log_box(&mut out, &log.text, log.start_line, color);
     }
     out
 }
@@ -277,8 +281,18 @@ pub fn render_anyhow(e: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::error::ProcessFailed;
+    use crate::engine::error::{LogTail, ProcessFailed};
     use anyhow::Context as _;
+    use std::sync::Arc;
+
+    /// A `ProcessFailed` whose log handle is never read (tests that only exercise
+    /// the cause chain / rendering, not log extraction).
+    fn dummy_process_failed() -> ProcessFailed {
+        ProcessFailed {
+            status: "exit status: 1".to_string(),
+            log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
+        }
+    }
 
     #[test]
     fn is_cancelled_detects_cancellation_in_chain() {
@@ -317,15 +331,19 @@ mod tests {
     #[test]
     fn renders_target_failure_with_log_box() {
         let addr = crate::htaddr::parse_addr("//simple_fail:d1").unwrap();
-        let source = anyhow::Error::new(ProcessFailed {
-            status: "exit status: 1".to_string(),
-            log_tail: String::new(),
-        })
-        .context("driver run")
-        .context("run")
-        .context("execute //simple_fail:d1");
+        let source = anyhow::Error::new(dummy_process_failed())
+            .context("driver run")
+            .context("run")
+            .context("execute //simple_fail:d1");
         let log = "stuff\nstuff\nstuff\nstuff\nstuff\nstuff\nstuff\nstuff\nnot gucci";
-        let f = TargetFailure::new(addr, Some(log.to_string()), source);
+        let f = TargetFailure::new(
+            addr,
+            Some(LogTail {
+                text: log.to_string(),
+                start_line: 1,
+            }),
+            source,
+        );
 
         let rendered = render_target_failure(&f, false);
         let expected = "\
@@ -342,6 +360,32 @@ mod tests {
   8 │ stuff
   9 │ not gucci
     ╰────
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn log_box_numbers_reflect_real_file_positions() {
+        // The last 3 lines of a 100-line log render with numbers 98–100, not 1–3,
+        // and the gutter widens to fit the largest number.
+        let addr = crate::htaddr::parse_addr("//simple_fail:d1").unwrap();
+        let f = TargetFailure::new(
+            addr,
+            Some(LogTail {
+                text: "line98\nline99\nboom".to_string(),
+                start_line: 98,
+            }),
+            anyhow::anyhow!("boom"),
+        );
+        let rendered = render_target_failure(&f, false);
+        let expected = "\
+× target failed: //simple_fail:d1
+╰─▶ boom
+      ╭─[log]
+   98 │ line98
+   99 │ line99
+  100 │ boom
+      ╰────
 ";
         assert_eq!(rendered, expected);
     }
@@ -416,7 +460,14 @@ mod tests {
     #[test]
     fn color_styles_markers_red_border_white_numbers_dim() {
         let addr = crate::htaddr::parse_addr("//pkg:a").unwrap();
-        let f = TargetFailure::new(addr, Some("oops".to_string()), anyhow::anyhow!("boom"));
+        let f = TargetFailure::new(
+            addr,
+            Some(LogTail {
+                text: "oops".to_string(),
+                start_line: 1,
+            }),
+            anyhow::anyhow!("boom"),
+        );
         let rendered = render_target_failure(&f, true);
         // × and ╰─▶ markers red.
         assert!(rendered.contains(&format!("{}", "×".red())));

@@ -144,7 +144,7 @@ impl Workspace {
                 for f in &failures {
                     msg.push_str(&format!("{}: {:#}", f.addr.format(), f.source));
                     if let Some(tail) = &f.log_tail {
-                        msg.push_str(&format!("\nlast log lines:\n{tail}"));
+                        msg.push_str(&format!("\nlast log lines:\n{}", tail.text));
                     }
                     msg.push('\n');
                 }

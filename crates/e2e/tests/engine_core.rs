@@ -130,3 +130,26 @@ async fn test_failing_command_returns_error() -> anyhow::Result<()> {
     assert!(err.is_err(), "expected error from failing command");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_failure_surfaces_process_log_tail() -> anyhow::Result<()> {
+    // The failure diagnostic reads the last log lines lazily from the on-disk
+    // log (the sandbox of a failed target survives until its next run), so the
+    // captured output must reach the recorded failure end-to-end.
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "fail",
+        r#"target(name = "t", driver = "bash", run = "echo distinctive-marker-line; exit 3")"#,
+    );
+
+    let err = match ws.run("//fail:t").await {
+        Ok(_) => panic!("expected error from failing command"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("distinctive-marker-line"),
+        "log tail must surface the process output, got: {msg}"
+    );
+    Ok(())
+}

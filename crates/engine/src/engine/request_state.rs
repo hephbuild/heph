@@ -195,6 +195,10 @@ pub struct RequestStateData {
     /// short-circuiting on the first error; errors are aggregated into a
     /// `MultiError`. Defaults to true (current behavior).
     pub fail_fast: bool,
+    /// How many trailing lines of a failing target's process log to show in its
+    /// diagnostic box (`heph run --log-lines`). The full log is always saved as
+    /// the `log.txt` artifact; this only bounds the rendered tail.
+    pub log_tail_lines: usize,
     /// Optional one-way build-progress event stream. Lives in the shared
     /// `Arc<RequestStateData>`, so `with_parent` / `with_skip_provider` children
     /// inherit it for free.
@@ -264,6 +268,12 @@ impl RequestState {
 
     pub fn fail_fast(&self) -> bool {
         self.data.fail_fast
+    }
+
+    /// Trailing process-log lines to render in a failure box (see
+    /// [`RequestStateData::log_tail_lines`]).
+    pub fn log_tail_lines(&self) -> usize {
+        self.data.log_tail_lines
     }
 
     /// The request's in-flight sandbox-cleanup counter. Clone to hand to
@@ -444,6 +454,10 @@ impl Engine {
         self.new_state_with_fail_fast(true)
     }
 
+    /// Default number of trailing process-log lines shown in a failure box when a
+    /// caller (e.g. `gc`, non-`run` commands) does not override it.
+    pub const DEFAULT_LOG_TAIL_LINES: usize = 10;
+
     pub fn new_state_with_fail_fast(self: &Arc<Self>, fail_fast: bool) -> Arc<RequestState> {
         self.new_state_with_events(fail_fast, None)
     }
@@ -457,6 +471,7 @@ impl Engine {
             fail_fast,
             events,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Self::DEFAULT_LOG_TAIL_LINES,
         )
     }
 
@@ -468,6 +483,7 @@ impl Engine {
         fail_fast: bool,
         events: Option<crate::engine::event::EventSender>,
         bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+        log_tail_lines: usize,
     ) -> Arc<RequestState> {
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
@@ -492,6 +508,7 @@ impl Engine {
             mem_probe: Memoizer::with_tag("probe"),
             mem_probe_inner: Memoizer::with_tag("probe_inner"),
             fail_fast,
+            log_tail_lines,
             events,
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
