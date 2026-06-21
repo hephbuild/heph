@@ -94,6 +94,15 @@ fn files_matching_pattern(pattern: &str, files: &[String]) -> Vec<String> {
 /// identity mappings. No filesystem access — keeps the embedcfg in sync with
 /// what downstream `build_lib` sandboxes stage (which also comes from
 /// `EmbedFiles`).
+///
+/// Every `//go:embed` pattern must resolve to at least one file — that is a Go
+/// language rule, not just a convention. If `go list` ran with `-e` and the
+/// embed source files were not staged (e.g. a package whose embed inputs were
+/// never wired into the heph go provider), it reports `EmbedPatterns` with an
+/// empty `EmbedFiles`, and emitting that cfg makes `go tool compile` panic in
+/// `staticdata.WriteEmbed` (`index out of range [0] with length 0`) instead of
+/// reporting a clean error. We reject it here so the failure names the offending
+/// pattern and points at the missing embed inputs.
 pub fn compute_embed_cfg_json(
     embed_patterns: &[String],
     embed_files: &[String],
@@ -101,9 +110,23 @@ pub fn compute_embed_cfg_json(
     let mut patterns_map: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut files_map: BTreeMap<&str, &str> = BTreeMap::new();
 
+    let mut unmatched: Vec<&str> = Vec::new();
     for pattern in embed_patterns {
         let resolved = files_matching_pattern(pattern, embed_files);
+        if resolved.is_empty() {
+            unmatched.push(pattern.as_str());
+        }
         patterns_map.insert(pattern.as_str(), resolved);
+    }
+
+    if !unmatched.is_empty() {
+        anyhow::bail!(
+            "//go:embed pattern(s) matched no files: {}. \
+             go list resolved these patterns to zero files — the embed source files \
+             are not staged. Declare the embed inputs (e.g. a BUILD2 provider_state(provider=\"go\") \
+             with go_src-labeled group targets) so the package's embed sources reach the sandbox.",
+            unmatched.join(", "),
+        );
     }
 
     for file in embed_files {
@@ -272,6 +295,44 @@ mod tests {
         let mut keys: Vec<&str> = files_map.keys().map(String::as_str).collect();
         keys.sort();
         assert_eq!(keys, vec!["a.txt", "sub/b.txt"]);
+    }
+
+    #[test]
+    fn test_pattern_matching_no_files_errors() {
+        // Regression for the `go tool compile` ICE: a pattern that resolves to
+        // zero files must be rejected here (Go itself rejects it), not emitted
+        // as an embedcfg with an empty file list that panics WriteEmbed.
+        let err = compute_embed_cfg_json(
+            &[
+                "resources/infhostd_ifplugd_nsg101.sh".to_string(),
+                "ui_dist/*".to_string(),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("matched no files"), "msg: {msg}");
+        assert!(
+            msg.contains("resources/infhostd_ifplugd_nsg101.sh") && msg.contains("ui_dist/*"),
+            "error must name the offending patterns: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_partial_unmatched_pattern_errors() {
+        // One pattern resolves, the other does not: still an error, and only the
+        // unresolved pattern is named.
+        let err = compute_embed_cfg_json(
+            &["assets/*".to_string(), "missing/*".to_string()],
+            &["assets/a.txt".to_string()],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("missing/*"), "msg: {msg}");
+        assert!(
+            !msg.contains("assets/*"),
+            "resolved pattern must not be named: {msg}"
+        );
     }
 
     #[test]
