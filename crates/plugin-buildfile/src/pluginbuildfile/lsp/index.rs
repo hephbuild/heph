@@ -51,26 +51,10 @@ pub(crate) struct CallTargets {
     pub addrs: Vec<String>,
 }
 
-/// A `target()` call site and the driver it selected.
-#[derive(Clone, Debug)]
-pub(crate) struct TargetCall {
-    pub span: Span,
-    pub driver: String,
-}
-
-/// A `provider_state()` call site and the provider it targets.
-#[derive(Clone, Debug)]
-pub(crate) struct StateCall {
-    pub span: Span,
-    pub provider: String,
-}
-
 /// Everything the proxy needs to answer position-based requests for one document.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DocIndex {
     pub call_targets: Vec<CallTargets>,
-    pub target_calls: Vec<TargetCall>,
-    pub state_calls: Vec<StateCall>,
     /// Rendered hover doc for each top-level function binding (`def` in this file
     /// or imported via `load`), keyed by name. Used to synthesize a signature
     /// tooltip for undocumented functions, which the stock server skips.
@@ -104,7 +88,6 @@ impl DocIndex {
         // order and dedups identical spans (e.g. a loop body line that produced
         // several targets).
         let mut by_span: BTreeMap<Span, Vec<String>> = BTreeMap::new();
-        let mut target_calls = Vec::new();
 
         for target in &result.targets {
             let addr = format!("//{pkg}:{}", target.name);
@@ -113,15 +96,6 @@ impl DocIndex {
                     .entry(Span::of(frame))
                     .or_default()
                     .push(addr.clone());
-            }
-            // The innermost frame is the `target()` call itself. Recorded for every
-            // target (driver may be empty) so completion can offer the base
-            // `target()` args even before a driver is chosen.
-            if let Some(inner) = target.provenance.first() {
-                target_calls.push(TargetCall {
-                    span: Span::of(inner),
-                    driver: target.driver.clone(),
-                });
             }
         }
 
@@ -134,35 +108,12 @@ impl DocIndex {
             })
             .collect();
 
-        // `provider_state()` call sites → provider, for state-arg completion.
-        let state_calls = result
-            .states
-            .iter()
-            .filter_map(|s| {
-                let inner = s.provenance.first()?;
-                Some(StateCall {
-                    span: Span::of(inner),
-                    provider: s.provider.clone(),
-                })
-            })
-            .collect();
-
         DocIndex {
             call_targets,
-            target_calls,
-            state_calls,
             defs,
             loaded,
             source,
         }
-    }
-
-    /// The provider of the `provider_state()` call covering the 1-based position.
-    pub(crate) fn state_provider_at(&self, line: u32, col: u32) -> Option<&str> {
-        self.state_calls
-            .iter()
-            .find(|sc| sc.span.covers(line, col))
-            .map(|sc| sc.provider.as_str())
     }
 
     /// The load path and exported name for the loaded symbol at the 1-based
@@ -195,16 +146,6 @@ impl DocIndex {
                 )
             })
             .map(|ct| ct.addrs.as_slice())
-    }
-
-    /// If the 1-based position is inside a `target()` call, its driver (which may
-    /// be the empty string when no `driver=` is set yet); `None` if not in a
-    /// `target()` call.
-    pub(crate) fn driver_at(&self, line: u32, col: u32) -> Option<&str> {
-        self.target_calls
-            .iter()
-            .find(|tc| tc.span.covers(line, col))
-            .map(|tc| tc.driver.as_str())
     }
 }
 
@@ -403,24 +344,6 @@ target(name = \"direct\", driver = \"exec\")
 
         // A blank position yields nothing.
         assert!(index.targets_at(4, 1).is_none());
-    }
-
-    #[test]
-    fn driver_at_target_call_resolves_driver() {
-        let content = "target(name = \"t\", driver = \"exec\")\n";
-        let index = index_for(content);
-        // The target() call is on line 1.
-        assert_eq!(index.driver_at(1, 1), Some("exec"));
-        assert!(index.driver_at(50, 1).is_none());
-    }
-
-    #[test]
-    fn state_provider_at_resolves_provider() {
-        let content = "provider_state(provider = \"go\", go_codegen_root = True)\n";
-        let index = index_for(content);
-        // Cursor inside the provider_state() call on line 1.
-        assert_eq!(index.state_provider_at(1, 1), Some("go"));
-        assert!(index.state_provider_at(50, 1).is_none());
     }
 
     #[test]
