@@ -1,6 +1,9 @@
+pub mod file;
 pub mod tar;
 pub mod tar_index;
 pub mod unpack;
+
+pub use file::FileContent;
 
 use std::io;
 use std::path::PathBuf;

@@ -1,5 +1,7 @@
+use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct TargetNotFoundError {
@@ -90,12 +92,16 @@ impl fmt::Display for UpstreamFailed {
 impl std::error::Error for UpstreamFailed {}
 
 /// A target's own process exited non-zero. Carries the exit status string and a
-/// bounded tail of the process log (the full log is still saved as the `log.txt`
-/// artifact). Surfaced as the `source` of a `TargetFailure`.
+/// lazy [`Content`] handle to the full process log, rather than the log bytes:
+/// the diagnostic reads only the last N lines on demand (see
+/// [`last_n_lines_with_start`]), where N is the request's `--log-lines`. The log
+/// file persists in the sandbox until the target's next run, so the handle stays
+/// readable through end-of-run rendering. Surfaced as the `source` of a
+/// [`TargetFailure`].
 #[derive(Debug, Clone)]
 pub struct ProcessFailed {
     pub status: String,
-    pub log_tail: String,
+    pub log: Arc<dyn Content>,
 }
 
 impl fmt::Display for ProcessFailed {
@@ -118,13 +124,14 @@ impl std::error::Error for ProcessFailed {}
 pub struct TargetFailure {
     pub addr: Addr,
     /// The last lines of the target's process log (the full log is still saved
-    /// as the `log.txt` artifact). Rendered as a framed `log` box.
-    pub log_tail: Option<String>,
+    /// as the `log.txt` artifact), with the real starting line number so the box
+    /// renders true file positions. Rendered as a framed `log` box.
+    pub log_tail: Option<LogTail>,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
 impl TargetFailure {
-    pub fn new(addr: Addr, log_tail: Option<String>, source: anyhow::Error) -> Self {
+    pub fn new(addr: Addr, log_tail: Option<LogTail>, source: anyhow::Error) -> Self {
         Self {
             addr,
             log_tail,
@@ -168,12 +175,31 @@ impl fmt::Display for FrozenCheckError {
 
 impl std::error::Error for FrozenCheckError {}
 
+/// A bounded slice of a process log prepared for display: the last lines of the
+/// full log, plus the real 1-based line number its first line had in the full log
+/// so the renderer can show true file positions (e.g. 91–100 for the last 10 of a
+/// 100-line log) instead of renumbering from 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogTail {
+    pub text: String,
+    /// 1-based line number of `text`'s first line within the full log.
+    pub start_line: usize,
+}
+
 /// Returns the last `n` lines of `s`, joined with `\n`. A trailing newline does
 /// not count as an extra empty line (`str::lines` already drops it).
 pub fn last_n_lines(s: &str, n: usize) -> String {
+    last_n_lines_with_start(s, n).0
+}
+
+/// Like [`last_n_lines`] but also returns the 1-based line number of the first
+/// returned line within `s`, so callers can render real file positions rather
+/// than renumbering the tail from 1.
+pub fn last_n_lines_with_start(s: &str, n: usize) -> (String, usize) {
     let lines: Vec<&str> = s.lines().collect();
     let start = lines.len().saturating_sub(n);
-    lines.get(start..).unwrap_or(&[]).join("\n")
+    let text = lines.get(start..).unwrap_or(&[]).join("\n");
+    (text, start + 1)
 }
 
 #[cfg(test)]
@@ -199,5 +225,24 @@ mod tests {
     fn last_n_lines_trailing_newline() {
         // The trailing newline is dropped by `lines()`, so the last real line wins.
         assert_eq!(last_n_lines("a\nb\nc\n", 2), "b\nc");
+    }
+
+    #[test]
+    fn last_n_lines_with_start_reports_real_first_line() {
+        // 5 lines, last 3 → first shown line is line 3 (1-based).
+        assert_eq!(
+            last_n_lines_with_start("a\nb\nc\nd\ne", 3),
+            ("c\nd\ne".to_string(), 3)
+        );
+    }
+
+    #[test]
+    fn last_n_lines_with_start_fewer_than_n_starts_at_one() {
+        assert_eq!(last_n_lines_with_start("a\nb", 10), ("a\nb".to_string(), 1));
+    }
+
+    #[test]
+    fn last_n_lines_with_start_empty_starts_at_one() {
+        assert_eq!(last_n_lines_with_start("", 10), (String::new(), 1));
     }
 }

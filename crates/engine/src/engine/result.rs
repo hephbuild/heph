@@ -455,7 +455,7 @@ fn classify_failure(
     let log_tail = if interactive {
         None
     } else {
-        extract_log_tail(&e)
+        extract_log_tail(&e, rs.log_tail_lines())
     };
     rs.record_failure(
         addr.clone(),
@@ -464,10 +464,17 @@ fn classify_failure(
     UpstreamFailed { root: addr.clone() }.into()
 }
 
-/// Pull the captured log tail out of a `ProcessFailed` anywhere in the chain so
-/// the recorded `TargetFailure` can surface it in its diagnostic.
-fn extract_log_tail(e: &anyhow::Error) -> Option<String> {
-    downcast_chain_ref::<ProcessFailed>(e).map(|pf| pf.log_tail.clone())
+/// Read the last `n` lines of a `ProcessFailed`'s log (anywhere in the chain) so
+/// the recorded `TargetFailure` can surface them in its diagnostic, tagged with
+/// the real starting line number. Best-effort: a log file that can't be read
+/// (e.g. already reclaimed) yields no tail rather than masking the failure.
+fn extract_log_tail(e: &anyhow::Error, n: usize) -> Option<hplugin::error::LogTail> {
+    use std::io::Read as _;
+    let pf = downcast_chain_ref::<ProcessFailed>(e)?;
+    let mut buf = String::new();
+    pf.log.reader().ok()?.read_to_string(&mut buf).ok()?;
+    let (text, start_line) = hplugin::error::last_n_lines_with_start(&buf, n);
+    Some(hplugin::error::LogTail { text, start_line })
 }
 
 /// At the outermost `result_addr` frame (the directly-requested target, with no
@@ -3579,15 +3586,21 @@ mod tests {
         // suite covers the live path). `last_n_lines` itself is unit-tested in
         // `engine::error`.
         use crate::engine::error::{ProcessFailed, UpstreamFailed};
+        use std::sync::Arc;
 
         let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
         let rs = engine.new_state();
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
 
-        let tail = "line6\nline7\nline8\nline9\nline10";
+        // A 12-line log, default tail of 10 → lines 3..=12 with start_line 3.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        let full: String = (1..=12).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(&log_path, &full)?;
+
         let e = anyhow::Error::new(ProcessFailed {
             status: "exit status: 1".to_string(),
-            log_tail: tail.to_string(),
+            log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
         })
         .context("driver run")
         .context("execute //pkg:a");
@@ -3595,9 +3608,15 @@ mod tests {
         let out = classify_failure(&rs, &addr, false, e);
         // Own failure → cheap marker propagated upward.
         assert!(downcast_chain_ref::<UpstreamFailed>(&out).is_some());
-        // …and the rich record carries the log tail pulled from ProcessFailed.
+        // …and the rich record carries the last 10 lines read from the log file,
+        // tagged with the real starting line number.
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        assert_eq!(recorded.log_tail.as_deref(), Some(tail));
+        let tail = recorded.log_tail.as_ref().expect("log tail");
+        assert_eq!(
+            tail.text,
+            "line3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12"
+        );
+        assert_eq!(tail.start_line, 3);
         Ok(())
     }
 
@@ -3606,14 +3625,19 @@ mod tests {
         // Interactive targets stream their output live to the user's terminal, so
         // the captured log tail must NOT be re-rendered in the failure box.
         use crate::engine::error::ProcessFailed;
+        use std::sync::Arc;
 
         let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
         let rs = engine.new_state();
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
 
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "line9\nline10\n")?;
+
         let e = anyhow::Error::new(ProcessFailed {
             status: "exit status: 1".to_string(),
-            log_tail: "line9\nline10".to_string(),
+            log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
         })
         .context("execute //pkg:a");
 

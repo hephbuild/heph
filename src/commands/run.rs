@@ -80,6 +80,10 @@ pub struct RunArgs {
     /// Fail if generated output differs from the tree (CI check)
     #[arg(long = "frozen")]
     pub frozen: bool,
+    /// Number of trailing process-log lines to show in a failing target's
+    /// diagnostic box. The full log is always saved as the `log.txt` artifact.
+    #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
+    pub log_lines: usize,
 }
 
 struct RunApp {
@@ -149,9 +153,12 @@ impl App for RunApp {
             interactive,
             frozen: self.args.frozen,
         };
-        let rs = self
-            .engine
-            .new_state_full(self.fail_fast, ctx.event_sender(), ctx.bg_pending());
+        let rs = self.engine.new_state_full(
+            self.fail_fast,
+            ctx.event_sender(),
+            ctx.bg_pending(),
+            self.args.log_lines,
+        );
 
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
         // `finalize!` paved road handles rendering and exit uniformly. The engine
