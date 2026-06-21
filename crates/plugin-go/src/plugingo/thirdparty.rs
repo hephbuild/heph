@@ -131,6 +131,7 @@ pub fn build_lib_spec(
     src_addrs: &[String],
     s_file_addrs: &[String],
     h_file_addrs: &[String],
+    extra_h_file_addrs: &[String],
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
     go_version: &str,
@@ -178,18 +179,17 @@ pub fn build_lib_spec(
                     .collect(),
             ),
         );
-        // .h headers next to .s files (e.g. purego ships its own abi_arm64.h).
-        // Staged so asm `-I .` can resolve `#include "abi_arm64.h"`.
-        if !h_file_addrs.is_empty() {
-            deps.insert(
-                "hdr".to_string(),
-                Value::List(
-                    h_file_addrs
-                        .iter()
-                        .map(|s| Value::String(s.clone()))
-                        .collect(),
-                ),
-            );
+        // .h headers next to .s files (e.g. purego ships its own abi_arm64.h),
+        // plus sibling-package headers the asm `#include`s across the module
+        // (circl `dh/x448` → `math/fp448/fp_amd64.h`). Both stage at their
+        // module-relative path so asm `-I .` / relative `#include` resolve.
+        let hdrs: Vec<Value> = h_file_addrs
+            .iter()
+            .chain(extra_h_file_addrs.iter())
+            .map(|s| Value::String(s.clone()))
+            .collect();
+        if !hdrs.is_empty() {
+            deps.insert("hdr".to_string(), Value::List(hdrs));
         }
     }
     if let Some(e) = embed_addr {
@@ -516,6 +516,7 @@ mod tests {
             &[filter_src_addr("logr.go")],
             &[],
             &[],
+            &[],
             None,
             &[],
             V,
@@ -541,6 +542,7 @@ mod tests {
             &[filter_src_addr("logr.go")],
             &[],
             &[],
+            &[],
             None,
             &[],
             V,
@@ -556,6 +558,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             None,
@@ -577,6 +580,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             None,
@@ -602,6 +606,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             None,
@@ -631,6 +636,7 @@ mod tests {
             &[src.clone()],
             &[],
             &[],
+            &[],
             None,
             &[],
             V,
@@ -654,6 +660,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             None,
@@ -687,6 +694,7 @@ mod tests {
             &[filter_src_addr("main.go")],
             &[],
             &[],
+            &[],
             None,
             &[],
             V,
@@ -706,6 +714,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             None,
@@ -735,6 +744,7 @@ mod tests {
             &[filter_src_addr("logr.go")],
             &[],
             &[],
+            &[],
             None,
             &[],
             V,
@@ -761,6 +771,7 @@ mod tests {
             &[filter_src_addr("logr.go")],
             &[],
             &[],
+            &[],
             None,
             &[],
             V,
@@ -783,6 +794,7 @@ mod tests {
             &[],
             &[filter_src_addr("impl.go")],
             &s_addrs,
+            &[],
             &[],
             None,
             &[],
@@ -833,6 +845,47 @@ mod tests {
     }
 
     #[test]
+    fn test_build_lib_extra_h_files_join_hdr_group() {
+        // circl shape: x448 asm `#include`s a sibling-package header, surfaced
+        // as extra_h_file_addrs. It must land in the `hdr` group (staged into
+        // the sandbox) alongside any same-package headers.
+        let pkg = test_pkg_with_asm(
+            vec!["impl.go".to_string()],
+            vec!["curve_amd64.s".to_string()],
+        );
+        let extra = vec![
+            "//@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2:download[@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2/math/fp448/fp_amd64.h]"
+                .to_string(),
+        ];
+        let spec = build_lib_spec(
+            test_addr(),
+            &pkg,
+            &test_factors(),
+            &[],
+            &[filter_src_addr("impl.go")],
+            &[filter_src_addr("curve_amd64.s")],
+            &[], // no same-package headers
+            &extra,
+            None,
+            &[],
+            V,
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let hdr = match deps.get("hdr").expect("extra headers must form hdr group") {
+            Value::List(v) => v,
+            _ => panic!("hdr group must be a list"),
+        };
+        assert!(
+            hdr.iter()
+                .any(|e| matches!(e, Value::String(s) if s == &extra[0])),
+            "hdr group must carry the cross-package header addr: {hdr:?}"
+        );
+    }
+
+    #[test]
     fn test_build_lib_no_s_files_no_asm_steps() {
         let spec = build_lib_spec(
             test_addr(),
@@ -840,6 +893,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             None,
@@ -865,6 +919,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             Some(&embed),
@@ -898,6 +953,7 @@ mod tests {
             &test_factors(),
             &[],
             &[filter_src_addr("logr.go")],
+            &[],
             &[],
             &[],
             Some(&embed),

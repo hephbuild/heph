@@ -398,7 +398,38 @@ impl ManagedDriver for GoGolistDriver {
             ),
             None => None,
         };
-        let addrs = resolve_package_addrs(&pkg, pkg_str, &source_map, download_addr.as_ref());
+        let mut addrs = resolve_package_addrs(&pkg, pkg_str, &source_map, download_addr.as_ref());
+
+        // circl-style asm `#include`s reach into sibling packages of the same
+        // module (`dh/x448` → `../../math/fp448/fp_amd64.h`). Those headers
+        // aren't in this package's HFiles, so scan the asm sources and stage the
+        // siblings via the module-root download target at their module-relative
+        // path — the path the `-I .` asm step resolves them against.
+        if let (Some(dl), false) = (download_addr.as_ref(), pkg.s_files.is_empty())
+            && let Some(pkg_dir) = pkg.dir.as_deref()
+        {
+            let module_ws_root = dl.package.as_str();
+            let subpath = pkg_str
+                .strip_prefix(module_ws_root)
+                .map(|s| s.trim_start_matches('/'))
+                .unwrap_or("");
+            addrs.extra_h_files = crate::plugingo::pkg_analysis::collect_cross_pkg_asm_headers(
+                pkg_dir,
+                subpath,
+                &pkg.s_files,
+            )
+            .into_iter()
+            .map(|rel| {
+                TargetAddr {
+                    r#ref: dl.clone(),
+                    output: None,
+                    filters: vec![format!("{module_ws_root}/{rel}")],
+                }
+                .to_string()
+            })
+            .collect();
+        }
+
         let addrs_bin = encode_package_addrs(&addrs).context("encode package_addrs.bin")?;
         std::fs::write(req.sandbox_pkg_dir.join("package_addrs.bin"), &addrs_bin)
             .context("write package_addrs.bin")?;

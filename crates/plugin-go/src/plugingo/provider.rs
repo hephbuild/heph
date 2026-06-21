@@ -1135,6 +1135,7 @@ impl ProviderInner {
                         &pkg_addrs.go_files,
                         &pkg_addrs.s_files,
                         &pkg_addrs.h_files,
+                        &pkg_addrs.extra_h_files,
                         embed_addr.as_ref(),
                         &pkg_addrs.embed_files,
                         &self.go_version,
