@@ -23,7 +23,8 @@
 use crate::engine::remote_cache::RemoteCacheBackend;
 use anyhow::Context;
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use enclose::enclose;
+use futures::{Stream, TryStreamExt};
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as AdcBuilder};
 use object_store::buffered::BufWriter;
 use object_store::gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder};
@@ -33,6 +34,7 @@ use object_store::{
 };
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::OnceCell;
@@ -102,16 +104,50 @@ impl ObjStoreBackend {
     }
 }
 
+/// Stream adapter that enters `span` on every `poll_next`. The object byte
+/// stream is consumed lazily — long after [`open_read`](ObjStoreBackend::open_read)
+/// returns — so object_store's internal retry log (`"Encountered error while
+/// reading response body…"`, emitted mid-stream) only inherits our span fields
+/// (cache `key`, object `path`) if the span is active during those polls. Plain
+/// `tracing::Instrument` covers futures, not streams, hence this wrapper.
+struct SpanStream<S> {
+    span: tracing::Span,
+    inner: S,
+}
+
+impl<S: Stream + Unpin> Stream for SpanStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<S::Item>> {
+        let this = self.get_mut();
+        let _guard = this.span.enter();
+        Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
+/// Convert a mid-stream object_store error into the `io::Error` that
+/// [`StreamReader`] requires, folding the object path into the message so a
+/// body-read failure names the artifact instead of a bare HTTP error.
+fn stream_read_err(path: &ObjPath, e: object_store::Error) -> std::io::Error {
+    std::io::Error::other(format!("remote object {path} stream error: {e}"))
+}
+
 #[async_trait]
 impl RemoteCacheBackend for ObjStoreBackend {
     async fn open_read(&self, key: &str) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
         let path = self.object_path(key);
         match self.store.get(&path).await {
             Ok(res) => {
-                // Adapt the object byte stream into an `AsyncRead`. `io::Error`
-                // is what `StreamReader` requires; the object_store error is
-                // preserved as its source.
-                let stream = res.into_stream().map_err(std::io::Error::other);
+                // The byte stream is read downstream, where object_store may log
+                // body-read retries. Wrap it in a span carrying the cache key and
+                // object path so those logs (and any surfaced error) name the
+                // artifact that flaked instead of a bare HTTP message.
+                let span = tracing::info_span!("remote_get", key = %key, path = %path);
+                let stream = SpanStream {
+                    span,
+                    inner: res.into_stream(),
+                }
+                .map_err(enclose!((path) move |e| stream_read_err(&path, e)));
                 Ok(Some(Box::pin(StreamReader::new(stream))))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -269,6 +305,45 @@ mod tests {
         put(&backend, "k/v", b"hello").await;
         assert!(backend.exists("k/v").await.expect("exists"));
         assert_eq!(get(&backend, "k/v").await.expect("present"), b"hello");
+    }
+
+    #[test]
+    fn stream_read_err_names_object_path_and_keeps_cause() {
+        let path = ObjPath::from("repo-a/cas/deadbeef");
+        let e = object_store::Error::Generic {
+            store: "S3",
+            source: "connection reset".into(),
+        };
+        let msg = stream_read_err(&path, e).to_string();
+        // Path identifies the artifact; original error text is folded in so a
+        // mid-stream body failure stays diagnosable.
+        assert!(msg.contains("repo-a/cas/deadbeef"), "msg: {msg}");
+        assert!(msg.contains("connection reset"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn span_stream_forwards_items_and_errors_in_order() {
+        use futures::StreamExt;
+        let items: Vec<object_store::Result<u8>> = vec![
+            Ok(1),
+            Ok(2),
+            Err(object_store::Error::Generic {
+                store: "S3",
+                source: "boom".into(),
+            }),
+        ];
+        let span = tracing::info_span!("remote_get", key = "k", path = "p");
+        let s = SpanStream {
+            span,
+            inner: futures::stream::iter(items),
+        };
+        let out: Vec<_> = s.collect().await;
+        // The span wrapper is transparent: every item and the trailing error
+        // pass through unchanged and in order.
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0], Ok(1)));
+        assert!(matches!(out[1], Ok(2)));
+        assert!(out[2].is_err());
     }
 
     #[tokio::test]
