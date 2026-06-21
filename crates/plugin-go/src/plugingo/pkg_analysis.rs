@@ -62,6 +62,12 @@ pub struct GoPackage {
 
 /// Per-file Addr strings derived from a `GoPackage` by the golist driver.
 /// Each entry mirrors the same-name field in `GoPackage`, preserving order.
+///
+/// Serialized to `package_addrs.bin` via borsh, which is NOT self-describing:
+/// adding/removing/reordering a field breaks decode of artifacts cached under
+/// the old layout ("Unexpected length of input"). Any change here MUST bump
+/// `GO_GOLIST_FORMAT_VERSION` (driver_golist.rs) to invalidate stale `_golist`
+/// caches. `test_package_addrs_borsh_layout_is_frozen` guards this.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct PackageAddrs {
     #[serde(rename = "GoFiles", default)]
