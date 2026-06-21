@@ -11,8 +11,15 @@ pub fn init() -> LogSink {
     // fuser is chatty at info!/warn! during mount lifecycle. Cap it at
     // error! by default so genuine failures surface but lifecycle noise
     // is silenced. User raises via `RUST_LOG=fuser=debug` for details.
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,fuser=error"));
+    //
+    // object_store's GCS credential provider emits an info! per GCP token
+    // fetch ("fetching token from metadata server"); cap it at warn! so the
+    // remote cache doesn't spam a token line on every run. Genuine auth
+    // failures still surface; `RUST_LOG=object_store::gcp::credential=info`
+    // restores the detail.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,fuser=error,object_store::gcp::credential=warn")
+    });
 
     // tracing_subscriber defaults ANSI on regardless of where the writer points.
     // Our writer is stderr, so gate color on stderr's capability — otherwise a
