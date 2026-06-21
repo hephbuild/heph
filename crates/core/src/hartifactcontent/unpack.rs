@@ -126,14 +126,39 @@ pub fn unpack(
                 }
                 #[cfg(unix)]
                 {
-                    std::os::unix::fs::symlink(&*target, &dest).with_context(|| {
-                        format!(
-                            "create symlink {:?} -> {:?} (existing={})",
-                            dest,
-                            target,
-                            describe_existing(&dest),
-                        )
-                    })?;
+                    match std::os::unix::fs::symlink(&*target, &dest) {
+                        Ok(()) => {}
+                        // Inputs can overlap (multiple sources unpack into the
+                        // same ws). An identical symlink already in place is a
+                        // no-op; only a divergent target is an error.
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                            let existing = fs::read_link(&dest).with_context(|| {
+                                format!(
+                                    "read existing symlink {:?} while unpacking {:?} -> {:?}",
+                                    dest, entry.path, target,
+                                )
+                            })?;
+                            if existing != **target {
+                                anyhow::bail!(
+                                    "symlink {:?} already exists with divergent target: \
+                                     existing -> {:?}, unpacking -> {:?}",
+                                    dest,
+                                    existing,
+                                    target,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "create symlink {:?} -> {:?} (existing={})",
+                                    dest,
+                                    target,
+                                    describe_existing(&dest),
+                                )
+                            });
+                        }
+                    }
                 }
                 #[cfg(not(unix))]
                 {
@@ -281,6 +306,36 @@ mod tests {
             "script exited non-zero: {output:?}"
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
+    }
+
+    #[test]
+    fn unpack_existing_identical_symlink_is_noop() {
+        // Overlapping inputs unpack into the same dir; re-creating an identical
+        // symlink must succeed (idempotent), not fail with EEXIST.
+        let buf = pack_with_symlink(false);
+        let content = TarBytes(buf);
+        let out = tempfile::tempdir().expect("out tempdir");
+
+        unpack(&content, out.path(), None, None).expect("first unpack");
+        unpack(&content, out.path(), None, None).expect("second unpack must be idempotent");
+
+        let link_path = out.path().join("link.txt");
+        let read_target = std::fs::read_link(&link_path).unwrap();
+        assert_eq!(read_target, PathBuf::from("target.txt"));
+    }
+
+    #[test]
+    fn unpack_existing_divergent_symlink_errors() {
+        let buf = pack_with_symlink(false);
+        let content = TarBytes(buf);
+        let out = tempfile::tempdir().expect("out tempdir");
+
+        // Pre-create link.txt pointing elsewhere; unpack must reject divergence.
+        symlink("other.txt", out.path().join("link.txt")).unwrap();
+
+        let err = unpack(&content, out.path(), None, None).expect_err("expected error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("divergent target"), "unexpected: {msg}");
     }
 
     #[test]
