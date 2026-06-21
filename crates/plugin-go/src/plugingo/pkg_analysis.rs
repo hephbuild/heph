@@ -5,8 +5,9 @@ use hmodel::htaddr::{Addr, parse_addr_with_base};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct GoPackage {
@@ -71,6 +72,12 @@ pub struct PackageAddrs {
     /// `#include` directives.
     #[serde(rename = "HFiles", default)]
     pub h_files: Vec<String>,
+    /// Addrs for header files this package's asm `#include`s from sibling
+    /// packages in the same module (e.g. circl `dh/x448` → `math/fp448`). Not
+    /// in `HFiles` (they belong to other packages), discovered by scanning the
+    /// asm sources and staged via the module-root `download` target.
+    #[serde(rename = "ExtraHFiles", default)]
+    pub extra_h_files: Vec<String>,
     #[serde(rename = "TestGoFiles", default)]
     pub test_go_files: Vec<String>,
     #[serde(rename = "XTestGoFiles", default)]
@@ -150,12 +157,134 @@ pub fn resolve_package_addrs(
         go_files: resolve(&pkg.go_files),
         s_files: resolve(&pkg.s_files),
         h_files: resolve(&pkg.h_files),
+        // Cross-package asm headers need filesystem scanning; the golist driver
+        // fills this in after resolve (it can't be derived from `go list` JSON).
+        extra_h_files: Vec::new(),
         test_go_files: resolve(&pkg.test_go_files),
         xtest_go_files: resolve(&pkg.xtest_go_files),
         embed_files: resolve(&pkg.embed_files),
         test_embed_files: resolve(&pkg.test_embed_files),
         xtest_embed_files: resolve(&pkg.xtest_embed_files),
     }
+}
+
+/// Parse `#include "path"` directives out of Go assembly (or header) source.
+///
+/// Go's assembler only honours double-quoted includes; angle-bracket form is
+/// not used. Returns the quoted paths verbatim, in source order.
+pub fn parse_asm_includes(content: &str) -> impl Iterator<Item = &str> {
+    content.lines().filter_map(|line| {
+        let rest = line.trim_start().strip_prefix("#include")?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        rest.split_once('"').map(|(inc, _)| inc)
+    })
+}
+
+/// Resolve `.`/`..` components in `p` lexically (no filesystem access), keeping
+/// any root/prefix component intact so `..` can never climb above the root.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    let mut anchored = false;
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Don't pop the root/prefix anchor or a leading `..`.
+                if out.len() > usize::from(anchored)
+                    && out.last().map(|s| s.as_os_str() != "..").unwrap_or(true)
+                {
+                    out.pop();
+                } else if !anchored {
+                    out.push("..".into());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anchored = true;
+                out.push(comp.as_os_str().to_os_string());
+            }
+            Component::Normal(c) => out.push(c.to_os_string()),
+        }
+    }
+    out.iter().collect()
+}
+
+/// Discover header files that asm sources `#include` from *sibling packages* in
+/// the same module — files the package's own `HFiles` never lists, so nothing
+/// else stages them.
+///
+/// Example: cloudflare/circl's `dh/x448/curve_amd64.s` does
+/// `#include "../../math/fp448/fp_amd64.h"`. That header lives in the `math/
+/// fp448` package, not `dh/x448`, so the asm step fails with "no such file"
+/// unless it's staged at its module-relative path.
+///
+/// `pkg_dir` is the package's source directory (host GOMODCACHE path); `subpath`
+/// is its module-relative location (e.g. `dh/x448`), used to derive the module
+/// root. Returns module-root-relative, forward-slashed paths — deduped and
+/// sorted for deterministic output. Headers inside `pkg_dir` itself are skipped
+/// (already covered by `HFiles`); includes that don't resolve to a real file
+/// (std headers like `textflag.h` via `-I $GOROOT/pkg/include`, or generated
+/// `go_asm.h`) are skipped.
+pub fn collect_cross_pkg_asm_headers(
+    pkg_dir: &str,
+    subpath: &str,
+    s_files: &[String],
+) -> Vec<String> {
+    let pkg_dir = Path::new(pkg_dir);
+    // Strip the subpath components off pkg_dir to reach the module root.
+    let mut module_root = pkg_dir;
+    for _ in subpath.split('/').filter(|s| !s.is_empty()) {
+        module_root = match module_root.parent() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+    }
+
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+
+    let enqueue = |from: &Path, inc: &str, queue: &mut VecDeque<PathBuf>| {
+        // Absolute includes would be non-hermetic; Go asm never uses them.
+        if inc.starts_with('/') {
+            return;
+        }
+        let base = from.parent().unwrap_or(module_root);
+        queue.push_back(lexical_normalize(&base.join(inc)));
+    };
+
+    for s in s_files {
+        let p = pkg_dir.join(s);
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            for inc in parse_asm_includes(&content) {
+                enqueue(&p, inc, &mut queue);
+            }
+        }
+    }
+
+    while let Some(hdr) = queue.pop_front() {
+        if !visited.insert(hdr.clone()) {
+            continue;
+        }
+        // Never stage anything outside the module (or std headers absent here).
+        if !hdr.starts_with(module_root) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&hdr) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Record only siblings — headers in the origin package ship via HFiles.
+        if !hdr.starts_with(pkg_dir)
+            && let Ok(rel) = hdr.strip_prefix(module_root)
+        {
+            out.insert(rel.to_string_lossy().replace('\\', "/"));
+        }
+        for inc in parse_asm_includes(&content) {
+            enqueue(&hdr, inc, &mut queue);
+        }
+    }
+
+    out.into_iter().collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -664,5 +793,86 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
         assert!(pkg.go_files.is_empty());
         assert!(pkg.imports.is_empty());
         assert!(pkg.module.is_none());
+    }
+
+    #[test]
+    fn test_parse_asm_includes() {
+        let src = concat!(
+            "#include \"textflag.h\"\n",
+            "  #include \"../../math/fp448/fp_amd64.h\"\n",
+            "#include \"curve_amd64.h\"\n",
+            "// #include \"not_a_real_one.h\"\n",
+            "TEXT ·foo(SB), 0, $0\n",
+        );
+        let got: Vec<&str> = parse_asm_includes(src).collect();
+        assert_eq!(
+            got,
+            vec!["textflag.h", "../../math/fp448/fp_amd64.h", "curve_amd64.h",]
+        );
+    }
+
+    #[test]
+    fn test_collect_cross_pkg_asm_headers_circl_shape() {
+        // Lay out a circl-shaped module: dh/x448 asm `#include`s a sibling
+        // header in math/fp448, which itself pulls in a same-dir helper.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let x448 = root.join("dh/x448");
+        let fp448 = root.join("math/fp448");
+        std::fs::create_dir_all(&x448).unwrap();
+        std::fs::create_dir_all(&fp448).unwrap();
+
+        std::fs::write(
+            x448.join("curve_amd64.s"),
+            concat!(
+                "#include \"textflag.h\"\n",
+                "#include \"../../math/fp448/fp_amd64.h\"\n",
+                "#include \"curve_amd64.h\"\n",
+            ),
+        )
+        .unwrap();
+        // Same-package header — must NOT be reported (covered by HFiles).
+        std::fs::write(x448.join("curve_amd64.h"), "// macros\n").unwrap();
+        // Sibling header pulls a same-dir helper — both must be reported.
+        std::fs::write(fp448.join("fp_amd64.h"), "#include \"fp_amd64_helper.h\"\n").unwrap();
+        std::fs::write(fp448.join("fp_amd64_helper.h"), "// more macros\n").unwrap();
+
+        let got = collect_cross_pkg_asm_headers(
+            &x448.to_string_lossy(),
+            "dh/x448",
+            &["curve_amd64.s".to_string()],
+        );
+        assert_eq!(
+            got,
+            vec![
+                "math/fp448/fp_amd64.h".to_string(),
+                "math/fp448/fp_amd64_helper.h".to_string(),
+            ],
+            "must report sibling headers (transitively), module-relative, sorted; \
+             never the same-package header nor the std `textflag.h`"
+        );
+    }
+
+    #[test]
+    fn test_collect_cross_pkg_asm_headers_none_when_self_contained() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("crypto/foo");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("impl_amd64.s"),
+            "#include \"textflag.h\"\n#include \"local.h\"\n",
+        )
+        .unwrap();
+        std::fs::write(pkg.join("local.h"), "// macros\n").unwrap();
+
+        let got = collect_cross_pkg_asm_headers(
+            &pkg.to_string_lossy(),
+            "crypto/foo",
+            &["impl_amd64.s".to_string()],
+        );
+        assert!(
+            got.is_empty(),
+            "self-contained asm must not stage any cross-package header: {got:?}"
+        );
     }
 }
