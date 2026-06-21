@@ -429,13 +429,16 @@ impl ProviderTrait for Provider {
                             ("pass_env", ParamType::list(ParamType::String)),
                             ("runtime_env", ParamType::map(ParamType::String)),
                             ("runtime_pass_env", ParamType::list(ParamType::String)),
+                            ("pre_run", ParamType::list(ParamType::String)),
                         ]),
                     ]),
                     "Test settings for this package. `test = False` skips its tests \
                      (inherited by descendants); `test = True` (or unset) runs them. \
-                     The struct form sets env on the generated `test`/`xtest` run \
+                     The struct form configures the generated `test`/`xtest` run \
                      targets — `env`/`runtime_env` (map[string]) and \
-                     `pass_env`/`runtime_pass_env` (list[string]) — and applies only \
+                     `pass_env`/`runtime_pass_env` (list[string]) set env, and \
+                     `pre_run` (list[string]) runs shell lines before the test binary \
+                     (switching the target to the bash driver) — and applies only \
                      to this package.",
                 ),
             ],
@@ -810,7 +813,13 @@ fn parse_str_map(v: &Value) -> anyhow::Result<BTreeMap<String, String>> {
 /// Keys accepted inside a `test = {...}` go provider_state map. Used to reject
 /// typos / unsupported knobs (the `test` map only configures env, never
 /// enable/disable — that's the bool `test = False`).
-const TEST_STATE_KEYS: &[&str] = &["env", "runtime_env", "pass_env", "runtime_pass_env"];
+const TEST_STATE_KEYS: &[&str] = &[
+    "env",
+    "runtime_env",
+    "pass_env",
+    "runtime_pass_env",
+    "pre_run",
+];
 
 fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test::TestEnv> {
     let mut out = target_test::TestEnv::default();
@@ -847,6 +856,10 @@ fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test
             out.runtime_pass_env.extend(
                 parse_strings(v).context("parsing test runtime_pass_env from go provider_state")?,
             );
+        }
+        if let Some(v) = test_map.get("pre_run") {
+            out.pre_run
+                .extend(parse_strings(v).context("parsing test pre_run from go provider_state")?);
         }
     }
     Ok(out)
@@ -4112,6 +4125,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             && env.runtime_env.is_empty()
             && env.pass_env.is_empty()
             && env.runtime_pass_env.is_empty()
+            && env.pre_run.is_empty()
     }
 
     fn state_with_test_map(pkg: &str, entries: Vec<(&str, Value)>) -> State {
@@ -4215,6 +4229,49 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             msg.contains("test = False"),
             "error must point to the correct disable syntax: {msg}"
         );
+    }
+
+    #[test]
+    fn pick_test_env_reads_pre_run_lines_in_order() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![(
+                "pre_run",
+                Value::List(vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                    Value::String("c".to_string()),
+                ]),
+            )],
+        )];
+        let env = pick_test_env(&states, "foo").unwrap();
+        assert_eq!(env.pre_run, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn pick_test_env_pre_run_applies_only_to_exact_package() {
+        // pre_run at ancestor `foo` must NOT leak into `foo/bar`'s test targets.
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![(
+                "pre_run",
+                Value::List(vec![Value::String("setup".to_string())]),
+            )],
+        )];
+        let env = pick_test_env(&states, "foo/bar").unwrap();
+        assert!(env.pre_run.is_empty());
+    }
+
+    #[test]
+    fn pick_test_env_errors_on_non_string_pre_run_item() {
+        let states = vec![state_with_test_map(
+            "foo",
+            vec![(
+                "pre_run",
+                Value::List(vec![Value::String("ok".to_string()), Value::Bool(true)]),
+            )],
+        )];
+        assert!(pick_test_env(&states, "foo").is_err());
     }
 
     #[tokio::test]

@@ -18,6 +18,9 @@ pub struct TestEnv {
     pub runtime_env: BTreeMap<String, String>,
     pub pass_env: Vec<String>,
     pub runtime_pass_env: Vec<String>,
+    /// Shell lines run before the test binary. When non-empty the `test`/`xtest`
+    /// target switches from the `exec` driver to the `bash` driver.
+    pub pre_run: Vec<String>,
 }
 
 /// Compile the test package (GoFiles + TestGoFiles) with `go tool compile` in test mode.
@@ -206,22 +209,37 @@ pub fn build_test_spec(
 /// `data_query_addr` is a `@heph/query` addr selecting sibling targets labeled
 /// `go_test_data`. The engine expands the query lazily, so this provider does
 /// not need to scan the package itself.
+///
+/// `test_env.pre_run` carries shell lines from the package's
+/// `test = {"pre_run": [...]}` provider state. When empty, the target uses the
+/// `exec` driver and runs the test binary as a literal argv. When non-empty, it
+/// switches to the `bash` driver so the `pre_run` lines execute (as shell)
+/// before the test binary.
 pub fn test_spec(
     addr: Addr,
     build_test_addr: Addr,
     data_query_addr: &Addr,
     test_env: &TestEnv,
 ) -> TargetSpec {
-    // exec driver passes argv literally — no shell expansion. The engine
-    // stages dep outputs at <pkg>/<file> under ws_dir, and the process cwd
-    // is the target's package dir (engine/driver_managed_os.rs:78). The
-    // `test` target is a sibling of `build_test` in the same package, so
-    // its `test_binary` output lands next to us and `./test_binary`
-    // resolves regardless of package depth.
-    let run = vec![
-        Value::String("./test_binary".to_string()),
-        Value::String("-test.v".to_string()),
-    ];
+    // Both drivers run with cwd = the target's package dir, and the engine
+    // stages dep outputs at <pkg>/<file> under ws_dir
+    // (engine/driver_managed_os.rs:78). The `test` target is a sibling of
+    // `build_test` in the same package, so its `test_binary` output lands next
+    // to us and `./test_binary` resolves regardless of package depth.
+    let (driver, run) = if test_env.pre_run.is_empty() {
+        // exec driver passes argv literally — no shell expansion.
+        let run = Value::List(vec![
+            Value::String("./test_binary".to_string()),
+            Value::String("-test.v".to_string()),
+        ]);
+        ("exec", run)
+    } else {
+        // bash driver: each list element is one shell line, joined with `\n`.
+        // Run the user's `pre_run` lines first, then the test binary.
+        let mut lines: Vec<String> = test_env.pre_run.clone();
+        lines.push("./test_binary -test.v".to_string());
+        ("bash", to_run_value(lines))
+    };
 
     let deps_map: HashMap<String, Value> = HashMap::from([
         (
@@ -235,7 +253,7 @@ pub fn test_spec(
     ]);
 
     let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::List(run));
+    config.insert("run".to_string(), run);
     config.insert("deps".to_string(), Value::Map(deps_map));
     config.insert("out".to_string(), Value::Map(HashMap::new()));
 
@@ -262,7 +280,7 @@ pub fn test_spec(
 
     TargetSpec {
         addr,
-        driver: "exec".to_string(),
+        driver: driver.to_string(),
         config,
         labels: vec!["test".to_string(), "go-test".to_string()],
         transitive: Default::default(),
@@ -834,6 +852,7 @@ mod tests {
             runtime_env: BTreeMap::from([("BAR".to_string(), "2".to_string())]),
             pass_env: vec!["HOME".to_string()],
             runtime_pass_env: vec!["PATH".to_string()],
+            pre_run: Vec::new(),
         };
         let spec = test_spec(
             mk_addr("mypkg", "test"),
@@ -972,5 +991,53 @@ mod tests {
         );
         assert!(s.contains("//mypkg"), "must filter by package: {s}");
         assert_eq!(s, qa.format());
+    }
+
+    #[test]
+    fn test_test_spec_pre_run_switches_to_bash() {
+        let test_env = TestEnv {
+            pre_run: vec![
+                "export FOO=bar".to_string(),
+                "mkdir -p ./scratch".to_string(),
+            ],
+            ..TestEnv::default()
+        };
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+            &test_env,
+        );
+        assert_eq!(spec.driver, "bash");
+        let lines: Vec<String> = match spec.config.get("run").expect("run present") {
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => s.clone(),
+                    other => panic!("run line must be string: {other:?}"),
+                })
+                .collect(),
+            other => panic!("run must be a list: {other:?}"),
+        };
+        // pre_run lines come first, in order, then the test binary invocation.
+        assert_eq!(
+            lines,
+            vec![
+                "export FOO=bar".to_string(),
+                "mkdir -p ./scratch".to_string(),
+                "./test_binary -test.v".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_test_spec_empty_pre_run_stays_exec() {
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+            &TestEnv::default(),
+        );
+        assert_eq!(spec.driver, "exec");
     }
 }
