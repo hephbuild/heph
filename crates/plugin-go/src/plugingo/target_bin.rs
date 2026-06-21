@@ -8,12 +8,28 @@ use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
 use std::collections::{BTreeMap, HashMap};
 
+/// Extra link configuration plumbed onto the `build` (binary) target from a
+/// package's `provider_state(provider="go", link={...})`.
+///
+/// - `flags`: passed verbatim to `go tool link` (e.g. `-X main.version=...`).
+/// - `deps`: target addresses staged into the link sandbox (hashed inputs) so
+///   `flags` can reference their outputs.
+/// - `runtime_deps`: target addresses that travel with the binary at run time
+///   only (not hashed — they do not invalidate the link cache).
+#[derive(Debug, Default, Clone)]
+pub struct LinkConfig {
+    pub flags: Vec<String>,
+    pub deps: Vec<String>,
+    pub runtime_deps: Vec<String>,
+}
+
 pub fn build_spec(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
     // All transitive libs including own build_lib at index 0
     transitive_libs: &[(String, Addr)],
+    link: &LinkConfig,
     go_version: &str,
 ) -> TargetSpec {
     let binary_name = import_path
@@ -27,6 +43,7 @@ pub fn build_spec(
         import_path,
         &binary_name,
         transitive_libs,
+        &link.flags,
     ));
 
     let mut deps: BTreeMap<String, Value> = transitive_libs
@@ -39,6 +56,14 @@ pub fn build_spec(
     if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
         deps.insert(sdk_group, sdk_val);
     }
+    // Link deps from provider_state land in their own group so they never collide
+    // with the importcfg lib groups (stdlib/firstparty/thirdparty/sdk).
+    if !link.deps.is_empty() {
+        deps.insert(
+            "link_deps".to_string(),
+            Value::List(link.deps.iter().cloned().map(Value::String).collect()),
+        );
+    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
@@ -46,6 +71,23 @@ pub fn build_spec(
         "deps".to_string(),
         Value::Map(deps.into_iter().collect::<HashMap<_, _>>()),
     );
+    // Runtime-only link deps: staged with the binary at run time, excluded from
+    // the link's def hash (pluginexec excludes runtime_deps from the hash).
+    if !link.runtime_deps.is_empty() {
+        config.insert(
+            "runtime_deps".to_string(),
+            Value::Map(HashMap::from([(
+                "link_runtime_deps".to_string(),
+                Value::List(
+                    link.runtime_deps
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            )])),
+        );
+    }
     if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
         config.insert(ro_k, ro_v);
     }
@@ -83,16 +125,23 @@ fn generate_link_script(
     self_import_path: &str,
     binary_name: &str,
     transitive_libs: &[(String, Addr)],
+    link_flags: &[String],
 ) -> Vec<String> {
     // The main package is passed as a positional arg to the linker, not via importcfg.
     let mut lines = write_importcfg_script(transitive_libs, Some(self_import_path));
     let self_group = import_path_to_dep_group(self_import_path);
     let self_env_var = format!("SRC_{}", self_group.to_uppercase());
+    // User link flags from provider_state, inserted verbatim before `-o`.
+    let flags = if link_flags.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", link_flags.join(" "))
+    };
     // -buildmode=pie matches Go's default on darwin/arm64 (and most modern
     // platforms). Libs were compiled with -shared, so the link must agree on
     // PIE — otherwise asm relocations from transitive deps fail to resolve.
     lines.push(format!(
-        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"",
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie{flags} -o {} \"${}\"",
         binary_name, self_env_var
     ));
     lines
@@ -143,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_driver_is_bash() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
         assert_eq!(spec.driver, "sh");
     }
 
@@ -154,6 +203,7 @@ mod tests {
             "example.com/myapp/cmd",
             &test_factors(),
             &[],
+            &LinkConfig::default(),
             V,
         );
         let out = match spec.config.get("out").unwrap() {
@@ -173,7 +223,7 @@ mod tests {
             ("example.com/cmd".to_string(), lib_addr("cmd")),
             ("fmt".to_string(), lib_addr("@heph/go/std/fmt")),
         ];
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, V);
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, &LinkConfig::default(), V);
         let run = run_str(&spec);
         assert!(run.contains("tool link"));
         assert!(run.contains("importcfg"));
@@ -181,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_run_uses_hermetic_go() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
         let run = run_str(&spec);
         assert!(
             run.contains("\"$GO\""),
@@ -202,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_deps_include_hermetic_sdk() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
@@ -219,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_env_pins_cgo_disabled() {
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], V);
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &LinkConfig::default(), V);
         let env = match spec.config.get("env").unwrap() {
             Value::Map(m) => m,
             _ => panic!("expected map"),
@@ -232,13 +282,97 @@ mod tests {
     }
 
     #[test]
+    fn test_link_flags_threaded_into_link_command() {
+        let link = LinkConfig {
+            flags: vec!["-X main.version=1.2.3".to_string(), "-s".to_string()],
+            ..Default::default()
+        };
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &link, V);
+        let run = run_str(&spec);
+        let link_line = run
+            .lines()
+            .find(|l| l.contains("tool link"))
+            .expect("link line present");
+        assert!(
+            link_line.contains("-X main.version=1.2.3") && link_line.contains(" -s "),
+            "link flags must be threaded into the link command: {link_line}"
+        );
+        let flags_pos = link_line.find("-X main.version").unwrap();
+        let o_pos = link_line.find(" -o ").unwrap();
+        assert!(flags_pos < o_pos, "flags must precede -o: {link_line}");
+    }
+
+    #[test]
+    fn test_link_deps_added_to_deps_map() {
+        let link = LinkConfig {
+            deps: vec!["//some:target".to_string()],
+            ..Default::default()
+        };
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &link, V);
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let group = match deps.get("link_deps").expect("link_deps group present") {
+            Value::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        assert!(matches!(&group[0], Value::String(s) if s == "//some:target"));
+    }
+
+    #[test]
+    fn test_link_runtime_deps_added_to_runtime_deps_map() {
+        let link = LinkConfig {
+            runtime_deps: vec!["//some:rt".to_string()],
+            ..Default::default()
+        };
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &[], &link, V);
+        let rdeps = match spec.config.get("runtime_deps").expect("runtime_deps present") {
+            Value::Map(m) => m,
+            _ => panic!("expected runtime_deps map"),
+        };
+        let group = match rdeps
+            .get("link_runtime_deps")
+            .expect("link_runtime_deps group present")
+        {
+            Value::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        assert!(matches!(&group[0], Value::String(s) if s == "//some:rt"));
+    }
+
+    #[test]
+    fn test_link_empty_omits_extra_keys() {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &LinkConfig::default(),
+            V,
+        );
+        assert!(
+            !spec.config.contains_key("runtime_deps"),
+            "no runtime_deps key when link config empty"
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!(),
+        };
+        assert!(
+            !deps.contains_key("link_deps"),
+            "no link_deps group when link config empty"
+        );
+    }
+
+    #[test]
     fn test_run_self_not_in_importcfg() {
         // The main package is passed as a positional arg to the linker, not via importcfg.
         let libs = vec![
             ("example.com/cmd".to_string(), lib_addr("cmd")),
             ("fmt".to_string(), lib_addr("@heph/go/std/fmt")),
         ];
-        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, V);
+        let spec = build_spec(test_addr(), "example.com/cmd", &test_factors(), &libs, &LinkConfig::default(), V);
         let run = run_str(&spec);
         assert!(
             !run.contains("packagefile example.com/cmd="),
