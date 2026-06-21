@@ -13,6 +13,15 @@
 //! (resolved from `PATH` / `go env GOROOT` inside the sandbox): no SDK target,
 //! no `gosdk` dep, host env passed through. Non-hermetic by construction.
 //!
+//! With `gotool = "//pkg:go"` ([`is_target_ref`]) the toolchain comes from
+//! another *target* — e.g. `//@heph/bin:go` (host `go` exposed by the hostbin
+//! provider) or a `//some/pkg:go` built by the nix driver. The build deps that
+//! target in the `gosdk` group exactly like the hermetic SDK, but its staged
+//! path is not known ahead of time, so `go`/`GOROOT` are resolved from the
+//! staged output at runtime (auto-detecting a GOROOT directory vs. a bare `go`
+//! binary; see [`addr_util::go_goroot_prelude`] and the golist driver). How
+//! hermetic the result is then depends entirely on what that target produces.
+//!
 //! The SDK is one cacheable output (the full tree: `go` + `pkg/tool` + `lib` +
 //! `src` + version/env metadata; `api/test/doc/misc` excluded — nothing reads
 //! them). Consumers don't copy it: it is staged read-only once and exposed to
@@ -66,6 +75,43 @@ pub const HOST: &str = "host";
 /// Whether `spec` selects the host toolchain (vs. a hermetic pinned version).
 pub fn is_host(spec: &str) -> bool {
     spec == HOST
+}
+
+/// Whether `spec` selects a **target** toolchain: an explicit target address
+/// providing the `go` toolchain, distinguished by a leading `//`. Examples:
+/// `//@heph/bin:go` (host `go` exposed by the hostbin provider) or
+/// `//some/pkg:go` (a `go` built by the nix driver). The build deps that target
+/// in the `gosdk` group, stages its single output, and resolves `go`/`GOROOT`
+/// from it at runtime — auto-detecting a full GOROOT tree (a directory whose
+/// `bin/go` is used) vs. a bare `go` binary (a file), with `GOROOT` taken from
+/// whatever that `go` reports.
+pub fn is_target_ref(spec: &str) -> bool {
+    spec.starts_with("//")
+}
+
+/// The three ways the required `gotool` provider option selects the toolchain.
+/// Threaded everywhere as the `go_version` string; classify with [`classify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toolchain<'a> {
+    /// `gotool = "host"` — host `go` resolved from `PATH` / `go env GOROOT`.
+    Host,
+    /// `gotool = "//pkg:go"` — a target producing the toolchain (hostbin, nix, …).
+    Target(&'a str),
+    /// `gotool = "1.26.4"` — a pinned hermetic SDK downloaded from go.dev.
+    Hermetic(&'a str),
+}
+
+/// Classify a `gotool` value into the toolchain it selects. `"host"` →
+/// [`Toolchain::Host`]; anything starting with `//` → [`Toolchain::Target`];
+/// everything else is taken as a pinned hermetic version.
+pub fn classify(spec: &str) -> Toolchain<'_> {
+    if is_host(spec) {
+        Toolchain::Host
+    } else if is_target_ref(spec) {
+        Toolchain::Target(spec)
+    } else {
+        Toolchain::Hermetic(spec)
+    }
 }
 
 /// Base provider package for the hermetic toolchain. The concrete target lives
@@ -175,8 +221,11 @@ pub(crate) fn resolve_host_go() -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!("go host toolchain: `go` not found on PATH")
 }
 
-/// Query `GOROOT` from the host `go` binary.
-pub(crate) fn host_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+/// Query `GOROOT` from a `go` binary (`go env GOROOT`). Shared by the host
+/// toolchain and a target-ref toolchain: works for the host `go`, a relocated
+/// SDK tree, and hostbin/nix wrappers alike — each reports the root matching its
+/// own location.
+pub(crate) fn go_env_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
     let out = std::process::Command::new(go_bin)
         .args(["env", "GOROOT"])
@@ -519,6 +568,24 @@ mod tests {
         // Not a toolchain package, or nested.
         assert_eq!(version_from_pkg("mylib"), None);
         assert_eq!(version_from_pkg("@heph/go/toolchain/1.26.4/extra"), None);
+    }
+
+    #[test]
+    fn test_classify_distinguishes_host_target_hermetic() {
+        assert_eq!(classify("host"), Toolchain::Host);
+        assert_eq!(classify("1.26.4"), Toolchain::Hermetic("1.26.4"));
+        assert_eq!(
+            classify("//@heph/bin:go"),
+            Toolchain::Target("//@heph/bin:go")
+        );
+        assert_eq!(
+            classify("//some/pkg:go"),
+            Toolchain::Target("//some/pkg:go")
+        );
+        // A bare version is never mistaken for a target ref.
+        assert!(!is_target_ref("1.26.4"));
+        assert!(!is_target_ref("host"));
+        assert!(is_target_ref("//@heph/bin:go"));
     }
 
     #[test]

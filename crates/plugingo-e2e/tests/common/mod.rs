@@ -42,16 +42,22 @@ pub fn fixture(name: &str) -> anyhow::Result<TempDir> {
     copy_dir_to_tempdir(&testdata(name))
 }
 
+/// Path to the host `go` binary, feeding the `//@heph/bin:go` static target.
+/// That target is only queried by target-ref toolchain tests (which require
+/// `go`); host and hermetic builds never reference it. So when no host `go` is
+/// on PATH (e.g. a hermetic-only CI runner) fall back to the bare name instead
+/// of panicking — the value is then never used.
 fn go_bin_path() -> String {
-    let output = std::process::Command::new("go")
+    match std::process::Command::new("go")
         .args(["env", "GOROOT"])
         .output()
-        .expect("go env GOROOT");
-    let goroot = String::from_utf8(output.stdout)
-        .expect("utf8 goroot")
-        .trim()
-        .to_string();
-    format!("{goroot}/bin/go")
+    {
+        Ok(output) if output.status.success() => {
+            let goroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            format!("{goroot}/bin/go")
+        }
+        _ => "go".to_string(),
+    }
 }
 
 /// Pinned hermetic Go toolchain version the e2e suite builds against. Mirrors
@@ -96,21 +102,29 @@ fn sdk_checksums_for(gotool: &str) -> std::collections::HashMap<String, String> 
         .collect()
 }
 
+/// Build the workspace using the **host** `go` (gotool = "host") resolved from
+/// PATH / `go env GOROOT` in-sandbox. This is the default for the e2e suite: it
+/// needs no network (no SDK download), only `go` on PATH — guard call sites with
+/// `require_go!`. Use [`make_workspace_hermetic`] for the few tests that must
+/// exercise the hermetic-install (download) route.
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
-}
-
-/// Build the workspace using the **host** `go` (gotool = "host") instead of a
-/// hermetic SDK. Requires `go` on PATH (guard call sites with `require_go!`).
-pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, &[], HOST_GO)
 }
 
-/// Like [`make_workspace`] but with `fs.skip` entries, mirroring a config file's
-/// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
-/// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
+/// Build the workspace using the **hermetic** Go SDK ([`HERMETIC_GO`]),
+/// downloaded and staged by the provider. Reserved for tests that specifically
+/// exercise the hermetic install/download path — it hits the network, so guard
+/// call sites for offline tolerance.
+pub fn make_workspace_hermetic(dir: TempDir) -> anyhow::Result<Workspace> {
+    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
+}
+
+/// Like [`make_workspace`] (host `go`) but with `fs.skip` entries, mirroring a
+/// config file's `fs: { skip: [...] }`. Used to reproduce a codegen target whose
+/// generated Go package lives under a skipped subtree (e.g. a generated `gen/**`
+/// tree).
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, skip, HERMETIC_GO)
+    make_workspace_ordered(dir, false, true, skip, HOST_GO)
 }
 
 /// Same as [`make_workspace`] but registers the **go provider before** the
@@ -125,7 +139,7 @@ pub fn make_workspace_go_first(
     dir: TempDir,
     foreign_name_guard: bool,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, true, foreign_name_guard, &[], HERMETIC_GO)
+    make_workspace_ordered(dir, true, foreign_name_guard, &[], HOST_GO)
 }
 
 fn make_workspace_ordered(

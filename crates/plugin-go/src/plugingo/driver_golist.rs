@@ -240,25 +240,39 @@ impl ManagedDriver for GoGolistDriver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<GoGolistDef>();
 
-        // GOROOT and the `go` binary come from either the hermetic SDK staged
-        // into this sandbox by the `gosdk` dep, or — when the provider selects
-        // `gotool = "host"` — the host `go` resolved from this process's PATH.
-        let host = crate::plugingo::toolchain::is_host(&def.go_version);
-        let (goroot, go_bin) = if host {
-            let go_bin = crate::plugingo::toolchain::resolve_host_go()?;
-            let goroot = crate::plugingo::toolchain::host_goroot(&go_bin)?;
-            (goroot, go_bin)
-        } else {
-            let goroot = req
-                .sandbox_ws_dir
-                .join(crate::plugingo::toolchain::staged_goroot(&def.go_version));
-            let go_bin = goroot.join("bin").join("go");
-            if !go_bin.exists() {
-                anyhow::bail!(
-                    "go_golist: hermetic go binary missing at {go_bin:?} (gosdk dep not staged?)"
-                );
+        // GOROOT and the `go` binary depend on the selected toolchain:
+        // - Hermetic: the SDK staged into this sandbox by the `gosdk` dep, at the
+        //   deterministic staged path.
+        // - Host (`gotool = "host"`): the host `go` resolved from this process's
+        //   PATH; GOROOT is whatever it reports.
+        // - Target (`gotool = "//pkg:go"`): the `go` staged by the `gosdk` dep at
+        //   a path discovered from the dep's output; GOROOT is whatever it reports
+        //   (auto-detecting a GOROOT tree vs. a bare `go` binary).
+        use crate::plugingo::toolchain::Toolchain;
+        let toolchain = crate::plugingo::toolchain::classify(&def.go_version);
+        let (goroot, go_bin) = match toolchain {
+            Toolchain::Host => {
+                let go_bin = crate::plugingo::toolchain::resolve_host_go()?;
+                let goroot = crate::plugingo::toolchain::go_env_goroot(&go_bin)?;
+                (goroot, go_bin)
             }
-            (goroot, go_bin)
+            Toolchain::Target(_) => {
+                let go_bin = resolve_target_go(&req.inputs)?;
+                let goroot = crate::plugingo::toolchain::go_env_goroot(&go_bin)?;
+                (goroot, go_bin)
+            }
+            Toolchain::Hermetic(v) => {
+                let goroot = req
+                    .sandbox_ws_dir
+                    .join(crate::plugingo::toolchain::staged_goroot(v));
+                let go_bin = goroot.join("bin").join("go");
+                if !go_bin.exists() {
+                    anyhow::bail!(
+                        "go_golist: hermetic go binary missing at {go_bin:?} (gosdk dep not staged?)"
+                    );
+                }
+                (goroot, go_bin)
+            }
         };
         // Sandbox-local build cache so `go list` neither reads nor writes the
         // host GOCACHE.
@@ -301,10 +315,12 @@ impl ManagedDriver for GoGolistDriver {
                 env.insert(name.to_string(), v);
             }
         }
-        // Host toolchain: the `go` subprocess may need PATH (e.g. to locate
-        // ancillary tools). Hermetic mode deliberately omits it to stay
-        // PATH-independent.
-        if host && let Ok(v) = std::env::var("PATH") {
+        // Non-hermetic toolchains: the `go` subprocess (or a hostbin/nix wrapper)
+        // may need PATH — to locate ancillary tools, or for the wrapper itself.
+        // Hermetic mode deliberately omits it to stay PATH-independent.
+        if !matches!(toolchain, Toolchain::Hermetic(_))
+            && let Ok(v) = std::env::var("PATH")
+        {
             env.insert("PATH".to_string(), v);
         }
 
@@ -473,6 +489,54 @@ fn normalize_dir(dir: &str, ws_prefix: &str) -> String {
     }
 }
 
+/// Resolve the `go` binary from a target-ref toolchain (`gotool = "//pkg:go"`)
+/// staged into this sandbox via the `gosdk` dep. The dep's output is either a
+/// full GOROOT tree (we pick its `bin/go`) or a single `go` binary (a hostbin or
+/// nix wrapper); when both shapes appear, prefer a `.../bin/go`. Shared with the
+/// `go_compile` driver, which resolves the same target toolchain in-process.
+pub(crate) fn resolve_target_go(
+    inputs: &[hdriver_support::driver_managed::ManagedRunInput],
+) -> anyhow::Result<std::path::PathBuf> {
+    let prefix = format!("dep|{}|", crate::plugingo::addr_util::GO_SDK_DEP_GROUP);
+    let gosdk = inputs
+        .iter()
+        .find(|m| m.input.origin_id.starts_with(&prefix))
+        .context("go_golist: target toolchain `gosdk` dep not staged")?;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for entry in gosdk
+        .input
+        .artifact
+        .content
+        .as_ref()
+        .walk()
+        .context("walk target toolchain output")?
+    {
+        let entry = entry.context("read target toolchain entry")?;
+        if entry.path.file_name().and_then(|n| n.to_str()) == Some("go") {
+            candidates.push(gosdk.unpack_root.join(&entry.path));
+        }
+    }
+
+    pick_go_binary(candidates).context("go_golist: no `go` binary in target toolchain output")
+}
+
+/// Pick the `go` binary among the toolchain output's `go`-named entries,
+/// preferring a `.../bin/go` (a full GOROOT tree) over a bare `go` wrapper
+/// (hostbin/nix). Returns `None` when no candidate is present.
+pub(crate) fn pick_go_binary(
+    mut candidates: Vec<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    // `false` (parent is `bin`) sorts before `true`. Stable so ties keep input order.
+    candidates.sort_by_key(|p| {
+        p.parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            != Some("bin")
+    });
+    candidates.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +545,26 @@ mod tests {
 
     fn driver() -> GoGolistDriver {
         GoGolistDriver::new()
+    }
+
+    #[test]
+    fn test_pick_go_binary_prefers_goroot_tree_bin_go() {
+        use std::path::PathBuf;
+        // hostbin wrapper only → use it.
+        assert_eq!(
+            pick_go_binary(vec![PathBuf::from("__heph/hostbin/go")]),
+            Some(PathBuf::from("__heph/hostbin/go"))
+        );
+        // Both a wrapper and a full tree → prefer the tree's bin/go.
+        assert_eq!(
+            pick_go_binary(vec![
+                PathBuf::from("ws/wrap/go"),
+                PathBuf::from("ws/sdk/go/bin/go"),
+            ]),
+            Some(PathBuf::from("ws/sdk/go/bin/go"))
+        );
+        // No candidates → None.
+        assert_eq!(pick_go_binary(vec![]), None);
     }
 
     fn make_parse_request(

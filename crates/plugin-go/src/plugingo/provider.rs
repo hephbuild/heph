@@ -216,15 +216,19 @@ impl Provider {
         // `gotool` selects the Go toolchain and is REQUIRED — there is no
         // implicit default. Set it to:
         //   - `"host"` → use the host `go` (read from PATH / `go env GOROOT`
-        //     inside the sandbox; non-hermetic, see [`toolchain::HOST`]), or
+        //     inside the sandbox; non-hermetic, see [`toolchain::HOST`]),
         //   - a pinned version like `"1.26.4"` → download + manage that SDK
-        //     hermetically (`//@heph/go/toolchain/<version>:go`).
+        //     hermetically (`//@heph/go/toolchain/<version>:go`), or
+        //   - a target address like `"//@heph/bin:go"` (host `go` via the hostbin
+        //     provider) or `"//some/pkg:go"` (e.g. a nix-built `go`) → use the
+        //     `go` produced by that target (see [`toolchain::is_target_ref`]).
         hplugin::config::deny_unknown("go provider", opts, &["gotool", "skip", "checksums"])?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "go provider: `gotool` is required — set it to \"host\" (use the host go) \
-                     or a pinned version like \"{}\" (hermetic SDK download)",
+                    "go provider: `gotool` is required — set it to \"host\" (use the host go), \
+                     a pinned version like \"{}\" (hermetic SDK download), or a target address \
+                     like \"//@heph/bin:go\" (a target that produces the go toolchain)",
                     toolchain::DEFAULT_GO_VERSION
                 )
             })?;
