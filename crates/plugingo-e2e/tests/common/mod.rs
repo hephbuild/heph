@@ -199,7 +199,7 @@ fn make_workspace_ordered(
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
         .with_managed_driver(Box::new(plugingo::GoGolistDriver::new()))
         .with_managed_driver(Box::new(plugingo::GoToolchainDriver))
-        .with_managed_driver(Box::new(plugingo::GoEmbedDriver))
+        .with_managed_driver(Box::new(plugingo::GoCompileDriver::new()))
         .build()
         .context("build plugingo workspace")
 }

@@ -1265,11 +1265,12 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                let embed_addr = if !pkg.embed_patterns.is_empty() || !pkg.embed_files.is_empty() {
-                    Some(self.make_addr_with_name(&addr.package, "embed", &factors))
-                } else {
-                    None
-                };
+                // The package embeds iff `go list` reported any embed pattern/file.
+                // `go_compile` resolves the embedcfg in-process from `_golist`'s
+                // package.bin — no separate `go_embed` target. Pass the golist
+                // addr only when embedding.
+                let embedding = !pkg.embed_patterns.is_empty() || !pkg.embed_files.is_empty();
+                let embed_golist = if embedding { Some(&golist_addr) } else { None };
 
                 let pkg_addrs = self
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
@@ -1285,15 +1286,14 @@ impl ProviderInner {
                         &pkg_addrs.s_files,
                         &pkg_addrs.h_files,
                         &pkg_addrs.extra_h_files,
-                        embed_addr.as_ref(),
+                        embed_golist,
                         &pkg_addrs.embed_files,
                         &self.go_version,
                     ),
                     _ => {
-                        // `go_embed_src` assets are staged for the compile (read-only,
-                        // sharing the embed target's stage) so `-embedcfg` finds the
-                        // real bytes. Only when the package actually has embeds.
-                        let embed_src_addrs = if embed_addr.is_some() {
+                        // `go_embed_src` assets (kept out of `_golist`) are staged
+                        // for the compile so the in-driver embedcfg finds the bytes.
+                        let embed_src_addrs = if embedding {
                             compute_embed_src_addrs(addr.package.as_str(), &req.states)
                                 .map_err(GetError::Other)?
                         } else {
@@ -1307,7 +1307,7 @@ impl ProviderInner {
                             &transitive.libs,
                             &pkg_addrs.go_files,
                             &self.go_version,
-                            embed_addr.as_ref(),
+                            embed_golist,
                             &pkg_addrs.embed_files,
                             &embed_src_addrs,
                         )
@@ -1416,15 +1416,15 @@ impl ProviderInner {
                     || !pkg.embed_files.is_empty()
                     || !pkg.test_embed_patterns.is_empty()
                     || !pkg.test_embed_files.is_empty();
-                let embed_addr = if has_any_embed {
-                    Some(self.make_addr_with_name(&addr.package, "embed_test", &factors))
+                let embed_golist = if has_any_embed {
+                    Some(&golist_addr)
                 } else {
                     None
                 };
 
                 let mut test_embed_files = pkg_addrs.embed_files.clone();
                 test_embed_files.extend(pkg_addrs.test_embed_files.iter().cloned());
-                let embed_src_addrs = if embed_addr.is_some() {
+                let embed_src_addrs = if has_any_embed {
                     compute_embed_src_addrs(addr.package.as_str(), &req.states)
                         .map_err(GetError::Other)?
                 } else {
@@ -1438,7 +1438,7 @@ impl ProviderInner {
                     &transitive.libs,
                     &pkg_addrs.go_files,
                     &pkg_addrs.test_go_files,
-                    embed_addr.as_ref(),
+                    embed_golist,
                     &test_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
@@ -1517,14 +1517,15 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                let xtest_embed_addr =
-                    if !pkg.xtest_embed_patterns.is_empty() || !pkg.xtest_embed_files.is_empty() {
-                        Some(self.make_addr_with_name(&addr.package, "embed_xtest", &factors))
-                    } else {
-                        None
-                    };
+                let xtest_embedding =
+                    !pkg.xtest_embed_patterns.is_empty() || !pkg.xtest_embed_files.is_empty();
+                let xtest_embed_golist = if xtest_embedding {
+                    Some(&golist_addr)
+                } else {
+                    None
+                };
 
-                let embed_src_addrs = if xtest_embed_addr.is_some() {
+                let embed_src_addrs = if xtest_embedding {
                     compute_embed_src_addrs(addr.package.as_str(), &req.states)
                         .map_err(GetError::Other)?
                 } else {
@@ -1537,7 +1538,7 @@ impl ProviderInner {
                     &factors,
                     &rewritten_libs,
                     &pkg_addrs.xtest_go_files,
-                    xtest_embed_addr.as_ref(),
+                    xtest_embed_golist,
                     &pkg_addrs.xtest_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
@@ -1811,55 +1812,8 @@ impl ProviderInner {
                 );
                 Ok(GetResponse { target_spec: spec })
             }
-            "embed" => {
-                if pkg.embed_patterns.is_empty() && pkg.embed_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                let embed_src_addrs = compute_embed_src_addrs(addr.package.as_str(), &req.states)
-                    .map_err(GetError::Other)?;
-                Ok(GetResponse {
-                    target_spec: build_embed_spec(
-                        addr.clone(),
-                        &golist_addr,
-                        "embed",
-                        &embed_src_addrs,
-                    ),
-                })
-            }
-            "embed_test" => {
-                let has_any = !pkg.embed_patterns.is_empty()
-                    || !pkg.embed_files.is_empty()
-                    || !pkg.test_embed_patterns.is_empty()
-                    || !pkg.test_embed_files.is_empty();
-                if !has_any {
-                    return Err(GetError::NotFound);
-                }
-                let embed_src_addrs = compute_embed_src_addrs(addr.package.as_str(), &req.states)
-                    .map_err(GetError::Other)?;
-                Ok(GetResponse {
-                    target_spec: build_embed_spec(
-                        addr.clone(),
-                        &golist_addr,
-                        "test_embed",
-                        &embed_src_addrs,
-                    ),
-                })
-            }
-            "embed_xtest" => {
-                if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                let embed_src_addrs = compute_embed_src_addrs(addr.package.as_str(), &req.states)
-                    .map_err(GetError::Other)?;
-                Ok(GetResponse {
-                    target_spec: build_embed_spec(
-                        addr.clone(),
-                        &golist_addr,
-                        "xtest_embed",
-                        &embed_src_addrs,
-                    ),
-                })
-            }
+            // `embed` / `embed_test` / `embed_xtest` targets are gone — the
+            // `go_compile` driver resolves the embedcfg in-process.
             _ => Err(GetError::NotFound),
         }
     }
@@ -2510,50 +2464,6 @@ impl ProviderInner {
     }
 }
 
-fn build_embed_spec(
-    addr: Addr,
-    golist_addr: &Addr,
-    variant: &str,
-    embed_src_addrs: &[String],
-) -> hplugin::provider::TargetSpec {
-    use hcore::htvalue::Value;
-    use std::collections::HashMap;
-
-    let golist_dep = format!("{}|pkg", golist_addr.format());
-
-    let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("variant".to_string(), Value::String(variant.to_string()));
-    let mut deps_map: HashMap<String, Value> = HashMap::new();
-    deps_map.insert(
-        "golist".to_string(),
-        Value::List(vec![Value::String(golist_dep)]),
-    );
-    // The `go_embed_src` lane: assets `go list` never saw. The driver re-globs
-    // these against the package's `EmbedPatterns` to reproduce Go's EmbedFiles.
-    if !embed_src_addrs.is_empty() {
-        deps_map.insert(
-            "embed_src".to_string(),
-            Value::List(embed_src_addrs.iter().cloned().map(Value::String).collect()),
-        );
-    }
-    config.insert("deps".to_string(), Value::Map(deps_map));
-    config.insert(
-        "out".to_string(),
-        Value::Map(HashMap::from([(
-            "cfg".to_string(),
-            Value::List(vec![Value::String("embedcfg".to_string())]),
-        )])),
-    );
-
-    hplugin::provider::TargetSpec {
-        addr,
-        driver: "go_embed".to_string(),
-        config,
-        labels: vec![],
-        transitive: Default::default(),
-    }
-}
-
 /// Build a synthetic `GoPackage` representing the `main` package of a
 /// testmain.go file. Only `imports` is set — used to drive
 /// `collect_direct_libs` resolution.
@@ -3148,7 +3058,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -3330,7 +3240,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("lib", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -3609,25 +3519,20 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     // ---- with_embed ----
 
     #[tokio::test]
-    async fn test_with_embed_has_embed_target() {
+    async fn test_with_embed_no_separate_embed_target() {
+        // The `embed` target is gone — the go_compile driver resolves the
+        // embedcfg in-process.
         require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "embed"))
-            .await
-            .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_embed");
-        let out = match resp.target_spec.config.get("out").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!(),
-        };
-        assert!(out.contains_key("cfg"));
+        let result = provider_get(&p, make_addr("server", "embed")).await;
+        assert!(matches!(result, Err(GetError::NotFound)));
     }
 
     // ---- factors ----
 
     #[tokio::test]
-    async fn test_factors_linux_amd64_runtime_env() {
+    async fn test_factors_linux_amd64_in_compile_config() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -3638,20 +3543,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             Addr::new(PkgBuf::from(""), "build_lib".to_string(), args)
         };
         let resp = provider_get(&p, addr).await.unwrap();
-        let runtime_env = match resp.target_spec.config.get("runtime_env").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!("expected map"),
-        };
-        assert!(
-            matches!(runtime_env.get("GOOS"), Some(Value::String(s)) if s == "linux"),
-            "GOOS should be linux, got {:?}",
-            runtime_env.get("GOOS")
-        );
-        assert!(
-            matches!(runtime_env.get("GOARCH"), Some(Value::String(s)) if s == "amd64"),
-            "GOARCH should be amd64, got {:?}",
-            runtime_env.get("GOARCH")
-        );
+        let cfg = &resp.target_spec.config;
+        assert!(matches!(cfg.get("goos"), Some(Value::String(s)) if s == "linux"));
+        assert!(matches!(cfg.get("goarch"), Some(Value::String(s)) if s == "amd64"));
     }
 
     // ---- with_embed ----
@@ -3664,7 +3558,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("server", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
         let out = match resp.target_spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!(),
@@ -3673,7 +3567,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
-    async fn test_with_embed_build_lib_has_embed_dep() {
+    async fn test_with_embed_build_lib_resolves_embed_in_driver() {
         require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -3684,54 +3578,26 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
+        // No separate `embed` target; the compile reads golist's package.bin.
         assert!(
-            deps.contains_key("embed"),
-            "build_lib for embed package must depend on the embed target: {:?}",
-            deps.keys().collect::<Vec<_>>()
+            !deps.contains_key("embed"),
+            "build_lib must not dep on a separate embed target"
         );
-    }
-
-    #[tokio::test]
-    async fn test_with_embed_build_lib_run_has_embedcfg_flag() {
-        require_go!();
-        let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "build_lib"))
-            .await
-            .unwrap();
-        let run = run_str(&resp.target_spec);
-        assert!(
-            run.contains("-embedcfg"),
-            "build_lib run script must contain -embedcfg for embed package: {run}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_with_embed_embed_target_has_golist_dep() {
-        require_go!();
-        let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "embed"))
-            .await
-            .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_embed");
-        let deps = match resp.target_spec.config.get("deps").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!("expected deps map"),
-        };
         assert!(
             deps.contains_key("golist"),
-            "embed spec must dep on golist output"
+            "embedding build_lib must dep on golist for EmbedPatterns: {:?}",
+            deps.keys().collect::<Vec<_>>()
         );
-        let variant = match resp.target_spec.config.get("variant").unwrap() {
-            Value::String(s) => s.as_str(),
-            _ => panic!("expected string"),
+        let variant = match resp.target_spec.config.get("embed_variant").unwrap() {
+            Value::List(v) => v,
+            _ => panic!("embed_variant must be a list"),
         };
-        assert_eq!(variant, "embed");
+        assert_eq!(variant.len(), 1, "embedding package sets one embed_variant");
+        assert!(matches!(&variant[0], Value::String(s) if s == "embed"));
     }
 
     #[tokio::test]
-    async fn test_simple_lib_build_lib_no_embed_dep() {
+    async fn test_simple_lib_build_lib_no_embed() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -3740,15 +3606,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
+        assert!(!deps.contains_key("embed"));
         assert!(
-            !deps.contains_key("embed"),
-            "build_lib for non-embed package must not have 'embed' dep"
+            !deps.contains_key("golist"),
+            "non-embed build_lib must not dep on golist"
         );
-        let run = run_str(&resp.target_spec);
-        assert!(
-            !run.contains("-embedcfg"),
-            "build_lib for non-embed package must not include -embedcfg: {run}"
-        );
+        let variant = match resp.target_spec.config.get("embed_variant").unwrap() {
+            Value::List(v) => v,
+            _ => panic!("embed_variant must be a list"),
+        };
+        assert!(variant.is_empty(), "non-embed package has no embed_variant");
     }
 
     #[tokio::test]
@@ -4009,7 +3876,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("pkg", "build_test_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -4168,7 +4035,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("mod-asm");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -4190,22 +4057,23 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         };
 
-        let run = run_str(&resp.target_spec);
-
-        // Only assert asm steps when the package actually has .s files on this platform.
-        // If SFiles is empty for this arch, tool asm won't appear and that's correct.
-        if run.contains("tool asm") {
+        let cfg = &resp.target_spec.config;
+        let s_files = match cfg.get("s_files").unwrap() {
+            Value::List(v) => v,
+            _ => panic!("s_files must be a list"),
+        };
+        // Only assert the asm wiring when the package actually has .s files on
+        // this platform; the go_compile driver derives the asm/symabis/pack
+        // steps from s_files at run time.
+        if !s_files.is_empty() {
+            let deps = match cfg.get("deps").unwrap() {
+                Value::Map(m) => m,
+                _ => panic!("deps must be a map"),
+            };
             assert!(
-                run.contains("tool pack r"),
-                "asm package must pack .o files: {run}"
-            );
-            assert!(
-                run.contains("-asmhdr"),
-                "asm package compile step must emit -asmhdr: {run}"
-            );
-            assert!(
-                run.contains("$GOROOT/pkg/include"),
-                "asm step must include GOROOT/pkg/include: {run}"
+                deps.contains_key("asm"),
+                "asm package must stage its .s sources in the `asm` dep group: {:?}",
+                deps.keys().collect::<Vec<_>>()
             );
         }
     }

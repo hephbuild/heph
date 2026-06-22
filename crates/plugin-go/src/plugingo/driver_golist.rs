@@ -240,8 +240,8 @@ impl ManagedDriver for GoGolistDriver {
         // `gotool = "host"` — the host `go` resolved from this process's PATH.
         let host = crate::plugingo::toolchain::is_host(&def.go_version);
         let (goroot, go_bin) = if host {
-            let go_bin = resolve_host_go()?;
-            let goroot = host_goroot(&go_bin)?;
+            let go_bin = crate::plugingo::toolchain::resolve_host_go()?;
+            let goroot = crate::plugingo::toolchain::host_goroot(&go_bin)?;
             (goroot, go_bin)
         } else {
             let goroot = req
@@ -466,45 +466,6 @@ fn normalize_dir(dir: &str, ws_prefix: &str) -> String {
     } else {
         dir.to_string()
     }
-}
-
-/// Resolve the host `go` binary from this process's `PATH` — used for
-/// `go list` when the provider selects `gotool = "host"`.
-fn resolve_host_go() -> anyhow::Result<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")
-        .ok_or_else(|| anyhow::anyhow!("go_golist host toolchain: PATH not set"))?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join("go");
-        if std::fs::metadata(&cand)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            return Ok(cand);
-        }
-    }
-    anyhow::bail!("go_golist host toolchain: `go` not found on PATH")
-}
-
-/// Query `GOROOT` from the host `go` binary.
-fn host_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let out = std::process::Command::new(go_bin)
-        .args(["env", "GOROOT"])
-        .output()
-        .with_context(|| format!("run {go_bin:?} env GOROOT"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "`{go_bin:?} env GOROOT` failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let goroot = String::from_utf8(out.stdout)
-        .context("go env GOROOT output is not utf8")?
-        .trim()
-        .to_string();
-    if goroot.is_empty() {
-        anyhow::bail!("`{go_bin:?} env GOROOT` returned empty");
-    }
-    Ok(std::path::PathBuf::from(goroot))
 }
 
 #[cfg(test)]

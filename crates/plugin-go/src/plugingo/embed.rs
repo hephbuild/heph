@@ -1,50 +1,4 @@
-#[cfg(test)]
-use anyhow::Context;
-#[cfg(test)]
-use hcore::htvalue::Value;
-#[cfg(test)]
-use hmodel::htaddr::Addr;
-#[cfg(test)]
-use hplugin::provider::TargetSpec;
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::HashMap;
-
-/// Build the `embed` target spec.
-/// Encodes the embedcfg JSON for `go tool compile -embedcfg` purely from the
-/// `embed_patterns` and `embed_files` lists produced by `go list` — no
-/// filesystem access. The cfg `Files` map is therefore guaranteed to align with
-/// what downstream `build_lib` sandboxes stage (also derived from `EmbedFiles`).
-#[cfg(test)]
-pub fn build_spec(
-    addr: Addr,
-    embed_patterns: &[String],
-    embed_files: &[String],
-) -> anyhow::Result<TargetSpec> {
-    let cfg_json =
-        compute_embed_cfg_json(embed_patterns, embed_files).context("compute embed cfg json")?;
-
-    // Escape single quotes so the JSON can be embedded in a shell single-quoted string.
-    let escaped_json = cfg_json.replace('\'', "'\\''");
-    let run = format!("printf '%s\\n' '{escaped_json}' > embedcfg\n");
-
-    let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
-    config.insert(
-        "out".to_string(),
-        Value::Map(HashMap::from([(
-            "cfg".to_string(),
-            Value::List(vec![Value::String("embedcfg".to_string())]),
-        )])),
-    );
-    Ok(TargetSpec {
-        addr,
-        driver: "sh".to_string(),
-        config,
-        labels: vec![],
-        transitive: Default::default(),
-    })
-}
 
 /// Group `embed_files` (Go's resolved EmbedFiles list) by the pattern that
 /// matches them. Pure path-based matching: no filesystem access.
@@ -188,6 +142,25 @@ pub fn select_pattern_files(pattern: &str, files: &[String]) -> Vec<String> {
     matched
 }
 
+/// Union Go's authoritative `EmbedFiles` (`go_src`, already resolved by
+/// `go list`) with the selector's resolution of the `go_embed_src` files for
+/// each pattern. Returns a sorted, deduped package-relative file list.
+pub fn merge_embed_files(
+    go_src_files: Vec<String>,
+    patterns: &[String],
+    embed_src_rel: &[String],
+) -> Vec<String> {
+    let mut files = go_src_files;
+    if !embed_src_rel.is_empty() {
+        for pattern in patterns {
+            files.extend(select_pattern_files(pattern, embed_src_rel));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
 /// Produce the JSON string expected by `go tool compile -embedcfg`.
 ///
 /// `embed_files` (from `go list EmbedFiles`) is Go's authoritative resolved
@@ -245,74 +218,6 @@ pub fn compute_embed_cfg_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmodel::htpkg::PkgBuf;
-
-    fn test_addr() -> Addr {
-        Addr::new(
-            PkgBuf::from("mylib"),
-            "embed".to_string(),
-            Default::default(),
-        )
-    }
-
-    #[test]
-    fn test_embed_driver_is_bash() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        assert_eq!(spec.driver, "sh");
-    }
-
-    #[test]
-    fn test_embed_out_cfg_group() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        let out = spec.config.get("out").unwrap();
-        assert!(matches!(out, Value::Map(m) if m.contains_key("cfg")));
-    }
-
-    #[test]
-    fn test_embed_run_emits_embedcfg() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        assert!(
-            run.contains("embedcfg"),
-            "run must reference embedcfg: {run}"
-        );
-    }
-
-    #[test]
-    fn test_embed_run_contains_pattern() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        assert!(
-            run.contains("static/index.html"),
-            "run must contain the embed pattern in the JSON: {run}"
-        );
-    }
 
     #[test]
     fn test_embed_files_paths_are_relative() {
