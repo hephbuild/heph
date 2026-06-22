@@ -23,6 +23,7 @@ pub fn build_spec(
     go_version: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    embed_src_addrs: &[String],
 ) -> TargetSpec {
     let out_file = archive_filename(import_path);
     // Go requires the main package to be compiled with -p "main" so the linker
@@ -75,6 +76,21 @@ pub fn build_spec(
             ),
         );
     }
+    // `go_embed_src` assets (e.g. a frontend bundle) staged into their own group
+    // at pkg-relative paths so `-embedcfg` finds them. Marked read-only below so
+    // they materialize once into the shared stage and hardlink into both this
+    // sandbox and the `embed` target's — no second byte-copy of large assets.
+    if !embed_src_addrs.is_empty() {
+        deps.insert(
+            "embed_src".to_string(),
+            Value::List(
+                embed_src_addrs
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
         deps.insert(sdk_group, sdk_val);
     }
@@ -82,8 +98,15 @@ pub fn build_spec(
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
-    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
-        config.insert(ro_k, ro_v);
+    let mut read_only_groups: Vec<Value> = Vec::new();
+    if let Some((_, Value::List(v))) = go_sdk_read_only_config(go_version) {
+        read_only_groups.extend(v);
+    }
+    if !embed_src_addrs.is_empty() {
+        read_only_groups.push(Value::String("embed_src".to_string()));
+    }
+    if !read_only_groups.is_empty() {
+        config.insert("read_only_deps".to_string(), Value::List(read_only_groups));
     }
     if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
         config.insert(pe_k, pe_v);
@@ -196,6 +219,7 @@ mod tests {
             V,
             None,
             &[],
+            &[],
         );
         assert_eq!(spec.driver, "sh");
     }
@@ -211,6 +235,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let out = spec.config.get("out").unwrap();
@@ -229,6 +254,7 @@ mod tests {
             &addrs,
             V,
             None,
+            &[],
             &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
@@ -269,6 +295,7 @@ mod tests {
             V,
             None,
             &[],
+            &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -308,6 +335,7 @@ mod tests {
             V,
             None,
             &[],
+            &[],
         );
         // The SDK is read-only — staged once, hardlinked into each sandbox.
         let ro = match spec
@@ -336,6 +364,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let run = run_str(&spec);
@@ -369,6 +398,7 @@ mod tests {
             V,
             None,
             &[],
+            &[],
         );
         let run = run_str(&spec);
         assert!(
@@ -394,6 +424,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let run = run_str(&spec);
@@ -427,6 +458,7 @@ mod tests {
             V,
             None,
             &[],
+            &[],
         );
         let run = run_str(&spec);
         assert!(run.contains("packagefile fmt="));
@@ -450,6 +482,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
@@ -491,6 +524,7 @@ mod tests {
             V,
             None,
             &[],
+            &[],
         );
         let s2 = build_spec(
             test_addr(),
@@ -501,6 +535,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
 
@@ -520,6 +555,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let env = match spec.config.get("env").unwrap() {
@@ -544,6 +580,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let run = run_str(&spec);
@@ -570,6 +607,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let run = run_str(&spec);
@@ -600,6 +638,7 @@ mod tests {
             V,
             Some(&embed_addr()),
             &[],
+            &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -622,6 +661,70 @@ mod tests {
     }
 
     #[test]
+    fn test_embed_src_addrs_add_read_only_group() {
+        // go_embed_src assets get their own dep group, staged read-only so they
+        // share the embed target's stage instead of being copied a second time.
+        let spec = build_spec(
+            test_addr(),
+            "example.com/mylib",
+            "mylib",
+            &test_factors(),
+            &[],
+            &src_addrs(),
+            V,
+            Some(&embed_addr()),
+            &[],
+            &["//mylib:frontend".to_string()],
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        assert!(
+            deps.contains_key("embed_src"),
+            "deps must have embed_src group: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+        let ro = match spec
+            .config
+            .get("read_only_deps")
+            .expect("read_only_deps set")
+        {
+            Value::List(v) => v,
+            _ => panic!("read_only_deps must be a list"),
+        };
+        assert!(
+            ro.iter()
+                .any(|e| matches!(e, Value::String(s) if s == "embed_src")),
+            "embed_src group must be marked read-only: {ro:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_embed_src_group_when_absent() {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/mylib",
+            "mylib",
+            &test_factors(),
+            &[],
+            &src_addrs(),
+            V,
+            None,
+            &[],
+            &[],
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        assert!(
+            !deps.contains_key("embed_src"),
+            "no embed_src group when no go_embed_src addrs"
+        );
+    }
+
+    #[test]
     fn test_with_embed_addr_run_contains_embedcfg_flag() {
         let spec = build_spec(
             test_addr(),
@@ -632,6 +735,7 @@ mod tests {
             &src_addrs(),
             V,
             Some(&embed_addr()),
+            &[],
             &[],
         );
         let run = run_str(&spec);
@@ -657,6 +761,7 @@ mod tests {
             V,
             None,
             &[],
+            &[],
         );
         assert!(
             spec.labels.contains(&"go-build".to_string()),
@@ -676,6 +781,7 @@ mod tests {
             &src_addrs(),
             V,
             None,
+            &[],
             &[],
         );
         let run = run_str(&spec);

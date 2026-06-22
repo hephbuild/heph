@@ -37,6 +37,7 @@ pub fn build_test_lib_spec(
     test_src_addrs: &[String],
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    embed_src_addrs: &[String],
     go_version: &str,
 ) -> TargetSpec {
     let out_file = format!("{}_test.a", package_name);
@@ -54,6 +55,7 @@ pub fn build_test_lib_spec(
         src_addrs.iter().chain(test_src_addrs.iter()).cloned(),
         embed_addr,
         embed_file_addrs,
+        embed_src_addrs,
         run,
         out_file,
         go_version,
@@ -73,6 +75,7 @@ pub fn build_xtest_lib_spec(
     xtest_src_addrs: &[String],
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    embed_src_addrs: &[String],
     go_version: &str,
 ) -> TargetSpec {
     // xtest package import path is "<import_path>_test"
@@ -92,6 +95,7 @@ pub fn build_xtest_lib_spec(
         xtest_src_addrs.iter().cloned(),
         embed_addr,
         embed_file_addrs,
+        embed_src_addrs,
         run,
         out_file,
         go_version,
@@ -117,6 +121,7 @@ pub fn build_testmain_lib_spec(
         testmain_libs,
         std::iter::once(testmain_src_addr.format()),
         None,
+        &[],
         &[],
         run,
         out_file,
@@ -332,6 +337,7 @@ fn build_lib_spec_inner(
     src_addrs: impl Iterator<Item = String>,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    embed_src_addrs: &[String],
     run: Vec<String>,
     out_file: String,
     go_version: &str,
@@ -367,6 +373,18 @@ fn build_lib_spec_inner(
             ),
         );
     }
+    // `go_embed_src` assets staged read-only (see [`target_lib::build_spec`]).
+    if !embed_src_addrs.is_empty() {
+        deps.insert(
+            "embed_src".to_string(),
+            Value::List(
+                embed_src_addrs
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
         deps.insert(sdk_group, sdk_val);
     }
@@ -377,8 +395,15 @@ fn build_lib_spec_inner(
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(full_run));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
-    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
-        config.insert(ro_k, ro_v);
+    let mut read_only_groups: Vec<Value> = Vec::new();
+    if let Some((_, Value::List(v))) = go_sdk_read_only_config(go_version) {
+        read_only_groups.extend(v);
+    }
+    if !embed_src_addrs.is_empty() {
+        read_only_groups.push(Value::String("embed_src".to_string()));
+    }
+    if !read_only_groups.is_empty() {
+        config.insert("read_only_deps".to_string(), Value::List(read_only_groups));
     }
     if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
         config.insert(pe_k, pe_v);
@@ -464,6 +489,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
             V,
         );
         assert_eq!(spec.driver, "sh");
@@ -480,6 +506,7 @@ mod tests {
             &src_addrs("pkg"),
             &[],
             None,
+            &[],
             &[],
             V,
         );
@@ -514,6 +541,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
             V,
         );
         let run = run_str(&spec);
@@ -539,6 +567,7 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             None,
+            &[],
             &[],
             V,
         );
@@ -571,6 +600,7 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             None,
+            &[],
             &[],
             V,
         );
@@ -713,6 +743,7 @@ mod tests {
             &src_addrs("pkg"),
             &[],
             None,
+            &[],
             &[],
             V,
         );
@@ -902,6 +933,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
             V,
         );
         assert!(
@@ -921,6 +953,7 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             None,
+            &[],
             &[],
             V,
         );

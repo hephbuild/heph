@@ -1036,6 +1036,48 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     Ok(addrs)
 }
 
+/// Pick the closest (deepest) ancestor state carrying `go_embed_deps`. Mirrors
+/// [`pick_codegen_deps`] for the embed-only lane.
+fn pick_embed_deps(states: &[State]) -> Option<&State> {
+    states
+        .iter()
+        .filter(|s| s.state.contains_key("go_embed_deps"))
+        .max_by_key(|s| s.package.as_str().len())
+}
+
+/// Address set for the `go_embed_src` lane: targets whose outputs are consumed
+/// *only* via `//go:embed`, never parsed by `go list`.
+///
+/// Deliberately **excluded from `_golist`** (unlike [`compute_pkg_src_addrs`]),
+/// so an expensive asset build — e.g. a frontend bundle — never blocks
+/// list/query/metadata or `go list` itself. The patterns are still reported by
+/// `go list` (parsed from the `.go` source); the `go_embed` driver resolves them
+/// against these staged files downstream, and `build_lib` stages them for the
+/// compile. Sources:
+/// 1. `query("label(go_embed_src) && tree_output(pkg) && …")` — codegen targets
+///    labelled `go_embed_src`.
+/// 2. `go_embed_deps` from the closest ancestor BUILD state — explicit embed
+///    targets that don't carry the label.
+fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
+    let codegen_root = pick_codegen_root(states);
+    let scope = match codegen_root {
+        Some(root) => pkg_prefix_pattern(root.package.as_str()),
+        None => pkg_pattern(pkg_str),
+    };
+    let expr = format!("label(go_embed_src) && tree_output({pkg_str}) && {scope}");
+    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &[]);
+    let mut addrs = vec![query_addr.format()];
+
+    if let Some(deps_state) = pick_embed_deps(states)
+        && let Some(deps_val) = deps_state.state.get("go_embed_deps")
+    {
+        let deps =
+            parse_strings(deps_val).context("parsing go_embed_deps from go provider_state")?;
+        addrs.extend(deps);
+    }
+    Ok(addrs)
+}
+
 impl ProviderInner {
     async fn handle_get(self: Arc<Self>, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
@@ -1247,17 +1289,29 @@ impl ProviderInner {
                         &pkg_addrs.embed_files,
                         &self.go_version,
                     ),
-                    _ => target_lib::build_spec(
-                        addr.clone(),
-                        &import_path,
-                        pkg.name.as_deref().unwrap_or(""),
-                        &factors,
-                        &transitive.libs,
-                        &pkg_addrs.go_files,
-                        &self.go_version,
-                        embed_addr.as_ref(),
-                        &pkg_addrs.embed_files,
-                    ),
+                    _ => {
+                        // `go_embed_src` assets are staged for the compile (read-only,
+                        // sharing the embed target's stage) so `-embedcfg` finds the
+                        // real bytes. Only when the package actually has embeds.
+                        let embed_src_addrs = if embed_addr.is_some() {
+                            compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                                .map_err(GetError::Other)?
+                        } else {
+                            Vec::new()
+                        };
+                        target_lib::build_spec(
+                            addr.clone(),
+                            &import_path,
+                            pkg.name.as_deref().unwrap_or(""),
+                            &factors,
+                            &transitive.libs,
+                            &pkg_addrs.go_files,
+                            &self.go_version,
+                            embed_addr.as_ref(),
+                            &pkg_addrs.embed_files,
+                            &embed_src_addrs,
+                        )
+                    }
                 };
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1370,6 +1424,12 @@ impl ProviderInner {
 
                 let mut test_embed_files = pkg_addrs.embed_files.clone();
                 test_embed_files.extend(pkg_addrs.test_embed_files.iter().cloned());
+                let embed_src_addrs = if embed_addr.is_some() {
+                    compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                        .map_err(GetError::Other)?
+                } else {
+                    Vec::new()
+                };
                 let spec = target_test::build_test_lib_spec(
                     addr.clone(),
                     &import_path,
@@ -1380,6 +1440,7 @@ impl ProviderInner {
                     &pkg_addrs.test_go_files,
                     embed_addr.as_ref(),
                     &test_embed_files,
+                    &embed_src_addrs,
                     &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
@@ -1463,6 +1524,12 @@ impl ProviderInner {
                         None
                     };
 
+                let embed_src_addrs = if xtest_embed_addr.is_some() {
+                    compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                        .map_err(GetError::Other)?
+                } else {
+                    Vec::new()
+                };
                 let spec = target_test::build_xtest_lib_spec(
                     addr.clone(),
                     &import_path,
@@ -1472,6 +1539,7 @@ impl ProviderInner {
                     &pkg_addrs.xtest_go_files,
                     xtest_embed_addr.as_ref(),
                     &pkg_addrs.xtest_embed_files,
+                    &embed_src_addrs,
                     &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
@@ -1747,8 +1815,15 @@ impl ProviderInner {
                 if pkg.embed_patterns.is_empty() && pkg.embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
+                let embed_src_addrs = compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "embed"),
+                    target_spec: build_embed_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        "embed",
+                        &embed_src_addrs,
+                    ),
                 })
             }
             "embed_test" => {
@@ -1759,16 +1834,30 @@ impl ProviderInner {
                 if !has_any {
                     return Err(GetError::NotFound);
                 }
+                let embed_src_addrs = compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "test_embed"),
+                    target_spec: build_embed_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        "test_embed",
+                        &embed_src_addrs,
+                    ),
                 })
             }
             "embed_xtest" => {
                 if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
+                let embed_src_addrs = compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "xtest_embed"),
+                    target_spec: build_embed_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        "xtest_embed",
+                        &embed_src_addrs,
+                    ),
                 })
             }
             _ => Err(GetError::NotFound),
@@ -2425,6 +2514,7 @@ fn build_embed_spec(
     addr: Addr,
     golist_addr: &Addr,
     variant: &str,
+    embed_src_addrs: &[String],
 ) -> hplugin::provider::TargetSpec {
     use hcore::htvalue::Value;
     use std::collections::HashMap;
@@ -2438,6 +2528,14 @@ fn build_embed_spec(
         "golist".to_string(),
         Value::List(vec![Value::String(golist_dep)]),
     );
+    // The `go_embed_src` lane: assets `go list` never saw. The driver re-globs
+    // these against the package's `EmbedPatterns` to reproduce Go's EmbedFiles.
+    if !embed_src_addrs.is_empty() {
+        deps_map.insert(
+            "embed_src".to_string(),
+            Value::List(embed_src_addrs.iter().cloned().map(Value::String).collect()),
+        );
+    }
     config.insert("deps".to_string(), Value::Map(deps_map));
     config.insert(
         "out".to_string(),
@@ -4665,6 +4763,47 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             srcfiles.iter().any(|s| s == "//codegen:gen"),
             "go_codegen_deps must be appended to srcfiles, got: {srcfiles:?}"
+        );
+    }
+
+    #[test]
+    fn compute_embed_src_addrs_has_label_query_and_appends_deps() {
+        let mut state_map = HashMap::new();
+        state_map.insert(
+            "go_embed_deps".to_string(),
+            Value::List(vec![Value::String("//ui:dist".to_string())]),
+        );
+        let states = vec![State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: state_map,
+        }];
+        let addrs = compute_embed_src_addrs("pkg", &states).unwrap();
+        assert!(
+            addrs
+                .iter()
+                .any(|s| s.contains("label(go_embed_src)") && s.contains("tree_output(")),
+            "must query go_embed_src tree outputs: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|s| s == "//ui:dist"),
+            "go_embed_deps must be appended: {addrs:?}"
+        );
+    }
+
+    #[test]
+    fn compute_pkg_src_addrs_excludes_go_embed_src_lane() {
+        // Decoupling guarantee: `_golist`'s source set pulls the `go_src` lane but
+        // never `go_embed_src`, so an expensive asset build (frontend bundle) can
+        // never block `go list` / query / metadata.
+        let addrs = compute_pkg_src_addrs("pkg", &[]).unwrap();
+        assert!(
+            addrs.iter().any(|s| s.contains("label(go_src)")),
+            "go_src lane must be present in golist srcfiles: {addrs:?}"
+        );
+        assert!(
+            !addrs.iter().any(|s| s.contains("go_embed_src")),
+            "golist srcfiles must NOT reference the go_embed_src lane: {addrs:?}"
         );
     }
 

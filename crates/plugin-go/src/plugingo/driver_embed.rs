@@ -54,13 +54,16 @@ impl Hash for EmbedVariant {
 }
 
 /// Bump to invalidate every cached embed cfg whenever the embed cfg layout
-/// (paths, file resolution semantics) changes.
-const GO_EMBED_FORMAT_VERSION: u32 = 5;
+/// (paths, file resolution semantics) changes. v6: `go_embed_src` lane —
+/// patterns now resolved against staged files, not just `go list EmbedFiles`.
+const GO_EMBED_FORMAT_VERSION: u32 = 6;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct GoEmbedDef {
     variant: EmbedVariant,
     golist_origin_id: String,
+    /// Origin ids of the `go_embed_src` inputs (assets `go list` never saw).
+    embed_src_origin_ids: Vec<String>,
 }
 
 impl Hash for GoEmbedDef {
@@ -68,6 +71,7 @@ impl Hash for GoEmbedDef {
         GO_EMBED_FORMAT_VERSION.hash(state);
         self.variant.hash(state);
         self.golist_origin_id.hash(state);
+        self.embed_src_origin_ids.hash(state);
     }
 }
 
@@ -118,14 +122,50 @@ impl ManagedDriver for GoEmbedDriver {
             });
         }
 
-        // The embed driver only reads `package.bin` from the golist input and
-        // writes a JSON file enumerating Go's `EmbedFiles`. It never opens the
-        // actual embed source files, so they are not staged here — the consumer
-        // (`build_lib` / `build_test_lib`) declares them in its own deps.
+        // The `go_embed_src` lane: assets `go list` never resolved (they are
+        // intentionally kept out of `_golist`). Staged here so the driver can
+        // re-glob them against the package's `EmbedPatterns` and reproduce Go's
+        // `EmbedFiles`. Read-only + per-file: materialized once into the shared
+        // stage and hardlinked file-by-file (the run step reads the list to
+        // enumerate them), shared with the consumer's compile sandbox.
+        let embed_src_origin_ids: Vec<String> = spec
+            .deps
+            .get("embed_src")
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, addr_str)| {
+                        let origin_id = format!("dep|embed_src|{i}");
+                        inputs.push(Input {
+                            r#ref: TargetAddr::parse(addr_str, &pkg)
+                                .with_context(|| format!("parse embed_src dep addr {addr_str}"))?,
+                            mode: InputMode::Standard,
+                            origin_id: origin_id.clone(),
+                            annotations: std::collections::BTreeMap::from([
+                                (
+                                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                                    "true".to_string(),
+                                ),
+                                (
+                                    hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+                                    "true".to_string(),
+                                ),
+                            ]),
+                            hashed: true,
+                            runtime: true,
+                        });
+                        Ok(origin_id)
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         let def = GoEmbedDef {
             variant: spec.variant,
             golist_origin_id,
+            embed_src_origin_ids,
         };
 
         // Parse outputs
@@ -237,7 +277,19 @@ impl ManagedDriver for GoEmbedDriver {
             ),
         };
         let patterns = &patterns_owned;
-        let files = &files_owned;
+
+        // Enumerate the staged `go_embed_src` files (package-relative). These are
+        // assets `go list` never resolved; we re-glob them against `patterns` to
+        // reproduce the `EmbedFiles` Go would have produced, then union with the
+        // `go_src` files `go list` did resolve.
+        let embed_src_rel = if def.embed_src_origin_ids.is_empty() {
+            Vec::new()
+        } else {
+            collect_embed_src_rel(&req, &def.embed_src_origin_ids)
+                .context("enumerate staged go_embed_src files")?
+        };
+        let files = merge_embed_files(files_owned, patterns, &embed_src_rel);
+        let files = &files;
 
         if patterns.is_empty() && files.is_empty() {
             // Write empty embedcfg
@@ -249,9 +301,10 @@ impl ManagedDriver for GoEmbedDriver {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
 
-        // Pure path matching against Go's resolved EmbedFiles list — no
-        // filesystem access. The Files map is guaranteed to align with what
-        // downstream `build_lib` sandboxes stage (also derived from EmbedFiles).
+        // Group the resolved files under each pattern. `go_src` files came from
+        // Go's authoritative `EmbedFiles`; `go_embed_src` files were resolved by
+        // our Go-faithful selector above. Both align with what the consumer's
+        // compile sandbox stages.
         let cfg_json =
             embed::compute_embed_cfg_json(patterns, files).context("compute embedcfg")?;
 
@@ -259,6 +312,55 @@ impl ManagedDriver for GoEmbedDriver {
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
+}
+
+/// Union Go's authoritative `EmbedFiles` (`go_src`, already resolved by
+/// `go list`) with the selector's resolution of the `go_embed_src` files for
+/// each pattern. Returns a sorted, deduped package-relative file list.
+fn merge_embed_files(
+    go_src_files: Vec<String>,
+    patterns: &[String],
+    embed_src_rel: &[String],
+) -> Vec<String> {
+    let mut files = go_src_files;
+    if !embed_src_rel.is_empty() {
+        for pattern in patterns {
+            files.extend(embed::select_pattern_files(pattern, embed_src_rel));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Read the staged `go_embed_src` inputs' list files and return their files as
+/// package-relative, `/`-separated paths — the space `//go:embed` patterns match
+/// against. Read-only per-file staging records every individual file in the list.
+fn collect_embed_src_rel(
+    req: &ManagedRunRequest<'_, '_>,
+    origin_ids: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut rel: Vec<String> = Vec::new();
+    for id in origin_ids {
+        let managed = req
+            .inputs
+            .iter()
+            .find(|m| m.input.origin_id == *id)
+            .ok_or_else(|| anyhow::anyhow!("go_embed: embed_src input {id} not found"))?;
+        let list_path = managed.require_list_path()?;
+        let f = std::fs::File::open(list_path)
+            .with_context(|| format!("open embed_src list {list_path:?}"))?;
+        for line in std::io::BufReader::new(f).lines() {
+            let line = line.context("read embed_src list line")?;
+            if line.is_empty() {
+                continue;
+            }
+            let abs = std::path::Path::new(&line);
+            let r = abs.strip_prefix(&req.sandbox_pkg_dir).unwrap_or(abs);
+            rel.push(r.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(rel)
 }
 
 #[cfg(test)]
@@ -306,6 +408,38 @@ mod tests {
                 transitive: Default::default(),
             }),
         }
+    }
+
+    #[test]
+    fn test_merge_embed_files_unions_go_src_and_embed_src() {
+        // go_src files (from go list) ∪ selector resolution of go_embed_src
+        // assets against the patterns, sorted + deduped.
+        let go_src = vec!["static/x.html".to_string()];
+        // Plain-dir pattern `dist`: recursion skips leading-dot entries (no all:).
+        let patterns = vec!["dist".to_string(), "static/x.html".to_string()];
+        let embed_src = vec![
+            "dist/app.js".to_string(),
+            "dist/index.html".to_string(),
+            "dist/.hidden".to_string(), // excluded by Go's dir-recursion rule
+        ];
+        let merged = merge_embed_files(go_src, &patterns, &embed_src);
+        assert_eq!(
+            merged,
+            vec![
+                "dist/app.js".to_string(),
+                "dist/index.html".to_string(),
+                "static/x.html".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_embed_files_no_embed_src_is_passthrough() {
+        // The common case (no go_embed_src) must be byte-identical to go list's
+        // EmbedFiles — pure addition, zero change for existing packages.
+        let go_src = vec!["b.txt".to_string(), "a.txt".to_string()];
+        let merged = merge_embed_files(go_src, &["*.txt".to_string()], &[]);
+        assert_eq!(merged, vec!["a.txt".to_string(), "b.txt".to_string()]);
     }
 
     #[test]
@@ -402,6 +536,75 @@ mod tests {
         assert!(
             non_golist.is_empty(),
             "embed driver must only declare the golist input, got: {non_golist:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_embed_src_inputs_are_read_only_per_file() {
+        // go_embed_src assets must be staged read-only + per-file: hardlinked
+        // once into the shared stage (shared with the compile sandbox) and
+        // enumerable from the input list so run() can re-glob them.
+        let ct = noop_ctoken();
+        let mut config: HashMap<String, Value> = HashMap::new();
+        config.insert("variant".to_string(), Value::String("embed".to_string()));
+        config.insert(
+            "deps".to_string(),
+            Value::Map(HashMap::from([
+                (
+                    "golist".to_string(),
+                    Value::List(vec![Value::String("//mypkg:_golist|pkg".to_string())]),
+                ),
+                (
+                    "embed_src".to_string(),
+                    Value::List(vec![Value::String("//mypkg:frontend".to_string())]),
+                ),
+            ])),
+        );
+        config.insert(
+            "out".to_string(),
+            Value::Map(HashMap::from([(
+                "cfg".to_string(),
+                Value::List(vec![Value::String("embedcfg".to_string())]),
+            )])),
+        );
+        let req = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: std::sync::Arc::new(TargetSpec {
+                addr: Addr::new(
+                    PkgBuf::from("mypkg"),
+                    "embed".to_string(),
+                    Default::default(),
+                ),
+                driver: "go_embed".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            }),
+        };
+        let resp = driver().parse(req, &ct).await.unwrap();
+        let es = resp
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.origin_id == "dep|embed_src|0")
+            .expect("embed_src input present");
+        assert_eq!(
+            es.annotations
+                .get(hdriver_support::stage::READ_ONLY_ANNOTATION)
+                .map(String::as_str),
+            Some("true"),
+            "embed_src must be read-only"
+        );
+        assert_eq!(
+            es.annotations
+                .get(hdriver_support::stage::STAGE_PER_FILE_ANNOTATION)
+                .map(String::as_str),
+            Some("true"),
+            "embed_src must be staged per-file"
+        );
+        assert_eq!(
+            resp.target_def.def::<GoEmbedDef>().embed_src_origin_ids,
+            vec!["dep|embed_src|0".to_string()]
         );
     }
 
