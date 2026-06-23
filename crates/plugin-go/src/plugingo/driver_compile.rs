@@ -129,7 +129,7 @@ struct GoCompileDef {
 
 /// Bump to invalidate every cached `go_compile` archive whenever the compile
 /// command shape or embed resolution semantics change.
-const GO_COMPILE_FORMAT_VERSION: u32 = 1;
+const GO_COMPILE_FORMAT_VERSION: u32 = 2;
 
 impl Hash for GoCompileDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -139,7 +139,17 @@ impl Hash for GoCompileDef {
         self.goos.hash(state);
         self.goarch.hash(state);
         self.go_version.hash(state);
-        self.import_paths.hash(state);
+        // `import_paths` order is not semantically meaningful — it comes from a
+        // closure walk that dedups through a per-process-randomized `HashSet`,
+        // and `run()` re-sorts before writing importcfg, so the archive is
+        // identical regardless of order. Hash a sorted view so the cache key is
+        // order-invariant at the boundary, independent of how the spec was built.
+        let mut import_paths: Vec<&str> = self.import_paths.iter().map(String::as_str).collect();
+        import_paths.sort_unstable();
+        import_paths.len().hash(state);
+        for ip in import_paths {
+            ip.hash(state);
+        }
         self.s_files.hash(state);
         self.embed_variant.map(|v| v.hash_tag()).hash(state);
         self.golist_origin_id.hash(state);
@@ -739,11 +749,15 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         deps.insert(sdk_group, sdk_val);
     }
 
-    let import_paths: Vec<Value> = p
-        .transitive_libs
-        .iter()
-        .map(|(ip, _)| Value::String(ip.clone()))
-        .collect();
+    // Sort so the config (and thus the GoCompileDef cache key) is independent of
+    // the order `transitive_libs` arrives in. The closure walk dedups imports
+    // through a HashSet whose iteration order is randomized per process; without
+    // this sort the hash flips every run and the whole graph rebuilds even though
+    // run() already sorts before writing importcfg, so the archive is identical.
+    let mut import_paths: Vec<String> =
+        p.transitive_libs.iter().map(|(ip, _)| ip.clone()).collect();
+    import_paths.sort();
+    let import_paths: Vec<Value> = import_paths.into_iter().map(Value::String).collect();
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("p_flag".to_string(), Value::String(p.p_flag));
@@ -933,6 +947,110 @@ mod driver_tests {
                 .get(hdriver_support::stage::READ_ONLY_ANNOTATION)
                 .map(String::as_str),
             Some("true")
+        );
+    }
+
+    fn def_hash(def: &GoCompileDef) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        def.hash(&mut h);
+        h.finish()
+    }
+
+    fn spec_with_libs(libs: &[(String, Addr)]) -> TargetSpec {
+        build_compile_spec(CompileParams {
+            addr: Addr::new(
+                PkgBuf::from("mylib"),
+                "build_lib".to_string(),
+                Default::default(),
+            ),
+            p_flag: "example.com/mylib".to_string(),
+            out_file: "x.a".to_string(),
+            factors: &factors(),
+            go_version: V,
+            transitive_libs: libs,
+            src_addrs: &["//mylib:a.go".to_string()],
+            s_files: &[],
+            s_file_addrs: &[],
+            hdr_addrs: &[],
+            golist_addr: None,
+            embed_variant: "",
+            embed_file_addrs: &[],
+            embed_src_addrs: &[],
+        })
+    }
+
+    // Regression: the closure walk dedups imports through a HashSet whose order
+    // is randomized per process. import_paths must be sorted before it enters
+    // the GoCompileDef hash, or the cache key flips every run and the whole graph
+    // rebuilds even though the produced archive is byte-identical.
+    #[tokio::test]
+    async fn import_path_order_does_not_affect_compile_def_hash() {
+        let lib = |ip: &str, name: &str| {
+            (
+                ip.to_string(),
+                Addr::new(PkgBuf::from("dep"), name.to_string(), Default::default()),
+            )
+        };
+        let forward = [
+            lib("example.com/a", "a"),
+            lib("example.com/b", "b"),
+            lib("example.com/c", "c"),
+        ];
+        let reversed = [
+            lib("example.com/c", "c"),
+            lib("example.com/b", "b"),
+            lib("example.com/a", "a"),
+        ];
+
+        let def_fwd = parse_def(spec_with_libs(&forward)).await;
+        let def_rev = parse_def(spec_with_libs(&reversed)).await;
+        let d_fwd = def_fwd.def::<GoCompileDef>();
+        let d_rev = def_rev.def::<GoCompileDef>();
+
+        assert_eq!(
+            d_fwd.import_paths, d_rev.import_paths,
+            "import_paths must be sorted regardless of input order"
+        );
+        assert_eq!(
+            def_hash(&d_fwd),
+            def_hash(&d_rev),
+            "cache key must not depend on transitive_libs order"
+        );
+    }
+
+    // The boundary guarantee: even a spec that somehow arrives with unsorted
+    // import_paths (e.g. a stale on-disk spec, or a builder that forgot to sort)
+    // must hash identically. This exercises `GoCompileDef::hash` directly,
+    // bypassing `build_compile_spec`'s own sort — the regression the HEPH_DEBUG_HASH
+    // dumps revealed: import_paths reached the hash in HashSet order and flipped
+    // the cache key run-to-run.
+    #[test]
+    fn compile_def_hash_invariant_under_import_path_permutation() {
+        let mk = |ips: &[&str]| GoCompileDef {
+            p_flag: "example.com/mylib".to_string(),
+            out_file: "x.a".to_string(),
+            goos: "linux".to_string(),
+            goarch: "amd64".to_string(),
+            go_version: "1.26.4".to_string(),
+            import_paths: ips.iter().map(|s| s.to_string()).collect(),
+            s_files: vec![],
+            embed_variant: None,
+            golist_origin_id: None,
+            embed_src_origin_ids: vec![],
+        };
+        let a = mk(&["net", "os", "errors", "io", "crypto/rand"]);
+        let b = mk(&["crypto/rand", "io", "net", "errors", "os"]);
+        assert_eq!(
+            def_hash(&a),
+            def_hash(&b),
+            "cache key must be invariant under import_paths order at the hash boundary"
+        );
+        // Sanity: a genuinely different import set still hashes differently.
+        let c = mk(&["net", "os", "errors", "io"]);
+        assert_ne!(
+            def_hash(&a),
+            def_hash(&c),
+            "different import set must differ"
         );
     }
 }
