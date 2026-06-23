@@ -976,7 +976,7 @@ fn pick_codegen_deps(states: &[State]) -> Option<&State> {
 /// glob. Includes:
 /// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
 ///    non-Go sources (e.g. embed targets).
-/// 2. `query("tree_output(pkg) && … && label(go_src)")` — unpacks the full output tree
+/// 2. `query("… && tree_output(pkg) && label(go_src)")` — unpacks the full output tree
 ///    of any codegen target labelled `go_src` into the pkg dir, so both
 ///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
 ///    land in the sandbox.
@@ -1023,11 +1023,11 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
         None => pkg_pattern(pkg_str),
     };
     // Cheapest-first: the engine evaluates `&&` terms left-to-right and bails on
-    // the first `MatchNo`. `tree_output`/`scope` reject at the no-IO addr tier,
-    // while `label` forces a `get_spec`, so order the addr-tier checks ahead of
-    // it — the bulk of candidates (outside `pkg`'s subtree) bail before any spec
-    // is resolved.
-    let go_src_expr = format!("tree_output({pkg_str}) && {scope} && label(go_src)");
+    // the first `MatchNo`. `scope`/`tree_output` reject at the no-IO addr tier,
+    // while `label` forces a `get_spec`, so `label` goes last — the bulk of
+    // candidates bail before any spec is resolved. (`scope` is a single
+    // `has_prefix` and fully resolves at the addr tier, so it leads.)
+    let go_src_expr = format!("{scope} && tree_output({pkg_str}) && label(go_src)");
     let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &[]);
     addrs.push(go_src_query_addr.format());
 
@@ -1059,7 +1059,7 @@ fn pick_embed_deps(states: &[State]) -> Option<&State> {
 /// `go list` (parsed from the `.go` source); the `go_embed` driver resolves them
 /// against these staged files downstream, and `build_lib` stages them for the
 /// compile. Sources:
-/// 1. `query("tree_output(pkg) && … && label(go_embed_src)")` — codegen targets
+/// 1. `query("… && tree_output(pkg) && label(go_embed_src)")` — codegen targets
 ///    labelled `go_embed_src`.
 /// 2. `go_embed_deps` from the closest ancestor BUILD state — explicit embed
 ///    targets that don't carry the label.
@@ -1069,9 +1069,9 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => pkg_pattern(pkg_str),
     };
-    // Cheapest-first (see `compute_pkg_src_addrs`): addr-tier `tree_output`/
-    // `scope` reject without IO; `label` forces a `get_spec`, so it goes last.
-    let expr = format!("tree_output({pkg_str}) && {scope} && label(go_embed_src)");
+    // Cheapest-first (see `compute_pkg_src_addrs`): addr-tier `scope`/
+    // `tree_output` reject without IO; `label` forces a `get_spec`, so it goes last.
+    let expr = format!("{scope} && tree_output({pkg_str}) && label(go_embed_src)");
     let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &[]);
     let mut addrs = vec![query_addr.format()];
 
