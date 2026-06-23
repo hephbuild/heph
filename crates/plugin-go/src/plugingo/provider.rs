@@ -976,7 +976,7 @@ fn pick_codegen_deps(states: &[State]) -> Option<&State> {
 /// glob. Includes:
 /// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
 ///    non-Go sources (e.g. embed targets).
-/// 2. `query("… && tree_output(pkg) && label(go_src)")` — unpacks the full output tree
+/// 2. `query("… && label(go_src) && tree_output(pkg)")` — unpacks the full output tree
 ///    of any codegen target labelled `go_src` into the pkg dir, so both
 ///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
 ///    land in the sandbox.
@@ -1022,12 +1022,11 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => pkg_pattern(pkg_str),
     };
-    // Cheapest-first: the engine evaluates `&&` terms left-to-right and bails on
-    // the first `MatchNo`. `scope`/`tree_output` reject at the no-IO addr tier,
-    // while `label` forces a `get_spec`, so `label` goes last — the bulk of
-    // candidates bail before any spec is resolved. (`scope` is a single
-    // `has_prefix` and fully resolves at the addr tier, so it leads.)
-    let go_src_expr = format!("{scope} && tree_output({pkg_str}) && label(go_src)");
+    // Cheapest-first by resolution tier: `scope` resolves at the no-IO addr
+    // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
+    // def tier (`get_def`, the most expensive). Order terms by that cost so the
+    // engine's left-to-right `&&` bails at the cheapest possible tier.
+    let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
     let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &[]);
     addrs.push(go_src_query_addr.format());
 
@@ -1059,7 +1058,7 @@ fn pick_embed_deps(states: &[State]) -> Option<&State> {
 /// `go list` (parsed from the `.go` source); the `go_embed` driver resolves them
 /// against these staged files downstream, and `build_lib` stages them for the
 /// compile. Sources:
-/// 1. `query("… && tree_output(pkg) && label(go_embed_src)")` — codegen targets
+/// 1. `query("… && label(go_embed_src) && tree_output(pkg)")` — codegen targets
 ///    labelled `go_embed_src`.
 /// 2. `go_embed_deps` from the closest ancestor BUILD state — explicit embed
 ///    targets that don't carry the label.
@@ -1069,9 +1068,9 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => pkg_pattern(pkg_str),
     };
-    // Cheapest-first (see `compute_pkg_src_addrs`): addr-tier `scope`/
-    // `tree_output` reject without IO; `label` forces a `get_spec`, so it goes last.
-    let expr = format!("{scope} && tree_output({pkg_str}) && label(go_embed_src)");
+    // Cheapest-first by resolution tier (see `compute_pkg_src_addrs`): `scope`
+    // (addr) < `label` (spec/`get_spec`) < `tree_output` (def/`get_def`).
+    let expr = format!("{scope} && label(go_embed_src) && tree_output({pkg_str})");
     let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &[]);
     let mut addrs = vec![query_addr.format()];
 
@@ -4666,21 +4665,20 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
     }
 
-    // Cheapest-first ordering: the engine evaluates `&&` left-to-right and bails
-    // on the first `MatchNo`. The addr-tier `tree_output`/`scope` checks reject
-    // without IO, whereas `label` forces a `get_spec`, so `label` must come last
-    // in both source-set queries. Freezing the order keeps the cheap checks in
-    // front so consumers bail before resolving any spec.
+    // Cheapest-first by resolution tier: the engine evaluates `&&` left-to-right
+    // and resolves each term at its cheapest tier — `scope` (addr, no IO) <
+    // `label` (spec/`get_spec`) < `tree_output` (def/`get_def`). Freeze that
+    // order in both source-set queries: `label` before `tree_output`.
     #[test]
-    fn source_set_queries_put_label_last() {
+    fn source_set_queries_order_label_before_tree_output() {
         let go_src = compute_pkg_src_addrs("pkg", &[])
             .unwrap()
             .into_iter()
             .find(|s| s.contains("label(go_src)"))
             .expect("go_src query present");
         assert!(
-            go_src.find("tree_output(").unwrap() < go_src.find("label(go_src)").unwrap(),
-            "go_src query must check tree_output before label: {go_src}"
+            go_src.find("label(go_src)").unwrap() < go_src.find("tree_output(").unwrap(),
+            "go_src query must check label before tree_output: {go_src}"
         );
 
         let embed = compute_embed_src_addrs("pkg", &[])
@@ -4689,8 +4687,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .find(|s| s.contains("label(go_embed_src)"))
             .expect("go_embed_src query present");
         assert!(
-            embed.find("tree_output(").unwrap() < embed.find("label(go_embed_src)").unwrap(),
-            "go_embed_src query must check tree_output before label: {embed}"
+            embed.find("label(go_embed_src)").unwrap() < embed.find("tree_output(").unwrap(),
+            "go_embed_src query must check label before tree_output: {embed}"
         );
     }
 
