@@ -81,8 +81,13 @@ struct GoGolistDef {
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
-/// output format (package.bin layout, package_addrs.bin schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 14;
+/// output format (package.bin layout, package_addrs.bin schema, …) OR the
+/// embed/compile behavior that consumes it changes. v15: the compile+embed
+/// integration (PR #121) reshaped how `EmbedFiles`/`EmbedPatterns` flow into
+/// `go_compile`; cached `_golist` artifacts from intermediate builds of that
+/// work could carry empty `EmbedFiles` for a now-resolvable embed, surfacing as
+/// `compute embedcfg: //go:embed pattern(s) matched no files` until evicted.
+const GO_GOLIST_FORMAT_VERSION: u32 = 15;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
