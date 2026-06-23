@@ -235,6 +235,22 @@ pub trait StableManagedDriver {
     ) -> DynFuture<'a, DynItemStream>;
 }
 
+/// The cold hook surface: a single client-streaming RPC. A hook is a build-event
+/// CONSUMER — the host streams the engine's `BuildEvent`s into the plugin
+/// (`HOOK_METHOD_ON_EVENTS`: the request stream carries one event per
+/// [`StableItemStream::next`], each an envelope `StreamItem` whose `item` is the
+/// event's serde-JSON bytes), and the reply is a unary ack once the stream ends.
+/// Same frozen-dispatch + append-only contract as [`StableProvider`]; new hook
+/// RPCs are new method ids, the vtable is untouched.
+#[stabby::stabby]
+pub trait StableHook {
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>>;
+}
+
 /// Cooperative cancellation, in its OWN trait (composed into both handles like
 /// [`StableMeta`]). The host calls `cancel(request_id)` when its own request token
 /// fires; the plugin looks up the in-flight call by `request_id` and trips the
@@ -255,12 +271,22 @@ pub type DynProvider = stabby::dynptr!(
 pub type DynManagedDriver = stabby::dynptr!(
     stabby::boxed::Box<dyn StableManagedDriver + StableMeta + StableCancel + Send + Sync>
 );
+/// A hook handle composes its dispatch surface with [`StableMeta`] (the hook name)
+/// only — hooks have no per-request cancellation, so no [`StableCancel`].
+pub type DynHook = stabby::dynptr!(stabby::boxed::Box<dyn StableHook + StableMeta + Send + Sync>);
 
 /// A named managed driver in a plugin's component bundle.
 #[stabby::stabby]
 pub struct NamedDriver {
     pub name: SString,
     pub driver: DynManagedDriver,
+}
+
+/// A named hook in a plugin's component bundle.
+#[stabby::stabby]
+pub struct NamedHook {
+    pub name: SString,
+    pub hook: DynHook,
 }
 
 /// What a cdylib's create entry returns: a provider + named drivers, all as owned
@@ -277,6 +303,10 @@ pub struct PluginComponents {
     pub provider_name: SString,
     pub provider: DynProvider,
     pub drivers: SVec<NamedDriver>,
+    /// Named build-event hooks the plugin exports. Empty for provider/driver-only
+    /// plugins. A hook-only plugin leaves `provider_name` empty (its `provider` is
+    /// a no-op the host drops) and carries its hooks here.
+    pub hooks: SVec<NamedHook>,
     pub meta: SVec<u8>,
 }
 

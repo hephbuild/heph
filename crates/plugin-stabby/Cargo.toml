@@ -20,12 +20,17 @@ hdriver-support = { package = "driver-support", path = "../driver-support", opti
 plugin-abi = { path = "../plugin-abi", features = ["convert"], optional = true }
 prost = { version = "0.14", optional = true }
 async-trait = { version = "0.1.89", optional = true }
+# Host side encodes BuildEvents as serde-JSON to stream into a hook plugin.
+serde_json = { version = "1", optional = true }
+# Host spawns one background task per hook to drive its client-stream RPC to the
+# plugin (it runs concurrently with event production).
+tokio = { version = "1.52", features = ["rt", "sync"], optional = true }
 
 [features]
 # host: adapters from the engine's ProviderExecutor onto the stable ABI, plus
 # the libloading-based cdylib loader. The shared ABI contract (`abi`) is always
 # compiled (needs only stabby) so the guest SDK can depend on it feature-free.
-host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:plugin-abi", "dep:prost", "dep:async-trait"]
+host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:plugin-abi", "dep:prost", "dep:async-trait", "dep:serde_json", "dep:tokio"]
 
 [dev-dependencies]
 futures = "0.3.32"

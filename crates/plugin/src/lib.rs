@@ -33,6 +33,7 @@ pub mod config;
 pub mod driver;
 pub mod eresult;
 pub mod error;
+pub mod hook;
 pub mod htspec;
 pub mod lsp;
 pub mod provider;

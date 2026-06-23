@@ -85,6 +85,8 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         provider_name: "go".into(),
         provider: make_dyn_provider(provider),
         drivers,
+        // The go plugin exports no hooks.
+        hooks: stabby::vec::Vec::new(),
         // No return-side metadata to report yet.
         meta: stabby::vec::Vec::new(),
     })

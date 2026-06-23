@@ -18,6 +18,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ConfigRequest as DriverConfigRequest, ParseRequest, RunInput,
     RunRequest, inputartifact,
 };
+use hplugin::hook::Hook;
 use hplugin::provider::{
     ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
     ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
@@ -25,7 +26,8 @@ use hplugin::provider::{
 };
 use hplugin_stabby::abi::{
     DynExecutor, DynFunctionRegistry, DynItemStream, StableCancel, StableFunctionRegistryDyn,
-    StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta, StableProvider,
+    StableHook, StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta,
+    StableProvider,
 };
 use plugin_abi::convert;
 use plugin_abi::pb;
@@ -1054,6 +1056,142 @@ impl Content for DiskInputContent {
     }
 }
 
+// ---- Hook (build-event consumer) ----
+
+/// Wrap an author `Hook` as an ABI-stable [`hplugin_stabby::abi::DynHook`].
+pub fn make_dyn_hook(hook: Arc<dyn Hook>) -> hplugin_stabby::abi::DynHook {
+    stabby::boxed::Box::new(StableHookImpl { hook }).into()
+}
+
+/// A provider that exposes nothing — its empty `config` name makes the host drop
+/// it at load. The `PluginComponents.provider` field is non-optional, so a
+/// hook-only (or driver-only) plugin fills it with this placeholder.
+struct NoopProvider;
+
+impl Provider for NoopProvider {
+    fn config(&self, _req: ConfigRequest) -> Result<hplugin::provider::ConfigResponse> {
+        Ok(hplugin::provider::ConfigResponse {
+            name: String::new(),
+        })
+    }
+    fn list<'a>(
+        &'a self,
+        _req: ListRequest,
+        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Box<dyn Iterator<Item = Result<hplugin::provider::ListResponse>> + Send>>,
+    > {
+        Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+    }
+    fn list_packages<'a>(
+        &'a self,
+        _req: ListPackagesRequest,
+        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Box<dyn Iterator<Item = Result<hplugin::provider::ListPackageResponse>> + Send>>,
+    > {
+        Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+    }
+    fn get<'a>(
+        &'a self,
+        _req: GetRequest,
+        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<'a, std::result::Result<hplugin::provider::GetResponse, GetError>>
+    {
+        Box::pin(async { Err(GetError::NotFound) })
+    }
+    fn probe<'a>(
+        &'a self,
+        _req: ProbeRequest,
+        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<'a, Result<hplugin::provider::ProbeResponse>> {
+        Box::pin(async { Ok(hplugin::provider::ProbeResponse { states: vec![] }) })
+    }
+}
+
+/// A no-op provider handle for hook-only / driver-only plugins. The host drops it
+/// (its `config` name is empty), so it is never invoked.
+pub fn make_noop_provider() -> hplugin_stabby::abi::DynProvider {
+    make_dyn_provider(Arc::new(NoopProvider))
+}
+
+/// Wraps an author `Hook` as a [`StableHook`].
+pub struct StableHookImpl {
+    pub hook: Arc<dyn Hook>,
+}
+
+impl StableMeta for StableHookImpl {
+    extern "C" fn meta(&self, kind: u32) -> SVec<u8> {
+        match pb::HookMethod::try_from(kind as i32) {
+            Ok(pb::HookMethod::Config) => SVec::from(
+                pb::ConfigResponse {
+                    name: self.hook.name(),
+                }
+                .encode_to_vec()
+                .as_slice(),
+            ),
+            // Unknown sync metadatum: empty == "none", never a hard failure.
+            _ => SVec::new(),
+        }
+    }
+}
+
+impl StableHook for StableHookImpl {
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>> {
+        let hook = Arc::clone(&self.hook);
+        stabby::boxed::Box::new(async move {
+            match pb::HookMethod::try_from(method as i32) {
+                Ok(pb::HookMethod::OnEvents) => hook_on_events(hook, req).await,
+                _ => unimplemented(method),
+            }
+        })
+        .into()
+    }
+}
+
+/// Decode one host->plugin event frame into a `BuildEvent`. `None` ends the pull
+/// loop (a `StreamEnd`, an error, or a non-item frame). Events ride as serde-JSON
+/// inside `StreamItem.item` — the `BuildEvent` type is already serde, so there is
+/// no parallel proto mirror to keep in lockstep.
+fn decode_event_frame(bytes: &[u8]) -> Option<hcore::events::BuildEvent> {
+    match pb::Frame::decode(bytes).ok()?.body? {
+        Body::StreamItem(si) => serde_json::from_slice(&si.item).ok(),
+        _ => None,
+    }
+}
+
+/// Consume the client-streamed events: pull each frame on a blocking thread (the
+/// host's stream `next` blocks until the next event arrives), hand it to the
+/// author hook, then signal end-of-stream. The reply is an empty ack — the host
+/// only needs this future to resolve, which means the plugin drained the full
+/// stream and ran its final flush.
+async fn hook_on_events(hook: Arc<dyn Hook>, req: DynItemStream) -> SVec<u8> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cdylib_runtime().spawn_blocking(move || {
+        loop {
+            let bytes = req.next();
+            // Empty == the host closed the stream (request finished).
+            if bytes.is_empty() {
+                break;
+            }
+            match decode_event_frame(&bytes) {
+                Some(ev) => hook.on_event(&ev),
+                None => break,
+            }
+        }
+        hook.on_close();
+        let _ = tx.send(());
+    });
+    let _ = rx.await;
+    SVec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,6 +1836,72 @@ mod tests {
         assert!(
             msg.contains("//go:embed pattern(s) matched no files: ui_dist/*"),
             "underlying cause dropped — only the top frame crossed: {msg}"
+        );
+    }
+
+    // A hook receives every client-streamed event in order across the seam, then
+    // `on_close` fires when the host ends the stream. Exercises the full
+    // host→guest client-stream path: StableRemoteHook (host) → make_dyn_hook
+    // (guest) → author Hook.
+    #[test]
+    fn hook_client_stream_roundtrip() {
+        use hcore::events::{BuildEvent, BuildEventKind};
+        use hplugin::hook::Hook;
+        use hplugin_stabby::load_stable::StableRemoteHook;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: Mutex<Vec<u64>>,
+            closed: AtomicBool,
+        }
+        impl Hook for Recorder {
+            fn name(&self) -> String {
+                "rec".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ev.at_unix_ms);
+            }
+            fn on_close(&self) {
+                self.closed.store(true, Ordering::Release);
+            }
+        }
+
+        let rec = Arc::new(Recorder::default());
+        let remote = StableRemoteHook::new(make_dyn_hook(Arc::clone(&rec) as Arc<dyn Hook>), "rec");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let mk = |at| BuildEvent {
+                at_unix_ms: at,
+                kind: BuildEventKind::ResultStart {
+                    addr: "//a:b".into(),
+                },
+            };
+            remote.on_event(&mk(1));
+            remote.on_event(&mk(2));
+            remote.on_event(&mk(3));
+            // Closes the stream and awaits the plugin's ack (its full drain).
+            remote.drain().await;
+        });
+
+        let seen = rec.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            seen,
+            vec![1, 2, 3],
+            "all events arrive in order across the seam"
+        );
+        assert!(
+            rec.closed.load(Ordering::Acquire),
+            "on_close fires when the host ends the stream"
         );
     }
 

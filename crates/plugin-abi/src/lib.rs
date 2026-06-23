@@ -17,7 +17,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 
 /// ABI semantic version. Major must match exactly between host and plugin;
 /// minor is negotiated to `min(host, plugin)` at handshake.
-pub const ABI_SEMVER: &str = "0.2.0";
+///
+/// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
+/// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
+/// must be rebuilt against this ABI.
+pub const ABI_SEMVER: &str = "0.3.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

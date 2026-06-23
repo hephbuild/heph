@@ -2,6 +2,7 @@ use crate::engine::config::Config;
 use crate::engine::config_yaml::{FuseConfig, Options};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
+use crate::engine::hook::Hook as SDKHook;
 use crate::engine::local_cache::LocalCache;
 use crate::engine::local_cache_mem::LocalCacheMem;
 use crate::engine::local_cache_sqlite::LocalCacheSQLite;
@@ -74,6 +75,11 @@ pub struct Engine {
     pub providers_by_name: HashMap<String, Arc<Provider>>,
     pub(crate) drivers: Vec<Arc<Driver>>,
     pub drivers_by_name: HashMap<String, Arc<Driver>>,
+
+    /// Registered build-event hooks. Fed every emitted `BuildEvent` (see
+    /// `RequestState::emit`); unlike providers/drivers they are never queried,
+    /// only observed. Usually empty (a cheap no-op on the emit hot path).
+    pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
     pub home: PathBuf,
@@ -375,6 +381,7 @@ impl Engine {
             providers_by_name: HashMap::new(),
             drivers: vec![],
             drivers_by_name: HashMap::new(),
+            hooks: vec![],
             requests: Mutex::new(HashMap::new()),
             result_semaphore: Arc::new(Semaphore::new(max_workers)),
             max_workers,
@@ -593,6 +600,30 @@ impl Engine {
         self.providers_by_name
             .insert(provider.name.clone(), provider);
         Ok(())
+    }
+
+    /// Register a build-event hook. Hooks are observers — fed every emitted
+    /// `BuildEvent` and never queried — so they need no name-uniqueness guard
+    /// (two CI summary hooks would just both run). Loaded from out-of-process
+    /// plugins (see `plugin_load`).
+    pub fn register_hook(&mut self, hook: Arc<dyn SDKHook>) -> anyhow::Result<()> {
+        self.hooks.push(hook);
+        Ok(())
+    }
+
+    /// Snapshot of the registered hooks, cloned into a request's state so every
+    /// emitted event fans out to them. Empty unless a hook plugin is configured.
+    pub fn hooks(&self) -> Vec<Arc<dyn SDKHook>> {
+        self.hooks.clone()
+    }
+
+    /// Await every hook's in-flight delivery/flush. Called at command teardown,
+    /// after the request state (and thus its `on_close`) has dropped, so an
+    /// out-of-process hook's final write completes before the process exits.
+    pub async fn await_hooks(&self) {
+        for h in &self.hooks {
+            h.drain().await;
+        }
     }
 
     pub fn register_provider_factory(

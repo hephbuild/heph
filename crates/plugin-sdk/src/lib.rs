@@ -12,7 +12,7 @@
 //! - (future) proto/shm, wasm — sibling features, same author surface.
 
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
-pub use hplugin::{driver, eresult, provider};
+pub use hplugin::{driver, eresult, hook, provider};
 
 #[cfg(feature = "stabby")]
 mod guest;
@@ -31,7 +31,9 @@ pub mod stabby {
     pub use hplugin_stabby::abi;
 
     pub use crate::guest::GuestExecutor;
-    pub use crate::serve::{make_dyn_managed_driver, make_dyn_provider};
+    pub use crate::serve::{
+        make_dyn_hook, make_dyn_managed_driver, make_dyn_provider, make_noop_provider,
+    };
 
     /// Decode the cdylib create-entry config (`pb::CreateConfig`) from its prost
     /// bytes, and convert its structured `options` map into a plugin `options:`
