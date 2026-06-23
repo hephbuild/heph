@@ -2286,7 +2286,7 @@ impl ProviderInner {
             // Pre-dedupe the top-level set so we don't fan out the same
             // import_path twice (also halves cache lookups for repeated entries
             // between `root_imports` and `extra_imports`).
-            let unique_imports: Vec<String> = root_imports
+            let mut unique_imports: Vec<String> = root_imports
                 .iter()
                 .chain(extra_imports.iter())
                 .filter(|i| *i != "unsafe" && *i != "C")
@@ -2294,6 +2294,9 @@ impl ProviderInner {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
+            // HashSet iteration order is randomized per process; sort so the
+            // resulting transitive lib order is deterministic run-to-run.
+            unique_imports.sort();
 
             let module_root_buf = module_root.to_path_buf();
             let sub_closures = try_join_all(unique_imports.into_iter().map(|ip| {
@@ -2320,7 +2323,7 @@ impl ProviderInner {
         let go_mod_requires = &go_mod.requires;
         let workspace_module_path = go_mod.module_path.as_str();
 
-        let imports: Vec<String> = root_imports
+        let mut imports: Vec<String> = root_imports
             .iter()
             .chain(extra_imports.iter())
             .filter(|i| *i != "unsafe" && *i != "C")
@@ -2328,6 +2331,12 @@ impl ProviderInner {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        // HashSet iteration order is randomized per process; sort so the
+        // resulting `libs` order is deterministic run-to-run (mirrors the
+        // transitive branch above). The go_compile cache key sorts at the hash
+        // boundary too, but keeping this lane deterministic avoids surprising any
+        // other consumer of `TransitiveDeps.libs`.
+        imports.sort();
 
         let results = try_join_all(imports.iter().map(|ip| {
             self.resolve_import(
