@@ -3805,6 +3805,7 @@ dependencies = [
  "plugin",
  "serde_yaml",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -3816,6 +3817,7 @@ dependencies = [
  "plugin-gha",
  "plugin-sdk",
  "stabby",
+ "tracing",
 ]
 
 [[package]]

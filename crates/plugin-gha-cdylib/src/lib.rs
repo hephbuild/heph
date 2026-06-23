@@ -21,7 +21,7 @@ pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginCompone
     match build(&cfg) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("heph-gha-plugin: plugin construction failed: {e:#}");
+            tracing::error!("heph-gha-plugin: plugin construction failed: {e:#}");
             std::process::abort();
         }
     }

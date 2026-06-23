@@ -189,8 +189,8 @@ impl GhaHook {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from));
         if summary_path.is_none() {
-            eprintln!(
-                "heph-gha-hook: neither `summaryPath` option nor $GITHUB_STEP_SUMMARY set; \
+            tracing::warn!(
+                "gha hook: neither `summaryPath` option nor $GITHUB_STEP_SUMMARY set; \
                  no summary will be written"
             );
         }

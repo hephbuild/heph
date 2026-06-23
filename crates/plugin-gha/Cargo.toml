@@ -11,6 +11,7 @@ workspace = true
 hplugin = { package = "plugin", path = "../plugin" }
 hcore = { package = "core", path = "../core" }
 anyhow = "1.0.102"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

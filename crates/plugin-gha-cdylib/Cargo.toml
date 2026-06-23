@@ -15,3 +15,4 @@ hplugin = { package = "plugin", path = "../plugin" }
 plugin-sdk = { path = "../plugin-sdk", features = ["stabby"] }
 stabby = "72.1.8"
 anyhow = "1.0.102"
+tracing = "0.1"
