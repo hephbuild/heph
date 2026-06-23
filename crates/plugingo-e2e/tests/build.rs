@@ -82,6 +82,41 @@ async fn test_embed_buildtagged_file_compiles_with_embedcfg() -> anyhow::Result<
     Ok(())
 }
 
+/// Embed via a `go_embed_src`-labeled `group` target wrapping `glob("resources/*")`
+/// (the decoupled embed lane). golist excludes go_embed_src, so go list reports
+/// empty EmbedFiles by design and the compile must resolve the pattern from the
+/// staged go_embed_src files. Repro for the infhostd failure.
+#[tokio::test]
+async fn test_embed_group_go_embed_src_compiles() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_group")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//:build_lib").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "go_embed_src group embedding build_lib should compile"
+    );
+    Ok(())
+}
+
+/// Embed a GENERATED file via the go_embed_src lane: a codegen target produces
+/// resources/gen.sh (labelled go_embed_src), embedded by //go:embed. golist
+/// excludes go_embed_src, so the file is never on disk for go list — the compile
+/// must stage+resolve it through the embed_src lane + selector. The decoupling's
+/// real path; closest to the infhostd report.
+#[tokio::test]
+async fn test_embed_generated_go_embed_src_compiles() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_gen")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//:build_lib").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "generated go_embed_src embedding build_lib should compile"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_with_dep_cmd_build() -> anyhow::Result<()> {
     require_go!();
