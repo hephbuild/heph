@@ -976,7 +976,7 @@ fn pick_codegen_deps(states: &[State]) -> Option<&State> {
 /// glob. Includes:
 /// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
 ///    non-Go sources (e.g. embed targets).
-/// 2. `query("label(go_src) && tree_output(pkg) && …")` — unpacks the full output tree
+/// 2. `query("tree_output(pkg) && … && label(go_src)")` — unpacks the full output tree
 ///    of any codegen target labelled `go_src` into the pkg dir, so both
 ///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
 ///    land in the sandbox.
@@ -1022,7 +1022,12 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => pkg_pattern(pkg_str),
     };
-    let go_src_expr = format!("label(go_src) && tree_output({pkg_str}) && {scope}");
+    // Cheapest-first: the engine evaluates `&&` terms left-to-right and bails on
+    // the first `MatchNo`. `tree_output`/`scope` reject at the no-IO addr tier,
+    // while `label` forces a `get_spec`, so order the addr-tier checks ahead of
+    // it — the bulk of candidates (outside `pkg`'s subtree) bail before any spec
+    // is resolved.
+    let go_src_expr = format!("tree_output({pkg_str}) && {scope} && label(go_src)");
     let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &[]);
     addrs.push(go_src_query_addr.format());
 
@@ -1054,7 +1059,7 @@ fn pick_embed_deps(states: &[State]) -> Option<&State> {
 /// `go list` (parsed from the `.go` source); the `go_embed` driver resolves them
 /// against these staged files downstream, and `build_lib` stages them for the
 /// compile. Sources:
-/// 1. `query("label(go_embed_src) && tree_output(pkg) && …")` — codegen targets
+/// 1. `query("tree_output(pkg) && … && label(go_embed_src)")` — codegen targets
 ///    labelled `go_embed_src`.
 /// 2. `go_embed_deps` from the closest ancestor BUILD state — explicit embed
 ///    targets that don't carry the label.
@@ -1064,7 +1069,9 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => pkg_pattern(pkg_str),
     };
-    let expr = format!("label(go_embed_src) && tree_output({pkg_str}) && {scope}");
+    // Cheapest-first (see `compute_pkg_src_addrs`): addr-tier `tree_output`/
+    // `scope` reject without IO; `label` forces a `get_spec`, so it goes last.
+    let expr = format!("tree_output({pkg_str}) && {scope} && label(go_embed_src)");
     let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &[]);
     let mut addrs = vec![query_addr.format()];
 
@@ -4656,6 +4663,34 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             addrs.iter().any(|s| s == "//ui:dist"),
             "go_embed_deps must be appended: {addrs:?}"
+        );
+    }
+
+    // Cheapest-first ordering: the engine evaluates `&&` left-to-right and bails
+    // on the first `MatchNo`. The addr-tier `tree_output`/`scope` checks reject
+    // without IO, whereas `label` forces a `get_spec`, so `label` must come last
+    // in both source-set queries. Freezing the order keeps the cheap checks in
+    // front so consumers bail before resolving any spec.
+    #[test]
+    fn source_set_queries_put_label_last() {
+        let go_src = compute_pkg_src_addrs("pkg", &[])
+            .unwrap()
+            .into_iter()
+            .find(|s| s.contains("label(go_src)"))
+            .expect("go_src query present");
+        assert!(
+            go_src.find("tree_output(").unwrap() < go_src.find("label(go_src)").unwrap(),
+            "go_src query must check tree_output before label: {go_src}"
+        );
+
+        let embed = compute_embed_src_addrs("pkg", &[])
+            .unwrap()
+            .into_iter()
+            .find(|s| s.contains("label(go_embed_src)"))
+            .expect("go_embed_src query present");
+        assert!(
+            embed.find("tree_output(").unwrap() < embed.find("label(go_embed_src)").unwrap(),
+            "go_embed_src query must check tree_output before label: {embed}"
         );
     }
 
