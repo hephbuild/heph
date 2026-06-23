@@ -1063,60 +1063,6 @@ pub fn make_dyn_hook(hook: Arc<dyn Hook>) -> hplugin_stabby::abi::DynHook {
     stabby::boxed::Box::new(StableHookImpl { hook }).into()
 }
 
-/// A provider that exposes nothing — its empty `config` name makes the host drop
-/// it at load. The `PluginComponents.provider` field is non-optional, so a
-/// hook-only (or driver-only) plugin fills it with this placeholder.
-struct NoopProvider;
-
-impl Provider for NoopProvider {
-    fn config(&self, _req: ConfigRequest) -> Result<hplugin::provider::ConfigResponse> {
-        Ok(hplugin::provider::ConfigResponse {
-            name: String::new(),
-        })
-    }
-    fn list<'a>(
-        &'a self,
-        _req: ListRequest,
-        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<Box<dyn Iterator<Item = Result<hplugin::provider::ListResponse>> + Send>>,
-    > {
-        Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-    }
-    fn list_packages<'a>(
-        &'a self,
-        _req: ListPackagesRequest,
-        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<Box<dyn Iterator<Item = Result<hplugin::provider::ListPackageResponse>> + Send>>,
-    > {
-        Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
-    }
-    fn get<'a>(
-        &'a self,
-        _req: GetRequest,
-        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<'a, std::result::Result<hplugin::provider::GetResponse, GetError>>
-    {
-        Box::pin(async { Err(GetError::NotFound) })
-    }
-    fn probe<'a>(
-        &'a self,
-        _req: ProbeRequest,
-        _ct: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
-    ) -> futures::future::BoxFuture<'a, Result<hplugin::provider::ProbeResponse>> {
-        Box::pin(async { Ok(hplugin::provider::ProbeResponse { states: vec![] }) })
-    }
-}
-
-/// A no-op provider handle for hook-only / driver-only plugins. The host drops it
-/// (its `config` name is empty), so it is never invoked.
-pub fn make_noop_provider() -> hplugin_stabby::abi::DynProvider {
-    make_dyn_provider(Arc::new(NoopProvider))
-}
-
 /// Wraps an author `Hook` as a [`StableHook`].
 pub struct StableHookImpl {
     pub hook: Arc<dyn Hook>,

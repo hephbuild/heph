@@ -289,9 +289,10 @@ pub struct NamedHook {
     pub hook: DynHook,
 }
 
-/// What a cdylib's create entry returns: a provider + named drivers, all as owned
-/// ABI-stable handles that the host wraps with [`crate::load_stable`]. (plugin-go
-/// always exports a provider; driver-only bundles can carry an empty name.)
+/// What a cdylib's create entry returns: an optional provider + named drivers +
+/// named hooks, all as owned ABI-stable handles that the host wraps with
+/// [`crate::load_stable`]. A plugin populates only what it exports — a hook-only
+/// (or driver-only) bundle leaves `provider` `None`.
 ///
 /// `meta` is reserved, prost-encoded return-side metadata (empty today). It exists
 /// so a plugin can later report additive descriptive data (capabilities, abi
@@ -300,8 +301,10 @@ pub struct NamedHook {
 /// live native vtables); only the data rides prost.
 #[stabby::stabby]
 pub struct PluginComponents {
+    /// The exported provider's name (empty when `provider` is `None`).
     pub provider_name: SString,
-    pub provider: DynProvider,
+    /// The exported provider, or `None` for a hook-only / driver-only plugin.
+    pub provider: stabby::option::Option<DynProvider>,
     pub drivers: SVec<NamedDriver>,
     /// Named build-event hooks the plugin exports. Empty for provider/driver-only
     /// plugins. A hook-only plugin leaves `provider_name` empty (its `provider` is

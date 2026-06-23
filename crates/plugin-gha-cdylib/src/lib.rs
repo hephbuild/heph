@@ -9,9 +9,7 @@ use std::sync::Arc;
 use hplugin::hook::Hook;
 use hplugin_gha::GhaHook;
 use plugin_sdk::stabby::abi::{NamedHook, PluginComponents};
-use plugin_sdk::stabby::{
-    create_config_from_bytes, make_dyn_hook, make_noop_provider, options_from_pb_map,
-};
+use plugin_sdk::stabby::{create_config_from_bytes, make_dyn_hook, options_from_pb_map};
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is prost-encoded
@@ -39,9 +37,9 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     });
 
     Ok(PluginComponents {
-        // Hook-only: no provider (placeholder dropped by the host), no drivers.
+        // Hook-only: no provider, no drivers.
         provider_name: String::new().into(),
-        provider: make_noop_provider(),
+        provider: stabby::option::Option::None(),
         drivers: stabby::vec::Vec::new(),
         hooks,
         meta: stabby::vec::Vec::new(),

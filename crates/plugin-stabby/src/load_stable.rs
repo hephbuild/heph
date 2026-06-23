@@ -97,12 +97,9 @@ pub fn load(
         // Reserved return-side metadata; nothing consumes it yet.
         meta: _,
     } = comps;
-    let pname = provider_name.to_string();
-    let host_provider = if pname.is_empty() {
-        None
-    } else {
-        Some(StableRemoteProvider::new(provider, pname))
-    };
+    // `provider` is optional: hook-only / driver-only plugins export `None`.
+    let provider: std::option::Option<DynProvider> = provider.into();
+    let host_provider = provider.map(|p| StableRemoteProvider::new(p, provider_name.to_string()));
 
     let mut host_drivers = Vec::new();
     for nd in drivers {

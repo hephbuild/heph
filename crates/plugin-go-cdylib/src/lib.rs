@@ -83,7 +83,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
 
     Ok(PluginComponents {
         provider_name: "go".into(),
-        provider: make_dyn_provider(provider),
+        provider: stabby::option::Option::Some(make_dyn_provider(provider)),
         drivers,
         // The go plugin exports no hooks.
         hooks: stabby::vec::Vec::new(),
