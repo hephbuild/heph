@@ -121,7 +121,7 @@ fn frame_iter<T: 'static>(
             }))),
             Some(Err(e)) => {
                 done = true;
-                Some(frame_bytes(stream_err(e.to_string())))
+                Some(frame_bytes(stream_err(format!("{e:#}"))))
             }
             None => {
                 done = true;
@@ -312,7 +312,7 @@ async fn provider_list_stream(provider: Arc<dyn Provider>, req: SVec<u8>) -> Dyn
             }
             .encode_to_vec()
         })),
-        Err(e) => error_item_stream(e.to_string()),
+        Err(e) => error_item_stream(format!("{e:#}")),
     }
 }
 
@@ -332,7 +332,7 @@ async fn provider_list_packages_stream(
             }
             .encode_to_vec()
         })),
-        Err(e) => error_item_stream(e.to_string()),
+        Err(e) => error_item_stream(format!("{e:#}")),
     }
 }
 
@@ -361,7 +361,7 @@ async fn provider_get(
         }),
         Err(GetError::Other(e)) => Body::GetErr(pb::GetError {
             kind: get_error_kind(&e) as i32,
-            message: e.to_string(),
+            message: format!("{e:#}"),
         }),
     };
     unary(body)
@@ -382,7 +382,7 @@ async fn provider_probe(
         Ok(pr) => Body::ProbeResp(pb::ProbeResponse {
             states: pr.states.iter().map(convert::state_to_pb).collect(),
         }),
-        Err(e) => err_body(e.to_string()),
+        Err(e) => err_body(format!("{e:#}")),
     };
     unary(body)
 }
@@ -681,9 +681,9 @@ async fn driver_parse(
             Ok(td) => Body::ParseResp(pb::ParseResponse {
                 target_def: Some(td),
             }),
-            Err(e) => err_body(e.to_string()),
+            Err(e) => err_body(format!("{e:#}")),
         },
-        Err(e) => err_body(e.to_string()),
+        Err(e) => err_body(format!("{e:#}")),
     };
     unary(body)
 }
@@ -697,7 +697,7 @@ async fn driver_apply_transitive(
     let guard = cancels.enter(&req.request_id);
     let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default()) {
         Ok(td) => td,
-        Err(e) => return unary(err_body(e.to_string())),
+        Err(e) => return unary(err_body(format!("{e:#}"))),
     };
     let areq = ApplyTransitiveRequest {
         request_id: req.request_id,
@@ -709,9 +709,9 @@ async fn driver_apply_transitive(
             Ok(td) => Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
                 target_def: Some(td),
             }),
-            Err(e) => err_body(e.to_string()),
+            Err(e) => err_body(format!("{e:#}")),
         },
-        Err(e) => err_body(e.to_string()),
+        Err(e) => err_body(format!("{e:#}")),
     };
     unary(body)
 }
@@ -852,7 +852,7 @@ async fn run_once(
     let shell = req.shell;
     let target = match convert::target_def_from_pb(req.target.unwrap_or_default()) {
         Ok(t) => t,
-        Err(e) => return run_out_err(e.to_string()),
+        Err(e) => return run_out_err(format!("{e:#}")),
     };
     let request_id = req.request_id;
     let hashin = req.hashin;
@@ -893,7 +893,7 @@ async fn run_once(
                     .collect(),
             })),
         },
-        Err(e) => run_out_err(e.to_string()),
+        Err(e) => run_out_err(format!("{e:#}")),
     }
 }
 
@@ -1410,6 +1410,87 @@ mod tests {
         assert!(got[0].is_ok());
         let err = got[1].as_ref().expect_err("second item is the error");
         assert!(err.to_string().contains("boom"));
+    }
+
+    // A driver error crossing the proto seam must carry its FULL anyhow cause
+    // chain, not just the top context. Serializing with `e.to_string()` dropped
+    // the deepest cause (e.g. a driver wrapping `compute embedcfg` over a real
+    // `//go:embed matched no files` bail surfaced as a useless one-liner). The
+    // message must be the `{:#}` chain so the host re-renders the root cause.
+    #[test]
+    fn run_error_message_carries_full_cause_chain() {
+        use hcore::hasync::Cancellable;
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+
+        struct FailDriver;
+        #[async_trait::async_trait]
+        impl ManagedDriver for FailDriver {
+            fn config(
+                &self,
+                _r: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                Ok(hplugin::driver::ConfigResponse {
+                    name: "fail".into(),
+                })
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                hplugin::driver::DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _r: hplugin::driver::ParseRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn apply_transitive(
+                &self,
+                _r: hplugin::driver::ApplyTransitiveRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _r: ManagedRunRequest<'a, 'io>,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                Err(anyhow::anyhow!("//go:embed matched no files").context("compute embedcfg"))
+            }
+        }
+
+        // A minimally-valid target so run_once gets past target conversion and
+        // actually invokes the driver (raw_def needs parseable JSON bytes).
+        let target = pb::TargetDef {
+            raw_def: Some(pb::RawDefBlob {
+                driver: String::new(),
+                format: pb::raw_def_blob::Format::Json as i32,
+                data: b"null".to_vec().into(),
+            }),
+            ..Default::default()
+        };
+        let frame = futures::executor::block_on(run_once(
+            Arc::new(FailDriver) as Arc<dyn ManagedDriver>,
+            pb::ManagedRunRequest {
+                request_id: "r".into(),
+                target: Some(target),
+                ..Default::default()
+            },
+            &StdCancellationToken::new(),
+        ));
+        match frame.msg {
+            Some(pb::run_out_frame::Msg::Error(msg)) => {
+                assert!(
+                    msg.contains("compute embedcfg"),
+                    "top context present: {msg}"
+                );
+                assert!(
+                    msg.contains("//go:embed matched no files"),
+                    "deepest cause must survive the seam: {msg}"
+                );
+            }
+            other => panic!("expected error frame, got {other:?}"),
+        }
     }
 
     // `run` over invoke_bidi: the request stream (RunInFrame) is consumed and the
