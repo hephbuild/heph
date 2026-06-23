@@ -673,7 +673,10 @@ mod source_map_tests {
         let err = add_path_to_tar(&mut tar, dir.path(), &p, "bin").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a directory"), "got: {msg}");
-        assert!(msg.contains("out") && msg.contains("bin"), "must name path+group: {msg}");
+        assert!(
+            msg.contains("out") && msg.contains("bin"),
+            "must name path+group: {msg}"
+        );
     }
 
     // Symmetric: a directory output declared on a file must fail clearly rather
@@ -687,6 +690,9 @@ mod source_map_tests {
         let err = add_path_to_tar(&mut tar, dir.path(), &p, "data").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a file"), "got: {msg}");
-        assert!(msg.contains("out") && msg.contains("data"), "must name path+group: {msg}");
+        assert!(
+            msg.contains("out") && msg.contains("data"),
+            "must name path+group: {msg}"
+        );
     }
 }
