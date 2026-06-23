@@ -197,9 +197,19 @@ pub fn compute_embed_cfg_json(
     if !unmatched.is_empty() {
         anyhow::bail!(
             "//go:embed pattern(s) matched no files: {}. \
-             go list resolved these patterns to zero files — the embed source files \
-             are not staged. Declare the embed inputs (e.g. a BUILD2 provider_state(provider=\"go\") \
-             with go_src-labeled group targets) so the package's embed sources reach the sandbox.",
+             `go list` resolved these patterns to zero files, so the embed sources never \
+             reached the `_golist` sandbox. Likely causes, in order:\n  \
+             1. Stale `_golist` cache — if these files exist on disk, an older/cached \
+             `_golist` (e.g. computed by a previous binary) may be served. Clear the cache \
+             (remove `.heph3/cache`) and rebuild.\n  \
+             2. Excluded from the source walk — an `fs.skip` entry in the workspace config \
+             matches the file or its directory; heph does not stage skipped files even when \
+             `//go:embed` references them.\n  \
+             3. Generated/codegen output not wired as a source — declare it (e.g. a \
+             `provider_state(provider=\"go\")` with a go_src-labeled group target) so it reaches \
+             the sandbox.\n  \
+             (A file merely existing on disk is not sufficient; it must be visible to heph's \
+             source walk and present when `_golist` ran.)",
             unmatched.join(", "),
         );
     }

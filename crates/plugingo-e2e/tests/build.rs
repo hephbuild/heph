@@ -33,6 +33,55 @@ async fn test_embed_build_lib_compiles_with_embedcfg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Embed a file living in a SUBDIRECTORY (`//go:embed resources/script.sh`).
+/// Regression: the non-go `**/*` source glob must stage subdir files into the
+/// `_golist` sandbox so `go list` resolves the pattern into `EmbedFiles`; a
+/// failure surfaces as `compute embedcfg: //go:embed pattern(s) matched no files`.
+#[tokio::test]
+async fn test_embed_subdir_build_lib_compiles_with_embedcfg() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_subdir")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//:build_lib").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "subdir-embedding build_lib should compile and produce an archive"
+    );
+    Ok(())
+}
+
+/// Embed a subdir file from a NON-root package (`//app:build_lib`, embed
+/// `resources/script.sh`). Exercises the `{pkg}/**/*` glob for a nested package.
+#[tokio::test]
+async fn test_embed_nested_pkg_build_lib_compiles_with_embedcfg() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_nested")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//app:build_lib").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "nested-package subdir-embedding build_lib should compile"
+    );
+    Ok(())
+}
+
+/// Embed a subdir file from a package whose embedding .go file is behind a
+/// `//go:build linux` constraint, built for goos=linux. Mirrors infhostd:
+/// the pattern reaches EmbedPatterns but the file must still resolve into
+/// EmbedFiles for the linux build context.
+#[tokio::test]
+async fn test_embed_buildtagged_file_compiles_with_embedcfg() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_buildtag")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//app:build_lib@goarch=amd64,goos=linux").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "build-tagged embedding build_lib should compile for goos=linux"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_with_dep_cmd_build() -> anyhow::Result<()> {
     require_go!();
