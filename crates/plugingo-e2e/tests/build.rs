@@ -201,3 +201,20 @@ async fn test_with_dep_cmd_build_host_toolchain() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Regression: a package mixing a go_src static `//go:embed` (resources/x.sh on
+/// disk, no target) with a go_embed_src embed (ui_dist, decoupled out of golist).
+/// `go list` resolves embeds atomically, so the unresolved go_embed_src patterns
+/// must NOT poison resolution of the co-located static embed.
+#[tokio::test]
+async fn test_embed_mixed_go_src_and_go_embed_src_compiles() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_mixed")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//:build_lib").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "mixed go_src + go_embed_src embedding build_lib should compile"
+    );
+    Ok(())
+}

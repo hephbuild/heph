@@ -1084,6 +1084,24 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
     Ok(addrs)
 }
 
+/// The package's static (checked-in) non-Go source tree as a single fs-glob addr,
+/// excluding `.go`. Staged into the compile's `embed_src` group when `go list`'s
+/// `EmbedFiles` came back empty — which happens when an unresolved `go_embed_src`
+/// pattern (decoupled out of `_golist`) poisons go list's atomic per-package embed
+/// resolution, zeroing `EmbedFiles` for the co-located plain `//go:embed` statics
+/// too. Staging the static tree lets the in-driver Go-faithful selector resolve
+/// those statics from the bytes. Generated `go_embed_src` outputs carry the
+/// codegen xattr and are skipped by the glob, so the decoupling (and any
+/// `go_embed_src` lane staging) is preserved with no double-staging.
+fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
+    let glob = if pkg_str.is_empty() {
+        "**/*".to_string()
+    } else {
+        format!("{pkg_str}/**/*")
+    };
+    pluginfs::glob_addr(&glob, &["**/*.go"]).format()
+}
+
 impl ProviderInner {
     async fn handle_get(self: Arc<Self>, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
@@ -1299,12 +1317,19 @@ impl ProviderInner {
                     _ => {
                         // `go_embed_src` assets (kept out of `_golist`) are staged
                         // for the compile so the in-driver embedcfg finds the bytes.
-                        let embed_src_addrs = if embedding {
+                        let mut embed_src_addrs = if embedding {
                             compute_embed_src_addrs(addr.package.as_str(), &req.states)
                                 .map_err(GetError::Other)?
                         } else {
                             Vec::new()
                         };
+                        // When `go list` resolved zero EmbedFiles but the package
+                        // embeds, a go_embed_src pattern poisoned go list's atomic
+                        // resolution and zeroed the co-located static embeds too.
+                        // Stage the static non-go tree so the selector resolves them.
+                        if embedding && pkg_addrs.embed_files.is_empty() {
+                            embed_src_addrs.push(pkg_static_embed_glob_addr(addr.package.as_str()));
+                        }
                         target_lib::build_spec(
                             addr.clone(),
                             &import_path,
@@ -1430,12 +1455,19 @@ impl ProviderInner {
 
                 let mut test_embed_files = pkg_addrs.embed_files.clone();
                 test_embed_files.extend(pkg_addrs.test_embed_files.iter().cloned());
-                let embed_src_addrs = if has_any_embed {
+                let mut embed_src_addrs = if has_any_embed {
                     compute_embed_src_addrs(addr.package.as_str(), &req.states)
                         .map_err(GetError::Other)?
                 } else {
                     Vec::new()
                 };
+                // Same poisoning guard as build_lib: if go list resolved zero
+                // (test_)EmbedFiles for an embedding package, stage the static
+                // non-go tree so the selector resolves the plain `//go:embed`
+                // statics that a co-located go_embed_src pattern zeroed.
+                if has_any_embed && test_embed_files.is_empty() {
+                    embed_src_addrs.push(pkg_static_embed_glob_addr(addr.package.as_str()));
+                }
                 let spec = target_test::build_test_lib_spec(
                     addr.clone(),
                     &import_path,
