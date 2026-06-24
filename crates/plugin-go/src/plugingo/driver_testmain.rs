@@ -50,8 +50,16 @@ struct GoTestmainDef {
     mode: TestmainMode,
 }
 
+/// Bump to invalidate every cached `testmain.go` whenever the generation logic
+/// changes (the test-function scanner, the emitted bootstrap shape, …) — the
+/// def hash is otherwise just `golist_origin_id + mode`, so a pure logic change
+/// would be served stale from cache. v1: comment/string-aware scanner (no longer
+/// pulls a commented-out `func Test…` into testmain.go).
+const GO_TESTMAIN_FORMAT_VERSION: u32 = 1;
+
 impl Hash for GoTestmainDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        GO_TESTMAIN_FORMAT_VERSION.hash(state);
         self.golist_origin_id.hash(state);
         match self.mode {
             TestmainMode::Internal => 0u8.hash(state),
