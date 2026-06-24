@@ -218,3 +218,16 @@ async fn test_embed_mixed_go_src_and_go_embed_src_compiles() -> anyhow::Result<(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_embed_mixed_build_testmain_lib() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_mixed")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//:build_testmain_lib").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "testmain_lib should compile"
+    );
+    Ok(())
+}

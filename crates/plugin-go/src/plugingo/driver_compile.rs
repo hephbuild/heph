@@ -658,12 +658,41 @@ impl GoCompileDriver {
             .with_context(|| format!("wait for go {step}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
             anyhow::bail!(
-                "go {step} failed:\n{}",
-                hplugin::error::last_n_lines(&stderr, 20)
+                "go {step} failed ({}):\n{}",
+                output.status,
+                go_failure_detail(&stdout, &stderr)
             );
         }
         Ok(())
+    }
+}
+
+/// Build the human-readable detail for a failed `go` invocation. `go tool` writes
+/// diagnostics to stderr, but some failures (and the `go` wrapper itself) print on
+/// stdout, so a stderr-only message can come back blank — useless. Include both
+/// (labelled, last 20 lines each) and fall back to an explicit marker when both
+/// are empty, so the error always says something actionable.
+fn go_failure_detail(stdout: &str, stderr: &str) -> String {
+    let stderr_tail = hplugin::error::last_n_lines(stderr.trim(), 20);
+    let stdout_tail = hplugin::error::last_n_lines(stdout.trim(), 20);
+    let mut detail = String::new();
+    if !stderr_tail.is_empty() {
+        detail.push_str("stderr:\n");
+        detail.push_str(&stderr_tail);
+    }
+    if !stdout_tail.is_empty() {
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str("stdout:\n");
+        detail.push_str(&stdout_tail);
+    }
+    if detail.is_empty() {
+        "<no output on stdout or stderr>".to_string()
+    } else {
+        detail
     }
 }
 
@@ -810,6 +839,26 @@ mod driver_tests {
     use hmodel::htpkg::PkgBuf;
 
     const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
+
+    // A failed `go` invocation must never report a blank body. Regression: the
+    // message only included stderr, so a failure that printed on stdout (or
+    // nowhere) surfaced as `go compile failed:` with nothing after it.
+    #[test]
+    fn go_failure_detail_surfaces_each_stream() {
+        // stderr only
+        let d = go_failure_detail("", "boom on stderr");
+        assert!(d.contains("stderr:") && d.contains("boom on stderr"), "{d}");
+        assert!(!d.contains("stdout:"), "{d}");
+        // stdout only — must not come back blank
+        let d = go_failure_detail("boom on stdout", "");
+        assert!(d.contains("stdout:") && d.contains("boom on stdout"), "{d}");
+        // both streams present
+        let d = go_failure_detail("out msg", "err msg");
+        assert!(d.contains("out msg") && d.contains("err msg"), "{d}");
+        // neither — explicit marker, never empty
+        let d = go_failure_detail("", "   \n  ");
+        assert_eq!(d, "<no output on stdout or stderr>");
+    }
 
     fn factors() -> Factors {
         Factors {
