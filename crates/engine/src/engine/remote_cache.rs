@@ -161,7 +161,41 @@ impl ConfiguredCache {
             );
         }
     }
+
+    /// Probe round-trip latency: one warmup call (discarded — it pays the
+    /// connection/TLS setup cost that would otherwise skew the first sample),
+    /// then [`LATENCY_SAMPLES`] consecutive measured calls reduced to their
+    /// median (resists a one-off spike). Any probe failing aborts the whole
+    /// measurement with that error.
+    async fn probe_latency(&self) -> anyhow::Result<Duration> {
+        self.backend
+            .exists(LATENCY_PROBE_KEY)
+            .await
+            .context("remote cache latency warmup probe")?;
+        let mut samples = Vec::with_capacity(LATENCY_SAMPLES);
+        for _ in 0..LATENCY_SAMPLES {
+            let started = Instant::now();
+            self.backend
+                .exists(LATENCY_PROBE_KEY)
+                .await
+                .context("remote cache latency probe")?;
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        samples
+            .into_iter()
+            .nth(LATENCY_SAMPLES / 2)
+            .context("latency probe collected no samples")
+    }
 }
+
+/// Object key probed to measure cache latency. Never expected to exist; the
+/// backend round-trip is what we time.
+const LATENCY_PROBE_KEY: &str = "__heph_latency_probe__";
+
+/// Measured (non-warmup) latency calls per cache. Odd so the median is a single
+/// sample, not an average of two.
+const LATENCY_SAMPLES: usize = 3;
 
 /// Per-cache latency probe result, surfaced by `heph tool cache measure-latency`.
 #[derive(Debug, Clone)]
@@ -304,9 +338,8 @@ impl RemoteCacheSet {
     /// order so subsequent runs skip the probe.
     pub async fn measure_latency(&self) -> Vec<CacheLatency> {
         let probes = self.caches.iter().map(|c| async move {
-            let started = Instant::now();
-            let latency = match c.backend.exists("__heph_latency_probe__").await {
-                Ok(_) => Some(started.elapsed()),
+            let latency = match c.probe_latency().await {
+                Ok(d) => Some(d),
                 Err(e) => {
                     warn!(cache = %c.def.name, error = ?e, "remote cache latency probe failed");
                     None
@@ -384,9 +417,8 @@ impl RemoteCacheSet {
             .enumerate()
             .filter(|(_, c)| c.def.read)
             .map(|(i, c)| async move {
-                let started = Instant::now();
-                let lat = match c.backend.exists("__heph_latency_probe__").await {
-                    Ok(_) => started.elapsed(),
+                let lat = match c.probe_latency().await {
+                    Ok(d) => d,
                     Err(e) => {
                         // Log-once + breaker via shared health; a probe that fails
                         // sorts the cache last (and may trip the breaker).
@@ -1049,6 +1081,83 @@ mod tests {
         );
         cache.note_err("op", &e);
         assert!(cache.broken());
+    }
+
+    /// Backend that records how many times `exists` was called and sleeps a
+    /// scripted duration per call, so a latency probe is deterministic.
+    struct ScriptedBackend {
+        calls: AtomicUsize,
+        /// Sleep applied to call N (clamped to the last entry once exhausted).
+        delays: Vec<Duration>,
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for ScriptedBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            anyhow::bail!("unused")
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("unused")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            let d = self.delays.get(n).or_else(|| self.delays.last()).copied();
+            if let Some(d) = d {
+                tokio::time::sleep(d).await;
+            }
+            Ok(false)
+        }
+    }
+
+    /// A latency probe discards one warmup call, then times exactly
+    /// [`LATENCY_SAMPLES`] calls and reports their median.
+    #[tokio::test]
+    async fn probe_latency_warms_up_then_medians() {
+        // Warmup is slowest so it would dominate a naive single-shot probe; the
+        // three measured samples are 30/10/20ms → median 20ms.
+        let backend = Arc::new(ScriptedBackend {
+            calls: AtomicUsize::new(0),
+            delays: vec![
+                Duration::from_millis(80),
+                Duration::from_millis(30),
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+            ],
+        });
+        let cache = ConfiguredCache {
+            def: def("x", "memory:///x", true, true),
+            backend: backend.clone(),
+            health: CacheHealth::default(),
+        };
+
+        let lat = cache.probe_latency().await.expect("probe");
+
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            LATENCY_SAMPLES + 1,
+            "one warmup call plus {LATENCY_SAMPLES} measured calls"
+        );
+        // Median is the 20ms sample — well clear of both the 10ms floor and the
+        // 80ms warmup, with slack for scheduler jitter.
+        assert!(
+            lat >= Duration::from_millis(15) && lat < Duration::from_millis(60),
+            "median sample expected ~20ms, got {lat:?}"
+        );
+    }
+
+    /// A probe whose warmup fails surfaces the error rather than reporting a
+    /// bogus latency.
+    #[tokio::test]
+    async fn probe_latency_propagates_failure() {
+        let cache = ConfiguredCache {
+            def: def("broken", "memory:///broken", true, true),
+            backend: Arc::new(FailBackend),
+            health: CacheHealth::default(),
+        };
+        assert!(cache.probe_latency().await.is_err());
     }
 
     #[tokio::test]
