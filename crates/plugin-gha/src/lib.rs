@@ -22,6 +22,13 @@ use hplugin::hook::Hook;
 /// section of the summary.
 const SLOW_THRESHOLD_MS: u64 = 10_000;
 
+/// `$GITHUB_STEP_SUMMARY` is capped at 1 MiB by GitHub. The header is tiny and
+/// fixed; the only unbounded sections are the slow + failed lists, so they are
+/// truncated to the slowest / first N (with a "…and X more" line) to keep every
+/// snapshot well under the limit.
+const MAX_SLOW_ROWS: usize = 20;
+const MAX_FAILED_ROWS: usize = 50;
+
 /// The folded build status. Only what the summary renders: matched/finished sets
 /// for progress, cache-hit + built counts, the failure list, and the in-flight
 /// execute start times for slow detection.
@@ -99,7 +106,8 @@ impl Tally {
                 (elapsed >= SLOW_THRESHOLD_MS).then(|| (addr.clone(), elapsed))
             })
             .collect();
-        slow.sort_by(|a, b| b.1.cmp(&a.1));
+        // Slowest first.
+        slow.sort_by_key(|(_, elapsed)| std::cmp::Reverse(*elapsed));
         slow
     }
 
@@ -123,14 +131,17 @@ impl Tally {
         let slow = self.slow(now_ms);
         if !slow.is_empty() {
             out.push_str("\n### Slow targets\n\n| target | running for |\n| --- | --- |\n");
-            for (addr, elapsed) in slow {
+            for (addr, elapsed) in slow.iter().take(MAX_SLOW_ROWS) {
                 out.push_str(&format!("| `{addr}` | {}s |\n", elapsed / 1000));
+            }
+            if slow.len() > MAX_SLOW_ROWS {
+                out.push_str(&format!("\n…and {} more\n", slow.len() - MAX_SLOW_ROWS));
             }
         }
 
         if !self.failed.is_empty() {
             out.push_str("\n### Failed\n\n");
-            for (addr, err) in &self.failed {
+            for (addr, err) in self.failed.iter().take(MAX_FAILED_ROWS) {
                 match err {
                     Some(e) => out.push_str(&format!(
                         "- `{addr}` — {}\n",
@@ -138,6 +149,12 @@ impl Tally {
                     )),
                     None => out.push_str(&format!("- `{addr}`\n")),
                 }
+            }
+            if self.failed.len() > MAX_FAILED_ROWS {
+                out.push_str(&format!(
+                    "\n…and {} more\n",
+                    self.failed.len() - MAX_FAILED_ROWS
+                ));
             }
         }
         out
@@ -161,11 +178,15 @@ impl Inner {
             let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
             tally.render_markdown(now_unix_ms())
         };
-        // Atomic: write a temp sibling then rename, so a reader never sees a
-        // half-written summary.
+        // Each write fully RESETS the file (write a temp sibling, then rename over
+        // the target): the summary always shows only the latest snapshot, never an
+        // append of every refresh. Atomic so a reader never sees a half-written
+        // file.
         let tmp = path.with_extension("heph-tmp");
-        if std::fs::write(&tmp, markdown.as_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+        if std::fs::write(&tmp, markdown.as_bytes()).is_ok()
+            && let Err(e) = std::fs::rename(&tmp, path)
+        {
+            tracing::warn!("gha hook: failed to write step summary: {e}");
         }
     }
 }
@@ -335,6 +356,26 @@ mod tests {
             md.contains("//a:w") && md.contains("boom"),
             "failure detail: {md}"
         );
+    }
+
+    #[test]
+    fn slow_list_capped_to_top_n() {
+        let mut t = Tally::default();
+        // Many concurrent long-running targets; the slowest started earliest.
+        for i in 0..(MAX_SLOW_ROWS + 5) {
+            t.apply(&ev(
+                i as u64,
+                BuildEventKind::ExecuteStart {
+                    addr: format!("//a:t{i}"),
+                    driver: "exec".into(),
+                    cache: false,
+                },
+            ));
+        }
+        let md = t.render_markdown(1_000_000);
+        let rows = md.matches("| `//a:t").count();
+        assert_eq!(rows, MAX_SLOW_ROWS, "slow rows capped: {rows}");
+        assert!(md.contains("…and 5 more"), "overflow line: {md}");
     }
 
     #[test]
