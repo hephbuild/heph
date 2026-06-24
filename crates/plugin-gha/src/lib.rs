@@ -3,10 +3,12 @@
 //! ways. Published out-of-process as a cdylib (see `plugin-gha-cdylib`) and
 //! enabled via a config `plugins:` entry.
 //!
-//! - **Live**, while the job runs: a dedicated GitHub **check run** whose markdown
-//!   `output` is PATCHed on a timer. A check run is the only Actions surface that
-//!   updates in real time — `$GITHUB_STEP_SUMMARY` is rendered by GitHub *only*
-//!   when the step ends, so it cannot show live progress.
+//! - **Live**, while the job runs: a **sticky PR comment** whose body is PATCHed on
+//!   a timer. `$GITHUB_STEP_SUMMARY` is rendered by GitHub *only* when the step
+//!   ends, so it can't show live progress; a comment can, works with the default
+//!   `GITHUB_TOKEN`, and (unlike a check run) never nests under another workflow's
+//!   check suite. One comment per job, reused across runs (found by a hidden marker)
+//!   so it's never spammed.
 //! - **At the end**: the full markdown is written once to `$GITHUB_STEP_SUMMARY`.
 //!
 //! The aggregation is intentionally self-contained (a small [`Tally`]) rather than
@@ -212,112 +214,99 @@ impl Tally {
     }
 }
 
-/// The default check-run name for an invocation: the heph command, suffixed with
-/// the Actions job id (`GITHUB_JOB`) when present so the same command in different
-/// jobs never collides into one check. Same command + same step is the only case
-/// that can still collide — set the `checkName` option there.
-fn default_check_name(command: &str, job: Option<String>) -> String {
-    let base = if command.is_empty() {
-        "heph".to_string()
-    } else {
-        format!("heph: {command}")
-    };
+/// Scopes the sticky comment to one per job: the Actions job id (`GITHUB_JOB`) when
+/// present, else the heph command (so local / non-Actions runs still get a stable
+/// key). A job keeps a single comment across all its steps.
+fn comment_key(command: &str, job: Option<String>) -> String {
     match job.filter(|s| !s.is_empty()) {
-        Some(job) => format!("{base} [{job}]"),
-        None => base,
+        Some(job) => job,
+        None if command.is_empty() => "heph".to_string(),
+        None => command.to_string(),
     }
 }
 
-/// The commit a check run should attach to. On a `pull_request` event `GITHUB_SHA`
-/// is the ephemeral *merge* commit (`refs/pull/N/merge`); a check attached there is
-/// invisible on the PR. The commit reviewers actually see is the PR **head**, which
-/// the event payload carries at `pull_request.head.sha`. So: on a PR event, read the
-/// event JSON (`GITHUB_EVENT_PATH`) and use that head sha; otherwise (push, etc.)
-/// fall back to `GITHUB_SHA`. This is why the workflow no longer needs to override
-/// `GITHUB_SHA` itself.
-fn resolve_head_sha() -> Option<String> {
-    let nonempty = |s: String| Some(s).filter(|s| !s.is_empty());
-    let event = std::env::var("GITHUB_EVENT_NAME").unwrap_or_default();
-    if (event == "pull_request" || event == "pull_request_target")
-        && let Some(sha) = pr_head_sha_from_event()
-    {
-        return Some(sha);
+/// Shared GitHub REST auth/version headers.
+fn gh_headers(token: &str) -> reqwest::header::HeaderMap {
+    use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+    let mut h = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}")) {
+        h.insert(AUTHORIZATION, v);
     }
-    std::env::var("GITHUB_SHA").ok().and_then(nonempty)
+    h.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    h.insert(USER_AGENT, HeaderValue::from_static("heph"));
+    h.insert(
+        HeaderName::from_static("x-github-api-version"),
+        HeaderValue::from_static("2022-11-28"),
+    );
+    h
 }
 
-/// Read the Actions event payload (`GITHUB_EVENT_PATH`) and pull
-/// `pull_request.head.sha` out of it; `None` if unset / unreadable / absent.
-fn pr_head_sha_from_event() -> Option<String> {
-    let path = std::env::var("GITHUB_EVENT_PATH")
+/// The PR number for the current event, or `None` outside a PR. Prefers the event
+/// payload's `pull_request.number`, falling back to `GITHUB_REF`
+/// (`refs/pull/<N>/merge`).
+fn pr_number() -> Option<u64> {
+    if let Some(path) = std::env::var("GITHUB_EVENT_PATH")
         .ok()
-        .filter(|s| !s.is_empty())?;
-    let bytes = std::fs::read(path).ok()?;
-    pr_head_sha_from_json(&bytes)
-}
-
-/// Extract `pull_request.head.sha` from raw event-payload JSON. Pure (no env / fs)
-/// so it is unit-testable; `None` if the bytes don't parse or the field is missing.
-fn pr_head_sha_from_json(bytes: &[u8]) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    json.get("pull_request")?
-        .get("head")?
-        .get("sha")?
-        .as_str()
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        && let Ok(bytes) = std::fs::read(path)
+        && let Some(n) = pr_number_from_json(&bytes)
+    {
+        return Some(n);
+    }
+    pr_number_from_ref(&std::env::var("GITHUB_REF").unwrap_or_default())
 }
 
-/// Live updates to a dedicated GitHub **check run**. A check run's markdown
-/// `output` can be PATCHed while the job runs (the step summary cannot), so this
-/// is the live surface. Configured from the Actions environment; disabled (with no
-/// network calls) if any of token / repo / head-sha is missing. All calls are
-/// best-effort — an API/network error is logged, never fatal.
-struct ChecksClient {
-    /// Built lazily on first use. The blocking client must not be constructed on a
-    /// thread inside a tokio runtime; building it here, on the off-runtime update
-    /// thread (or the `on_close` blocking thread), keeps that guaranteed regardless
-    /// of where the plugin was loaded.
+/// Extract `pull_request.number` from raw event-payload JSON. Pure (testable).
+fn pr_number_from_json(bytes: &[u8]) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    json.get("pull_request")?.get("number")?.as_u64()
+}
+
+/// Parse the PR number out of a `refs/pull/<N>/merge` (or `/head`) ref. Pure.
+fn pr_number_from_ref(git_ref: &str) -> Option<u64> {
+    git_ref
+        .strip_prefix("refs/pull/")?
+        .split('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Live updates to a **sticky PR comment**. Unlike a check run, an issue comment
+/// is never grouped under a workflow's check suite, so it works correctly with the
+/// default `GITHUB_TOKEN` (needs `pull-requests: write`). The comment is found-or-
+/// created once (matched by a hidden marker) and PATCHed in place afterwards, so
+/// repeated runs reuse the one comment instead of spamming new ones. One comment
+/// per `marker` key (the job, so a job keeps a single comment across its steps).
+struct CommentClient {
     http: std::sync::OnceLock<reqwest::blocking::Client>,
     api_url: String,
     repo: String,
     token: String,
-    head_sha: String,
-    /// The check run's unique GitHub identity. Each heph invocation (a separate
-    /// process — CI runs many across jobs/steps) must use a distinct name, else
-    /// same-name runs on the same head sha collapse to the latest and earlier
-    /// commands' results are lost. Derived from the command + job (or `checkName`).
-    name: String,
-    /// The check run id, assigned by the first (create) call, reused by PATCHes.
+    /// The PR to comment on.
+    pr: u64,
+    /// Hidden HTML marker (`<!-- heph-gha:<key> -->`) identifying *this* comment, so
+    /// the same job's comment is found and reused rather than duplicated.
+    marker: String,
+    /// The comment id, resolved (found-or-created) on first sync, reused after.
     id: Mutex<Option<u64>>,
 }
 
-impl ChecksClient {
-    /// Build from the Actions env (`GITHUB_TOKEN` / `GITHUB_REPOSITORY` /
-    /// `GITHUB_SHA`, `GITHUB_API_URL` optional), or `None` if a required piece is
-    /// absent. The head sha is resolved by [`resolve_head_sha`] so a check on a PR
-    /// lands on the PR head commit, not the merge commit — no workflow override
-    /// needed. `head_sha_override` (the `headSha` option) still wins if set.
-    ///
-    /// `token_env` names the env var the API token is read from (default
-    /// `GITHUB_TOKEN`). Point it at a **GitHub App** installation token (or a PAT)
-    /// to give the check run its own check suite — with the default `GITHUB_TOKEN`,
-    /// GitHub nests the API-created run under another workflow's github-actions
-    /// check suite (e.g. a labeler), which the check-runs API can't override.
-    fn from_env(
-        name: String,
-        head_sha_override: Option<String>,
-        token_env: Option<String>,
-    ) -> Option<Self> {
+impl CommentClient {
+    /// Build from the Actions env, or `None` outside a PR / without a token. `key`
+    /// scopes the sticky comment (the job id, so one comment per job). `token_env`
+    /// names the token var (default `GITHUB_TOKEN`).
+    fn from_env(key: &str, token_env: Option<String>) -> Option<Self> {
         let nonempty = |v: String| Some(v).filter(|s| !s.is_empty());
         let token_var = token_env
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "GITHUB_TOKEN".to_string());
         let token = std::env::var(&token_var).ok().and_then(nonempty)?;
         let repo = std::env::var("GITHUB_REPOSITORY").ok().and_then(nonempty)?;
-        let head_sha = head_sha_override
-            .and_then(nonempty)
-            .or_else(resolve_head_sha)?;
+        let pr = pr_number()?;
         let api_url = std::env::var("GITHUB_API_URL")
             .ok()
             .and_then(nonempty)
@@ -327,8 +316,8 @@ impl ChecksClient {
             api_url,
             repo,
             token,
-            head_sha,
-            name,
+            pr,
+            marker: format!("<!-- heph-gha:{key} -->"),
             id: Mutex::new(None),
         })
     }
@@ -337,113 +326,118 @@ impl ChecksClient {
         self.http.get_or_init(reqwest::blocking::Client::new)
     }
 
-    fn headers(&self) -> reqwest::header::HeaderMap {
-        use reqwest::header::{
-            ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
-        };
-        let mut h = HeaderMap::new();
-        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", self.token)) {
-            h.insert(AUTHORIZATION, v);
+    /// Find an existing comment carrying our marker, returning its id. Pages through
+    /// the PR's comments (newest unlikely to matter; caps pages to bound work).
+    fn find_existing(&self) -> Option<u64> {
+        const MAX_PAGES: u32 = 10;
+        for page in 1..=MAX_PAGES {
+            let resp = self
+                .http()
+                .get(format!(
+                    "{}/repos/{}/issues/{}/comments?per_page=100&page={page}",
+                    self.api_url, self.repo, self.pr
+                ))
+                .headers(gh_headers(&self.token))
+                .send()
+                .and_then(|r| r.error_for_status())
+                .and_then(|r| r.json::<Vec<serde_json::Value>>());
+            let comments = match resp {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("listing PR comments failed: {e}");
+                    return None;
+                }
+            };
+            if comments.is_empty() {
+                break;
+            }
+            for c in &comments {
+                let body = c
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if body.contains(&self.marker)
+                    && let Some(cid) = c.get("id").and_then(serde_json::Value::as_u64)
+                {
+                    return Some(cid);
+                }
+            }
+            if comments.len() < 100 {
+                break;
+            }
         }
-        h.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/vnd.github+json"),
-        );
-        h.insert(USER_AGENT, HeaderValue::from_static("heph"));
-        h.insert(
-            HeaderName::from_static("x-github-api-version"),
-            HeaderValue::from_static("2022-11-28"),
-        );
-        h
+        None
     }
 
-    /// Create the check run on the first call, PATCH it after. `completed` finalizes
-    /// it with a `success`/`failure` conclusion from `ok`.
-    fn sync(&self, title: String, summary: String, completed: bool, ok: bool) {
+    /// Create-or-update the sticky comment with `markdown`. The marker is prepended
+    /// (hidden) so the comment is re-findable across processes.
+    fn sync(&self, markdown: String) {
         let mut id = self.id.lock().unwrap_or_else(|e| e.into_inner());
-        let status = if completed {
-            "completed"
-        } else {
-            "in_progress"
-        };
-        let conclusion = completed.then_some(if ok { "success" } else { "failure" });
-        let output = serde_json::json!({ "title": title, "summary": summary });
-
-        // Build the request body via a map (avoids `Value` index assignment).
-        let mut body = serde_json::Map::new();
-        body.insert("status".into(), serde_json::json!(status));
-        body.insert("output".into(), output);
-        if let Some(c) = conclusion {
-            body.insert("conclusion".into(), serde_json::json!(c));
+        // First sync: adopt an existing comment (e.g. from an earlier step in this
+        // job) before deciding to create — that is what keeps it one-per-job.
+        if id.is_none() {
+            *id = self.find_existing();
         }
+        let body = format!("{}\n{markdown}", self.marker);
+        let mut payload = serde_json::Map::new();
+        payload.insert("body".into(), serde_json::json!(body));
 
         let result = match *id {
-            None => {
-                // Create: `name` + `head_sha` are required. `name` is per-invocation
-                // unique so concurrent heph commands don't clobber one another.
-                body.insert("name".into(), serde_json::json!(self.name));
-                body.insert("head_sha".into(), serde_json::json!(self.head_sha));
-                self.http()
-                    .post(format!("{}/repos/{}/check-runs", self.api_url, self.repo))
-                    .headers(self.headers())
-                    .json(&serde_json::Value::Object(body))
-                    .send()
-                    .and_then(|r| r.error_for_status())
-                    .and_then(|r| r.json::<serde_json::Value>())
-                    .map(|v| {
-                        if let Some(new_id) = v.get("id").and_then(serde_json::Value::as_u64) {
-                            *id = Some(new_id);
-                        }
-                        // Surface the deep-link to the check's output in the job log.
-                        if let Some(url) = v.get("html_url").and_then(serde_json::Value::as_str) {
-                            tracing::info!("check run {url}");
-                        }
-                    })
-            }
-            Some(rid) => self
+            Some(cid) => self
                 .http()
                 .patch(format!(
-                    "{}/repos/{}/check-runs/{rid}",
+                    "{}/repos/{}/issues/comments/{cid}",
                     self.api_url, self.repo
                 ))
-                .headers(self.headers())
-                .json(&serde_json::Value::Object(body))
+                .headers(gh_headers(&self.token))
+                .json(&serde_json::Value::Object(payload))
                 .send()
                 .and_then(|r| r.error_for_status())
                 .map(drop),
+            None => self
+                .http()
+                .post(format!(
+                    "{}/repos/{}/issues/{}/comments",
+                    self.api_url, self.repo, self.pr
+                ))
+                .headers(gh_headers(&self.token))
+                .json(&serde_json::Value::Object(payload))
+                .send()
+                .and_then(|r| r.error_for_status())
+                .and_then(|r| r.json::<serde_json::Value>())
+                .map(|v| {
+                    if let Some(new_id) = v.get("id").and_then(serde_json::Value::as_u64) {
+                        *id = Some(new_id);
+                    }
+                    if let Some(url) = v.get("html_url").and_then(serde_json::Value::as_str) {
+                        tracing::info!("status comment {url}");
+                    }
+                }),
         };
         if let Err(e) = result {
-            tracing::warn!("check-run update failed: {e}");
+            tracing::warn!("status-comment update failed: {e}");
         }
     }
 }
 
 struct Inner {
     tally: Mutex<Tally>,
-    /// Title for the check run + the summary H2: `heph: <command>`.
+    /// The summary H2 + comment heading: `heph: <command>`.
     title: String,
     /// Final step-summary path; `None` disables the end-of-run file write.
     summary_path: Option<PathBuf>,
-    /// Live check-run updater; `None` when not running under Actions (or no token).
-    checks: Option<ChecksClient>,
+    /// Live sticky-comment updater; `None` when not running under Actions (or no
+    /// token / not a PR).
+    comment: Option<CommentClient>,
     /// Set by `on_close` so the live-update thread exits.
     stop: AtomicBool,
 }
 
 impl Inner {
-    /// (title, full markdown) for the current tally.
-    fn render(&self) -> (String, String) {
+    /// The full status markdown for the current tally.
+    fn render_markdown(&self) -> String {
         let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
-        let markdown = tally.render_markdown(now_unix_ms(), &self.title);
-        (self.title.clone(), markdown)
-    }
-
-    fn ok(&self) -> bool {
-        self.tally
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .failed
-            .is_empty()
+        tally.render_markdown(now_unix_ms(), &self.title)
     }
 
     /// Write the full markdown to the step-summary file once, at the end of the
@@ -452,7 +446,7 @@ impl Inner {
         let Some(path) = &self.summary_path else {
             return;
         };
-        let (_, markdown) = self.render();
+        let markdown = self.render_markdown();
         let tmp = path.with_extension("heph-tmp");
         if std::fs::write(&tmp, markdown.as_bytes()).is_ok()
             && let Err(e) = std::fs::rename(&tmp, path)
@@ -469,27 +463,15 @@ pub struct GhaHook {
 
 impl GhaHook {
     /// Build from the plugin's `options:` map. Options (all optional):
-    /// `refreshSecs` (live check-run PATCH interval, default 30), `summaryPath`
-    /// (final step-summary file, default `$GITHUB_STEP_SUMMARY`), `headSha` (check
-    /// run head sha; default is auto-resolved by [`resolve_head_sha`] — the PR head
-    /// on a `pull_request` event, else `$GITHUB_SHA`), `tokenEnv` (name of the env
-    /// var holding the API token, default `GITHUB_TOKEN`; point at a GitHub App /
-    /// PAT token so the check gets its own check suite instead of nesting under
-    /// another workflow's), `checkName` (the check run's GitHub identity; default
-    /// is the heph command + job id, kept distinct per invocation so CI's many
-    /// heph commands don't overwrite one check). Spawns the live-update thread when
-    /// a check run can be created.
+    /// `refreshSecs` (live PR-comment PATCH interval, default 30), `summaryPath`
+    /// (final step-summary file, default `$GITHUB_STEP_SUMMARY`), `tokenEnv` (name
+    /// of the env var holding the API token, default `GITHUB_TOKEN`). Spawns the
+    /// live-update thread when a PR comment can be created.
     pub fn from_options(opts: &Options) -> anyhow::Result<Self> {
         deny_unknown(
             "gha hook",
             opts,
-            &[
-                "refreshSecs",
-                "summaryPath",
-                "headSha",
-                "tokenEnv",
-                "checkName",
-            ],
+            &["refreshSecs", "summaryPath", "tokenEnv"],
         )?;
         tracing::info!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
@@ -512,22 +494,15 @@ impl GhaHook {
         } else {
             format!("heph: {command}")
         };
-        // The check-run identity. CI runs many heph commands across jobs/steps, each
-        // a fresh process; a static name would make same-name runs collapse to the
-        // latest on the head sha. Derive a distinct name per invocation (or take the
-        // explicit `checkName`).
-        let check_name = match decode_opt::<String>(opts, "gha hook", "checkName")? {
-            Some(n) if !n.is_empty() => n,
-            _ => default_check_name(&command, std::env::var("GITHUB_JOB").ok()),
-        };
 
-        let head_sha = decode_opt::<String>(opts, "gha hook", "headSha")?;
         let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
-        let checks = ChecksClient::from_env(check_name, head_sha, token_env);
-        if checks.is_none() {
+        // One sticky PR comment per job (keyed by GITHUB_JOB, command as fallback).
+        let key = comment_key(&command, std::env::var("GITHUB_JOB").ok());
+        let comment = CommentClient::from_env(&key, token_env);
+        if comment.is_none() {
             tracing::info!(
-                "gha hook: GITHUB_TOKEN/GITHUB_REPOSITORY/GITHUB_SHA not all set; \
-                 live check-run updates disabled (step summary still written at end)"
+                "gha hook: GITHUB_TOKEN/GITHUB_REPOSITORY/PR not all set; \
+                 live status comment disabled (step summary still written at end)"
             );
         }
 
@@ -535,29 +510,27 @@ impl GhaHook {
             tally: Mutex::new(Tally::default()),
             title,
             summary_path,
-            checks,
+            comment,
             stop: AtomicBool::new(false),
         });
 
-        // Live updates run only when a check run is configured. A plain thread (no
+        // Live updates run only when a comment is configured. A plain thread (no
         // async runtime) keeps the hook free of runtime entanglement; it creates
-        // the check run up front so it appears at job start, then PATCHes it every
+        // the comment up front so it appears at job start, then PATCHes it every
         // `refreshSecs` until `on_close` sets `stop`.
-        if inner.checks.is_some() {
+        if inner.comment.is_some() {
             let t = Arc::clone(&inner);
             std::thread::spawn(move || {
-                let (title, summary) = t.render();
-                if let Some(c) = &t.checks {
-                    c.sync(title, summary, false, true);
+                if let Some(c) = &t.comment {
+                    c.sync(t.render_markdown());
                 }
                 while !t.stop.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_secs(refresh_secs));
                     if t.stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let (title, summary) = t.render();
-                    if let Some(c) = &t.checks {
-                        c.sync(title, summary, false, true);
+                    if let Some(c) = &t.comment {
+                        c.sync(t.render_markdown());
                     }
                 }
             });
@@ -581,13 +554,12 @@ impl Hook for GhaHook {
     }
 
     fn on_close(&self) {
-        // Stop the live-update thread, finalize the check run, then write the step
+        // Stop the live-update thread, write the final comment, then the step
         // summary once — all synchronously, so they complete before the plugin
         // acks the host (which is the host's drain barrier before process exit).
         self.inner.stop.store(true, Ordering::Release);
-        if let Some(c) = &self.inner.checks {
-            let (title, summary) = self.inner.render();
-            c.sync(title, summary, true, self.inner.ok());
+        if let Some(c) = &self.inner.comment {
+            c.sync(self.inner.render_markdown());
         }
         self.inner.write_summary();
     }
@@ -760,39 +732,29 @@ mod tests {
     }
 
     #[test]
-    fn check_name_distinct_per_command_and_job() {
-        // Command + job → unique even when two jobs run the same command.
+    fn comment_key_prefers_job_then_command() {
+        // Job id wins → one comment per job.
+        assert_eq!(comment_key("run //a:x", Some("test".into())), "test");
+        // No job → command keeps it stable (local / non-Actions).
+        assert_eq!(comment_key("run //a:x", None), "run //a:x");
+        // Empty job string treated as absent.
         assert_eq!(
-            default_check_name("run //a:x", Some("test".into())),
-            "heph: run //a:x [test]",
+            comment_key("query //...", Some(String::new())),
+            "query //..."
         );
-        // No job → bare command name.
-        assert_eq!(default_check_name("run //a:x", None), "heph: run //a:x");
-        // Empty job string is treated as absent.
-        assert_eq!(
-            default_check_name("query //...", Some(String::new())),
-            "heph: query //...",
-        );
-        // Empty command → still a stable fallback.
-        assert_eq!(default_check_name("", None), "heph");
+        // Empty command → stable fallback.
+        assert_eq!(comment_key("", None), "heph");
     }
 
     #[test]
-    fn pr_head_sha_extracted_from_event_json() {
-        // A trimmed `pull_request` event payload.
-        let payload = serde_json::json!({
-            "pull_request": { "head": { "sha": "deadbeefcafe" } }
-        })
-        .to_string();
-        assert_eq!(
-            pr_head_sha_from_json(payload.as_bytes()).as_deref(),
-            Some("deadbeefcafe"),
-        );
-        // Missing field / wrong shape → None (so it falls back to GITHUB_SHA).
-        assert_eq!(pr_head_sha_from_json(b"{}"), None);
-        assert_eq!(pr_head_sha_from_json(b"not json"), None);
-        let no_sha = serde_json::json!({ "pull_request": { "head": {} } }).to_string();
-        assert_eq!(pr_head_sha_from_json(no_sha.as_bytes()), None);
+    fn pr_number_extracted_from_event_and_ref() {
+        let payload = serde_json::json!({ "pull_request": { "number": 122 } }).to_string();
+        assert_eq!(pr_number_from_json(payload.as_bytes()), Some(122));
+        assert_eq!(pr_number_from_json(b"{}"), None);
+        // Ref fallback.
+        assert_eq!(pr_number_from_ref("refs/pull/122/merge"), Some(122));
+        assert_eq!(pr_number_from_ref("refs/pull/7/head"), Some(7));
+        assert_eq!(pr_number_from_ref("refs/heads/main"), None);
     }
 
     #[test]
