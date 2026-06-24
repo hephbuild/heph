@@ -56,9 +56,16 @@ impl HephLspContext {
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
+        let builtin_hovers = crate::pluginbuildfile::run_file::builtin_call_hovers(&doc_globals);
         let patterns = buildfile_patterns(&*engine);
         let provider = build_listing_provider(&root, &patterns, &registry);
-        let shared = SharedState::new(engine, root.clone(), patterns.clone(), core_members);
+        let shared = SharedState::new(
+            engine,
+            root.clone(),
+            patterns.clone(),
+            core_members,
+            builtin_hovers,
+        );
         HephLspContext {
             root,
             registry,

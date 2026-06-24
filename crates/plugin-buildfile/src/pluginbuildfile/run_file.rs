@@ -85,6 +85,100 @@ pub(crate) fn heph_core_members(globals_doc: &starlark::docs::DocModule) -> Vec<
         .collect()
 }
 
+/// Rendered hover markdown for the `target` and `provider_state` builtins, keyed
+/// by name. Both take a raw `args: &Arguments`, so the stock server can only
+/// render the meaningless `def name(*args, **kwargs)` prototype; we render a
+/// meaningful one — `target`'s recognized base arguments (from
+/// [`target_base_fields`], so the two never drift) plus a `**config` catch-all for
+/// driver fields, and `provider_state`'s `provider` plus a `**state` catch-all —
+/// while keeping each builtin's real docstring. Computed once at startup (the
+/// signatures are static); the proxy serves these when the callee name is hovered.
+pub(crate) fn builtin_call_hovers(
+    globals_doc: &starlark::docs::DocModule,
+) -> std::collections::HashMap<String, String> {
+    use starlark::docs::markdown::render_doc_item_no_link;
+    use starlark::docs::{
+        DocFunction, DocItem, DocMember, DocParam, DocParams, DocReturn, DocString,
+    };
+    use starlark::typing::Ty;
+
+    // The builtin's real docstring, pulled from the globals doc so it never drifts
+    // from the `#[starlark_module]` definition.
+    let docstring = |name: &str| -> Option<DocString> {
+        match globals_doc.members.get(name) {
+            Some(DocItem::Member(DocMember::Function(f))) => f.docs.clone(),
+            _ => None,
+        }
+    };
+
+    // One named parameter; `required` controls whether a `= None` default (the
+    // optional convention) is shown.
+    let param = |name: &str, ty: Ty, required: bool| DocParam {
+        name: name.to_string(),
+        docs: None,
+        typ: ty,
+        default_value: (!required).then(|| "None".to_string()),
+    };
+    // A `**name` catch-all of arbitrary type.
+    let kwargs = |name: &str| DocParam {
+        name: name.to_string(),
+        docs: None,
+        typ: Ty::any(),
+        default_value: None,
+    };
+    let render = |name: &str, params: DocParams, ret: Ty| {
+        let item = DocItem::Member(DocMember::Function(DocFunction {
+            docs: docstring(name),
+            params,
+            ret: DocReturn {
+                docs: None,
+                typ: ret,
+            },
+        }));
+        render_doc_item_no_link(name, &item)
+    };
+
+    let mut out = std::collections::HashMap::new();
+
+    // `target(name, driver, …, **config) -> str`. Base args come from the single
+    // source of truth shared with completion.
+    out.insert(
+        "target".to_string(),
+        render(
+            "target",
+            DocParams {
+                pos_only: Vec::new(),
+                pos_or_named: target_base_fields()
+                    .into_iter()
+                    .map(|f| param(&f.name, param_type_to_ty(&f.ty), f.required))
+                    .collect(),
+                args: None,
+                named_only: Vec::new(),
+                kwargs: Some(kwargs("config")),
+            },
+            Ty::string(),
+        ),
+    );
+
+    // `provider_state(provider, **state) -> None`.
+    out.insert(
+        "provider_state".to_string(),
+        render(
+            "provider_state",
+            DocParams {
+                pos_only: Vec::new(),
+                pos_or_named: vec![param("provider", Ty::string(), true)],
+                args: None,
+                named_only: Vec::new(),
+                kwargs: Some(kwargs("state")),
+            },
+            Ty::none(),
+        ),
+    );
+
+    out
+}
+
 pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
     let mut builder = GlobalsBuilder::standard();
     builder = builder.with(starlark_module);
@@ -1212,6 +1306,31 @@ mod tests {
     use hcore::htvalue::signature::Param;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn builtin_call_hovers_render_real_signatures() {
+        let doc = build_globals(&ProviderFunctionRegistry::default()).documentation();
+        let hovers = builtin_call_hovers(&doc);
+
+        let target = hovers.get("target").expect("target hover");
+        // Real args, the `**config` catch-all, and the address return — not the
+        // stock `def target(*args, **kwargs) -> None`.
+        assert!(target.contains("name"), "names base arg: {target}");
+        assert!(target.contains("driver"), "names driver arg: {target}");
+        assert!(target.contains("**config"), "shows config kwargs: {target}");
+        assert!(!target.contains("**kwargs"), "no raw kwargs: {target}");
+        // The real docstring carries through.
+        assert!(target.contains("Declare a build target"), "doc: {target}");
+
+        let ps = hovers.get("provider_state").expect("provider_state hover");
+        assert!(ps.contains("provider"), "names provider arg: {ps}");
+        assert!(ps.contains("**state"), "shows state kwargs: {ps}");
+        assert!(!ps.contains("**kwargs"), "no raw kwargs: {ps}");
+        assert!(
+            ps.contains("provider state") || ps.contains("provider"),
+            "doc: {ps}"
+        );
+    }
 
     fn run_pkg_blocking(provider: &Provider, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
         let registry = provider

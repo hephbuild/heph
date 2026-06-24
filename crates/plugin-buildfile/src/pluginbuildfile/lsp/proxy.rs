@@ -304,6 +304,13 @@ fn enrich_hover(
         // the stock server has no docs for these dynamic kwargs, so render the
         // schema field's type + doc ourselves.
         md = field_md;
+    } else if let Some(builtin_md) =
+        builtin_call_name_at(&index.source, byte_offset(&index.source, line, col))
+            .and_then(|name| shared.builtin_hovers.get(name))
+    {
+        // The `target` / `provider_state` callee name: both take a raw `*args,
+        // **kwargs`, so the stock hover is meaningless — render the real signature.
+        md = builtin_md.clone();
     } else if md.is_empty()
         && let Some(doc) = index.def_hover_at(line + 1, col + 1)
     {
@@ -864,6 +871,38 @@ fn word_at_offset(source: &str, offset: usize) -> Option<&str> {
     source.get(start..end)
 }
 
+/// If the identifier covering `offset` is the callee name of a recognized builtin
+/// call — `target(` or `provider_state(` — return that name; `None` otherwise. The
+/// identifier must be immediately followed (modulo whitespace) by `(`, so a bare
+/// `target` used as a value isn't mistaken for the call. Purely textual.
+fn builtin_call_name_at(source: &str, offset: usize) -> Option<&str> {
+    let b = source.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let offset = offset.min(b.len());
+    let on_ident = b.get(offset).copied().is_some_and(is_ident)
+        || (offset > 0 && b.get(offset - 1).copied().is_some_and(is_ident));
+    if !on_ident {
+        return None;
+    }
+    let mut start = offset;
+    while start > 0 && b.get(start - 1).copied().is_some_and(is_ident) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while b.get(end).copied().is_some_and(is_ident) {
+        end += 1;
+    }
+    let word = source.get(start..end)?;
+    if word != "target" && word != "provider_state" {
+        return None;
+    }
+    let mut k = end;
+    while b.get(k).copied().is_some_and(|c| c.is_ascii_whitespace()) {
+        k += 1;
+    }
+    (b.get(k) == Some(&b'(')).then_some(word)
+}
+
 fn field_item(name: &str, ty: &str, doc: String, ctx: &str, required: bool) -> CompletionItem {
     // Target config fields are mostly optional, so mark the minority — the
     // required ones — explicitly (Bazel `mandatory` / JSON-Schema `required`
@@ -987,7 +1026,7 @@ fn enrich_completion(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_symbol_def, pkg_of, result_points_to_other_file};
+    use super::{builtin_call_name_at, find_symbol_def, pkg_of, result_points_to_other_file};
     use std::path::Path;
 
     struct FakeEngine {
@@ -1068,6 +1107,9 @@ mod tests {
             Ok(result) => super::super::index::DocIndex::build(&result, "pkg", content.to_string()),
             Err(_) => super::super::index::DocIndex::source_only(content.to_string()),
         };
+        let doc_globals =
+            crate::pluginbuildfile::run_file::build_globals(&registry).documentation();
+        let builtin_hovers = crate::pluginbuildfile::run_file::builtin_call_hovers(&doc_globals);
         let engine = Arc::new(FakeEngine {
             root: tmp.path().to_path_buf(),
             registry,
@@ -1077,6 +1119,7 @@ mod tests {
             tmp.path().to_path_buf(),
             vec![glob::Pattern::new("BUILD").unwrap()],
             vec![],
+            builtin_hovers,
         );
         let uri = starlark_lsp::server::LspUri::File(tmp.path().join("BUILD"));
         shared.set_index(uri.clone(), index);
@@ -1198,6 +1241,51 @@ mod tests {
         assert!(md.contains("go_codegen_root"), "names the field: {md}");
         assert!(md.contains("bool"), "shows the type: {md}");
         assert!(md.contains("Go codegen root"), "shows the doc: {md}");
+    }
+
+    #[test]
+    fn hover_on_provider_state_callee_renders_signature() {
+        // Hovering the `provider_state` name (not a field) shows the real
+        // signature, not the stock `def provider_state(*args, **kwargs)`.
+        let content = "provider_state(provider = \"go\")\n";
+        let (shared, uri) = shared_with_index(content);
+        // Cursor on the `provider_state` callee (0-based col 3).
+        let md = hover_value(&shared, &uri, 0, 3).expect("hover");
+        assert!(md.contains("provider"), "names provider arg: {md}");
+        assert!(md.contains("**state"), "shows state kwargs: {md}");
+        assert!(!md.contains("**kwargs"), "not the raw prototype: {md}");
+    }
+
+    #[test]
+    fn hover_on_target_callee_renders_signature() {
+        let content = "target(name = \"t\", driver = \"exec\")\n";
+        let (shared, uri) = shared_with_index(content);
+        // Cursor on the `target` callee (0-based col 2).
+        let md = hover_value(&shared, &uri, 0, 2).expect("hover");
+        assert!(md.contains("name"), "names base arg: {md}");
+        assert!(md.contains("**config"), "shows config kwargs: {md}");
+        assert!(!md.contains("**kwargs"), "not the raw prototype: {md}");
+    }
+
+    #[test]
+    fn builtin_call_name_at_detects_callee_only() {
+        // On the callee name immediately before `(`.
+        assert_eq!(
+            builtin_call_name_at("target(name = \"t\")", 2),
+            Some("target")
+        );
+        assert_eq!(
+            builtin_call_name_at("provider_state(provider = \"go\")", 3),
+            Some("provider_state")
+        );
+        // Whitespace between name and `(` is tolerated.
+        assert_eq!(builtin_call_name_at("target  (x)", 2), Some("target"));
+        // A bare `target` not used as a call → None.
+        assert_eq!(builtin_call_name_at("x = target", 8), None);
+        // An unrelated identifier → None.
+        assert_eq!(builtin_call_name_at("glob(\"x\")", 1), None);
+        // Inside the args, not on the callee → None.
+        assert_eq!(builtin_call_name_at("target(name = \"t\")", 9), None);
     }
 
     #[test]
