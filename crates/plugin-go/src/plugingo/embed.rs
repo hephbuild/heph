@@ -1,50 +1,4 @@
-#[cfg(test)]
-use anyhow::Context;
-#[cfg(test)]
-use hcore::htvalue::Value;
-#[cfg(test)]
-use hmodel::htaddr::Addr;
-#[cfg(test)]
-use hplugin::provider::TargetSpec;
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::HashMap;
-
-/// Build the `embed` target spec.
-/// Encodes the embedcfg JSON for `go tool compile -embedcfg` purely from the
-/// `embed_patterns` and `embed_files` lists produced by `go list` — no
-/// filesystem access. The cfg `Files` map is therefore guaranteed to align with
-/// what downstream `build_lib` sandboxes stage (also derived from `EmbedFiles`).
-#[cfg(test)]
-pub fn build_spec(
-    addr: Addr,
-    embed_patterns: &[String],
-    embed_files: &[String],
-) -> anyhow::Result<TargetSpec> {
-    let cfg_json =
-        compute_embed_cfg_json(embed_patterns, embed_files).context("compute embed cfg json")?;
-
-    // Escape single quotes so the JSON can be embedded in a shell single-quoted string.
-    let escaped_json = cfg_json.replace('\'', "'\\''");
-    let run = format!("printf '%s\\n' '{escaped_json}' > embedcfg\n");
-
-    let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), Value::String(run));
-    config.insert(
-        "out".to_string(),
-        Value::Map(HashMap::from([(
-            "cfg".to_string(),
-            Value::List(vec![Value::String("embedcfg".to_string())]),
-        )])),
-    );
-    Ok(TargetSpec {
-        addr,
-        driver: "sh".to_string(),
-        config,
-        labels: vec![],
-        transitive: Default::default(),
-    })
-}
 
 /// Group `embed_files` (Go's resolved EmbedFiles list) by the pattern that
 /// matches them. Pure path-based matching: no filesystem access.
@@ -86,6 +40,127 @@ fn files_matching_pattern(pattern: &str, files: &[String]) -> Vec<String> {
     matched
 }
 
+/// Resolve a single `//go:embed` pattern against a flat list of candidate files
+/// (package-relative, `/`-separated paths), mirroring Go's `cmd/go` embed
+/// resolution. Returns the files Go would embed for `pattern`.
+///
+/// Used for the `go_embed_src` lane: those source files are *not* staged into
+/// `_golist`, so `go list` never resolves them. The integrated compile driver
+/// stages them and calls this to reproduce Go's `EmbedFiles` for the patterns
+/// `go list` reported but could not resolve.
+///
+/// Rules (verified against real `go list`):
+/// - `all:` prefix disables the leading-`.`/`_` exclusion during directory
+///   recursion (otherwise such entries are skipped).
+/// - The pattern is matched segment-by-segment via `path.Match` semantics (no
+///   separator crossing). A `*` matches dot/underscore entries at the matched
+///   level — Go does too.
+/// - A matched file is embedded directly. A matched directory is walked
+///   recursively; entries whose name begins with `.` or `_` are skipped unless
+///   `all:` was given. The matched directory's own name is exempt from that
+///   rule (it was named explicitly, by literal or glob).
+pub fn select_pattern_files(pattern: &str, files: &[String]) -> Vec<String> {
+    let all = pattern.starts_with("all:");
+    let p = pattern.strip_prefix("all:").unwrap_or(pattern);
+    let pat_segs: Vec<&str> = p.split('/').collect();
+
+    // Per-segment matcher: exact compare unless the segment carries glob meta.
+    let seg_matches = |pat_seg: &str, name: &str| -> bool {
+        if pat_seg.contains(['*', '?', '[']) {
+            match glob::Pattern::new(pat_seg) {
+                // Single path element → no separators to worry about; Go's `*`
+                // matches a leading dot, which is glob's default.
+                Ok(g) => g.matches(name),
+                Err(_) => false,
+            }
+        } else {
+            pat_seg == name
+        }
+    };
+    // Does path `entry` (split into segments) match the pattern exactly?
+    let entry_matches = |entry: &str| -> bool {
+        let segs: Vec<&str> = entry.split('/').collect();
+        segs.len() == pat_segs.len()
+            && pat_segs
+                .iter()
+                .zip(segs.iter())
+                .all(|(ps, s)| seg_matches(ps, s))
+    };
+    // Is `entry` a directory in the candidate set (a strict path-prefix of some
+    // file)? Derived purely from the flat file list — no filesystem access.
+    let is_dir = |entry: &str| -> bool {
+        let prefix = format!("{entry}/");
+        files.iter().any(|f| f.starts_with(&prefix))
+    };
+    // Walk a matched directory, applying Go's leading-`.`/`_` exclusion to every
+    // element *below* the matched root.
+    let push_dir_files = |dir: &str, out: &mut Vec<String>| {
+        let prefix = format!("{dir}/");
+        for f in files {
+            let Some(rel) = f.strip_prefix(&prefix) else {
+                continue;
+            };
+            if all || !rel.split('/').any(|seg| seg.starts_with(['.', '_'])) {
+                out.push(f.clone());
+            }
+        }
+    };
+
+    let mut matched: Vec<String> = Vec::new();
+    // Collect the set of matched roots: candidate files matching the pattern
+    // directly, plus directories matching it (expanded below).
+    for f in files {
+        if entry_matches(f) {
+            matched.push(f.clone());
+        }
+    }
+    // Directory roots: every ancestor path of a file. Track which we've expanded
+    // so a dir shared by many files is walked once.
+    let mut seen_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in files {
+        let mut acc = String::new();
+        for seg in f.split('/') {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            if acc.as_str() == f.as_str() {
+                break; // the file itself, not a dir
+            }
+            if seen_dirs.contains(&acc) {
+                continue;
+            }
+            if is_dir(&acc) && entry_matches(&acc) {
+                seen_dirs.insert(acc.clone());
+                push_dir_files(&acc, &mut matched);
+            }
+        }
+    }
+
+    matched.sort();
+    matched.dedup();
+    matched
+}
+
+/// Union Go's authoritative `EmbedFiles` (`go_src`, already resolved by
+/// `go list`) with the selector's resolution of the `go_embed_src` files for
+/// each pattern. Returns a sorted, deduped package-relative file list.
+pub fn merge_embed_files(
+    go_src_files: Vec<String>,
+    patterns: &[String],
+    embed_src_rel: &[String],
+) -> Vec<String> {
+    let mut files = go_src_files;
+    if !embed_src_rel.is_empty() {
+        for pattern in patterns {
+            files.extend(select_pattern_files(pattern, embed_src_rel));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
 /// Produce the JSON string expected by `go tool compile -embedcfg`.
 ///
 /// `embed_files` (from `go list EmbedFiles`) is Go's authoritative resolved
@@ -122,9 +197,19 @@ pub fn compute_embed_cfg_json(
     if !unmatched.is_empty() {
         anyhow::bail!(
             "//go:embed pattern(s) matched no files: {}. \
-             go list resolved these patterns to zero files — the embed source files \
-             are not staged. Declare the embed inputs (e.g. a BUILD2 provider_state(provider=\"go\") \
-             with go_src-labeled group targets) so the package's embed sources reach the sandbox.",
+             `go list` resolved these patterns to zero files, so the embed sources never \
+             reached the `_golist` sandbox. Likely causes, in order:\n  \
+             1. Stale `_golist` cache — if these files exist on disk, an older/cached \
+             `_golist` (e.g. computed by a previous binary) may be served. Clear the cache \
+             (remove `.heph3/cache`) and rebuild.\n  \
+             2. Excluded from the source walk — an `fs.skip` entry in the workspace config \
+             matches the file or its directory; heph does not stage skipped files even when \
+             `//go:embed` references them.\n  \
+             3. Generated/codegen output not wired as a source — declare it (e.g. a \
+             `provider_state(provider=\"go\")` with a go_src-labeled group target) so it reaches \
+             the sandbox.\n  \
+             (A file merely existing on disk is not sufficient; it must be visible to heph's \
+             source walk and present when `_golist` ran.)",
             unmatched.join(", "),
         );
     }
@@ -143,74 +228,6 @@ pub fn compute_embed_cfg_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmodel::htpkg::PkgBuf;
-
-    fn test_addr() -> Addr {
-        Addr::new(
-            PkgBuf::from("mylib"),
-            "embed".to_string(),
-            Default::default(),
-        )
-    }
-
-    #[test]
-    fn test_embed_driver_is_bash() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        assert_eq!(spec.driver, "sh");
-    }
-
-    #[test]
-    fn test_embed_out_cfg_group() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        let out = spec.config.get("out").unwrap();
-        assert!(matches!(out, Value::Map(m) if m.contains_key("cfg")));
-    }
-
-    #[test]
-    fn test_embed_run_emits_embedcfg() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        assert!(
-            run.contains("embedcfg"),
-            "run must reference embedcfg: {run}"
-        );
-    }
-
-    #[test]
-    fn test_embed_run_contains_pattern() {
-        let spec = build_spec(
-            test_addr(),
-            &["static/index.html".to_string()],
-            &["static/index.html".to_string()],
-        )
-        .unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        assert!(
-            run.contains("static/index.html"),
-            "run must contain the embed pattern in the JSON: {run}"
-        );
-    }
 
     #[test]
     fn test_embed_files_paths_are_relative() {
@@ -333,6 +350,173 @@ mod tests {
             !msg.contains("assets/*"),
             "resolved pattern must not be named: {msg}"
         );
+    }
+
+    /// The fixture used to reverse-engineer Go's selection, kept in sync with
+    /// the `go list` ground truth captured during development.
+    fn selector_fixture() -> Vec<String> {
+        [
+            "assets/a.txt",
+            "assets/b.log",
+            "assets/.dot.txt",
+            "assets/_u.txt",
+            "assets/sub/c.txt",
+            "assets/sub/.d.txt",
+            "assets/.hid/h.txt",
+            "assets/_und/u.txt",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn select_sorted(pattern: &str) -> Vec<String> {
+        let mut v = select_pattern_files(pattern, &selector_fixture());
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_select_plain_dir_excludes_dot_and_underscore() {
+        // `assets`: recurse, skip any element starting with . or _.
+        assert_eq!(
+            select_sorted("assets"),
+            vec!["assets/a.txt", "assets/b.log", "assets/sub/c.txt"]
+        );
+    }
+
+    #[test]
+    fn test_select_all_prefix_includes_everything() {
+        assert_eq!(
+            select_sorted("all:assets"),
+            vec![
+                "assets/.dot.txt",
+                "assets/.hid/h.txt",
+                "assets/_u.txt",
+                "assets/_und/u.txt",
+                "assets/a.txt",
+                "assets/b.log",
+                "assets/sub/.d.txt",
+                "assets/sub/c.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_select_star_matches_dotfiles_at_level_then_recurses() {
+        // `assets/*`: `*` matches dot/underscore entries at this level; matched
+        // dirs recurse with the normal skip rule (so sub/.d.txt is excluded).
+        assert_eq!(
+            select_sorted("assets/*"),
+            vec![
+                "assets/.dot.txt",
+                "assets/.hid/h.txt",
+                "assets/_u.txt",
+                "assets/_und/u.txt",
+                "assets/a.txt",
+                "assets/b.log",
+                "assets/sub/c.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_select_glob_with_extension() {
+        // `assets/*.txt`: matches .txt files at one level, including dotfiles.
+        assert_eq!(
+            select_sorted("assets/*.txt"),
+            vec!["assets/.dot.txt", "assets/_u.txt", "assets/a.txt"]
+        );
+    }
+
+    #[test]
+    fn test_select_nested_plain_dir() {
+        assert_eq!(select_sorted("assets/sub"), vec!["assets/sub/c.txt"]);
+    }
+
+    #[test]
+    fn test_select_literal_file() {
+        assert_eq!(select_sorted("assets/a.txt"), vec!["assets/a.txt"]);
+    }
+
+    #[test]
+    fn test_select_literal_dotfile_is_included() {
+        // A literal pattern naming a dotfile embeds it (the skip rule only
+        // applies to glob matches and directory recursion).
+        assert_eq!(
+            select_pattern_files("assets/.dot.txt", &selector_fixture()),
+            vec!["assets/.dot.txt"]
+        );
+    }
+
+    #[test]
+    fn test_select_no_match_is_empty() {
+        assert!(select_pattern_files("missing/*", &selector_fixture()).is_empty());
+    }
+
+    /// Parity guard: when a host `go` is available, diff our selector against
+    /// real `go list EmbedFiles` for each pattern. Skips silently otherwise so
+    /// CI without a host toolchain still passes.
+    #[test]
+    fn test_selector_matches_real_go_list() {
+        use std::process::Command;
+        let go = match which_go() {
+            Some(g) => g,
+            None => return,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("go.mod"), "module example.com/m\ngo 1.22\n").unwrap();
+        let pkg = root.join("p");
+        let files = selector_fixture();
+        for f in &files {
+            let dst = pkg.join(f);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::write(&dst, b"x").unwrap();
+        }
+        for pattern in [
+            "assets",
+            "all:assets",
+            "assets/*",
+            "assets/*.txt",
+            "assets/sub",
+            "assets/a.txt",
+        ] {
+            let src = format!(
+                "package p\nimport \"embed\"\n//go:embed {pattern}\nvar A embed.FS\nvar _ = A\n"
+            );
+            std::fs::write(pkg.join("a.go"), src).unwrap();
+            let out = Command::new(&go)
+                .args(["list", "-json=EmbedFiles", "./p"])
+                .current_dir(root)
+                .env("GOWORK", "off")
+                .env("GOFLAGS", "")
+                .output()
+                .expect("run go list");
+            assert!(
+                out.status.success(),
+                "go list failed for {pattern}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            let mut want: Vec<String> = v["EmbedFiles"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default();
+            want.sort();
+            assert_eq!(
+                select_sorted(pattern),
+                want,
+                "mismatch for pattern {pattern}"
+            );
+        }
+    }
+
+    fn which_go() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|p| p.join("go"))
+            .find(|p| p.is_file())
     }
 
     #[test]

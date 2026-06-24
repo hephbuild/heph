@@ -599,7 +599,15 @@ impl ManagedDriver for StableRemoteManagedDriver {
     }
 
     fn supports_shell(&self) -> bool {
-        true
+        // Report no native shell so the host's ManagedDriverBridge dispatches
+        // `--shell` to its pluginexec fallback (an interactive bash in the
+        // already-materialized sandbox) instead of forwarding `run_shell` across
+        // the ABI. The stable ABI exposes no `supports_shell`, and no external
+        // plugin implements an interactive `run_shell` — forwarding only reaches
+        // the driver's default `run_shell`, which bails ("the bridge must
+        // dispatch to the shell fallback"). Returning false makes `--shell` work
+        // uniformly for every external managed driver (e.g. go_compile).
+        false
     }
 
     async fn run<'a, 'io>(

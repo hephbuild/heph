@@ -976,7 +976,7 @@ fn pick_codegen_deps(states: &[State]) -> Option<&State> {
 /// glob. Includes:
 /// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
 ///    non-Go sources (e.g. embed targets).
-/// 2. `query("label(go_src) && tree_output(pkg) && …")` — unpacks the full output tree
+/// 2. `query("… && label(go_src) && tree_output(pkg)")` — unpacks the full output tree
 ///    of any codegen target labelled `go_src` into the pkg dir, so both
 ///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
 ///    land in the sandbox.
@@ -1022,7 +1022,11 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => pkg_pattern(pkg_str),
     };
-    let go_src_expr = format!("label(go_src) && tree_output({pkg_str}) && {scope}");
+    // Cheapest-first by resolution tier: `scope` resolves at the no-IO addr
+    // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
+    // def tier (`get_def`, the most expensive). Order terms by that cost so the
+    // engine's left-to-right `&&` bails at the cheapest possible tier.
+    let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
     let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &[]);
     addrs.push(go_src_query_addr.format());
 
@@ -1034,6 +1038,68 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
         addrs.extend(deps);
     }
     Ok(addrs)
+}
+
+/// Pick the closest (deepest) ancestor state carrying `go_embed_deps`. Mirrors
+/// [`pick_codegen_deps`] for the embed-only lane.
+fn pick_embed_deps(states: &[State]) -> Option<&State> {
+    states
+        .iter()
+        .filter(|s| s.state.contains_key("go_embed_deps"))
+        .max_by_key(|s| s.package.as_str().len())
+}
+
+/// Address set for the `go_embed_src` lane: targets whose outputs are consumed
+/// *only* via `//go:embed`, never parsed by `go list`.
+///
+/// Deliberately **excluded from `_golist`** (unlike [`compute_pkg_src_addrs`]),
+/// so an expensive asset build — e.g. a frontend bundle — never blocks
+/// list/query/metadata or `go list` itself. The patterns are still reported by
+/// `go list` (parsed from the `.go` source); the `go_embed` driver resolves them
+/// against these staged files downstream, and `build_lib` stages them for the
+/// compile. Sources:
+/// 1. `query("… && label(go_embed_src) && tree_output(pkg)")` — codegen targets
+///    labelled `go_embed_src`.
+/// 2. `go_embed_deps` from the closest ancestor BUILD state — explicit embed
+///    targets that don't carry the label.
+fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
+    let codegen_root = pick_codegen_root(states);
+    let scope = match codegen_root {
+        Some(root) => pkg_prefix_pattern(root.package.as_str()),
+        None => pkg_pattern(pkg_str),
+    };
+    // Cheapest-first by resolution tier (see `compute_pkg_src_addrs`): `scope`
+    // (addr) < `label` (spec/`get_spec`) < `tree_output` (def/`get_def`).
+    let expr = format!("{scope} && label(go_embed_src) && tree_output({pkg_str})");
+    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &[]);
+    let mut addrs = vec![query_addr.format()];
+
+    if let Some(deps_state) = pick_embed_deps(states)
+        && let Some(deps_val) = deps_state.state.get("go_embed_deps")
+    {
+        let deps =
+            parse_strings(deps_val).context("parsing go_embed_deps from go provider_state")?;
+        addrs.extend(deps);
+    }
+    Ok(addrs)
+}
+
+/// The package's static (checked-in) non-Go source tree as a single fs-glob addr,
+/// excluding `.go`. Staged into the compile's `embed_src` group when `go list`'s
+/// `EmbedFiles` came back empty — which happens when an unresolved `go_embed_src`
+/// pattern (decoupled out of `_golist`) poisons go list's atomic per-package embed
+/// resolution, zeroing `EmbedFiles` for the co-located plain `//go:embed` statics
+/// too. Staging the static tree lets the in-driver Go-faithful selector resolve
+/// those statics from the bytes. Generated `go_embed_src` outputs carry the
+/// codegen xattr and are skipped by the glob, so the decoupling (and any
+/// `go_embed_src` lane staging) is preserved with no double-staging.
+fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
+    let glob = if pkg_str.is_empty() {
+        "**/*".to_string()
+    } else {
+        format!("{pkg_str}/**/*")
+    };
+    pluginfs::glob_addr(&glob, &["**/*.go"]).format()
 }
 
 impl ProviderInner {
@@ -1223,11 +1289,12 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                let embed_addr = if !pkg.embed_patterns.is_empty() || !pkg.embed_files.is_empty() {
-                    Some(self.make_addr_with_name(&addr.package, "embed", &factors))
-                } else {
-                    None
-                };
+                // The package embeds iff `go list` reported any embed pattern/file.
+                // `go_compile` resolves the embedcfg in-process from `_golist`'s
+                // package.bin — no separate `go_embed` target. Pass the golist
+                // addr only when embedding.
+                let embedding = !pkg.embed_patterns.is_empty() || !pkg.embed_files.is_empty();
+                let embed_golist = if embedding { Some(&golist_addr) } else { None };
 
                 let pkg_addrs = self
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
@@ -1243,21 +1310,39 @@ impl ProviderInner {
                         &pkg_addrs.s_files,
                         &pkg_addrs.h_files,
                         &pkg_addrs.extra_h_files,
-                        embed_addr.as_ref(),
+                        embed_golist,
                         &pkg_addrs.embed_files,
                         &self.go_version,
                     ),
-                    _ => target_lib::build_spec(
-                        addr.clone(),
-                        &import_path,
-                        pkg.name.as_deref().unwrap_or(""),
-                        &factors,
-                        &transitive.libs,
-                        &pkg_addrs.go_files,
-                        &self.go_version,
-                        embed_addr.as_ref(),
-                        &pkg_addrs.embed_files,
-                    ),
+                    _ => {
+                        // `go_embed_src` assets (kept out of `_golist`) are staged
+                        // for the compile so the in-driver embedcfg finds the bytes.
+                        let mut embed_src_addrs = if embedding {
+                            compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                                .map_err(GetError::Other)?
+                        } else {
+                            Vec::new()
+                        };
+                        // When `go list` resolved zero EmbedFiles but the package
+                        // embeds, a go_embed_src pattern poisoned go list's atomic
+                        // resolution and zeroed the co-located static embeds too.
+                        // Stage the static non-go tree so the selector resolves them.
+                        if embedding && pkg_addrs.embed_files.is_empty() {
+                            embed_src_addrs.push(pkg_static_embed_glob_addr(addr.package.as_str()));
+                        }
+                        target_lib::build_spec(
+                            addr.clone(),
+                            &import_path,
+                            pkg.name.as_deref().unwrap_or(""),
+                            &factors,
+                            &transitive.libs,
+                            &pkg_addrs.go_files,
+                            &self.go_version,
+                            embed_golist,
+                            &pkg_addrs.embed_files,
+                            &embed_src_addrs,
+                        )
+                    }
                 };
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1362,14 +1447,27 @@ impl ProviderInner {
                     || !pkg.embed_files.is_empty()
                     || !pkg.test_embed_patterns.is_empty()
                     || !pkg.test_embed_files.is_empty();
-                let embed_addr = if has_any_embed {
-                    Some(self.make_addr_with_name(&addr.package, "embed_test", &factors))
+                let embed_golist = if has_any_embed {
+                    Some(&golist_addr)
                 } else {
                     None
                 };
 
                 let mut test_embed_files = pkg_addrs.embed_files.clone();
                 test_embed_files.extend(pkg_addrs.test_embed_files.iter().cloned());
+                let mut embed_src_addrs = if has_any_embed {
+                    compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                        .map_err(GetError::Other)?
+                } else {
+                    Vec::new()
+                };
+                // Same poisoning guard as build_lib: if go list resolved zero
+                // (test_)EmbedFiles for an embedding package, stage the static
+                // non-go tree so the selector resolves the plain `//go:embed`
+                // statics that a co-located go_embed_src pattern zeroed.
+                if has_any_embed && test_embed_files.is_empty() {
+                    embed_src_addrs.push(pkg_static_embed_glob_addr(addr.package.as_str()));
+                }
                 let spec = target_test::build_test_lib_spec(
                     addr.clone(),
                     &import_path,
@@ -1378,8 +1476,9 @@ impl ProviderInner {
                     &transitive.libs,
                     &pkg_addrs.go_files,
                     &pkg_addrs.test_go_files,
-                    embed_addr.as_ref(),
+                    embed_golist,
                     &test_embed_files,
+                    &embed_src_addrs,
                     &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
@@ -1456,13 +1555,20 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                let xtest_embed_addr =
-                    if !pkg.xtest_embed_patterns.is_empty() || !pkg.xtest_embed_files.is_empty() {
-                        Some(self.make_addr_with_name(&addr.package, "embed_xtest", &factors))
-                    } else {
-                        None
-                    };
+                let xtest_embedding =
+                    !pkg.xtest_embed_patterns.is_empty() || !pkg.xtest_embed_files.is_empty();
+                let xtest_embed_golist = if xtest_embedding {
+                    Some(&golist_addr)
+                } else {
+                    None
+                };
 
+                let embed_src_addrs = if xtest_embedding {
+                    compute_embed_src_addrs(addr.package.as_str(), &req.states)
+                        .map_err(GetError::Other)?
+                } else {
+                    Vec::new()
+                };
                 let spec = target_test::build_xtest_lib_spec(
                     addr.clone(),
                     &import_path,
@@ -1470,8 +1576,9 @@ impl ProviderInner {
                     &factors,
                     &rewritten_libs,
                     &pkg_addrs.xtest_go_files,
-                    xtest_embed_addr.as_ref(),
+                    xtest_embed_golist,
                     &pkg_addrs.xtest_embed_files,
+                    &embed_src_addrs,
                     &self.go_version,
                 );
                 Ok(GetResponse { target_spec: spec })
@@ -1743,34 +1850,8 @@ impl ProviderInner {
                 );
                 Ok(GetResponse { target_spec: spec })
             }
-            "embed" => {
-                if pkg.embed_patterns.is_empty() && pkg.embed_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "embed"),
-                })
-            }
-            "embed_test" => {
-                let has_any = !pkg.embed_patterns.is_empty()
-                    || !pkg.embed_files.is_empty()
-                    || !pkg.test_embed_patterns.is_empty()
-                    || !pkg.test_embed_files.is_empty();
-                if !has_any {
-                    return Err(GetError::NotFound);
-                }
-                Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "test_embed"),
-                })
-            }
-            "embed_xtest" => {
-                if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "xtest_embed"),
-                })
-            }
+            // `embed` / `embed_test` / `embed_xtest` targets are gone — the
+            // `go_compile` driver resolves the embedcfg in-process.
             _ => Err(GetError::NotFound),
         }
     }
@@ -2237,7 +2318,7 @@ impl ProviderInner {
             // Pre-dedupe the top-level set so we don't fan out the same
             // import_path twice (also halves cache lookups for repeated entries
             // between `root_imports` and `extra_imports`).
-            let unique_imports: Vec<String> = root_imports
+            let mut unique_imports: Vec<String> = root_imports
                 .iter()
                 .chain(extra_imports.iter())
                 .filter(|i| *i != "unsafe" && *i != "C")
@@ -2245,6 +2326,9 @@ impl ProviderInner {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
+            // HashSet iteration order is randomized per process; sort so the
+            // resulting transitive lib order is deterministic run-to-run.
+            unique_imports.sort();
 
             let module_root_buf = module_root.to_path_buf();
             let sub_closures = try_join_all(unique_imports.into_iter().map(|ip| {
@@ -2271,7 +2355,7 @@ impl ProviderInner {
         let go_mod_requires = &go_mod.requires;
         let workspace_module_path = go_mod.module_path.as_str();
 
-        let imports: Vec<String> = root_imports
+        let mut imports: Vec<String> = root_imports
             .iter()
             .chain(extra_imports.iter())
             .filter(|i| *i != "unsafe" && *i != "C")
@@ -2279,6 +2363,12 @@ impl ProviderInner {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        // HashSet iteration order is randomized per process; sort so the
+        // resulting `libs` order is deterministic run-to-run (mirrors the
+        // transitive branch above). The go_compile cache key sorts at the hash
+        // boundary too, but keeping this lane deterministic avoids surprising any
+        // other consumer of `TransitiveDeps.libs`.
+        imports.sort();
 
         let results = try_join_all(imports.iter().map(|ip| {
             self.resolve_import(
@@ -2418,41 +2508,6 @@ impl ProviderInner {
         }
 
         None
-    }
-}
-
-fn build_embed_spec(
-    addr: Addr,
-    golist_addr: &Addr,
-    variant: &str,
-) -> hplugin::provider::TargetSpec {
-    use hcore::htvalue::Value;
-    use std::collections::HashMap;
-
-    let golist_dep = format!("{}|pkg", golist_addr.format());
-
-    let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("variant".to_string(), Value::String(variant.to_string()));
-    let mut deps_map: HashMap<String, Value> = HashMap::new();
-    deps_map.insert(
-        "golist".to_string(),
-        Value::List(vec![Value::String(golist_dep)]),
-    );
-    config.insert("deps".to_string(), Value::Map(deps_map));
-    config.insert(
-        "out".to_string(),
-        Value::Map(HashMap::from([(
-            "cfg".to_string(),
-            Value::List(vec![Value::String("embedcfg".to_string())]),
-        )])),
-    );
-
-    hplugin::provider::TargetSpec {
-        addr,
-        driver: "go_embed".to_string(),
-        config,
-        labels: vec![],
-        transitive: Default::default(),
     }
 }
 
@@ -3050,7 +3105,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -3232,7 +3287,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("lib", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -3511,25 +3566,20 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     // ---- with_embed ----
 
     #[tokio::test]
-    async fn test_with_embed_has_embed_target() {
+    async fn test_with_embed_no_separate_embed_target() {
+        // The `embed` target is gone — the go_compile driver resolves the
+        // embedcfg in-process.
         require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "embed"))
-            .await
-            .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_embed");
-        let out = match resp.target_spec.config.get("out").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!(),
-        };
-        assert!(out.contains_key("cfg"));
+        let result = provider_get(&p, make_addr("server", "embed")).await;
+        assert!(matches!(result, Err(GetError::NotFound)));
     }
 
     // ---- factors ----
 
     #[tokio::test]
-    async fn test_factors_linux_amd64_runtime_env() {
+    async fn test_factors_linux_amd64_in_compile_config() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -3540,20 +3590,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             Addr::new(PkgBuf::from(""), "build_lib".to_string(), args)
         };
         let resp = provider_get(&p, addr).await.unwrap();
-        let runtime_env = match resp.target_spec.config.get("runtime_env").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!("expected map"),
-        };
-        assert!(
-            matches!(runtime_env.get("GOOS"), Some(Value::String(s)) if s == "linux"),
-            "GOOS should be linux, got {:?}",
-            runtime_env.get("GOOS")
-        );
-        assert!(
-            matches!(runtime_env.get("GOARCH"), Some(Value::String(s)) if s == "amd64"),
-            "GOARCH should be amd64, got {:?}",
-            runtime_env.get("GOARCH")
-        );
+        let cfg = &resp.target_spec.config;
+        assert!(matches!(cfg.get("goos"), Some(Value::String(s)) if s == "linux"));
+        assert!(matches!(cfg.get("goarch"), Some(Value::String(s)) if s == "amd64"));
     }
 
     // ---- with_embed ----
@@ -3566,7 +3605,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("server", "build_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
         let out = match resp.target_spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!(),
@@ -3575,7 +3614,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
-    async fn test_with_embed_build_lib_has_embed_dep() {
+    async fn test_with_embed_build_lib_resolves_embed_in_driver() {
         require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -3586,54 +3625,26 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
+        // No separate `embed` target; the compile reads golist's package.bin.
         assert!(
-            deps.contains_key("embed"),
-            "build_lib for embed package must depend on the embed target: {:?}",
-            deps.keys().collect::<Vec<_>>()
+            !deps.contains_key("embed"),
+            "build_lib must not dep on a separate embed target"
         );
-    }
-
-    #[tokio::test]
-    async fn test_with_embed_build_lib_run_has_embedcfg_flag() {
-        require_go!();
-        let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "build_lib"))
-            .await
-            .unwrap();
-        let run = run_str(&resp.target_spec);
-        assert!(
-            run.contains("-embedcfg"),
-            "build_lib run script must contain -embedcfg for embed package: {run}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_with_embed_embed_target_has_golist_dep() {
-        require_go!();
-        let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "embed"))
-            .await
-            .unwrap();
-        assert_eq!(resp.target_spec.driver, "go_embed");
-        let deps = match resp.target_spec.config.get("deps").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!("expected deps map"),
-        };
         assert!(
             deps.contains_key("golist"),
-            "embed spec must dep on golist output"
+            "embedding build_lib must dep on golist for EmbedPatterns: {:?}",
+            deps.keys().collect::<Vec<_>>()
         );
-        let variant = match resp.target_spec.config.get("variant").unwrap() {
-            Value::String(s) => s.as_str(),
-            _ => panic!("expected string"),
+        let variant = match resp.target_spec.config.get("embed_variant").unwrap() {
+            Value::List(v) => v,
+            _ => panic!("embed_variant must be a list"),
         };
-        assert_eq!(variant, "embed");
+        assert_eq!(variant.len(), 1, "embedding package sets one embed_variant");
+        assert!(matches!(&variant[0], Value::String(s) if s == "embed"));
     }
 
     #[tokio::test]
-    async fn test_simple_lib_build_lib_no_embed_dep() {
+    async fn test_simple_lib_build_lib_no_embed() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -3642,15 +3653,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             Value::Map(m) => m,
             _ => panic!("expected deps map"),
         };
+        assert!(!deps.contains_key("embed"));
         assert!(
-            !deps.contains_key("embed"),
-            "build_lib for non-embed package must not have 'embed' dep"
+            !deps.contains_key("golist"),
+            "non-embed build_lib must not dep on golist"
         );
-        let run = run_str(&resp.target_spec);
-        assert!(
-            !run.contains("-embedcfg"),
-            "build_lib for non-embed package must not include -embedcfg: {run}"
-        );
+        let variant = match resp.target_spec.config.get("embed_variant").unwrap() {
+            Value::List(v) => v,
+            _ => panic!("embed_variant must be a list"),
+        };
+        assert!(variant.is_empty(), "non-embed package has no embed_variant");
     }
 
     #[tokio::test]
@@ -3911,7 +3923,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let resp = provider_get(&p, make_addr("pkg", "build_test_lib"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -4070,7 +4082,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("mod-asm");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "sh");
+        assert_eq!(resp.target_spec.driver, "go_compile");
     }
 
     #[tokio::test]
@@ -4092,22 +4104,23 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         };
 
-        let run = run_str(&resp.target_spec);
-
-        // Only assert asm steps when the package actually has .s files on this platform.
-        // If SFiles is empty for this arch, tool asm won't appear and that's correct.
-        if run.contains("tool asm") {
+        let cfg = &resp.target_spec.config;
+        let s_files = match cfg.get("s_files").unwrap() {
+            Value::List(v) => v,
+            _ => panic!("s_files must be a list"),
+        };
+        // Only assert the asm wiring when the package actually has .s files on
+        // this platform; the go_compile driver derives the asm/symabis/pack
+        // steps from s_files at run time.
+        if !s_files.is_empty() {
+            let deps = match cfg.get("deps").unwrap() {
+                Value::Map(m) => m,
+                _ => panic!("deps must be a map"),
+            };
             assert!(
-                run.contains("tool pack r"),
-                "asm package must pack .o files: {run}"
-            );
-            assert!(
-                run.contains("-asmhdr"),
-                "asm package compile step must emit -asmhdr: {run}"
-            );
-            assert!(
-                run.contains("$GOROOT/pkg/include"),
-                "asm step must include GOROOT/pkg/include: {run}"
+                deps.contains_key("asm"),
+                "asm package must stage its .s sources in the `asm` dep group: {:?}",
+                deps.keys().collect::<Vec<_>>()
             );
         }
     }
@@ -4665,6 +4678,74 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             srcfiles.iter().any(|s| s == "//codegen:gen"),
             "go_codegen_deps must be appended to srcfiles, got: {srcfiles:?}"
+        );
+    }
+
+    #[test]
+    fn compute_embed_src_addrs_has_label_query_and_appends_deps() {
+        let mut state_map = HashMap::new();
+        state_map.insert(
+            "go_embed_deps".to_string(),
+            Value::List(vec![Value::String("//ui:dist".to_string())]),
+        );
+        let states = vec![State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: state_map,
+        }];
+        let addrs = compute_embed_src_addrs("pkg", &states).unwrap();
+        assert!(
+            addrs
+                .iter()
+                .any(|s| s.contains("label(go_embed_src)") && s.contains("tree_output(")),
+            "must query go_embed_src tree outputs: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|s| s == "//ui:dist"),
+            "go_embed_deps must be appended: {addrs:?}"
+        );
+    }
+
+    // Cheapest-first by resolution tier: the engine evaluates `&&` left-to-right
+    // and resolves each term at its cheapest tier — `scope` (addr, no IO) <
+    // `label` (spec/`get_spec`) < `tree_output` (def/`get_def`). Freeze that
+    // order in both source-set queries: `label` before `tree_output`.
+    #[test]
+    fn source_set_queries_order_label_before_tree_output() {
+        let go_src = compute_pkg_src_addrs("pkg", &[])
+            .unwrap()
+            .into_iter()
+            .find(|s| s.contains("label(go_src)"))
+            .expect("go_src query present");
+        assert!(
+            go_src.find("label(go_src)").unwrap() < go_src.find("tree_output(").unwrap(),
+            "go_src query must check label before tree_output: {go_src}"
+        );
+
+        let embed = compute_embed_src_addrs("pkg", &[])
+            .unwrap()
+            .into_iter()
+            .find(|s| s.contains("label(go_embed_src)"))
+            .expect("go_embed_src query present");
+        assert!(
+            embed.find("label(go_embed_src)").unwrap() < embed.find("tree_output(").unwrap(),
+            "go_embed_src query must check label before tree_output: {embed}"
+        );
+    }
+
+    #[test]
+    fn compute_pkg_src_addrs_excludes_go_embed_src_lane() {
+        // Decoupling guarantee: `_golist`'s source set pulls the `go_src` lane but
+        // never `go_embed_src`, so an expensive asset build (frontend bundle) can
+        // never block `go list` / query / metadata.
+        let addrs = compute_pkg_src_addrs("pkg", &[]).unwrap();
+        assert!(
+            addrs.iter().any(|s| s.contains("label(go_src)")),
+            "go_src lane must be present in golist srcfiles: {addrs:?}"
+        );
+        assert!(
+            !addrs.iter().any(|s| s.contains("go_embed_src")),
+            "golist srcfiles must NOT reference the go_embed_src lane: {addrs:?}"
         );
     }
 

@@ -1,5 +1,5 @@
 mod addr_util;
-mod driver_embed;
+mod driver_compile;
 mod driver_golist;
 mod driver_testmain;
 mod embed;
@@ -17,7 +17,7 @@ mod target_test;
 mod thirdparty;
 mod toolchain;
 
-pub use driver_embed::GoEmbedDriver;
+pub use driver_compile::GoCompileDriver;
 pub use driver_golist::GoGolistDriver;
 pub use driver_testmain::GoTestmainDriver;
 pub use provider::{Config, Provider};

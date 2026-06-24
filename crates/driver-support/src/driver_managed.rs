@@ -407,10 +407,34 @@ fn add_path_to_tar(
     match &path.content {
         Content::FilePath(fp) => {
             let source = ws_dir.join(fp);
+            // A single-file output must resolve to a file/symlink. Without this
+            // check a path that materialized as a directory is registered blindly
+            // and only fails deep in `tar.pack` with a cryptic `Is a directory`
+            // (EISDIR). lstat here so the consumer gets a path-and-group message.
+            let md = fs::symlink_metadata(&source).with_context(|| {
+                format!("lstat declared file output {fp:?} (group={group_for_err})")
+            })?;
+            let ft = md.file_type();
+            anyhow::ensure!(
+                ft.is_file() || ft.is_symlink(),
+                "declared file output {fp:?} (group={group_for_err}) is a directory, \
+                 not a file; declare it as a directory or glob output instead"
+            );
             tar.create_file(source.to_string_lossy().into_owned(), fp.clone());
         }
         Content::DirPath(dir) => {
             let dir_full = ws_dir.join(dir);
+            // Symmetric to the FilePath guard: a directory output declared on a
+            // path that materialized as a file would otherwise be single-walked
+            // and packed silently. lstat so the consumer gets a clear message.
+            let md = fs::symlink_metadata(&dir_full).with_context(|| {
+                format!("lstat declared directory output {dir:?} (group={group_for_err})")
+            })?;
+            anyhow::ensure!(
+                md.file_type().is_dir(),
+                "declared directory output {dir:?} (group={group_for_err}) is a file, \
+                 not a directory; declare it as a file or glob output instead"
+            );
             for entry in walkdir::WalkDir::new(&dir_full) {
                 let entry = entry.with_context(|| {
                     format!("walk output dir {:?} (group={})", dir_full, group_for_err)
@@ -626,6 +650,49 @@ mod source_map_tests {
             m.is_empty(),
             "inputs unpacked outside ws_dir must not contribute: {:?}",
             m
+        );
+    }
+
+    fn out_path(content: path::Content) -> path::Path {
+        path::Path {
+            content,
+            codegen_tree: path::CodegenMode::None,
+            collect: false,
+        }
+    }
+
+    // A single-file output declared on a path that materialized as a directory
+    // must fail with a legible message naming the path and group — not the raw
+    // `Is a directory` (EISDIR) buried in `tar.pack`.
+    #[test]
+    fn file_output_pointing_at_dir_errors_clearly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("out")).expect("mkdir");
+        let p = out_path(path::Content::FilePath("out".to_string()));
+        let mut tar = TarPacker::new();
+        let err = add_path_to_tar(&mut tar, dir.path(), &p, "bin").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is a directory"), "got: {msg}");
+        assert!(
+            msg.contains("out") && msg.contains("bin"),
+            "must name path+group: {msg}"
+        );
+    }
+
+    // Symmetric: a directory output declared on a file must fail clearly rather
+    // than silently single-walking the file.
+    #[test]
+    fn dir_output_pointing_at_file_errors_clearly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("out"), b"x").expect("write");
+        let p = out_path(path::Content::DirPath("out".to_string()));
+        let mut tar = TarPacker::new();
+        let err = add_path_to_tar(&mut tar, dir.path(), &p, "data").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is a file"), "got: {msg}");
+        assert!(
+            msg.contains("out") && msg.contains("data"),
+            "must name path+group: {msg}"
         );
     }
 }

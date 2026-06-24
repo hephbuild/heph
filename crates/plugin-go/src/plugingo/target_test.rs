@@ -2,6 +2,7 @@ use crate::plugingo::addr_util::{
     go_build_env, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
     import_path_to_dep_group, to_run_value, write_importcfg_script,
 };
+use crate::plugingo::driver_compile::{CompileParams, build_compile_spec};
 use crate::plugingo::factors::Factors;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
@@ -23,9 +24,47 @@ pub struct TestEnv {
     pub pre_run: Vec<String>,
 }
 
-/// Compile the test package (GoFiles + TestGoFiles) with `go tool compile` in test mode.
-///
-/// Output: `<pkgname>_test.a`
+/// Shared `go_compile` builder for the test/xtest/testmain lib compiles.
+/// `golist_addr` is `Some` iff the variant embeds; the driver resolves the
+/// embedcfg in-process (no separate `go_embed` target).
+#[expect(clippy::too_many_arguments, reason = "all parameters are required")]
+fn compile_lib(
+    addr: Addr,
+    p_flag: String,
+    out_file: String,
+    factors: &Factors,
+    transitive_libs: &[(String, Addr)],
+    src_addrs: Vec<String>,
+    golist_addr: Option<&Addr>,
+    embed_variant: &str,
+    embed_file_addrs: &[String],
+    embed_src_addrs: &[String],
+    go_version: &str,
+) -> TargetSpec {
+    build_compile_spec(CompileParams {
+        addr,
+        p_flag,
+        out_file,
+        factors,
+        go_version,
+        transitive_libs,
+        src_addrs: &src_addrs,
+        s_files: &[],
+        s_file_addrs: &[],
+        hdr_addrs: &[],
+        golist_addr,
+        embed_variant: if golist_addr.is_some() {
+            embed_variant
+        } else {
+            ""
+        },
+        embed_file_addrs,
+        embed_src_addrs,
+    })
+}
+
+/// Compile the test package (GoFiles + TestGoFiles), test mode. Output:
+/// `<pkgname>_test.a`.
 #[expect(clippy::too_many_arguments, reason = "all parameters are required")]
 pub fn build_test_lib_spec(
     addr: Addr,
@@ -35,34 +74,32 @@ pub fn build_test_lib_spec(
     transitive_libs: &[(String, Addr)],
     src_addrs: &[String],
     test_src_addrs: &[String],
-    embed_addr: Option<&Addr>,
+    golist_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    embed_src_addrs: &[String],
     go_version: &str,
 ) -> TargetSpec {
-    let out_file = format!("{}_test.a", package_name);
-    let run = compile_run_script(
-        import_path,
-        transitive_libs,
-        &out_file,
-        embed_addr.is_some(),
-    );
-
-    build_lib_spec_inner(
+    let src: Vec<String> = src_addrs
+        .iter()
+        .chain(test_src_addrs.iter())
+        .cloned()
+        .collect();
+    compile_lib(
         addr,
+        import_path.to_string(),
+        format!("{package_name}_test.a"),
         factors,
         transitive_libs,
-        src_addrs.iter().chain(test_src_addrs.iter()).cloned(),
-        embed_addr,
+        src,
+        golist_addr,
+        "test_embed",
         embed_file_addrs,
-        run,
-        out_file,
+        embed_src_addrs,
         go_version,
     )
 }
 
-/// Compile the external test package (XTestGoFiles) with `go tool compile`.
-///
-/// Output: `<pkgname>_xtest.a`
+/// Compile the external test package (XTestGoFiles). Output: `<pkgname>_xtest.a`.
 #[expect(clippy::too_many_arguments, reason = "all parameters are required")]
 pub fn build_xtest_lib_spec(
     addr: Addr,
@@ -71,36 +108,27 @@ pub fn build_xtest_lib_spec(
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
     xtest_src_addrs: &[String],
-    embed_addr: Option<&Addr>,
+    golist_addr: Option<&Addr>,
     embed_file_addrs: &[String],
+    embed_src_addrs: &[String],
     go_version: &str,
 ) -> TargetSpec {
-    // xtest package import path is "<import_path>_test"
-    let xtest_import_path = format!("{}_test", import_path);
-    let out_file = format!("{}_xtest.a", package_name);
-    let run = compile_run_script(
-        &xtest_import_path,
-        transitive_libs,
-        &out_file,
-        embed_addr.is_some(),
-    );
-
-    build_lib_spec_inner(
+    compile_lib(
         addr,
+        format!("{import_path}_test"),
+        format!("{package_name}_xtest.a"),
         factors,
         transitive_libs,
-        xtest_src_addrs.iter().cloned(),
-        embed_addr,
+        xtest_src_addrs.to_vec(),
+        golist_addr,
+        "xtest_embed",
         embed_file_addrs,
-        run,
-        out_file,
+        embed_src_addrs,
         go_version,
     )
 }
 
-/// Compile the generated testmain.go with `go tool compile`.
-///
-/// Output: `testmain_main.a`
+/// Compile the generated testmain.go. Output: `testmain_main.a`.
 pub fn build_testmain_lib_spec(
     addr: Addr,
     factors: &Factors,
@@ -108,18 +136,17 @@ pub fn build_testmain_lib_spec(
     testmain_libs: &[(String, Addr)],
     go_version: &str,
 ) -> TargetSpec {
-    let out_file = "testmain_main.a".to_string();
-    let run = compile_run_script("main", testmain_libs, &out_file, false);
-
-    build_lib_spec_inner(
+    compile_lib(
         addr,
+        "main".to_string(),
+        "testmain_main.a".to_string(),
         factors,
         testmain_libs,
-        std::iter::once(testmain_src_addr.format()),
+        vec![testmain_src_addr.format()],
         None,
+        "",
         &[],
-        run,
-        out_file,
+        &[],
         go_version,
     )
 }
@@ -301,115 +328,6 @@ fn str_list_value(v: &[String]) -> Value {
     Value::List(v.iter().cloned().map(Value::String).collect())
 }
 
-fn compile_run_script(
-    p_flag: &str,
-    transitive_libs: &[(String, Addr)],
-    out_file: &str,
-    has_embed: bool,
-) -> Vec<String> {
-    let mut lines = write_importcfg_script(transitive_libs, None);
-    let embedcfg_flag = if has_embed {
-        " -embedcfg \"$SRC_EMBED\""
-    } else {
-        ""
-    };
-
-    lines.push(format!(
-        "\"$GO\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"",
-    ));
-
-    lines
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "all parameters are required, no natural grouping"
-)]
-fn build_lib_spec_inner(
-    addr: Addr,
-    factors: &Factors,
-    transitive_libs: &[(String, Addr)],
-    src_addrs: impl Iterator<Item = String>,
-    embed_addr: Option<&Addr>,
-    embed_file_addrs: &[String],
-    run: Vec<String>,
-    out_file: String,
-    go_version: &str,
-) -> TargetSpec {
-    let mut deps: BTreeMap<String, Value> = transitive_libs
-        .iter()
-        .map(|(import_path, dep_addr)| {
-            let group = import_path_to_dep_group(import_path);
-            (group, Value::List(vec![Value::String(dep_addr.format())]))
-        })
-        .collect();
-
-    deps.insert(
-        String::new(),
-        Value::List(src_addrs.map(Value::String).collect()),
-    );
-    if let Some(e) = embed_addr {
-        deps.insert(
-            "embed".to_string(),
-            Value::List(vec![Value::String(e.format())]),
-        );
-    }
-    // Embed files travel as inputs so the engine stages them into the sandbox
-    // alongside sources — embedcfg paths are pkg-relative and must resolve here.
-    if !embed_file_addrs.is_empty() {
-        deps.insert(
-            "embed_files".to_string(),
-            Value::List(
-                embed_file_addrs
-                    .iter()
-                    .map(|s| Value::String(s.clone()))
-                    .collect(),
-            ),
-        );
-    }
-    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
-        deps.insert(sdk_group, sdk_val);
-    }
-
-    let mut full_run = go_run_prelude(go_version);
-    full_run.extend(run);
-
-    let mut config: HashMap<String, Value> = HashMap::new();
-    config.insert("run".to_string(), to_run_value(full_run));
-    config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
-    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
-        config.insert(ro_k, ro_v);
-    }
-    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
-        config.insert(pe_k, pe_v);
-    }
-    config.insert(
-        "out".to_string(),
-        Value::Map(HashMap::from([(
-            "a".to_string(),
-            Value::List(vec![Value::String(out_file)]),
-        )])),
-    );
-    config.insert(
-        "runtime_env".to_string(),
-        Value::Map(HashMap::from([
-            ("GOOS".to_string(), Value::String(factors.goos.clone())),
-            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-        ])),
-    );
-    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
-    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert("env".to_string(), go_build_env());
-
-    TargetSpec {
-        addr,
-        driver: "sh".to_string(),
-        config,
-        labels: vec!["go-build".to_string()],
-        transitive: Default::default(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,9 +382,10 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
             V,
         );
-        assert_eq!(spec.driver, "sh");
+        assert_eq!(spec.driver, "go_compile");
     }
 
     #[test]
@@ -480,6 +399,7 @@ mod tests {
             &src_addrs("pkg"),
             &[],
             None,
+            &[],
             &[],
             V,
         );
@@ -514,16 +434,13 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
             V,
         );
-        let run = run_str(&spec);
-        assert!(
-            run.contains("tool compile"),
-            "run must use go tool compile: {run}"
-        );
-        assert!(
-            !run.contains("test -c"),
-            "run must NOT use go test -c: {run}"
+        assert_eq!(spec.driver, "go_compile");
+        assert_eq!(
+            crate::plugingo::driver_compile::test_support::cfg_str(&spec, "p_flag"),
+            "example.com/pkg"
         );
     }
 
@@ -539,6 +456,7 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             None,
+            &[],
             &[],
             V,
         );
@@ -572,12 +490,12 @@ mod tests {
             &src_addrs("pkg"),
             None,
             &[],
+            &[],
             V,
         );
-        let run = run_str(&spec);
-        assert!(
-            run.contains("example.com/pkg_test"),
-            "xtest compile must use _test import path: {run}"
+        assert_eq!(
+            crate::plugingo::driver_compile::test_support::cfg_str(&spec, "p_flag"),
+            "example.com/pkg_test"
         );
     }
 
@@ -618,10 +536,9 @@ mod tests {
             &[],
             V,
         );
-        let run = run_str(&spec);
-        assert!(
-            run.contains("-p \"main\""),
-            "testmain lib must use -p main: {run}"
+        assert_eq!(
+            crate::plugingo::driver_compile::test_support::cfg_str(&spec, "p_flag"),
+            "main"
         );
     }
 
@@ -703,7 +620,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_test_lib_spec_env_pins_cgo_disabled() {
+    fn test_build_test_lib_spec_carries_go_version() {
+        // CGO/GOTOOLCHAIN are pinned inside the go_compile driver now; cache
+        // correctness rides on the hashed go_version in the spec.
         let spec = build_test_lib_spec(
             mk_addr("pkg", "build_test_lib"),
             "example.com/pkg",
@@ -714,16 +633,13 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
             V,
         );
-        let env = match spec.config.get("env").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!("expected map"),
-        };
-        assert!(
-            matches!(env.get("CGO_ENABLED"), Some(Value::String(s)) if s == "0"),
-            "compile env must pin CGO_ENABLED=0 in the hashed map: {:?}",
-            env.get("CGO_ENABLED")
+        assert_eq!(spec.driver, "go_compile");
+        assert_eq!(
+            crate::plugingo::driver_compile::test_support::cfg_str(&spec, "go_version"),
+            V
         );
     }
 
@@ -902,6 +818,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
             V,
         );
         assert!(
@@ -921,6 +838,7 @@ mod tests {
             &[],
             &src_addrs("pkg"),
             None,
+            &[],
             &[],
             V,
         );

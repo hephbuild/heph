@@ -11,7 +11,7 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoEmbedDriver, GoGolistDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoCompileDriver, GoGolistDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
@@ -70,10 +70,10 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         name: "go_toolchain".into(),
         driver: make_dyn_managed_driver(toolchain),
     });
-    let embed: Arc<dyn ManagedDriver> = Arc::new(GoEmbedDriver);
+    let compile: Arc<dyn ManagedDriver> = Arc::new(GoCompileDriver::new());
     drivers.push(NamedDriver {
-        name: "go_embed".into(),
-        driver: make_dyn_managed_driver(embed),
+        name: "go_compile".into(),
+        driver: make_dyn_managed_driver(compile),
     });
     let testmain: Arc<dyn ManagedDriver> = Arc::new(GoTestmainDriver);
     drivers.push(NamedDriver {

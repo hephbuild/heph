@@ -158,6 +158,46 @@ pub fn staged_goroot(version: &str) -> String {
     format!("{}/{SDK_DIR}", toolchain_pkg(version))
 }
 
+/// Resolve the host `go` binary from this process's `PATH` — used when the
+/// provider selects `gotool = "host"`.
+pub(crate) fn resolve_host_go() -> anyhow::Result<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| anyhow::anyhow!("go host toolchain: PATH not set"))?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join("go");
+        if std::fs::metadata(&cand)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Ok(cand);
+        }
+    }
+    anyhow::bail!("go host toolchain: `go` not found on PATH")
+}
+
+/// Query `GOROOT` from the host `go` binary.
+pub(crate) fn host_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context;
+    let out = std::process::Command::new(go_bin)
+        .args(["env", "GOROOT"])
+        .output()
+        .with_context(|| format!("run {go_bin:?} env GOROOT"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`{go_bin:?} env GOROOT` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let goroot = String::from_utf8(out.stdout)
+        .context("go env GOROOT output is not utf8")?
+        .trim()
+        .to_string();
+    if goroot.is_empty() {
+        anyhow::bail!("`{go_bin:?} env GOROOT` returned empty");
+    }
+    Ok(std::path::PathBuf::from(goroot))
+}
+
 /// Build the `TargetSpec` for the toolchain download target for `version`.
 /// `host_goos` / `host_goarch` are the platform the SDK runs on; `sha256` is the
 /// expected tarball checksum the caller resolved from the provider's `checksums`

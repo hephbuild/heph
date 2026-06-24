@@ -58,9 +58,15 @@ struct PartialAnalysis {
 fn process_reader<R: BufRead>(pkg_label: &str, reader: R) -> std::io::Result<PartialAnalysis> {
     let mut result = PartialAnalysis::default();
 
+    // Comment/raw-string state carried across lines: a `/* … */` block or a
+    // backtick raw string can span multiple lines, and a `func Test…` sitting
+    // inside either must NOT be scanned as a real test (the bug: a commented-out
+    // `func TestDiblManual` at column 0 got pulled into testmain.go).
+    let mut state = ScanState::default();
     for line in reader.lines() {
         let line = line?;
-        process_line(pkg_label, &line, &mut result);
+        let code = blank_comments(&line, &mut state);
+        process_line(pkg_label, &code, &mut result);
     }
 
     let has_findings = !result.tests.is_empty()
@@ -75,6 +81,91 @@ fn process_reader<R: BufRead>(pkg_label: &str, reader: R) -> std::io::Result<Par
         }
     }
     Ok(result)
+}
+
+/// Multi-line scanner state: inside a `/* … */` block comment, or inside a
+/// backtick raw string — both can span lines.
+#[derive(Default)]
+struct ScanState {
+    in_block_comment: bool,
+    in_raw_string: bool,
+}
+
+/// Return `line` with comment bytes blanked to spaces (column positions
+/// preserved so the column-0 `func ` check still holds), tracking block-comment
+/// and raw-string state across lines via `state`. Handles `//` line comments,
+/// `/* … */` block comments, `"…"`/`'…'` (with `\` escapes) and backtick raw
+/// strings so a `/*` or `func` *inside* a literal is not mistaken for code.
+/// Go block comments do not nest. Operates on bytes; only ASCII delimiters are
+/// inspected, non-ASCII bytes inside literals are preserved.
+fn blank_comments(line: &str, state: &mut ScanState) -> String {
+    // Bounds-checked accessor: blank one byte to a space if in range.
+    fn blank(buf: &mut [u8], idx: usize) {
+        if let Some(b) = buf.get_mut(idx) {
+            *b = b' ';
+        }
+    }
+
+    let mut out = line.as_bytes().to_vec();
+    let mut i = 0;
+    while let Some(&c) = out.get(i) {
+        let next = out.get(i + 1).copied();
+        if state.in_raw_string {
+            // Raw-string content (and its closing backtick) is a literal, not
+            // code — blank it so a `func Test…` on a line inside it is not scanned.
+            if c == b'`' {
+                state.in_raw_string = false;
+            }
+            blank(&mut out, i);
+            i += 1;
+        } else if state.in_block_comment {
+            if c == b'*' && next == Some(b'/') {
+                state.in_block_comment = false;
+                blank(&mut out, i);
+                blank(&mut out, i + 1);
+                i += 2;
+            } else {
+                blank(&mut out, i);
+                i += 1;
+            }
+        } else if c == b'/' && next == Some(b'/') {
+            // Line comment: blank the rest of the line.
+            for b in out.iter_mut().skip(i) {
+                *b = b' ';
+            }
+            break;
+        } else if c == b'/' && next == Some(b'*') {
+            state.in_block_comment = true;
+            blank(&mut out, i);
+            blank(&mut out, i + 1);
+            i += 2;
+        } else if c == b'`' {
+            state.in_raw_string = true;
+            blank(&mut out, i);
+            i += 1;
+        } else if c == b'"' || c == b'\'' {
+            // Interpreted string / rune: skip to the matching quote, honoring
+            // `\` escapes. Go does not allow a newline inside these, so any
+            // unterminated quote ends at the line break. Content is code (kept).
+            let quote = c;
+            i += 1;
+            while let Some(&q) = out.get(i) {
+                if q == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                if q == quote {
+                    break;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    // Lossy is safe: only ASCII delimiter bytes were rewritten to spaces; any
+    // multi-byte UTF-8 sequences inside literals were stepped over intact.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn process_line(pkg_label: &str, line: &str, result: &mut PartialAnalysis) {
@@ -316,6 +407,60 @@ mod tests {
         assert_eq!(partial.tests.len(), 1);
         assert_eq!(partial.tests[0].name, "TestFoo");
         assert_eq!(partial.tests[0].package, "_test");
+    }
+
+    #[test]
+    fn test_block_commented_func_is_ignored() {
+        // Regression: a `func Test…` at column 0 inside a `/* … */` block comment
+        // must not be scanned as a test (it produced an undefined reference in
+        // the generated testmain.go).
+        let source = "package pkg\n\n\
+            /* for manual testing only\n\
+            func TestDiblManual(tt *testing.T) {\n\
+            \ttt.Fatal(\"\")\n\
+            }\n\
+            */\n\n\
+            func TestReal(t *testing.T) {}\n";
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
+        let names: Vec<&str> = partial.tests.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["TestReal"], "commented func must be skipped");
+    }
+
+    #[test]
+    fn test_line_commented_func_is_ignored() {
+        let source =
+            "package pkg\n\n// func TestNope(t *testing.T) {}\nfunc TestYes(t *testing.T) {}\n";
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
+        let names: Vec<&str> = partial.tests.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["TestYes"]);
+    }
+
+    #[test]
+    fn test_trailing_line_comment_keeps_func() {
+        let source = "package pkg\n\nfunc TestFoo(t *testing.T) { // a comment\n}\n";
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
+        assert_eq!(partial.tests.len(), 1);
+        assert_eq!(partial.tests[0].name, "TestFoo");
+    }
+
+    #[test]
+    fn test_block_comment_open_in_string_does_not_swallow_funcs() {
+        // A `/*` inside a string literal must NOT start a block comment that
+        // would hide the real test below it.
+        let source =
+            "package pkg\n\nvar s = \"/* not a comment\"\nfunc TestKept(t *testing.T) {}\n";
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
+        let names: Vec<&str> = partial.tests.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["TestKept"]);
+    }
+
+    #[test]
+    fn test_func_inside_raw_string_is_ignored() {
+        // A backtick raw string spanning lines with `func Test…` inside is not code.
+        let source = "package pkg\n\nvar tmpl = `\nfunc TestInRawString(t *testing.T) {}\n`\nfunc TestReal(t *testing.T) {}\n";
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
+        let names: Vec<&str> = partial.tests.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["TestReal"]);
     }
 
     #[test]
