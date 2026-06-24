@@ -313,9 +313,32 @@ pub struct PluginComponents {
     pub meta: SVec<u8>,
 }
 
+/// A host log sink the plugin forwards its `tracing` events through. A loaded
+/// cdylib statically links its OWN `tracing`, whose global subscriber is never set
+/// — so a plugin's `tracing::*` would be silently dropped. The host hands the
+/// plugin this sink (via [`SET_LOG_SINK_SYMBOL`]); the plugin installs a tracing
+/// subscriber that calls `log` for every event, and the host re-emits it on its
+/// own `tracing`, so plugin logs appear in the host's output. `level` is the
+/// `tracing::Level` as `1=ERROR .. 5=TRACE`; `target` is the event's target.
+#[stabby::stabby]
+pub trait StableLogSink {
+    extern "C" fn log(&self, level: u8, target: SString, message: SString);
+}
+
+/// An owned, ABI-stable handle to the host's log sink.
+pub type DynLogSink = stabby::dynptr!(stabby::boxed::Box<dyn StableLogSink + Send + Sync>);
+
 /// The cdylib create-entry symbol name (exported with `#[stabby::export]`,
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
+
+/// Optional cdylib symbol: install a host [`DynLogSink`] so the plugin's `tracing`
+/// events reach the host. The host calls it right after load if present; a plugin
+/// that does not export it simply gets no log forwarding.
+pub const SET_LOG_SINK_SYMBOL: &[u8] = b"heph_plugin_set_log_sink";
+
+/// The set-log-sink entry's function-pointer type.
+pub type SetLogSinkFn = extern "C" fn(DynLogSink);
 
 /// The create entry's function-pointer type. The config crosses as prost-encoded
 /// `pb::CreateConfig` bytes (not a stabby struct), so adding config fields is an

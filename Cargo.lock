@@ -3918,6 +3918,8 @@ dependencies = [
  "stabby",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3937,6 +3939,7 @@ dependencies = [
  "serde_json",
  "stabby",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

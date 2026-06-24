@@ -17,6 +17,8 @@ pub use hplugin::{driver, eresult, hook, provider};
 #[cfg(feature = "stabby")]
 mod guest;
 #[cfg(feature = "stabby")]
+mod logsink;
+#[cfg(feature = "stabby")]
 mod serve;
 
 /// In-process stable-ABI cdylib transport (opt-in via the `stabby` feature).
@@ -31,6 +33,7 @@ pub mod stabby {
     pub use hplugin_stabby::abi;
 
     pub use crate::guest::GuestExecutor;
+    pub use crate::logsink::install_log_sink;
     pub use crate::serve::{make_dyn_hook, make_dyn_managed_driver, make_dyn_provider};
 
     /// Decode the cdylib create-entry config (`pb::CreateConfig`) from its prost

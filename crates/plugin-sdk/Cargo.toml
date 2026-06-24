@@ -32,6 +32,11 @@ serde_json = { version = "1", optional = true }
 # distinct from the host's, so async work that touches the reactor (e.g. plugin-go
 # shelling out to `go list` in a driver `run`) must execute on the cdylib's runtime.
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync"], optional = true }
+# A loaded cdylib statically links its own `tracing` whose global subscriber is
+# unset, so plugin logs would vanish. The SDK installs a subscriber that forwards
+# every event to the host sink over the ABI.
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
 
 [features]
 # In-process stable-ABI cdylib transport. Pulls in the stabby guest serving
@@ -46,6 +51,8 @@ stabby = [
     "dep:prost",
     "dep:serde_json",
     "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
 ]
 
 [dev-dependencies]

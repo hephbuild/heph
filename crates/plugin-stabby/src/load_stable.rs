@@ -6,8 +6,8 @@
 
 use crate::abi::{
     CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver, DynProvider,
-    StableCancelDyn, StableHookDyn, StableItemStream, StableItemStreamDyn, StableManagedDriverDyn,
-    StableMetaDyn, StableProviderDyn,
+    SET_LOG_SINK_SYMBOL, SetLogSinkFn, StableCancelDyn, StableHookDyn, StableItemStream,
+    StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use async_trait::async_trait;
@@ -83,7 +83,17 @@ pub fn load(
         // `CreateFn` before returning it; calling it is then ABI-sound.
         let create = unsafe { lib.get_stabbied::<CreateFn>(CREATE_SYMBOL) }
             .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
-        create(sv(&cfg))
+        let comps = create(sv(&cfg));
+        // Optional: hand the plugin a host log sink so its `tracing` events (which
+        // its statically-linked `tracing` would otherwise drop — no subscriber is
+        // set in the dylib) are re-emitted on the host. A plugin built against an
+        // older SDK simply won't export the symbol; that is not an error.
+        // SAFETY: get_stabbied checks the symbol's stabby type report against
+        // `SetLogSinkFn` before returning it.
+        if let Ok(set_sink) = unsafe { lib.get_stabbied::<SetLogSinkFn>(SET_LOG_SINK_SYMBOL) } {
+            set_sink(crate::host::HostLogSink::wrap());
+        }
+        comps
     };
     // Keep the dylib mapped for the process lifetime (the returned trait objects'
     // vtables point into its code); leaking the handle is intentional.

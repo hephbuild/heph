@@ -212,6 +212,46 @@ impl Tally {
     }
 }
 
+/// The commit a check run should attach to. On a `pull_request` event `GITHUB_SHA`
+/// is the ephemeral *merge* commit (`refs/pull/N/merge`); a check attached there is
+/// invisible on the PR. The commit reviewers actually see is the PR **head**, which
+/// the event payload carries at `pull_request.head.sha`. So: on a PR event, read the
+/// event JSON (`GITHUB_EVENT_PATH`) and use that head sha; otherwise (push, etc.)
+/// fall back to `GITHUB_SHA`. This is why the workflow no longer needs to override
+/// `GITHUB_SHA` itself.
+fn resolve_head_sha() -> Option<String> {
+    let nonempty = |s: String| Some(s).filter(|s| !s.is_empty());
+    let event = std::env::var("GITHUB_EVENT_NAME").unwrap_or_default();
+    if (event == "pull_request" || event == "pull_request_target")
+        && let Some(sha) = pr_head_sha_from_event()
+    {
+        return Some(sha);
+    }
+    std::env::var("GITHUB_SHA").ok().and_then(nonempty)
+}
+
+/// Read the Actions event payload (`GITHUB_EVENT_PATH`) and pull
+/// `pull_request.head.sha` out of it; `None` if unset / unreadable / absent.
+fn pr_head_sha_from_event() -> Option<String> {
+    let path = std::env::var("GITHUB_EVENT_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let bytes = std::fs::read(path).ok()?;
+    pr_head_sha_from_json(&bytes)
+}
+
+/// Extract `pull_request.head.sha` from raw event-payload JSON. Pure (no env / fs)
+/// so it is unit-testable; `None` if the bytes don't parse or the field is missing.
+fn pr_head_sha_from_json(bytes: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    json.get("pull_request")?
+        .get("head")?
+        .get("sha")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Live updates to a dedicated GitHub **check run**. A check run's markdown
 /// `output` can be PATCHed while the job runs (the step summary cannot), so this
 /// is the live surface. Configured from the Actions environment; disabled (with no
@@ -234,15 +274,16 @@ struct ChecksClient {
 impl ChecksClient {
     /// Build from the Actions env (`GITHUB_TOKEN` / `GITHUB_REPOSITORY` /
     /// `GITHUB_SHA`, `GITHUB_API_URL` optional), or `None` if a required piece is
-    /// absent. `head_sha_override` (the `headSha` option) wins over `GITHUB_SHA`
-    /// — useful to attach the check to a PR head rather than the merge commit.
+    /// absent. The head sha is resolved by [`resolve_head_sha`] so a check on a PR
+    /// lands on the PR head commit, not the merge commit — no workflow override
+    /// needed. `head_sha_override` (the `headSha` option) still wins if set.
     fn from_env(head_sha_override: Option<String>) -> Option<Self> {
         let nonempty = |v: String| Some(v).filter(|s| !s.is_empty());
         let token = std::env::var("GITHUB_TOKEN").ok().and_then(nonempty)?;
         let repo = std::env::var("GITHUB_REPOSITORY").ok().and_then(nonempty)?;
         let head_sha = head_sha_override
-            .or_else(|| std::env::var("GITHUB_SHA").ok())
-            .and_then(nonempty)?;
+            .and_then(nonempty)
+            .or_else(resolve_head_sha)?;
         let api_url = std::env::var("GITHUB_API_URL")
             .ok()
             .and_then(nonempty)
@@ -319,7 +360,7 @@ impl ChecksClient {
                         }
                         // Surface the deep-link to the check's output in the job log.
                         if let Some(url) = v.get("html_url").and_then(serde_json::Value::as_str) {
-                            tracing::info!("gha hook: check run {url}");
+                            tracing::info!("check run {url}");
                         }
                     })
             }
@@ -336,7 +377,7 @@ impl ChecksClient {
                 .map(drop),
         };
         if let Err(e) = result {
-            tracing::warn!("gha hook: check-run update failed: {e}");
+            tracing::warn!("check-run update failed: {e}");
         }
     }
 }
@@ -380,7 +421,7 @@ impl Inner {
         if std::fs::write(&tmp, markdown.as_bytes()).is_ok()
             && let Err(e) = std::fs::rename(&tmp, path)
         {
-            tracing::warn!("gha hook: failed to write step summary: {e}");
+            tracing::warn!("failed to write step summary: {e}");
         }
     }
 }
@@ -394,10 +435,12 @@ impl GhaHook {
     /// Build from the plugin's `options:` map. Options (all optional):
     /// `refreshSecs` (live check-run PATCH interval, default 30), `summaryPath`
     /// (final step-summary file, default `$GITHUB_STEP_SUMMARY`), `headSha` (check
-    /// run head sha, default `$GITHUB_SHA`). Spawns the live-update thread when a
-    /// check run can be created.
+    /// run head sha; default is auto-resolved by [`resolve_head_sha`] — the PR head
+    /// on a `pull_request` event, else `$GITHUB_SHA`). Spawns the live-update thread
+    /// when a check run can be created.
     pub fn from_options(opts: &Options) -> anyhow::Result<Self> {
         deny_unknown("gha hook", opts, &["refreshSecs", "summaryPath", "headSha"])?;
+        tracing::info!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
             .unwrap_or(30)
             .max(1);
@@ -654,6 +697,24 @@ mod tests {
             t.render_markdown(0, "heph: test").contains("~1"),
             "provisional total"
         );
+    }
+
+    #[test]
+    fn pr_head_sha_extracted_from_event_json() {
+        // A trimmed `pull_request` event payload.
+        let payload = serde_json::json!({
+            "pull_request": { "head": { "sha": "deadbeefcafe" } }
+        })
+        .to_string();
+        assert_eq!(
+            pr_head_sha_from_json(payload.as_bytes()).as_deref(),
+            Some("deadbeefcafe"),
+        );
+        // Missing field / wrong shape → None (so it falls back to GITHUB_SHA).
+        assert_eq!(pr_head_sha_from_json(b"{}"), None);
+        assert_eq!(pr_head_sha_from_json(b"not json"), None);
+        let no_sha = serde_json::json!({ "pull_request": { "head": {} } }).to_string();
+        assert_eq!(pr_head_sha_from_json(no_sha.as_bytes()), None);
     }
 
     #[test]
