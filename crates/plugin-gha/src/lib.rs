@@ -29,9 +29,31 @@ const SLOW_THRESHOLD_MS: u64 = 10_000;
 const MAX_SLOW_ROWS: usize = 20;
 const MAX_FAILED_ROWS: usize = 50;
 
+/// One long-running phase a target can currently be in. A target is slow because
+/// of a *single* active phase (it executes, or pulls from cache, or writes cache —
+/// not several at once), so the summary names which one.
+#[derive(Clone, Copy)]
+enum Phase {
+    Execute,
+    CachePull,
+    LocalCacheWrite,
+    RemoteCacheWrite,
+}
+
+impl Phase {
+    fn label(self) -> &'static str {
+        match self {
+            Phase::Execute => "execute",
+            Phase::CachePull => "cache pull",
+            Phase::LocalCacheWrite => "cache write",
+            Phase::RemoteCacheWrite => "remote cache write",
+        }
+    }
+}
+
 /// The folded build status. Only what the summary renders: matched/finished sets
 /// for progress, cache-hit + built counts, the failure list, and the in-flight
-/// execute start times for slow detection.
+/// active phase per target for slow detection.
 #[derive(Default)]
 struct Tally {
     matched: BTreeSet<String>,
@@ -40,9 +62,10 @@ struct Tally {
     built: usize,
     cache_hit: BTreeSet<String>,
     failed: Vec<(String, Option<String>)>,
-    /// addr -> `ExecuteStart` timestamp; removed on `ExecuteEnd`. The remaining
-    /// entries are the currently-running targets.
-    running: BTreeMap<String, u64>,
+    /// addr -> (active phase, its start timestamp). Set on a phase `*Start`,
+    /// cleared on the matching `*End`; the remaining entries are the targets
+    /// currently inside a phase (one phase each).
+    running: BTreeMap<String, (Phase, u64)>,
 }
 
 impl Tally {
@@ -63,13 +86,31 @@ impl Tally {
                 }
             }
             BuildEventKind::ExecuteStart { addr, .. } => {
-                self.running.insert(addr.clone(), ev.at_unix_ms);
+                self.running
+                    .insert(addr.clone(), (Phase::Execute, ev.at_unix_ms));
             }
             BuildEventKind::ExecuteEnd { addr, error } => {
                 self.running.remove(addr);
                 if error.is_none() {
                     self.built += 1;
                 }
+            }
+            BuildEventKind::RemoteCacheReadStart { addr } => {
+                self.running
+                    .insert(addr.clone(), (Phase::CachePull, ev.at_unix_ms));
+            }
+            BuildEventKind::LocalCacheWriteStart { addr } => {
+                self.running
+                    .insert(addr.clone(), (Phase::LocalCacheWrite, ev.at_unix_ms));
+            }
+            BuildEventKind::RemoteCacheWriteStart { addr } => {
+                self.running
+                    .insert(addr.clone(), (Phase::RemoteCacheWrite, ev.at_unix_ms));
+            }
+            BuildEventKind::RemoteCacheReadEnd { addr, .. }
+            | BuildEventKind::LocalCacheWriteEnd { addr, .. }
+            | BuildEventKind::RemoteCacheWriteEnd { addr, .. } => {
+                self.running.remove(addr);
             }
             BuildEventKind::LocalCacheHit { addr } | BuildEventKind::RemoteCacheHit { addr } => {
                 self.cache_hit.insert(addr.clone());
@@ -96,18 +137,19 @@ impl Tally {
             .count()
     }
 
-    /// Targets still executing past [`SLOW_THRESHOLD_MS`], slowest first.
-    fn slow(&self, now_ms: u64) -> Vec<(String, u64)> {
-        let mut slow: Vec<(String, u64)> = self
+    /// Targets stuck in a single phase past [`SLOW_THRESHOLD_MS`], slowest first.
+    /// Each carries the phase label so the summary shows *what* is slow.
+    fn slow(&self, now_ms: u64) -> Vec<(String, &'static str, u64)> {
+        let mut slow: Vec<(String, &'static str, u64)> = self
             .running
             .iter()
-            .filter_map(|(addr, start)| {
+            .filter_map(|(addr, (phase, start))| {
                 let elapsed = now_ms.saturating_sub(*start);
-                (elapsed >= SLOW_THRESHOLD_MS).then(|| (addr.clone(), elapsed))
+                (elapsed >= SLOW_THRESHOLD_MS).then(|| (addr.clone(), phase.label(), elapsed))
             })
             .collect();
         // Slowest first.
-        slow.sort_by_key(|(_, elapsed)| std::cmp::Reverse(*elapsed));
+        slow.sort_by_key(|(_, _, elapsed)| std::cmp::Reverse(*elapsed));
         slow
     }
 
@@ -130,9 +172,11 @@ impl Tally {
 
         let slow = self.slow(now_ms);
         if !slow.is_empty() {
-            out.push_str("\n### Slow targets\n\n| target | running for |\n| --- | --- |\n");
-            for (addr, elapsed) in slow.iter().take(MAX_SLOW_ROWS) {
-                out.push_str(&format!("| `{addr}` | {}s |\n", elapsed / 1000));
+            out.push_str(
+                "\n### Slow targets\n\n| target | phase | running for |\n| --- | --- | --- |\n",
+            );
+            for (addr, phase, elapsed) in slow.iter().take(MAX_SLOW_ROWS) {
+                out.push_str(&format!("| `{addr}` | {phase} | {}s |\n", elapsed / 1000));
             }
             if slow.len() > MAX_SLOW_ROWS {
                 out.push_str(&format!("\n…and {} more\n", slow.len() - MAX_SLOW_ROWS));
@@ -355,6 +399,36 @@ mod tests {
         assert!(
             md.contains("//a:w") && md.contains("boom"),
             "failure detail: {md}"
+        );
+    }
+
+    #[test]
+    fn slow_target_names_its_active_phase() {
+        let mut t = Tally::default();
+        // Stuck pulling from the remote cache (not executing).
+        t.apply(&ev(
+            0,
+            BuildEventKind::RemoteCacheReadStart {
+                addr: "//a:p".into(),
+            },
+        ));
+        let md = t.render_markdown(SLOW_THRESHOLD_MS + 1);
+        assert!(md.contains("//a:p"), "slow target listed: {md}");
+        assert!(md.contains("cache pull"), "phase labelled: {md}");
+        assert!(md.contains("| phase |"), "phase column header: {md}");
+
+        // Its end clears it — no longer slow.
+        t.apply(&ev(
+            0,
+            BuildEventKind::RemoteCacheReadEnd {
+                addr: "//a:p".into(),
+                error: None,
+            },
+        ));
+        assert!(
+            !t.render_markdown(SLOW_THRESHOLD_MS + 1)
+                .contains("### Slow"),
+            "cleared on phase end"
         );
     }
 
