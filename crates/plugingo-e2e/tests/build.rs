@@ -117,6 +117,24 @@ async fn test_embed_generated_go_embed_src_compiles() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `build_test_lib` (TestEmbed variant) for a build-tagged on-disk embed,
+/// goos=linux. The test compile unions embed+test_embed patterns/files; this
+/// exercises the path the infhostd `build_test_lib` failure hit.
+#[tokio::test]
+async fn test_embed_buildtagged_build_test_lib_compiles() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("with_embed_buildtag")?;
+    let ws = make_workspace(dir)?;
+    let result = ws
+        .run("//app:build_test_lib@goarch=amd64,goos=linux")
+        .await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "build-tagged build_test_lib should compile for goos=linux"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_with_dep_cmd_build() -> anyhow::Result<()> {
     require_go!();
