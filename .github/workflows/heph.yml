@@ -119,8 +119,10 @@ jobs:
           # explicitly, so no uniform suffix is needed.
           if [ "${{ matrix.os }}" = "darwin" ]; then ext=dylib; else ext=so; fi
           PLUGIN_GO_NAME="heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
+          PLUGIN_GHA_NAME="heph-gha-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
+          echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
           OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
           # FUSE (default feature) on Linux is pure-Rust (no libfuse link), so
           # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
@@ -133,19 +135,25 @@ jobs:
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cargo build --release --locked --target ${{ matrix.target }} -p heph --bin heph
             cargo build --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
+            cargo build --release --locked --target ${{ matrix.target }} -p plugin-gha-cdylib
             lib="$OUT/libplugin_go_cdylib.dylib"
+            gha_lib="$OUT/libplugin_gha_cdylib.dylib"
             # The nix toolchain hard-links libiconv against its /nix/store path,
             # which is absent on user machines (dyld aborts at launch). Rewrite
-            # those load commands to the OS /usr/lib copies — for both artifacts.
+            # those load commands to the OS /usr/lib copies — for every artifact.
             bash scripts/macos-portable.sh "$OUT/heph"
             bash scripts/macos-portable.sh "$lib"
+            bash scripts/macos-portable.sh "$gha_lib"
           else
             cargo zigbuild --release --locked --target ${{ matrix.target }} -p heph --bin heph
             cargo zigbuild --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p plugin-gha-cdylib
             lib="$OUT/libplugin_go_cdylib.so"
+            gha_lib="$OUT/libplugin_gha_cdylib.so"
           fi
           cp "$OUT/heph" $BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
+          cp "$gha_lib" $PLUGIN_GHA_NAME
 
       - name: sccache stats
         if: always()
@@ -172,6 +180,12 @@ jobs:
         with:
           name: ${{steps.build.outputs.plugin_go_name}}
           path: ${{steps.build.outputs.plugin_go_name}}
+
+      - name: Upload gha plugin artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.plugin_gha_name}}
+          path: ${{steps.build.outputs.plugin_gha_name}}
 
   upload_artifacts:
     name: Pre-release
@@ -218,6 +232,13 @@ jobs:
               -out "$GITHUB_WORKSPACE/dist/heph-go-plugin.json" )
           cat dist/heph-go-plugin.json
           echo "manifest checksum: $(cat dist/heph-go-plugin.json.sha256)"
+          # The gha hook plugin ships the same way: one manifest entry per
+          # per-os/arch cdylib in dist/, published as a release asset.
+          ( cd tools/pluginmanifest && go run . -name gha -version "$VERSION" \
+              -prefix heph-gha-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
+              -out "$GITHUB_WORKSPACE/dist/heph-gha-plugin.json" )
+          cat dist/heph-gha-plugin.json
+          echo "manifest checksum: $(cat dist/heph-gha-plugin.json.sha256)"
 
       - name: Create Release in artifacts repo
         id: create_release

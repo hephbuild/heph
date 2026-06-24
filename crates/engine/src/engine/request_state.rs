@@ -203,6 +203,13 @@ pub struct RequestStateData {
     /// `Arc<RequestStateData>`, so `with_parent` / `with_skip_provider` children
     /// inherit it for free.
     pub events: Option<crate::engine::event::EventSender>,
+    /// Build-event hooks registered on the engine, fanned out from [`emit`].
+    /// Cloned from `engine.hooks()` once per top-level request; shared via the
+    /// `Arc<RequestStateData>` so `with_parent`/`with_skip_provider` children
+    /// inherit them. Usually empty (a no-op slice walk on the emit hot path).
+    ///
+    /// [`emit`]: RequestState::emit
+    pub hooks: Vec<Arc<dyn crate::engine::hook::Hook>>,
     /// Guards the one-shot `MaxWorkers` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
@@ -318,18 +325,26 @@ impl RequestState {
 
     /// Stamp the server timestamp on `kind` and emit it on the event stream, if any.
     pub fn emit(&self, kind: crate::engine::event::BuildEventKind) {
-        // Fold into the process-global telemetry counters first: this is the
-        // single chokepoint every progress event flows through, so target/cache
-        // tallies stay in lockstep with what the renderer sees. Always counted
-        // (cheap atomics); the opt-out only gates whether the snapshot is sent.
-        htelemetry::telemetry::observe_event(&kind);
+        // Nobody downstream: skip building the event entirely (the common case
+        // for non-`run` commands with no renderer and no hooks). Usage telemetry
+        // is itself a registered hook (the built-in `TelemetryHook`, wired in
+        // `bootstrap` when enabled), so it rides the fan-out below rather than a
+        // dedicated call here — an opt-out leaves `hooks` empty and pays nothing.
+        if self.data.events.is_none() && self.data.hooks.is_empty() {
+            return;
+        }
+        let event = crate::engine::event::BuildEvent {
+            at_unix_ms: crate::engine::event::now_unix_ms(),
+            kind,
+        };
+        // Fan out to every registered hook (best-effort, sync push).
+        for hook in &self.data.hooks {
+            hook.on_event(&event);
+        }
         if let Some(tx) = &self.data.events {
             // A closed receiver (consumer gone) is expected; events are
             // best-effort, so dropping the send result is intentional.
-            drop(tx.send(crate::engine::event::BuildEvent {
-                at_unix_ms: crate::engine::event::now_unix_ms(),
-                kind,
-            }));
+            drop(tx.send(event));
         }
     }
 
@@ -441,6 +456,11 @@ impl RequestState {
 impl Drop for RequestStateData {
     fn drop(&mut self) {
         self.ctoken.cancel();
+        // Signal end-of-stream to each hook so it can flush its final state. The
+        // host awaits the actual flush separately via `Engine::await_hooks`.
+        for hook in &self.hooks {
+            hook.on_close();
+        }
         if let Some(engine) = self.engine.upgrade()
             && let Ok(mut requests) = engine.requests.lock()
         {
@@ -510,6 +530,7 @@ impl Engine {
             fail_fast,
             log_tail_lines,
             events,
+            hooks: self.hooks(),
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending,
@@ -742,6 +763,64 @@ mod tests {
             "child drop must not cancel parent token"
         );
 
+        Ok(())
+    }
+
+    // A registered hook is fed every emitted event (via the `emit` chokepoint,
+    // even with no renderer channel) and gets `on_close` when the request state
+    // drops.
+    #[test]
+    fn emit_fans_out_to_hooks_and_closes_on_drop() -> anyhow::Result<()> {
+        use crate::engine::hook::Hook;
+        use hcore::events::{BuildEvent, BuildEventKind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default)]
+        struct Rec {
+            seen: Mutex<Vec<String>>,
+            closed: AtomicBool,
+        }
+        impl Hook for Rec {
+            fn name(&self) -> String {
+                "rec".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                if let BuildEventKind::ResultStart { addr } = &ev.kind {
+                    self.seen.lock().push(addr.clone());
+                }
+            }
+            fn on_close(&self) {
+                self.closed.store(true, Ordering::Release);
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut e = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let rec = Arc::new(Rec::default());
+        e.register_hook(Arc::clone(&rec) as Arc<dyn Hook>)?;
+        let engine = Arc::new(e);
+
+        // No renderer channel (events = None); the hook still receives events.
+        let state = engine.new_state_with_events(true, None);
+        state.emit(BuildEventKind::ResultStart {
+            addr: "//a:b".into(),
+        });
+        assert_eq!(rec.seen.lock().clone(), vec!["//a:b".to_string()]);
+        assert!(
+            !rec.closed.load(Ordering::Acquire),
+            "not closed mid-request"
+        );
+
+        drop(state);
+        assert!(
+            rec.closed.load(Ordering::Acquire),
+            "on_close fires when the request state drops"
+        );
         Ok(())
     }
 }

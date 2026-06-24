@@ -28,6 +28,7 @@ pub use cwd::get_cwp;
 // `crate::engine::driver::…` etc. resolve unchanged across engine + plugins.
 pub use hplugin::driver;
 pub use hplugin::error;
+pub use hplugin::hook;
 pub mod event;
 mod local_cache;
 mod local_cache_fs;

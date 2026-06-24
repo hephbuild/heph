@@ -235,6 +235,22 @@ pub trait StableManagedDriver {
     ) -> DynFuture<'a, DynItemStream>;
 }
 
+/// The cold hook surface: a single client-streaming RPC. A hook is a build-event
+/// CONSUMER — the host streams the engine's `BuildEvent`s into the plugin
+/// (`HOOK_METHOD_ON_EVENTS`: the request stream carries one event per
+/// [`StableItemStream::next`], each an envelope `StreamItem` whose `item` is the
+/// event's serde-JSON bytes), and the reply is a unary ack once the stream ends.
+/// Same frozen-dispatch + append-only contract as [`StableProvider`]; new hook
+/// RPCs are new method ids, the vtable is untouched.
+#[stabby::stabby]
+pub trait StableHook {
+    extern "C" fn invoke_client_stream<'a>(
+        &'a self,
+        method: u32,
+        req: DynItemStream,
+    ) -> DynFuture<'a, SVec<u8>>;
+}
+
 /// Cooperative cancellation, in its OWN trait (composed into both handles like
 /// [`StableMeta`]). The host calls `cancel(request_id)` when its own request token
 /// fires; the plugin looks up the in-flight call by `request_id` and trips the
@@ -255,6 +271,9 @@ pub type DynProvider = stabby::dynptr!(
 pub type DynManagedDriver = stabby::dynptr!(
     stabby::boxed::Box<dyn StableManagedDriver + StableMeta + StableCancel + Send + Sync>
 );
+/// A hook handle composes its dispatch surface with [`StableMeta`] (the hook name)
+/// only — hooks have no per-request cancellation, so no [`StableCancel`].
+pub type DynHook = stabby::dynptr!(stabby::boxed::Box<dyn StableHook + StableMeta + Send + Sync>);
 
 /// A named managed driver in a plugin's component bundle.
 #[stabby::stabby]
@@ -263,9 +282,17 @@ pub struct NamedDriver {
     pub driver: DynManagedDriver,
 }
 
-/// What a cdylib's create entry returns: a provider + named drivers, all as owned
-/// ABI-stable handles that the host wraps with [`crate::load_stable`]. (plugin-go
-/// always exports a provider; driver-only bundles can carry an empty name.)
+/// A named hook in a plugin's component bundle.
+#[stabby::stabby]
+pub struct NamedHook {
+    pub name: SString,
+    pub hook: DynHook,
+}
+
+/// What a cdylib's create entry returns: an optional provider + named drivers +
+/// named hooks, all as owned ABI-stable handles that the host wraps with
+/// [`crate::load_stable`]. A plugin populates only what it exports — a hook-only
+/// (or driver-only) bundle leaves `provider` `None`.
 ///
 /// `meta` is reserved, prost-encoded return-side metadata (empty today). It exists
 /// so a plugin can later report additive descriptive data (capabilities, abi
@@ -274,15 +301,44 @@ pub struct NamedDriver {
 /// live native vtables); only the data rides prost.
 #[stabby::stabby]
 pub struct PluginComponents {
+    /// The exported provider's name (empty when `provider` is `None`).
     pub provider_name: SString,
-    pub provider: DynProvider,
+    /// The exported provider, or `None` for a hook-only / driver-only plugin.
+    pub provider: stabby::option::Option<DynProvider>,
     pub drivers: SVec<NamedDriver>,
+    /// Named build-event hooks the plugin exports. Empty for provider/driver-only
+    /// plugins. A hook-only plugin leaves `provider_name` empty (its `provider` is
+    /// a no-op the host drops) and carries its hooks here.
+    pub hooks: SVec<NamedHook>,
     pub meta: SVec<u8>,
 }
+
+/// A host log sink the plugin forwards its `tracing` events through. A loaded
+/// cdylib statically links its OWN `tracing`, whose global subscriber is never set
+/// — so a plugin's `tracing::*` would be silently dropped. The host hands the
+/// plugin this sink (via [`SET_LOG_SINK_SYMBOL`]); the plugin installs a tracing
+/// subscriber that calls `log` for every event, and the host re-emits it on its
+/// own `tracing`, so plugin logs appear in the host's output. `level` is the
+/// `tracing::Level` as `1=ERROR .. 5=TRACE`; `target` is the event's target.
+#[stabby::stabby]
+pub trait StableLogSink {
+    extern "C" fn log(&self, level: u8, target: SString, message: SString);
+}
+
+/// An owned, ABI-stable handle to the host's log sink.
+pub type DynLogSink = stabby::dynptr!(stabby::boxed::Box<dyn StableLogSink + Send + Sync>);
 
 /// The cdylib create-entry symbol name (exported with `#[stabby::export]`,
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
+
+/// Optional cdylib symbol: install a host [`DynLogSink`] so the plugin's `tracing`
+/// events reach the host. The host calls it right after load if present; a plugin
+/// that does not export it simply gets no log forwarding.
+pub const SET_LOG_SINK_SYMBOL: &[u8] = b"heph_plugin_set_log_sink";
+
+/// The set-log-sink entry's function-pointer type.
+pub type SetLogSinkFn = extern "C" fn(DynLogSink);
 
 /// The create entry's function-pointer type. The config crosses as prost-encoded
 /// `pb::CreateConfig` bytes (not a stabby struct), so adding config fields is an

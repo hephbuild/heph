@@ -22,6 +22,7 @@ enum PluginKind {
   PLUGIN_KIND_PROVIDER = 1;
   PLUGIN_KIND_DRIVER = 2;
   PLUGIN_KIND_BOTH = 3;
+  PLUGIN_KIND_HOOK = 4;
 }
 
 enum PayloadEncoding {

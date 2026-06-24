@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+// Hook-exported methods. A hook is a build-event consumer: the host
+// client-streams the engine's `BuildEvent`s into the plugin, which processes each
+// and returns a unary ack at end of stream. Same append-only dispatch contract as
+// ProviderMethod / DriverMethod. See crates/plugin-stabby/ABI_VERSIONING.md.
+package heph.plugin.v1;
+
+// Selects which hook RPC the stable-ABI dispatch (`StableHook::invoke_client_stream`)
+// should run.
+enum HookMethod {
+  HOOK_METHOD_UNSPECIFIED = 0;
+  // Client-streaming: the host streams events (host -> plugin), the plugin acks
+  // once the stream ends. Each streamed item is one `BuildEvent`, serialized as
+  // JSON bytes inside the envelope `StreamItem.item` (the event type is already
+  // serde, so it stays the single source of truth — no parallel proto mirror).
+  HOOK_METHOD_ON_EVENTS = 1;
+  HOOK_METHOD_CONFIG = 2; // sync metadata (StableMeta::meta): the hook name
+}

@@ -3797,6 +3797,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-gha"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core",
+ "plugin",
+ "reqwest 0.13.4",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "plugin-gha-cdylib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "plugin",
+ "plugin-gha",
+ "plugin-sdk",
+ "stabby",
+ "tracing",
+]
+
+[[package]]
 name = "plugin-go"
 version = "0.1.0"
 dependencies = [
@@ -3888,9 +3914,12 @@ dependencies = [
  "plugin-abi",
  "plugin-stabby",
  "prost 0.14.4",
+ "serde_json",
  "stabby",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3907,7 +3936,10 @@ dependencies = [
  "plugin",
  "plugin-abi",
  "prost 0.14.4",
+ "serde_json",
  "stabby",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

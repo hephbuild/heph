@@ -135,6 +135,28 @@ in
     echo "installed go plugin -> $dest"
   '';
 
+  # Build + install the GitHub Actions hook plugin (a cdylib + manifest), the same
+  # publish flow as `install-go-plugin`. Reference it from config with a `path:`
+  # entry (e.g. in a `ci.hephconfig` profile overlay, enabled via HEPH_PROFILES).
+  scripts.install-gha-plugin.exec = ''
+    cargo build --release -p plugin-gha-cdylib
+    if [ "$(uname -s)" = "Darwin" ]; then
+      lib="$CARGO_TARGET_DIR/release/libplugin_gha_cdylib.dylib"
+      name="heph-gha-plugin.dylib"
+      bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
+    else
+      lib="$CARGO_TARGET_DIR/release/libplugin_gha_cdylib.so"
+      name="heph-gha-plugin.so"
+    fi
+    dest="$HOME/.heph/plugins/gha"
+    mkdir -p "$dest"
+    cp "$lib" "$dest/$name.new"
+    mv -f "$dest/$name.new" "$dest/$name"
+    ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
+        && go run . -name gha -host-path "$name" -checksum-from "$dest/$name" -out "$dest/heph-gha-plugin.json" )
+    echo "installed gha plugin -> $dest"
+  '';
+
   scripts.install-dev-build.exec = ''
     cargo build
     mkdir -p $(dirname "${binLocation}")

@@ -219,10 +219,15 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
         args,
-        engine,
+        engine: std::sync::Arc::clone(&engine),
         matcher: m,
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, interactive, shutdown).await
+    let result = tui::run_app(app, sink, interactive, shutdown).await;
+    // The app's request state has dropped now (firing each hook's `on_close`);
+    // await any hook's final out-of-process flush before returning so a process
+    // exit never races it.
+    engine.await_hooks().await;
+    result
 }

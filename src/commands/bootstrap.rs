@@ -53,6 +53,22 @@ pub fn block_on<F: Future>(fut: F) -> anyhow::Result<F::Output> {
 // trigger without depending on this bin module; re-exported for existing callers.
 pub use hcore::shutdown::{ShutdownTrigger, SuppressionHandle};
 
+/// Built-in hook that feeds the build-event stream into the usage-telemetry
+/// counters (the PostHog exit reporter snapshots them). Registered only when
+/// telemetry is enabled — see `new_engine`. The flush, the synchronous
+/// `snapshot()` read, and the non-event recorders stay as direct calls.
+struct TelemetryHook;
+
+impl engine::hook::Hook for TelemetryHook {
+    fn name(&self) -> String {
+        "telemetry".to_string()
+    }
+    fn on_event(&self, ev: &hcore::events::BuildEvent) {
+        crate::telemetry::observe_event(&ev.kind);
+    }
+    fn on_close(&self) {}
+}
+
 /// Read the telemetry opt-out flag straight from `.hephconfig2`, independent of
 /// engine construction, so the top-level CLI reporter can decide whether to send
 /// without holding an `Engine`. Any failure (no repo root, unreadable/invalid
@@ -126,6 +142,16 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // registers the provider + drivers it exports. The engine owns the resolve +
     // download + load machinery (see `engine::plugin_load`).
     e.register_plugins(&file.plugins)?;
+
+    // Usage telemetry is a built-in, auto-enabled hook: it folds the build-event
+    // stream into the process-global counters the exit reporter flushes to
+    // PostHog. Registered only when telemetry is enabled, so an opt-out pays no
+    // per-event cost. Non-event signals (execute_ms, artifacts, graph size, the
+    // CLI invocation) are still recorded via direct `telemetry::record_*` calls,
+    // and the synchronous `snapshot()` read the engine uses stays direct.
+    if crate::telemetry::is_enabled(file.telemetry_enabled()) {
+        e.register_hook(Arc::new(TelemetryHook))?;
+    }
 
     let engine = Arc::new(e);
 

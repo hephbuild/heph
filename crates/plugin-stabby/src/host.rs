@@ -2,9 +2,9 @@
 //! a loaded plugin can call back via direct stabby vtable dispatch.
 
 use crate::abi::{
-    DynArtifact, DynExecutor, DynFunctionRegistry, DynRead, NoteDepOutcome, QueryOutcome,
-    ResultOutcome, StableAddr, StableArtifactContent, StableExecutor, StableFunctionRegistry,
-    StableRead,
+    DynArtifact, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead, NoteDepOutcome,
+    QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
+    StableFunctionRegistry, StableLogSink, StableRead,
 };
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
@@ -82,6 +82,39 @@ impl StableArtifactContent for HostArtifactContent {
         match self.content.file_path() {
             Some(p) => SString::from(p.to_string_lossy().as_ref()),
             None => SString::new(),
+        }
+    }
+}
+
+/// Host-side log sink handed to a loaded plugin. A cdylib statically links its
+/// OWN `tracing`, whose global subscriber is never set, so a plugin's
+/// `tracing::*` events would be dropped on the floor. The plugin installs a
+/// subscriber that funnels every event here; this re-emits it on the *host's*
+/// `tracing`, so plugin logs land in the host's output like any other span.
+/// `level` is the `tracing::Level` as `1=ERROR .. 5=TRACE`; `target` carries the
+/// plugin's module path so host filtering still works.
+pub struct HostLogSink;
+
+impl HostLogSink {
+    /// Wrap as an ABI-stable [`DynLogSink`] to pass over the seam.
+    pub fn wrap() -> DynLogSink {
+        stabby::boxed::Box::new(HostLogSink).into()
+    }
+}
+
+impl StableLogSink for HostLogSink {
+    extern "C" fn log(&self, level: u8, target: SString, message: SString) {
+        let target = target.to_string();
+        let message = message.to_string();
+        // Re-emit on the host subscriber. Target is set dynamically so the
+        // plugin's module path is preserved for env-filter matching. The level
+        // is a compile-time constant per arm, matching `tracing`'s macro shape.
+        match level {
+            1 => tracing::error!(target: "heph::plugin", plugin = %target, "{message}"),
+            2 => tracing::warn!(target: "heph::plugin", plugin = %target, "{message}"),
+            3 => tracing::info!(target: "heph::plugin", plugin = %target, "{message}"),
+            4 => tracing::debug!(target: "heph::plugin", plugin = %target, "{message}"),
+            _ => tracing::trace!(target: "heph::plugin", plugin = %target, "{message}"),
         }
     }
 }

@@ -5,9 +5,9 @@
 //! executor across natively (`HostExecutor`) so callbacks are direct.
 
 use crate::abi::{
-    CREATE_SYMBOL, CreateFn, DynExecutor, DynItemStream, DynManagedDriver, DynProvider,
-    StableCancelDyn, StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
-    StableProviderDyn,
+    CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver, DynProvider,
+    SET_LOG_SINK_SYMBOL, SetLogSinkFn, StableCancelDyn, StableHookDyn, StableItemStream,
+    StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use async_trait::async_trait;
@@ -23,6 +23,7 @@ use hplugin::driver::{
     ConfigResponse as DriverConfigResponse, DriverSchema, ParseRequest, ParseResponse,
     inputartifact,
 };
+use hplugin::hook::Hook;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
     ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
@@ -39,10 +40,12 @@ fn sv(bytes: &[u8]) -> SVec<u8> {
     SVec::from(bytes)
 }
 
-/// A loaded plugin's host-side handles: an optional provider + named drivers.
+/// A loaded plugin's host-side handles: an optional provider + named drivers +
+/// named hooks.
 pub type LoadedComponents = (
     Option<StableRemoteProvider>,
     Vec<(String, StableRemoteManagedDriver)>,
+    Vec<(String, StableRemoteHook)>,
 );
 
 /// Load a plugin cdylib and construct the host-side handles. The library's ABI is
@@ -80,7 +83,17 @@ pub fn load(
         // `CreateFn` before returning it; calling it is then ABI-sound.
         let create = unsafe { lib.get_stabbied::<CreateFn>(CREATE_SYMBOL) }
             .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
-        create(sv(&cfg))
+        let comps = create(sv(&cfg));
+        // Optional: hand the plugin a host log sink so its `tracing` events (which
+        // its statically-linked `tracing` would otherwise drop — no subscriber is
+        // set in the dylib) are re-emitted on the host. A plugin built against an
+        // older SDK simply won't export the symbol; that is not an error.
+        // SAFETY: get_stabbied checks the symbol's stabby type report against
+        // `SetLogSinkFn` before returning it.
+        if let Ok(set_sink) = unsafe { lib.get_stabbied::<SetLogSinkFn>(SET_LOG_SINK_SYMBOL) } {
+            set_sink(crate::host::HostLogSink::wrap());
+        }
+        comps
     };
     // Keep the dylib mapped for the process lifetime (the returned trait objects'
     // vtables point into its code); leaking the handle is intentional.
@@ -90,15 +103,13 @@ pub fn load(
         provider_name,
         provider,
         drivers,
+        hooks,
         // Reserved return-side metadata; nothing consumes it yet.
         meta: _,
     } = comps;
-    let pname = provider_name.to_string();
-    let host_provider = if pname.is_empty() {
-        None
-    } else {
-        Some(StableRemoteProvider::new(provider, pname))
-    };
+    // `provider` is optional: hook-only / driver-only plugins export `None`.
+    let provider: std::option::Option<DynProvider> = provider.into();
+    let host_provider = provider.map(|p| StableRemoteProvider::new(p, provider_name.to_string()));
 
     let mut host_drivers = Vec::new();
     for nd in drivers {
@@ -108,7 +119,13 @@ pub fn load(
             StableRemoteManagedDriver::new(nd.driver, name),
         ));
     }
-    Ok((host_provider, host_drivers))
+
+    let mut host_hooks = Vec::new();
+    for nh in hooks {
+        let name = nh.name.to_string();
+        host_hooks.push((name.clone(), StableRemoteHook::new(nh.hook, name)));
+    }
+    Ok((host_provider, host_drivers, host_hooks))
 }
 
 fn decode_unary(bytes: &[u8]) -> anyhow::Result<Body> {
@@ -672,6 +689,127 @@ impl StableRemoteManagedDriver {
             Ok(result) => result,
             Err(_canceled) => anyhow::bail!("run drain thread dropped"),
         }
+    }
+}
+
+/// Host-side request stream backed by a channel: each `next` blocks until the
+/// host pushes the next event frame (or all senders drop == clean end). The guest
+/// pulls it on a blocking thread, so the blocking `recv` is sound (mirrors how the
+/// guest drains run output on a blocking task).
+struct HostChannelItemStream {
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+}
+
+impl StableItemStream for HostChannelItemStream {
+    extern "C" fn next(&self) -> SVec<u8> {
+        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        // `Err` == every sender dropped (stream closed cleanly) => empty SVec.
+        match rx.recv() {
+            Ok(b) => SVec::from(b.as_slice()),
+            Err(_) => SVec::new(),
+        }
+    }
+}
+
+fn host_channel_item_stream(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> DynItemStream {
+    stabby::boxed::Box::new(HostChannelItemStream {
+        rx: std::sync::Mutex::new(rx),
+    })
+    .into()
+}
+
+/// One build event, framed as the envelope `StreamItem` carrying its serde-JSON
+/// bytes (the wire form a hook plugin pulls and deserializes).
+fn event_frame(ev: &hcore::events::BuildEvent) -> Vec<u8> {
+    let item = serde_json::to_vec(ev).unwrap_or_default();
+    pb::Frame {
+        id: 0,
+        body: Some(Body::StreamItem(pb::StreamItem { item: item.into() })),
+    }
+    .encode_to_vec()
+}
+
+/// Lazily-opened state for a remote hook's event stream.
+#[derive(Default)]
+struct HookStreamState {
+    started: bool,
+    /// Pushes event frames to the in-flight client-stream; `None` once closed.
+    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// The task driving the plugin's `invoke_client_stream` to its ack.
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Host handle to a loaded plugin's hook. Forwards each engine `BuildEvent` across
+/// the seam by client-streaming it into the plugin (`HOOK_METHOD_ON_EVENTS`). The
+/// stream opens lazily on the first event; [`on_close`](Hook::on_close) ends it;
+/// [`drain`](Hook::drain) awaits the plugin's ack so its final flush completes
+/// before the host exits.
+pub struct StableRemoteHook {
+    inner: Arc<DynHook>,
+    name: String,
+    state: std::sync::Mutex<HookStreamState>,
+}
+
+impl StableRemoteHook {
+    pub fn new(inner: DynHook, name: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            name: name.into(),
+            state: std::sync::Mutex::new(HookStreamState::default()),
+        }
+    }
+}
+
+impl Hook for StableRemoteHook {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn on_event(&self, ev: &hcore::events::BuildEvent) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.started {
+            st.started = true;
+            // Open the client-stream once: the host pushes frames into `tx`, the
+            // plugin pulls them and acks when the stream closes. Spawned because
+            // the call runs for the whole request, concurrent with event flow.
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let stream = host_channel_item_stream(rx);
+            let inner = Arc::clone(&self.inner);
+            let join = tokio::spawn(async move {
+                drop(
+                    inner
+                        .invoke_client_stream(pb::HookMethod::OnEvents as u32, stream)
+                        .await,
+                );
+            });
+            st.tx = Some(tx);
+            st.join = Some(join);
+        }
+        if let Some(tx) = &st.tx {
+            // Plugin gone / stream closed => receiver dropped; best-effort.
+            drop(tx.send(event_frame(ev)));
+        }
+    }
+
+    fn on_close(&self) {
+        // Drop the sender so the plugin's pull sees end-of-stream and flushes.
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.tx = None;
+    }
+
+    fn drain(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            // Ensure the stream is closed, then await the plugin's ack so its final
+            // write lands before the host exits.
+            let join = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.tx = None;
+                st.join.take()
+            };
+            if let Some(j) = join {
+                drop(j.await);
+            }
+        })
     }
 }
 
