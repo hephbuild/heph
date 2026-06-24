@@ -317,6 +317,10 @@ impl ChecksClient {
                         if let Some(new_id) = v.get("id").and_then(serde_json::Value::as_u64) {
                             *id = Some(new_id);
                         }
+                        // Surface the deep-link to the check's output in the job log.
+                        if let Some(url) = v.get("html_url").and_then(serde_json::Value::as_str) {
+                            tracing::info!("gha hook: check run {url}");
+                        }
                     })
             }
             Some(rid) => self
