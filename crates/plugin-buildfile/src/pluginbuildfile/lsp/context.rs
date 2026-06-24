@@ -56,9 +56,16 @@ impl HephLspContext {
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
+        let builtin_hovers = crate::pluginbuildfile::run_file::builtin_call_hovers(&doc_globals);
         let patterns = buildfile_patterns(&*engine);
         let provider = build_listing_provider(&root, &patterns, &registry);
-        let shared = SharedState::new(engine, root.clone(), patterns.clone(), core_members);
+        let shared = SharedState::new(
+            engine,
+            root.clone(),
+            patterns.clone(),
+            core_members,
+            builtin_hovers,
+        );
         HephLspContext {
             root,
             registry,
@@ -231,6 +238,11 @@ impl LspContext for HephLspContext {
             }
         };
 
+        // Static validation of `target` / `provider_state` keyword arguments
+        // against the engine's schemas (unknown key / wrong type → red squiggle).
+        // Runs off the parsed AST, so it works mid-edit without a full eval.
+        let diagnostics = super::diagnostics::validate(&ast, &*self.shared.engine);
+
         // Best-effort evaluation to populate the provenance / driver index. A
         // half-typed buffer that fails to evaluate simply yields no provenance —
         // but we keep the source for prefix-based completion/hover. We do not
@@ -246,7 +258,7 @@ impl LspContext for HephLspContext {
         }
 
         LspEvalResult {
-            diagnostics: vec![],
+            diagnostics,
             ast: Some(ast),
         }
     }

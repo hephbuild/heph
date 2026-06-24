@@ -299,6 +299,18 @@ fn enrich_hover(
     // stock server has no docs for the engine-injected native functions).
     if let Some(fn_md) = provider_fn_hover(&index.source, line, col, shared) {
         md = fn_md;
+    } else if let Some(field_md) = provider_state_field_hover(&index.source, line, col, shared) {
+        // A provider-state field name (`provider_state(provider="go", go_codegen_root=…)`):
+        // the stock server has no docs for these dynamic kwargs, so render the
+        // schema field's type + doc ourselves.
+        md = field_md;
+    } else if let Some(builtin_md) =
+        builtin_call_name_at(&index.source, byte_offset(&index.source, line, col))
+            .and_then(|name| shared.builtin_hovers.get(name))
+    {
+        // The `target` / `provider_state` callee name: both take a raw `*args,
+        // **kwargs`, so the stock hover is meaningless — render the real signature.
+        md = builtin_md.clone();
     } else if md.is_empty()
         && let Some(doc) = index.def_hover_at(line + 1, col + 1)
     {
@@ -403,6 +415,30 @@ fn provider_fn_hover(source: &str, line: u32, col: u32, shared: &SharedState) ->
     // — identical to a local `def` — rather than `def heph.fs.join(...)`. The
     // namespace is evident from the call site being hovered.
     Some(render_doc_item_no_link(&func, &item))
+}
+
+/// Hover markdown for a provider-state field under the cursor: when the cursor is
+/// on an identifier inside a `provider_state(provider="X", …)` call and that
+/// identifier names a field in provider `X`'s state schema, render its type and
+/// doc. `None` otherwise. Text-based (like the matching completion) so it resolves
+/// while the buffer is mid-edit and wouldn't evaluate.
+fn provider_state_field_hover(
+    source: &str,
+    line: u32,
+    col: u32,
+    shared: &SharedState,
+) -> Option<String> {
+    let offset = byte_offset(source, line, col);
+    let provider = provider_state_at(source, offset).filter(|p| !p.is_empty())?;
+    let word = word_at_offset(source, offset)?;
+    let schema = shared.engine.provider_state_schema(&provider)?;
+    let field = schema.fields.iter().find(|f| f.name == word)?;
+    let mut md = format!("```python\n{}: {}\n```", field.name, field.ty.render());
+    if !field.doc.is_empty() {
+        md.push_str("\n\n");
+        md.push_str(&field.doc);
+    }
+    Some(md)
 }
 
 /// Render an htvalue default as a Starlark literal for the hover prototype
@@ -641,6 +677,232 @@ fn in_driver_value(prefix: &str) -> bool {
         .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
 }
 
+/// Byte offset into `source` for a 0-based `(line, col)`, clamped to bounds. The
+/// column is treated as a byte column — BUILD structure (identifiers, `=`, parens)
+/// is ASCII, so this is exact at the positions we resolve.
+fn byte_offset(source: &str, line: u32, col: u32) -> usize {
+    let mut off = 0usize;
+    for (i, l) in source.split_inclusive('\n').enumerate() {
+        if i as u32 == line {
+            return off + (col as usize).min(l.len());
+        }
+        off += l.len();
+    }
+    off.min(source.len())
+}
+
+/// The `provider = "X"` value of the innermost `provider_state(...)` call whose
+/// argument list contains the byte `offset`, or `None` when `offset` isn't inside
+/// such a call. Purely textual, so it resolves the provider while the buffer is
+/// mid-edit (a half-typed arg name makes the buffer fail to evaluate, which the
+/// provenance-based index can't recover from). The value is the empty string when
+/// `provider=` hasn't been written yet.
+fn provider_state_at(source: &str, offset: usize) -> Option<String> {
+    let region = enclosing_call_args("provider_state", source, offset)?;
+    Some(kwarg_string(region, "provider").unwrap_or_default())
+}
+
+/// The `driver = "X"` value of the innermost `target(...)` call whose argument
+/// list contains the byte `offset`, or `None` when `offset` isn't inside a
+/// `target(...)` call. The value is the empty string when `driver=` hasn't been
+/// written yet (the base `target` args still complete). Textual, so it resolves
+/// while the buffer is mid-edit and wouldn't evaluate.
+fn target_driver_at(source: &str, offset: usize) -> Option<String> {
+    let region = enclosing_call_args("target", source, offset)?;
+    Some(kwarg_string(region, "driver").unwrap_or_default())
+}
+
+/// The text between the parentheses of the innermost call named `name` enclosing
+/// the byte `offset` (the call's argument list), or `None` if the innermost
+/// enclosing call has a different (or no) callee. Returns the region up to the
+/// end of the source when the call's `)` hasn't been typed yet. String literals
+/// and nested calls are skipped so parens/quotes inside them don't confuse the
+/// scan.
+fn enclosing_call_args<'a>(name: &str, source: &'a str, offset: usize) -> Option<&'a str> {
+    let open = innermost_call_open(name, source, offset)?;
+    let region_start = open + 1;
+    let b = source.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = open;
+    while let Some(&c) = b.get(i) {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source.get(region_start..i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    // Unterminated call (the `)` isn't typed yet): the region runs to the end.
+    source.get(region_start..)
+}
+
+/// Byte offset of the `(` opening the innermost call enclosing `offset`, when that
+/// call's callee identifier is exactly `name`; `None` otherwise. Scans `[0,
+/// offset)` tracking string literals and a stack of open calls.
+fn innermost_call_open(name: &str, source: &str, offset: usize) -> Option<usize> {
+    let b = source.as_bytes();
+    let offset = offset.min(b.len());
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < offset {
+        let Some(&c) = b.get(i) else { break };
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'(' => {
+                    // The callee identifier ends just before `(` (allowing whitespace).
+                    let mut j = i;
+                    while j > 0
+                        && b.get(j - 1)
+                            .copied()
+                            .is_some_and(|c| c.is_ascii_whitespace())
+                    {
+                        j -= 1;
+                    }
+                    let end = j;
+                    while j > 0 && b.get(j - 1).copied().is_some_and(is_ident) {
+                        j -= 1;
+                    }
+                    stack.push((i, source.get(j..end) == Some(name)));
+                }
+                b')' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    match stack.last() {
+        Some(&(open, true)) => Some(open),
+        _ => None,
+    }
+}
+
+/// The string value of the `key = "…"` keyword argument within a call's argument
+/// text, or `None` if the key isn't present as a whole-token keyword argument.
+fn kwarg_string(args: &str, key: &str) -> Option<String> {
+    let b = args.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let is_ws = |c: u8| c.is_ascii_whitespace();
+    let mut search = 0;
+    while let Some(rel) = args.get(search..)?.find(key) {
+        let start = search + rel;
+        let end = start + key.len();
+        search = end;
+        // Whole-token match (not a suffix of a longer identifier).
+        if start > 0 && b.get(start - 1).copied().is_some_and(is_ident) {
+            continue;
+        }
+        // Next non-whitespace must be `=`, then a quoted string.
+        let mut k = end;
+        while b.get(k).copied().is_some_and(is_ws) {
+            k += 1;
+        }
+        if b.get(k) != Some(&b'=') {
+            continue;
+        }
+        k += 1;
+        while b.get(k).copied().is_some_and(is_ws) {
+            k += 1;
+        }
+        let Some(&quote) = b.get(k) else { continue };
+        if quote != b'"' && quote != b'\'' {
+            continue;
+        }
+        k += 1;
+        let vstart = k;
+        while b.get(k).is_some_and(|&c| c != quote) {
+            k += 1;
+        }
+        return args.get(vstart..k).map(str::to_string);
+    }
+    None
+}
+
+/// The identifier (ASCII `[A-Za-z0-9_]`) covering the byte `offset`, or `None`
+/// when `offset` isn't on an identifier. The cursor may sit at either edge.
+fn word_at_offset(source: &str, offset: usize) -> Option<&str> {
+    let b = source.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let offset = offset.min(b.len());
+    let on_ident = b.get(offset).copied().is_some_and(is_ident)
+        || (offset > 0 && b.get(offset - 1).copied().is_some_and(is_ident));
+    if !on_ident {
+        return None;
+    }
+    let mut start = offset;
+    while start > 0 && b.get(start - 1).copied().is_some_and(is_ident) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while b.get(end).copied().is_some_and(is_ident) {
+        end += 1;
+    }
+    source.get(start..end)
+}
+
+/// If the identifier covering `offset` is the callee name of a recognized builtin
+/// call — `target(` or `provider_state(` — return that name; `None` otherwise. The
+/// identifier must be immediately followed (modulo whitespace) by `(`, so a bare
+/// `target` used as a value isn't mistaken for the call. Purely textual.
+fn builtin_call_name_at(source: &str, offset: usize) -> Option<&str> {
+    let b = source.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let offset = offset.min(b.len());
+    let on_ident = b.get(offset).copied().is_some_and(is_ident)
+        || (offset > 0 && b.get(offset - 1).copied().is_some_and(is_ident));
+    if !on_ident {
+        return None;
+    }
+    let mut start = offset;
+    while start > 0 && b.get(start - 1).copied().is_some_and(is_ident) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while b.get(end).copied().is_some_and(is_ident) {
+        end += 1;
+    }
+    let word = source.get(start..end)?;
+    if word != "target" && word != "provider_state" {
+        return None;
+    }
+    let mut k = end;
+    while b.get(k).copied().is_some_and(|c| c.is_ascii_whitespace()) {
+        k += 1;
+    }
+    (b.get(k) == Some(&b'(')).then_some(word)
+}
+
 fn field_item(name: &str, ty: &str, doc: String, ctx: &str, required: bool) -> CompletionItem {
     // Target config fields are mostly optional, so mark the minority — the
     // required ones — explicitly (Bazel `mandatory` / JSON-Schema `required`
@@ -676,7 +938,7 @@ fn enrich_completion(
     let Some(index) = shared.index(uri) else {
         return;
     };
-    let (l, c) = (line + 1, col + 1);
+    let offset = byte_offset(&index.source, line, col);
 
     // The source up to the cursor on its line, for string-context detection.
     let line_text = index.source.lines().nth(line as usize).unwrap_or("");
@@ -711,30 +973,32 @@ fn enrich_completion(
             .collect()
     } else if in_string(prefix) {
         vec![]
-    } else if let Some(driver) = index.driver_at(l, c) {
+    } else if let Some(driver) = target_driver_at(&index.source, offset) {
         let mut items: Vec<CompletionItem> = crate::pluginbuildfile::run_file::target_base_fields()
             .into_iter()
             .map(|f| field_item(&f.name, &f.ty.render(), f.doc, "target", f.required))
             .collect();
         if !driver.is_empty()
-            && let Some(schema) = shared.engine.driver_schema(driver)
+            && let Some(schema) = shared.engine.driver_schema(&driver)
         {
             items.extend(
                 schema
                     .fields
                     .into_iter()
-                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, driver, f.required)),
+                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, &driver, f.required)),
             );
         }
         items
-    } else if let Some(provider) = index.state_provider_at(l, c) {
+    } else if let Some(provider) =
+        provider_state_at(&index.source, offset).filter(|p| !p.is_empty())
+    {
         shared
             .engine
-            .provider_state_schema(provider)
+            .provider_state_schema(&provider)
             .map(|s| {
                 s.fields
                     .into_iter()
-                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, provider, f.required))
+                    .map(|f| field_item(&f.name, &f.ty.render(), f.doc, &provider, f.required))
                     .collect()
             })
             .unwrap_or_default()
@@ -762,8 +1026,297 @@ fn enrich_completion(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_symbol_def, pkg_of, result_points_to_other_file};
+    use super::{builtin_call_name_at, find_symbol_def, pkg_of, result_points_to_other_file};
     use std::path::Path;
+
+    struct FakeEngine {
+        root: std::path::PathBuf,
+        registry: std::sync::Arc<hplugin::provider::ProviderFunctionRegistry>,
+    }
+
+    impl hplugin::lsp::LspEngine for FakeEngine {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+        fn provider_function_registry(
+            &self,
+        ) -> std::sync::Arc<hplugin::provider::ProviderFunctionRegistry> {
+            std::sync::Arc::clone(&self.registry)
+        }
+        fn driver_schema(&self, name: &str) -> Option<hplugin::driver::DriverSchema> {
+            use hcore::htvalue::signature::ParamType;
+            use hplugin::driver::{DriverField, DriverSchema};
+            if name != "exec" {
+                return None;
+            }
+            Some(DriverSchema {
+                fields: vec![DriverField {
+                    name: "cmd".to_string(),
+                    ty: ParamType::String,
+                    doc: "Command line to run.".to_string(),
+                    required: true,
+                }],
+            })
+        }
+        fn driver_names(&self) -> Vec<String> {
+            vec!["exec".to_string()]
+        }
+        fn provider_state_schema(&self, name: &str) -> Option<hplugin::provider::StateSchema> {
+            use hcore::htvalue::signature::ParamType;
+            use hplugin::provider::{StateField, StateSchema};
+            if name != "go" {
+                return None;
+            }
+            Some(StateSchema {
+                fields: vec![StateField {
+                    name: "go_codegen_root".to_string(),
+                    ty: ParamType::Bool,
+                    doc: "Mark this package as a Go codegen root.".to_string(),
+                    required: false,
+                }],
+            })
+        }
+        fn provider_options(&self, _name: &str) -> hplugin::config::Options {
+            Default::default()
+        }
+    }
+
+    fn shared_with_index(
+        content: &str,
+    ) -> (
+        std::sync::Arc<super::SharedState>,
+        starlark_lsp::server::LspUri,
+    ) {
+        use crate::pluginbuildfile::run_file::{BuildFileLoader, eval_source};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(hplugin::provider::ProviderFunctionRegistry::default());
+        let loader = BuildFileLoader::new(
+            tmp.path().to_path_buf(),
+            vec![glob::Pattern::new("BUILD").unwrap()],
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::clone(&registry),
+            Arc::new(std::sync::OnceLock::new()),
+            Arc::new(hwalk::CachedWalker::disabled()),
+        );
+        // Mirror context.rs: a buffer that fails to eval falls back to a
+        // source-only index (the realistic mid-edit case).
+        let index = match eval_source("BUILD", content.to_string(), "pkg", &loader) {
+            Ok(result) => super::super::index::DocIndex::build(&result, "pkg", content.to_string()),
+            Err(_) => super::super::index::DocIndex::source_only(content.to_string()),
+        };
+        let doc_globals =
+            crate::pluginbuildfile::run_file::build_globals(&registry).documentation();
+        let builtin_hovers = crate::pluginbuildfile::run_file::builtin_call_hovers(&doc_globals);
+        let engine = Arc::new(FakeEngine {
+            root: tmp.path().to_path_buf(),
+            registry,
+        });
+        let shared = super::SharedState::new(
+            engine,
+            tmp.path().to_path_buf(),
+            vec![glob::Pattern::new("BUILD").unwrap()],
+            vec![],
+            builtin_hovers,
+        );
+        let uri = starlark_lsp::server::LspUri::File(tmp.path().join("BUILD"));
+        shared.set_index(uri.clone(), index);
+        (shared, uri)
+    }
+
+    fn completion_labels(
+        shared: &super::SharedState,
+        uri: &starlark_lsp::server::LspUri,
+        line: u32,
+        col: u32,
+    ) -> Vec<String> {
+        let mut resp = lsp_server::Response {
+            id: 1.into(),
+            result: None,
+            error: None,
+        };
+        super::enrich_completion(&mut resp, uri, line, col, shared);
+        let Some(value) = resp.result else {
+            return vec![];
+        };
+        match serde_json::from_value::<lsp_types::CompletionResponse>(value).unwrap() {
+            lsp_types::CompletionResponse::Array(items) => {
+                items.into_iter().map(|i| i.label).collect()
+            }
+            lsp_types::CompletionResponse::List(l) => {
+                l.items.into_iter().map(|i| i.label).collect()
+            }
+        }
+    }
+
+    fn hover_value(
+        shared: &super::SharedState,
+        uri: &starlark_lsp::server::LspUri,
+        line: u32,
+        col: u32,
+    ) -> Option<String> {
+        let mut resp = lsp_server::Response {
+            id: 1.into(),
+            result: None,
+            error: None,
+        };
+        super::enrich_hover(&mut resp, uri, line, col, shared);
+        let value = resp.result?;
+        match serde_json::from_value::<lsp_types::Hover>(value)
+            .unwrap()
+            .contents
+        {
+            lsp_types::HoverContents::Markup(m) => Some(m.value),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn completion_mid_edit_offers_state_fields() {
+        // The realistic LSP scenario: a partial property name (`go_c`) is in the
+        // buffer, so it does NOT evaluate — the provenance index is unavailable.
+        // Text-based detection must still offer the provider's state fields.
+        let content = "provider_state(provider = \"go\", go_c)\n";
+        let (shared, uri) = shared_with_index(content);
+        // Cursor on the partial `go_c` token (0-based col 35).
+        let labels = completion_labels(&shared, &uri, 0, 35);
+        assert!(
+            labels.iter().any(|l| l == "go_codegen_root"),
+            "expected go_codegen_root mid-edit, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_mid_edit_offers_target_fields() {
+        // Partial property name → buffer doesn't evaluate. Text-based detection
+        // must still offer the base `target` args plus the driver's config fields.
+        let content = "target(name = \"t\", driver = \"exec\", c)\n";
+        let (shared, uri) = shared_with_index(content);
+        // Cursor on the partial `c` token (0-based col 35).
+        let labels = completion_labels(&shared, &uri, 0, 35);
+        assert!(
+            labels.iter().any(|l| l == "name"),
+            "expected base target field, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "cmd"),
+            "expected exec driver field `cmd`, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_inside_provider_state_offers_state_fields() {
+        // Cursor inside a fully-valid call, after the provider arg.
+        let content = "provider_state(provider = \"go\", )\n";
+        let (shared, uri) = shared_with_index(content);
+        // 0-based position just before the closing paren (col 31 = after `, `).
+        let labels = completion_labels(&shared, &uri, 0, 31);
+        assert!(
+            labels.iter().any(|l| l == "go_codegen_root"),
+            "expected go_codegen_root in completions, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_outside_provider_state_offers_no_state_fields() {
+        // A bare top-level position is not inside any provider_state call.
+        let content = "x = 1\nprovider_state(provider = \"go\")\n";
+        let (shared, uri) = shared_with_index(content);
+        let labels = completion_labels(&shared, &uri, 0, 0);
+        assert!(
+            !labels.iter().any(|l| l == "go_codegen_root"),
+            "should not offer state fields outside the call, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn hover_on_state_field_renders_type_and_doc() {
+        // Even mid-edit (no closing value), hovering the field name shows its doc.
+        let content = "provider_state(provider = \"go\", go_codegen_root = True)\n";
+        let (shared, uri) = shared_with_index(content);
+        // Cursor on `go_codegen_root` (starts at 0-based col 32).
+        let md = hover_value(&shared, &uri, 0, 35).expect("hover");
+        assert!(md.contains("go_codegen_root"), "names the field: {md}");
+        assert!(md.contains("bool"), "shows the type: {md}");
+        assert!(md.contains("Go codegen root"), "shows the doc: {md}");
+    }
+
+    #[test]
+    fn hover_on_provider_state_callee_renders_signature() {
+        // Hovering the `provider_state` name (not a field) shows the real
+        // signature, not the stock `def provider_state(*args, **kwargs)`.
+        let content = "provider_state(provider = \"go\")\n";
+        let (shared, uri) = shared_with_index(content);
+        // Cursor on the `provider_state` callee (0-based col 3).
+        let md = hover_value(&shared, &uri, 0, 3).expect("hover");
+        assert!(md.contains("provider"), "names provider arg: {md}");
+        assert!(md.contains("**state"), "shows state kwargs: {md}");
+        assert!(!md.contains("**kwargs"), "not the raw prototype: {md}");
+    }
+
+    #[test]
+    fn hover_on_target_callee_renders_signature() {
+        let content = "target(name = \"t\", driver = \"exec\")\n";
+        let (shared, uri) = shared_with_index(content);
+        // Cursor on the `target` callee (0-based col 2).
+        let md = hover_value(&shared, &uri, 0, 2).expect("hover");
+        assert!(md.contains("name"), "names base arg: {md}");
+        assert!(md.contains("**config"), "shows config kwargs: {md}");
+        assert!(!md.contains("**kwargs"), "not the raw prototype: {md}");
+    }
+
+    #[test]
+    fn builtin_call_name_at_detects_callee_only() {
+        // On the callee name immediately before `(`.
+        assert_eq!(
+            builtin_call_name_at("target(name = \"t\")", 2),
+            Some("target")
+        );
+        assert_eq!(
+            builtin_call_name_at("provider_state(provider = \"go\")", 3),
+            Some("provider_state")
+        );
+        // Whitespace between name and `(` is tolerated.
+        assert_eq!(builtin_call_name_at("target  (x)", 2), Some("target"));
+        // A bare `target` not used as a call → None.
+        assert_eq!(builtin_call_name_at("x = target", 8), None);
+        // An unrelated identifier → None.
+        assert_eq!(builtin_call_name_at("glob(\"x\")", 1), None);
+        // Inside the args, not on the callee → None.
+        assert_eq!(builtin_call_name_at("target(name = \"t\")", 9), None);
+    }
+
+    #[test]
+    fn enclosing_provider_state_resolves_provider_textually() {
+        use super::{byte_offset, provider_state_at};
+        // Multi-line call: cursor on the second line still resolves the provider.
+        let src = "provider_state(\n    provider = \"go\",\n    go_c,\n)\n";
+        let off = byte_offset(src, 2, 6); // inside `go_c` on line 2 (0-based)
+        assert_eq!(provider_state_at(src, off).as_deref(), Some("go"));
+        // Outside any call → None.
+        assert_eq!(
+            provider_state_at("y = 2\n", byte_offset("y = 2\n", 0, 0)),
+            None
+        );
+        // A different call's args don't count as provider_state.
+        let other = "target(name = \"t\", )\n";
+        assert_eq!(provider_state_at(other, byte_offset(other, 0, 18)), None);
+    }
+
+    #[test]
+    fn kwarg_string_extracts_whole_token_value() {
+        use super::kwarg_string;
+        assert_eq!(
+            kwarg_string("provider = \"go\", x = 1", "provider").as_deref(),
+            Some("go")
+        );
+        // A longer identifier ending in the key must not match.
+        assert_eq!(kwarg_string("myprovider = \"go\"", "provider"), None);
+        // Missing key → None.
+        assert_eq!(kwarg_string("x = 1", "provider"), None);
+    }
 
     #[test]
     fn find_symbol_def_locates_def_and_assignment() {
