@@ -128,14 +128,21 @@ jobs:
           # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
           # devenv macfuse-stubs; zig mangles the nix `-L` path under its SDK
           # syslibroot and fails to find `-lfuse`, so the (native arm64) macOS
-          # runner uses plain `cargo build` — no cross needed there. The go plugin
-          # cdylib builds in a second invocation: `--bin heph` is a target filter
-          # that would exclude the cdylib's lib target, so it can't share the bin's
-          # command. The compile is still shared (deps are already built).
+          # runner uses plain `cargo build` — no cross needed there.
+          #
+          # The heph bin and the two plugin cdylibs build in ONE invocation. They
+          # share nearly the whole workspace dep graph, and under the release
+          # profile (thin-LTO + opt-level=3) each artifact's final codegen/LTO pass
+          # is heavy — splitting into separate `cargo build` calls serializes those
+          # three passes and pays cargo startup + freshness re-resolution each time.
+          # A single invocation lets cargo's jobserver overlap them (one artifact's
+          # link tail filling cores while the next codegens). `--bin heph` selects
+          # the binary; `--lib` adds every selected package's lib target — i.e. both
+          # cdylibs (heph's own lib is already built as the bin's dependency, so it
+          # costs nothing extra).
+          TARGETS="--bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib"
           if [ "${{ matrix.os }}" = "darwin" ]; then
-            cargo build --release --locked --target ${{ matrix.target }} -p heph --bin heph
-            cargo build --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
-            cargo build --release --locked --target ${{ matrix.target }} -p plugin-gha-cdylib
+            cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
             gha_lib="$OUT/libplugin_gha_cdylib.dylib"
             # The nix toolchain hard-links libiconv against its /nix/store path,
@@ -145,9 +152,7 @@ jobs:
             bash scripts/macos-portable.sh "$lib"
             bash scripts/macos-portable.sh "$gha_lib"
           else
-            cargo zigbuild --release --locked --target ${{ matrix.target }} -p heph --bin heph
-            cargo zigbuild --release --locked --target ${{ matrix.target }} -p plugin-go-cdylib
-            cargo zigbuild --release --locked --target ${{ matrix.target }} -p plugin-gha-cdylib
+            cargo zigbuild --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
           fi
