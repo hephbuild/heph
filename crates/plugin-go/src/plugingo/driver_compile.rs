@@ -382,7 +382,7 @@ impl ManagedDriver for GoCompileDriver {
         // 3. embedcfg (optional): patterns from go list ∪ go_embed_src resolution.
         let has_embed = if let Some(variant) = def.embed_variant {
             let embedcfg = self
-                .compute_embedcfg(&req, &def, variant)
+                .compute_embedcfg(&req, def, variant)
                 .context("compute embedcfg")?;
             std::fs::write(pkg_dir.join("embedcfg"), embedcfg).context("write embedcfg")?;
             true
@@ -591,8 +591,36 @@ impl GoCompileDriver {
         };
 
         let embed_src_rel = self.collect_embed_src_rel(req, &def.embed_src_origin_ids)?;
-        let files = embed::merge_embed_files(go_src_files, &patterns, &embed_src_rel);
-        embed::compute_embed_cfg_json(&patterns, &files)
+        let files = embed::merge_embed_files(go_src_files.clone(), &patterns, &embed_src_rel);
+        // On a zero-match failure, attach what each lane actually saw plus the
+        // sandbox package-dir contents. This turns the otherwise-opaque "matched
+        // no files" into a precise picture: whether go list's EmbedFiles (go_src
+        // lane) was empty, whether the go_embed_src lane staged anything, and
+        // whether the file is physically present in the compile sandbox at all.
+        embed::compute_embed_cfg_json(&patterns, &files).with_context(|| {
+            let preview = |v: &[String]| -> String {
+                if v.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    v.iter().take(40).cloned().collect::<Vec<_>>().join(", ")
+                }
+            };
+            let staged = list_pkg_dir_rel(&req.sandbox_pkg_dir);
+            format!(
+                "embedcfg diagnostics: go_src EmbedFiles (go list, {}): [{}]; \
+                 go_embed_src staged ({}): [{}]; embed_src deps wired={}, golist input present={}; \
+                 files in sandbox pkg dir {:?} ({}): [{}]",
+                go_src_files.len(),
+                preview(&go_src_files),
+                embed_src_rel.len(),
+                preview(&embed_src_rel),
+                def.embed_src_origin_ids.len(),
+                def.golist_origin_id.is_some(),
+                req.sandbox_pkg_dir,
+                staged.len(),
+                preview(&staged),
+            )
+        })
     }
 
     /// Staged `go_embed_src` files as package-relative, `/`-separated paths.
@@ -665,6 +693,33 @@ impl GoCompileDriver {
         }
         Ok(())
     }
+}
+
+/// Recursively list regular files under `dir` as `/`-separated paths relative to
+/// `dir`. Used only for embedcfg failure diagnostics, so it is best-effort:
+/// unreadable entries are skipped rather than erroring.
+fn list_pkg_dir_rel(dir: &std::path::Path) -> Vec<String> {
+    fn walk(base: &std::path::Path, cur: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(cur) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => walk(base, &path, out),
+                Ok(ft) if ft.is_file() || ft.is_symlink() => {
+                    if let Ok(rel) = path.strip_prefix(base) {
+                        out.push(rel.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 // ---------------------------------------------------------------------------
