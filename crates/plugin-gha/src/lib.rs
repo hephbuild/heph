@@ -8,7 +8,8 @@
 //!   ends, so it can't show live progress; a comment can, works with the default
 //!   `GITHUB_TOKEN`, and (unlike a check run) never nests under another workflow's
 //!   check suite. One comment per job, reused across runs (found by a hidden marker)
-//!   so it's never spammed.
+//!   so it's never spammed; within it each heph command (each step) keeps its own
+//!   section, so a job's earlier steps' results are preserved, not overwritten.
 //! - **At the end**: the full markdown is written once to `$GITHUB_STEP_SUMMARY`.
 //!
 //! The aggregation is intentionally self-contained (a small [`Tally`]) rather than
@@ -275,12 +276,91 @@ fn pr_number_from_ref(git_ref: &str) -> Option<u64> {
         .ok()
 }
 
-/// Live updates to a **sticky PR comment**. Unlike a check run, an issue comment
-/// is never grouped under a workflow's check suite, so it works correctly with the
-/// default `GITHUB_TOKEN` (needs `pull-requests: write`). The comment is found-or-
-/// created once (matched by a hidden marker) and PATCHed in place afterwards, so
-/// repeated runs reuse the one comment instead of spamming new ones. One comment
-/// per `marker` key (the job, so a job keeps a single comment across its steps).
+/// Hidden delimiters wrapping one heph command's section inside the shared
+/// per-job comment, so each step (a separate heph process) owns its own block and
+/// updates only that — earlier steps' sections are preserved.
+fn section_open(key: &str) -> String {
+    format!("<!-- heph-gha-step:{key} -->")
+}
+fn section_close(key: &str) -> String {
+    format!("<!-- /heph-gha-step:{key} -->")
+}
+
+/// Parse the ordered `(key, content)` sections out of a comment body. Tolerant:
+/// anything outside a well-formed open/close pair is ignored.
+fn parse_sections(body: &str) -> Vec<(String, String)> {
+    const OPEN: &str = "<!-- heph-gha-step:";
+    let mut out = Vec::new();
+    let mut rest = body;
+    // `.get(..)` (not `s[..]` slicing) throughout to satisfy the string-slice lint
+    // and stay panic-free on any malformed body.
+    while let Some(i) = rest.find(OPEN) {
+        let Some(after) = rest.get(i + OPEN.len()..) else {
+            break;
+        };
+        let Some(j) = after.find(" -->") else { break };
+        let (Some(key), Some(content_start)) = (after.get(..j), after.get(j + " -->".len()..))
+        else {
+            break;
+        };
+        let close = section_close(key);
+        let Some(k) = content_start.find(&close) else {
+            break;
+        };
+        let (Some(content), Some(next)) =
+            (content_start.get(..k), content_start.get(k + close.len()..))
+        else {
+            break;
+        };
+        out.push((key.to_string(), content.trim_matches('\n').to_string()));
+        rest = next;
+    }
+    out
+}
+
+/// Replace the section named `key` in place, or append it if new (preserving the
+/// order of the others).
+fn upsert_section(sections: &mut Vec<(String, String)>, key: &str, content: &str) {
+    if let Some(slot) = sections.iter_mut().find(|(k, _)| k == key) {
+        slot.1 = content.to_string();
+    } else {
+        sections.push((key.to_string(), content.to_string()));
+    }
+}
+
+/// Serialize the comment body: the container marker (used to find the comment)
+/// followed by each section wrapped in its hidden delimiters.
+fn assemble_body(container_marker: &str, sections: &[(String, String)]) -> String {
+    let mut s = String::from(container_marker);
+    s.push('\n');
+    for (key, content) in sections {
+        s.push_str(&format!(
+            "{}\n{content}\n{}\n\n",
+            section_open(key),
+            section_close(key)
+        ));
+    }
+    s.trim_end().to_string()
+}
+
+/// The found-or-created comment state, kept across the process's timer ticks so the
+/// other steps' sections (loaded once) are preserved on every update.
+#[derive(Default)]
+struct CommentState {
+    /// Whether the existing comment (if any) has been fetched & adopted.
+    loaded: bool,
+    /// The comment id once found or created.
+    id: Option<u64>,
+    /// All sections currently in the comment, including this process's.
+    sections: Vec<(String, String)>,
+}
+
+/// Live updates to a **sticky PR comment**. Unlike a check run, an issue comment is
+/// never grouped under a workflow's check suite, so it works with the default
+/// `GITHUB_TOKEN` (needs `pull-requests: write`). One comment per job (found-or-
+/// created via the hidden `container_marker`, so it's never spammed); within it,
+/// each heph command owns a `section_key` block, so a job's many steps each keep
+/// their own results instead of overwriting one another.
 struct CommentClient {
     http: std::sync::OnceLock<reqwest::blocking::Client>,
     api_url: String,
@@ -288,18 +368,19 @@ struct CommentClient {
     token: String,
     /// The PR to comment on.
     pr: u64,
-    /// Hidden HTML marker (`<!-- heph-gha:<key> -->`) identifying *this* comment, so
-    /// the same job's comment is found and reused rather than duplicated.
-    marker: String,
-    /// The comment id, resolved (found-or-created) on first sync, reused after.
-    id: Mutex<Option<u64>>,
+    /// Hidden marker (`<!-- heph-gha:<job> -->`) identifying *this job's* comment.
+    container_marker: String,
+    /// This process's section key (the heph command) within that comment.
+    section_key: String,
+    state: Mutex<CommentState>,
 }
 
 impl CommentClient {
-    /// Build from the Actions env, or `None` outside a PR / without a token. `key`
-    /// scopes the sticky comment (the job id, so one comment per job). `token_env`
-    /// names the token var (default `GITHUB_TOKEN`).
-    fn from_env(key: &str, token_env: Option<String>) -> Option<Self> {
+    /// Build from the Actions env, or `None` outside a PR / without a token.
+    /// `job_key` scopes the comment (one per job); `section_key` scopes this
+    /// process's block within it. `token_env` names the token var (default
+    /// `GITHUB_TOKEN`).
+    fn from_env(job_key: &str, section_key: &str, token_env: Option<String>) -> Option<Self> {
         let nonempty = |v: String| Some(v).filter(|s| !s.is_empty());
         let token_var = token_env
             .filter(|s| !s.is_empty())
@@ -317,8 +398,9 @@ impl CommentClient {
             repo,
             token,
             pr,
-            marker: format!("<!-- heph-gha:{key} -->"),
-            id: Mutex::new(None),
+            container_marker: format!("<!-- heph-gha:{job_key} -->"),
+            section_key: section_key.to_string(),
+            state: Mutex::new(CommentState::default()),
         })
     }
 
@@ -326,9 +408,9 @@ impl CommentClient {
         self.http.get_or_init(reqwest::blocking::Client::new)
     }
 
-    /// Find an existing comment carrying our marker, returning its id. Pages through
-    /// the PR's comments (newest unlikely to matter; caps pages to bound work).
-    fn find_existing(&self) -> Option<u64> {
+    /// Find this job's comment (by `container_marker`), returning its id + body.
+    /// Pages through the PR's comments, capped to bound work.
+    fn fetch_existing(&self) -> Option<(u64, String)> {
         const MAX_PAGES: u32 = 10;
         for page in 1..=MAX_PAGES {
             let resp = self
@@ -356,10 +438,10 @@ impl CommentClient {
                     .get("body")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                if body.contains(&self.marker)
+                if body.contains(&self.container_marker)
                     && let Some(cid) = c.get("id").and_then(serde_json::Value::as_u64)
                 {
-                    return Some(cid);
+                    return Some((cid, body.to_string()));
                 }
             }
             if comments.len() < 100 {
@@ -369,20 +451,25 @@ impl CommentClient {
         None
     }
 
-    /// Create-or-update the sticky comment with `markdown`. The marker is prepended
-    /// (hidden) so the comment is re-findable across processes.
+    /// Upsert this process's section with `markdown` and write the merged comment.
+    /// On the first call it adopts any existing comment for this job (inheriting the
+    /// other steps' sections); afterwards it edits only its own block.
     fn sync(&self, markdown: String) {
-        let mut id = self.id.lock().unwrap_or_else(|e| e.into_inner());
-        // First sync: adopt an existing comment (e.g. from an earlier step in this
-        // job) before deciding to create — that is what keeps it one-per-job.
-        if id.is_none() {
-            *id = self.find_existing();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.loaded {
+            if let Some((cid, body)) = self.fetch_existing() {
+                st.id = Some(cid);
+                st.sections = parse_sections(&body);
+            }
+            st.loaded = true;
         }
-        let body = format!("{}\n{markdown}", self.marker);
+        upsert_section(&mut st.sections, &self.section_key, &markdown);
+        let body = assemble_body(&self.container_marker, &st.sections);
+
         let mut payload = serde_json::Map::new();
         payload.insert("body".into(), serde_json::json!(body));
 
-        let result = match *id {
+        let result = match st.id {
             Some(cid) => self
                 .http()
                 .patch(format!(
@@ -407,7 +494,7 @@ impl CommentClient {
                 .and_then(|r| r.json::<serde_json::Value>())
                 .map(|v| {
                     if let Some(new_id) = v.get("id").and_then(serde_json::Value::as_u64) {
-                        *id = Some(new_id);
+                        st.id = Some(new_id);
                     }
                     if let Some(url) = v.get("html_url").and_then(serde_json::Value::as_str) {
                         tracing::info!("status comment {url}");
@@ -496,9 +583,16 @@ impl GhaHook {
         };
 
         let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
-        // One sticky PR comment per job (keyed by GITHUB_JOB, command as fallback).
-        let key = comment_key(&command, std::env::var("GITHUB_JOB").ok());
-        let comment = CommentClient::from_env(&key, token_env);
+        // One sticky PR comment per job (keyed by GITHUB_JOB, command as fallback);
+        // within it, one section per heph command so a job's steps each keep their
+        // own results.
+        let job_key = comment_key(&command, std::env::var("GITHUB_JOB").ok());
+        let section_key = if command.is_empty() {
+            "heph".to_string()
+        } else {
+            command.clone()
+        };
+        let comment = CommentClient::from_env(&job_key, &section_key, token_env);
         if comment.is_none() {
             tracing::info!(
                 "gha hook: GITHUB_TOKEN/GITHUB_REPOSITORY/PR not all set; \
@@ -744,6 +838,39 @@ mod tests {
         );
         // Empty command → stable fallback.
         assert_eq!(comment_key("", None), "heph");
+    }
+
+    #[test]
+    fn comment_sections_preserve_other_steps() {
+        // Two steps wrote their sections into one job comment.
+        let container = "<!-- heph-gha:test -->";
+        let mut sections = parse_sections(&assemble_body(
+            container,
+            &[
+                ("run //a:x".into(), "## heph: run //a:x\nbuilt 1".into()),
+                ("run //b:y".into(), "## heph: run //b:y\nbuilt 2".into()),
+            ],
+        ));
+        assert_eq!(sections.len(), 2);
+
+        // A third step updates only its own section; the others stay.
+        upsert_section(&mut sections, "run //a:x", "## heph: run //a:x\nbuilt 9");
+        let body = assemble_body(container, &sections);
+        assert!(body.starts_with(container), "container marker kept: {body}");
+        assert!(body.contains("built 9"), "own section updated: {body}");
+        assert!(body.contains("built 2"), "other step preserved: {body}");
+        // Round-trips back to the same three sections, in order.
+        let reparsed = parse_sections(&body);
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(reparsed[0].0, "run //a:x");
+        assert_eq!(reparsed[1].0, "run //b:y");
+
+        // A brand-new command appends a section rather than clobbering.
+        upsert_section(&mut sections, "query //...", "## heph: query //...\nok");
+        assert_eq!(
+            parse_sections(&assemble_body(container, &sections)).len(),
+            3
+        );
     }
 
     #[test]
