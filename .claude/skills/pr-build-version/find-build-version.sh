@@ -10,8 +10,10 @@ POLL_INTERVAL=10
 
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
-# Resolve the PR for the current branch -> head commit SHA.
-sha=$(gh pr view --json headRefOid -q .headRefOid 2>/dev/null || true)
+# Resolve the PR for the current branch -> head commit SHA + PR url.
+pr_json=$(gh pr view --json headRefOid,url 2>/dev/null || true)
+sha=$(echo "$pr_json" | jq -r '.headRefOid // empty')
+pr_url=$(echo "$pr_json" | jq -r '.url // empty')
 if [ -z "${sha:-}" ]; then
   echo "error: no PR found for the current branch" >&2
   exit 2
@@ -34,7 +36,7 @@ while :; do
       version=$(gh api "repos/$repo/check-runs/$jid/annotations" \
         -q ".[] | select(.title == \"$ANNOTATION_TITLE\") | .message" 2>/dev/null | head -n1 || true)
       if [ -n "${version:-}" ]; then
-        printf '%s\n%s\n' "$version" "$run_url"
+        printf '%s\n%s\n%s\n' "$version" "$run_url" "$pr_url"
         exit 0
       fi
     done

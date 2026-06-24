@@ -22,7 +22,7 @@ step runs, so poll until present (cap 5 min).
 ## Run
 
 Execute this script. It resolves the PR, finds the `CI` run, polls annotations for 5 minutes, and
-prints the version + run URL (or a clear failure).
+prints the version + run URL + PR URL (or a clear failure).
 
 ```bash
 bash .claude/skills/pr-build-version/find-build-version.sh
@@ -30,7 +30,7 @@ bash .claude/skills/pr-build-version/find-build-version.sh
 
 ## After running
 
-- On success: report the version and the run URL to the user, both clickable.
+- On success: report the version, the run URL, and the PR URL to the user, all clickable.
 - If the script exits non-zero, relay the exact error it printed — do not retry blindly:
   - `no PR` → there is no open PR for the current branch; tell the user to open one.
   - `no CI run` → the `CI` workflow has not started for the head commit yet.
