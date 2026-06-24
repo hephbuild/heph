@@ -162,6 +162,19 @@ impl Tally {
         slow
     }
 
+    /// A status emoji for the CLI invocation, derived from the tally: ❌ if anything
+    /// failed, ✅ once every matched target is done, otherwise ⏳ (still running).
+    fn status_emoji(&self) -> &'static str {
+        let (done, total) = self.progress();
+        if !self.failed.is_empty() {
+            "❌"
+        } else if self.matched_complete && done == total {
+            "✅"
+        } else {
+            "⏳"
+        }
+    }
+
     /// Render the GitHub-Actions markdown for the current tally. `heading` is the
     /// H2 title (the heph command being run).
     fn render_markdown(&self, now_ms: u64, heading: &str) -> String {
@@ -172,7 +185,8 @@ impl Tally {
             format!("~{total}")
         };
         let mut out = String::new();
-        out.push_str(&format!("## {heading}\n\n"));
+        // Heading leads with the invocation status emoji.
+        out.push_str(&format!("## {} {heading}\n\n", self.status_emoji()));
         out.push_str(&format!(
             "**Targets:** {done} / {total_str} &nbsp;•&nbsp; **built:** {} &nbsp;•&nbsp; **cached:** {} &nbsp;•&nbsp; **failed:** {}\n",
             self.built,
@@ -182,15 +196,19 @@ impl Tally {
 
         let slow = self.slow(now_ms);
         if !slow.is_empty() {
-            out.push_str(
-                "\n### Slow targets\n\n| target | phase | running for |\n| --- | --- | --- |\n",
-            );
+            // Collapsible: slow targets are noise most of the time, expanded on demand.
+            // The blank line after </summary> is required for the table to render.
+            out.push_str(&format!(
+                "\n<details><summary>🐢 Slow targets ({})</summary>\n\n| target | phase | running for |\n| --- | --- | --- |\n",
+                slow.len(),
+            ));
             for (addr, phase, elapsed) in slow.iter().take(MAX_SLOW_ROWS) {
                 out.push_str(&format!("| `{addr}` | {phase} | {}s |\n", elapsed / 1000));
             }
             if slow.len() > MAX_SLOW_ROWS {
                 out.push_str(&format!("\n…and {} more\n", slow.len() - MAX_SLOW_ROWS));
             }
+            out.push_str("</details>\n");
         }
 
         if !self.failed.is_empty() {
@@ -741,15 +759,19 @@ mod tests {
         // now far enough past //a:z's start to mark it slow.
         let md = t.render_markdown(SLOW_THRESHOLD_MS + 5_000, "heph: test");
 
-        // The H2 is the heph command.
-        assert!(md.contains("## heph: test"), "command heading: {md}");
+        // The H2 is the heph command, led by a status emoji (❌ — there's a failure).
+        assert!(md.contains("## ❌ heph: test"), "command heading: {md}");
         // 2 of 3 matched finished (x, y); w finished but isn't in the matched set.
         assert!(md.contains("2 / 3"), "progress: {md}");
         assert!(md.contains("**built:** 1"), "built: {md}");
         assert!(md.contains("**cached:** 1"), "cached: {md}");
         assert!(md.contains("**failed:** 1"), "failed: {md}");
-        // //a:z is still running past the threshold.
-        assert!(md.contains("### Slow targets"), "slow section: {md}");
+        // //a:z is still running past the threshold — in the collapsible.
+        assert!(
+            md.contains("<details><summary>🐢 Slow targets (1)</summary>"),
+            "slow collapsible: {md}"
+        );
+        assert!(md.contains("</details>"), "collapsible closed: {md}");
         assert!(md.contains("//a:z"), "slow target listed: {md}");
         // failure surfaced with its message.
         assert!(md.contains("### Failed"), "failed section: {md}");
@@ -757,6 +779,44 @@ mod tests {
             md.contains("//a:w") && md.contains("boom"),
             "failure detail: {md}"
         );
+    }
+
+    #[test]
+    fn status_emoji_tracks_invocation_outcome() {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: vec!["//a:x".into()],
+                complete: true,
+            },
+        ));
+        // Matched but nothing finished → running.
+        assert_eq!(t.status_emoji(), "⏳");
+        assert!(
+            t.render_markdown(0, "heph: test")
+                .contains("## ⏳ heph: test")
+        );
+
+        // All matched finished, no failure → success.
+        t.apply(&ev(
+            1,
+            BuildEventKind::ResultEnd {
+                addr: "//a:x".into(),
+                error: None,
+            },
+        ));
+        assert_eq!(t.status_emoji(), "✅");
+
+        // A failure flips it to failed regardless of progress.
+        t.apply(&ev(
+            2,
+            BuildEventKind::ResultEnd {
+                addr: "//a:x".into(),
+                error: Some("boom".into()),
+            },
+        ));
+        assert_eq!(t.status_emoji(), "❌");
     }
 
     #[test]
