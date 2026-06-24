@@ -212,6 +212,22 @@ impl Tally {
     }
 }
 
+/// The default check-run name for an invocation: the heph command, suffixed with
+/// the Actions job id (`GITHUB_JOB`) when present so the same command in different
+/// jobs never collides into one check. Same command + same step is the only case
+/// that can still collide — set the `checkName` option there.
+fn default_check_name(command: &str, job: Option<String>) -> String {
+    let base = if command.is_empty() {
+        "heph".to_string()
+    } else {
+        format!("heph: {command}")
+    };
+    match job.filter(|s| !s.is_empty()) {
+        Some(job) => format!("{base} [{job}]"),
+        None => base,
+    }
+}
+
 /// The commit a check run should attach to. On a `pull_request` event `GITHUB_SHA`
 /// is the ephemeral *merge* commit (`refs/pull/N/merge`); a check attached there is
 /// invisible on the PR. The commit reviewers actually see is the PR **head**, which
@@ -267,6 +283,11 @@ struct ChecksClient {
     repo: String,
     token: String,
     head_sha: String,
+    /// The check run's unique GitHub identity. Each heph invocation (a separate
+    /// process — CI runs many across jobs/steps) must use a distinct name, else
+    /// same-name runs on the same head sha collapse to the latest and earlier
+    /// commands' results are lost. Derived from the command + job (or `checkName`).
+    name: String,
     /// The check run id, assigned by the first (create) call, reused by PATCHes.
     id: Mutex<Option<u64>>,
 }
@@ -283,7 +304,11 @@ impl ChecksClient {
     /// to give the check run its own check suite — with the default `GITHUB_TOKEN`,
     /// GitHub nests the API-created run under another workflow's github-actions
     /// check suite (e.g. a labeler), which the check-runs API can't override.
-    fn from_env(head_sha_override: Option<String>, token_env: Option<String>) -> Option<Self> {
+    fn from_env(
+        name: String,
+        head_sha_override: Option<String>,
+        token_env: Option<String>,
+    ) -> Option<Self> {
         let nonempty = |v: String| Some(v).filter(|s| !s.is_empty());
         let token_var = token_env
             .filter(|s| !s.is_empty())
@@ -303,6 +328,7 @@ impl ChecksClient {
             repo,
             token,
             head_sha,
+            name,
             id: Mutex::new(None),
         })
     }
@@ -353,8 +379,9 @@ impl ChecksClient {
 
         let result = match *id {
             None => {
-                // Create: `name` + `head_sha` are required.
-                body.insert("name".into(), serde_json::json!("heph build"));
+                // Create: `name` + `head_sha` are required. `name` is per-invocation
+                // unique so concurrent heph commands don't clobber one another.
+                body.insert("name".into(), serde_json::json!(self.name));
                 body.insert("head_sha".into(), serde_json::json!(self.head_sha));
                 self.http()
                     .post(format!("{}/repos/{}/check-runs", self.api_url, self.repo))
@@ -448,13 +475,21 @@ impl GhaHook {
     /// on a `pull_request` event, else `$GITHUB_SHA`), `tokenEnv` (name of the env
     /// var holding the API token, default `GITHUB_TOKEN`; point at a GitHub App /
     /// PAT token so the check gets its own check suite instead of nesting under
-    /// another workflow's). Spawns the live-update thread when a check run can be
-    /// created.
+    /// another workflow's), `checkName` (the check run's GitHub identity; default
+    /// is the heph command + job id, kept distinct per invocation so CI's many
+    /// heph commands don't overwrite one check). Spawns the live-update thread when
+    /// a check run can be created.
     pub fn from_options(opts: &Options) -> anyhow::Result<Self> {
         deny_unknown(
             "gha hook",
             opts,
-            &["refreshSecs", "summaryPath", "headSha", "tokenEnv"],
+            &[
+                "refreshSecs",
+                "summaryPath",
+                "headSha",
+                "tokenEnv",
+                "checkName",
+            ],
         )?;
         tracing::info!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
@@ -469,16 +504,6 @@ impl GhaHook {
                  no step summary will be written"
             );
         }
-        let head_sha = decode_opt::<String>(opts, "gha hook", "headSha")?;
-        let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
-        let checks = ChecksClient::from_env(head_sha, token_env);
-        if checks.is_none() {
-            tracing::info!(
-                "gha hook: GITHUB_TOKEN/GITHUB_REPOSITORY/GITHUB_SHA not all set; \
-                 live check-run updates disabled (step summary still written at end)"
-            );
-        }
-
         // The plugin shares the heph process, so its args ARE the heph command:
         // skip the binary (argv[0]) and join the rest, e.g. `run //foo:bar`.
         let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
@@ -487,6 +512,24 @@ impl GhaHook {
         } else {
             format!("heph: {command}")
         };
+        // The check-run identity. CI runs many heph commands across jobs/steps, each
+        // a fresh process; a static name would make same-name runs collapse to the
+        // latest on the head sha. Derive a distinct name per invocation (or take the
+        // explicit `checkName`).
+        let check_name = match decode_opt::<String>(opts, "gha hook", "checkName")? {
+            Some(n) if !n.is_empty() => n,
+            _ => default_check_name(&command, std::env::var("GITHUB_JOB").ok()),
+        };
+
+        let head_sha = decode_opt::<String>(opts, "gha hook", "headSha")?;
+        let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
+        let checks = ChecksClient::from_env(check_name, head_sha, token_env);
+        if checks.is_none() {
+            tracing::info!(
+                "gha hook: GITHUB_TOKEN/GITHUB_REPOSITORY/GITHUB_SHA not all set; \
+                 live check-run updates disabled (step summary still written at end)"
+            );
+        }
 
         let inner = Arc::new(Inner {
             tally: Mutex::new(Tally::default()),
@@ -714,6 +757,24 @@ mod tests {
             t.render_markdown(0, "heph: test").contains("~1"),
             "provisional total"
         );
+    }
+
+    #[test]
+    fn check_name_distinct_per_command_and_job() {
+        // Command + job → unique even when two jobs run the same command.
+        assert_eq!(
+            default_check_name("run //a:x", Some("test".into())),
+            "heph: run //a:x [test]",
+        );
+        // No job → bare command name.
+        assert_eq!(default_check_name("run //a:x", None), "heph: run //a:x");
+        // Empty job string is treated as absent.
+        assert_eq!(
+            default_check_name("query //...", Some(String::new())),
+            "heph: query //...",
+        );
+        // Empty command → still a stable fallback.
+        assert_eq!(default_check_name("", None), "heph");
     }
 
     #[test]
