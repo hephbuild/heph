@@ -1118,8 +1118,7 @@ fn decode_event_frame(bytes: &[u8]) -> Option<hcore::events::BuildEvent> {
 /// only needs this future to resolve, which means the plugin drained the full
 /// stream and ran its final flush.
 async fn hook_on_events(hook: Arc<dyn Hook>, req: DynItemStream) -> SVec<u8> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    cdylib_runtime().spawn_blocking(move || {
+    let handle = cdylib_runtime().spawn_blocking(move || {
         loop {
             let bytes = req.next();
             // Empty == the host closed the stream (request finished).
@@ -1132,9 +1131,10 @@ async fn hook_on_events(hook: Arc<dyn Hook>, req: DynItemStream) -> SVec<u8> {
             }
         }
         hook.on_close();
-        let _ = tx.send(());
     });
-    let _ = rx.await;
+    // Wait for the blocking pull loop to finish (stream fully drained + the hook's
+    // final flush done) before acking the host.
+    drop(handle.await);
     SVec::new()
 }
 

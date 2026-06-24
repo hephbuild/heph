@@ -3803,6 +3803,8 @@ dependencies = [
  "anyhow",
  "core",
  "plugin",
+ "reqwest 0.13.4",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tracing",

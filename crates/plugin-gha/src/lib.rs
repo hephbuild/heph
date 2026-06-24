@@ -1,7 +1,13 @@
 //! A GitHub Actions hook: folds the engine's build-event stream into a status
-//! tally and periodically rewrites the job's `$GITHUB_STEP_SUMMARY` markdown
-//! (done/total, built, cached, failed, slow targets). Published out-of-process as
-//! a cdylib (see `plugin-gha-cdylib`) and enabled via a config `plugins:` entry.
+//! tally (done/total, built, cached, failed, slow targets) and surfaces it two
+//! ways. Published out-of-process as a cdylib (see `plugin-gha-cdylib`) and
+//! enabled via a config `plugins:` entry.
+//!
+//! - **Live**, while the job runs: a dedicated GitHub **check run** whose markdown
+//!   `output` is PATCHed on a timer. A check run is the only Actions surface that
+//!   updates in real time — `$GITHUB_STEP_SUMMARY` is rendered by GitHub *only*
+//!   when the step ends, so it cannot show live progress.
+//! - **At the end**: the full markdown is written once to `$GITHUB_STEP_SUMMARY`.
 //!
 //! The aggregation is intentionally self-contained (a small [`Tally`]) rather than
 //! reusing the TUI's `BuildState`: the renderer's aggregator is coupled to ratatui
@@ -153,8 +159,9 @@ impl Tally {
         slow
     }
 
-    /// Render the GitHub-Actions step-summary markdown for the current tally.
-    fn render_markdown(&self, now_ms: u64) -> String {
+    /// Render the GitHub-Actions markdown for the current tally. `heading` is the
+    /// H2 title (the heph command being run).
+    fn render_markdown(&self, now_ms: u64, heading: &str) -> String {
         let (done, total) = self.progress();
         let total_str = if self.matched_complete {
             total.to_string()
@@ -162,7 +169,7 @@ impl Tally {
             format!("~{total}")
         };
         let mut out = String::new();
-        out.push_str("## heph build\n\n");
+        out.push_str(&format!("## {heading}\n\n"));
         out.push_str(&format!(
             "**Targets:** {done} / {total_str} &nbsp;•&nbsp; **built:** {} &nbsp;•&nbsp; **cached:** {} &nbsp;•&nbsp; **failed:** {}\n",
             self.built,
@@ -205,27 +212,166 @@ impl Tally {
     }
 }
 
+/// Live updates to a dedicated GitHub **check run**. A check run's markdown
+/// `output` can be PATCHed while the job runs (the step summary cannot), so this
+/// is the live surface. Configured from the Actions environment; disabled (with no
+/// network calls) if any of token / repo / head-sha is missing. All calls are
+/// best-effort — an API/network error is logged, never fatal.
+struct ChecksClient {
+    /// Built lazily on first use. The blocking client must not be constructed on a
+    /// thread inside a tokio runtime; building it here, on the off-runtime update
+    /// thread (or the `on_close` blocking thread), keeps that guaranteed regardless
+    /// of where the plugin was loaded.
+    http: std::sync::OnceLock<reqwest::blocking::Client>,
+    api_url: String,
+    repo: String,
+    token: String,
+    head_sha: String,
+    /// The check run id, assigned by the first (create) call, reused by PATCHes.
+    id: Mutex<Option<u64>>,
+}
+
+impl ChecksClient {
+    /// Build from the Actions env (`GITHUB_TOKEN` / `GITHUB_REPOSITORY` /
+    /// `GITHUB_SHA`, `GITHUB_API_URL` optional), or `None` if a required piece is
+    /// absent. `head_sha_override` (the `headSha` option) wins over `GITHUB_SHA`
+    /// — useful to attach the check to a PR head rather than the merge commit.
+    fn from_env(head_sha_override: Option<String>) -> Option<Self> {
+        let nonempty = |v: String| Some(v).filter(|s| !s.is_empty());
+        let token = std::env::var("GITHUB_TOKEN").ok().and_then(nonempty)?;
+        let repo = std::env::var("GITHUB_REPOSITORY").ok().and_then(nonempty)?;
+        let head_sha = head_sha_override
+            .or_else(|| std::env::var("GITHUB_SHA").ok())
+            .and_then(nonempty)?;
+        let api_url = std::env::var("GITHUB_API_URL")
+            .ok()
+            .and_then(nonempty)
+            .unwrap_or_else(|| "https://api.github.com".to_string());
+        Some(Self {
+            http: std::sync::OnceLock::new(),
+            api_url,
+            repo,
+            token,
+            head_sha,
+            id: Mutex::new(None),
+        })
+    }
+
+    fn http(&self) -> &reqwest::blocking::Client {
+        self.http.get_or_init(reqwest::blocking::Client::new)
+    }
+
+    fn headers(&self) -> reqwest::header::HeaderMap {
+        use reqwest::header::{
+            ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
+        };
+        let mut h = HeaderMap::new();
+        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", self.token)) {
+            h.insert(AUTHORIZATION, v);
+        }
+        h.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.github+json"),
+        );
+        h.insert(USER_AGENT, HeaderValue::from_static("heph"));
+        h.insert(
+            HeaderName::from_static("x-github-api-version"),
+            HeaderValue::from_static("2022-11-28"),
+        );
+        h
+    }
+
+    /// Create the check run on the first call, PATCH it after. `completed` finalizes
+    /// it with a `success`/`failure` conclusion from `ok`.
+    fn sync(&self, title: String, summary: String, completed: bool, ok: bool) {
+        let mut id = self.id.lock().unwrap_or_else(|e| e.into_inner());
+        let status = if completed {
+            "completed"
+        } else {
+            "in_progress"
+        };
+        let conclusion = completed.then_some(if ok { "success" } else { "failure" });
+        let output = serde_json::json!({ "title": title, "summary": summary });
+
+        // Build the request body via a map (avoids `Value` index assignment).
+        let mut body = serde_json::Map::new();
+        body.insert("status".into(), serde_json::json!(status));
+        body.insert("output".into(), output);
+        if let Some(c) = conclusion {
+            body.insert("conclusion".into(), serde_json::json!(c));
+        }
+
+        let result = match *id {
+            None => {
+                // Create: `name` + `head_sha` are required.
+                body.insert("name".into(), serde_json::json!("heph build"));
+                body.insert("head_sha".into(), serde_json::json!(self.head_sha));
+                self.http()
+                    .post(format!("{}/repos/{}/check-runs", self.api_url, self.repo))
+                    .headers(self.headers())
+                    .json(&serde_json::Value::Object(body))
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.json::<serde_json::Value>())
+                    .map(|v| {
+                        if let Some(new_id) = v.get("id").and_then(serde_json::Value::as_u64) {
+                            *id = Some(new_id);
+                        }
+                    })
+            }
+            Some(rid) => self
+                .http()
+                .patch(format!(
+                    "{}/repos/{}/check-runs/{rid}",
+                    self.api_url, self.repo
+                ))
+                .headers(self.headers())
+                .json(&serde_json::Value::Object(body))
+                .send()
+                .and_then(|r| r.error_for_status())
+                .map(drop),
+        };
+        if let Err(e) = result {
+            tracing::warn!("gha hook: check-run update failed: {e}");
+        }
+    }
+}
+
 struct Inner {
     tally: Mutex<Tally>,
-    /// Where to write the summary; `None` disables writing (warned once at build).
+    /// Title for the check run + the summary H2: `heph: <command>`.
+    title: String,
+    /// Final step-summary path; `None` disables the end-of-run file write.
     summary_path: Option<PathBuf>,
-    /// Set by `on_close` so the periodic writer thread exits.
+    /// Live check-run updater; `None` when not running under Actions (or no token).
+    checks: Option<ChecksClient>,
+    /// Set by `on_close` so the live-update thread exits.
     stop: AtomicBool,
 }
 
 impl Inner {
+    /// (title, full markdown) for the current tally.
+    fn render(&self) -> (String, String) {
+        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+        let markdown = tally.render_markdown(now_unix_ms(), &self.title);
+        (self.title.clone(), markdown)
+    }
+
+    fn ok(&self) -> bool {
+        self.tally
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failed
+            .is_empty()
+    }
+
+    /// Write the full markdown to the step-summary file once, at the end of the
+    /// run. Atomic (temp + rename) so a reader never sees a half-written file.
     fn write_summary(&self) {
         let Some(path) = &self.summary_path else {
             return;
         };
-        let markdown = {
-            let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
-            tally.render_markdown(now_unix_ms())
-        };
-        // Each write fully RESETS the file (write a temp sibling, then rename over
-        // the target): the summary always shows only the latest snapshot, never an
-        // append of every refresh. Atomic so a reader never sees a half-written
-        // file.
+        let (_, markdown) = self.render();
         let tmp = path.with_extension("heph-tmp");
         if std::fs::write(&tmp, markdown.as_bytes()).is_ok()
             && let Err(e) = std::fs::rename(&tmp, path)
@@ -241,12 +387,13 @@ pub struct GhaHook {
 }
 
 impl GhaHook {
-    /// Build from the plugin's `options:` map. Reads `refreshSecs` (default 30)
-    /// and an optional `summaryPath` override; absent the override it targets
-    /// `$GITHUB_STEP_SUMMARY`. Spawns a background thread that rewrites the
-    /// summary every `refreshSecs` until [`Hook::on_close`].
+    /// Build from the plugin's `options:` map. Options (all optional):
+    /// `refreshSecs` (live check-run PATCH interval, default 30), `summaryPath`
+    /// (final step-summary file, default `$GITHUB_STEP_SUMMARY`), `headSha` (check
+    /// run head sha, default `$GITHUB_SHA`). Spawns the live-update thread when a
+    /// check run can be created.
     pub fn from_options(opts: &Options) -> anyhow::Result<Self> {
-        deny_unknown("gha hook", opts, &["refreshSecs", "summaryPath"])?;
+        deny_unknown("gha hook", opts, &["refreshSecs", "summaryPath", "headSha"])?;
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
             .unwrap_or(30)
             .max(1);
@@ -256,28 +403,58 @@ impl GhaHook {
         if summary_path.is_none() {
             tracing::warn!(
                 "gha hook: neither `summaryPath` option nor $GITHUB_STEP_SUMMARY set; \
-                 no summary will be written"
+                 no step summary will be written"
+            );
+        }
+        let head_sha = decode_opt::<String>(opts, "gha hook", "headSha")?;
+        let checks = ChecksClient::from_env(head_sha);
+        if checks.is_none() {
+            tracing::info!(
+                "gha hook: GITHUB_TOKEN/GITHUB_REPOSITORY/GITHUB_SHA not all set; \
+                 live check-run updates disabled (step summary still written at end)"
             );
         }
 
+        // The plugin shares the heph process, so its args ARE the heph command:
+        // skip the binary (argv[0]) and join the rest, e.g. `run //foo:bar`.
+        let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+        let title = if command.is_empty() {
+            "heph".to_string()
+        } else {
+            format!("heph: {command}")
+        };
+
         let inner = Arc::new(Inner {
             tally: Mutex::new(Tally::default()),
+            title,
             summary_path,
+            checks,
             stop: AtomicBool::new(false),
         });
 
-        // Periodic writer. A plain thread (no async runtime) keeps the hook free
-        // of runtime entanglement; it exits once `stop` is set by `on_close`.
-        let t = Arc::clone(&inner);
-        std::thread::spawn(move || {
-            while !t.stop.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_secs(refresh_secs));
-                if t.stop.load(Ordering::Acquire) {
-                    break;
+        // Live updates run only when a check run is configured. A plain thread (no
+        // async runtime) keeps the hook free of runtime entanglement; it creates
+        // the check run up front so it appears at job start, then PATCHes it every
+        // `refreshSecs` until `on_close` sets `stop`.
+        if inner.checks.is_some() {
+            let t = Arc::clone(&inner);
+            std::thread::spawn(move || {
+                let (title, summary) = t.render();
+                if let Some(c) = &t.checks {
+                    c.sync(title, summary, false, true);
                 }
-                t.write_summary();
-            }
-        });
+                while !t.stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_secs(refresh_secs));
+                    if t.stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let (title, summary) = t.render();
+                    if let Some(c) = &t.checks {
+                        c.sync(title, summary, false, true);
+                    }
+                }
+            });
+        }
 
         Ok(Self { inner })
     }
@@ -297,9 +474,14 @@ impl Hook for GhaHook {
     }
 
     fn on_close(&self) {
-        // Stop the periodic writer and flush the final summary synchronously, so
-        // the completed status is written before the plugin acks the host.
+        // Stop the live-update thread, finalize the check run, then write the step
+        // summary once — all synchronously, so they complete before the plugin
+        // acks the host (which is the host's drain barrier before process exit).
         self.inner.stop.store(true, Ordering::Release);
+        if let Some(c) = &self.inner.checks {
+            let (title, summary) = self.inner.render();
+            c.sync(title, summary, true, self.inner.ok());
+        }
         self.inner.write_summary();
     }
 }
@@ -384,8 +566,10 @@ mod tests {
     fn markdown_reports_counts_slow_and_failures() {
         let t = scripted();
         // now far enough past //a:z's start to mark it slow.
-        let md = t.render_markdown(SLOW_THRESHOLD_MS + 5_000);
+        let md = t.render_markdown(SLOW_THRESHOLD_MS + 5_000, "heph: test");
 
+        // The H2 is the heph command.
+        assert!(md.contains("## heph: test"), "command heading: {md}");
         // 2 of 3 matched finished (x, y); w finished but isn't in the matched set.
         assert!(md.contains("2 / 3"), "progress: {md}");
         assert!(md.contains("**built:** 1"), "built: {md}");
@@ -412,7 +596,7 @@ mod tests {
                 addr: "//a:p".into(),
             },
         ));
-        let md = t.render_markdown(SLOW_THRESHOLD_MS + 1);
+        let md = t.render_markdown(SLOW_THRESHOLD_MS + 1, "heph: test");
         assert!(md.contains("//a:p"), "slow target listed: {md}");
         assert!(md.contains("cache pull"), "phase labelled: {md}");
         assert!(md.contains("| phase |"), "phase column header: {md}");
@@ -426,7 +610,7 @@ mod tests {
             },
         ));
         assert!(
-            !t.render_markdown(SLOW_THRESHOLD_MS + 1)
+            !t.render_markdown(SLOW_THRESHOLD_MS + 1, "heph: test")
                 .contains("### Slow"),
             "cleared on phase end"
         );
@@ -446,7 +630,7 @@ mod tests {
                 },
             ));
         }
-        let md = t.render_markdown(1_000_000);
+        let md = t.render_markdown(1_000_000, "heph: test");
         let rows = md.matches("| `//a:t").count();
         assert_eq!(rows, MAX_SLOW_ROWS, "slow rows capped: {rows}");
         assert!(md.contains("…and 5 more"), "overflow line: {md}");
@@ -462,7 +646,10 @@ mod tests {
                 complete: false,
             },
         ));
-        assert!(t.render_markdown(0).contains("~1"), "provisional total");
+        assert!(
+            t.render_markdown(0, "heph: test").contains("~1"),
+            "provisional total"
+        );
     }
 
     #[test]
