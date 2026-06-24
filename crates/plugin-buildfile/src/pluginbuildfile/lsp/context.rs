@@ -231,6 +231,11 @@ impl LspContext for HephLspContext {
             }
         };
 
+        // Static validation of `target` / `provider_state` keyword arguments
+        // against the engine's schemas (unknown key / wrong type → red squiggle).
+        // Runs off the parsed AST, so it works mid-edit without a full eval.
+        let diagnostics = super::diagnostics::validate(&ast, &*self.shared.engine);
+
         // Best-effort evaluation to populate the provenance / driver index. A
         // half-typed buffer that fails to evaluate simply yields no provenance —
         // but we keep the source for prefix-based completion/hover. We do not
@@ -246,7 +251,7 @@ impl LspContext for HephLspContext {
         }
 
         LspEvalResult {
-            diagnostics: vec![],
+            diagnostics,
             ast: Some(ast),
         }
     }
