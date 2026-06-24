@@ -1804,4 +1804,59 @@ mod tests {
         assert!(schema.fields[0].required);
         assert!(schema.fields[0].doc.contains("Command arguments"));
     }
+
+    // The remote managed-driver proxy must report no native shell, so the host's
+    // ManagedDriverBridge dispatches `--shell` to its pluginexec fallback rather
+    // than forwarding run_shell across the ABI (which would hit the driver's
+    // default run_shell and bail). Regression: this used to hardcode `true`, so
+    // `--shell` on any external managed driver (e.g. go_compile) failed.
+    #[test]
+    fn remote_managed_driver_reports_no_native_shell() {
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+        use hplugin_stabby::load_stable::StableRemoteManagedDriver;
+
+        struct BareDriver;
+        #[async_trait::async_trait]
+        impl ManagedDriver for BareDriver {
+            fn config(
+                &self,
+                _req: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                Ok(hplugin::driver::ConfigResponse {
+                    name: "bare".into(),
+                })
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                hplugin::driver::DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _req: hplugin::driver::ParseRequest,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn apply_transitive(
+                &self,
+                _req: hplugin::driver::ApplyTransitiveRequest,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _req: ManagedRunRequest<'a, 'io>,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                anyhow::bail!("unused")
+            }
+        }
+
+        let dynd = make_dyn_managed_driver(Arc::new(BareDriver) as Arc<dyn ManagedDriver>);
+        let host = StableRemoteManagedDriver::new(dynd, "bare");
+        assert!(
+            !host.supports_shell(),
+            "remote proxy must defer --shell to the host pluginexec fallback"
+        );
+    }
 }
