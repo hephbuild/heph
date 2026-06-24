@@ -277,9 +277,18 @@ impl ChecksClient {
     /// absent. The head sha is resolved by [`resolve_head_sha`] so a check on a PR
     /// lands on the PR head commit, not the merge commit — no workflow override
     /// needed. `head_sha_override` (the `headSha` option) still wins if set.
-    fn from_env(head_sha_override: Option<String>) -> Option<Self> {
+    ///
+    /// `token_env` names the env var the API token is read from (default
+    /// `GITHUB_TOKEN`). Point it at a **GitHub App** installation token (or a PAT)
+    /// to give the check run its own check suite — with the default `GITHUB_TOKEN`,
+    /// GitHub nests the API-created run under another workflow's github-actions
+    /// check suite (e.g. a labeler), which the check-runs API can't override.
+    fn from_env(head_sha_override: Option<String>, token_env: Option<String>) -> Option<Self> {
         let nonempty = |v: String| Some(v).filter(|s| !s.is_empty());
-        let token = std::env::var("GITHUB_TOKEN").ok().and_then(nonempty)?;
+        let token_var = token_env
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "GITHUB_TOKEN".to_string());
+        let token = std::env::var(&token_var).ok().and_then(nonempty)?;
         let repo = std::env::var("GITHUB_REPOSITORY").ok().and_then(nonempty)?;
         let head_sha = head_sha_override
             .and_then(nonempty)
@@ -436,10 +445,17 @@ impl GhaHook {
     /// `refreshSecs` (live check-run PATCH interval, default 30), `summaryPath`
     /// (final step-summary file, default `$GITHUB_STEP_SUMMARY`), `headSha` (check
     /// run head sha; default is auto-resolved by [`resolve_head_sha`] — the PR head
-    /// on a `pull_request` event, else `$GITHUB_SHA`). Spawns the live-update thread
-    /// when a check run can be created.
+    /// on a `pull_request` event, else `$GITHUB_SHA`), `tokenEnv` (name of the env
+    /// var holding the API token, default `GITHUB_TOKEN`; point at a GitHub App /
+    /// PAT token so the check gets its own check suite instead of nesting under
+    /// another workflow's). Spawns the live-update thread when a check run can be
+    /// created.
     pub fn from_options(opts: &Options) -> anyhow::Result<Self> {
-        deny_unknown("gha hook", opts, &["refreshSecs", "summaryPath", "headSha"])?;
+        deny_unknown(
+            "gha hook",
+            opts,
+            &["refreshSecs", "summaryPath", "headSha", "tokenEnv"],
+        )?;
         tracing::info!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
             .unwrap_or(30)
@@ -454,7 +470,8 @@ impl GhaHook {
             );
         }
         let head_sha = decode_opt::<String>(opts, "gha hook", "headSha")?;
-        let checks = ChecksClient::from_env(head_sha);
+        let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
+        let checks = ChecksClient::from_env(head_sha, token_env);
         if checks.is_none() {
             tracing::info!(
                 "gha hook: GITHUB_TOKEN/GITHUB_REPOSITORY/GITHUB_SHA not all set; \
