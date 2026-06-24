@@ -8,7 +8,7 @@ use futures::TryStreamExt;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::engine::error::TargetNotFoundError;
+use crate::engine::error::{MultiError, TargetNotFoundError};
 use crate::engine::{Engine, get_cwp, get_root, gitignore};
 use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::Addr;
@@ -99,7 +99,9 @@ impl App for ValidateApp {
                         Ok::<(), anyhow::Error>(())
                     })
                 });
-                crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
+                // Always aggregate: validate reports every broken target, not
+                // just the first one to fail.
+                crate::engine::fanout::join_all_failable(futs, false).await?;
                 Ok::<(), anyhow::Error>(())
             });
 
@@ -131,26 +133,39 @@ impl App for ValidateApp {
                 Ok(want != existing) // true = stale
             });
 
-            let ((), overlaps, stale) = tokio::try_join!(link_fut, overlap_fut, gitignore_fut)?;
+            // `join!` (not `try_join!`) so a failing check never short-circuits
+            // the others — every check runs to completion and `finish` reports
+            // all of their failures at once.
+            let (link_res, overlap_res, gitignore_res) =
+                tokio::join!(link_fut, overlap_fut, gitignore_fut);
 
-            let mut problems: Vec<String> = Vec::new();
-            for o in &overlaps {
-                problems.push(format!(
-                    "codegen=copy outputs overlap: `{}` ({}) and `{}` ({})",
-                    o.a.path,
-                    o.a.addr.format(),
-                    o.b.path,
-                    o.b.addr.format()
-                ));
-            }
-            if stale {
-                problems.push(
-                    "`.gitignore` is out of date — run `heph tool gen-gitignore`".to_string(),
-                );
-            }
-            if !problems.is_empty() {
-                anyhow::bail!("validation failed:\n  {}", problems.join("\n  "));
-            }
+            let overlap_res = overlap_res.map(|overlaps| {
+                overlaps
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "codegen=copy outputs overlap: `{}` ({}) and `{}` ({})",
+                            o.a.path,
+                            o.a.addr.format(),
+                            o.b.path,
+                            o.b.addr.format()
+                        )
+                    })
+                    .collect::<Vec<String>>()
+            });
+            let gitignore_res = gitignore_res.map(|stale| {
+                if stale {
+                    vec!["`.gitignore` is out of date — run `heph tool gen-gitignore`".to_string()]
+                } else {
+                    Vec::new()
+                }
+            });
+
+            finish(vec![
+                link_res.map(|()| Vec::new()),
+                overlap_res,
+                gitignore_res,
+            ])?;
 
             // Success prints nothing; only the scoped-skip warning is emitted.
             if scoped {
@@ -163,6 +178,30 @@ impl App for ValidateApp {
 
         crate::commands::errors::finalize!(ctx, rs, res)
     }
+}
+
+/// Fold the outcome of every validate check into a single result. Each check
+/// contributes either a list of human-readable problem strings (`Ok`) or a hard
+/// error (`Err`); a check's `Err` that is itself a [`MultiError`] is flattened
+/// so its inner errors surface individually. The point is exhaustiveness: nothing
+/// short-circuits, so the user sees *all* the problems, not just the first.
+fn finish(checks: Vec<anyhow::Result<Vec<String>>>) -> anyhow::Result<()> {
+    let mut errs: Vec<anyhow::Error> = Vec::new();
+    for check in checks {
+        match check {
+            Ok(problems) => errs.extend(problems.into_iter().map(|p| anyhow::anyhow!(p))),
+            Err(e) => match e.downcast::<MultiError>() {
+                Ok(MultiError(inner)) => errs.extend(inner),
+                Err(e) => errs.push(e),
+            },
+        }
+    }
+    let combined = match errs.len() {
+        0 => return Ok(()),
+        1 => errs.pop().expect("len == 1"),
+        _ => MultiError(errs).into(),
+    };
+    Err(combined).context("validation failed")
 }
 
 pub fn execute(args: &ValidateArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
@@ -189,4 +228,77 @@ async fn execute_async(
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish;
+    use crate::engine::error::MultiError;
+
+    #[test]
+    fn all_checks_ok_is_ok() {
+        assert!(finish(vec![Ok(vec![]), Ok(vec![]), Ok(vec![])]).is_ok());
+    }
+
+    #[test]
+    fn reports_every_problem_not_just_the_first() {
+        // A link failure, an overlap, and a stale gitignore — all three must
+        // appear in the rendered error, proving nothing short-circuited.
+        let err = finish(vec![
+            Err(anyhow::anyhow!("link broke for //pkg:a")),
+            Ok(vec!["codegen overlap on `gen.rs`".to_string()]),
+            Ok(vec![".gitignore is out of date".to_string()]),
+        ])
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("link broke for //pkg:a"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("codegen overlap on `gen.rs`"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains(".gitignore is out of date"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn flattens_nested_multierror_from_a_check() {
+        // The link fanout returns a MultiError when several targets fail; its
+        // inner errors must be hoisted into the top-level list, not nested.
+        let link_err = MultiError(vec![
+            anyhow::anyhow!("target a failed"),
+            anyhow::anyhow!("target b failed"),
+        ]);
+        let err = finish(vec![
+            Err(link_err.into()),
+            Ok(vec!["overlap c".to_string()]),
+            Ok(vec![]),
+        ])
+        .unwrap_err();
+        let multi = err
+            .downcast_ref::<MultiError>()
+            .expect("expected a flattened MultiError");
+        assert_eq!(multi.0.len(), 3, "two link errors + one overlap");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("target a failed"), "got: {rendered}");
+        assert!(rendered.contains("target b failed"), "got: {rendered}");
+        assert!(rendered.contains("overlap c"), "got: {rendered}");
+    }
+
+    #[test]
+    fn single_problem_is_returned_unwrapped() {
+        // One problem stays a plain error (no "N errors:" envelope).
+        let err = finish(vec![
+            Ok(vec!["lonely overlap".to_string()]),
+            Ok(vec![]),
+            Ok(vec![]),
+        ])
+        .unwrap_err();
+        assert!(err.downcast_ref::<MultiError>().is_none());
+        assert!(format!("{err:#}").contains("lonely overlap"));
+    }
 }
