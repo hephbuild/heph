@@ -269,11 +269,29 @@ pub enum FuseMode {
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
 /// default to off; FUSE is opt-in.
+///
+/// `backend` (macOS only) selects the userspace FUSE backend: `kext` (the
+/// classic kernel-extension path — fastest, but the macFUSE system extension
+/// must be approved) or `fskit` (Apple's FSKit, macOS 15.4+ — unprivileged,
+/// no kext, mounts under `/Volumes`). Omit to let the engine pick the backend
+/// that is actually usable on the host. Ignored on Linux.
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FuseConfig {
     #[serde(default)]
     pub enabled: Option<FuseEnabled>,
+    #[serde(default)]
+    pub backend: Option<FuseBackend>,
+}
+
+/// macOS FUSE backend selector. See [`FuseConfig`].
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FuseBackend {
+    /// Classic kernel-extension backend (macFUSE kext).
+    Kext,
+    /// Apple FSKit backend — unprivileged, macOS 15.4+.
+    Fskit,
 }
 
 /// Tri-state config value. Parses YAML `true`, `false`, or `"auto"`.
@@ -329,6 +347,28 @@ impl FuseConfig {
     /// Convenience: is FUSE forced on by config?
     pub fn is_on(&self) -> bool {
         matches!(self.mode(), FuseMode::On)
+    }
+
+    /// Build a config forced on (tests / programmatic callers).
+    pub fn on() -> Self {
+        Self {
+            enabled: Some(FuseEnabled::On),
+            backend: None,
+        }
+    }
+
+    /// Build a config in `auto` mode (tests / programmatic callers).
+    pub fn auto() -> Self {
+        Self {
+            enabled: Some(FuseEnabled::Auto),
+            backend: None,
+        }
+    }
+
+    /// Force a specific macOS backend, keeping the current mode.
+    pub fn with_backend(mut self, backend: FuseBackend) -> Self {
+        self.backend = Some(backend);
+        self
     }
 }
 
@@ -812,6 +852,48 @@ caches:
         let f = FuseConfig::default();
         assert_eq!(f.mode(), FuseMode::Off);
         assert!(f.is_off());
+        assert_eq!(f.backend, None);
+    }
+
+    #[test]
+    fn fuse_config_backend_kext() {
+        let yaml = "fuse:\n  enabled: true\n  backend: kext\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.backend, Some(FuseBackend::Kext));
+        assert_eq!(f.mode(), FuseMode::On);
+    }
+
+    #[test]
+    fn fuse_config_backend_fskit() {
+        let yaml = "fuse:\n  enabled: true\n  backend: fskit\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.backend, Some(FuseBackend::Fskit));
+    }
+
+    #[test]
+    fn fuse_config_backend_defaults_none_when_omitted() {
+        let yaml = "fuse:\n  enabled: true\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.backend, None);
+    }
+
+    #[test]
+    fn fuse_config_backend_rejects_unknown() {
+        let yaml = "fuse:\n  enabled: true\n  backend: bogus\n";
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn fuse_config_helpers_set_mode_and_backend() {
+        assert_eq!(FuseConfig::on().mode(), FuseMode::On);
+        assert_eq!(FuseConfig::auto().mode(), FuseMode::Auto);
+        let f = FuseConfig::on().with_backend(FuseBackend::Fskit);
+        assert_eq!(f.backend, Some(FuseBackend::Fskit));
+        assert_eq!(f.mode(), FuseMode::On);
     }
 
     #[test]

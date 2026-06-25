@@ -17,7 +17,7 @@ pub use config::MemCacheOptions;
 // `crate::engine::config_yaml::…`, `engine::get_root`, `engine::get_cwd` resolve
 // unchanged across the monolith.
 pub use hconfig as config_yaml;
-pub use hconfig::{FuseConfig, FuseMode, get_cwd, get_root};
+pub use hconfig::{FuseBackend, FuseConfig, FuseMode, get_cwd, get_root};
 mod plugin_load;
 pub use plugin_load::clear_plugin_cache;
 mod cwd;

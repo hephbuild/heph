@@ -1449,6 +1449,55 @@ unsafe impl Send for Mount {}
 #[cfg(target_os = "linux")]
 unsafe impl Sync for Mount {}
 
+/// Populate the fuser `Config` for a mount, branching on platform + backend.
+///
+/// Linux: multi-threaded kernel-FUSE session with `AutoUnmount` (fusermount
+/// tears the mount down if we die) and `RootAndOwner` ACL (owner + root only;
+/// needs `user_allow_other` in `/etc/fuse.conf` for unprivileged mounts).
+/// `clone_fd` + `n_threads` parallelize op handling (Linux-only ioctl).
+///
+/// macOS kernel (kext) backend: same `AutoUnmount` + `RootAndOwner` safety net,
+/// but single-threaded — fuser hard-errors `n_threads != 1` and `clone_fd`
+/// uses a Linux-only ioctl.
+///
+/// macOS FSKit backend: pass `-o backend=fskit` so macFUSE mounts over its
+/// FSKit XPC service (no kernel extension). FSKit does not implement the
+/// kernel `auto_unmount` supervision or the `allow_root`/`allow_other` ACL
+/// knobs, so we omit `AutoUnmount` and keep the default `Owner` ACL; the
+/// system reclaims the volume when our process exits.
+fn configure_mount(config: &mut Config, backend: crate::MountBackend) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = backend; // Linux always uses the kernel driver.
+        config.acl = SessionACL::RootAndOwner;
+        config.mount_options.push(fuser::MountOption::AutoUnmount);
+        config.n_threads = Some(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        );
+        config.clone_fd = true;
+    }
+    #[cfg(target_os = "macos")]
+    match backend {
+        crate::MountBackend::Kernel => {
+            config.acl = SessionACL::RootAndOwner;
+            config.mount_options.push(fuser::MountOption::AutoUnmount);
+        }
+        crate::MountBackend::Fskit => {
+            config
+                .mount_options
+                .push(fuser::MountOption::CUSTOM("backend=fskit".to_string()));
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = backend;
+        config.acl = SessionACL::RootAndOwner;
+        config.mount_options.push(fuser::MountOption::AutoUnmount);
+    }
+}
+
 #[expect(
     clippy::self_named_constructors,
     reason = "verb matches the operation: mounting yields a Mount handle"
@@ -1457,43 +1506,16 @@ impl Mount {
     /// Mount the given `LayeredFs` (shared via Arc so the caller keeps a
     /// handle for slot registration while the session thread owns its
     /// own ref). The mount unmounts when this `Mount` is dropped.
-    pub fn mount(mountpoint: &Path, fs: std::sync::Arc<LayeredFs>) -> anyhow::Result<Self> {
-        // AutoUnmount = kernel safety net: kext tears the mount down
-        // when our process dies (crash, kill -9, panic). fuser 0.17
-        // moved the allow_root/allow_other selector to Config.acl;
-        // RootAndOwner is the narrower choice for sandbox use (only
-        // root + mount owner, no other users).
-        //
-        // Linux note: this path still requires `user_allow_other` in
-        // /etc/fuse.conf when running as non-root.
-        // AutoUnmount = kernel safety net: kext/fusermount tears the
-        // mount down if our process dies (SIGKILL, panic without
-        // unwind, OOM). Required: a crash without AutoUnmount strands
-        // the mount until manual `umount` or next startup sweep, and
-        // child sandbox processes inherit a broken view.
-        //
-        // AutoUnmount needs acl != Owner — fuser hard-errors otherwise
-        // because fusermount-side supervision is keyed on allow_other
-        // /allow_root. We pick RootAndOwner (allow_root): owner + root
-        // only, no other UIDs. On Linux this also needs
-        // `user_allow_other` in /etc/fuse.conf for unprivileged mounts.
-        //
-        // Multi-threaded session (Linux only): each FUSE op served on a
-        // worker, so a slow read in one layer doesn't block other ops.
-        // fuser hard-errors `n_threads != 1` on macOS, and `clone_fd`
-        // uses Linux-specific `FUSE_DEV_IOC_CLONE`.
+    ///
+    /// `backend` selects the macOS userspace backend (see [`MountBackend`]);
+    /// it is ignored on Linux, which always uses the kernel FUSE driver.
+    pub fn mount(
+        mountpoint: &Path,
+        fs: std::sync::Arc<LayeredFs>,
+        backend: crate::MountBackend,
+    ) -> anyhow::Result<Self> {
         let mut config = Config::default();
-        config.acl = SessionACL::RootAndOwner;
-        config.mount_options.push(fuser::MountOption::AutoUnmount);
-        #[cfg(target_os = "linux")]
-        {
-            config.n_threads = Some(
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1),
-            );
-            config.clone_fd = true;
-        }
+        configure_mount(&mut config, backend);
         let fs_clone = fs.clone();
         let session = fuser::spawn_mount2(MountFs(fs), mountpoint, &config)
             .with_context(|| format!("mount FUSE at {:?}", mountpoint))?;

@@ -1,4 +1,6 @@
 use crate::engine::config::Config;
+#[cfg(target_os = "macos")]
+use crate::engine::config_yaml::FuseBackend;
 use crate::engine::config_yaml::{FuseConfig, Options};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
@@ -129,19 +131,90 @@ pub struct EngineMount {
     pub(crate) fs: Arc<sandboxfuse::LayeredFs>,
 }
 
+/// Ordered list of mount backends to try, resolved from config + platform.
+///
+/// On macOS the user may pin `fuse: { backend: kext | fskit }`; when unset the
+/// engine auto-picks — it tries the kernel-extension backend first (fastest)
+/// and falls back to FSKit (unprivileged, macOS 15.4+) if the kext mount can't
+/// be brought up (e.g. the system extension isn't approved). Linux always uses
+/// the single kernel backend.
+fn backend_candidates(cfg: &FuseConfig) -> Vec<sandboxfuse::MountBackend> {
+    #[cfg(target_os = "macos")]
+    {
+        match cfg.backend {
+            Some(FuseBackend::Kext) => vec![sandboxfuse::MountBackend::Kernel],
+            Some(FuseBackend::Fskit) => vec![sandboxfuse::MountBackend::Fskit],
+            None => vec![
+                sandboxfuse::MountBackend::Kernel,
+                sandboxfuse::MountBackend::Fskit,
+            ],
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cfg;
+        vec![sandboxfuse::MountBackend::Kernel]
+    }
+}
+
+/// Mountpoint for a backend. The kernel/kext mount lives at `<root>/lower`,
+/// alongside the upper dir. FSKit mounts only under `/Volumes`, and the volume
+/// there is created by macFUSE's privileged mount service (the dir is not
+/// user-creatable), so its mountpoint sits outside `<home>`.
+fn backend_mountpoint(backend: sandboxfuse::MountBackend, root: &Path, pid: u32) -> PathBuf {
+    match backend {
+        sandboxfuse::MountBackend::Fskit => PathBuf::from(format!("/Volumes/heph-sandbox-{pid}")),
+        sandboxfuse::MountBackend::Kernel => root.join("lower"),
+    }
+}
+
+/// Actionable hint appended to a mount failure, tailored to the backend so
+/// the user knows which one-time approval is missing.
+fn mount_failure_hint(backend: sandboxfuse::MountBackend) -> &'static str {
+    match backend {
+        #[cfg(target_os = "macos")]
+        sandboxfuse::MountBackend::Kernel => {
+            "FUSE (kext) mount failed. Install macFUSE and approve its system \
+             extension in System Settings > Privacy & Security (a reboot may be \
+             required), or set `fuse: { backend: fskit }` to use the \
+             unprivileged FSKit backend"
+        }
+        #[cfg(target_os = "macos")]
+        sandboxfuse::MountBackend::Fskit => {
+            "FUSE (FSKit) mount failed. Requires macOS 15.4+ with macFUSE's \
+             FSKit file-system extension enabled in System Settings > General > \
+             Login Items & Extensions > File System Extensions; the mountpoint \
+             must be under /Volumes"
+        }
+        #[cfg(not(target_os = "macos"))]
+        sandboxfuse::MountBackend::Kernel => {
+            "FUSE mount failed. Ensure /dev/fuse is accessible and, for \
+             unprivileged use, that `user_allow_other` is set in /etc/fuse.conf"
+        }
+        #[cfg(not(target_os = "macos"))]
+        sandboxfuse::MountBackend::Fskit => "FUSE mount failed",
+    }
+}
+
 impl EngineFuse {
     /// Construct + (when not disabled) mount eagerly. Errors only when
     /// `cfg.enabled == Some(true)` and the mount cannot be brought up.
     pub fn new(cfg: FuseConfig, home: &Path) -> anyhow::Result<Self> {
         let pid = std::process::id();
         let root = home.join(format!("sandboxfuse{pid}"));
-        let lower = root.join("lower");
         let upper = root.join("upper");
+        let candidates = backend_candidates(&cfg);
+        // Default `lower` (used when mounting is skipped) is the first
+        // candidate's mountpoint; a successful mount overwrites it below.
+        let default_lower = candidates
+            .first()
+            .map(|b| backend_mountpoint(*b, &root, pid))
+            .unwrap_or_else(|| root.join("lower"));
 
         if cfg.is_off() {
             return Ok(Self {
                 root,
-                lower,
+                lower: default_lower,
                 upper,
                 mount: None,
             });
@@ -154,43 +227,65 @@ impl EngineFuse {
             }
             return Ok(Self {
                 root,
-                lower,
+                lower: default_lower,
                 upper,
                 mount: None,
             });
         }
 
-        std::fs::create_dir_all(&lower)
-            .with_context(|| format!("create FUSE lower dir {:?}", lower))?;
         std::fs::create_dir_all(&upper)
             .with_context(|| format!("create FUSE upper dir {:?}", upper))?;
+
+        // Try each candidate backend in order. The first that mounts wins; on
+        // macOS with no explicit `backend`, this means "kext, else FSKit".
         let fs = Arc::new(sandboxfuse::LayeredFs::new_empty(upper.clone()));
-        match sandboxfuse::Mount::mount(&lower, fs.clone()) {
-            Ok(m) => {
-                // Tell the supervisor about this mount so a crashed
-                // parent doesn't leak the FUSE mount into the next run.
-                // The supervisor will `umount -f <root>/lower` on EOF.
-                hproc::process_supervisor::register_fuse_root(root.clone());
-                Ok(Self {
-                    root,
-                    lower,
-                    upper,
-                    mount: Some(EngineMount { _mount: m, fs }),
-                })
+        let mut last_err: Option<anyhow::Error> = None;
+        for (i, backend) in candidates.iter().copied().enumerate() {
+            let lower = backend_mountpoint(backend, &root, pid);
+            // Pre-create the kernel/kext mountpoint. FSKit's `/Volumes`
+            // mountpoint is created by macFUSE itself and isn't writable by us.
+            if matches!(backend, sandboxfuse::MountBackend::Kernel)
+                && let Err(e) = std::fs::create_dir_all(&lower)
+            {
+                last_err =
+                    Some(anyhow::Error::new(e).context(format!("create FUSE lower dir {lower:?}")));
+                continue;
             }
-            Err(e) => {
-                if cfg.is_on() {
-                    return Err(e).context("FUSE forced on but mount failed");
+            match sandboxfuse::Mount::mount(&lower, fs.clone(), backend) {
+                Ok(m) => {
+                    // Tell the supervisor about this mountpoint so a crashed
+                    // parent doesn't leak the FUSE mount into the next run.
+                    // The supervisor will `umount -f <mountpoint>` on EOF.
+                    hproc::process_supervisor::register_fuse_root(lower.clone());
+                    return Ok(Self {
+                        root,
+                        lower,
+                        upper,
+                        mount: Some(EngineMount { _mount: m, fs }),
+                    });
                 }
-                warn!(error = ?e, "FUSE mount failed; falling back to unpack-copy");
-                Ok(Self {
-                    root,
-                    lower,
-                    upper,
-                    mount: None,
-                })
+                Err(e) => {
+                    let more = candidates.len() - 1 - i;
+                    if more > 0 {
+                        warn!(error = ?e, hint = mount_failure_hint(backend), "FUSE mount failed; trying next backend");
+                    }
+                    last_err = Some(e.context(mount_failure_hint(backend)));
+                }
             }
         }
+
+        // No candidate mounted.
+        let err = last_err.unwrap_or_else(|| anyhow::anyhow!("no FUSE backend available"));
+        if cfg.is_on() {
+            return Err(err);
+        }
+        warn!(error = ?err, "FUSE mount failed; falling back to unpack-copy");
+        Ok(Self {
+            root,
+            lower: default_lower,
+            upper,
+            mount: None,
+        })
     }
 
     /// Returns the shared `LayeredFs` when FUSE was successfully mounted.
@@ -285,6 +380,37 @@ fn sweep_stale_sandboxfuse_dirs(home: &Path) {
         // force is required to make sweep idempotent + bounded.
         force_umount(&lower);
         drop(crate::engine::sandbox_cleaner::remove_dir_all(&dir));
+    }
+    #[cfg(target_os = "macos")]
+    sweep_stale_fskit_volumes();
+}
+
+/// Force-umount stale FSKit mounts left under `/Volumes` by crashed runs.
+///
+/// The kext mount lives under `<home>` and is swept by
+/// [`sweep_stale_sandboxfuse_dirs`]; FSKit mounts instead sit at
+/// `/Volumes/heph-sandbox-<pid>` (the volume is created by macFUSE outside our
+/// home dir). Scan `/Volumes` for those whose pid is dead and unmount them.
+#[cfg(target_os = "macos")]
+fn sweep_stale_fskit_volumes() {
+    let Ok(entries) = std::fs::read_dir("/Volumes") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid_str) = name.strip_prefix("heph-sandbox-") else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<libc::pid_t>() else {
+            continue;
+        };
+        // SAFETY: kill(pid, 0) is a probe-only syscall; sig=0 doesn't deliver.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            continue;
+        }
+        force_umount(&entry.path());
     }
 }
 

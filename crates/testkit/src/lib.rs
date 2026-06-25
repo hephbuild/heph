@@ -16,6 +16,7 @@ pub struct WorkspaceBuilder {
     dir: TempDir,
     parallelism: Option<usize>,
     fs_skip: Vec<String>,
+    fuse: heph::engine::FuseConfig,
     setups: Vec<SetupFn>,
 }
 
@@ -25,6 +26,7 @@ impl WorkspaceBuilder {
             dir: tempfile::tempdir().context("create workspace tempdir")?,
             parallelism: None,
             fs_skip: vec![],
+            fuse: heph::engine::FuseConfig::default(),
             setups: vec![],
         })
     }
@@ -34,12 +36,22 @@ impl WorkspaceBuilder {
             dir,
             parallelism: None,
             fs_skip: vec![],
+            fuse: heph::engine::FuseConfig::default(),
             setups: vec![],
         }
     }
 
     pub fn with_parallelism(mut self, p: usize) -> Self {
         self.parallelism = Some(p);
+        self
+    }
+
+    /// Enable the FUSE sandbox overlay for this workspace. Mirrors the
+    /// config file's `fuse:` block. Tests that pass `FuseConfig::on()` should
+    /// gate on host FUSE support (see `hsandboxfuse::support_check`) and skip
+    /// when unavailable, since a forced-on mount errors on hosts without it.
+    pub fn with_fuse(mut self, fuse: heph::engine::FuseConfig) -> Self {
+        self.fuse = fuse;
         self
     }
 
@@ -79,6 +91,7 @@ impl WorkspaceBuilder {
             home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
             fs_skip: self.fs_skip,
+            fuse: self.fuse,
             ..Default::default()
         })?;
         for setup in self.setups {
@@ -216,6 +229,42 @@ pub fn artifact_paths(result: &EResult) -> Vec<PathBuf> {
 
 pub fn root(ws: &Workspace) -> &Path {
     ws.dir.path()
+}
+
+/// Ground-truth probe: does a real FUSE mount succeed on this host right now?
+///
+/// Mounts an empty overlay at a throwaway temp dir and immediately unmounts.
+/// Unlike `hsandboxfuse::support_check` (which only sniffs for installed
+/// userland and can be optimistic on macOS), this exercises the actual mount
+/// path, so a forced-on FUSE test can reliably skip when FUSE is installed but
+/// not usable (e.g. macFUSE present but its system extension not approved, or
+/// `/dev/fuse` not accessible in a container).
+///
+/// The `support_check` gate is load-bearing on macOS, not just an optimization:
+/// libfuse is weak-linked there (see sandboxfuse `build.rs`), so its symbols
+/// bind to null when macFUSE is absent. `Mount::mount` must only be reached
+/// once `support_check` confirms macFUSE is present — calling it otherwise
+/// dereferences a null symbol and SIGSEGVs instead of returning an `Err`.
+pub fn fuse_mount_works() -> bool {
+    if !hsandboxfuse::support_check().is_available() {
+        return false;
+    }
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let lower = dir.path().join("lower");
+    let upper = dir.path().join("upper");
+    if std::fs::create_dir_all(&lower).is_err() || std::fs::create_dir_all(&upper).is_err() {
+        return false;
+    }
+    let fs = Arc::new(hsandboxfuse::LayeredFs::new_empty(upper));
+    match hsandboxfuse::Mount::mount(&lower, fs, hsandboxfuse::MountBackend::default()) {
+        Ok(m) => {
+            drop(m);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn copy_dir_to_tempdir(src: &Path) -> anyhow::Result<TempDir> {

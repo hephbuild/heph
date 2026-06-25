@@ -46,12 +46,14 @@ impl ProcessTracker {
         self.send(Msg::Untrack(pgid))
     }
 
-    /// Register a sandboxfuse root with the supervisor. On parent EOF the
-    /// supervisor will `umount -f <root>/lower` so a crash doesn't leave
-    /// the FUSE kext wedged. One-shot: registrations accumulate; there
-    /// is no unregister verb (the dir is per-pid and reaped on exit).
-    pub fn register_fuse_root(&self, root: std::path::PathBuf) -> anyhow::Result<()> {
-        self.send(Msg::FuseRoot(root))
+    /// Register a sandboxfuse mountpoint with the supervisor. On parent EOF
+    /// the supervisor will `umount -f <mountpoint>` so a crash doesn't leave
+    /// the FUSE mount wedged. The kernel/kext mountpoint is `<root>/lower`;
+    /// the FSKit mountpoint lives under `/Volumes`. One-shot: registrations
+    /// accumulate; there is no unregister verb (the dir is per-pid and reaped
+    /// on exit).
+    pub fn register_fuse_root(&self, mountpoint: std::path::PathBuf) -> anyhow::Result<()> {
+        self.send(Msg::FuseRoot(mountpoint))
     }
 
     fn send(&self, msg: Msg) -> anyhow::Result<()> {
