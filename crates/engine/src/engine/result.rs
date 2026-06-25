@@ -280,15 +280,137 @@ impl ResultArtifact {
     }
 
     /// Wrap a zero-copy passthrough output that skipped the local cache. The
-    /// `OutputArtifact` itself is the `Content`: for a `Content::File` it walks
-    /// to the single source file at its `out_path`, reading the durable source
-    /// path directly (no tar, no cache blob).
+    /// content reads the durable source file directly (no tar, no cache blob),
+    /// and — because the file was never snapshotted into the cache — re-hashes
+    /// it on consume and fails if it diverges from the hash recorded at
+    /// input-hashing time. See [`PassthroughContent`].
+    ///
+    /// `is_passthrough` only ever flags a `Content::File`; any other variant
+    /// reaching here is a producer bug, so it falls back to carrying the raw
+    /// artifact rather than panicking.
     fn passthrough(a: outputartifact::OutputArtifact) -> Self {
+        let group = a.group.clone();
+        let r#type = manifest_artifact_type(&a.r#type);
+        let content: Arc<dyn Content> = match a.content {
+            outputartifact::Content::File(f) => Arc::new(PassthroughContent {
+                source_path: f.source_path,
+                out_path: f.out_path,
+                x: f.x,
+                expected: a.hashout,
+            }),
+            other => Arc::new(outputartifact::OutputArtifact {
+                content: other,
+                ..a
+            }),
+        };
         Self {
-            group: a.group.clone(),
-            r#type: manifest_artifact_type(&a.r#type),
-            content: Arc::new(a),
+            group,
+            r#type,
+            content,
         }
+    }
+}
+
+/// [`Content`] for a passthrough source-file artifact (e.g. `@heph/fs:file`):
+/// referenced by path and read live on consume, never copied into the cache.
+///
+/// Because nothing snapshots the bytes, the workspace file could be modified
+/// between when it was hashed (the value folded into the target's `hashin` cache
+/// key) and when a consumer reads it here. The live bytes would then silently
+/// diverge from the cache key, poisoning every downstream entry. To turn that
+/// silent corruption into a hard, explicit failure, the bytes are re-hashed as
+/// they stream through — no extra I/O, the consumer is reading them anyway — and
+/// the digest is checked against the recorded `hashout` at EOF.
+///
+/// `seekable_reader`/`file_path` stay `None` (Content defaults): the FUSE
+/// tar-index path is bypassed and every consumer materializes via `walk()`, so
+/// the verifying reader is always on the materialization path.
+struct PassthroughContent {
+    source_path: String,
+    out_path: String,
+    x: bool,
+    /// Content hash recorded when the target was hashed; the just-read bytes
+    /// must still hash to this.
+    expected: String,
+}
+
+impl PassthroughContent {
+    fn verifying_reader(&self) -> anyhow::Result<VerifyingReader> {
+        let file = std::fs::File::open(&self.source_path)
+            .with_context(|| format!("open passthrough source '{}'", self.source_path))?;
+        Ok(VerifyingReader {
+            inner: Box::new(file),
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+            x: self.x,
+            expected: self.expected.clone(),
+            source_path: self.source_path.clone(),
+            verified: false,
+        })
+    }
+}
+
+impl Content for PassthroughContent {
+    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+        Ok(Box::new(self.verifying_reader()?))
+    }
+
+    fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+        let data: Box<dyn std::io::Read> = Box::new(self.verifying_reader()?);
+        Ok(Box::new(std::iter::once(Ok(WalkEntry {
+            path: std::path::PathBuf::from(&self.out_path),
+            kind: WalkEntryKind::File { data, x: self.x },
+        }))))
+    }
+
+    fn hashout(&self) -> anyhow::Result<String> {
+        Ok(self.expected.clone())
+    }
+}
+
+/// A `Read` adapter that hashes the bytes it passes through and, at EOF, verifies
+/// the digest matches the expected content hash — failing the read (and so the
+/// consuming target) otherwise. The algorithm is identical to
+/// [`hwalk::file_hashout`]: xxh3 over the content followed by a single exec-bit
+/// marker byte. `passthrough_reader_matches_file_hashout` pins the two together
+/// so they cannot silently drift.
+struct VerifyingReader {
+    inner: Box<dyn std::io::Read>,
+    hasher: xxhash_rust::xxh3::Xxh3,
+    x: bool,
+    expected: String,
+    source_path: String,
+    verified: bool,
+}
+
+impl std::io::Read for VerifyingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            // EOF: finalize and verify exactly once. A reader read to completion
+            // (the materialization copy always is) triggers this; a partial read
+            // that is dropped early simply does not verify.
+            if !self.verified {
+                self.verified = true;
+                self.hasher.update(&[self.x as u8]);
+                let got = format!("{:x}", self.hasher.digest());
+                if got != self.expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "passthrough source file '{}' was modified after it was hashed: \
+                             content hash {got} no longer matches the {} recorded at \
+                             input-hashing time — a source file changed mid-build",
+                            self.source_path, self.expected
+                        ),
+                    ));
+                }
+            }
+            return Ok(0);
+        }
+        if let Some(chunk) = buf.get(..n) {
+            self.hasher.update(chunk);
+        }
+        Ok(n)
     }
 }
 
@@ -2242,6 +2364,7 @@ mod tests {
         source_path: &str,
         out_path: &str,
         passthrough: bool,
+        hashout: &str,
     ) -> outputartifact::OutputArtifact {
         outputartifact::OutputArtifact {
             group: "out".to_string(),
@@ -2253,7 +2376,7 @@ mod tests {
                 x: false,
                 passthrough,
             }),
-            hashout: "h".to_string(),
+            hashout: hashout.to_string(),
         }
     }
 
@@ -2262,8 +2385,8 @@ mod tests {
     /// file, or any non-file content is never a passthrough — it must be packed.
     #[test]
     fn is_passthrough_gates_on_tmp_and_producer_flag() {
-        let flagged = file_output("/ws/go.mod", "go.mod", true).content;
-        let unflagged = file_output("/ws/go.mod", "go.mod", false).content;
+        let flagged = file_output("/ws/go.mod", "go.mod", true, "h").content;
+        let unflagged = file_output("/ws/go.mod", "go.mod", false, "h").content;
         let raw = outputartifact::Content::Raw(outputartifact::ContentRaw {
             data: vec![1, 2, 3],
             path: "x".to_string(),
@@ -2290,7 +2413,13 @@ mod tests {
         let source_path = dir.path().join("go.mod");
         std::fs::write(&source_path, b"module example\n").expect("write");
 
-        let oa = file_output(source_path.to_str().expect("utf8"), "mgmt/go/go.mod", true);
+        let hashout = hwalk::file_hashout(&source_path, false).expect("hash");
+        let oa = file_output(
+            source_path.to_str().expect("utf8"),
+            "mgmt/go/go.mod",
+            true,
+            &hashout,
+        );
         let ra = ResultArtifact::passthrough(oa);
 
         assert_eq!(ra.group, "out");
@@ -2310,6 +2439,81 @@ mod tests {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut data, &mut buf).expect("read");
         assert_eq!(buf, b"module example\n");
+    }
+
+    /// A passthrough file is referenced by path and read live, never snapshotted
+    /// into the cache. If the workspace file is modified between hashing and
+    /// consume, its content no longer matches the recorded `hashout` — which is
+    /// folded into the cache key — so reading it to EOF must fail explicitly
+    /// rather than silently feed divergent bytes into a downstream cache entry.
+    #[tokio::test]
+    async fn passthrough_read_fails_when_source_modified_after_hashing() {
+        let dir = tempdir().expect("tempdir");
+        let source_path = dir.path().join("go.mod");
+        std::fs::write(&source_path, b"module example\n").expect("write");
+
+        // Hash recorded at input-hashing time.
+        let hashout = hwalk::file_hashout(&source_path, false).expect("hash");
+
+        // File mutated after hashing, before the consumer reads it.
+        std::fs::write(&source_path, b"module tampered\n").expect("rewrite");
+
+        let oa = file_output(
+            source_path.to_str().expect("utf8"),
+            "mgmt/go/go.mod",
+            true,
+            &hashout,
+        );
+        let ra = ResultArtifact::passthrough(oa);
+
+        let mut walk = ra.content.walk().expect("walk");
+        let entry = walk.next().expect("one entry").expect("ok");
+        let WalkEntryKind::File { mut data, .. } = entry.kind else {
+            panic!("expected file entry");
+        };
+        let mut buf = Vec::new();
+        let err = std::io::Read::read_to_end(&mut data, &mut buf)
+            .expect_err("modified source must fail the read");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("modified after it was hashed"), "msg: {msg}");
+        assert!(msg.contains("go.mod"), "msg names the file: {msg}");
+    }
+
+    /// The verifying reader must compute byte-for-byte the same digest as
+    /// [`hwalk::file_hashout`] — they are two implementations of one hash and
+    /// would silently break passthrough verification if they drifted. Reading an
+    /// unmodified file through the reader (with the canonical hash as `expected`)
+    /// succeeds; with any other `expected` it fails.
+    #[tokio::test]
+    async fn passthrough_reader_matches_file_hashout() {
+        let dir = tempdir().expect("tempdir");
+        let source_path = dir.path().join("blob.bin");
+        // Larger than the reader's chunking to exercise multiple `update`s.
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source_path, &bytes).expect("write");
+
+        let canonical = hwalk::file_hashout(&source_path, false).expect("hash");
+
+        let pc = |expected: &str| PassthroughContent {
+            source_path: source_path.to_str().expect("utf8").to_string(),
+            out_path: "blob.bin".to_string(),
+            x: false,
+            expected: expected.to_string(),
+        };
+
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut pc(&canonical).reader().expect("reader"), &mut buf)
+            .expect("read");
+        assert_eq!(buf, bytes, "bytes pass through unchanged");
+
+        // Same content, wrong expected → the reader rejects at EOF.
+        let mut sink = Vec::new();
+        std::io::Read::read_to_end(
+            &mut pc(&format!("{canonical}0")).reader().expect("reader"),
+            &mut sink,
+        )
+        .expect_err("wrong expected hash must fail");
     }
 
     /// Minimal [`Content`] for guard-lifetime tests; carries no real bytes.
