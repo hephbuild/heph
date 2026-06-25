@@ -100,6 +100,11 @@ impl Workspace {
             home_dir: std::path::PathBuf::new(),
             parallelism: cfg.parallelism,
             fs_skip: cfg.fs_skip.clone(),
+            // Explicit, not the omitted-config platform default (`auto` on
+            // Linux): a second `Engine` reopened over the same root races the
+            // first's FUSE per-pid lock, and this harness isn't exercising
+            // FUSE anyway.
+            fuse: heph::engine::FuseConfig::off(),
             ..Default::default()
         })
         .context("reopen: build engine over the existing workspace root")?;

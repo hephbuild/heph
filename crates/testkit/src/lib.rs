@@ -26,7 +26,13 @@ impl WorkspaceBuilder {
             dir: tempfile::tempdir().context("create workspace tempdir")?,
             parallelism: None,
             fs_skip: vec![],
-            fuse: heph::engine::FuseConfig::default(),
+            // Explicitly off, not `default()`: the omitted-config default is
+            // platform-gated (`auto` on Linux — see `FuseConfig`), and a
+            // harness-built workspace whose test doesn't care about FUSE must
+            // not silently engage a real mount/lock just because the CI host
+            // happens to have `/dev/fuse`. Tests exercising FUSE opt in via
+            // `with_fuse`.
+            fuse: heph::engine::FuseConfig::off(),
             setups: vec![],
         })
     }
@@ -36,7 +42,13 @@ impl WorkspaceBuilder {
             dir,
             parallelism: None,
             fs_skip: vec![],
-            fuse: heph::engine::FuseConfig::default(),
+            // Explicitly off, not `default()`: the omitted-config default is
+            // platform-gated (`auto` on Linux — see `FuseConfig`), and a
+            // harness-built workspace whose test doesn't care about FUSE must
+            // not silently engage a real mount/lock just because the CI host
+            // happens to have `/dev/fuse`. Tests exercising FUSE opt in via
+            // `with_fuse`.
+            fuse: heph::engine::FuseConfig::off(),
             setups: vec![],
         }
     }
