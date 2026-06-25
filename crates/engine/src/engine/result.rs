@@ -254,33 +254,211 @@ impl Content for GuardedArtifact {
     }
 }
 
-/// Build an [`EResult`] from cached artifacts, filtering by output group and
+/// One produced output of a target as it travels the result pipeline: an opaque
+/// [`Content`] handle plus the group/type metadata that [`build_eresult`] and
+/// codegen write-back need. The content is either a cache-backed [`CacheArtifact`]
+/// (the normal stored/packed path) or a zero-copy passthrough — e.g. an
+/// `@heph/fs:file` source file that never entered the local cache, carried as
+/// its raw [`OutputArtifact`](outputartifact::OutputArtifact). Passthrough
+/// artifacts skip [`Engine::cache_locally`] entirely, so they are never of type
+/// `CacheArtifact`.
+#[derive(Clone)]
+pub struct ResultArtifact {
+    pub content: Arc<dyn Content>,
+    pub group: String,
+    pub r#type: ManifestArtifactType,
+}
+
+impl ResultArtifact {
+    /// Wrap a cache-backed artifact (the normal stored/packed output).
+    fn from_cache(a: CacheArtifact) -> Self {
+        Self {
+            group: a.group.clone(),
+            r#type: a.r#type.clone(),
+            content: Arc::new(a),
+        }
+    }
+
+    /// Wrap a zero-copy passthrough output that skipped the local cache. The
+    /// content reads the durable source file directly (no tar, no cache blob),
+    /// and — because the file was never snapshotted into the cache — re-hashes
+    /// it on consume and fails if it diverges from the hash recorded at
+    /// input-hashing time. See [`PassthroughContent`].
+    ///
+    /// `is_passthrough` only ever flags a `Content::File`; any other variant
+    /// reaching here is a producer bug, so it falls back to carrying the raw
+    /// artifact rather than panicking.
+    fn passthrough(a: outputartifact::OutputArtifact) -> Self {
+        let group = a.group.clone();
+        let r#type = manifest_artifact_type(&a.r#type);
+        let content: Arc<dyn Content> = match a.content {
+            outputartifact::Content::File(f) => Arc::new(PassthroughContent {
+                source_path: f.source_path,
+                out_path: f.out_path,
+                x: f.x,
+                expected: a.hashout,
+            }),
+            other => Arc::new(outputartifact::OutputArtifact {
+                content: other,
+                ..a
+            }),
+        };
+        Self {
+            group,
+            r#type,
+            content,
+        }
+    }
+}
+
+/// [`Content`] for a passthrough source-file artifact (e.g. `@heph/fs:file`):
+/// referenced by path and read live on consume, never copied into the cache.
+///
+/// Because nothing snapshots the bytes, the workspace file could be modified
+/// between when it was hashed (the value folded into the target's `hashin` cache
+/// key) and when a consumer reads it here. The live bytes would then silently
+/// diverge from the cache key, poisoning every downstream entry. To turn that
+/// silent corruption into a hard, explicit failure, the bytes are re-hashed as
+/// they stream through — no extra I/O, the consumer is reading them anyway — and
+/// the digest is checked against the recorded `hashout` at EOF.
+///
+/// `seekable_reader`/`file_path` stay `None` (Content defaults): the FUSE
+/// tar-index path is bypassed and every consumer materializes via `walk()`, so
+/// the verifying reader is always on the materialization path.
+struct PassthroughContent {
+    source_path: String,
+    out_path: String,
+    x: bool,
+    /// Content hash recorded when the target was hashed; the just-read bytes
+    /// must still hash to this.
+    expected: String,
+}
+
+impl PassthroughContent {
+    fn verifying_reader(&self) -> anyhow::Result<VerifyingReader> {
+        let file = std::fs::File::open(&self.source_path)
+            .with_context(|| format!("open passthrough source '{}'", self.source_path))?;
+        Ok(VerifyingReader {
+            inner: Box::new(file),
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+            x: self.x,
+            expected: self.expected.clone(),
+            source_path: self.source_path.clone(),
+            verified: false,
+        })
+    }
+}
+
+impl Content for PassthroughContent {
+    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+        Ok(Box::new(self.verifying_reader()?))
+    }
+
+    fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+        let data: Box<dyn std::io::Read> = Box::new(self.verifying_reader()?);
+        Ok(Box::new(std::iter::once(Ok(WalkEntry {
+            path: std::path::PathBuf::from(&self.out_path),
+            kind: WalkEntryKind::File { data, x: self.x },
+        }))))
+    }
+
+    fn hashout(&self) -> anyhow::Result<String> {
+        Ok(self.expected.clone())
+    }
+}
+
+/// A `Read` adapter that hashes the bytes it passes through and, at EOF, verifies
+/// the digest matches the expected content hash — failing the read (and so the
+/// consuming target) otherwise. The algorithm is identical to
+/// [`hwalk::file_hashout`]: xxh3 over the content followed by a single exec-bit
+/// marker byte. `passthrough_reader_matches_file_hashout` pins the two together
+/// so they cannot silently drift.
+struct VerifyingReader {
+    inner: Box<dyn std::io::Read>,
+    hasher: xxhash_rust::xxh3::Xxh3,
+    x: bool,
+    expected: String,
+    source_path: String,
+    verified: bool,
+}
+
+impl std::io::Read for VerifyingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            // EOF: finalize and verify exactly once. A reader read to completion
+            // (the materialization copy always is) triggers this; a partial read
+            // that is dropped early simply does not verify.
+            if !self.verified {
+                self.verified = true;
+                self.hasher.update(&[self.x as u8]);
+                let got = format!("{:x}", self.hasher.digest());
+                if got != self.expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "passthrough source file '{}' was modified after it was hashed: \
+                             content hash {got} no longer matches the {} recorded at \
+                             input-hashing time — a source file changed mid-build",
+                            self.source_path, self.expected
+                        ),
+                    ));
+                }
+            }
+            return Ok(0);
+        }
+        if let Some(chunk) = buf.get(..n) {
+            self.hasher.update(chunk);
+        }
+        Ok(n)
+    }
+}
+
+fn manifest_artifact_type(t: &outputartifact::Type) -> ManifestArtifactType {
+    match t {
+        outputartifact::Type::Output => ManifestArtifactType::Output,
+        outputartifact::Type::Log => ManifestArtifactType::Log,
+        outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+    }
+}
+
+/// Whether a produced output is a zero-copy source-file passthrough that must
+/// skip the local cache. True only on the uncached (`tmp`) path AND when its
+/// producer flagged a `Content::File` as a durable source reference (e.g.
+/// `@heph/fs:file`). A cacheable revision must own a durable copy of its bytes
+/// (`source_path` may change/vanish across runs), so it is never a passthrough.
+fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> bool {
+    use_tmp_cache && matches!(content, outputartifact::Content::File(f) if f.passthrough)
+}
+
+/// Build an [`EResult`] from produced artifacts, filtering by output group and
 /// type, and attaching `guard` (the read lock for this target's cache entry) to
 /// each kept artifact. `guard` is `None` only for the non-cacheable (force/shell)
 /// path, whose artifacts are ephemeral and need no long-lived lock.
 fn build_eresult(
-    cached: Vec<CacheArtifact>,
+    produced: Vec<ResultArtifact>,
     artifacts_meta: Vec<ArtifactMeta>,
     outputs: &[String],
     guard: Option<Arc<ResultReadGuard>>,
 ) -> EResult {
-    let wrap = |a: CacheArtifact| -> Arc<dyn Content> {
-        let inner: Arc<dyn Content> = Arc::new(a);
+    let wrap = |content: Arc<dyn Content>| -> Arc<dyn Content> {
         match &guard {
             Some(lock) => Arc::new(GuardedArtifact {
-                inner,
+                inner: content,
                 _lock: Arc::clone(lock),
             }),
-            None => inner,
+            None => content,
         }
     };
 
     let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
     let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
-    for a in cached {
+    for a in produced {
         match a.r#type {
-            ManifestArtifactType::Output if outputs.contains(&a.group) => artifacts.push(wrap(a)),
-            ManifestArtifactType::SupportFile => support_artifacts.push(wrap(a)),
+            ManifestArtifactType::Output if outputs.contains(&a.group) => {
+                artifacts.push(wrap(a.content))
+            }
+            ManifestArtifactType::SupportFile => support_artifacts.push(wrap(a.content)),
             _ => {}
         }
     }
@@ -383,7 +561,7 @@ pub(crate) struct LockedResolution {
 /// cell (every output group), shared across all `(outputs, is_top)` callers and
 /// filtered per caller by [`build_eresult`].
 struct ExecutedArtifacts {
-    cached: Vec<CacheArtifact>,
+    cached: Vec<ResultArtifact>,
     meta: Vec<ArtifactMeta>,
 }
 
@@ -939,15 +1117,18 @@ impl Engine {
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<EResult> {
         let locked = self.clone().resolve_locked(rs.clone(), def, opts).await?;
-        let (cached, meta) = match &locked.executed {
+        let (cached, meta): (Vec<ResultArtifact>, Vec<ArtifactMeta>) = match &locked.executed {
             // This cell produced the artifacts; filter the full set to `outputs`.
+            // Already `ResultArtifact`s (cache-backed or passthrough).
             Some(ex) => (ex.cached.clone(), ex.meta.clone()),
             // Pre-existing hit: read only this caller's outputs under the shared
             // riding read. Silent — the shared cell already emitted the addr's
             // hit/miss event; re-emitting per caller would double-count. Reuse the
             // manifest the probe already parsed (shared across all callers of this
             // single-flight cell) instead of re-reading + re-deserializing it;
-            // fall back to a fresh read only if it is somehow absent.
+            // fall back to a fresh read only if it is somehow absent. A cache hit
+            // is always cache-backed (a passthrough never wrote a manifest), so
+            // every artifact maps through `from_cache`.
             None => {
                 let res = match &locked.manifest {
                     Some(manifest) => {
@@ -971,12 +1152,19 @@ impl Engine {
                             .await?
                     }
                 };
-                res.with_context(|| {
+                let (cache_arts, meta) = res.with_context(|| {
                     format!(
                         "result lock confirmed a cache entry for {} but it vanished before read",
                         def.target.addr
                     )
-                })?
+                })?;
+                (
+                    cache_arts
+                        .into_iter()
+                        .map(ResultArtifact::from_cache)
+                        .collect(),
+                    meta,
+                )
             }
         };
 
@@ -1239,7 +1427,7 @@ impl Engine {
         &self,
         is_top: bool,
         def: &LinkedTargetDef,
-        cached: &[CacheArtifact],
+        cached: &[ResultArtifact],
         frozen: bool,
     ) -> anyhow::Result<()> {
         use crate::engine::driver::targetdef::path::CodegenMode;
@@ -1291,6 +1479,7 @@ impl Engine {
             if frozen {
                 // Compare each generated file against the tree; never write.
                 let walker = artifact
+                    .content
                     .walk()
                     .with_context(|| format!("walk codegen output for frozen check: {group}"))?;
                 for entry in walker {
@@ -1370,6 +1559,7 @@ impl Engine {
                 // churn and pointless mtime bumps.
                 let stamp = def.target.addr.format();
                 let walker = artifact
+                    .content
                     .walk()
                     .with_context(|| format!("walk codegen output for write-back: {group}"))?;
                 for entry in walker {
@@ -1483,7 +1673,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<(Vec<CacheArtifact>, Vec<ArtifactMeta>)> {
+    ) -> anyhow::Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>)> {
         let addr = opts.def.target.addr.clone();
         let hashin = opts.hashin.clone();
         let spec = opts.spec.clone();
@@ -1531,21 +1721,62 @@ impl Engine {
                     }
 
                     hcore::hmemoizer::set_phase("execute_cache:cache_locally");
-                    let write_addr = addr.format();
-                    let out = crate::engine::event::emit_scope(
-                        &rs,
-                        crate::engine::event::BuildEventKind::LocalCacheWriteStart {
-                            addr: write_addr.clone(),
-                        },
-                        move |error| crate::engine::event::BuildEventKind::LocalCacheWriteEnd {
-                            addr: write_addr,
-                            error,
-                        },
-                        engine.cache_locally(rs.ctoken(), &addr, &hashin, artifacts, use_tmp_cache),
-                    )
-                    .await
-                    .map(|cached| (cached, artifacts_meta))
-                    .with_context(|| format!("cache_locally {addr}"));
+
+                    // Partition produced outputs. A zero-copy passthrough (an
+                    // uncached source file flagged by its producer — e.g.
+                    // `@heph/fs:file`) skips the local cache entirely and is
+                    // carried as its raw `OutputArtifact`, so the cache-write
+                    // hot path does no file read, tar, or copy. Everything else
+                    // is packed/stored by `cache_locally`. Order is irrelevant —
+                    // `build_eresult` filters by (group, type), not position —
+                    // so the two sets are simply concatenated below.
+                    let mut passthrough: Vec<ResultArtifact> = Vec::new();
+                    let mut to_cache: Vec<outputartifact::OutputArtifact> = Vec::new();
+                    for artifact in artifacts {
+                        if is_passthrough(use_tmp_cache, &artifact.content) {
+                            passthrough.push(ResultArtifact::passthrough(artifact));
+                        } else {
+                            to_cache.push(artifact);
+                        }
+                    }
+
+                    // Only emit a LocalCacheWrite span (and run `cache_locally`)
+                    // when there is something to store — an all-passthrough
+                    // target writes nothing here, so no "cache write" phase.
+                    let cached = if to_cache.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        let write_addr = addr.format();
+                        crate::engine::event::emit_scope(
+                            &rs,
+                            crate::engine::event::BuildEventKind::LocalCacheWriteStart {
+                                addr: write_addr.clone(),
+                            },
+                            move |error| {
+                                crate::engine::event::BuildEventKind::LocalCacheWriteEnd {
+                                    addr: write_addr,
+                                    error,
+                                }
+                            },
+                            engine.cache_locally(
+                                rs.ctoken(),
+                                &addr,
+                                &hashin,
+                                to_cache,
+                                use_tmp_cache,
+                            ),
+                        )
+                        .await
+                    };
+
+                    let out = cached
+                        .map(move |cached| {
+                            let mut produced = passthrough;
+                            produced
+                                .extend(cached.into_iter().map(ResultArtifact::from_cache));
+                            (produced, artifacts_meta)
+                        })
+                        .with_context(|| format!("cache_locally {addr}"));
 
                     // Remote push: fire-and-forget on a background task (tracked
                     // by `bg_pending`, so the CLI/TUI stays open until it drains).
@@ -2128,6 +2359,162 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    fn file_output(
+        source_path: &str,
+        out_path: &str,
+        passthrough: bool,
+        hashout: &str,
+    ) -> outputartifact::OutputArtifact {
+        outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: "f".to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::File(outputartifact::ContentFile {
+                source_path: source_path.to_string(),
+                out_path: out_path.to_string(),
+                x: false,
+                passthrough,
+            }),
+            hashout: hashout.to_string(),
+        }
+    }
+
+    /// Passthrough is gated two ways: only on the uncached (`tmp`) path, and only
+    /// for a producer-flagged `Content::File`. A cacheable revision, an unflagged
+    /// file, or any non-file content is never a passthrough — it must be packed.
+    #[test]
+    fn is_passthrough_gates_on_tmp_and_producer_flag() {
+        let flagged = file_output("/ws/go.mod", "go.mod", true, "h").content;
+        let unflagged = file_output("/ws/go.mod", "go.mod", false, "h").content;
+        let raw = outputartifact::Content::Raw(outputartifact::ContentRaw {
+            data: vec![1, 2, 3],
+            path: "x".to_string(),
+            x: false,
+        });
+
+        assert!(is_passthrough(true, &flagged), "tmp + flagged file");
+        assert!(!is_passthrough(false, &flagged), "cacheable must pack");
+        assert!(
+            !is_passthrough(true, &unflagged),
+            "unflagged file must pack"
+        );
+        assert!(!is_passthrough(true, &raw), "non-file must pack");
+    }
+
+    /// A passthrough `ResultArtifact` is the raw `OutputArtifact` as `Content`: it
+    /// never becomes a `CacheArtifact`, carries no cache blob, and `walk()` yields
+    /// the single source file at its `out_path`, read directly from the durable
+    /// `source_path`. `seekable_reader`/`file_path` stay `None` so the FUSE
+    /// tar-index path is bypassed and consumers materialize via generic unpack.
+    #[tokio::test]
+    async fn passthrough_result_artifact_reads_source_without_cache() {
+        let dir = tempdir().expect("tempdir");
+        let source_path = dir.path().join("go.mod");
+        std::fs::write(&source_path, b"module example\n").expect("write");
+
+        let hashout = hwalk::file_hashout(&source_path, false).expect("hash");
+        let oa = file_output(
+            source_path.to_str().expect("utf8"),
+            "mgmt/go/go.mod",
+            true,
+            &hashout,
+        );
+        let ra = ResultArtifact::passthrough(oa);
+
+        assert_eq!(ra.group, "out");
+        assert_eq!(ra.r#type, ManifestArtifactType::Output);
+        // No cache backing: a passthrough exposes neither a seekable tar nor a
+        // cache file path.
+        assert!(ra.content.seekable_reader().expect("seekable").is_none());
+        assert!(ra.content.file_path().is_none());
+
+        let mut walk = ra.content.walk().expect("walk");
+        let entry = walk.next().expect("one entry").expect("ok");
+        assert!(walk.next().is_none(), "single file");
+        assert_eq!(entry.path, std::path::PathBuf::from("mgmt/go/go.mod"));
+        let WalkEntryKind::File { mut data, .. } = entry.kind else {
+            panic!("expected file entry");
+        };
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut data, &mut buf).expect("read");
+        assert_eq!(buf, b"module example\n");
+    }
+
+    /// A passthrough file is referenced by path and read live, never snapshotted
+    /// into the cache. If the workspace file is modified between hashing and
+    /// consume, its content no longer matches the recorded `hashout` — which is
+    /// folded into the cache key — so reading it to EOF must fail explicitly
+    /// rather than silently feed divergent bytes into a downstream cache entry.
+    #[tokio::test]
+    async fn passthrough_read_fails_when_source_modified_after_hashing() {
+        let dir = tempdir().expect("tempdir");
+        let source_path = dir.path().join("go.mod");
+        std::fs::write(&source_path, b"module example\n").expect("write");
+
+        // Hash recorded at input-hashing time.
+        let hashout = hwalk::file_hashout(&source_path, false).expect("hash");
+
+        // File mutated after hashing, before the consumer reads it.
+        std::fs::write(&source_path, b"module tampered\n").expect("rewrite");
+
+        let oa = file_output(
+            source_path.to_str().expect("utf8"),
+            "mgmt/go/go.mod",
+            true,
+            &hashout,
+        );
+        let ra = ResultArtifact::passthrough(oa);
+
+        let mut walk = ra.content.walk().expect("walk");
+        let entry = walk.next().expect("one entry").expect("ok");
+        let WalkEntryKind::File { mut data, .. } = entry.kind else {
+            panic!("expected file entry");
+        };
+        let mut buf = Vec::new();
+        let err = std::io::Read::read_to_end(&mut data, &mut buf)
+            .expect_err("modified source must fail the read");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("modified after it was hashed"), "msg: {msg}");
+        assert!(msg.contains("go.mod"), "msg names the file: {msg}");
+    }
+
+    /// The verifying reader must compute byte-for-byte the same digest as
+    /// [`hwalk::file_hashout`] — they are two implementations of one hash and
+    /// would silently break passthrough verification if they drifted. Reading an
+    /// unmodified file through the reader (with the canonical hash as `expected`)
+    /// succeeds; with any other `expected` it fails.
+    #[tokio::test]
+    async fn passthrough_reader_matches_file_hashout() {
+        let dir = tempdir().expect("tempdir");
+        let source_path = dir.path().join("blob.bin");
+        // Larger than the reader's chunking to exercise multiple `update`s.
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source_path, &bytes).expect("write");
+
+        let canonical = hwalk::file_hashout(&source_path, false).expect("hash");
+
+        let pc = |expected: &str| PassthroughContent {
+            source_path: source_path.to_str().expect("utf8").to_string(),
+            out_path: "blob.bin".to_string(),
+            x: false,
+            expected: expected.to_string(),
+        };
+
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut pc(&canonical).reader().expect("reader"), &mut buf)
+            .expect("read");
+        assert_eq!(buf, bytes, "bytes pass through unchanged");
+
+        // Same content, wrong expected → the reader rejects at EOF.
+        let mut sink = Vec::new();
+        std::io::Read::read_to_end(
+            &mut pc(&format!("{canonical}0")).reader().expect("reader"),
+            &mut sink,
+        )
+        .expect_err("wrong expected hash must fail");
+    }
 
     /// Minimal [`Content`] for guard-lifetime tests; carries no real bytes.
     struct DummyContent;

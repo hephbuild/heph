@@ -1,9 +1,10 @@
 use crate::engine::Engine;
 use crate::engine::error::{CycleError, TargetFailure};
-use crate::engine::local_cache::CacheArtifact;
 use crate::engine::meta::ResultMeta;
 use crate::engine::provider::State;
-use crate::engine::result::{ArtifactMeta, ExtendedTargetDef, LockedResolution, OutputMatcher};
+use crate::engine::result::{
+    ArtifactMeta, ExtendedTargetDef, LockedResolution, OutputMatcher, ResultArtifact,
+};
 use crate::engine::spec::EngineTargetSpec;
 use hcore::hasync::StdCancellationToken;
 use hcore::hmemoizer::Memoizer;
@@ -16,7 +17,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Weak};
 
 type ArcErr = Arc<anyhow::Error>;
-type ExecuteCacheResult = Result<(Vec<CacheArtifact>, Vec<ArtifactMeta>), ArcErr>;
+type ExecuteCacheResult = Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>), ArcErr>;
 type ProbeStatesResult = Result<Arc<Vec<State>>, ArcErr>;
 
 /// Pointer-keyed map entry for `DepDag` nodes.

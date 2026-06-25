@@ -707,6 +707,9 @@ fn emit_glob_file(
             source_path,
             out_path: rel_str.to_string(),
             x: fh.exec,
+            // Workspace source file: durable for the build, so the engine can
+            // reference it by path instead of tar-packing it into the cache.
+            passthrough: true,
         }),
         hashout: fh.hashout.clone(),
     });
@@ -955,6 +958,9 @@ impl hplugin::driver::Driver for Driver {
                             source_path,
                             out_path: path.clone(),
                             x: fh.exec,
+                            // Workspace source file: durable for the build, so the
+                            // engine references it by path instead of tar-packing it.
+                            passthrough: true,
                         }),
                         hashout: fh.hashout.clone(),
                     }],
