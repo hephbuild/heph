@@ -254,12 +254,8 @@ impl ProviderFn for GlobFn {
         // Arg shape is enforced by the declared signature before we get here.
         let pattern = str_arg("heph.fs.glob", &args)?;
 
-        let resolved = if ctx.pkg.is_empty() {
-            pattern.to_string()
-        } else {
-            format!("{}/{}", ctx.pkg, pattern)
-        };
-        let resolved = normalize_path(&resolved).context("heph.fs.glob: normalizing pattern")?;
+        let resolved = hmodel::htpkg::join_rel_checked(ctx.pkg, pattern)
+            .context("heph.fs.glob: normalizing pattern")?;
 
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.

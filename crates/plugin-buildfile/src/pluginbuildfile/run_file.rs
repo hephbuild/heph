@@ -581,23 +581,22 @@ fn starlark_to_rust(v: &Value) -> htvalue::Value {
     );
 }
 
-/// Returns `path` prefixed with the current package (e.g. `"src/main.rs"` from pkg
-/// `"foo/bar"` becomes `"foo/bar/src/main.rs"`). If `abs` is true, or the current
-/// package is empty (workspace root), returns `path` unchanged.
-fn resolve_fs_path(eval: &Evaluator, path: &str, abs: bool) -> String {
+/// Returns `path` prefixed with the current package and lexically normalized
+/// (e.g. `"./src/main.rs"` from pkg `"foo/bar"` becomes `"foo/bar/src/main.rs"`).
+/// If `abs` is true, returns `path` unchanged; at the workspace root the package
+/// prefix is empty but the path is still normalized. Errors when a `..` segment
+/// would escape the workspace root.
+fn resolve_fs_path(eval: &Evaluator, path: &str, abs: bool) -> anyhow::Result<String> {
     if abs {
-        return path.to_string();
+        return Ok(path.to_string());
     }
     let extra = eval
         .extra
         .expect("evaluator extra must be set")
         .downcast_ref::<Extra>()
         .expect("evaluator extra must be of type Extra");
-    if extra.pkg.is_empty() {
-        path.to_string()
-    } else {
-        format!("{}/{}", extra.pkg, path)
-    }
+    hmodel::htpkg::join_rel_checked(extra.pkg, path)
+        .with_context(|| format!("resolving fs path {path:?} in package {}", extra.pkg))
 }
 
 /// Snapshot the Starlark call stack at the moment `target()` runs into a chain of
@@ -761,7 +760,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         path: &str,
         #[starlark(require = named, default = false)] abs: bool,
     ) -> starlark::Result<String> {
-        let resolved = resolve_fs_path(eval, path, abs);
+        let resolved = resolve_fs_path(eval, path, abs)?;
         Ok(hbuiltins::pluginfs::file_addr(&resolved).format())
     }
 
@@ -774,7 +773,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         exclude: Option<Value<'v>>,
         #[starlark(require = named, default = false)] abs: bool,
     ) -> starlark::Result<String> {
-        let resolved = resolve_fs_path(eval, pattern, abs);
+        let resolved = resolve_fs_path(eval, pattern, abs)?;
         let excludes: Vec<String> = match exclude {
             Some(v) => {
                 if let Some(s) = v.unpack_str() {
