@@ -36,8 +36,16 @@ plugins:
       # no release publishes: point it at a build target in *this* workspace, or
       # at a released tag's download target.
       #govet: "//@heph/go/govet/v0.1.234:heph-govet"
+# Sandbox FUSE overlay. `enabled: true | false | auto` — when on, inputs are
+# served from an in-memory union filesystem instead of being copied into each
+# sandbox (faster for large dep sets). `auto` uses FUSE only past an input-size
+# threshold. On macOS, `backend` picks the userspace backend: `kext` (default;
+# fastest, needs the macFUSE system extension approved) or `fskit` (Apple FSKit,
+# macOS 15.4+; unprivileged — no kext — but mounts under /Volumes and needs the
+# macFUSE FSKit file-system extension enabled). Ignored on Linux.
 #fuse:
 #  enabled: true
+#  backend: kext
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus
 # `read`/`write` flags (both default true) and a `concurrency` request cap
 # (default 10). Supported schemes: s3://, gs://, az://, http(s):// (credentials

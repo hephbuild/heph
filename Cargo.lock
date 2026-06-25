@@ -5916,6 +5916,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "heph",
+ "sandboxfuse",
  "tempfile",
  "tokio",
 ]
