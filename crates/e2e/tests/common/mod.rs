@@ -6,7 +6,7 @@ use heph::pluginexec;
 use heph::pluginstatictarget;
 use htestkit::WorkspaceBuilder;
 
-pub use htestkit::{artifact_bytes, artifact_paths, artifact_string, root};
+pub use htestkit::{artifact_bytes, artifact_paths, artifact_string, fuse_mount_works, root};
 
 pub struct Workspace(htestkit::Workspace);
 
@@ -35,6 +35,19 @@ impl Workspace {
             builder
         };
         Self(builder.build().expect("build workspace"))
+    }
+
+    /// Workspace with the FUSE sandbox overlay forced on. Callers must first
+    /// check [`fuse_mount_works`] and skip the test when it returns false —
+    /// a forced-on mount errors on hosts without usable FUSE.
+    pub fn with_fuse() -> Self {
+        let builder = WorkspaceBuilder::new()
+            .expect("workspace tempdir")
+            .with_fuse(heph::engine::FuseConfig::on())
+            .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_bash()));
+        Self(builder.build().expect("build fuse workspace"))
     }
 
     pub fn with_static(targets: Vec<pluginstatictarget::Target>) -> Result<Self> {

@@ -588,29 +588,46 @@ impl LocalCache for LocalCacheSQLite {
 
 /// Owns both a pooled sqlite connection and a `Blob` opened against it.
 ///
-/// `rusqlite::blob::Blob<'conn>` borrows its connection; lifetime extension
-/// to `'static` is sound because the blob is dropped before `_conn` (Rust
-/// drops struct fields in declaration order).
+/// `rusqlite::blob::Blob<'conn>` borrows its connection, so this is a
+/// self-referential struct. The connection is kept behind a `Box` so its
+/// address is stable: moving the `OwnedBlob` (e.g. into a `Box<dyn ReadSeek>`
+/// or onto another thread) moves only the box pointer, never the
+/// `PooledConnection` — which stores the `rusqlite::Connection` (and its
+/// `RefCell<InnerConnection>`) inline. Without the box, moving the struct
+/// would relocate the connection's bytes and leave the blob's captured
+/// `&Connection` dangling, which surfaced as spurious
+/// "RefCell already mutably borrowed" panics on the first blob read.
+///
+/// Field drop order matters: `blob` is declared before `_conn` so it is
+/// dropped (closing the sqlite blob handle) before the connection it
+/// borrows.
 struct OwnedBlob {
     blob: rusqlite::blob::Blob<'static>,
-    _conn: r2d2::PooledConnection<SqliteConnectionManager>,
+    _conn: Box<r2d2::PooledConnection<SqliteConnectionManager>>,
 }
 
 // SAFETY: rusqlite::Connection is Send. The blob holds a raw sqlite3
-// statement pointer whose ownership transfers with the connection. Both
-// fields are Send-compatible; the borrow we extended to 'static is local
-// to this struct and never observed externally.
+// blob handle whose ownership transfers with the connection. Both fields
+// are Send-compatible; the boxed connection keeps a stable address so the
+// borrow we extended to 'static stays valid after the value is moved, and
+// it is never observed externally.
 unsafe impl Send for OwnedBlob {}
 
 impl OwnedBlob {
     fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>, row_id: i64) -> Result<Self> {
+        // Box first so the connection has a stable heap address; the blob's
+        // borrow is taken from the boxed connection, not a soon-to-be-moved
+        // stack/inline value.
+        let conn = Box::new(conn);
         let conn_ref: &Connection = &conn;
         let blob = conn_ref
             .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
             .context("opening seekable sqlite blob")?;
-        // SAFETY: `blob` borrows from `conn` which is owned alongside it in
-        // the returned struct; struct field drop order (blob before _conn)
-        // guarantees the borrow outlives no longer than the connection.
+        // SAFETY: `blob` borrows the `Connection` inside `*conn`, which lives
+        // on the heap behind the `Box` stored in `_conn`. Moving `Self` moves
+        // only the box pointer, so the borrow stays valid; field drop order
+        // (blob before _conn) guarantees the blob is closed before the
+        // connection it borrows is dropped.
         let blob_static: rusqlite::blob::Blob<'static> = unsafe { std::mem::transmute(blob) };
         Ok(Self {
             blob: blob_static,

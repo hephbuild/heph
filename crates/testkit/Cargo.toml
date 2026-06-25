@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 heph = { path = "../.." }
+hsandboxfuse = { package = "sandboxfuse", path = "../sandboxfuse", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
 tempfile = "3"

@@ -33,7 +33,7 @@
 
 mod support;
 
-pub use support::{FuseSupport, support_check};
+pub use support::{FuseSupport, MountBackend, support_check};
 
 #[cfg(all(unix, feature = "fuse-sandbox"))]
 mod imp;

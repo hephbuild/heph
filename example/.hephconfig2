@@ -28,8 +28,19 @@ plugins:
         "1.26.4/linux/arm64": "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768"
         "1.26.4/darwin/amd64": "05dc9b5f9997744520aaebb3d5deaa7c755371aebbfb7f97c2511a9f3367538d"
         "1.26.4/darwin/arm64": "b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53"
+# Sandbox FUSE overlay. `enabled: true | false | auto` — when on, inputs are
+# served from an in-memory union filesystem instead of being copied into each
+# sandbox (faster for large dep sets). `auto` uses FUSE only past an input-size
+# threshold. Omit `enabled` (or the whole `fuse:` block) to take the platform
+# default: `auto` on Linux, `off` on macOS (the macOS backends each need a
+# one-time approval that can't be assumed present).
+# On macOS, `backend` picks the userspace backend: `kext` (default;
+# fastest, needs the macFUSE system extension approved) or `fskit` (Apple FSKit,
+# macOS 15.4+; unprivileged — no kext — but mounts under /Volumes and needs the
+# macFUSE FSKit file-system extension enabled). Ignored on Linux.
 #fuse:
 #  enabled: true
+#  backend: kext
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus
 # `read`/`write` flags (both default true) and a `concurrency` request cap
 # (default 10). Supported schemes: s3://, gs://, az://, http(s):// (credentials

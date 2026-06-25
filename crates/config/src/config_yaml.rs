@@ -266,14 +266,43 @@ pub enum FuseMode {
     Auto,
 }
 
+/// Default mode when `enabled` is omitted (no `fuse:` block, or `fuse: {}`).
+/// Platform-gated: Linux auto-enables FUSE (the engine decides per target),
+/// while macOS and every other platform default off — the macOS backends
+/// (kext / FSKit) each need a one-time, often admin- or MDM-gated approval
+/// that can't be assumed present, so FUSE stays opt-in there.
+#[cfg(target_os = "linux")]
+const DEFAULT_OMITTED_MODE: FuseMode = FuseMode::Auto;
+#[cfg(not(target_os = "linux"))]
+const DEFAULT_OMITTED_MODE: FuseMode = FuseMode::Off;
+
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
-/// default to off; FUSE is opt-in.
+/// take the platform default ([`DEFAULT_OMITTED_MODE`]): `auto` on Linux,
+/// `off` on macOS and elsewhere.
+///
+/// `backend` (macOS only) selects the userspace FUSE backend: `kext` (the
+/// classic kernel-extension path — fastest, but the macFUSE system extension
+/// must be approved) or `fskit` (Apple's FSKit, macOS 15.4+ — unprivileged,
+/// no kext, mounts under `/Volumes`). Omit to let the engine pick the backend
+/// that is actually usable on the host. Ignored on Linux.
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FuseConfig {
     #[serde(default)]
     pub enabled: Option<FuseEnabled>,
+    #[serde(default)]
+    pub backend: Option<FuseBackend>,
+}
+
+/// macOS FUSE backend selector. See [`FuseConfig`].
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FuseBackend {
+    /// Classic kernel-extension backend (macFUSE kext).
+    Kext,
+    /// Apple FSKit backend — unprivileged, macOS 15.4+.
+    Fskit,
 }
 
 /// Tri-state config value. Parses YAML `true`, `false`, or `"auto"`.
@@ -317,11 +346,13 @@ impl FuseConfig {
         match self.enabled {
             Some(FuseEnabled::On) => FuseMode::On,
             Some(FuseEnabled::Auto) => FuseMode::Auto,
-            Some(FuseEnabled::Off) | None => FuseMode::Off,
+            Some(FuseEnabled::Off) => FuseMode::Off,
+            None => DEFAULT_OMITTED_MODE,
         }
     }
 
-    /// Convenience: FUSE off (explicit `enabled: false` or omitted).
+    /// Convenience: is FUSE off? (explicit `enabled: false`, or omitted on a
+    /// platform whose [`DEFAULT_OMITTED_MODE`] is `Off`, i.e. non-Linux).
     pub fn is_off(&self) -> bool {
         matches!(self.mode(), FuseMode::Off)
     }
@@ -329,6 +360,28 @@ impl FuseConfig {
     /// Convenience: is FUSE forced on by config?
     pub fn is_on(&self) -> bool {
         matches!(self.mode(), FuseMode::On)
+    }
+
+    /// Build a config forced on (tests / programmatic callers).
+    pub fn on() -> Self {
+        Self {
+            enabled: Some(FuseEnabled::On),
+            backend: None,
+        }
+    }
+
+    /// Build a config in `auto` mode (tests / programmatic callers).
+    pub fn auto() -> Self {
+        Self {
+            enabled: Some(FuseEnabled::Auto),
+            backend: None,
+        }
+    }
+
+    /// Force a specific macOS backend, keeping the current mode.
+    pub fn with_backend(mut self, backend: FuseBackend) -> Self {
+        self.backend = Some(backend);
+        self
     }
 }
 
@@ -778,9 +831,19 @@ caches:
         let yaml = "fuse: {}\n";
         let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let f = cfg.fuse.expect("fuse present");
-        assert_eq!(f.mode(), FuseMode::Off);
-        assert!(f.is_off());
+        // Omitted `enabled` takes the platform default: auto on Linux, off
+        // on macOS/elsewhere.
         assert!(!f.is_on());
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(f.mode(), FuseMode::Auto);
+            assert!(!f.is_off());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(f.mode(), FuseMode::Off);
+            assert!(f.is_off());
+        }
     }
 
     #[test]
@@ -808,10 +871,55 @@ caches:
     }
 
     #[test]
-    fn fuse_config_default_struct_is_off() {
+    fn fuse_config_default_struct_takes_platform_default() {
         let f = FuseConfig::default();
+        assert_eq!(f.backend, None);
+        assert!(!f.is_on());
+        #[cfg(target_os = "linux")]
+        assert_eq!(f.mode(), FuseMode::Auto);
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(f.mode(), FuseMode::Off);
-        assert!(f.is_off());
+    }
+
+    #[test]
+    fn fuse_config_backend_kext() {
+        let yaml = "fuse:\n  enabled: true\n  backend: kext\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.backend, Some(FuseBackend::Kext));
+        assert_eq!(f.mode(), FuseMode::On);
+    }
+
+    #[test]
+    fn fuse_config_backend_fskit() {
+        let yaml = "fuse:\n  enabled: true\n  backend: fskit\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.backend, Some(FuseBackend::Fskit));
+    }
+
+    #[test]
+    fn fuse_config_backend_defaults_none_when_omitted() {
+        let yaml = "fuse:\n  enabled: true\n";
+        let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.backend, None);
+    }
+
+    #[test]
+    fn fuse_config_backend_rejects_unknown() {
+        let yaml = "fuse:\n  enabled: true\n  backend: bogus\n";
+        let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn fuse_config_helpers_set_mode_and_backend() {
+        assert_eq!(FuseConfig::on().mode(), FuseMode::On);
+        assert_eq!(FuseConfig::auto().mode(), FuseMode::Auto);
+        let f = FuseConfig::on().with_backend(FuseBackend::Fskit);
+        assert_eq!(f.backend, Some(FuseBackend::Fskit));
+        assert_eq!(f.mode(), FuseMode::On);
     }
 
     #[test]
