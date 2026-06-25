@@ -9,7 +9,9 @@
 //!   `GITHUB_TOKEN`, and (unlike a check run) never nests under another workflow's
 //!   check suite. One comment per job, reused across runs (found by a hidden marker)
 //!   so it's never spammed; within it each heph command (each step) keeps its own
-//!   section, so a job's earlier steps' results are preserved, not overwritten.
+//!   section, so a job's earlier steps' results are preserved, not overwritten. The
+//!   comment also records the workflow run id, so a *new* run's first step resets
+//!   the body instead of stacking its sections on the previous build's.
 //! - **At the end**: the full markdown is written once to `$GITHUB_STEP_SUMMARY`.
 //!
 //! The aggregation is intentionally self-contained (a small [`Tally`]) rather than
@@ -67,6 +69,11 @@ impl Phase {
 struct Tally {
     matched: BTreeSet<String>,
     matched_complete: bool,
+    /// Set once the build's event stream closes (`on_close`). The build is over,
+    /// so the status must settle: ✅ unless something failed. Without this the
+    /// emoji stays ⏳ whenever `done` never reaches `total` — e.g. transparent
+    /// group targets are matched but emit no `ResultEnd`, so they never finish.
+    closed: bool,
     finished: BTreeSet<String>,
     built: usize,
     cache_hit: BTreeSet<String>,
@@ -162,16 +169,18 @@ impl Tally {
         slow
     }
 
-    /// A status emoji for the CLI invocation, derived from the tally: ❌ if anything
-    /// failed, ✅ once every matched target is done, otherwise ⏳ (still running).
+    /// A status emoji reflecting whether *this invocation* is still running: ⏳
+    /// until its event stream closes, then ✅ (or ❌ if anything failed). Progress
+    /// counts (`done`/`total`) drive the targets line, not this — a matched
+    /// transparent group emits no `ResultEnd`, so `done == total` is unreliable as
+    /// a "finished" signal; the stream closing is the authoritative one.
     fn status_emoji(&self) -> &'static str {
-        let (done, total) = self.progress();
-        if !self.failed.is_empty() {
-            "❌"
-        } else if self.matched_complete && done == total {
+        if !self.closed {
+            "⏳"
+        } else if self.failed.is_empty() {
             "✅"
         } else {
-            "⏳"
+            "❌"
         }
     }
 
@@ -304,6 +313,23 @@ fn section_close(key: &str) -> String {
     format!("<!-- /heph-gha-step:{key} -->")
 }
 
+/// Hidden marker recording which workflow *run* last wrote the comment. The
+/// comment is reused across runs (found by the container marker), but each new
+/// run must start from a clean slate — otherwise the previous build's sections
+/// pile up. Comparing this marker on adopt tells a new run to reset.
+fn run_marker(run_id: &str) -> String {
+    format!("<!-- heph-gha-run:{run_id} -->")
+}
+
+/// Extract the run id from a comment body's [`run_marker`], or `None` if absent
+/// (e.g. a comment written before this marker existed). Pure (testable).
+fn parse_run_id(body: &str) -> Option<String> {
+    const OPEN: &str = "<!-- heph-gha-run:";
+    let after = body.find(OPEN).and_then(|i| body.get(i + OPEN.len()..))?;
+    let end = after.find(" -->")?;
+    after.get(..end).map(str::to_string)
+}
+
 /// Parse the ordered `(key, content)` sections out of a comment body. Tolerant:
 /// anything outside a well-formed open/close pair is ignored.
 fn parse_sections(body: &str) -> Vec<(String, String)> {
@@ -346,10 +372,13 @@ fn upsert_section(sections: &mut Vec<(String, String)>, key: &str, content: &str
     }
 }
 
-/// Serialize the comment body: the container marker (used to find the comment)
-/// followed by each section wrapped in its hidden delimiters.
-fn assemble_body(container_marker: &str, sections: &[(String, String)]) -> String {
+/// Serialize the comment body: the container marker (used to find the comment),
+/// the run marker (used to detect a new run on adopt), then each section wrapped
+/// in its hidden delimiters.
+fn assemble_body(container_marker: &str, run_id: &str, sections: &[(String, String)]) -> String {
     let mut s = String::from(container_marker);
+    s.push('\n');
+    s.push_str(&run_marker(run_id));
     s.push('\n');
     for (key, content) in sections {
         s.push_str(&format!(
@@ -388,6 +417,10 @@ struct CommentClient {
     pr: u64,
     /// Hidden marker (`<!-- heph-gha:<job> -->`) identifying *this job's* comment.
     container_marker: String,
+    /// Identifies the current workflow run (run id + attempt). When an adopted
+    /// comment carries a different run, its sections are from a prior build and
+    /// are reset. Empty outside Actions (local runs keep reusing the comment).
+    run_id: String,
     /// This process's section key (the heph command) within that comment.
     section_key: String,
     state: Mutex<CommentState>,
@@ -410,6 +443,15 @@ impl CommentClient {
             .ok()
             .and_then(nonempty)
             .unwrap_or_else(|| "https://api.github.com".to_string());
+        // Run id + attempt: a re-run of the same workflow gets a fresh attempt and
+        // must reset too, so both are folded in.
+        let run = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+        let attempt = std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default();
+        let run_id = if run.is_empty() && attempt.is_empty() {
+            String::new()
+        } else {
+            format!("{run}-{attempt}")
+        };
         Some(Self {
             http: std::sync::OnceLock::new(),
             api_url,
@@ -417,6 +459,7 @@ impl CommentClient {
             token,
             pr,
             container_marker: format!("<!-- heph-gha:{job_key} -->"),
+            run_id,
             section_key: section_key.to_string(),
             state: Mutex::new(CommentState::default()),
         })
@@ -477,12 +520,17 @@ impl CommentClient {
         if !st.loaded {
             if let Some((cid, body)) = self.fetch_existing() {
                 st.id = Some(cid);
-                st.sections = parse_sections(&body);
+                // Same run → inherit the other steps' sections. Different (or
+                // missing) run → the comment is from a prior build; start fresh so
+                // its stale sections don't pile up.
+                if parse_run_id(&body).as_deref() == Some(self.run_id.as_str()) {
+                    st.sections = parse_sections(&body);
+                }
             }
             st.loaded = true;
         }
         upsert_section(&mut st.sections, &self.section_key, &markdown);
-        let body = assemble_body(&self.container_marker, &st.sections);
+        let body = assemble_body(&self.container_marker, &self.run_id, &st.sections);
 
         let mut payload = serde_json::Map::new();
         payload.insert("body".into(), serde_json::json!(body));
@@ -670,6 +718,12 @@ impl Hook for GhaHook {
         // summary once — all synchronously, so they complete before the plugin
         // acks the host (which is the host's drain barrier before process exit).
         self.inner.stop.store(true, Ordering::Release);
+        // Settle the status before the final render: the build is over.
+        self.inner
+            .tally
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed = true;
         if let Some(c) = &self.inner.comment {
             c.sync(self.inner.render_markdown());
         }
@@ -755,7 +809,9 @@ mod tests {
 
     #[test]
     fn markdown_reports_counts_slow_and_failures() {
-        let t = scripted();
+        let mut t = scripted();
+        // The build has ended (stream closed) with a failure recorded.
+        t.closed = true;
         // now far enough past //a:z's start to mark it slow.
         let md = t.render_markdown(SLOW_THRESHOLD_MS + 5_000, "heph: test");
 
@@ -791,14 +847,12 @@ mod tests {
                 complete: true,
             },
         ));
-        // Matched but nothing finished → running.
+        // Stream still open → running, regardless of how much has finished.
         assert_eq!(t.status_emoji(), "⏳");
         assert!(
             t.render_markdown(0, "heph: test")
                 .contains("## ⏳ heph: test")
         );
-
-        // All matched finished, no failure → success.
         t.apply(&ev(
             1,
             BuildEventKind::ResultEnd {
@@ -806,9 +860,13 @@ mod tests {
                 error: None,
             },
         ));
+        assert_eq!(t.status_emoji(), "⏳", "still running until the stream closes");
+
+        // Stream closes with no failure → success.
+        t.closed = true;
         assert_eq!(t.status_emoji(), "✅");
 
-        // A failure flips it to failed regardless of progress.
+        // A failure flips a closed invocation to failed.
         t.apply(&ev(
             2,
             BuildEventKind::ResultEnd {
@@ -906,6 +964,7 @@ mod tests {
         let container = "<!-- heph-gha:test -->";
         let mut sections = parse_sections(&assemble_body(
             container,
+            "run1",
             &[
                 ("run //a:x".into(), "## heph: run //a:x\nbuilt 1".into()),
                 ("run //b:y".into(), "## heph: run //b:y\nbuilt 2".into()),
@@ -915,7 +974,7 @@ mod tests {
 
         // A third step updates only its own section; the others stay.
         upsert_section(&mut sections, "run //a:x", "## heph: run //a:x\nbuilt 9");
-        let body = assemble_body(container, &sections);
+        let body = assemble_body(container, "run1", &sections);
         assert!(body.starts_with(container), "container marker kept: {body}");
         assert!(body.contains("built 9"), "own section updated: {body}");
         assert!(body.contains("built 2"), "other step preserved: {body}");
@@ -928,9 +987,72 @@ mod tests {
         // A brand-new command appends a section rather than clobbering.
         upsert_section(&mut sections, "query //...", "## heph: query //...\nok");
         assert_eq!(
-            parse_sections(&assemble_body(container, &sections)).len(),
+            parse_sections(&assemble_body(container, "run1", &sections)).len(),
             3
         );
+    }
+
+    #[test]
+    fn run_marker_round_trips_and_signals_new_run() {
+        let container = "<!-- heph-gha:test -->";
+        // A first run wrote three steps' sections.
+        let body = assemble_body(
+            container,
+            "10-1",
+            &[
+                ("run //a:x".into(), "x".into()),
+                ("run //b:y".into(), "y".into()),
+                ("run //c:z".into(), "z".into()),
+            ],
+        );
+        assert_eq!(parse_run_id(&body).as_deref(), Some("10-1"));
+        assert_eq!(parse_sections(&body).len(), 3);
+
+        // The next build (different run id) detects the mismatch — its first step
+        // resets the sections instead of stacking onto the prior three.
+        let prev = parse_run_id(&body);
+        let current = "11-1";
+        let mut sections = if prev.as_deref() == Some(current) {
+            parse_sections(&body)
+        } else {
+            Vec::new()
+        };
+        upsert_section(&mut sections, "run //a:x", "fresh");
+        let new_body = assemble_body(container, current, &sections);
+        let reparsed = parse_sections(&new_body);
+        assert_eq!(reparsed.len(), 1, "stale sections cleared: {new_body}");
+        assert_eq!(reparsed[0].0, "run //a:x");
+        assert_eq!(parse_run_id(&new_body).as_deref(), Some(current));
+
+        // A comment from before this marker existed has no run id → also resets.
+        assert_eq!(parse_run_id("<!-- heph-gha:test -->\nlegacy"), None);
+    }
+
+    #[test]
+    fn status_settles_to_success_when_stream_closes() {
+        let mut t = Tally::default();
+        // Matched a target that never finishes (e.g. a transparent group emits no
+        // ResultEnd), and the matcher set was never marked complete.
+        t.apply(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: vec!["//a:grp".into()],
+                complete: false,
+            },
+        ));
+        assert_eq!(t.status_emoji(), "⏳", "still running before close");
+
+        // Stream closes: build is over, nothing failed → success, not stuck ⏳.
+        t.closed = true;
+        assert_eq!(t.status_emoji(), "✅");
+        assert!(
+            t.render_markdown(0, "heph: test").contains("## ✅ heph: test"),
+            "checkbox in final render"
+        );
+
+        // A failure still wins over the closed-success default.
+        t.failed.push(("//a:grp".into(), Some("boom".into())));
+        assert_eq!(t.status_emoji(), "❌");
     }
 
     #[test]
