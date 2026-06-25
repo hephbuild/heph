@@ -233,12 +233,23 @@ pub fn root(ws: &Workspace) -> &Path {
 
 /// Ground-truth probe: does a real FUSE mount succeed on this host right now?
 ///
-/// Mounts an empty overlay at a throwaway temp dir and immediately unmounts.
-/// Unlike `hsandboxfuse::support_check` (which only sniffs for installed
-/// userland and can be optimistic on macOS), this exercises the actual mount
-/// path, so a forced-on FUSE test can reliably skip when FUSE is installed but
-/// not usable (e.g. macFUSE present but its system extension not approved, or
-/// `/dev/fuse` not accessible in a container).
+/// Mounts an empty overlay and immediately unmounts. Unlike
+/// `hsandboxfuse::support_check` (which only sniffs for installed userland and
+/// can be optimistic on macOS), this exercises the actual mount path, so a
+/// forced-on FUSE test can reliably skip when FUSE is installed but not usable
+/// (e.g. macFUSE present but neither its kext nor its FSKit extension approved,
+/// or `/dev/fuse` not accessible in a container).
+///
+/// It mirrors the engine's backend ordering (`backend_candidates` /
+/// `backend_mountpoint` in `engine.rs`): on macOS the forced-on e2e workspaces
+/// use `FuseConfig::on()` (auto backend), so the engine tries the kext first
+/// then falls back to FSKit. The probe tries the same sequence and reports
+/// usable when *either* mounts — otherwise the suite would skip on a kext-less
+/// mac even though the engine would happily mount via FSKit.
+///
+/// The result is cached: the probe mounts at most once per process (so parallel
+/// tests don't race on the FSKit `/Volumes` mountpoint) and the outcome is
+/// stable for the host.
 ///
 /// The `support_check` gate is load-bearing on macOS, not just an optimization:
 /// libfuse is weak-linked there (see sandboxfuse `build.rs`), so its symbols
@@ -246,19 +257,53 @@ pub fn root(ws: &Workspace) -> &Path {
 /// once `support_check` confirms macFUSE is present — calling it otherwise
 /// dereferences a null symbol and SIGSEGVs instead of returning an `Err`.
 pub fn fuse_mount_works() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(probe_fuse_mount)
+}
+
+fn probe_fuse_mount() -> bool {
     if !hsandboxfuse::support_check().is_available() {
         return false;
     }
+    // macOS auto-order is kext → FSKit; every other platform has the single
+    // kernel backend. Kept in sync with `engine::backend_candidates`.
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        hsandboxfuse::MountBackend::Kernel,
+        hsandboxfuse::MountBackend::Fskit,
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let candidates = [hsandboxfuse::MountBackend::Kernel];
+
+    candidates.into_iter().any(probe_backend)
+}
+
+/// Attempt one backend at the mountpoint the engine would use for it
+/// (`engine::backend_mountpoint`): the kernel/kext backend mounts at a writable
+/// temp dir; FSKit mounts only under `/Volumes`, where macFUSE's privileged
+/// service creates the volume. Returns true iff the mount comes up.
+fn probe_backend(backend: hsandboxfuse::MountBackend) -> bool {
     let Ok(dir) = tempfile::tempdir() else {
         return false;
     };
-    let lower = dir.path().join("lower");
     let upper = dir.path().join("upper");
-    if std::fs::create_dir_all(&lower).is_err() || std::fs::create_dir_all(&upper).is_err() {
+    if std::fs::create_dir_all(&upper).is_err() {
         return false;
     }
+    let lower = match backend {
+        hsandboxfuse::MountBackend::Fskit => {
+            PathBuf::from(format!("/Volumes/heph-probe-{}", std::process::id()))
+        }
+        hsandboxfuse::MountBackend::Kernel => {
+            let lower = dir.path().join("lower");
+            if std::fs::create_dir_all(&lower).is_err() {
+                return false;
+            }
+            lower
+        }
+    };
     let fs = Arc::new(hsandboxfuse::LayeredFs::new_empty(upper));
-    match hsandboxfuse::Mount::mount(&lower, fs, hsandboxfuse::MountBackend::default()) {
+    match hsandboxfuse::Mount::mount(&lower, fs, backend) {
         Ok(m) => {
             drop(m);
             true
