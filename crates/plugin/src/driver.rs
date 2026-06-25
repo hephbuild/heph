@@ -801,6 +801,17 @@ pub mod outputartifact {
         pub source_path: String,
         pub out_path: String,
         pub x: bool,
+        /// When true, `source_path` is a durable workspace source file (not a
+        /// sandbox-produced output) and is safe to reference by path for the
+        /// whole build. The engine's local-cache write skips tar-packing such
+        /// an artifact on the *uncached* (tmp) path and reads the source
+        /// directly on consume — see [`Engine::cache_locally`]. Only set by
+        /// source providers (e.g. `@heph/fs:file`); a driver whose output lives
+        /// in a sandbox that is cleaned after caching MUST leave this false, or
+        /// the path dangles before the consumer reads it.
+        ///
+        /// [`Engine::cache_locally`]: ../../../../engine/index.html
+        pub passthrough: bool,
     }
 
     #[derive(Clone)]

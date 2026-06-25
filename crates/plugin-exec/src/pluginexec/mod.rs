@@ -1356,6 +1356,9 @@ impl Driver {
                         .parse()?,
                     out_path: "log.txt".to_string(),
                     x: false,
+                    // Log lives in the sandbox (cleaned after caching): never
+                    // passthrough — it must be packed into the cache.
+                    passthrough: false,
                 }),
                 hashout: "".to_string(),
             }],

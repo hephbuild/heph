@@ -755,6 +755,9 @@ pub fn output_artifact_from_pb(oa: pb::OutputArtifactRef) -> OutputArtifact {
             source_path: f.source_path,
             out_path: f.out_path,
             x: f.x,
+            // Passthrough does not cross the plugin ABI yet (no proto field):
+            // out-of-process plugins always pack. Safe default.
+            passthrough: false,
         }),
         Some(pb::output_artifact_ref::Content::Raw(r)) => OaContent::Raw(ContentRaw {
             data: r.data.to_vec(),

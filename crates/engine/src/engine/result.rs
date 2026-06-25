@@ -254,33 +254,89 @@ impl Content for GuardedArtifact {
     }
 }
 
-/// Build an [`EResult`] from cached artifacts, filtering by output group and
+/// One produced output of a target as it travels the result pipeline: an opaque
+/// [`Content`] handle plus the group/type metadata that [`build_eresult`] and
+/// codegen write-back need. The content is either a cache-backed [`CacheArtifact`]
+/// (the normal stored/packed path) or a zero-copy passthrough — e.g. an
+/// `@heph/fs:file` source file that never entered the local cache, carried as
+/// its raw [`OutputArtifact`](outputartifact::OutputArtifact). Passthrough
+/// artifacts skip [`Engine::cache_locally`] entirely, so they are never of type
+/// `CacheArtifact`.
+#[derive(Clone)]
+pub struct ResultArtifact {
+    pub content: Arc<dyn Content>,
+    pub group: String,
+    pub r#type: ManifestArtifactType,
+}
+
+impl ResultArtifact {
+    /// Wrap a cache-backed artifact (the normal stored/packed output).
+    fn from_cache(a: CacheArtifact) -> Self {
+        Self {
+            group: a.group.clone(),
+            r#type: a.r#type.clone(),
+            content: Arc::new(a),
+        }
+    }
+
+    /// Wrap a zero-copy passthrough output that skipped the local cache. The
+    /// `OutputArtifact` itself is the `Content`: for a `Content::File` it walks
+    /// to the single source file at its `out_path`, reading the durable source
+    /// path directly (no tar, no cache blob).
+    fn passthrough(a: outputartifact::OutputArtifact) -> Self {
+        Self {
+            group: a.group.clone(),
+            r#type: manifest_artifact_type(&a.r#type),
+            content: Arc::new(a),
+        }
+    }
+}
+
+fn manifest_artifact_type(t: &outputartifact::Type) -> ManifestArtifactType {
+    match t {
+        outputartifact::Type::Output => ManifestArtifactType::Output,
+        outputartifact::Type::Log => ManifestArtifactType::Log,
+        outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+    }
+}
+
+/// Whether a produced output is a zero-copy source-file passthrough that must
+/// skip the local cache. True only on the uncached (`tmp`) path AND when its
+/// producer flagged a `Content::File` as a durable source reference (e.g.
+/// `@heph/fs:file`). A cacheable revision must own a durable copy of its bytes
+/// (`source_path` may change/vanish across runs), so it is never a passthrough.
+fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> bool {
+    use_tmp_cache && matches!(content, outputartifact::Content::File(f) if f.passthrough)
+}
+
+/// Build an [`EResult`] from produced artifacts, filtering by output group and
 /// type, and attaching `guard` (the read lock for this target's cache entry) to
 /// each kept artifact. `guard` is `None` only for the non-cacheable (force/shell)
 /// path, whose artifacts are ephemeral and need no long-lived lock.
 fn build_eresult(
-    cached: Vec<CacheArtifact>,
+    produced: Vec<ResultArtifact>,
     artifacts_meta: Vec<ArtifactMeta>,
     outputs: &[String],
     guard: Option<Arc<ResultReadGuard>>,
 ) -> EResult {
-    let wrap = |a: CacheArtifact| -> Arc<dyn Content> {
-        let inner: Arc<dyn Content> = Arc::new(a);
+    let wrap = |content: Arc<dyn Content>| -> Arc<dyn Content> {
         match &guard {
             Some(lock) => Arc::new(GuardedArtifact {
-                inner,
+                inner: content,
                 _lock: Arc::clone(lock),
             }),
-            None => inner,
+            None => content,
         }
     };
 
     let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
     let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
-    for a in cached {
+    for a in produced {
         match a.r#type {
-            ManifestArtifactType::Output if outputs.contains(&a.group) => artifacts.push(wrap(a)),
-            ManifestArtifactType::SupportFile => support_artifacts.push(wrap(a)),
+            ManifestArtifactType::Output if outputs.contains(&a.group) => {
+                artifacts.push(wrap(a.content))
+            }
+            ManifestArtifactType::SupportFile => support_artifacts.push(wrap(a.content)),
             _ => {}
         }
     }
@@ -383,7 +439,7 @@ pub(crate) struct LockedResolution {
 /// cell (every output group), shared across all `(outputs, is_top)` callers and
 /// filtered per caller by [`build_eresult`].
 struct ExecutedArtifacts {
-    cached: Vec<CacheArtifact>,
+    cached: Vec<ResultArtifact>,
     meta: Vec<ArtifactMeta>,
 }
 
@@ -939,15 +995,18 @@ impl Engine {
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<EResult> {
         let locked = self.clone().resolve_locked(rs.clone(), def, opts).await?;
-        let (cached, meta) = match &locked.executed {
+        let (cached, meta): (Vec<ResultArtifact>, Vec<ArtifactMeta>) = match &locked.executed {
             // This cell produced the artifacts; filter the full set to `outputs`.
+            // Already `ResultArtifact`s (cache-backed or passthrough).
             Some(ex) => (ex.cached.clone(), ex.meta.clone()),
             // Pre-existing hit: read only this caller's outputs under the shared
             // riding read. Silent — the shared cell already emitted the addr's
             // hit/miss event; re-emitting per caller would double-count. Reuse the
             // manifest the probe already parsed (shared across all callers of this
             // single-flight cell) instead of re-reading + re-deserializing it;
-            // fall back to a fresh read only if it is somehow absent.
+            // fall back to a fresh read only if it is somehow absent. A cache hit
+            // is always cache-backed (a passthrough never wrote a manifest), so
+            // every artifact maps through `from_cache`.
             None => {
                 let res = match &locked.manifest {
                     Some(manifest) => {
@@ -971,12 +1030,19 @@ impl Engine {
                             .await?
                     }
                 };
-                res.with_context(|| {
+                let (cache_arts, meta) = res.with_context(|| {
                     format!(
                         "result lock confirmed a cache entry for {} but it vanished before read",
                         def.target.addr
                     )
-                })?
+                })?;
+                (
+                    cache_arts
+                        .into_iter()
+                        .map(ResultArtifact::from_cache)
+                        .collect(),
+                    meta,
+                )
             }
         };
 
@@ -1239,7 +1305,7 @@ impl Engine {
         &self,
         is_top: bool,
         def: &LinkedTargetDef,
-        cached: &[CacheArtifact],
+        cached: &[ResultArtifact],
         frozen: bool,
     ) -> anyhow::Result<()> {
         use crate::engine::driver::targetdef::path::CodegenMode;
@@ -1291,6 +1357,7 @@ impl Engine {
             if frozen {
                 // Compare each generated file against the tree; never write.
                 let walker = artifact
+                    .content
                     .walk()
                     .with_context(|| format!("walk codegen output for frozen check: {group}"))?;
                 for entry in walker {
@@ -1370,6 +1437,7 @@ impl Engine {
                 // churn and pointless mtime bumps.
                 let stamp = def.target.addr.format();
                 let walker = artifact
+                    .content
                     .walk()
                     .with_context(|| format!("walk codegen output for write-back: {group}"))?;
                 for entry in walker {
@@ -1483,7 +1551,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<(Vec<CacheArtifact>, Vec<ArtifactMeta>)> {
+    ) -> anyhow::Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>)> {
         let addr = opts.def.target.addr.clone();
         let hashin = opts.hashin.clone();
         let spec = opts.spec.clone();
@@ -1531,21 +1599,62 @@ impl Engine {
                     }
 
                     hcore::hmemoizer::set_phase("execute_cache:cache_locally");
-                    let write_addr = addr.format();
-                    let out = crate::engine::event::emit_scope(
-                        &rs,
-                        crate::engine::event::BuildEventKind::LocalCacheWriteStart {
-                            addr: write_addr.clone(),
-                        },
-                        move |error| crate::engine::event::BuildEventKind::LocalCacheWriteEnd {
-                            addr: write_addr,
-                            error,
-                        },
-                        engine.cache_locally(rs.ctoken(), &addr, &hashin, artifacts, use_tmp_cache),
-                    )
-                    .await
-                    .map(|cached| (cached, artifacts_meta))
-                    .with_context(|| format!("cache_locally {addr}"));
+
+                    // Partition produced outputs. A zero-copy passthrough (an
+                    // uncached source file flagged by its producer — e.g.
+                    // `@heph/fs:file`) skips the local cache entirely and is
+                    // carried as its raw `OutputArtifact`, so the cache-write
+                    // hot path does no file read, tar, or copy. Everything else
+                    // is packed/stored by `cache_locally`. Order is irrelevant —
+                    // `build_eresult` filters by (group, type), not position —
+                    // so the two sets are simply concatenated below.
+                    let mut passthrough: Vec<ResultArtifact> = Vec::new();
+                    let mut to_cache: Vec<outputartifact::OutputArtifact> = Vec::new();
+                    for artifact in artifacts {
+                        if is_passthrough(use_tmp_cache, &artifact.content) {
+                            passthrough.push(ResultArtifact::passthrough(artifact));
+                        } else {
+                            to_cache.push(artifact);
+                        }
+                    }
+
+                    // Only emit a LocalCacheWrite span (and run `cache_locally`)
+                    // when there is something to store — an all-passthrough
+                    // target writes nothing here, so no "cache write" phase.
+                    let cached = if to_cache.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        let write_addr = addr.format();
+                        crate::engine::event::emit_scope(
+                            &rs,
+                            crate::engine::event::BuildEventKind::LocalCacheWriteStart {
+                                addr: write_addr.clone(),
+                            },
+                            move |error| {
+                                crate::engine::event::BuildEventKind::LocalCacheWriteEnd {
+                                    addr: write_addr,
+                                    error,
+                                }
+                            },
+                            engine.cache_locally(
+                                rs.ctoken(),
+                                &addr,
+                                &hashin,
+                                to_cache,
+                                use_tmp_cache,
+                            ),
+                        )
+                        .await
+                    };
+
+                    let out = cached
+                        .map(move |cached| {
+                            let mut produced = passthrough;
+                            produced
+                                .extend(cached.into_iter().map(ResultArtifact::from_cache));
+                            (produced, artifacts_meta)
+                        })
+                        .with_context(|| format!("cache_locally {addr}"));
 
                     // Remote push: fire-and-forget on a background task (tracked
                     // by `bg_pending`, so the CLI/TUI stays open until it drains).
@@ -2128,6 +2237,80 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    fn file_output(
+        source_path: &str,
+        out_path: &str,
+        passthrough: bool,
+    ) -> outputartifact::OutputArtifact {
+        outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: "f".to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::File(outputartifact::ContentFile {
+                source_path: source_path.to_string(),
+                out_path: out_path.to_string(),
+                x: false,
+                passthrough,
+            }),
+            hashout: "h".to_string(),
+        }
+    }
+
+    /// Passthrough is gated two ways: only on the uncached (`tmp`) path, and only
+    /// for a producer-flagged `Content::File`. A cacheable revision, an unflagged
+    /// file, or any non-file content is never a passthrough — it must be packed.
+    #[test]
+    fn is_passthrough_gates_on_tmp_and_producer_flag() {
+        let flagged = file_output("/ws/go.mod", "go.mod", true).content;
+        let unflagged = file_output("/ws/go.mod", "go.mod", false).content;
+        let raw = outputartifact::Content::Raw(outputartifact::ContentRaw {
+            data: vec![1, 2, 3],
+            path: "x".to_string(),
+            x: false,
+        });
+
+        assert!(is_passthrough(true, &flagged), "tmp + flagged file");
+        assert!(!is_passthrough(false, &flagged), "cacheable must pack");
+        assert!(
+            !is_passthrough(true, &unflagged),
+            "unflagged file must pack"
+        );
+        assert!(!is_passthrough(true, &raw), "non-file must pack");
+    }
+
+    /// A passthrough `ResultArtifact` is the raw `OutputArtifact` as `Content`: it
+    /// never becomes a `CacheArtifact`, carries no cache blob, and `walk()` yields
+    /// the single source file at its `out_path`, read directly from the durable
+    /// `source_path`. `seekable_reader`/`file_path` stay `None` so the FUSE
+    /// tar-index path is bypassed and consumers materialize via generic unpack.
+    #[tokio::test]
+    async fn passthrough_result_artifact_reads_source_without_cache() {
+        let dir = tempdir().expect("tempdir");
+        let source_path = dir.path().join("go.mod");
+        std::fs::write(&source_path, b"module example\n").expect("write");
+
+        let oa = file_output(source_path.to_str().expect("utf8"), "mgmt/go/go.mod", true);
+        let ra = ResultArtifact::passthrough(oa);
+
+        assert_eq!(ra.group, "out");
+        assert_eq!(ra.r#type, ManifestArtifactType::Output);
+        // No cache backing: a passthrough exposes neither a seekable tar nor a
+        // cache file path.
+        assert!(ra.content.seekable_reader().expect("seekable").is_none());
+        assert!(ra.content.file_path().is_none());
+
+        let mut walk = ra.content.walk().expect("walk");
+        let entry = walk.next().expect("one entry").expect("ok");
+        assert!(walk.next().is_none(), "single file");
+        assert_eq!(entry.path, std::path::PathBuf::from("mgmt/go/go.mod"));
+        let WalkEntryKind::File { mut data, .. } = entry.kind else {
+            panic!("expected file entry");
+        };
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut data, &mut buf).expect("read");
+        assert_eq!(buf, b"module example\n");
+    }
 
     /// Minimal [`Content`] for guard-lifetime tests; carries no real bytes.
     struct DummyContent;
