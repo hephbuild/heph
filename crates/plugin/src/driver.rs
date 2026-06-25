@@ -695,14 +695,14 @@ pub mod targetdef {
         use serde::Serialize;
         use std::fmt::Display;
 
-        #[derive(Clone, Serialize)]
+        #[derive(Clone, Debug, Serialize)]
         pub struct Path {
             pub content: Content,
             pub codegen_tree: CodegenMode,
             pub collect: bool,
         }
 
-        #[derive(Clone, Serialize)]
+        #[derive(Clone, Debug, Serialize)]
         pub enum Content {
             FilePath(String),
             DirPath(String),

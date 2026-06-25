@@ -310,12 +310,13 @@ impl Driver {
     }
 }
 
-fn spec_path_to_target_path(raw: &str, pkg: &hmodel::htpkg::PkgBuf, codegen: &CodegenMode) -> Path {
-    let path = if pkg.is_empty() {
-        raw.to_string()
-    } else {
-        format!("{}/{}", pkg, raw)
-    };
+fn spec_path_to_target_path(
+    raw: &str,
+    pkg: &hmodel::htpkg::PkgBuf,
+    codegen: &CodegenMode,
+) -> anyhow::Result<Path> {
+    let path = hmodel::htpkg::join_rel_checked(pkg.as_str(), raw)
+        .with_context(|| format!("resolving output path {raw:?} in package {pkg}"))?;
     let content = if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
         Content::Glob(path)
     } else if path.ends_with('/') {
@@ -323,11 +324,11 @@ fn spec_path_to_target_path(raw: &str, pkg: &hmodel::htpkg::PkgBuf, codegen: &Co
     } else {
         Content::FilePath(path)
     };
-    Path {
+    Ok(Path {
         content,
         codegen_tree: codegen.clone(),
         collect: true,
-    }
+    })
 }
 
 fn decode_path(opts: &hplugin::config::Options) -> anyhow::Result<Vec<String>> {
@@ -604,6 +605,26 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             format!("{:x}", h.finish()).into_bytes()
         };
 
+        let outputs = spec
+            .outputs
+            .iter()
+            .map(|(k, v)| {
+                Ok(Output {
+                    group: k.clone(),
+                    paths: v
+                        .iter()
+                        .map(|p| spec_path_to_target_path(p, &pkg, &spec.codegen))
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let support_files = spec
+            .support_files
+            .iter()
+            .map(|p| spec_path_to_target_path(p, &pkg, &CodegenMode::None))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         Ok(ParseResponse {
             target_def: EngineTargetDef {
                 addr: req.target_spec.addr.clone(),
@@ -616,22 +637,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .chain(runtime_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(tool_inputs.into_iter().map(|(_, v)| v))
                     .collect(),
-                outputs: spec
-                    .outputs
-                    .iter()
-                    .map(|(k, v)| Output {
-                        group: k.clone(),
-                        paths: v
-                            .iter()
-                            .map(|p| spec_path_to_target_path(p, &pkg, &spec.codegen))
-                            .collect(),
-                    })
-                    .collect(),
-                support_files: spec
-                    .support_files
-                    .iter()
-                    .map(|p| spec_path_to_target_path(p, &pkg, &CodegenMode::None))
-                    .collect(),
+                outputs,
+                support_files,
                 cache: CacheConfig {
                     enabled: spec.cache.local,
                     remote_enabled: spec.cache.remote,
@@ -1364,6 +1371,47 @@ mod tests {
     use hdriver_support::driver_managed::ManagedDriver;
     use hmodel::htaddr::Addr;
     use hplugin::driver::RunRequest;
+
+    #[test]
+    fn spec_path_to_target_path_normalizes_and_classifies() {
+        use hmodel::htpkg::PkgBuf;
+
+        let pkg = PkgBuf::from("a/b/rest");
+
+        // `./`-prefixed output path no longer leaks a `pkg/./sub` smell.
+        let file = spec_path_to_target_path("./openapi/X.yaml", &pkg, &CodegenMode::Copy).unwrap();
+        assert!(
+            matches!(&file.content, Content::FilePath(p) if p == "a/b/rest/openapi/X.yaml"),
+            "got {}",
+            file.content
+        );
+        assert_eq!(file.codegen_tree, CodegenMode::Copy);
+
+        // Trailing slash classifies as a directory output.
+        let dir = spec_path_to_target_path("./gen/", &pkg, &CodegenMode::None).unwrap();
+        assert!(
+            matches!(&dir.content, Content::DirPath(p) if p == "a/b/rest/gen/"),
+            "got {}",
+            dir.content
+        );
+
+        // Glob metacharacters survive normalization.
+        let glob = spec_path_to_target_path("./gen/**/*.go", &pkg, &CodegenMode::None).unwrap();
+        assert!(
+            matches!(&glob.content, Content::Glob(p) if p == "a/b/rest/gen/**/*.go"),
+            "got {}",
+            glob.content
+        );
+
+        // A `..` that escapes the workspace root (more `..` than path depth) is a
+        // hard error.
+        let err = spec_path_to_target_path("../../../../etc/passwd", &pkg, &CodegenMode::None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resolving output path"),
+            "got {err}"
+        );
+    }
 
     fn make_req<'a, 'io>(request: RunRequest<'a, 'io>) -> ManagedRunRequest<'a, 'io> {
         let path = request.sandbox_dir.clone();
