@@ -266,9 +266,20 @@ pub enum FuseMode {
     Auto,
 }
 
+/// Default mode when `enabled` is omitted (no `fuse:` block, or `fuse: {}`).
+/// Platform-gated: Linux auto-enables FUSE (the engine decides per target),
+/// while macOS and every other platform default off — the macOS backends
+/// (kext / FSKit) each need a one-time, often admin- or MDM-gated approval
+/// that can't be assumed present, so FUSE stays opt-in there.
+#[cfg(target_os = "linux")]
+const DEFAULT_OMITTED_MODE: FuseMode = FuseMode::Auto;
+#[cfg(not(target_os = "linux"))]
+const DEFAULT_OMITTED_MODE: FuseMode = FuseMode::Off;
+
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
-/// default to off; FUSE is opt-in.
+/// take the platform default ([`DEFAULT_OMITTED_MODE`]): `auto` on Linux,
+/// `off` on macOS and elsewhere.
 ///
 /// `backend` (macOS only) selects the userspace FUSE backend: `kext` (the
 /// classic kernel-extension path — fastest, but the macFUSE system extension
@@ -335,11 +346,13 @@ impl FuseConfig {
         match self.enabled {
             Some(FuseEnabled::On) => FuseMode::On,
             Some(FuseEnabled::Auto) => FuseMode::Auto,
-            Some(FuseEnabled::Off) | None => FuseMode::Off,
+            Some(FuseEnabled::Off) => FuseMode::Off,
+            None => DEFAULT_OMITTED_MODE,
         }
     }
 
-    /// Convenience: FUSE off (explicit `enabled: false` or omitted).
+    /// Convenience: is FUSE off? (explicit `enabled: false`, or omitted on a
+    /// platform whose [`DEFAULT_OMITTED_MODE`] is `Off`, i.e. non-Linux).
     pub fn is_off(&self) -> bool {
         matches!(self.mode(), FuseMode::Off)
     }
@@ -818,9 +831,19 @@ caches:
         let yaml = "fuse: {}\n";
         let cfg: ConfigYaml = serde_yaml::from_str(yaml).expect("parse");
         let f = cfg.fuse.expect("fuse present");
-        assert_eq!(f.mode(), FuseMode::Off);
-        assert!(f.is_off());
+        // Omitted `enabled` takes the platform default: auto on Linux, off
+        // on macOS/elsewhere.
         assert!(!f.is_on());
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(f.mode(), FuseMode::Auto);
+            assert!(!f.is_off());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(f.mode(), FuseMode::Off);
+            assert!(f.is_off());
+        }
     }
 
     #[test]
@@ -848,11 +871,14 @@ caches:
     }
 
     #[test]
-    fn fuse_config_default_struct_is_off() {
+    fn fuse_config_default_struct_takes_platform_default() {
         let f = FuseConfig::default();
-        assert_eq!(f.mode(), FuseMode::Off);
-        assert!(f.is_off());
         assert_eq!(f.backend, None);
+        assert!(!f.is_on());
+        #[cfg(target_os = "linux")]
+        assert_eq!(f.mode(), FuseMode::Auto);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(f.mode(), FuseMode::Off);
     }
 
     #[test]

@@ -31,7 +31,10 @@ plugins:
 # Sandbox FUSE overlay. `enabled: true | false | auto` — when on, inputs are
 # served from an in-memory union filesystem instead of being copied into each
 # sandbox (faster for large dep sets). `auto` uses FUSE only past an input-size
-# threshold. On macOS, `backend` picks the userspace backend: `kext` (default;
+# threshold. Omit `enabled` (or the whole `fuse:` block) to take the platform
+# default: `auto` on Linux, `off` on macOS (the macOS backends each need a
+# one-time approval that can't be assumed present).
+# On macOS, `backend` picks the userspace backend: `kext` (default;
 # fastest, needs the macFUSE system extension approved) or `fskit` (Apple FSKit,
 # macOS 15.4+; unprivileged — no kext — but mounts under /Volumes and needs the
 # macFUSE FSKit file-system extension enabled). Ignored on Linux.
