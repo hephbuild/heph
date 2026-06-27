@@ -11,7 +11,8 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoCompileDriver, GoGolistDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoCompileDriver, GoGolistDriver, GoLintDriver, GoLintGateDriver, GoTestmainDriver,
+    GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{DynLogSink, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
@@ -88,6 +89,18 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "go_testmain".into(),
         driver: make_dyn_managed_driver(testmain),
+    });
+    // Per-package go/analysis (vet) with serialized facts, nogo-style.
+    let lint: Arc<dyn ManagedDriver> = Arc::new(GoLintDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_lint".into(),
+        driver: make_dyn_managed_driver(lint),
+    });
+    // Gate: fails the build when a package's lint report has findings.
+    let lint_gate: Arc<dyn ManagedDriver> = Arc::new(GoLintGateDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_lint_gate".into(),
+        driver: make_dyn_managed_driver(lint_gate),
     });
 
     Ok(PluginComponents {

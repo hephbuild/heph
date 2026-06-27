@@ -1,6 +1,7 @@
 mod addr_util;
 mod driver_compile;
 mod driver_golist;
+mod driver_lint;
 mod driver_testmain;
 mod embed;
 pub(crate) mod errors;
@@ -19,6 +20,7 @@ mod toolchain;
 
 pub use driver_compile::GoCompileDriver;
 pub use driver_golist::GoGolistDriver;
+pub use driver_lint::{GoLintDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;
 pub use provider::{Config, Provider};
 pub use toolchain::GoToolchainDriver;
