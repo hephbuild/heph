@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use clap::Args;
 use clap_complete::engine::ArgValueCompleter;
@@ -72,11 +73,19 @@ pub struct RunArgs {
     #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
     pub shell: Option<String>,
     /// Print output artifacts to stdout
-    #[arg(long = "cat-out")]
+    #[arg(long = "cat-out", conflicts_with = "list_out")]
     pub cat_out: bool,
     /// Print output file list to stdout
     #[arg(long = "list-out")]
     pub list_out: bool,
+    /// Copy output artifacts into DIR (created if needed).
+    /// Relative paths resolve against the current directory.
+    #[arg(long = "copy-out", value_name = "DIR")]
+    pub copy_out: Option<String>,
+    /// Restrict --cat-out/--list-out/--copy-out to these output names
+    /// (repeatable). When omitted, all of the target's outputs are considered.
+    #[arg(long = "output", value_name = "NAME")]
+    pub output: Vec<String>,
     /// Fail if generated output differs from the tree (CI check)
     #[arg(long = "frozen")]
     pub frozen: bool,
@@ -164,17 +173,23 @@ impl App for RunApp {
         // `finalize!` paved road handles rendering and exit uniformly. The engine
         // already returns `Err` for cancellation and genuine top-level failures;
         // per-addr failures (default, fail-fast off) live in the request's failure registry.
+        let outputs = if self.args.output.is_empty() {
+            OutputMatcher::All
+        } else {
+            OutputMatcher::Exact(self.args.output.clone())
+        };
+
         let res = match self.matcher {
             Matcher::Addr(addr) => self
                 .engine
                 .clone()
-                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .result_addr(rs.clone(), &addr, outputs, &opts)
                 .await
                 .map(|r| vec![r]),
             m => self
                 .engine
                 .clone()
-                .result(rs.clone(), &m, &opts)
+                .result(rs.clone(), &m, outputs, &opts)
                 .await
                 .map(|batch| batch.ok),
         };
@@ -201,6 +216,24 @@ impl App for RunApp {
                         for e in a.walk()? {
                             println!("{}", e?.path.display());
                         }
+                    }
+                }
+            }
+            if let Some(dir) = &self.args.copy_out {
+                let dst = std::path::Path::new(dir);
+                let dst = if dst.is_absolute() {
+                    dst.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .context("resolve current directory for --copy-out")?
+                        .join(dst)
+                };
+                std::fs::create_dir_all(&dst)
+                    .with_context(|| format!("create --copy-out dir {:?}", dst))?;
+                for r in &result {
+                    for a in &r.artifacts {
+                        crate::hartifactcontent::unpack::unpack(a.as_ref(), &dst, None, None)
+                            .with_context(|| format!("copy output into {:?}", dst))?;
                     }
                 }
             }

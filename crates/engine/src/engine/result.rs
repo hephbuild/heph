@@ -856,6 +856,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         matcher: &Matcher,
+        outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<BatchResult> {
         let mut opts = opts.clone();
@@ -903,8 +904,8 @@ impl Engine {
             }
             hcore::hmemoizer::join_set_spawn(
                 &mut set,
-                enclose!((self => engine, rs, opts, addr) async move {
-                    let r = engine.result_addr(rs, &addr, OutputMatcher::All, &opts).await;
+                enclose!((self => engine, rs, opts, addr, outputs) async move {
+                    let r = engine.result_addr(rs, &addr, outputs, &opts).await;
                     (addr, r)
                 }),
             );
@@ -3693,6 +3694,7 @@ mod tests {
             .result(
                 rs,
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await;
@@ -3716,6 +3718,7 @@ mod tests {
             .result(
                 rs,
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await
@@ -3747,6 +3750,7 @@ mod tests {
             .result(
                 rs,
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await;
@@ -3774,6 +3778,7 @@ mod tests {
             .result(
                 rs,
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await?;
@@ -4302,6 +4307,7 @@ mod tests {
             .result(
                 rs.clone(),
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await?;
@@ -4350,6 +4356,7 @@ mod tests {
             .result(
                 rs.clone(),
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await?;
@@ -4426,6 +4433,7 @@ mod tests {
             .result(
                 rs.clone(),
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await?;
@@ -4439,6 +4447,7 @@ mod tests {
             .result(
                 rs.clone(),
                 &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
                 &ResultOptions::default(),
             )
             .await?;

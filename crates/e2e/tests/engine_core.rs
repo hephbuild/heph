@@ -153,3 +153,53 @@ async fn test_failure_surfaces_process_log_tail() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_output_selection_filters_to_named_output() -> anyhow::Result<()> {
+    // `heph run --output foo` resolves only the requested output group; the
+    // sibling output's artifact must not surface. Mirrors the OutputMatcher::Exact
+    // path the CLI takes.
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "sel",
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    run = "printf 'FOO' > $OUT_FOO; printf 'BAR' > $OUT_BAR",
+    out = {"foo": ["foo.txt"], "bar": ["bar.txt"]},
+)
+"#,
+    );
+
+    let only_foo = ws.run_addr_outputs("//sel:t", &["foo"]).await?;
+    let paths = common::artifact_paths(&only_foo);
+    assert!(
+        paths.iter().any(|p| p.ends_with("foo.txt")),
+        "foo.txt must be present: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.ends_with("bar.txt")),
+        "bar.txt must be filtered out: {paths:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_output_selection_unknown_name_errors() -> anyhow::Result<()> {
+    // An output name the target does not declare must fail loudly, not silently
+    // resolve to an empty set.
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "selerr",
+        r#"target(name = "t", driver = "bash", run = "printf 'X' > $OUT", out = "x.txt")"#,
+    );
+
+    let err = match ws.run_addr_outputs("//selerr:t", &["nope"]).await {
+        Ok(_) => panic!("unknown output must error"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("output not found"), "got: {msg}");
+    Ok(())
+}

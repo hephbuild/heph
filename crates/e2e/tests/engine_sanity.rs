@@ -88,7 +88,14 @@ async fn test_static_matcher_package_all_targets() -> anyhow::Result<()> {
     let e = ws.engine.clone();
     let rs = e.new_state();
     let matcher = Matcher::Package(PkgBuf::from("mypkg"));
-    let results = e.result(rs, &matcher, &ResultOptions::default()).await?;
+    let results = e
+        .result(
+            rs,
+            &matcher,
+            heph::engine::OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
 
     assert_eq!(results.ok.len(), 2, "expected 2 targets in //mypkg");
     assert!(results.errors.is_empty());
