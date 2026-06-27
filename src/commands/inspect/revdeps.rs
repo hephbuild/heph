@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -16,8 +17,9 @@ use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
-    /// Target whose users to find: a `//pkg:name` address, or a `./path` /
-    /// `../path` file (sugar for its `fs` file target)
+    /// Target whose users to find: a `//pkg:name` or relative (`:name`,
+    /// `./pkg:name`) address, or a `./path` / `../path` to an existing file
+    /// (sugar for its `fs` file target)
     #[arg(add = ArgValueCompleter::new(complete_target_addr))]
     pub addr: String,
     /// Restrict the search to packages matching this matcher (e.g. //pkg/...);
@@ -81,23 +83,31 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
     bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
-/// Resolve a CLI target argument into an `Addr`. A `./` or `../` prefix is sugar
-/// for an `fs` file target: the path is resolved against the current package and
-/// rewritten to `//@heph/fs:file@f=<root-relative path>` so it matches the addr
-/// other targets reference the file by. Anything else is a plain target address.
-fn resolve_addr_in(input: &str, cwp: &PkgBuf) -> anyhow::Result<Addr> {
-    if input.starts_with("./") || input.starts_with("../") {
+/// Resolve a CLI target argument into an `Addr`, relative to package `cwp` under
+/// workspace `root`.
+///
+/// A `./` or `../` path that points at an existing file is sugar for that file's
+/// `fs` target — resolved against `cwp` and rewritten to
+/// `//@heph/fs:file@f=<root-relative path>`, the addr other targets reference the
+/// file by. The on-disk check is what disambiguates a file from a relative
+/// *target* sitting in the same directory: only a bare path (no `:name` / `@args`)
+/// that resolves to a real file takes the file path; everything else —
+/// non-existent paths, directories, `//pkg:name`, `:name` — is parsed as a
+/// (possibly relative) target address.
+fn resolve_addr_in(input: &str, cwp: &PkgBuf, root: &Path) -> anyhow::Result<Addr> {
+    if (input.starts_with("./") || input.starts_with("../")) && !input.contains([':', '@']) {
         let rel = htpkg::join_rel_checked(cwp.as_str(), input)
-            .with_context(|| format!("resolving file path {input}"))?;
-        Ok(crate::pluginfs::file_addr(&rel))
-    } else {
-        htaddr::parse_addr(input).with_context(|| format!("parse {input}"))
+            .with_context(|| format!("resolving path {input}"))?;
+        if root.join(&rel).is_file() {
+            return Ok(crate::pluginfs::file_addr(&rel));
+        }
     }
+    htaddr::parse_addr_with_base(input, cwp).with_context(|| format!("parse {input}"))
 }
 
-/// `resolve_addr_in` against the current working package.
+/// `resolve_addr_in` against the current working package and workspace root.
 fn resolve_addr(input: &str) -> anyhow::Result<Addr> {
-    resolve_addr_in(input, &crate::engine::get_cwp()?)
+    resolve_addr_in(input, &crate::engine::get_cwp()?, &crate::engine::get_root()?)
 }
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
@@ -124,29 +134,57 @@ mod tests {
     use crate::htaddr::parse_addr;
     use crate::htpkg::PkgBuf;
 
+    /// A tempdir root with `rel` touched as an empty file.
+    fn root_with_file(rel: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        dir
+    }
+
     #[test]
-    fn dot_slash_path_resolves_to_fs_file_addr() {
-        // `./somefile.txt` in package `cmd/server` → the fs file target keyed by
-        // the root-relative path.
-        let addr = resolve_addr_in("./somefile.txt", &PkgBuf::from("cmd/server")).unwrap();
+    fn existing_dot_slash_file_resolves_to_fs_file_addr() {
+        // `./somefile.txt` in package `cmd/server`, backed by a real file → the
+        // fs file target keyed by the root-relative path.
+        let root = root_with_file("cmd/server/somefile.txt");
+        let addr =
+            resolve_addr_in("./somefile.txt", &PkgBuf::from("cmd/server"), root.path()).unwrap();
         assert_eq!(addr, crate::pluginfs::file_addr("cmd/server/somefile.txt"));
     }
 
     #[test]
-    fn dot_dot_path_normalizes_against_package() {
-        let addr = resolve_addr_in("../shared/x.txt", &PkgBuf::from("cmd/server")).unwrap();
+    fn existing_dot_dot_file_normalizes_against_package() {
+        let root = root_with_file("cmd/shared/x.txt");
+        let addr =
+            resolve_addr_in("../shared/x.txt", &PkgBuf::from("cmd/server"), root.path()).unwrap();
         assert_eq!(addr, crate::pluginfs::file_addr("cmd/shared/x.txt"));
     }
 
     #[test]
-    fn path_at_root_package() {
-        let addr = resolve_addr_in("./a.txt", &PkgBuf::from("")).unwrap();
-        assert_eq!(addr, crate::pluginfs::file_addr("a.txt"));
+    fn missing_path_falls_back_to_relative_target() {
+        // No file on disk → `./somefile.txt` is a relative *target* in the
+        // sibling package, name derived from the last path component.
+        let dir = tempfile::tempdir().unwrap();
+        let addr =
+            resolve_addr_in("./somefile.txt", &PkgBuf::from("cmd/server"), dir.path()).unwrap();
+        assert_eq!(
+            addr,
+            parse_addr("//cmd/server/somefile.txt:somefile.txt").unwrap()
+        );
     }
 
     #[test]
     fn plain_addr_is_parsed_verbatim() {
-        let addr = resolve_addr_in("//lib:core", &PkgBuf::from("cmd/server")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let addr = resolve_addr_in("//lib:core", &PkgBuf::from("cmd/server"), dir.path()).unwrap();
         assert_eq!(addr, parse_addr("//lib:core").unwrap());
+    }
+
+    #[test]
+    fn colon_relative_target_resolves_against_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = resolve_addr_in(":mytarget", &PkgBuf::from("cmd/server"), dir.path()).unwrap();
+        assert_eq!(addr, parse_addr("//cmd/server:mytarget").unwrap());
     }
 }
