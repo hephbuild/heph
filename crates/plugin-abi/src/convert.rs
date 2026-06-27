@@ -662,6 +662,7 @@ fn cache_config_to_pb(c: &CacheConfig) -> pb::CacheConfig {
         enabled: c.enabled,
         remote_enabled: c.remote_enabled,
         history: c.history,
+        secret: c.secret,
     }
 }
 
@@ -670,6 +671,7 @@ fn cache_config_from_pb(c: pb::CacheConfig) -> CacheConfig {
         enabled: c.enabled,
         remote_enabled: c.remote_enabled,
         history: c.history,
+        secret: c.secret,
     }
 }
 

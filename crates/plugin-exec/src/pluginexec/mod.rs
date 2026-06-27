@@ -473,9 +473,34 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
+        // Whether the author wrote a `cache` attribute at all (vs the default).
+        // A secret target must not be cached; an *explicit* caching `cache` is a
+        // conflict we surface rather than silently override.
+        let cache_explicit = req.target_spec.config.contains_key("cache");
+
         let spec = spec::TargetSpec::from(req.target_spec.config.clone())?;
 
         let pkg = req.target_spec.addr.package.clone();
+
+        // Secret targets are forced uncached and their outputs are held in
+        // memory only. If the author also asked for caching explicitly, that is
+        // contradictory — error instead of silently dropping their request.
+        let cache = if spec.secret {
+            if cache_explicit && (spec.cache.local || spec.cache.remote) {
+                anyhow::bail!(
+                    "target {} is secret and cannot be cached: remove `cache` or set it to False",
+                    req.target_spec.addr.format()
+                );
+            }
+            CacheConfig::secret()
+        } else {
+            CacheConfig {
+                enabled: spec.cache.local,
+                remote_enabled: spec.cache.remote,
+                history: spec.cache.history,
+                secret: false,
+            }
+        };
 
         // Dep groups opted into read-only staging (stage once, hardlink in)
         // rather than copied into every sandbox.
@@ -639,11 +664,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .collect(),
                 outputs,
                 support_files,
-                cache: CacheConfig {
-                    enabled: spec.cache.local,
-                    remote_enabled: spec.cache.remote,
-                    history: spec.cache.history,
-                },
+                cache,
                 pty: true,
                 hash,
                 transparent: false,
@@ -2211,6 +2232,60 @@ mod tests {
             .expect("hash_dep input present");
         assert!(hash_dep_input.hashed);
         assert!(!hash_dep_input.runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_secret_forces_uncached() -> anyhow::Result<()> {
+        // `secret = True` with no `cache` attribute: forced uncached, marked secret.
+        let td = parse_with(HashMap::from([(
+            "secret".to_string(),
+            hcore::htvalue::Value::Bool(true),
+        )]))
+        .await?;
+        assert!(td.cache.secret, "secret flag set");
+        assert!(!td.cache.enabled, "secret target is uncached");
+        assert!(
+            !td.cache.remote_enabled,
+            "secret target is not remote-cached"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_secret_with_cache_false_ok() -> anyhow::Result<()> {
+        // Explicit `cache = False` does not conflict with `secret`.
+        let td = parse_with(HashMap::from([
+            ("secret".to_string(), hcore::htvalue::Value::Bool(true)),
+            ("cache".to_string(), hcore::htvalue::Value::Bool(false)),
+        ]))
+        .await?;
+        assert!(td.cache.secret);
+        assert!(!td.cache.enabled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_secret_with_explicit_cache_true_errors() {
+        // Asking for caching on a secret target is contradictory → error.
+        let err = match parse_with(HashMap::from([
+            ("secret".to_string(), hcore::htvalue::Value::Bool(true)),
+            ("cache".to_string(), hcore::htvalue::Value::Bool(true)),
+        ]))
+        .await
+        {
+            Ok(_) => panic!("secret + cache=True must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("secret"), "{msg}");
+        assert!(msg.contains("cannot be cached"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_parse_default_not_secret() -> anyhow::Result<()> {
+        let td = parse_with(HashMap::new()).await?;
+        assert!(!td.cache.secret);
         Ok(())
     }
 

@@ -482,11 +482,16 @@ pub mod targetdef {
     /// `enabled` gates local caching; `remote_enabled` gates the remote cache
     /// (only meaningful when `enabled`). `history` is how many cache revisions
     /// (distinct input hashes) to retain for this target — GC trims older ones.
+    ///
+    /// `secret` marks the target's outputs as secret: they are never persisted
+    /// to disk (held in memory only) and the target is forced uncached. When
+    /// `secret` is set, `enabled`/`remote_enabled` are always false.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     pub struct CacheConfig {
         pub enabled: bool,
         pub remote_enabled: bool,
         pub history: u32,
+        pub secret: bool,
     }
 
     impl CacheConfig {
@@ -499,6 +504,7 @@ pub mod targetdef {
                 enabled: true,
                 remote_enabled,
                 history: Self::DEFAULT_HISTORY,
+                secret: false,
             }
         }
 
@@ -508,6 +514,17 @@ pub mod targetdef {
                 enabled: false,
                 remote_enabled: false,
                 history: 0,
+                secret: false,
+            }
+        }
+
+        /// Secret target: uncached, outputs held in memory only (never on disk).
+        pub fn secret() -> Self {
+            Self {
+                enabled: false,
+                remote_enabled: false,
+                history: 0,
+                secret: true,
             }
         }
     }

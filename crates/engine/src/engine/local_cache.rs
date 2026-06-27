@@ -137,6 +137,31 @@ pub trait LocalCache: Send + Sync {
 #[error("not found")]
 pub struct NotFoundError;
 
+/// A [`LocalCache`] backend that refuses every operation. Used as the durable
+/// fallthrough for the secret cache: secret entries are held in memory and must
+/// never spill to disk, so any attempt to read or write through to durable
+/// storage is a bug we surface loudly rather than silently persisting a secret.
+pub(crate) struct DenyDurable;
+
+impl LocalCache for DenyDurable {
+    fn reader(&self, addr: &Addr, _hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
+        anyhow::bail!(
+            "secret cache: refusing durable read for {addr} {name} (secret never on disk)"
+        )
+    }
+    fn writer(&self, addr: &Addr, _hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Write>> {
+        anyhow::bail!(
+            "secret cache: refusing durable write for {addr} {name} (secret never on disk)"
+        )
+    }
+    fn exists(&self, _addr: &Addr, _hashin: &str, _name: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    fn delete(&self, _addr: &Addr, _hashin: &str, _name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) const MANIFEST_V1: &str = "manifest-v1.borsh";
 
 #[derive(Clone)]
@@ -328,11 +353,15 @@ impl Engine {
         hashin: &str,
         artifacts: Vec<outputartifact::OutputArtifact>,
         tmp: bool,
+        secret: bool,
     ) -> anyhow::Result<Vec<CacheArtifact>> {
         let mut res_artifacts = Vec::with_capacity(artifacts.len());
         let mut manifest_artifacts = Vec::with_capacity(artifacts.len());
 
-        let key = if tmp {
+        // Secret revisions are uncached too, so they share the `tmp` unique-key
+        // scheme — never read back across runs.
+        let unique_key = tmp || secret;
+        let key = if unique_key {
             let nanos = time::SystemTime::now()
                 .duration_since(time::UNIX_EPOCH)
                 .expect("Time went backwards")
@@ -342,12 +371,15 @@ impl Engine {
             hashin.to_string()
         };
 
-        // `tmp` (uncacheable/shell) revisions get a unique `{hashin}_{nanos}` key
-        // and are never read back across runs, so route them to the mem-only
-        // `local_cache_tmp` — small entries stay in memory and skip the SQLite
-        // WAL write. `CacheArtifact` carries the cache it was written to, so
-        // reads resolve against the same store.
-        let cache = if tmp {
+        // Secret outputs go to the mem-only `local_cache_secret`, which never
+        // spills to disk. Other `tmp` (uncacheable/shell) revisions get a unique
+        // `{hashin}_{nanos}` key and are never read back across runs, so route
+        // them to the mem-only `local_cache_tmp` — small entries stay in memory
+        // and skip the SQLite WAL write. `CacheArtifact` carries the cache it was
+        // written to, so reads resolve against the same store.
+        let cache = if secret {
+            &self.local_cache_secret
+        } else if tmp {
             &self.local_cache_tmp
         } else {
             &self.local_cache
@@ -601,6 +633,56 @@ mod tests {
         (engine, dir)
     }
 
+    /// A secret target's outputs go to the in-memory secret store and are never
+    /// written to the durable local cache (the on-disk tier).
+    #[tokio::test]
+    async fn secret_outputs_stay_in_memory_and_never_touch_durable() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let arts = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHSECRET",
+                vec![raw_artifact("a", b"top secret")],
+                false, // tmp
+                true,  // secret
+            )
+            .await
+            .expect("cache_locally");
+        assert_eq!(arts.len(), 1);
+        let art = &arts[0];
+
+        // The artifact is backed by the secret store, not the durable cache.
+        assert!(
+            Arc::ptr_eq(&art.cache, &engine.local_cache_secret),
+            "secret artifact must be stored in the secret cache"
+        );
+
+        // The durable on-disk cache must not hold the secret under any key.
+        assert!(
+            !engine
+                .local_cache
+                .exists(&addr, &art.hashin, &art.name)
+                .expect("exists"),
+            "secret output must never reach the durable cache"
+        );
+
+        // Still readable from the in-memory secret store.
+        let bytes = drain_reader(
+            art.cache
+                .reader(&addr, &art.hashin, &art.name)
+                .expect("secret reader")
+                .reader,
+        );
+        assert!(
+            !bytes.is_empty(),
+            "secret artifact must be readable in memory"
+        );
+    }
+
     /// Engine wired to the remote cache at `remote_uri` (a `file://` dir shared
     /// across engines). Returns an `Arc` so the `self: &Arc<Self>` upload helper
     /// can be called.
@@ -644,6 +726,7 @@ mod tests {
                 &addr,
                 "HASHIN1",
                 vec![raw_artifact("a", b"shared payload")],
+                false,
                 false,
             )
             .await
@@ -706,6 +789,7 @@ mod tests {
                 &addr,
                 "HASHBG",
                 vec![raw_artifact("a", b"bg payload")],
+                false,
                 false,
             )
             .await
@@ -809,6 +893,7 @@ mod tests {
                 &addr,
                 "PRIMARYHASH",
                 vec![raw_artifact("a", b"hello fixpoint")],
+                false,
                 false,
             )
             .await

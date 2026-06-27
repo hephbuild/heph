@@ -71,6 +71,9 @@ message CacheConfig {
   bool enabled = 1;
   bool remote_enabled = 2;
   uint32 history = 3;
+  // When set, this target's outputs are secret: never persisted to disk, held
+  // in memory only. Implies enabled = false (secret forces uncached).
+  bool secret = 4;
 }
 
 // Driver parsed form. Mirrors driver::targetdef::TargetDef.

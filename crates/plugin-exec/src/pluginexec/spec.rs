@@ -37,6 +37,10 @@ pub(crate) struct TargetSpec {
     pub codegen: CodegenMode,
     /// Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.
     pub cache: TargetSpecCache,
+    /// Mark all outputs as secret: forces the target uncached and keeps its
+    /// outputs in memory only (never written to disk). Setting `cache` to a
+    /// caching value alongside `secret` is an error.
+    pub secret: bool,
     /// Environment variables set for the command.
     pub env: HashMap<String, String>,
     /// Names of host environment variables passed through (hashed). `"*"` passes all.
@@ -148,6 +152,7 @@ mod tests {
             "run",
             "out",
             "cache",
+            "secret",
             "support_files",
             "codegen",
             "deps",
