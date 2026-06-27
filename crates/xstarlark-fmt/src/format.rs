@@ -78,7 +78,7 @@ impl<'a> Formatter<'a> {
     }
 
     pub(crate) fn format_file(&mut self, p: &mut Printer, stmts: &[AstStmt]) {
-        self.format_stmt_seq(p, stmts);
+        self.format_stmt_seq(p, stmts, None);
         self.comments.flush_rest(p);
     }
 
@@ -107,12 +107,14 @@ impl<'a> Formatter<'a> {
 
     // --- statements -------------------------------------------------------
 
-    fn format_stmt_seq(&mut self, p: &mut Printer, stmts: &[AstStmt]) {
+    /// Format a sequence of statements. `seq_bound` is the line past which this
+    /// sequence's last statement may not pull trailing comments (the next
+    /// statement of the enclosing block, or `None` at end-of-file).
+    fn format_stmt_seq(&mut self, p: &mut Printer, stmts: &[AstStmt], seq_bound: Option<usize>) {
         let top = p.level() == 0;
-        let mut prev: Option<&AstStmt> = None;
-        for stmt in stmts {
+        for (i, stmt) in stmts.iter().enumerate() {
             let bare_start = self.start_line(stmt.span);
-            if let Some(prev) = prev {
+            if let Some(prev) = i.checked_sub(1).and_then(|j| stmts.get(j)) {
                 let eff_start = match self.comments.next_line() {
                     Some(l) if l < bare_start => l,
                     _ => bare_start,
@@ -123,8 +125,15 @@ impl<'a> Formatter<'a> {
                 }
             }
             self.comments.flush_before(p, bare_start);
-            self.format_stmt(p, stmt);
-            prev = Some(stmt);
+            // A statement's trailing comments reach no further than the start of
+            // the next statement (or the sequence bound for the last one) — so a
+            // block never absorbs a comment that belongs to later code at the
+            // same indentation.
+            let trailing_bound = match stmts.get(i + 1) {
+                Some(next) => Some(self.start_line(next.span)),
+                None => seq_bound,
+            };
+            self.format_stmt(p, stmt, trailing_bound);
         }
     }
 
@@ -134,7 +143,7 @@ impl<'a> Formatter<'a> {
     /// belong to a following `elif`/`else` or the enclosing block.
     fn format_block(&mut self, p: &mut Printer, stmts: &[AstStmt], before_line: Option<usize>) {
         p.push();
-        self.format_stmt_seq(p, stmts);
+        self.format_stmt_seq(p, stmts, before_line);
         if let Some(first) = stmts.first() {
             let col = self.start_col(first.span);
             self.comments.flush_block(p, col, before_line);
@@ -142,10 +151,10 @@ impl<'a> Formatter<'a> {
         p.pop();
     }
 
-    fn format_stmt(&mut self, p: &mut Printer, stmt: &AstStmt) {
+    fn format_stmt(&mut self, p: &mut Printer, stmt: &AstStmt, trailing_bound: Option<usize>) {
         match &stmt.node {
             StmtP::If(_, _) | StmtP::IfElse(_, _) => {
-                self.format_if(p, stmt);
+                self.format_if(p, stmt, trailing_bound);
                 return;
             }
             StmtP::For(f) => {
@@ -156,7 +165,7 @@ impl<'a> Formatter<'a> {
                 self.format_expr(p, &f.over);
                 let _ = self.comments.take_suffix(header_end);
                 p.write(":\n");
-                self.format_block(p, block_stmts(&f.body), None);
+                self.format_block(p, block_stmts(&f.body), trailing_bound);
                 return;
             }
             StmtP::Def(d) => {
@@ -172,7 +181,7 @@ impl<'a> Formatter<'a> {
                 }
                 let _ = self.comments.take_suffix(close_line);
                 p.write(":\n");
-                self.format_block(p, block_stmts(&d.body), None);
+                self.format_block(p, block_stmts(&d.body), trailing_bound);
                 return;
             }
             StmtP::Load(l) => {
@@ -222,7 +231,7 @@ impl<'a> Formatter<'a> {
             StmtP::Pass => p.write("pass"),
             StmtP::Statements(inner) => {
                 // A bare nested statement block; render its contents in place.
-                self.format_stmt_seq(p, inner);
+                self.format_stmt_seq(p, inner, trailing_bound);
                 return;
             }
         }
@@ -240,7 +249,9 @@ impl<'a> Formatter<'a> {
     }
 
     /// Resugar `if` / nested `else: if` chains into `if`/`elif`/`else`.
-    fn format_if(&mut self, p: &mut Printer, stmt: &AstStmt) {
+    /// `trailing_bound` bounds the final branch / `else` body's trailing
+    /// comments (the next statement after the whole `if`).
+    fn format_if(&mut self, p: &mut Printer, stmt: &AstStmt, trailing_bound: Option<usize>) {
         let mut branches: Vec<(&AstExpr, &AstStmt)> = Vec::new();
         let mut else_block: Option<&AstStmt> = None;
 
@@ -293,10 +304,11 @@ impl<'a> Formatter<'a> {
             let _ = self.comments.take_suffix(self.end_line(cond.span));
             p.write(":\n");
             // This body's trailing comments are bounded by the next branch's
-            // condition, then the else block, then nothing (column-only).
+            // condition, then the else block, then the statement after the whole
+            // `if` (never unbounded — that would swallow later same-indent code).
             let before = match branches.get(i + 1) {
                 Some((next_cond, _)) => Some(self.start_line(next_cond.span)),
-                None => else_first_line,
+                None => else_first_line.or(trailing_bound),
             };
             self.format_block(p, block_stmts(body), before);
         }
@@ -306,7 +318,7 @@ impl<'a> Formatter<'a> {
                 self.comments.flush_before(p, else_line);
             }
             p.write("else:\n");
-            self.format_block(p, block_stmts(eb), None);
+            self.format_block(p, block_stmts(eb), trailing_bound);
         }
     }
 

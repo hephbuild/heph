@@ -1,0 +1,24 @@
+def f():
+    if a:
+        x = 1
+    elif b:
+        fail("no")
+    y = 2
+
+def g():
+    if c:
+        # belongs in g
+        z = 3
+----
+def f():
+  if a:
+    x = 1
+  elif b:
+    fail("no")
+
+  y = 2
+
+def g():
+  if c:
+    # belongs in g
+    z = 3
