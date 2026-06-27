@@ -1,5 +1,6 @@
 // Command heph-govet is a per-package go/analysis driver, built on
-// golang.org/x/tools/go/analysis/unitchecker.
+// golang.org/x/tools/go/analysis/unitchecker, with golangci-lint-style linter
+// selection from a `.golangci.yml`.
 //
 // It is the per-package "unit" checker heph runs for the `lint` target. Unlike
 // golangci-lint (which loads the whole package graph in one process and keeps
@@ -13,98 +14,74 @@
 //   - this package's own facts are written to cfg.VetxOutput, to be consumed by
 //     dependents.
 //
-// That is the nogo / `go vet` model. It gives heph tight per-package caching: a
-// package re-lints only when its own sources, a dep's export data, or a dep's
-// exported facts change — and full interprocedural fidelity (e.g. printf wrapper
-// detection across package boundaries), which export-data-only linting loses.
+// That is the nogo / `go vet` model. It gives heph tight per-package caching and
+// full interprocedural fidelity (e.g. printf wrapper detection across package
+// boundaries), which export-data-only linting loses.
 //
-// Invocation (by the heph go_lint driver):
+// # Linters
 //
-//	heph-govet -json <cfg.json>
+// golangci-lint does not own its analyzers — it curates upstream go/analysis
+// packages. This binary imports those same upstream analyzers directly (see
+// registry.go) and selects among them from a `.golangci.yml` (linters
+// enable/disable/default). The config path is passed via the
+// HEPH_GOVET_GOLANGCI_CONFIG environment variable by the heph go_lint driver.
 //
-// With -json, unitchecker writes facts to cfg.VetxOutput and prints the
-// diagnostics as JSON to stdout, exiting 0 even when findings exist. The heph
-// driver captures that JSON as the lint report; a separate gate target fails the
-// build when the report is non-empty (so facts are always produced and cached,
-// even for a package that currently has findings).
+// Not supported in this per-package model (by design):
+//   - formatters (gofmt, gofumpt, goimports) — not go/analysis analyzers;
+//   - `unused` — needs whole-program analysis, incompatible with per-unit facts;
+//   - `//nolint` directives and `issues` exclude-rules — these are golangci-lint
+//     runner features applied to its own issue stream, not the analyzers; they
+//     are a planned follow-up (filtered at the heph gate).
+//
+// # Invocation (by the heph go_lint driver)
+//
+//	HEPH_GOVET_GOLANGCI_CONFIG=/path/.golangci.yml heph-govet -json <cfg.cfg>
+//
+// unitchecker requires the cfg argument to end in ".cfg". With -json it writes
+// facts to cfg.VetxOutput and prints diagnostics as JSON to stdout, exiting 0
+// even when findings exist; the heph gate target decides pass/fail.
 package main
 
 import (
-	"golang.org/x/tools/go/analysis/unitchecker"
+	"fmt"
+	"os"
 
-	"golang.org/x/tools/go/analysis/passes/appends"
-	"golang.org/x/tools/go/analysis/passes/asmdecl"
-	"golang.org/x/tools/go/analysis/passes/assign"
-	"golang.org/x/tools/go/analysis/passes/atomic"
-	"golang.org/x/tools/go/analysis/passes/bools"
-	"golang.org/x/tools/go/analysis/passes/buildtag"
-	"golang.org/x/tools/go/analysis/passes/cgocall"
-	"golang.org/x/tools/go/analysis/passes/composite"
-	"golang.org/x/tools/go/analysis/passes/copylock"
-	"golang.org/x/tools/go/analysis/passes/defers"
-	"golang.org/x/tools/go/analysis/passes/directive"
-	"golang.org/x/tools/go/analysis/passes/errorsas"
-	"golang.org/x/tools/go/analysis/passes/httpresponse"
-	"golang.org/x/tools/go/analysis/passes/ifaceassert"
-	"golang.org/x/tools/go/analysis/passes/loopclosure"
-	"golang.org/x/tools/go/analysis/passes/lostcancel"
-	"golang.org/x/tools/go/analysis/passes/nilfunc"
-	"golang.org/x/tools/go/analysis/passes/printf"
-	"golang.org/x/tools/go/analysis/passes/shift"
-	"golang.org/x/tools/go/analysis/passes/sigchanyzer"
-	"golang.org/x/tools/go/analysis/passes/slog"
-	"golang.org/x/tools/go/analysis/passes/stdmethods"
-	"golang.org/x/tools/go/analysis/passes/stringintconv"
-	"golang.org/x/tools/go/analysis/passes/structtag"
-	"golang.org/x/tools/go/analysis/passes/testinggoroutine"
-	"golang.org/x/tools/go/analysis/passes/tests"
-	"golang.org/x/tools/go/analysis/passes/timeformat"
-	"golang.org/x/tools/go/analysis/passes/unmarshal"
-	"golang.org/x/tools/go/analysis/passes/unreachable"
-	"golang.org/x/tools/go/analysis/passes/unsafeptr"
-	"golang.org/x/tools/go/analysis/passes/unusedresult"
+	"golang.org/x/tools/go/analysis/unitchecker"
 )
 
+// configEnvVar names the environment variable carrying the `.golangci.yml` path.
+const configEnvVar = "HEPH_GOVET_GOLANGCI_CONFIG"
+
 func main() {
-	// The `go vet` default analyzer set. The fact-producing/consuming passes
-	// (printf, lostcancel, nilfunc, unusedresult, stringintconv, …) are the ones
-	// that need the PackageVetx wiring to reason across package boundaries.
-	//
-	// To add custom or third-party analyzers (anything exposing an
-	// *analysis.Analyzer — including most golangci-lint native linters and tools
-	// like nilaway), append them here and rebuild the binary. No other change is
-	// needed: facts flow automatically for any Analyzer that uses them.
-	unitchecker.Main(
-		appends.Analyzer,
-		asmdecl.Analyzer,
-		assign.Analyzer,
-		atomic.Analyzer,
-		bools.Analyzer,
-		buildtag.Analyzer,
-		cgocall.Analyzer,
-		composite.Analyzer,
-		copylock.Analyzer,
-		defers.Analyzer,
-		directive.Analyzer,
-		errorsas.Analyzer,
-		httpresponse.Analyzer,
-		ifaceassert.Analyzer,
-		loopclosure.Analyzer,
-		lostcancel.Analyzer,
-		nilfunc.Analyzer,
-		printf.Analyzer,
-		shift.Analyzer,
-		sigchanyzer.Analyzer,
-		slog.Analyzer,
-		stdmethods.Analyzer,
-		stringintconv.Analyzer,
-		structtag.Analyzer,
-		testinggoroutine.Analyzer,
-		tests.Analyzer,
-		timeformat.Analyzer,
-		unmarshal.Analyzer,
-		unreachable.Analyzer,
-		unsafeptr.Analyzer,
-		unusedresult.Analyzer,
-	)
+	r := registry()
+	cfg, err := loadConfig(os.Getenv(configEnvVar))
+	if err != nil {
+		fatal(err.Error())
+	}
+	analyzers, unknown, err := selectAnalyzers(cfg, r)
+	if err != nil {
+		fatal(err.Error())
+	}
+	// Fail loudly on linters we can't run rather than silently dropping them.
+	if len(unknown) > 0 {
+		fatal(fmt.Sprintf(
+			"unsupported linters in %s: %v\n(formatters and whole-program linters "+
+				"like `unused` are not available in the per-package model; see heph-govet docs)",
+			configEnvVar, unknown,
+		))
+	}
+	if len(analyzers) == 0 {
+		fatal("no analyzers enabled (check linters.default / linters.enable)")
+	}
+	if os.Getenv("HEPH_GOVET_DEBUG") != "" {
+		for _, a := range analyzers {
+			fmt.Fprintf(os.Stderr, "heph-govet: enabled analyzer %s\n", a.Name)
+		}
+	}
+	unitchecker.Main(analyzers...)
+}
+
+func fatal(msg string) {
+	fmt.Fprintf(os.Stderr, "heph-govet: %s\n", msg)
+	os.Exit(2)
 }

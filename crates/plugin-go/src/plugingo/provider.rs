@@ -1426,6 +1426,15 @@ impl ProviderInner {
                     }),
                 );
 
+                // A workspace-root `.golangci.yml` drives linter selection. Absent
+                // → the standard analyzer set. The file is a hashed input, so a
+                // config edit re-lints every package.
+                let config_addr = if self.workspace_root.join(".golangci.yml").exists() {
+                    Some(pluginfs::file_addr(".golangci.yml"))
+                } else {
+                    None
+                };
+
                 let spec = crate::plugingo::driver_lint::build_lint_spec(
                     crate::plugingo::driver_lint::LintParams {
                         addr: addr.clone(),
@@ -1436,6 +1445,7 @@ impl ProviderInner {
                         facts_libs: &facts_libs,
                         src_addrs: &pkg_addrs.go_files,
                         govet_addr: &govet_addr,
+                        config_addr: config_addr.as_ref(),
                     },
                 );
                 Ok(GetResponse { target_spec: spec })
