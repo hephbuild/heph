@@ -17,9 +17,9 @@ impl Engine {
     /// graph edge.
     ///
     /// Candidates are consumed straight off the query stream and resolved
-    /// concurrently (bounded by `concurrency`); users are yielded as they are
-    /// found, so nothing is ever materialized in bulk — the whole graph can be
-    /// many thousands of addrs. Output order follows completion order, not a
+    /// concurrently (bounded by `concurrency`); dependents are yielded as they
+    /// are found, so nothing is ever materialized in bulk — the whole graph can
+    /// be many thousands of addrs. Output order follows completion order, not a
     /// stable sort; a caller that needs determinism sorts the collected result.
     pub fn revdeps<'a>(
         self: Arc<Self>,
@@ -39,19 +39,19 @@ impl Engine {
             .map_err(|e| e.context("listing candidate targets"))
             .map_ok(move |candidate| {
                 enclose!((self => engine, rs, target) async move {
-                    resolve_user(&engine, &rs, candidate, &target).await
+                    resolve_dependent(&engine, &rs, candidate, &target).await
                 })
             })
             .try_buffer_unordered(concurrency)
-            // Drop the non-users (`None`); real errors still propagate.
-            .try_filter_map(|user| async move { Ok(user) })
+            // Drop the non-dependents (`None`); real errors still propagate.
+            .try_filter_map(|dependent| async move { Ok(dependent) })
     }
 }
 
 /// Resolve one candidate: is `target` among its direct inputs? Returns the
 /// candidate's addr when it is, `None` when it isn't or when the candidate can't
 /// be resolved standalone.
-async fn resolve_user(
+async fn resolve_dependent(
     engine: &Arc<Engine>,
     rs: &Arc<RequestState>,
     candidate: Addr,
@@ -62,8 +62,8 @@ async fn resolve_user(
         // A provider may `list` an addr it cannot `get` standalone (e.g.
         // per-platform variants that only resolve as in-context deps), or a
         // candidate may cycle back to the query target. Neither can be a
-        // resolvable user; skip it the way the query resolver does. A NotFound for
-        // a *different* addr is a real breakage and still propagates.
+        // resolvable dependent; skip it the way the query resolver does. A
+        // NotFound for a *different* addr is a real breakage and still propagates.
         Err(e)
             if downcast_chain_ref::<TargetNotFoundError>(&e)
                 .is_some_and(|nf| nf.addr == candidate) =>
@@ -128,17 +128,18 @@ mod tests {
         Matcher::PackagePrefix(PkgBuf::from(""))
     }
 
-    /// Drain the revdeps stream and return the users' formatted addrs, sorted.
+    /// Drain the revdeps stream and return the dependents' formatted addrs,
+    /// sorted.
     async fn collect_sorted(
         engine: Arc<Engine>,
         rs: Arc<RequestState>,
         target: Addr,
         scope: Matcher,
     ) -> anyhow::Result<Vec<String>> {
-        let users: Vec<Addr> = engine.revdeps(rs, target, &scope).try_collect().await?;
-        let mut users: Vec<String> = users.iter().map(|a| a.format()).collect();
-        users.sort();
-        Ok(users)
+        let dependents: Vec<Addr> = engine.revdeps(rs, target, &scope).try_collect().await?;
+        let mut dependents: Vec<String> = dependents.iter().map(|a| a.format()).collect();
+        dependents.sort();
+        Ok(dependents)
     }
 
     #[tokio::test]

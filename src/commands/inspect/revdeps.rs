@@ -58,15 +58,15 @@ impl App for RevdepsApp {
         } = self;
         let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
 
-        // Stream users as they are found and print incrementally. Resolving
+        // Stream dependents as they are found and print incrementally. Resolving
         // in-scope targets records rich failures in `rs`, which `finalize`
         // prefers over the returned error.
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
-            let users = Arc::clone(&engine).revdeps(rs.clone(), addr, &scope);
-            futures::pin_mut!(users);
-            while let Some(user) = users.next().await {
-                out.println(user?.format());
+            let dependents = Arc::clone(&engine).revdeps(rs.clone(), addr, &scope);
+            futures::pin_mut!(dependents);
+            while let Some(dependent) = dependents.next().await {
+                out.println(dependent?.format());
             }
             Ok(())
         }
