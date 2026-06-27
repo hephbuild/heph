@@ -57,7 +57,10 @@ async fn resolve_dependent(
     candidate: Addr,
     target: &Addr,
 ) -> anyhow::Result<Option<Addr>> {
-    let def = match Arc::clone(engine).get_direct_def(rs.clone(), &candidate).await {
+    let def = match Arc::clone(engine)
+        .get_direct_def(rs.clone(), &candidate)
+        .await
+    {
         Ok(def) => def,
         // A provider may `list` an addr it cannot `get` standalone (e.g.
         // per-platform variants that only resolve as in-context deps), or a
@@ -118,7 +121,8 @@ mod tests {
             parallelism: None,
             ..Default::default()
         })?;
-        engine.register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
@@ -178,10 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_users_is_empty() -> anyhow::Result<()> {
-        let (engine, _root) = make_engine(vec![
-            target("//lib:core", &[]),
-            target("//app:a", &[]),
-        ])?;
+        let (engine, _root) = make_engine(vec![target("//lib:core", &[]), target("//app:a", &[])])?;
         let rs = engine.new_state();
         let core = parse_addr("//lib:core")?;
 

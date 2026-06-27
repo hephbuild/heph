@@ -110,7 +110,11 @@ fn resolve_addr_in(input: &str, cwp: &PkgBuf, root: &Path) -> anyhow::Result<Add
 
 /// `resolve_addr_in` against the current working package and workspace root.
 fn resolve_addr(input: &str) -> anyhow::Result<Addr> {
-    resolve_addr_in(input, &crate::engine::get_cwp()?, &crate::engine::get_root()?)
+    resolve_addr_in(
+        input,
+        &crate::engine::get_cwp()?,
+        &crate::engine::get_root()?,
+    )
 }
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
