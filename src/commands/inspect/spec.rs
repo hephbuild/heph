@@ -58,8 +58,9 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 }
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let addr =
-        htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
+    let base = crate::engine::get_cwp()?;
+    let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
+        .with_context(|| format!("parse {}", args.addr))?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = SpecApp {
         engine,
