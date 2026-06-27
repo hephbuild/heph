@@ -621,13 +621,14 @@ impl ProviderInner {
                     // `_golist` result — no filesystem scan needed.
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     let names: &[&str] = if skip_tests {
-                        &["_golist", "build_lib", "build", "embed"]
+                        &["_golist", "build_lib", "build", "embed", "lint"]
                     } else {
                         &[
                             "_golist",
                             "build_lib",
                             "build",
                             "embed",
+                            "lint",
                             "embed_xtest",
                             "build_test",
                             "test",
@@ -758,7 +759,22 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed"];
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "lint", "_lint"];
+
+/// Workspace-relative package of the hermetic go/analysis unitchecker binary
+/// (`heph-govet`) staged read-only into every `go_lint` target. Built as an
+/// ordinary `build` (package main) target like any other first-party binary.
+const GOVET_TOOL_PKG: &str = "tools/heph-govet";
+
+/// First-party iff the dep package is neither stdlib (`@heph/go/std/…`) nor
+/// thirdparty (`…@heph/go/thirdparty/…`). `go_lint` generates facts deps only
+/// for first-party packages: std/thirdparty contribute export-data (type info)
+/// via their `build_lib` archives but are not linted, so interprocedural
+/// analyzers reason fully across first-party boundaries and fall back to
+/// intra-package across std/thirdparty edges.
+fn is_firstparty_pkg(pkg: &str) -> bool {
+    !pkg.starts_with("@heph/go/std/") && !pkg.contains("@heph/go/thirdparty/")
+}
 
 /// Whether this provider owns `name` — the complete set of go targets it can
 /// generate: the pre-golist special targets, the `_golist`-resolved non-test
@@ -1344,6 +1360,84 @@ impl ProviderInner {
                         )
                     }
                 };
+                Ok(GetResponse { target_spec: spec })
+            }
+            // User-facing gate: depends on `_lint`'s report and fails on findings.
+            // `_lint` always exits 0 so facts cache regardless; the gate is the
+            // thing that fails.
+            "lint" => {
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
+                let spec =
+                    crate::plugingo::driver_lint::build_lint_gate_spec(addr.clone(), &analyze_addr);
+                Ok(GetResponse { target_spec: spec })
+            }
+            // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
+            // dependents) + `lint-report.json` (consumed by the gate).
+            "_lint" => {
+                // Mirrors `build_lib`: a package with no Go source files isn't
+                // analyzable. Tests/xtests are linted via their own variants
+                // later; this is the normal-source unit.
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let transitive = Arc::clone(&self)
+                    .collect_direct_libs(
+                        Arc::clone(&req.executor),
+                        &pkg,
+                        &[],
+                        &factors,
+                        &module_root,
+                    )
+                    .await
+                    .map_err(GetError::Other)?;
+
+                // One facts dep per first-party transitive lib: its `_lint` target
+                // (same package + factors as its `build_lib`) produces the
+                // `lint.facts` this package consumes for interprocedural analysis.
+                let facts_libs: Vec<(String, Addr)> = transitive
+                    .libs
+                    .iter()
+                    .filter(|(_, dep)| is_firstparty_pkg(dep.package.as_str()))
+                    .map(|(ip, dep)| {
+                        (
+                            ip.clone(),
+                            Addr::new(dep.package.clone(), "_lint".to_string(), dep.args.clone()),
+                        )
+                    })
+                    .collect();
+
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+
+                // The unitchecker runs natively on the build host, so its binary
+                // is built for the host platform, not the analyzed code's factors.
+                let govet_addr = Addr::new(
+                    PkgBuf::from(GOVET_TOOL_PKG),
+                    "build".to_string(),
+                    factors_to_args(&Factors {
+                        goos: current_goos(),
+                        goarch: current_goarch(),
+                        build_tags: vec![],
+                    }),
+                );
+
+                let spec = crate::plugingo::driver_lint::build_lint_spec(
+                    crate::plugingo::driver_lint::LintParams {
+                        addr: addr.clone(),
+                        import_path: &import_path,
+                        factors: &factors,
+                        go_version: &self.go_version,
+                        transitive_libs: &transitive.libs,
+                        facts_libs: &facts_libs,
+                        src_addrs: &pkg_addrs.go_files,
+                        govet_addr: &govet_addr,
+                    },
+                );
                 Ok(GetResponse { target_spec: spec })
             }
             "build" => {
@@ -3308,6 +3402,75 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "cmd build_lib should depend on lib: got {:?}",
             deps.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_dep_lint_driver_and_facts_wiring() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        // The analyze target (`_lint`) runs heph-govet and produces facts+report.
+        let resp = provider_get(&p, make_addr("cmd", "_lint")).await.unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint");
+
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        // The unitchecker binary is staged for every analyze target.
+        assert!(
+            deps.keys().any(|k| k == "govet_tool"),
+            "_lint must stage the heph-govet tool: got {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+        // cmd imports the first-party `lib`, so its facts feed cmd's analysis:
+        // a `facts_*` group must reference lib's `_lint` target (not its archive).
+        let has_lib_facts = deps.iter().any(|(k, v)| {
+            k.starts_with("facts_")
+                && matches!(v, Value::List(items) if items.iter().any(|it|
+                    matches!(it, Value::String(s) if s.contains(":_lint"))))
+        });
+        assert!(
+            has_lib_facts,
+            "cmd _lint must consume lib's facts via a facts_* group: got {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+
+        // Both the facts and report artifacts are declared outputs.
+        let out = match resp.target_spec.config.get("out").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected out map"),
+        };
+        assert!(out.contains_key("facts") && out.contains_key("report"));
+    }
+
+    // The user-facing `lint` target is the gate: it depends on `_lint`'s report
+    // output and fails on findings, leaving fact production (and caching) to the
+    // always-exit-0 analyze target.
+    #[tokio::test]
+    async fn test_lint_gate_depends_on_analyze_report() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("cmd", "lint")).await.unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_gate");
+
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let report = match deps.get("report").unwrap() {
+            Value::List(l) => l,
+            _ => panic!("report not a list"),
+        };
+        match &report[0] {
+            Value::String(s) => assert!(
+                s.contains(":_lint") && s.ends_with("|report"),
+                "gate must consume the analyze target's report output: {s}"
+            ),
+            _ => panic!("not a string"),
+        }
     }
 
     // Regression: an imported package whose directory has Go files that are all
