@@ -860,7 +860,11 @@ mod tests {
                 error: None,
             },
         ));
-        assert_eq!(t.status_emoji(), "⏳", "still running until the stream closes");
+        assert_eq!(
+            t.status_emoji(),
+            "⏳",
+            "still running until the stream closes"
+        );
 
         // Stream closes with no failure → success.
         t.closed = true;
@@ -1046,7 +1050,8 @@ mod tests {
         t.closed = true;
         assert_eq!(t.status_emoji(), "✅");
         assert!(
-            t.render_markdown(0, "heph: test").contains("## ✅ heph: test"),
+            t.render_markdown(0, "heph: test")
+                .contains("## ✅ heph: test"),
             "checkbox in final render"
         );
 

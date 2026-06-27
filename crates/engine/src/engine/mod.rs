@@ -44,6 +44,7 @@ pub use hplugin::provider;
 pub use remote_cache::{RemoteCacheDef, RemoteCacheSet};
 mod query;
 pub mod request_state;
+mod revdeps;
 pub mod spec;
 pub use result::ArtifactMeta;
 pub use result::BatchResult;
