@@ -79,7 +79,8 @@ impl<'a> Formatter<'a> {
 
     pub(crate) fn format_file(&mut self, p: &mut Printer, stmts: &[AstStmt]) {
         self.format_stmt_seq(p, stmts, None);
-        self.comments.flush_rest(p);
+        let anchor = stmts.last().map(|s| self.end_line(s.span));
+        self.comments.flush_rest(p, anchor);
     }
 
     // --- position helpers -------------------------------------------------
@@ -124,7 +125,12 @@ impl<'a> Formatter<'a> {
                     p.write("\n");
                 }
             }
-            self.comments.flush_before(p, bare_start);
+            // Preserve a blank line between a leading comment and its statement.
+            if let Some(last_comment) = self.comments.flush_before(p, bare_start)
+                && last_comment + 1 < bare_start
+            {
+                p.write("\n");
+            }
             // A statement's trailing comments reach no further than the start of
             // the next statement (or the sequence bound for the last one) — so a
             // block never absorbs a comment that belongs to later code at the
@@ -146,7 +152,8 @@ impl<'a> Formatter<'a> {
         self.format_stmt_seq(p, stmts, before_line);
         if let Some(first) = stmts.first() {
             let col = self.start_col(first.span);
-            self.comments.flush_block(p, col, before_line);
+            let anchor = stmts.last().map(|s| self.end_line(s.span));
+            self.comments.flush_block(p, col, before_line, anchor);
         }
         p.pop();
     }

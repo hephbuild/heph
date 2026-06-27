@@ -102,10 +102,28 @@ impl CommentStore {
         self.next += 1;
     }
 
+    /// Seed the blank-line tracker for a trailing flush: a blank is wanted
+    /// before the first trailing comment when it is separated from the preceding
+    /// statement (`anchor`) — or the most recently emitted comment, whichever is
+    /// later in the source — by a blank line.
+    fn seed_prev(&self, anchor: Option<usize>) -> Option<usize> {
+        let last_emitted = self
+            .next
+            .checked_sub(1)
+            .and_then(|j| self.items.get(j))
+            .map(|c| c.line);
+        match (anchor, last_emitted) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Emit, each on its own line, all pending comments strictly above `line`.
-    pub(crate) fn flush_before(&mut self, p: &mut Printer, line: usize) {
+    /// Returns the source line of the last comment emitted, if any (so a caller
+    /// can preserve a blank line between a leading comment and its statement).
+    pub(crate) fn flush_before(&mut self, p: &mut Printer, line: usize) -> Option<usize> {
         if self.suppressed {
-            return;
+            return None;
         }
         let mut prev = None;
         loop {
@@ -115,6 +133,7 @@ impl CommentStore {
             }
             self.emit_next(p, &mut prev);
         }
+        prev
     }
 
     /// If the next pending comment is on `line`, consume it and return its
@@ -143,16 +162,19 @@ impl CommentStore {
     /// trailing comments belonging to a block at this nesting level. When
     /// `before_line` is set, only comments above that line are flushed (so a
     /// block's trailing comments don't reach into a following `elif`/`else`).
+    /// `anchor` is the preceding statement's line, so a blank line between it and
+    /// the first trailing comment is preserved.
     pub(crate) fn flush_block(
         &mut self,
         p: &mut Printer,
         body_col: usize,
         before_line: Option<usize>,
+        anchor: Option<usize>,
     ) {
         if self.suppressed {
             return;
         }
-        let mut prev = None;
+        let mut prev = self.seed_prev(anchor);
         loop {
             let go = matches!(
                 self.peek(),
@@ -165,12 +187,14 @@ impl CommentStore {
         }
     }
 
-    /// Emit every remaining comment (end-of-file trailing comments).
-    pub(crate) fn flush_rest(&mut self, p: &mut Printer) {
+    /// Emit every remaining comment (end-of-file trailing comments). `anchor` is
+    /// the last statement's line, so a blank line before the first trailing
+    /// comment is preserved.
+    pub(crate) fn flush_rest(&mut self, p: &mut Printer, anchor: Option<usize>) {
         if self.suppressed {
             return;
         }
-        let mut prev = None;
+        let mut prev = self.seed_prev(anchor);
         while self.peek().is_some() {
             self.emit_next(p, &mut prev);
         }
