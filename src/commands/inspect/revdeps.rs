@@ -4,13 +4,13 @@ use anyhow::Context;
 use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 use enclose::enclose;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
 use crate::engine::Engine;
-use crate::engine::error::{CycleError, TargetNotFoundError};
+use crate::engine::error::{CycleError, MultiError, TargetNotFoundError};
 use crate::engine::request_state::RequestState;
 use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::{self, Addr};
@@ -78,6 +78,10 @@ impl App for RevdepsApp {
 /// the reverse of `inspect deps`. Direct (not transitive) edges only: this
 /// answers "which targets reference this one", the precise inverse of the build
 /// graph edge. Results are sorted for deterministic output.
+///
+/// Candidates are consumed straight off the query stream and resolved
+/// concurrently (bounded by `concurrency`), so the full candidate set is never
+/// materialized up front — the whole graph can be many thousands of addrs.
 async fn revdeps(
     engine: Arc<Engine>,
     rs: Arc<RequestState>,
@@ -85,44 +89,83 @@ async fn revdeps(
     scope: &Matcher,
     fail_fast: bool,
 ) -> anyhow::Result<Vec<Addr>> {
-    let candidates: Vec<Addr> = Arc::clone(&engine)
+    // Cap in-flight def resolutions; the engine's own semaphores gate the real
+    // work, this just bounds the orchestration set held off the stream.
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_mul(2);
+    let target = target.clone();
+
+    let outcomes = Arc::clone(&engine)
         .query(rs.clone(), scope)
-        .try_collect()
-        .await
-        .context("listing candidate targets")?;
-
-    let futs = candidates.iter().map(|candidate| {
-        enclose!((engine, rs, candidate, target) async move {
-            let def = match Arc::clone(&engine).get_direct_def(rs.clone(), &candidate).await {
-                Ok(def) => def,
-                // A provider may `list` an addr it cannot `get` standalone (e.g.
-                // per-platform variants that only resolve as in-context deps), or
-                // a candidate may cycle back to the query target. Neither can be a
-                // resolvable user; skip it the way the query resolver does. A
-                // NotFound for a *different* addr is a real breakage and still
-                // propagates.
-                Err(e)
-                    if downcast_chain_ref::<TargetNotFoundError>(&e)
-                        .is_some_and(|nf| nf.addr == candidate) =>
-                {
-                    return Ok(None);
-                }
-                Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => return Ok(None),
-                Err(e) => return Err(e),
-            };
-            let uses = def
-                .target_def
-                .inputs
-                .iter()
-                .any(|input| input.r#ref.r#ref == target);
-            Ok::<Option<Addr>, anyhow::Error>(uses.then(|| candidate.clone()))
+        .map_err(|e| e.context("listing candidate targets"))
+        .map_ok(|candidate| {
+            enclose!((engine, rs, target) async move {
+                resolve_user(&engine, &rs, candidate, &target).await
+            })
         })
-    });
+        .try_buffer_unordered(concurrency);
 
-    let found = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
-    let mut users: Vec<Addr> = found.into_iter().flatten().collect();
+    // `fail_fast` short-circuits on the first error and drops the rest; otherwise
+    // every candidate is driven and all errors are aggregated (mirrors
+    // `join_all_failable`).
+    let mut users: Vec<Addr> = if fail_fast {
+        outcomes
+            .try_filter_map(|user| async move { Ok(user) })
+            .try_collect()
+            .await?
+    } else {
+        let results: Vec<anyhow::Result<Option<Addr>>> = outcomes.collect().await;
+        let mut users = Vec::new();
+        let mut errs = Vec::new();
+        for r in results {
+            match r {
+                Ok(Some(user)) => users.push(user),
+                Ok(None) => {}
+                Err(e) => errs.push(e),
+            }
+        }
+        if !errs.is_empty() {
+            return Err(MultiError(errs).into());
+        }
+        users
+    };
     users.sort_by_key(|a| a.format());
     Ok(users)
+}
+
+/// Resolve one candidate: is `target` among its direct inputs? Returns the
+/// candidate's addr when it is, `None` when it isn't or when the candidate can't
+/// be resolved standalone.
+async fn resolve_user(
+    engine: &Arc<Engine>,
+    rs: &Arc<RequestState>,
+    candidate: Addr,
+    target: &Addr,
+) -> anyhow::Result<Option<Addr>> {
+    let def = match Arc::clone(engine).get_direct_def(rs.clone(), &candidate).await {
+        Ok(def) => def,
+        // A provider may `list` an addr it cannot `get` standalone (e.g.
+        // per-platform variants that only resolve as in-context deps), or a
+        // candidate may cycle back to the query target. Neither can be a
+        // resolvable user; skip it the way the query resolver does. A NotFound for
+        // a *different* addr is a real breakage and still propagates.
+        Err(e)
+            if downcast_chain_ref::<TargetNotFoundError>(&e)
+                .is_some_and(|nf| nf.addr == candidate) =>
+        {
+            return Ok(None);
+        }
+        Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let uses = def
+        .target_def
+        .inputs
+        .iter()
+        .any(|input| input.r#ref.r#ref == *target);
+    Ok(uses.then_some(candidate))
 }
 
 pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
