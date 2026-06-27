@@ -882,6 +882,7 @@ async fn run_once(
         stdout: None,
         stderr: None,
         sandbox_dir: sandbox_dir.clone(),
+        events: None,
     };
     let mrr = ManagedRunRequest {
         request: rr,

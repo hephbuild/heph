@@ -1697,6 +1697,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -1749,6 +1750,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
 
         // Use a timeout to detect the hang
@@ -1807,6 +1809,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -1872,6 +1875,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);
@@ -1936,6 +1940,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
 
         let res = tokio::time::timeout(
@@ -1996,6 +2001,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
@@ -2538,6 +2544,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver
             .run(
@@ -2584,6 +2591,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver
             .run(
@@ -2660,6 +2668,7 @@ mod tests {
             stdout: Some(&mut stdout),
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver
             .run(
@@ -2811,6 +2820,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox.clone(),
+            events: None,
         };
 
         os.run_inner(req, &ctoken, false).await?;
@@ -2907,6 +2917,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver
             .run(
@@ -2978,6 +2989,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver.run(make_req(req), &ctoken).await?;
 
@@ -3061,6 +3073,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver
             .run(
@@ -3160,6 +3173,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
         driver
             .run(
@@ -3246,6 +3260,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: tmp.path().to_path_buf(),
+            events: None,
         };
 
         driver.run(make_req(req), &ctoken).await?;

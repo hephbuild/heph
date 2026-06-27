@@ -121,6 +121,7 @@ impl Engine {
                                 stdout,
                                 stderr,
                                 sandbox_dir,
+                                events: rs.events_sender(),
                             };
                             let res = if shell {
                                 driver.driver.run_shell(req, rs.ctoken()).await?
