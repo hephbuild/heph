@@ -15,8 +15,58 @@ use hplugin::provider::{
 use hwalk::{CachedWalker, Ignore};
 use starlark::environment::Globals;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// The BUILD-file name patterns used when a workspace's buildfile-provider
+/// config does not list its own `patterns`. Literal `BUILD` plus the `*.BUILD`
+/// glob (e.g. `foo.BUILD`).
+pub fn default_build_file_patterns() -> Vec<glob::Pattern> {
+    ["BUILD", "*.BUILD"]
+        .into_iter()
+        .map(|p| glob::Pattern::new(p).expect("valid default build pattern"))
+        .collect()
+}
+
+/// Compile the `patterns` option from a buildfile-provider config into globs,
+/// falling back to [`default_build_file_patterns`] when absent, empty, or
+/// uncompilable. Shared by the engine provider, the LSP, and the formatter so
+/// all agree on which files are BUILD files.
+pub fn build_file_patterns_from_options(
+    opts: &hplugin::config::Options,
+) -> anyhow::Result<Vec<glob::Pattern>> {
+    let names: Option<Vec<String>> =
+        hplugin::config::decode_opt(opts, "buildfile provider", "patterns")?;
+    let Some(names) = names.filter(|n| !n.is_empty()) else {
+        return Ok(default_build_file_patterns());
+    };
+    names
+        .into_iter()
+        .map(|p| glob::Pattern::new(&p).with_context(|| format!("invalid buildfile pattern `{p}`")))
+        .collect()
+}
+
+/// Every file directly inside `dir` whose name matches one of `patterns`
+/// (handles literal names like `BUILD` and globs like `*.BUILD`), sorted for
+/// deterministic order. A package may have more than one BUILD file.
+pub fn build_files_in_dir(dir: &Path, patterns: &[glob::Pattern]) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+            is_file
+                && patterns
+                    .iter()
+                    .any(|p| p.matches(&e.file_name().to_string_lossy()))
+        })
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    paths
+}
 
 pub struct RequestState {}
 
@@ -68,7 +118,7 @@ impl Default for Provider {
     fn default() -> Self {
         Self {
             root: std::path::PathBuf::from("/"),
-            build_file_patterns: vec![glob::Pattern::new("BUILD").expect("BUILD literal")],
+            build_file_patterns: default_build_file_patterns(),
             skip: Arc::new(Ignore::default()),
             default_driver: None,
             requests: Mutex::new(HashMap::new()),
@@ -110,15 +160,7 @@ impl Provider {
             opts,
             &["patterns", "skip", "defaultDriver"],
         )?;
-        let patterns: Vec<String> =
-            hplugin::config::decode_opt(opts, "buildfile provider", "patterns")?
-                .unwrap_or_else(|| vec!["BUILD".to_string()]);
-        let compiled = patterns
-            .into_iter()
-            .map(|p| {
-                glob::Pattern::new(&p).with_context(|| format!("invalid buildfile pattern `{p}`"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let compiled = build_file_patterns_from_options(opts)?;
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
@@ -436,7 +478,7 @@ mod tests {
         let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &Options::new())
             .expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
-        assert_eq!(names, vec!["BUILD"]);
+        assert_eq!(names, vec!["BUILD", "*.BUILD"]);
     }
 
     #[test]

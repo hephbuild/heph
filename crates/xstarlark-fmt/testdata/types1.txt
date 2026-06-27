@@ -1,0 +1,15 @@
+def f(a, b: int, c: str = "x"):
+    return a
+def g(x, y):
+    return y
+def h() -> int:
+    return 1
+----
+def f(a, b: int, c: str = "x"):
+  return a
+
+def g(x, y):
+  return y
+
+def h() -> int:
+  return 1

@@ -1,0 +1,15 @@
+if a:
+    if b:
+        str = """
+        a
+         b
+        c
+        """
+----
+if a:
+  if b:
+    str = """
+        a
+         b
+        c
+        """

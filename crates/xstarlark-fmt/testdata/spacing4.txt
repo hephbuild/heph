@@ -1,0 +1,10 @@
+def name():
+  if True:
+    out_file = some_func()
+  return some_func()
+----
+def name():
+  if True:
+    out_file = some_func()
+
+  return some_func()

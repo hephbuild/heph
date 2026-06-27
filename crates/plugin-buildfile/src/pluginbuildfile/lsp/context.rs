@@ -166,12 +166,9 @@ impl HephLspContext {
 /// names like `BUILD` and globs like `*.BUILD`). Used to resolve a package /
 /// `load("//pkg", …)` directory to its actual BUILD file.
 fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
-        let name = e.file_name();
-        let matches = e.file_type().map(|t| t.is_file()).unwrap_or(false)
-            && patterns.iter().any(|p| p.matches(&name.to_string_lossy()));
-        matches.then(|| e.path())
-    })
+    crate::pluginbuildfile::provider::build_files_in_dir(dir, patterns)
+        .into_iter()
+        .next()
 }
 
 /// Build a fresh buildfile provider for package/target listing, configured with
@@ -192,24 +189,12 @@ fn build_listing_provider(
 }
 
 /// BUILD-file name patterns from the workspace's buildfile-provider config,
-/// mirroring what the engine's provider uses. Falls back to `["BUILD"]` when the
-/// config is absent, lists no patterns, or none compile.
+/// mirroring what the engine's provider uses. Falls back to the shared defaults
+/// when the config is absent, lists no patterns, or none compile.
 fn buildfile_patterns(engine: &dyn LspEngine) -> Vec<glob::Pattern> {
     let opts = engine.provider_options("buildfile");
-    let names: Vec<String> =
-        hplugin::config::decode_opt::<Vec<String>>(&opts, "buildfile provider", "patterns")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-    let compiled: Vec<glob::Pattern> = names
-        .iter()
-        .filter_map(|n| glob::Pattern::new(n).ok())
-        .collect();
-    if compiled.is_empty() {
-        vec![glob::Pattern::new("BUILD").expect("BUILD literal")]
-    } else {
-        compiled
-    }
+    crate::pluginbuildfile::provider::build_file_patterns_from_options(&opts)
+        .unwrap_or_else(|_| crate::pluginbuildfile::provider::default_build_file_patterns())
 }
 
 impl LspContext for HephLspContext {

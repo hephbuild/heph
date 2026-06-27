@@ -1,0 +1,19 @@
+def name():
+    return [
+        [
+            "blah",
+            # com1
+        ]
+        # com2
+    ]
+    # com3
+----
+def name():
+  return [
+    [
+      "blah",
+      # com1
+    ],
+    # com2
+  ]
+  # com3

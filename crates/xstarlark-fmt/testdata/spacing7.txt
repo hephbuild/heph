@@ -1,0 +1,72 @@
+target()
+target(some=arg)
+target(some=arg, more=arg)
+random_func()
+random_func(arg1)
+random_func(arg1, arg2)
+a=target()
+a=target(some=arg)
+a=target(some=arg, more=arg)
+a=random_func()
+a=random_func(arg1)
+a=random_func(arg1, arg2)
+
+def blah():
+    target()
+    target(some=arg)
+    target(some=arg, more=arg)
+    random_func()
+    random_func(arg1)
+    random_func(arg1, arg2)
+    a=target()
+    a=target(some=arg)
+    a=target(some=arg, more=arg)
+    a=random_func()
+    a=random_func(arg1)
+    a=random_func(arg1, arg2)
+
+----
+target()
+
+target(
+  some = arg,
+)
+
+target(
+  some = arg,
+  more = arg,
+)
+
+random_func()
+
+random_func(arg1)
+random_func(arg1, arg2)
+a = target()
+
+a = target(
+  some = arg,
+)
+
+a = target(
+  some = arg,
+  more = arg,
+)
+
+a = random_func()
+
+a = random_func(arg1)
+a = random_func(arg1, arg2)
+
+def blah():
+  target()
+  target(some = arg)
+  target(some = arg, more = arg)
+  random_func()
+  random_func(arg1)
+  random_func(arg1, arg2)
+  a = target()
+  a = target(some = arg)
+  a = target(some = arg, more = arg)
+  a = random_func()
+  a = random_func(arg1)
+  a = random_func(arg1, arg2)

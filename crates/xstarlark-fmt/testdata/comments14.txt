@@ -1,0 +1,15 @@
+def name():
+    if True:
+        pass
+    else:
+        pass
+        # com3
+    # com4
+----
+def name():
+  if True:
+    pass
+  else:
+    pass
+    # com3
+  # com4
