@@ -1512,9 +1512,10 @@ mod tests {
         let (shared, uri) = shared_with_index("target(name=\"a\",deps=[\"x\",\"y\"])\n");
         let edits = super::format_edits(&uri, &shared).expect("edits");
         assert_eq!(edits.len(), 1, "one whole-document edit");
+        // No `indent` configured → the default of 4 spaces.
         assert_eq!(
             edits[0].new_text,
-            "target(\n  name = \"a\",\n  deps = [\"x\", \"y\"],\n)\n"
+            "target(\n    name = \"a\",\n    deps = [\"x\", \"y\"],\n)\n"
         );
         // The replaced range starts at the document origin.
         assert_eq!(edits[0].range.start, lsp_types::Position::new(0, 0));

@@ -130,7 +130,11 @@ impl App for BuildFmtApp {
 
                 let out_text = match hxstarlark_fmt::format(&path.to_string_lossy(), &src, cfg) {
                     Ok(text) => text,
+                    // The `heph:fmt skip-file` directive: leave untouched.
                     Err(FmtError::Skip) => continue,
+                    // A file that doesn't parse (a syntax error, or tab
+                    // indentation, which heph's Starlark dialect rejects) can't
+                    // be reformatted — fail the run so it's fixed, not hidden.
                     Err(e) => {
                         return Err(
                             anyhow::anyhow!(e).context(format!("formatting {}", path.display()))

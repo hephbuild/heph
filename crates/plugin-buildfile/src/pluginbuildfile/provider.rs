@@ -95,7 +95,7 @@ pub fn build_file_indent_from_options(opts: &hplugin::config::Options) -> anyhow
 }
 
 /// Default indentation width when the config does not set `indent`.
-pub const DEFAULT_INDENT: usize = 2;
+pub const DEFAULT_INDENT: usize = 4;
 
 /// Every file directly inside `dir` whose name matches one of `patterns`
 /// (handles literal names like `BUILD` and globs like `*.BUILD`), sorted for

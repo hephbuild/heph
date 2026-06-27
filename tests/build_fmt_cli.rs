@@ -29,7 +29,8 @@ fn workspace() -> tempfile::TempDir {
 }
 
 const MESSY: &str = "target(name=\"a\",deps=[\"x\",\"y\"])\n";
-const FORMATTED: &str = "target(\n  name = \"a\",\n  deps = [\"x\", \"y\"],\n)\n";
+// Default indent is 4 spaces; these workspaces don't configure `indent`.
+const FORMATTED: &str = "target(\n    name = \"a\",\n    deps = [\"x\", \"y\"],\n)\n";
 
 /// Run `heph tool build-fmt -` feeding `input` on stdin; return stdout.
 fn run_stdin(input: &str) -> String {
