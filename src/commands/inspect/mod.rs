@@ -5,6 +5,7 @@ mod functions;
 mod hashin;
 mod hashout;
 mod packages;
+mod revdeps;
 mod spec;
 
 use clap::{Args, Subcommand};
@@ -80,6 +81,18 @@ pub enum InspectCommands {
     ///
     /// `heph inspect deps //cmd/server:bin -i`
     Deps(deps::Args),
+    /// Print the targets that depend on a target ("where is this used?")
+    ///
+    /// The reverse of `deps`: scans the workspace (or `--scope` packages) and
+    /// prints every target that declares the given target as a direct input,
+    /// one per line.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect revdeps //lib:core`
+    ///
+    /// `heph inspect revdeps //lib:core --scope //cmd/...`
+    Revdeps(revdeps::Args),
     /// List provider-exposed functions (`heph.<provider>.<fn>`)
     ///
     /// Prints every function registered by a provider for use in BUILD files,
@@ -108,6 +121,7 @@ impl InspectCommands {
             InspectCommands::Spec(args) => spec::execute(args, sink, global),
             InspectCommands::Def(args) => def::execute(args, sink, global),
             InspectCommands::Deps(args) => deps::execute(args, sink, global),
+            InspectCommands::Revdeps(args) => revdeps::execute(args, sink, global),
             InspectCommands::Functions(args) => functions::execute(args, sink, global),
         }
     }

@@ -101,55 +101,33 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
         return parse_addr(&format!("//{}{}", base, input));
     }
 
-    // "./path" or "../path", optionally followed by ":name" and/or "@args"
+    // "./path:name" or "../path:name", optionally followed by "@args".
+    //
+    // An explicit ':name' is required. We deliberately do NOT derive a target
+    // name from the last path component (no "./sub" -> "//base/sub:sub"
+    // shorthand): a bare "./somefile.txt" is indistinguishable from a filesystem
+    // path, so it must not silently resolve into a target. Callers that want the
+    // path treated as a file handle that themselves.
     if input.starts_with("./") || input.starts_with("../") {
-        let colon_pos = input.find(':');
-        let at_pos = input.find('@');
-        // path ends at the first ':' or '@'
-        let path_end = match (colon_pos, at_pos) {
-            (Some(c), Some(a)) => c.min(a),
-            (Some(c), None) => c,
-            (None, Some(a)) => a,
-            (None, None) => input.len(),
+        let Some(colon_pos) = input.find(':') else {
+            return Err(anyhow::anyhow!(
+                "invalid address '{input}': a relative path reference must name a target, e.g. '{input}:name'"
+            ));
         };
-        // path_end is derived from find(':') / find('@') which are ASCII single-byte chars,
-        // so these indices are always on valid UTF-8 char boundaries.
+        // colon_pos comes from find(':') — an ASCII single-byte char — so both
+        // slices land on valid UTF-8 char boundaries.
         #[expect(
             clippy::string_slice,
-            reason = "indices derived from ASCII char positions, always valid boundaries"
+            reason = "index derived from ASCII char position, always a valid boundary"
         )]
-        let path_part = &input[..path_end];
+        let path_part = &input[..colon_pos];
         #[expect(
             clippy::string_slice,
-            reason = "indices derived from ASCII char positions, always valid boundaries"
+            reason = "index derived from ASCII char position, always a valid boundary"
         )]
-        let rest = &input[path_end..];
+        let rest = &input[colon_pos..]; // ":name" or ":name@args"
         let pkg = resolve_relative_pkg(base, path_part)?;
-        let full = if rest.starts_with(':') || rest.is_empty() {
-            if rest.is_empty() {
-                let name = pkg.rsplit('/').next().unwrap_or("");
-                if name.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "cannot derive name from path '{}'",
-                        path_part
-                    ));
-                }
-                format!("//{}:{}", pkg, name)
-            } else {
-                format!("//{}{}", pkg, rest)
-            }
-        } else {
-            // rest starts with '@', no explicit name — derive from pkg
-            let name = pkg.rsplit('/').next().unwrap_or("");
-            if name.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "cannot derive name from path '{}'",
-                    path_part
-                ));
-            }
-            format!("//{}:{}{}", pkg, name, rest)
-        };
-        return parse_addr(&full);
+        return parse_addr(&format!("//{pkg}{rest}"));
     }
 
     // A bare "name" (no leading ':', './', '../', or '//') is too ambiguous to
@@ -246,11 +224,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_addr_with_base_dot_slash() {
+    fn test_parse_addr_with_base_dot_slash_requires_name() {
+        // No derive-name shorthand: a bare "./sub" is ambiguous with a path and
+        // must name a target explicitly.
         let base = PkgBuf::from("a/b");
-        let res = parse_addr_with_base("./sub", &base).unwrap();
-        assert_eq!(res.package, "a/b/sub");
-        assert_eq!(res.name, "sub");
+        assert!(parse_addr_with_base("./sub", &base).is_err());
     }
 
     #[test]
@@ -262,17 +240,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_addr_with_base_dot_dot_slash() {
+    fn test_parse_addr_with_base_dot_dot_slash_requires_name() {
         let base = PkgBuf::from("a/b/c");
-        let res = parse_addr_with_base("../sibling", &base).unwrap();
-        assert_eq!(res.package, "a/b/sibling");
-        assert_eq!(res.name, "sibling");
+        assert!(parse_addr_with_base("../sibling", &base).is_err());
     }
 
     #[test]
-    fn test_parse_addr_with_base_dot_dot_slash_args() {
+    fn test_parse_addr_with_base_dot_dot_slash_explicit_name_args() {
         let base = PkgBuf::from("a/b/c");
-        let res = parse_addr_with_base("../sibling@k=v", &base).unwrap();
+        let res = parse_addr_with_base("../sibling:sibling@k=v", &base).unwrap();
         assert_eq!(res.package, "a/b/sibling");
         assert_eq!(res.name, "sibling");
         assert_eq!(res.args.get("k").unwrap(), "v");
@@ -281,7 +257,7 @@ mod tests {
     #[test]
     fn test_parse_addr_with_base_escapes_root_fails() {
         let base = PkgBuf::from("a");
-        let res = parse_addr_with_base("../../escape", &base);
+        let res = parse_addr_with_base("../../escape:x", &base);
         assert!(res.is_err());
     }
 
