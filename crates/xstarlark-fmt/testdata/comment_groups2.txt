@@ -1,0 +1,13 @@
+# group one
+# still one
+
+# group two
+target(name = "a")
+----
+# group one
+# still one
+
+# group two
+target(
+  name = "a",
+)

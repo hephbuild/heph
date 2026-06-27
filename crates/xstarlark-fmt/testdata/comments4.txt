@@ -1,0 +1,9 @@
+target(
+    name="a",
+    # some com
+)
+----
+target(
+  name = "a",
+  # some com
+)

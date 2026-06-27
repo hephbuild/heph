@@ -1,0 +1,6 @@
+if a:
+  aaa
+
+----
+if a:
+  aaa

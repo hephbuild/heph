@@ -1,3 +1,4 @@
+mod build_fmt;
 mod build_lsp;
 mod cache;
 mod completions;
@@ -50,6 +51,16 @@ pub enum ToolCommands {
     ///
     /// Example: `heph tool completions bash`
     Completions(completions::Args),
+    /// Format BUILD files
+    ///
+    /// Reformats the Starlark `BUILD` files of every package, or only those
+    /// matching a package matcher. Rewrites in place by default; `--check`
+    /// reports unformatted files and exits non-zero without writing. Pass `-`
+    /// to format stdin to stdout.
+    ///
+    /// Example: `heph tool build-fmt //pkg/...`
+    #[command(name = "build-fmt")]
+    BuildFmt(build_fmt::Args),
     /// Run the BUILD-file language server over stdio (used by editors).
     #[command(name = "build-lsp", hide = true)]
     BuildLsp(build_lsp::Args),
@@ -81,6 +92,7 @@ impl ToolCommands {
             ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
             ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Completions(args) => completions::execute(args),
+            ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, global),
             ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),
             ToolCommands::ResolvePlugins(args) => resolve_plugins::execute(args, sink, global),
         }

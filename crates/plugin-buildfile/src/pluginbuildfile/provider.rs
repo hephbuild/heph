@@ -15,8 +15,109 @@ use hplugin::provider::{
 use hwalk::{CachedWalker, Ignore};
 use starlark::environment::Globals;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// The BUILD-file name patterns used when a workspace's buildfile-provider
+/// config does not list its own `patterns`. Literal `BUILD` plus the `*.BUILD`
+/// glob (e.g. `foo.BUILD`).
+pub fn default_build_file_patterns() -> Vec<glob::Pattern> {
+    ["BUILD", "*.BUILD"]
+        .into_iter()
+        .map(|p| glob::Pattern::new(p).expect("valid default build pattern"))
+        .collect()
+}
+
+/// Compile the `patterns` option from a buildfile-provider config into globs,
+/// falling back to [`default_build_file_patterns`] when absent, empty, or
+/// uncompilable. Shared by the engine provider, the LSP, and the formatter so
+/// all agree on which files are BUILD files.
+pub fn build_file_patterns_from_options(
+    opts: &hplugin::config::Options,
+) -> anyhow::Result<Vec<glob::Pattern>> {
+    let names: Option<Vec<String>> =
+        hplugin::config::decode_opt(opts, "buildfile provider", "patterns")?;
+    let Some(names) = names.filter(|n| !n.is_empty()) else {
+        return Ok(default_build_file_patterns());
+    };
+    names
+        .into_iter()
+        .map(|p| glob::Pattern::new(&p).with_context(|| format!("invalid buildfile pattern `{p}`")))
+        .collect()
+}
+
+/// The buildfile-provider settings the formatter needs, resolved from a
+/// workspace `.hephconfig2`. Hands callers (the `build-fmt` command, the LSP)
+/// the patterns + indent with all config loading, decoding, and defaults
+/// handled here — they only supply a root.
+pub struct FormatSettings {
+    pub patterns: Vec<glob::Pattern>,
+    pub indent: usize,
+}
+
+impl FormatSettings {
+    /// Resolve from an optional workspace root. `None` — or a root with no
+    /// buildfile config — yields the defaults.
+    pub fn resolve(root: Option<&Path>) -> Self {
+        let opts = root.map(buildfile_options).unwrap_or_default();
+        FormatSettings {
+            patterns: build_file_patterns_from_options(&opts)
+                .unwrap_or_else(|_| default_build_file_patterns()),
+            indent: build_file_indent_from_options(&opts).unwrap_or(DEFAULT_INDENT),
+        }
+    }
+}
+
+/// The buildfile builtin-provider's `options:` map from the workspace config at
+/// `root`, or empty defaults when there is no config / no buildfile entry.
+/// Mirrors how the engine resolves a built-in provider's options.
+fn buildfile_options(root: &Path) -> hplugin::config::Options {
+    hconfig::load_from_root(root)
+        .ok()
+        .and_then(|cfg| {
+            cfg.plugins
+                .into_iter()
+                .find(|p| {
+                    matches!(&p.identifier, hconfig::PluginIdentifier::Builtin(b) if b == "buildfile")
+                })
+                .map(|p| p.options)
+        })
+        .unwrap_or_default()
+}
+
+/// The indentation width (spaces per level) the formatter should use, from the
+/// buildfile-provider config's `indent` option. Defaults to `DEFAULT_INDENT`.
+pub fn build_file_indent_from_options(opts: &hplugin::config::Options) -> anyhow::Result<usize> {
+    Ok(
+        hplugin::config::decode_opt(opts, "buildfile provider", "indent")?
+            .unwrap_or(DEFAULT_INDENT),
+    )
+}
+
+/// Default indentation width when the config does not set `indent`.
+pub const DEFAULT_INDENT: usize = 4;
+
+/// Every file directly inside `dir` whose name matches one of `patterns`
+/// (handles literal names like `BUILD` and globs like `*.BUILD`), sorted for
+/// deterministic order. A package may have more than one BUILD file.
+pub fn build_files_in_dir(dir: &Path, patterns: &[glob::Pattern]) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+            is_file
+                && patterns
+                    .iter()
+                    .any(|p| p.matches(&e.file_name().to_string_lossy()))
+        })
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+    paths
+}
 
 pub struct RequestState {}
 
@@ -68,7 +169,7 @@ impl Default for Provider {
     fn default() -> Self {
         Self {
             root: std::path::PathBuf::from("/"),
-            build_file_patterns: vec![glob::Pattern::new("BUILD").expect("BUILD literal")],
+            build_file_patterns: default_build_file_patterns(),
             skip: Arc::new(Ignore::default()),
             default_driver: None,
             requests: Mutex::new(HashMap::new()),
@@ -108,17 +209,9 @@ impl Provider {
         hplugin::config::deny_unknown(
             "buildfile provider",
             opts,
-            &["patterns", "skip", "defaultDriver"],
+            &["patterns", "skip", "defaultDriver", "indent"],
         )?;
-        let patterns: Vec<String> =
-            hplugin::config::decode_opt(opts, "buildfile provider", "patterns")?
-                .unwrap_or_else(|| vec!["BUILD".to_string()]);
-        let compiled = patterns
-            .into_iter()
-            .map(|p| {
-                glob::Pattern::new(&p).with_context(|| format!("invalid buildfile pattern `{p}`"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let compiled = build_file_patterns_from_options(opts)?;
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
@@ -436,7 +529,7 @@ mod tests {
         let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &Options::new())
             .expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
-        assert_eq!(names, vec!["BUILD"]);
+        assert_eq!(names, vec!["BUILD", "*.BUILD"]);
     }
 
     #[test]
@@ -476,6 +569,69 @@ mod tests {
             .err()
             .expect("must error");
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn default_patterns_include_dot_build() {
+        let names: Vec<String> = default_build_file_patterns()
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert_eq!(names, vec!["BUILD", "*.BUILD"]);
+    }
+
+    #[test]
+    fn build_files_in_dir_matches_literal_and_glob_sorted() {
+        let dir = tempdir().expect("tempdir");
+        for name in ["BUILD", "lib.BUILD", "app.BUILD", "notes.txt", "BUILD.bak"] {
+            std::fs::write(dir.path().join(name), "").expect("write");
+        }
+        let patterns = default_build_file_patterns();
+        let found: Vec<String> = build_files_in_dir(dir.path(), &patterns)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // `*.BUILD` matches `lib.BUILD`/`app.BUILD` but not `BUILD.bak` or `.txt`;
+        // results are sorted.
+        assert_eq!(found, vec!["BUILD", "app.BUILD", "lib.BUILD"]);
+    }
+
+    #[test]
+    fn format_settings_resolve_reads_config() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".hephconfig2"),
+            "plugins:\n  - builtin: buildfile\n    options:\n      patterns: [BUILD, \"*.star\"]\n      indent: 4\n",
+        )
+        .expect("write config");
+        let settings = FormatSettings::resolve(Some(dir.path()));
+        assert_eq!(settings.indent, 4);
+        let names: Vec<&str> = settings.patterns.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, vec!["BUILD", "*.star"]);
+    }
+
+    #[test]
+    fn format_settings_resolve_none_uses_defaults() {
+        let settings = FormatSettings::resolve(None);
+        assert_eq!(settings.indent, DEFAULT_INDENT);
+        let names: Vec<&str> = settings.patterns.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, vec!["BUILD", "*.BUILD"]);
+    }
+
+    #[test]
+    fn indent_option_defaults_then_reads() {
+        let empty = Options::new();
+        assert_eq!(
+            build_file_indent_from_options(&empty).expect("indent"),
+            DEFAULT_INDENT
+        );
+
+        let mut opts = Options::new();
+        opts.insert(
+            "indent".to_string(),
+            serde_yaml::from_str("4").expect("yaml"),
+        );
+        assert_eq!(build_file_indent_from_options(&opts).expect("indent"), 4);
     }
 
     #[test]

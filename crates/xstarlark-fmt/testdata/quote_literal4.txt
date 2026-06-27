@@ -1,0 +1,9 @@
+a = 'some \
+         long\
+     things'.format(input_var=input_var)
+----
+a = 'some \
+         long\
+     things'.format(
+  input_var = input_var,
+)

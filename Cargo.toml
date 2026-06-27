@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/config", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-stabby", "crates/plugin-sdk", "crates/plugin-go-cdylib", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/driver-bridge", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/plugin-gha", "crates/plugin-gha-cdylib", "crates/telemetry", "crates/tui", "crates/lock", "crates/selfupdate", "crates/engine"]
+members = ["gen/proto", "crates/e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/config", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-stabby", "crates/plugin-sdk", "crates/plugin-go-cdylib", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/driver-bridge", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-query", "crates/plugin-go", "crates/plugin-gha", "crates/plugin-gha-cdylib", "crates/telemetry", "crates/tui", "crates/lock", "crates/selfupdate", "crates/engine", "crates/xstarlark-fmt"]
 
 [profile.profiling]
 inherits = "release"
@@ -114,6 +114,7 @@ htui = { package = "tui", path = "crates/tui" }
 hlock = { package = "lock", path = "crates/lock" }
 hselfupdate = { package = "selfupdate", path = "crates/selfupdate" }
 hengine = { package = "engine", path = "crates/engine" }
+hxstarlark-fmt = { package = "xstarlark-fmt", path = "crates/xstarlark-fmt" }
 htspec-derive = { path = "crates/htspec-derive" }
 nom = { version = "8", default-features = false, features = ["std"] }
 anyhow = "1.0.102"

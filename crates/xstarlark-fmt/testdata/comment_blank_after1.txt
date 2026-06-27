@@ -1,0 +1,11 @@
+# some comment
+
+func(
+  foo = "bar"
+)
+----
+# some comment
+
+func(
+  foo = "bar",
+)

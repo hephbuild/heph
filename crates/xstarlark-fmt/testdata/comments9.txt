@@ -1,0 +1,17 @@
+f(
+    a=b,
+    # line1
+    # line2
+    # line3
+)
+
+c=d
+----
+f(
+  a = b,
+  # line1
+  # line2
+  # line3
+)
+
+c = d
