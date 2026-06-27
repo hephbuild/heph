@@ -7,6 +7,7 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+hconfig = { package = "config", path = "../config" }
 hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }

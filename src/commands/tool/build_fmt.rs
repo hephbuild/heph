@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use hplugin::config::Options;
 use hxstarlark_fmt::{Config, FmtError};
 
 use crate::commands::GlobalOptions;
@@ -14,10 +13,7 @@ use crate::commands::bootstrap;
 use crate::engine::{Engine, get_cwp, get_root};
 use crate::htmatcher::Matcher;
 use crate::htpkg::{self, PkgBuf};
-use crate::pluginbuildfile::{
-    DEFAULT_INDENT, build_file_indent_from_options, build_file_patterns_from_options,
-    build_files_in_dir, default_build_file_patterns,
-};
+use crate::pluginbuildfile::{FormatSettings, build_files_in_dir};
 use crate::tui::{self, App, AppContext, LogSink};
 
 /// The argument value that selects stdin → stdout mode.
@@ -45,29 +41,10 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
     bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
-/// The buildfile-provider options from the workspace `.hephconfig2`, or empty
-/// defaults when there is no workspace / no buildfile entry. Mirrors how the
-/// engine resolves a built-in provider's options.
-fn buildfile_options(root: &std::path::Path) -> Options {
-    use crate::engine::config_yaml::{PluginIdentifier, load_from_root};
-    load_from_root(root)
-        .ok()
-        .and_then(|cfg| {
-            cfg.plugins
-                .into_iter()
-                .find(|p| matches!(&p.identifier, PluginIdentifier::Builtin(b) if b == "buildfile"))
-                .map(|p| p.options)
-        })
-        .unwrap_or_default()
-}
-
 /// Read Starlark from stdin, write the formatted result to stdout. The indent
 /// width comes from the workspace's buildfile config when run inside one.
 fn format_stdin() -> anyhow::Result<()> {
-    let indent = match get_root() {
-        Ok(root) => build_file_indent_from_options(&buildfile_options(&root))?,
-        Err(_) => DEFAULT_INDENT,
-    };
+    let indent = FormatSettings::resolve(get_root().ok().as_deref()).indent;
 
     let mut src = String::new();
     std::io::stdin()
@@ -127,22 +104,20 @@ impl App for BuildFmtApp {
                 .await?
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
-            // Resolve the workspace's configured BUILD-file patterns (literal
-            // names like `BUILD` and globs like `*.BUILD`) and indent width so
-            // every file the buildfile provider treats as a BUILD file is
-            // covered and formatted as the workspace configures.
-            let opts = buildfile_options(&self.root);
-            let patterns = build_file_patterns_from_options(&opts)
-                .unwrap_or_else(|_| default_build_file_patterns());
+            // The workspace's configured BUILD-file patterns (literal names like
+            // `BUILD` and globs like `*.BUILD`) and indent width, so every file
+            // the buildfile provider treats as a BUILD file is covered and
+            // formatted as the workspace configures.
+            let settings = FormatSettings::resolve(Some(&self.root));
             let cfg = Config {
-                indent_size: build_file_indent_from_options(&opts)?,
+                indent_size: settings.indent,
             };
 
             // A package may have several matching files; dedup across packages.
             let mut build_files: BTreeSet<PathBuf> = BTreeSet::new();
             for pkg in &packages {
                 let dir = self.root.join(pkg);
-                build_files.extend(build_files_in_dir(&dir, &patterns));
+                build_files.extend(build_files_in_dir(&dir, &settings.patterns));
             }
 
             let mut changed = 0usize;

@@ -46,6 +46,45 @@ pub fn build_file_patterns_from_options(
         .collect()
 }
 
+/// The buildfile-provider settings the formatter needs, resolved from a
+/// workspace `.hephconfig2`. Hands callers (the `build-fmt` command, the LSP)
+/// the patterns + indent with all config loading, decoding, and defaults
+/// handled here — they only supply a root.
+pub struct FormatSettings {
+    pub patterns: Vec<glob::Pattern>,
+    pub indent: usize,
+}
+
+impl FormatSettings {
+    /// Resolve from an optional workspace root. `None` — or a root with no
+    /// buildfile config — yields the defaults.
+    pub fn resolve(root: Option<&Path>) -> Self {
+        let opts = root.map(buildfile_options).unwrap_or_default();
+        FormatSettings {
+            patterns: build_file_patterns_from_options(&opts)
+                .unwrap_or_else(|_| default_build_file_patterns()),
+            indent: build_file_indent_from_options(&opts).unwrap_or(DEFAULT_INDENT),
+        }
+    }
+}
+
+/// The buildfile builtin-provider's `options:` map from the workspace config at
+/// `root`, or empty defaults when there is no config / no buildfile entry.
+/// Mirrors how the engine resolves a built-in provider's options.
+fn buildfile_options(root: &Path) -> hplugin::config::Options {
+    hconfig::load_from_root(root)
+        .ok()
+        .and_then(|cfg| {
+            cfg.plugins
+                .into_iter()
+                .find(|p| {
+                    matches!(&p.identifier, hconfig::PluginIdentifier::Builtin(b) if b == "buildfile")
+                })
+                .map(|p| p.options)
+        })
+        .unwrap_or_default()
+}
+
 /// The indentation width (spaces per level) the formatter should use, from the
 /// buildfile-provider config's `indent` option. Defaults to `DEFAULT_INDENT`.
 pub fn build_file_indent_from_options(opts: &hplugin::config::Options) -> anyhow::Result<usize> {
@@ -555,6 +594,28 @@ mod tests {
         // `*.BUILD` matches `lib.BUILD`/`app.BUILD` but not `BUILD.bak` or `.txt`;
         // results are sorted.
         assert_eq!(found, vec!["BUILD", "app.BUILD", "lib.BUILD"]);
+    }
+
+    #[test]
+    fn format_settings_resolve_reads_config() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".hephconfig2"),
+            "plugins:\n  - builtin: buildfile\n    options:\n      patterns: [BUILD, \"*.star\"]\n      indent: 4\n",
+        )
+        .expect("write config");
+        let settings = FormatSettings::resolve(Some(dir.path()));
+        assert_eq!(settings.indent, 4);
+        let names: Vec<&str> = settings.patterns.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, vec!["BUILD", "*.star"]);
+    }
+
+    #[test]
+    fn format_settings_resolve_none_uses_defaults() {
+        let settings = FormatSettings::resolve(None);
+        assert_eq!(settings.indent, DEFAULT_INDENT);
+        let names: Vec<&str> = settings.patterns.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, vec!["BUILD", "*.BUILD"]);
     }
 
     #[test]
