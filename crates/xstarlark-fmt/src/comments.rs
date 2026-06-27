@@ -83,20 +83,37 @@ impl CommentStore {
         self.items.iter().any(|c| c.line > after && c.line < before)
     }
 
+    /// Emit the next pending comment, advancing the cursor. A blank line is
+    /// inserted first when this comment was separated from the previously-emitted
+    /// one (`prev`) by a blank line in the source — so the grouping of adjacent
+    /// comment blocks (e.g. commented-out alternatives) is preserved.
+    fn emit_next(&mut self, p: &mut Printer, prev: &mut Option<usize>) {
+        let Some(c) = self.items.get(self.next) else {
+            return;
+        };
+        let line = c.line;
+        let text = format_comment(&c.text);
+        if prev.is_some_and(|pl| line > pl + 1) {
+            p.write("\n");
+        }
+        p.write(&text);
+        p.write("\n");
+        *prev = Some(line);
+        self.next += 1;
+    }
+
     /// Emit, each on its own line, all pending comments strictly above `line`.
     pub(crate) fn flush_before(&mut self, p: &mut Printer, line: usize) {
         if self.suppressed {
             return;
         }
-        while let Some(c) = self.peek() {
-            if c.line < line {
-                let text = format_comment(&c.text);
-                self.next += 1;
-                p.write(&text);
-                p.write("\n");
-            } else {
+        let mut prev = None;
+        loop {
+            let go = matches!(self.peek(), Some(c) if c.line < line);
+            if !go {
                 break;
             }
+            self.emit_next(p, &mut prev);
         }
     }
 
@@ -135,15 +152,16 @@ impl CommentStore {
         if self.suppressed {
             return;
         }
-        while let Some(c) = self.peek() {
-            if c.col >= body_col && before_line.is_none_or(|bl| c.line < bl) {
-                let text = format_comment(&c.text);
-                self.next += 1;
-                p.write(&text);
-                p.write("\n");
-            } else {
+        let mut prev = None;
+        loop {
+            let go = matches!(
+                self.peek(),
+                Some(c) if c.col >= body_col && before_line.is_none_or(|bl| c.line < bl)
+            );
+            if !go {
                 break;
             }
+            self.emit_next(p, &mut prev);
         }
     }
 
@@ -152,11 +170,9 @@ impl CommentStore {
         if self.suppressed {
             return;
         }
-        while let Some(c) = self.peek() {
-            let text = format_comment(&c.text);
-            self.next += 1;
-            p.write(&text);
-            p.write("\n");
+        let mut prev = None;
+        while self.peek().is_some() {
+            self.emit_next(p, &mut prev);
         }
     }
 }

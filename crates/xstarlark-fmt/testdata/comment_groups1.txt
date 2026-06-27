@@ -1,0 +1,25 @@
+# jest_test_v2(
+#     linkdeps = deps.development,
+# )
+
+# prettier_v2(
+#     linkdeps = deps.development,
+#     treedeps = deps.tree,
+# )
+
+# eslint_flat(
+#     name = "lint",
+# )
+----
+# jest_test_v2(
+#     linkdeps = deps.development,
+# )
+
+# prettier_v2(
+#     linkdeps = deps.development,
+#     treedeps = deps.tree,
+# )
+
+# eslint_flat(
+#     name = "lint",
+# )
