@@ -87,6 +87,7 @@ impl EProvider for Provider {
                     config: Default::default(),
                     labels: vec![],
                     transitive: Default::default(),
+                    approval: Default::default(),
                 },
             })
         })
@@ -308,6 +309,7 @@ mod tests {
                 config: Default::default(),
                 labels: vec![],
                 transitive: Default::default(),
+                approval: Default::default(),
             }),
         }
     }

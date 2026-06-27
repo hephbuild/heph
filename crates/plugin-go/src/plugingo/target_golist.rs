@@ -141,6 +141,7 @@ fn build_spec_inner(
         config,
         labels: vec![],
         transitive: Default::default(),
+        approval: Default::default(),
     })
 }
 

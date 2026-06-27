@@ -1688,6 +1688,16 @@ impl Engine {
             .once(
                 key,
                 enclose!((self => engine, rs) move || async move {
+                    // Approval gate: an `approval`-required target pauses here for
+                    // an explicit user decision (interactive Y/N, stdin prompt, or
+                    // `--auto-approve`). Single-flighted by this memoizer cell, so
+                    // a target prompts at most once per request. Runs before the
+                    // execute semaphore is acquired, so a waiting prompt holds no
+                    // worker permit.
+                    engine
+                        .gate_approval(&rs, &spec, &def)
+                        .await
+                        .with_context(|| format!("approval {addr}"))?;
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
                     let (artifacts, sandbox_cleanup, sandbox_guards) = engine
                         .clone()
@@ -4658,6 +4668,7 @@ mod tests {
             config: HashMap::new(),
             labels: vec![],
             transitive: Default::default(),
+            approval: Default::default(),
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
@@ -4913,6 +4924,7 @@ mod tests {
             config: HashMap::new(),
             labels: vec![],
             transitive: Default::default(),
+            approval: Default::default(),
         };
         engine
             .register_provider(move |_| Box::new(OneTargetProvider { spec }))

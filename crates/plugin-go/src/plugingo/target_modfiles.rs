@@ -30,6 +30,7 @@ pub fn build_spec(addr: Addr, mod_files: &[String]) -> TargetSpec {
         config,
         labels: vec![],
         transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 

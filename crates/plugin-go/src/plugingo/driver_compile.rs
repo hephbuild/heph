@@ -829,6 +829,7 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         config,
         labels: vec!["go-build".to_string()],
         transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 

@@ -228,6 +228,7 @@ pub fn build_test_spec(
         config,
         labels: vec![],
         transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 
@@ -311,6 +312,7 @@ pub fn test_spec(
         config,
         labels: vec!["test".to_string(), "go-test".to_string()],
         transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 

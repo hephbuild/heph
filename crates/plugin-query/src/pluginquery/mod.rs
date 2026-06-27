@@ -171,6 +171,7 @@ impl EProvider for Provider {
                     config,
                     labels: vec![],
                     transitive: Default::default(),
+                    approval: Default::default(),
                 },
             })
         })

@@ -229,6 +229,7 @@ pub fn build_spec(
         config,
         labels: vec!["go-toolchain".to_string()],
         transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 

@@ -76,6 +76,7 @@ impl Provider {
                     config,
                     labels: t.labels,
                     transitive: Default::default(),
+                    approval: Default::default(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;

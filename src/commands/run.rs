@@ -91,6 +91,11 @@ struct RunApp {
     engine: Arc<Engine>,
     matcher: Matcher,
     fail_fast: bool,
+    auto_approve: bool,
+    /// Shared approval queue: attached to the TUI view (so prompts render) and to
+    /// the TUI approval handler (so keypresses resolve them). Unused in non-TUI
+    /// mode, which prompts on the terminal instead.
+    approval: tui::ApprovalCenter,
 }
 
 impl RunApp {
@@ -109,7 +114,7 @@ impl App for RunApp {
     type CiView = tui::CiProgressView;
 
     fn tui_view(&self) -> Self::TuiView {
-        tui::TuiProgressView::new(self.progress_label())
+        tui::TuiProgressView::new(self.progress_label()).with_approval(self.approval.clone())
     }
 
     fn ci_view(&self) -> Self::CiView {
@@ -153,11 +158,25 @@ impl App for RunApp {
             interactive,
             frozen: self.args.frozen,
         };
+        // In the interactive TUI the prompt renders on the live view and `y`/`n`
+        // resolve it; otherwise the notice prints to stderr and the decision is
+        // read from the terminal (or auto-approved).
+        let approval: Arc<dyn crate::engine::approval::ApprovalHandler> = if ctx.interactive() {
+            Arc::new(crate::commands::approval::TuiApprovalHandler::new(
+                self.approval.clone(),
+                self.auto_approve,
+            ))
+        } else {
+            Arc::new(crate::commands::approval::CliApprovalHandler::new(
+                self.auto_approve,
+            ))
+        };
         let rs = self.engine.new_state_full(
             self.fail_fast,
             ctx.event_sender(),
             ctx.bg_pending(),
             self.args.log_lines,
+            Some(approval),
         );
 
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
@@ -222,6 +241,8 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         engine: std::sync::Arc::clone(&engine),
         matcher: m,
         fail_fast: global.fail_fast,
+        auto_approve: global.auto_approve,
+        approval: tui::ApprovalCenter::new(),
     };
     let interactive = tui::should_use_tui(global.no_tui);
     let result = tui::run_app(app, sink, interactive, shutdown).await;

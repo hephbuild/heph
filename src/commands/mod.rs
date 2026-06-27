@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod bootstrap;
 pub mod completion;
 pub mod errors;

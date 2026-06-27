@@ -306,6 +306,7 @@ mod shell_fallback_tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
+                approval: Default::default(),
             }),
         });
         let bridge = ManagedDriverBridge::new_os_for_test_with_shell_fallback(

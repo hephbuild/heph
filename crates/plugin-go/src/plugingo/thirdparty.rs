@@ -117,6 +117,7 @@ pub fn build_download_spec(
         config,
         labels: vec![],
         transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 

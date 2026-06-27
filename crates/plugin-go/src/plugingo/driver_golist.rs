@@ -543,6 +543,7 @@ mod tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
+                approval: Default::default(),
             }),
         }
     }
@@ -576,6 +577,7 @@ mod tests {
                 config: HashMap::new(),
                 labels: vec![],
                 transitive: Default::default(),
+                approval: Default::default(),
             }),
         };
         assert!(driver().parse(req, &ct).await.is_err());

@@ -1042,6 +1042,10 @@ pub struct TuiProgressView {
     /// substring matched against the target addr. Empty means no filtering.
     /// Persists after `Enter` confirms so the filtered list stays scrollable.
     search_query: RefCell<String>,
+    /// Pending approval prompts shared with the engine's approval handler. `None`
+    /// for commands without an approval gate. When a prompt is active it is
+    /// rendered at the top of the live body and `y`/`n`/Enter resolve it.
+    approval: Option<crate::tui::approval::ApprovalCenter>,
 }
 
 impl TuiProgressView {
@@ -1062,7 +1066,60 @@ impl TuiProgressView {
             finished_at_ms: None,
             search_active: Cell::new(false),
             search_query: RefCell::new(String::new()),
+            approval: None,
         }
+    }
+
+    /// Attach the shared approval queue so this view renders pending prompts and
+    /// resolves them from key events. Used by commands that gate execution.
+    pub fn with_approval(mut self, center: crate::tui::approval::ApprovalCenter) -> Self {
+        self.approval = Some(center);
+        self
+    }
+
+    /// Body rows for the active approval prompt, or empty when idle. Collapsed:
+    /// a single banner with the keys. Expanded: the banner plus each notice's
+    /// name and wrapped contents (scrollable as part of the body).
+    fn approval_lines(&self) -> Vec<Line<'static>> {
+        let Some(view) = self.approval.as_ref().and_then(|c| c.current()) else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        let queued = if view.queued_behind > 0 {
+            format!(" · +{} waiting", view.queued_behind)
+        } else {
+            String::new()
+        };
+        let action = if view.expanded { "enter hide" } else { "enter view" };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ⚠ approval required: {}  [y] approve · [n] reject · {action}{queued}",
+                view.addr
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if view.expanded {
+            if view.notices.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "    (no notice declared)".to_string(),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )));
+            }
+            for notice in &view.notices {
+                lines.push(Line::from(Span::styled(
+                    format!("  ── {} ──", notice.name),
+                    Style::default().fg(Color::Cyan),
+                )));
+                for raw in notice.content.lines() {
+                    lines.push(Line::from(format!("  {raw}")));
+                }
+            }
+        }
+        lines
     }
 
     /// The selectable body views in cycle order: [`ViewMode::Default`] first,
@@ -1301,6 +1358,25 @@ impl TUIAppView for TuiProgressView {
         self.scope.set(next);
     }
 
+    fn approval_active(&self) -> bool {
+        self.approval.as_ref().is_some_and(|c| c.is_active())
+    }
+
+    fn approval_respond(&mut self, approve: bool) {
+        if let Some(center) = self.approval.as_ref() {
+            center.respond(approve);
+        }
+        // A resolved prompt shrinks the body; reset scroll so the live rows show.
+        self.scroll.set(0);
+    }
+
+    fn approval_toggle_notice(&mut self) {
+        if let Some(center) = self.approval.as_ref() {
+            center.toggle_expanded();
+        }
+        self.scroll.set(0);
+    }
+
     fn is_searching(&self) -> bool {
         self.search_active.get()
     }
@@ -1363,7 +1439,13 @@ impl TUIAppView for TuiProgressView {
         let query = self.search_query.borrow();
         let filter: &str = query.as_str();
         let body = match view {
-            ViewMode::Default => self.state.body_lines(now_ms),
+            // Pending approval prompts ride at the very top of the live body so a
+            // gated run is impossible to miss; the slow/lock rows follow.
+            ViewMode::Default => {
+                let mut b = self.approval_lines();
+                b.extend(self.state.body_lines(now_ms));
+                b
+            }
             ViewMode::Done => self.state.done_lines(self.scope.get(), filter),
             ViewMode::Failed => self.state.failed_lines(filter),
         };

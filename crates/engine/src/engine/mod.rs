@@ -20,6 +20,8 @@ pub use hconfig as config_yaml;
 pub use hconfig::{FuseConfig, FuseMode, get_cwd, get_root};
 mod plugin_load;
 pub use plugin_load::clear_plugin_cache;
+pub mod approval;
+pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
 mod cwd;
 mod result;
 pub use cwd::get_cwp;

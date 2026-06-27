@@ -17,6 +17,10 @@ pub struct GlobalOptions {
     /// matched target and reporting all failures at the end
     #[arg(long = "fail-fast", visible_alias = "ff", global = true)]
     pub fail_fast: bool,
+    /// Approve every `approval`-gated target without prompting. The notice (if
+    /// any) is still printed in non-TUI mode.
+    #[arg(long = "auto-approve", global = true)]
+    pub auto_approve: bool,
 }
 
 #[cfg(test)]
@@ -47,5 +51,11 @@ mod tests {
     fn no_tui_defaults_off() {
         assert!(!parse(&["heph"]).no_tui);
         assert!(parse(&["heph", "--no-tui"]).no_tui);
+    }
+
+    #[test]
+    fn auto_approve_is_opt_in() {
+        assert!(!parse(&["heph"]).auto_approve);
+        assert!(parse(&["heph", "--auto-approve"]).auto_approve);
     }
 }

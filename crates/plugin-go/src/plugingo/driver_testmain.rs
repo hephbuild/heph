@@ -311,6 +311,7 @@ mod tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
+                approval: Default::default(),
             }),
         }
     }
@@ -380,6 +381,7 @@ mod tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
+                approval: Default::default(),
             }),
         };
         let resp = driver().parse(req, &ct).await.unwrap();
@@ -414,6 +416,7 @@ mod tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
+                approval: Default::default(),
             }),
         };
         assert!(driver().parse(req, &ct).await.is_err());

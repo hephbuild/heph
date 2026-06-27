@@ -380,6 +380,7 @@ mod tests {
             config,
             labels: vec![],
             transitive: Default::default(),
+            approval: Default::default(),
         }
     }
 
@@ -396,6 +397,7 @@ mod tests {
             config,
             labels: vec![],
             transitive: Default::default(),
+            approval: Default::default(),
         }
     }
 
@@ -525,6 +527,7 @@ mod tests {
             config,
             labels: vec![],
             transitive: Default::default(),
+            approval: Default::default(),
         }
     }
 
