@@ -17,9 +17,18 @@ type golangciConfig struct {
 	Linters struct {
 		// "standard" (default), "all", "none", or "fast". Only standard/all/none
 		// are meaningful here; "fast" is treated as "standard".
-		Default string   `yaml:"default"`
-		Enable  []string `yaml:"enable"`
-		Disable []string `yaml:"disable"`
+		Default    string   `yaml:"default"`
+		Enable     []string `yaml:"enable"`
+		Disable    []string `yaml:"disable"`
+		Exclusions struct {
+			// Subset of golangci-lint exclusions: per-rule linter scoping plus
+			// path/text regexes. Presets and `source` matching are not parsed.
+			Rules []struct {
+				Linters []string `yaml:"linters"`
+				Path    string   `yaml:"path"`
+				Text    string   `yaml:"text"`
+			} `yaml:"rules"`
+		} `yaml:"exclusions"`
 	} `yaml:"linters"`
 }
 
@@ -44,10 +53,11 @@ func loadConfig(path string) (golangciConfig, error) {
 }
 
 // selectAnalyzers resolves the enabled linter set from cfg against the registry,
-// then flattens to the concrete analyzers to run. Unknown linter names (e.g. a
-// formatter or a linter not yet mapped here) are reported so they fail loudly
-// rather than being silently ignored.
-func selectAnalyzers(cfg golangciConfig, r map[string][]*analysis.Analyzer) ([]*analysis.Analyzer, []string, error) {
+// then flattens to the concrete analyzers to run. It also returns the
+// analyzer→golangci-linter-name map (for `//nolint:<linter>` matching). Unknown
+// linter names (e.g. a formatter or a linter not yet mapped here) are reported
+// so they fail loudly rather than being silently ignored.
+func selectAnalyzers(cfg golangciConfig, r map[string][]*analysis.Analyzer) ([]*analysis.Analyzer, map[*analysis.Analyzer]string, []string, error) {
 	enabled := map[string]bool{}
 	switch cfg.Linters.Default {
 	case "", "standard", "fast":
@@ -61,7 +71,7 @@ func selectAnalyzers(cfg golangciConfig, r map[string][]*analysis.Analyzer) ([]*
 	case "none":
 		// start empty
 	default:
-		return nil, nil, fmt.Errorf("unknown linters.default %q", cfg.Linters.Default)
+		return nil, nil, nil, fmt.Errorf("unknown linters.default %q", cfg.Linters.Default)
 	}
 
 	var unknown []string
@@ -84,15 +94,17 @@ func selectAnalyzers(cfg golangciConfig, r map[string][]*analysis.Analyzer) ([]*
 	sort.Strings(names)
 
 	seen := map[*analysis.Analyzer]bool{}
+	linterOf := map[*analysis.Analyzer]string{}
 	var out []*analysis.Analyzer
 	for _, n := range names {
 		for _, a := range r[n] {
 			if !seen[a] {
 				seen[a] = true
+				linterOf[a] = n
 				out = append(out, a)
 			}
 		}
 	}
 	sort.Strings(unknown)
-	return out, unknown, nil
+	return out, linterOf, unknown, nil
 }
