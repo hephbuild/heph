@@ -20,7 +20,12 @@ async fn test_result_matcher_eval_error_not_in_registry() -> anyhow::Result<()> 
     let rs = e.new_state();
     let matcher = Matcher::Package(PkgBuf::from("broken"));
     let res = e
-        .result(rs.clone(), &matcher, &ResultOptions::default())
+        .result(
+            rs.clone(),
+            &matcher,
+            heph::engine::OutputMatcher::All,
+            &ResultOptions::default(),
+        )
         .await;
 
     // The eval error surfaces as a returned `Err`...

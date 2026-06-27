@@ -118,6 +118,23 @@ impl Workspace {
         self.run_addr(addr).await
     }
 
+    /// Resolve a single addr restricted to a subset of its outputs — the exact
+    /// path `heph run --output NAME` takes. Returns the engine error verbatim
+    /// (e.g. "output not found") without the failure-registry rewrite, so callers
+    /// can assert on validation failures.
+    pub async fn run_addr_outputs(
+        &self,
+        addr_str: &str,
+        outputs: &[&str],
+    ) -> anyhow::Result<Arc<EResult>> {
+        let addr = parse_addr(addr_str)?;
+        let e = self.engine.clone();
+        let rs = e.new_state();
+        let matcher = OutputMatcher::Exact(outputs.iter().map(|s| s.to_string()).collect());
+        e.result_addr(rs, &addr, matcher, &ResultOptions::default())
+            .await
+    }
+
     pub async fn run_addr(&self, addr: Addr) -> anyhow::Result<Arc<EResult>> {
         let e = self.engine.clone();
         let rs = e.new_state();
@@ -164,7 +181,9 @@ impl Workspace {
     ) -> anyhow::Result<Vec<Arc<EResult>>> {
         let e = self.engine.clone();
         let rs = e.new_state();
-        let batch = e.result(rs, matcher, &ResultOptions::default()).await?;
+        let batch = e
+            .result(rs, matcher, OutputMatcher::All, &ResultOptions::default())
+            .await?;
         if !batch.errors.is_empty() {
             let mut msg = String::new();
             for (addr, err) in &batch.errors {
