@@ -26,12 +26,15 @@
 // enable/disable/default). The config path is passed via the
 // HEPH_GOVET_GOLANGCI_CONFIG environment variable by the heph go_lint driver.
 //
+// `//nolint` directives and `linters.exclusions.rules` (path/text/linter
+// scoping) ARE honored: each analyzer's emission is wrapped with a suppressor
+// (see filter.go), so the report this binary writes is already filtered.
+//
 // Not supported in this per-package model (by design):
 //   - formatters (gofmt, gofumpt, goimports) — not go/analysis analyzers;
 //   - `unused` — needs whole-program analysis, incompatible with per-unit facts;
-//   - `//nolint` directives and `issues` exclude-rules — these are golangci-lint
-//     runner features applied to its own issue stream, not the analyzers; they
-//     are a planned follow-up (filtered at the heph gate).
+//   - exclusion presets and `exclusions.rules[].source` matching (only
+//     path/text/linter scoping is parsed).
 //
 // # Invocation (by the heph go_lint driver)
 //
@@ -58,7 +61,7 @@ func main() {
 	if err != nil {
 		fatal(err.Error())
 	}
-	analyzers, unknown, err := selectAnalyzers(cfg, r)
+	analyzers, linterOf, unknown, err := selectAnalyzers(cfg, r)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -78,6 +81,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "heph-govet: enabled analyzer %s\n", a.Name)
 		}
 	}
+
+	// Apply `//nolint` + exclusion filtering by wrapping each analyzer's emission.
+	sup, err := newSuppressor(cfg)
+	if err != nil {
+		fatal(err.Error())
+	}
+	analyzers = wrapAnalyzers(analyzers, linterOf, sup)
+
 	unitchecker.Main(analyzers...)
 }
 
