@@ -27,6 +27,58 @@ const LIST_MAX_LINE_LENGTH: usize = 100;
 const LIST_MAX_COMBINED_LENGTH: usize = 50;
 const LIST_MAX_ELEM_LENGTH: usize = 50;
 
+// Expression binding precedence (higher binds tighter). A sub-expression whose
+// precedence is below its context's required minimum is parenthesized.
+const PREC_MIN: u8 = 0; // statement / argument / bracketed: never parenthesize
+const PREC_COND: u8 = 1; // `x if c else y`, `lambda`
+const PREC_OR: u8 = 2;
+const PREC_AND: u8 = 3;
+const PREC_NOT: u8 = 4;
+const PREC_CMP: u8 = 5; // == != < > <= >= in, not in
+const PREC_BIT_OR: u8 = 6;
+const PREC_BIT_XOR: u8 = 7;
+const PREC_BIT_AND: u8 = 8;
+const PREC_SHIFT: u8 = 9;
+const PREC_ADD: u8 = 10; // + -
+const PREC_MUL: u8 = 11; // * / // %
+const PREC_UNARY: u8 = 12; // unary - + ~
+const PREC_ATOM: u8 = 13; // literals, names, calls, indexing, lists, …
+
+/// Binding precedence of a binary operator.
+fn binop_prec(op: &starlark::syntax::ast::BinOp) -> u8 {
+    use starlark::syntax::ast::BinOp;
+    match op {
+        BinOp::Or => PREC_OR,
+        BinOp::And => PREC_AND,
+        BinOp::Equal
+        | BinOp::NotEqual
+        | BinOp::Less
+        | BinOp::Greater
+        | BinOp::LessOrEqual
+        | BinOp::GreaterOrEqual
+        | BinOp::In
+        | BinOp::NotIn => PREC_CMP,
+        BinOp::BitOr => PREC_BIT_OR,
+        BinOp::BitXor => PREC_BIT_XOR,
+        BinOp::BitAnd => PREC_BIT_AND,
+        BinOp::LeftShift | BinOp::RightShift => PREC_SHIFT,
+        BinOp::Add | BinOp::Subtract => PREC_ADD,
+        BinOp::Multiply | BinOp::Divide | BinOp::FloorDivide | BinOp::Percent => PREC_MUL,
+    }
+}
+
+/// Binding precedence of an expression — how tightly it holds together, used to
+/// decide whether it needs parentheses in a given context.
+fn expr_prec(expr: &ExprP<starlark::syntax::ast::AstNoPayload>) -> u8 {
+    match expr {
+        ExprP::If(_) | ExprP::Lambda(_) => PREC_COND,
+        ExprP::Op(_, op, _) => binop_prec(op),
+        ExprP::Not(_) => PREC_NOT,
+        ExprP::Minus(_) | ExprP::Plus(_) | ExprP::BitNot(_) => PREC_UNARY,
+        _ => PREC_ATOM,
+    }
+}
+
 pub(crate) struct Formatter<'a> {
     codemap: &'a CodeMap,
     comments: CommentStore,
@@ -331,17 +383,38 @@ impl<'a> Formatter<'a> {
 
     // --- expressions ------------------------------------------------------
 
+    /// Format an expression in a context that imposes no minimum precedence
+    /// (a statement, an argument, or a bracketed position).
     fn format_expr(&mut self, p: &mut Printer, expr: &AstExpr) {
+        self.format_expr_prec(p, expr, PREC_MIN);
+    }
+
+    /// Format an expression that appears where the surrounding operator binds at
+    /// `min` precedence, adding parentheses when the expression binds looser —
+    /// the Rust `starlark` AST drops source parentheses, so the formatter must
+    /// re-insert the ones meaning depends on (e.g. a ternary inside `+`).
+    fn format_expr_prec(&mut self, p: &mut Printer, expr: &AstExpr, min: u8) {
+        let parens = expr_prec(&expr.node) < min;
+        if parens {
+            p.write("(");
+        }
+        self.format_expr_bare(p, expr);
+        if parens {
+            p.write(")");
+        }
+    }
+
+    fn format_expr_bare(&mut self, p: &mut Printer, expr: &AstExpr) {
         match &expr.node {
             ExprP::Identifier(id) => p.write(&id.node.ident),
             ExprP::Literal(lit) => self.format_literal(p, lit, expr.span),
             ExprP::Dot(x, name) => {
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_ATOM);
                 p.write(".");
                 p.write(&name.node);
             }
             ExprP::Call(func, args) => {
-                self.format_expr(p, func);
+                self.format_expr_prec(p, func, PREC_ATOM);
                 let nl = p.level() == 0 && is_target_like(&args.args);
                 let region = (self.start_line(expr.span), self.end_line(expr.span));
                 let items: Vec<Item> = args.args.iter().map(Item::Arg).collect();
@@ -349,14 +422,14 @@ impl<'a> Formatter<'a> {
             }
             ExprP::Index(bx) => {
                 let (x, i) = &**bx;
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_ATOM);
                 p.write("[");
                 self.format_expr(p, i);
                 p.write("]");
             }
             ExprP::Index2(bx) => {
                 let (x, i, j) = &**bx;
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_ATOM);
                 p.write("[");
                 self.format_expr(p, i);
                 p.write(", ");
@@ -364,7 +437,7 @@ impl<'a> Formatter<'a> {
                 p.write("]");
             }
             ExprP::Slice(x, a, b, c) => {
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_ATOM);
                 p.write("[");
                 if let Some(a) = a {
                     self.format_expr(p, a);
@@ -380,33 +453,38 @@ impl<'a> Formatter<'a> {
                 p.write("]");
             }
             ExprP::Op(l, op, r) => {
-                self.format_expr(p, l);
+                let pr = binop_prec(op);
+                // Binary operators are left-associative: the left operand may
+                // bind at the same precedence, the right must bind tighter.
+                self.format_expr_prec(p, l, pr);
                 p.write(&format!("{op}"));
-                self.format_expr(p, r);
+                self.format_expr_prec(p, r, pr + 1);
             }
             ExprP::Not(x) => {
                 p.write("not ");
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_NOT);
             }
             ExprP::Minus(x) => {
                 p.write("-");
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_UNARY);
             }
             ExprP::Plus(x) => {
                 p.write("+");
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_UNARY);
             }
             ExprP::BitNot(x) => {
                 p.write("~");
-                self.format_expr(p, x);
+                self.format_expr_prec(p, x, PREC_UNARY);
             }
             ExprP::If(bx) => {
                 let (cond, v1, v2) = &**bx;
-                self.format_expr(p, v1);
+                // `v1 if cond else v2`: the value and condition bind tighter than
+                // the conditional; the else-branch is right-associative.
+                self.format_expr_prec(p, v1, PREC_COND + 1);
                 p.write(" if ");
-                self.format_expr(p, cond);
+                self.format_expr_prec(p, cond, PREC_COND + 1);
                 p.write(" else ");
-                self.format_expr(p, v2);
+                self.format_expr_prec(p, v2, PREC_COND);
             }
             ExprP::List(v) => {
                 let region = (self.start_line(expr.span), self.end_line(expr.span));
