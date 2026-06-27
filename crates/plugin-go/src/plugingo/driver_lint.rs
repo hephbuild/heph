@@ -342,6 +342,14 @@ impl ManagedDriver for GoLintDriver {
         )
         .context("write unitchecker cfg")?;
 
+        // `.golangci.yml` (if staged) selects which analyzers heph-govet runs.
+        // It is a hashed input, so a config change re-keys this target and
+        // re-lints. Passed by env because unitchecker rejects unknown flags.
+        let mut env: HashMap<String, String> = HashMap::new();
+        if let Ok(config_path) = self.single_staged_path(&req, "config") {
+            env.insert("HEPH_GOVET_GOLANGCI_CONFIG".to_string(), config_path);
+        }
+
         // `-json`: unitchecker writes facts to VetxOutput and prints diagnostics
         // as JSON to stdout, exiting 0 even when findings exist. We capture that
         // JSON as the report; the gate target decides pass/fail. This keeps facts
@@ -353,6 +361,7 @@ impl ManagedDriver for GoLintDriver {
                     OsString::from("-json"),
                     OsString::from(cfg_path.as_os_str()),
                 ],
+                &env,
                 pkg_dir,
                 ctoken,
             )
@@ -411,13 +420,18 @@ impl GoLintDriver {
         &self,
         govet_bin: &std::path::Path,
         args: Vec<OsString>,
+        env: &HashMap<String, String>,
         cwd: &std::path::Path,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Vec<u8>> {
+        let env_pairs: Vec<(OsString, OsString)> = env
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
         let spec = proc_exec::Spec {
             program: govet_bin.to_path_buf(),
             args,
-            env: vec![],
+            env: env_pairs,
             cwd: cwd.to_path_buf(),
             stdin: proc_exec::StdioSpec::Null,
             stdout: proc_exec::StdioSpec::Piped,
@@ -643,6 +657,9 @@ pub struct LintParams<'a> {
     pub src_addrs: &'a [String],
     /// `build` addr of the `heph-govet` unitchecker binary.
     pub govet_addr: &'a Addr,
+    /// `.golangci.yml` file addr → `config` dep group, passed to heph-govet via
+    /// `HEPH_GOVET_GOLANGCI_CONFIG`. `None` → the standard analyzer set.
+    pub config_addr: Option<&'a Addr>,
 }
 
 /// Build a `go_lint` target spec.
@@ -662,6 +679,9 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         Value::List(p.src_addrs.iter().cloned().map(Value::String).collect()),
     );
     deps.insert(GOVET_TOOL_GROUP.to_string(), str_one(p.govet_addr));
+    if let Some(cfg) = p.config_addr {
+        deps.insert("config".to_string(), str_one(cfg));
+    }
 
     // Sorted for an order-independent cache key (see GoLintDef::hash).
     let mut import_paths: Vec<String> =
@@ -765,6 +785,14 @@ mod tests {
     }
 
     fn spec(libs: &[(String, Addr)], facts: &[(String, Addr)]) -> TargetSpec {
+        spec_cfg(libs, facts, None)
+    }
+
+    fn spec_cfg(
+        libs: &[(String, Addr)],
+        facts: &[(String, Addr)],
+        config_addr: Option<&Addr>,
+    ) -> TargetSpec {
         let g = govet();
         build_lint_spec(LintParams {
             addr: addr("lint"),
@@ -775,6 +803,7 @@ mod tests {
             facts_libs: facts,
             src_addrs: &["//mylib:a.go".to_string()],
             govet_addr: &g,
+            config_addr,
         })
     }
 
@@ -868,6 +897,14 @@ mod tests {
     #[test]
     fn has_go_lint_label() {
         assert!(spec(&[], &[]).labels.contains(&"go-lint".to_string()));
+    }
+
+    #[test]
+    fn config_group_present_only_when_config_addr_given() {
+        assert!(!deps_map(&spec(&[], &[])).contains_key("config"));
+        let cfg = Addr::new(PkgBuf::from(""), ".golangci.yml".to_string(), Default::default());
+        let s = spec_cfg(&[], &[], Some(&cfg));
+        assert!(deps_map(&s).contains_key("config"));
     }
 
     #[test]
