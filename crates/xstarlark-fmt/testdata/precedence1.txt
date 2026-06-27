@@ -1,0 +1,13 @@
+a="ARCH="+("x86_64" if c else "arm")
+b=(x+y)*z
+c=-(x+y)
+d=(m if n else o).f
+e=not(p or q)
+f=a+b*c
+----
+a = "ARCH=" + ("x86_64" if c else "arm")
+b = (x + y) * z
+c = -(x + y)
+d = (m if n else o).f
+e = not (p or q)
+f = a + b * c
