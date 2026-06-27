@@ -3,20 +3,16 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
-use enclose::enclose;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
 use crate::engine::Engine;
-use crate::engine::error::{CycleError, MultiError, TargetNotFoundError};
-use crate::engine::request_state::RequestState;
-use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::{self, Addr};
 use crate::htmatcher::Matcher;
 use crate::htpkg::{self, PkgBuf};
-use crate::tui::{self, App, AppContext, LogSink};
+use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -62,110 +58,23 @@ impl App for RevdepsApp {
         } = self;
         let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
 
-        // Resolving in-scope targets records rich failures in `rs`, which
-        // `finalize` prefers over the returned error.
-        let res = revdeps(Arc::clone(&engine), rs.clone(), &addr, &scope, fail_fast).await;
-        crate::commands::errors::finalize!(ctx, rs, res, users => {
-            for user in &users {
-                println!("{}", user.format());
+        // Stream users as they are found and print incrementally. Resolving
+        // in-scope targets records rich failures in `rs`, which `finalize`
+        // prefers over the returned error.
+        let out = BufferedStdout::new(&ctx);
+        let res: anyhow::Result<()> = async {
+            let users = Arc::clone(&engine).revdeps(rs.clone(), addr, &scope);
+            futures::pin_mut!(users);
+            while let Some(user) = users.next().await {
+                out.println(user?.format());
             }
             Ok(())
-        })
+        }
+        .await;
+        out.close().await;
+
+        crate::commands::errors::finalize!(ctx, rs, res)
     }
-}
-
-/// Find every target in `scope` that declares `target` as a direct dependency —
-/// the reverse of `inspect deps`. Direct (not transitive) edges only: this
-/// answers "which targets reference this one", the precise inverse of the build
-/// graph edge. Results are sorted for deterministic output.
-///
-/// Candidates are consumed straight off the query stream and resolved
-/// concurrently (bounded by `concurrency`), so the full candidate set is never
-/// materialized up front — the whole graph can be many thousands of addrs.
-async fn revdeps(
-    engine: Arc<Engine>,
-    rs: Arc<RequestState>,
-    target: &Addr,
-    scope: &Matcher,
-    fail_fast: bool,
-) -> anyhow::Result<Vec<Addr>> {
-    // Cap in-flight def resolutions; the engine's own semaphores gate the real
-    // work, this just bounds the orchestration set held off the stream.
-    let concurrency = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .saturating_mul(2);
-    let target = target.clone();
-
-    let outcomes = Arc::clone(&engine)
-        .query(rs.clone(), scope)
-        .map_err(|e| e.context("listing candidate targets"))
-        .map_ok(|candidate| {
-            enclose!((engine, rs, target) async move {
-                resolve_user(&engine, &rs, candidate, &target).await
-            })
-        })
-        .try_buffer_unordered(concurrency);
-
-    // `fail_fast` short-circuits on the first error and drops the rest; otherwise
-    // every candidate is driven and all errors are aggregated (mirrors
-    // `join_all_failable`).
-    let mut users: Vec<Addr> = if fail_fast {
-        outcomes
-            .try_filter_map(|user| async move { Ok(user) })
-            .try_collect()
-            .await?
-    } else {
-        let results: Vec<anyhow::Result<Option<Addr>>> = outcomes.collect().await;
-        let mut users = Vec::new();
-        let mut errs = Vec::new();
-        for r in results {
-            match r {
-                Ok(Some(user)) => users.push(user),
-                Ok(None) => {}
-                Err(e) => errs.push(e),
-            }
-        }
-        if !errs.is_empty() {
-            return Err(MultiError(errs).into());
-        }
-        users
-    };
-    users.sort_by_key(|a| a.format());
-    Ok(users)
-}
-
-/// Resolve one candidate: is `target` among its direct inputs? Returns the
-/// candidate's addr when it is, `None` when it isn't or when the candidate can't
-/// be resolved standalone.
-async fn resolve_user(
-    engine: &Arc<Engine>,
-    rs: &Arc<RequestState>,
-    candidate: Addr,
-    target: &Addr,
-) -> anyhow::Result<Option<Addr>> {
-    let def = match Arc::clone(engine).get_direct_def(rs.clone(), &candidate).await {
-        Ok(def) => def,
-        // A provider may `list` an addr it cannot `get` standalone (e.g.
-        // per-platform variants that only resolve as in-context deps), or a
-        // candidate may cycle back to the query target. Neither can be a
-        // resolvable user; skip it the way the query resolver does. A NotFound for
-        // a *different* addr is a real breakage and still propagates.
-        Err(e)
-            if downcast_chain_ref::<TargetNotFoundError>(&e)
-                .is_some_and(|nf| nf.addr == candidate) =>
-        {
-            return Ok(None);
-        }
-        Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let uses = def
-        .target_def
-        .inputs
-        .iter()
-        .any(|input| input.r#ref.r#ref == *target);
-    Ok(uses.then_some(candidate))
 }
 
 pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
@@ -211,14 +120,9 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_addr_in, revdeps};
-    use crate::engine::{Config, Engine};
+    use super::resolve_addr_in;
     use crate::htaddr::parse_addr;
-    use crate::htmatcher::Matcher;
     use crate::htpkg::PkgBuf;
-    use crate::pluginstatictarget;
-    use std::collections::HashMap;
-    use std::sync::Arc;
 
     #[test]
     fn dot_slash_path_resolves_to_fs_file_addr() {
@@ -244,93 +148,5 @@ mod tests {
     fn plain_addr_is_parsed_verbatim() {
         let addr = resolve_addr_in("//lib:core", &PkgBuf::from("cmd/server")).unwrap();
         assert_eq!(addr, parse_addr("//lib:core").unwrap());
-    }
-
-    /// A static `exec` target depending on `deps` (default group) — addr strings.
-    fn target(addr: &str, deps: &[&str]) -> pluginstatictarget::Target {
-        let mut dep_map = HashMap::new();
-        if !deps.is_empty() {
-            dep_map.insert(
-                String::new(),
-                deps.iter().map(|d| (*d).to_string()).collect(),
-            );
-        }
-        pluginstatictarget::Target {
-            addr: addr.to_string(),
-            driver: "exec".to_string(),
-            run: Some("true".to_string()),
-            deps: dep_map,
-            ..Default::default()
-        }
-    }
-
-    fn make_engine(
-        targets: Vec<pluginstatictarget::Target>,
-    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
-        let root = tempfile::tempdir()?;
-        let mut engine = Engine::new(Config {
-            root: root.path().to_path_buf(),
-            home_dir: std::path::PathBuf::new(),
-            parallelism: None,
-            ..Default::default()
-        })?;
-        engine.register_managed_driver(|_| Box::new(crate::pluginexec::Driver::new_exec()))?;
-        let provider = pluginstatictarget::Provider::new(targets)?;
-        engine.register_provider(move |_| Box::new(provider))?;
-        Ok((Arc::new(engine), root))
-    }
-
-    fn all() -> Matcher {
-        Matcher::PackagePrefix(PkgBuf::from(""))
-    }
-
-    #[tokio::test]
-    async fn finds_direct_users() -> anyhow::Result<()> {
-        // //lib:core is used by //app:a and //app:b, not //other:c.
-        let (engine, _root) = make_engine(vec![
-            target("//lib:core", &[]),
-            target("//app:a", &["//lib:core"]),
-            target("//app:b", &["//lib:core"]),
-            target("//other:c", &[]),
-        ])?;
-        let rs = engine.new_state();
-        let core = parse_addr("//lib:core")?;
-
-        let users = revdeps(Arc::clone(&engine), rs, &core, &all(), false).await?;
-
-        let users: Vec<String> = users.iter().map(|a| a.format()).collect();
-        assert_eq!(users, vec!["//app:a".to_string(), "//app:b".to_string()]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn scope_restricts_search() -> anyhow::Result<()> {
-        let (engine, _root) = make_engine(vec![
-            target("//lib:core", &[]),
-            target("//app:a", &["//lib:core"]),
-            target("//tool:t", &["//lib:core"]),
-        ])?;
-        let rs = engine.new_state();
-        let core = parse_addr("//lib:core")?;
-
-        // Only search within //app — //tool:t must not appear.
-        let scope = Matcher::PackagePrefix(PkgBuf::from("app"));
-        let users = revdeps(Arc::clone(&engine), rs, &core, &scope, false).await?;
-
-        let users: Vec<String> = users.iter().map(|a| a.format()).collect();
-        assert_eq!(users, vec!["//app:a".to_string()]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn no_users_is_empty() -> anyhow::Result<()> {
-        let (engine, _root) = make_engine(vec![target("//lib:core", &[]), target("//app:a", &[])])?;
-        let rs = engine.new_state();
-        let core = parse_addr("//lib:core")?;
-
-        let users = revdeps(Arc::clone(&engine), rs, &core, &all(), false).await?;
-
-        assert!(users.is_empty());
-        Ok(())
     }
 }

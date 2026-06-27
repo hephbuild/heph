@@ -43,6 +43,7 @@ mod remote_cache_objstore;
 pub use hplugin::provider;
 pub use remote_cache::{RemoteCacheDef, RemoteCacheSet};
 mod query;
+mod revdeps;
 pub mod request_state;
 pub mod spec;
 pub use result::ArtifactMeta;
