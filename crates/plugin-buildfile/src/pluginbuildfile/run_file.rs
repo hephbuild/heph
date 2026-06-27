@@ -1438,10 +1438,7 @@ mod tests {
             htvalue::Value::Bool(true),
         )]));
         let err = approval_from(v).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("unknown entries"),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
     }
 
     #[test]

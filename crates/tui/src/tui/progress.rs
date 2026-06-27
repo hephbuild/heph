@@ -1090,7 +1090,11 @@ impl TuiProgressView {
         } else {
             String::new()
         };
-        let action = if view.expanded { "enter hide" } else { "enter view" };
+        let action = if view.expanded {
+            "enter hide"
+        } else {
+            "enter view"
+        };
         lines.push(Line::from(Span::styled(
             format!(
                 "  ⚠ approval required: {}  [y] approve · [n] reject · {action}{queued}",

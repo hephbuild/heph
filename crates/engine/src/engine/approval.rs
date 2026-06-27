@@ -85,7 +85,9 @@ impl Engine {
                 .clone()
                 .render_notice(rs, def, name)
                 .await
-                .with_context(|| format!("rendering approval notice `{name}` for {}", addr.format()))?;
+                .with_context(|| {
+                    format!("rendering approval notice `{name}` for {}", addr.format())
+                })?;
             notices.push(ApprovalNotice {
                 name: name.clone(),
                 content,
@@ -145,7 +147,9 @@ impl Engine {
                     &ResultOptions::default(),
                 )
                 .await
-                .with_context(|| format!("resolving notice input {}", input.target.addr.format()))?;
+                .with_context(|| {
+                    format!("resolving notice input {}", input.target.addr.format())
+                })?;
             for art in &res.artifacts {
                 for entry in art.walk()? {
                     let entry = entry?;
