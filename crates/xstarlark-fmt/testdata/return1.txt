@@ -1,0 +1,10 @@
+def f():
+    if x:
+        return
+    return g()
+----
+def f():
+  if x:
+    return
+
+  return g()

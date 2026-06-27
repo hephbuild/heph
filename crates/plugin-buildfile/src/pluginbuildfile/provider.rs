@@ -46,6 +46,18 @@ pub fn build_file_patterns_from_options(
         .collect()
 }
 
+/// The indentation width (spaces per level) the formatter should use, from the
+/// buildfile-provider config's `indent` option. Defaults to `DEFAULT_INDENT`.
+pub fn build_file_indent_from_options(opts: &hplugin::config::Options) -> anyhow::Result<usize> {
+    Ok(
+        hplugin::config::decode_opt(opts, "buildfile provider", "indent")?
+            .unwrap_or(DEFAULT_INDENT),
+    )
+}
+
+/// Default indentation width when the config does not set `indent`.
+pub const DEFAULT_INDENT: usize = 2;
+
 /// Every file directly inside `dir` whose name matches one of `patterns`
 /// (handles literal names like `BUILD` and globs like `*.BUILD`), sorted for
 /// deterministic order. A package may have more than one BUILD file.
@@ -158,7 +170,7 @@ impl Provider {
         hplugin::config::deny_unknown(
             "buildfile provider",
             opts,
-            &["patterns", "skip", "defaultDriver"],
+            &["patterns", "skip", "defaultDriver", "indent"],
         )?;
         let compiled = build_file_patterns_from_options(opts)?;
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
@@ -518,6 +530,47 @@ mod tests {
             .err()
             .expect("must error");
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn default_patterns_include_dot_build() {
+        let names: Vec<String> = default_build_file_patterns()
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert_eq!(names, vec!["BUILD", "*.BUILD"]);
+    }
+
+    #[test]
+    fn build_files_in_dir_matches_literal_and_glob_sorted() {
+        let dir = tempdir().expect("tempdir");
+        for name in ["BUILD", "lib.BUILD", "app.BUILD", "notes.txt", "BUILD.bak"] {
+            std::fs::write(dir.path().join(name), "").expect("write");
+        }
+        let patterns = default_build_file_patterns();
+        let found: Vec<String> = build_files_in_dir(dir.path(), &patterns)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // `*.BUILD` matches `lib.BUILD`/`app.BUILD` but not `BUILD.bak` or `.txt`;
+        // results are sorted.
+        assert_eq!(found, vec!["BUILD", "app.BUILD", "lib.BUILD"]);
+    }
+
+    #[test]
+    fn indent_option_defaults_then_reads() {
+        let empty = Options::new();
+        assert_eq!(
+            build_file_indent_from_options(&empty).expect("indent"),
+            DEFAULT_INDENT
+        );
+
+        let mut opts = Options::new();
+        opts.insert(
+            "indent".to_string(),
+            serde_yaml::from_str("4").expect("yaml"),
+        );
+        assert_eq!(build_file_indent_from_options(&opts).expect("indent"), 4);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use hplugin::lsp::LspEngine;
+use hplugin::config::Options;
 use hxstarlark_fmt::{Config, FmtError};
 
 use crate::commands::GlobalOptions;
@@ -15,9 +15,10 @@ use crate::engine::{Engine, get_cwp, get_root};
 use crate::htmatcher::Matcher;
 use crate::htpkg::{self, PkgBuf};
 use crate::pluginbuildfile::{
-    build_file_patterns_from_options, build_files_in_dir, default_build_file_patterns,
+    DEFAULT_INDENT, build_file_indent_from_options, build_file_patterns_from_options,
+    build_files_in_dir, default_build_file_patterns,
 };
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{self, App, AppContext, LogSink};
 
 /// The argument value that selects stdin → stdout mode.
 const STDIN_MARKER: &str = "-";
@@ -35,20 +36,39 @@ pub struct Args {
     /// Check mode: exit non-zero if any file is not formatted; do not write.
     #[arg(long)]
     pub check: bool,
-    /// Number of spaces per indentation level.
-    #[arg(long, default_value_t = 2)]
-    pub indent: usize,
 }
 
 pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
     if args.matcher.as_deref() == Some(STDIN_MARKER) {
-        return format_stdin(args.indent);
+        return format_stdin();
     }
     bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
 }
 
-/// Read Starlark from stdin, write the formatted result to stdout.
-fn format_stdin(indent: usize) -> anyhow::Result<()> {
+/// The buildfile-provider options from the workspace `.hephconfig2`, or empty
+/// defaults when there is no workspace / no buildfile entry. Mirrors how the
+/// engine resolves a built-in provider's options.
+fn buildfile_options(root: &std::path::Path) -> Options {
+    use crate::engine::config_yaml::{PluginIdentifier, load_from_root};
+    load_from_root(root)
+        .ok()
+        .and_then(|cfg| {
+            cfg.plugins
+                .into_iter()
+                .find(|p| matches!(&p.identifier, PluginIdentifier::Builtin(b) if b == "buildfile"))
+                .map(|p| p.options)
+        })
+        .unwrap_or_default()
+}
+
+/// Read Starlark from stdin, write the formatted result to stdout. The indent
+/// width comes from the workspace's buildfile config when run inside one.
+fn format_stdin() -> anyhow::Result<()> {
+    let indent = match get_root() {
+        Ok(root) => build_file_indent_from_options(&buildfile_options(&root))?,
+        Err(_) => DEFAULT_INDENT,
+    };
+
     let mut src = String::new();
     std::io::stdin()
         .read_to_string(&mut src)
@@ -79,7 +99,6 @@ struct BuildFmtApp {
     matcher: Matcher,
     root: PathBuf,
     check: bool,
-    indent: usize,
     fail_fast: bool,
 }
 
@@ -102,7 +121,6 @@ impl App for BuildFmtApp {
             .engine
             .new_state_with_events(self.fail_fast, ctx.event_sender());
 
-        let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
             let packages: Vec<String> = Arc::clone(&self.engine)
                 .packages(&self.matcher, &rs)
@@ -110,11 +128,15 @@ impl App for BuildFmtApp {
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
             // Resolve the workspace's configured BUILD-file patterns (literal
-            // names like `BUILD` and globs like `*.BUILD`) so every file the
-            // buildfile provider treats as a BUILD file is covered.
-            let opts = LspEngine::provider_options(self.engine.as_ref(), "buildfile");
+            // names like `BUILD` and globs like `*.BUILD`) and indent width so
+            // every file the buildfile provider treats as a BUILD file is
+            // covered and formatted as the workspace configures.
+            let opts = buildfile_options(&self.root);
             let patterns = build_file_patterns_from_options(&opts)
                 .unwrap_or_else(|_| default_build_file_patterns());
+            let cfg = Config {
+                indent_size: build_file_indent_from_options(&opts)?,
+            };
 
             // A package may have several matching files; dedup across packages.
             let mut build_files: BTreeSet<PathBuf> = BTreeSet::new();
@@ -123,10 +145,7 @@ impl App for BuildFmtApp {
                 build_files.extend(build_files_in_dir(&dir, &patterns));
             }
 
-            let cfg = Config {
-                indent_size: self.indent,
-            };
-            let mut changed: Vec<String> = Vec::new();
+            let mut changed = 0usize;
             let mut formatted = 0usize;
 
             for path in &build_files {
@@ -149,34 +168,29 @@ impl App for BuildFmtApp {
                 }
 
                 if self.check {
-                    changed.push(label);
+                    tracing::warn!("{label} is not formatted");
+                    changed += 1;
                 } else {
                     std::fs::write(path, &out_text)
                         .with_context(|| format!("writing {}", path.display()))?;
-                    out.println(format!("Formatted {label}"));
+                    tracing::info!("formatted {label}");
                     formatted += 1;
                 }
             }
 
             if self.check {
-                if changed.is_empty() {
-                    out.println("All BUILD files are formatted");
-                } else {
-                    for label in &changed {
-                        out.println(format!("Would reformat {label}"));
-                    }
-                    return Err(anyhow::anyhow!(
-                        "{} BUILD file(s) need formatting",
-                        changed.len()
-                    ));
+                if changed > 0 {
+                    return Err(anyhow::anyhow!("{changed} BUILD file(s) need formatting"));
                 }
+                tracing::info!("all BUILD files are formatted");
             } else if formatted == 0 {
-                out.println("All BUILD files already formatted");
+                tracing::info!("all BUILD files already formatted");
+            } else {
+                tracing::info!("formatted {formatted} BUILD file(s)");
             }
             Ok(())
         }
         .await;
-        out.close().await;
 
         crate::commands::errors::finalize!(ctx, rs, res)
     }
@@ -202,7 +216,6 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         matcher,
         root,
         check: args.check,
-        indent: args.indent,
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);

@@ -1,6 +1,12 @@
 //! End-to-end coverage for `heph tool build-fmt`: the stdin (`-`) mode, the
 //! read-only `--check` mode (non-zero exit when unformatted), and in-place
 //! rewriting (idempotent — a second run is clean).
+//!
+//! These drive the built `heph` binary against a temp workspace, so they need
+//! the compiled binary and a valid config — heavier than a unit test. They are
+//! `#[ignore]`d by default (the formatter's behavior is covered env-free by the
+//! `xstarlark-fmt` golden tests and the `plugin-buildfile` unit tests); run them
+//! explicitly with `cargo test -p heph --test build_fmt_cli -- --ignored`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -46,17 +52,20 @@ fn run_stdin(input: &str) -> String {
 }
 
 #[test]
+#[ignore = "drives the built heph binary against a temp workspace; run with --ignored"]
 fn stdin_mode_formats() {
     assert_eq!(run_stdin(MESSY), FORMATTED);
 }
 
 #[test]
+#[ignore = "drives the built heph binary against a temp workspace; run with --ignored"]
 fn stdin_mode_passes_through_skip_file() {
     let src = "# heph:fmt skip-file\ntarget(  name=\"a\"  )\n";
     assert_eq!(run_stdin(src), src);
 }
 
 #[test]
+#[ignore = "drives the built heph binary against a temp workspace; run with --ignored"]
 fn check_mode_reports_unformatted_and_fails() {
     let ws = workspace();
     std::fs::write(ws.path().join("BUILD"), MESSY).expect("write BUILD");
@@ -79,6 +88,7 @@ fn check_mode_reports_unformatted_and_fails() {
 }
 
 #[test]
+#[ignore = "drives the built heph binary against a temp workspace; run with --ignored"]
 fn in_place_rewrites_and_is_idempotent() {
     let ws = workspace();
     let build = ws.path().join("BUILD");
@@ -102,6 +112,7 @@ fn in_place_rewrites_and_is_idempotent() {
 }
 
 #[test]
+#[ignore = "drives the built heph binary against a temp workspace; run with --ignored"]
 fn formats_dot_build_files_by_default() {
     // `*.BUILD` is a default-supported pattern: a `lib.BUILD` file in a package
     // must be formatted alongside a plain `BUILD`.
