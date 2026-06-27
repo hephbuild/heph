@@ -10,10 +10,11 @@
 
 use super::index::SharedState;
 use crate::pluginbuildfile::run_file::resolve_load_target;
+use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
 use lsp_server::{Connection, Message, Notification, RequestId};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, Hover, HoverContents, LocationLink,
-    MarkedString, MarkupContent, MarkupKind, Position, Range,
+    MarkedString, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
 use starlark_lsp::server::LspUri;
 use std::collections::HashMap;
@@ -53,6 +54,22 @@ pub(crate) fn run(client: &Connection, server: &Connection, shared: Arc<SharedSt
         // client → server: forward, recording hover/completion requests.
         scope.spawn(|| {
             for msg in &client.receiver {
+                // `textDocument/formatting` is answered here — the stock server
+                // has no formatter, so we never forward it.
+                if let Message::Request(req) = &msg
+                    && req.method == "textDocument/formatting"
+                {
+                    let result = format_request(&req.params, &shared);
+                    let resp = lsp_server::Response {
+                        id: req.id.clone(),
+                        result: Some(result),
+                        error: None,
+                    };
+                    if client.sender.send(Message::Response(resp)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if let Message::Request(req) = &msg
                     && let Some(p) = classify(&req.method, &req.params)
                 {
@@ -123,9 +140,10 @@ fn enrich(resp: &mut lsp_server::Response, pending: &Pending, shared: &SharedSta
     }
 }
 
-/// Advertise `.` as a completion trigger character so editors request completion
-/// right after a member access (`heph.`, `heph.fs.`). The stock server sends an
-/// empty `completionProvider`, so nothing would fire on `.` otherwise.
+/// Patch the `initialize` response capabilities the stock server can't provide:
+/// advertise `.` as a completion trigger (so editors fire member completion after
+/// `heph.`/`heph.fs.`), and `documentFormattingProvider` (the stock server has no
+/// formatter — the proxy answers `textDocument/formatting` itself).
 fn enrich_initialize(resp: &mut lsp_server::Response) {
     let Some(serde_json::Value::Object(result)) = resp.result.as_mut() else {
         return;
@@ -141,6 +159,72 @@ fn enrich_initialize(resp: &mut lsp_server::Response) {
         .or_insert_with(|| serde_json::json!({}));
     if let serde_json::Value::Object(cp) = cp {
         cp.insert("triggerCharacters".to_string(), serde_json::json!(["."]));
+    }
+    caps.insert(
+        "documentFormattingProvider".to_string(),
+        serde_json::json!(true),
+    );
+}
+
+/// Build the JSON result for a `textDocument/formatting` request: a list of
+/// `TextEdit`s (a single whole-document replacement), an empty list when the
+/// buffer is already formatted, or `null` when it can't be formatted (unknown
+/// document, parse error, or the `heph:fmt skip-file` directive).
+fn format_request(params: &serde_json::Value, shared: &SharedState) -> serde_json::Value {
+    let null = serde_json::Value::Null;
+    let Some(uri) = params
+        .get("textDocument")
+        .and_then(|t| t.get("uri"))
+        .and_then(|u| u.as_str())
+        .and_then(|s| s.parse::<lsp_types::Uri>().ok())
+        .and_then(|u| LspUri::try_from(u).ok())
+    else {
+        return null;
+    };
+    match format_edits(&uri, shared) {
+        Some(edits) => serde_json::to_value(edits).unwrap_or(null),
+        None => null,
+    }
+}
+
+/// Format the live buffer for `uri`, returning the whole-document edit (or an
+/// empty list when already formatted). `None` when the document isn't tracked or
+/// the formatter declines it (parse error / skip directive).
+fn format_edits(uri: &LspUri, shared: &SharedState) -> Option<Vec<TextEdit>> {
+    let index = shared.index(uri)?;
+    let source = &index.source;
+    let indent = build_file_indent_from_options(&shared.engine.provider_options("buildfile"))
+        .unwrap_or(DEFAULT_INDENT);
+    let name = match uri {
+        LspUri::File(p) | LspUri::Starlark(p) => p.to_string_lossy().into_owned(),
+        _ => "BUILD".to_string(),
+    };
+    let formatted = hxstarlark_fmt::format(
+        &name,
+        source,
+        hxstarlark_fmt::Config {
+            indent_size: indent,
+        },
+    )
+    .ok()?;
+    if formatted == *source {
+        return Some(Vec::new());
+    }
+    Some(vec![TextEdit {
+        range: whole_document_range(source),
+        new_text: formatted,
+    }])
+}
+
+/// The range covering the whole document, end position in UTF-16 code units as
+/// the LSP spec requires.
+fn whole_document_range(source: &str) -> Range {
+    let last_line = source.matches('\n').count() as u32;
+    let last_line_text = source.rsplit('\n').next().unwrap_or("");
+    let last_col = last_line_text.encode_utf16().count() as u32;
+    Range {
+        start: Position::new(0, 0),
+        end: Position::new(last_line, last_col),
     }
 }
 
@@ -1404,6 +1488,55 @@ mod tests {
         assert_eq!(completion_member_base("x = heph"), None);
         assert_eq!(completion_member_base("x = "), None);
         assert_eq!(completion_member_base(""), None);
+    }
+
+    #[test]
+    fn initialize_advertises_formatting_capability() {
+        let mut resp = lsp_server::Response {
+            id: 1.into(),
+            result: Some(serde_json::json!({ "capabilities": {} })),
+            error: None,
+        };
+        super::enrich_initialize(&mut resp);
+        let caps = &resp.result.unwrap()["capabilities"];
+        assert_eq!(caps["documentFormattingProvider"], serde_json::json!(true));
+        // The completion trigger is still advertised.
+        assert_eq!(
+            caps["completionProvider"]["triggerCharacters"],
+            serde_json::json!(["."])
+        );
+    }
+
+    #[test]
+    fn formatting_replaces_whole_document() {
+        let (shared, uri) = shared_with_index("target(name=\"a\",deps=[\"x\",\"y\"])\n");
+        let edits = super::format_edits(&uri, &shared).expect("edits");
+        assert_eq!(edits.len(), 1, "one whole-document edit");
+        assert_eq!(
+            edits[0].new_text,
+            "target(\n  name = \"a\",\n  deps = [\"x\", \"y\"],\n)\n"
+        );
+        // The replaced range starts at the document origin.
+        assert_eq!(edits[0].range.start, lsp_types::Position::new(0, 0));
+    }
+
+    #[test]
+    fn formatting_already_formatted_yields_no_edits() {
+        let (shared, uri) = shared_with_index("x = 1\n");
+        let edits = super::format_edits(&uri, &shared).expect("edits");
+        assert!(
+            edits.is_empty(),
+            "formatted buffer needs no edits: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn formatting_skip_directive_declines() {
+        let (shared, uri) = shared_with_index("# heph:fmt skip-file\ntarget(  name=\"a\"  )\n");
+        assert!(
+            super::format_edits(&uri, &shared).is_none(),
+            "skip-file directive must produce no edits"
+        );
     }
 
     #[test]
