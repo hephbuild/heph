@@ -517,16 +517,6 @@ pub mod targetdef {
                 secret: false,
             }
         }
-
-        /// Secret target: uncached, outputs held in memory only (never on disk).
-        pub fn secret() -> Self {
-            Self {
-                enabled: false,
-                remote_enabled: false,
-                history: 0,
-                secret: true,
-            }
-        }
     }
 
     #[derive(Clone, Serialize)]

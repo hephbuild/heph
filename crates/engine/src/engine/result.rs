@@ -2080,6 +2080,8 @@ impl Engine {
             def.cache.history = def.cache.history.saturating_mul(2);
         }
 
+        validate_secret_cache(addr, &def.cache)?;
+
         if def.hash.is_empty() {
             anyhow::bail!("missing hash");
         }
@@ -2326,6 +2328,20 @@ impl Engine {
 /// pure functions of `def.addr` + `dest_provider`. Same dest ⇒ same stamp;
 /// different dests live in distinct `mem_def` cells already keyed by addr.
 /// No re-hash.
+/// A secret target's outputs are held in memory only, so the target must be
+/// uncached. Validated centrally here — driver-agnostic — so every driver gets
+/// the same contract: the author opts out of caching explicitly (`cache =
+/// False`); the engine never silently overrides a caching config.
+fn validate_secret_cache(
+    addr: &Addr,
+    cache: &crate::engine::driver::targetdef::CacheConfig,
+) -> anyhow::Result<()> {
+    if cache.secret && (cache.enabled || cache.remote_enabled) {
+        anyhow::bail!("target {addr} is secret and must be uncached: set `cache = False`");
+    }
+    Ok(())
+}
+
 fn rewrite_query_inputs(
     mut def: crate::engine::driver::targetdef::TargetDef,
     dest: &Addr,
@@ -4460,6 +4476,34 @@ mod tests {
             "inner result must not emit Matched, got {events:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn validate_secret_cache_requires_uncached() {
+        let addr = hmodel::htaddr::parse_addr("//pkg:s").expect("addr");
+
+        // Secret + local cache on → rejected, with an actionable message.
+        let mut c = CacheConfig::off();
+        c.secret = true;
+        c.enabled = true;
+        let err = validate_secret_cache(&addr, &c).expect_err("must reject cached secret");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("secret"), "{msg}");
+        assert!(msg.contains("cache = False"), "{msg}");
+
+        // Secret + remote cache on → also rejected.
+        let mut c = CacheConfig::off();
+        c.secret = true;
+        c.remote_enabled = true;
+        assert!(validate_secret_cache(&addr, &c).is_err());
+
+        // Secret + fully uncached → ok.
+        let mut c = CacheConfig::off();
+        c.secret = true;
+        assert!(validate_secret_cache(&addr, &c).is_ok());
+
+        // Non-secret cached target → unaffected.
+        assert!(validate_secret_cache(&addr, &CacheConfig::on(true)).is_ok());
     }
 
     // ----------------------------------------------------------------------
