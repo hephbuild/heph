@@ -75,12 +75,12 @@ impl ApprovalHandler for CliApprovalHandler {
         req: ApprovalRequest,
         _ctoken: &StdCancellationToken,
     ) -> anyhow::Result<bool> {
-        print_notice(&req);
+        log_notice(&req);
         if self.auto_approve {
-            eprintln!("approval: auto-approved {} (--auto-approve)", req.addr);
+            tracing::info!("approval: auto-approved {} (--auto-approve)", req.addr);
             Ok(true)
         } else {
-            eprintln!(
+            tracing::warn!(
                 "approval: {} requires approval; pass --auto-approve to proceed",
                 req.addr
             );
@@ -89,15 +89,13 @@ impl ApprovalHandler for CliApprovalHandler {
     }
 }
 
-/// Print the approval header and every notice's contents to stderr. Always runs
-/// in non-TUI mode, regardless of `--auto-approve`, so a gated target's notice
-/// is never silently skipped.
-fn print_notice(req: &ApprovalRequest) {
-    eprintln!();
-    eprintln!("⚠ approval required: {}", req.addr);
+/// Log the approval header and every notice's contents. Always runs in non-TUI
+/// mode, regardless of `--auto-approve`, so a gated target's notice is never
+/// silently skipped.
+fn log_notice(req: &ApprovalRequest) {
+    tracing::info!("approval required: {}", req.addr);
     for notice in &req.notices {
-        eprintln!("── notice: {} ──", notice.name);
-        eprintln!("{}", notice.content);
+        tracing::info!("notice {}:\n{}", notice.name, notice.content);
     }
 }
 

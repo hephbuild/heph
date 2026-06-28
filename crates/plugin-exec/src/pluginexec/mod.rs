@@ -258,9 +258,7 @@ impl Driver {
                 addr: Default::default(),
                 driver: "exec".to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
-                approval: Default::default(),
+                ..Default::default()
             }),
         })
     }
@@ -2107,9 +2105,7 @@ mod tests {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
-                        labels: vec![],
-                        transitive: Default::default(),
-                        approval: Default::default(),
+                        ..Default::default()
                     }),
                 },
                 &ctoken,
@@ -2147,9 +2143,7 @@ mod tests {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
-                        labels: vec![],
-                        transitive: Default::default(),
-                        approval: Default::default(),
+                        ..Default::default()
                     }),
                 },
                 &ctoken,
@@ -2180,9 +2174,7 @@ mod tests {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
-                        labels: vec![],
-                        transitive: Default::default(),
-                        approval: Default::default(),
+                        ..Default::default()
                     }),
                 },
                 &ctoken,

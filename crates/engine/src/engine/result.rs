@@ -1012,6 +1012,11 @@ impl Engine {
                 let def = link_res.with_context(|| "link")?;
                 let meta = meta_res.with_context(|| "meta")?;
 
+                // Validate approval notices against the linked input set up front,
+                // so a notice naming a non-existent input group fails fast on every
+                // path (including cache hits), not lazily at execution time.
+                Self::validate_approval(&spec, &def).with_context(|| "approval")?;
+
                 let output_names = match outputs {
                     OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
                     OutputMatcher::All => Ok(def.target.output_names()),
@@ -4665,10 +4670,7 @@ mod tests {
         let spec = TargetSpec {
             addr: addr.clone(),
             driver: "blocking".to_string(),
-            config: HashMap::new(),
-            labels: vec![],
-            transitive: Default::default(),
-            approval: Default::default(),
+            ..Default::default()
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
@@ -4921,10 +4923,7 @@ mod tests {
         let spec = TargetSpec {
             addr: addr.clone(),
             driver: "blocking".to_string(),
-            config: HashMap::new(),
-            labels: vec![],
-            transitive: Default::default(),
-            approval: Default::default(),
+            ..Default::default()
         };
         engine
             .register_provider(move |_| Box::new(OneTargetProvider { spec }))

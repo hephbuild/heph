@@ -75,8 +75,7 @@ impl Provider {
                     driver: t.driver,
                     config,
                     labels: t.labels,
-                    transitive: Default::default(),
-                    approval: Default::default(),
+                    ..Default::default()
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;

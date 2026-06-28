@@ -132,8 +132,7 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
         driver: "bash".to_string(),
         config,
         labels: vec!["go-build".to_string(), "go-std-install".to_string()],
-        transitive: Default::default(),
-        approval: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -174,8 +173,7 @@ pub fn build_spec(addr: Addr, import_path: &str, factors: &Factors) -> TargetSpe
         driver: "sh".to_string(),
         config,
         labels: vec!["go-build".to_string()],
-        transitive: Default::default(),
-        approval: Default::default(),
+        ..Default::default()
     }
 }
 

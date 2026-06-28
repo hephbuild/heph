@@ -304,9 +304,7 @@ mod shell_fallback_tests {
                 addr: Default::default(),
                 driver: "exec".to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
-                approval: Default::default(),
+                ..Default::default()
             }),
         });
         let bridge = ManagedDriverBridge::new_os_for_test_with_shell_fallback(

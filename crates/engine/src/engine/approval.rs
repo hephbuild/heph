@@ -52,7 +52,42 @@ pub trait ApprovalHandler: Send + Sync {
     ) -> anyhow::Result<bool>;
 }
 
+/// Whether an input belongs to the notice group `name`. An input's `origin_id`
+/// is driver-encoded as `|`-delimited tokens with the declared group name as one
+/// segment (e.g. `dep|plan|0` for the `plan` dep group), so a notice can name the
+/// whole id or any segment.
+fn input_in_group(origin_id: &str, name: &str) -> bool {
+    origin_id == name || origin_id.split('|').any(|seg| seg == name)
+}
+
 impl Engine {
+    /// Validate that every `approval.notice` name resolves to at least one input
+    /// group of the target. Run once the target is linked (before execution, on
+    /// every result path — including cache hits) so a notice naming a group that
+    /// does not exist fails fast and deterministically rather than only when the
+    /// target is actually executed.
+    pub(crate) fn validate_approval(
+        spec: &TargetSpec,
+        def: &LinkedTargetDef,
+    ) -> anyhow::Result<()> {
+        if !spec.approval.required {
+            return Ok(());
+        }
+        for name in &spec.approval.notice {
+            if !def
+                .inputs
+                .iter()
+                .any(|i| input_in_group(&i.origin_id, name))
+            {
+                anyhow::bail!(
+                    "approval notice references `{name}`, which is not an input group of {}",
+                    def.target.addr.format()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Gate a target's execution on user approval. A no-op unless
     /// `spec.approval.required`. Renders the notice inputs, asks the request's
     /// [`ApprovalHandler`], and returns an [`ApprovalDeniedError`] if the user
@@ -110,24 +145,21 @@ impl Engine {
         Ok(())
     }
 
-    /// Resolve every input group whose `origin_id` is `name` and concatenate the
-    /// UTF-8 text of their files. Binary bytes are rendered lossily. Errors if no
-    /// input matches `name` — a notice naming a group that isn't a declared input
-    /// is a build-file mistake, not something to silently skip.
+    /// Resolve every input group whose `origin_id` matches `name` (see
+    /// [`input_in_group`]) and concatenate the UTF-8 text of their files. Binary
+    /// bytes are rendered lossily. The notice name is validated up front by
+    /// [`Self::validate_approval`]; an empty match here would mean the input set
+    /// changed between link and execute, which is still surfaced as an error.
     async fn render_notice(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
         name: &str,
     ) -> anyhow::Result<String> {
-        // An input's `origin_id` is driver-encoded as `|`-delimited tokens with
-        // the declared group name as one segment (e.g. `dep|plan|0` for the
-        // `plan` dep group). Match the notice name against the whole id or any
-        // segment so a notice can name a dep group directly.
         let inputs: Vec<_> = def
             .inputs
             .iter()
-            .filter(|i| i.origin_id == name || i.origin_id.split('|').any(|seg| seg == name))
+            .filter(|i| input_in_group(&i.origin_id, name))
             .collect();
         if inputs.is_empty() {
             anyhow::bail!(
@@ -163,5 +195,27 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_in_group;
+
+    #[test]
+    fn group_matches_origin_id_segment() {
+        // Driver-encoded ids: the group name is one `|`-delimited segment.
+        assert!(input_in_group("dep|plan|0", "plan"));
+        assert!(input_in_group("tool|gosdk|2", "gosdk"));
+        // Whole-id match (drivers that use the bare group as origin_id).
+        assert!(input_in_group("plan", "plan"));
+    }
+
+    #[test]
+    fn group_rejects_non_segment_match() {
+        // A substring that is not a full segment must not match.
+        assert!(!input_in_group("dep|planning|0", "plan"));
+        assert!(!input_in_group("dep|plan|0", "dep|plan"));
+        assert!(!input_in_group("dep|plan|0", "missing"));
     }
 }

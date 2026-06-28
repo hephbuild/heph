@@ -828,8 +828,7 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         driver: "go_compile".to_string(),
         config,
         labels: vec!["go-build".to_string()],
-        transitive: Default::default(),
-        approval: Default::default(),
+        ..Default::default()
     }
 }
 
