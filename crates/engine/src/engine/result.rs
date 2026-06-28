@@ -1678,11 +1678,11 @@ impl Engine {
         let hashin = opts.hashin.clone();
         let spec = opts.spec.clone();
         let def = opts.def.clone();
+        // A secret target is uncached (enforced at parse: secret requires
+        // `cache = False`), so `use_tmp_cache` is already true via `!enabled`.
+        // `secret` only selects the in-memory secret store in `cache_locally`.
         let secret = opts.def.target.cache.secret;
-        // Secret targets are always uncached; a secret target with caching
-        // enabled is rejected at parse time, but treat secret as uncached here
-        // defensively so its outputs never reach the durable cache.
-        let use_tmp_cache = !opts.def.target.cache.enabled || opts.shell || secret;
+        let use_tmp_cache = !opts.def.target.cache.enabled || opts.shell;
         let interactive = opts.interactive.clone();
         let shell = opts.shell;
         let key = (addr.clone(), hashin.clone());

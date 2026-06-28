@@ -473,22 +473,17 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        // Whether the author wrote a `cache` attribute at all (vs the default).
-        // A secret target must not be cached; an *explicit* caching `cache` is a
-        // conflict we surface rather than silently override.
-        let cache_explicit = req.target_spec.config.contains_key("cache");
-
         let spec = spec::TargetSpec::from(req.target_spec.config.clone())?;
 
         let pkg = req.target_spec.addr.package.clone();
 
-        // Secret targets are forced uncached and their outputs are held in
-        // memory only. If the author also asked for caching explicitly, that is
-        // contradictory — error instead of silently dropping their request.
+        // A secret target's outputs are held in memory only, so it must be
+        // uncached. The author has to declare that explicitly with
+        // `cache = False` — we never silently override their caching config.
         let cache = if spec.secret {
-            if cache_explicit && (spec.cache.local || spec.cache.remote) {
+            if spec.cache.local || spec.cache.remote {
                 anyhow::bail!(
-                    "target {} is secret and cannot be cached: remove `cache` or set it to False",
+                    "target {} is secret and must be uncached: set `cache = False`",
                     req.target_spec.addr.format()
                 );
             }
@@ -2236,12 +2231,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_secret_forces_uncached() -> anyhow::Result<()> {
-        // `secret = True` with no `cache` attribute: forced uncached, marked secret.
-        let td = parse_with(HashMap::from([(
+    async fn test_parse_secret_without_cache_false_errors() {
+        // `secret = True` with the default `cache` (caching on): the author must
+        // opt out of caching explicitly, so this errors rather than being magic.
+        let err = match parse_with(HashMap::from([(
             "secret".to_string(),
             hcore::htvalue::Value::Bool(true),
         )]))
+        .await
+        {
+            Ok(_) => panic!("secret without cache=False must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("secret"), "{msg}");
+        assert!(msg.contains("cache = False"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_parse_secret_with_cache_false_ok() -> anyhow::Result<()> {
+        // Explicit `cache = False` is the only valid way to mark a secret target.
+        let td = parse_with(HashMap::from([
+            ("secret".to_string(), hcore::htvalue::Value::Bool(true)),
+            ("cache".to_string(), hcore::htvalue::Value::Bool(false)),
+        ]))
         .await?;
         assert!(td.cache.secret, "secret flag set");
         assert!(!td.cache.enabled, "secret target is uncached");
@@ -2249,19 +2262,6 @@ mod tests {
             !td.cache.remote_enabled,
             "secret target is not remote-cached"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_parse_secret_with_cache_false_ok() -> anyhow::Result<()> {
-        // Explicit `cache = False` does not conflict with `secret`.
-        let td = parse_with(HashMap::from([
-            ("secret".to_string(), hcore::htvalue::Value::Bool(true)),
-            ("cache".to_string(), hcore::htvalue::Value::Bool(false)),
-        ]))
-        .await?;
-        assert!(td.cache.secret);
-        assert!(!td.cache.enabled);
         Ok(())
     }
 
@@ -2279,7 +2279,7 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("secret"), "{msg}");
-        assert!(msg.contains("cannot be cached"), "{msg}");
+        assert!(msg.contains("cache = False"), "{msg}");
     }
 
     #[tokio::test]

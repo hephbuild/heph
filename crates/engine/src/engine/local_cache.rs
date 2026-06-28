@@ -358,10 +358,7 @@ impl Engine {
         let mut res_artifacts = Vec::with_capacity(artifacts.len());
         let mut manifest_artifacts = Vec::with_capacity(artifacts.len());
 
-        // Secret revisions are uncached too, so they share the `tmp` unique-key
-        // scheme — never read back across runs.
-        let unique_key = tmp || secret;
-        let key = if unique_key {
+        let key = if tmp {
             let nanos = time::SystemTime::now()
                 .duration_since(time::UNIX_EPOCH)
                 .expect("Time went backwards")
@@ -372,11 +369,12 @@ impl Engine {
         };
 
         // Secret outputs go to the mem-only `local_cache_secret`, which never
-        // spills to disk. Other `tmp` (uncacheable/shell) revisions get a unique
-        // `{hashin}_{nanos}` key and are never read back across runs, so route
-        // them to the mem-only `local_cache_tmp` — small entries stay in memory
-        // and skip the SQLite WAL write. `CacheArtifact` carries the cache it was
-        // written to, so reads resolve against the same store.
+        // spills to disk. A secret target is always uncached, so `tmp` is set
+        // and it gets the unique `{hashin}_{nanos}` key above. Other `tmp`
+        // (uncacheable/shell) revisions are never read back across runs, so
+        // route them to the mem-only `local_cache_tmp` — small entries stay in
+        // memory and skip the SQLite WAL write. `CacheArtifact` carries the cache
+        // it was written to, so reads resolve against the same store.
         let cache = if secret {
             &self.local_cache_secret
         } else if tmp {
