@@ -20,7 +20,14 @@ pub fn resolve_matcher(
                 "cannot combine -e/--query with positional TARGET arguments; use one or the other"
             );
         }
-        return htquery::parse(q, base_pkg).with_context(|| format!("parsing query {q:?}"));
+        let matcher =
+            htquery::parse(q, base_pkg).with_context(|| format!("parsing query {q:?}"))?;
+        // Record the parsed matcher's shape for telemetry from the one place the
+        // real parser actually ran — counts only, never the expression text.
+        let mut counts = htelemetry::telemetry::QueryExprCounts::default();
+        count_matcher(&matcher, &mut counts);
+        htelemetry::telemetry::record_query_expr(&counts);
+        return Ok(matcher);
     }
 
     let arg1 = arg1.as_ref().ok_or_else(|| {
@@ -58,10 +65,47 @@ pub fn matcher_from_args(
     }
 }
 
+/// Tally a parsed query matcher's nodes into telemetry counts. Walks the tree
+/// the real parser produced, so the syntax is never re-interpreted; counts only.
+fn count_matcher(m: &Matcher, c: &mut htelemetry::telemetry::QueryExprCounts) {
+    match m {
+        Matcher::Addr(_) => c.addr += 1,
+        Matcher::Label(_) => c.label += 1,
+        Matcher::Package(_) => c.package += 1,
+        Matcher::PackagePrefix(_) => c.package_prefix += 1,
+        Matcher::TreeOutputTo(_) => c.tree_output += 1,
+        Matcher::Or(terms) => {
+            c.or += 1;
+            terms.iter().for_each(|t| count_matcher(t, c));
+        }
+        Matcher::And(terms) => {
+            c.and += 1;
+            terms.iter().for_each(|t| count_matcher(t, c));
+        }
+        Matcher::Not(inner) => {
+            c.not += 1;
+            count_matcher(inner, c);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::htmatcher::Matcher;
+
+    #[test]
+    fn count_matcher_tallies_node_kinds() {
+        let pkg = PkgBuf::from("");
+        let m = htquery::parse("//a/... && label(foo) && !label(bar)", &pkg).expect("parse");
+        let mut c = htelemetry::telemetry::QueryExprCounts::default();
+        count_matcher(&m, &mut c);
+        assert_eq!(c.label, 2);
+        assert_eq!(c.not, 1);
+        assert_eq!(c.and, 1, "the && chain is one And node");
+        assert_eq!(c.package_prefix, 1, "`//a/...` is a package prefix");
+        assert_eq!(c.addr, 0);
+    }
 
     #[test]
     fn positional_addr_returns_addr() {

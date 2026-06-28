@@ -28,7 +28,7 @@ mod collector;
 mod repo;
 mod spool;
 
-pub use collector::{TelemetryCollector, TelemetrySnapshot};
+pub use collector::{QueryExprCounts, TelemetryCollector, TelemetrySnapshot};
 
 use clap::ArgMatches;
 use clap::parser::ValueSource;
@@ -89,6 +89,16 @@ pub fn record_sandbox(fuse: bool) {
 /// Record one local-cache blob spilling from the primary store to the FS store.
 pub fn record_cache_spill() {
     COLLECTOR.record_cache_spill();
+}
+
+/// Record the per-node shape of a parsed `--expr` query matcher tree.
+pub fn record_query_expr(counts: &QueryExprCounts) {
+    COLLECTOR.record_query_expr(counts);
+}
+
+/// Record the interactive-TUI decision (`should_use_tui`'s result).
+pub fn record_interactive(interactive: bool) {
+    COLLECTOR.record_interactive(interactive);
 }
 
 /// Read the global counters (largest-seen for `graph_size`, sums elsewhere).
@@ -273,7 +283,6 @@ pub fn record_invocation(
     let mut parts = Vec::new();
     let mut flags = Vec::new();
     let mut positionals = Vec::new();
-    let mut expr: Option<String> = None;
 
     let mut level_m = matches;
     let mut level_c = Some(cmd);
@@ -294,10 +303,6 @@ pub fn record_invocation(
                     })
                     .map(|id| id.as_str().to_string()),
             ),
-        }
-        // Deepest level that carries `--expr` wins (the subcommand's).
-        if let Ok(Some(v)) = level_m.try_get_one::<String>("expr") {
-            expr = Some(v.clone());
         }
         match level_m.subcommand() {
             Some((name, sub_m)) => {
@@ -328,16 +333,12 @@ pub fn record_invocation(
         "none"
     };
 
-    // Structural-only summary of any `--expr`; the text is never sent.
-    let query_expr = expr.as_deref().map(query_expr_shape);
-
     let failure = error.map(classify_failure);
 
     if let Err(e) = try_enqueue(ReportContext {
         command: &command,
         request_shape,
         flags: &flags,
-        query_expr,
         success: failure.is_none(),
         failure,
         duration_ms: took.as_millis() as u64,
@@ -378,36 +379,6 @@ fn split_set_args(m: &ArgMatches, cmd: &clap::Command) -> (Vec<String>, Vec<Stri
     (flags, positionals)
 }
 
-/// Non-PII structural summary of a `--expr` query selector.
-#[derive(Debug, Clone, Copy)]
-struct QueryExprShape {
-    /// Count of boolean operators (`&&`, `||`, `!`).
-    ops: u32,
-    /// Count of selector function calls (`label(`, `tree_output(`, …).
-    funcs: u32,
-}
-
-/// Summarize a query expression's *shape* only: how many boolean operators and
-/// selector-function calls it uses. The expression text is never sent — it can
-/// carry package paths / labels — so only these integer counts leave the host.
-fn query_expr_shape(expr: &str) -> QueryExprShape {
-    let ops = expr.matches("&&").count() + expr.matches("||").count() + expr.matches('!').count();
-    let funcs: usize = [
-        "label(",
-        "tree_output(",
-        "addr(",
-        "package_prefix(",
-        "package(",
-    ]
-    .iter()
-    .map(|f| expr.matches(f).count())
-    .sum();
-    QueryExprShape {
-        ops: ops as u32,
-        funcs: funcs as u32,
-    }
-}
-
 /// Coarse, non-PII failure class: user-cancelled vs a target that genuinely
 /// failed vs anything else.
 fn classify_failure(e: &anyhow::Error) -> &'static str {
@@ -438,8 +409,6 @@ struct ReportContext<'a> {
     /// stays exhaustive for every command without per-command code. Names only;
     /// never the values (an addr/label could be PII).
     flags: &'a [String],
-    /// Structural-only summary of a `--expr` query selector, when one was given.
-    query_expr: Option<QueryExprShape>,
     /// Whether the command ultimately succeeded.
     success: bool,
     /// Coarse failure class on error: `"cancelled"`, `"target_failure"`, or
@@ -515,23 +484,27 @@ fn build_props(
     put("request_shape", ctx.request_shape.into());
     put("success", ctx.success.into());
     put("flags", ctx.flags.into());
-    // Query selector shape — counts only, never the expression text. Absent when
-    // no `--expr` was given.
-    if let Some(q) = ctx.query_expr {
-        put("query_expr_ops", q.ops.into());
-        put("query_expr_funcs", q.funcs.into());
-    }
     if let Some(failure) = ctx.failure {
         put("failure", failure.into());
     }
     put("duration_ms", ctx.duration_ms.into());
-    // Whether this run used the interactive TUI — the same predicate the CLI
-    // applies (`should_use_tui`): a terminal on stderr and no `--no-tui`. Read
-    // here (same process, so stderr's terminal-ness is unchanged since start) so
-    // no per-command wiring is needed.
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr())
-        && !ctx.flags.iter().any(|f| f == "no_tui");
-    put("interactive", interactive.into());
+    // The interactive-TUI decision, recorded by `should_use_tui` itself (the one
+    // place that makes it). Absent for commands that never decide.
+    if let Some(interactive) = stats.interactive {
+        put("interactive", interactive.into());
+    }
+    // Query selector shape — per-node counts of the parsed matcher tree from the
+    // real query parser, never the expression text. Absent when no `--expr` ran.
+    if let Some(q) = stats.query_expr {
+        put("query_expr_addr", q.addr.into());
+        put("query_expr_label", q.label.into());
+        put("query_expr_package", q.package.into());
+        put("query_expr_package_prefix", q.package_prefix.into());
+        put("query_expr_tree_output", q.tree_output.into());
+        put("query_expr_and", q.and.into());
+        put("query_expr_or", q.or.into());
+        put("query_expr_not", q.not.into());
+    }
     // Number of config profiles layered via `HEPH_PROFILES` (count only — names
     // can be project-specific). Comma-separated, empty entries dropped, matching
     // the config loader.
@@ -738,12 +711,13 @@ mod tests {
             sandbox_fuse: 0,
             sandbox_os: 0,
             cache_spills: 0,
+            query_expr: None,
+            interactive: None,
         };
         let ctx = ReportContext {
             command: "run",
             request_shape: "addr",
             flags: &[],
-            query_expr: None,
             success: true,
             failure: None,
             duration_ms: 1,
@@ -800,17 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn query_expr_shape_counts_ops_and_funcs() {
-        let s = query_expr_shape("label(foo) && !package(//a) || tree_output(//b)");
-        assert_eq!(s.ops, 3, "&&, !, ||");
-        assert_eq!(s.funcs, 3, "label(, package(, tree_output(");
-        // `package(` must not be counted inside `package_prefix(`.
-        let p = query_expr_shape("package_prefix(//a)");
-        assert_eq!(p.funcs, 1);
-        assert_eq!(p.ops, 0);
-    }
-
-    #[test]
     fn build_props_carries_query_expr_and_new_counters() {
         let snapshot = TelemetrySnapshot {
             targets: 0,
@@ -834,20 +797,34 @@ mod tests {
             sandbox_fuse: 6,
             sandbox_os: 7,
             cache_spills: 8,
+            query_expr: Some(QueryExprCounts {
+                addr: 1,
+                label: 2,
+                package: 0,
+                package_prefix: 1,
+                tree_output: 0,
+                and: 1,
+                or: 0,
+                not: 1,
+            }),
+            interactive: Some(true),
         };
         let ctx = ReportContext {
             command: "run",
             request_shape: "addr",
             flags: &[],
-            query_expr: Some(QueryExprShape { ops: 2, funcs: 1 }),
             success: true,
             failure: None,
             duration_ms: 1,
         };
         let props = build_props(&ctx, &snapshot, Plugins::default(), None);
         let n = |k: &str| props.get(k).and_then(|v| v.as_u64());
-        assert_eq!(n("query_expr_ops"), Some(2));
-        assert_eq!(n("query_expr_funcs"), Some(1));
+        assert_eq!(n("query_expr_addr"), Some(1));
+        assert_eq!(n("query_expr_label"), Some(2));
+        assert_eq!(n("query_expr_package"), Some(0));
+        assert_eq!(n("query_expr_package_prefix"), Some(1));
+        assert_eq!(n("query_expr_and"), Some(1));
+        assert_eq!(n("query_expr_not"), Some(1));
         assert_eq!(n("remote_cache_hits"), Some(2));
         assert_eq!(n("remote_cache_misses"), Some(3));
         assert_eq!(n("remote_cache_writes"), Some(1));
@@ -858,18 +835,22 @@ mod tests {
         assert_eq!(n("sandbox_fuse"), Some(6));
         assert_eq!(n("sandbox_os"), Some(7));
         assert_eq!(n("cache_spills"), Some(8));
-        // Always-present environment shape.
-        assert!(props.contains_key("interactive"));
+        assert_eq!(
+            props.get("interactive").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert!(props.contains_key("config_profile_count"));
 
-        // No `--expr` → the query shape attrs are absent rather than zero.
-        let no_expr = ReportContext {
+        // No `--expr` and no TUI decision → those attrs are absent, not zero.
+        let bare = TelemetrySnapshot {
             query_expr: None,
-            ..ctx
+            interactive: None,
+            ..snapshot
         };
-        let props = build_props(&no_expr, &snapshot, Plugins::default(), None);
-        assert!(!props.contains_key("query_expr_ops"));
-        assert!(!props.contains_key("query_expr_funcs"));
+        let props = build_props(&ctx, &bare, Plugins::default(), None);
+        assert!(!props.contains_key("query_expr_addr"));
+        assert!(!props.contains_key("query_expr_label"));
+        assert!(!props.contains_key("interactive"));
     }
 
     #[test]

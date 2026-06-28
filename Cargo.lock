@@ -6138,6 +6138,7 @@ dependencies = [
  "futures",
  "libc",
  "ratatui",
+ "telemetry",
  "tempfile",
  "tokio",
  "tracing",

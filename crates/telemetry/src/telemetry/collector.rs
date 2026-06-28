@@ -14,9 +14,31 @@
 //!
 //! [`RequestState::emit`]: RequestState::emit
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use hcore::events::BuildEventKind;
+
+/// Per-node counts of a parsed query `--expr` matcher tree. Filled by the
+/// command that actually parses the expression (so the real parser is the only
+/// thing that ever interprets the syntax) and folded into the collector. Counts
+/// only — never any pattern/label/addr text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryExprCounts {
+    pub addr: u32,
+    pub label: u32,
+    pub package: u32,
+    pub package_prefix: u32,
+    pub tree_output: u32,
+    pub and: u32,
+    pub or: u32,
+    pub not: u32,
+}
+
+/// Tri-state for the interactive-TUI decision: not yet recorded, or the bool the
+/// CLI's `should_use_tui` returned.
+const INTERACTIVE_UNSET: u8 = 0;
+const INTERACTIVE_NO: u8 = 1;
+const INTERACTIVE_YES: u8 = 2;
 
 /// One bucket per possible bit-length of a `u64` (0..=64). Bucket `i` (`i >= 1`)
 /// holds values in `[2^(i-1), 2^i - 1]`; bucket `0` holds value `0`.
@@ -132,6 +154,20 @@ pub struct TelemetryCollector {
     /// Local-cache blobs that crossed the spill threshold and moved from the
     /// primary store onto the FS blob store.
     cache_spills: AtomicU64,
+    /// Whether a `--expr` query was parsed this run, and the per-node counts of
+    /// its matcher tree (recorded by the command that parses it).
+    query_expr_present: AtomicU8,
+    qe_addr: AtomicU64,
+    qe_label: AtomicU64,
+    qe_package: AtomicU64,
+    qe_package_prefix: AtomicU64,
+    qe_tree_output: AtomicU64,
+    qe_and: AtomicU64,
+    qe_or: AtomicU64,
+    qe_not: AtomicU64,
+    /// Interactive-TUI decision, recorded where `should_use_tui` makes it (tri-
+    /// state — see the `INTERACTIVE_*` constants).
+    interactive: AtomicU8,
 }
 
 impl Default for TelemetryCollector {
@@ -165,6 +201,16 @@ impl TelemetryCollector {
             sandbox_fuse: AtomicU64::new(0),
             sandbox_os: AtomicU64::new(0),
             cache_spills: AtomicU64::new(0),
+            query_expr_present: AtomicU8::new(0),
+            qe_addr: AtomicU64::new(0),
+            qe_label: AtomicU64::new(0),
+            qe_package: AtomicU64::new(0),
+            qe_package_prefix: AtomicU64::new(0),
+            qe_tree_output: AtomicU64::new(0),
+            qe_and: AtomicU64::new(0),
+            qe_or: AtomicU64::new(0),
+            qe_not: AtomicU64::new(0),
+            interactive: AtomicU8::new(INTERACTIVE_UNSET),
         }
     }
 
@@ -270,6 +316,34 @@ impl TelemetryCollector {
         self.cache_spills.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the per-node shape of a parsed `--expr` query matcher. Called by
+    /// the command that runs the real query parser, so the syntax is never
+    /// re-interpreted here. Counts accumulate (a run parses at most one expr).
+    pub fn record_query_expr(&self, c: &QueryExprCounts) {
+        self.query_expr_present.store(1, Ordering::Relaxed);
+        self.qe_addr.fetch_add(c.addr.into(), Ordering::Relaxed);
+        self.qe_label.fetch_add(c.label.into(), Ordering::Relaxed);
+        self.qe_package
+            .fetch_add(c.package.into(), Ordering::Relaxed);
+        self.qe_package_prefix
+            .fetch_add(c.package_prefix.into(), Ordering::Relaxed);
+        self.qe_tree_output
+            .fetch_add(c.tree_output.into(), Ordering::Relaxed);
+        self.qe_and.fetch_add(c.and.into(), Ordering::Relaxed);
+        self.qe_or.fetch_add(c.or.into(), Ordering::Relaxed);
+        self.qe_not.fetch_add(c.not.into(), Ordering::Relaxed);
+    }
+
+    /// Record the interactive-TUI decision exactly as `should_use_tui` made it.
+    pub fn record_interactive(&self, interactive: bool) {
+        let v = if interactive {
+            INTERACTIVE_YES
+        } else {
+            INTERACTIVE_NO
+        };
+        self.interactive.store(v, Ordering::Relaxed);
+    }
+
     /// Read the accumulated counters at this instant.
     pub fn snapshot(&self) -> TelemetrySnapshot {
         TelemetrySnapshot {
@@ -294,6 +368,23 @@ impl TelemetryCollector {
             sandbox_fuse: self.sandbox_fuse.load(Ordering::Relaxed),
             sandbox_os: self.sandbox_os.load(Ordering::Relaxed),
             cache_spills: self.cache_spills.load(Ordering::Relaxed),
+            query_expr: (self.query_expr_present.load(Ordering::Relaxed) != 0).then(|| {
+                QueryExprCounts {
+                    addr: self.qe_addr.load(Ordering::Relaxed) as u32,
+                    label: self.qe_label.load(Ordering::Relaxed) as u32,
+                    package: self.qe_package.load(Ordering::Relaxed) as u32,
+                    package_prefix: self.qe_package_prefix.load(Ordering::Relaxed) as u32,
+                    tree_output: self.qe_tree_output.load(Ordering::Relaxed) as u32,
+                    and: self.qe_and.load(Ordering::Relaxed) as u32,
+                    or: self.qe_or.load(Ordering::Relaxed) as u32,
+                    not: self.qe_not.load(Ordering::Relaxed) as u32,
+                }
+            }),
+            interactive: match self.interactive.load(Ordering::Relaxed) {
+                INTERACTIVE_YES => Some(true),
+                INTERACTIVE_NO => Some(false),
+                _ => None,
+            },
         }
     }
 }
@@ -328,6 +419,11 @@ pub struct TelemetrySnapshot {
     pub sandbox_fuse: u64,
     pub sandbox_os: u64,
     pub cache_spills: u64,
+    /// Per-node counts of a parsed `--expr` matcher tree; `None` when no query
+    /// expression was used this run.
+    pub query_expr: Option<QueryExprCounts>,
+    /// The interactive-TUI decision; `None` for commands that never make one.
+    pub interactive: Option<bool>,
 }
 
 #[cfg(test)]
@@ -411,6 +507,30 @@ mod tests {
         assert_eq!(s.sandbox_fuse, 1);
         assert_eq!(s.sandbox_os, 2);
         assert_eq!(s.cache_spills, 1);
+    }
+
+    #[test]
+    fn query_expr_and_interactive_are_tri_state() {
+        // Nothing recorded → both absent.
+        let s = TelemetryCollector::new().snapshot();
+        assert!(s.query_expr.is_none());
+        assert!(s.interactive.is_none());
+
+        let c = TelemetryCollector::new();
+        c.record_query_expr(&QueryExprCounts {
+            label: 2,
+            and: 1,
+            not: 1,
+            ..QueryExprCounts::default()
+        });
+        c.record_interactive(false);
+        let s = c.snapshot();
+        let q = s.query_expr.expect("present after record");
+        assert_eq!(q.label, 2);
+        assert_eq!(q.and, 1);
+        assert_eq!(q.not, 1);
+        assert_eq!(q.addr, 0);
+        assert_eq!(s.interactive, Some(false));
     }
 
     #[test]
