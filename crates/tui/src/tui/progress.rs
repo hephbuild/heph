@@ -1077,9 +1077,10 @@ impl TuiProgressView {
         self
     }
 
-    /// Body rows for the active approval prompt, or empty when idle. Collapsed:
-    /// a single banner with the keys. Expanded: the banner plus each notice's
-    /// name and wrapped contents (scrollable as part of the body).
+    /// Body rows for the active approval prompt, or empty when idle. The banner
+    /// carries the keys; when the target declares notices, each notice's file
+    /// path is shown as an "open in editor" link below it, and `enter` toggles an
+    /// inline (scrollable) preview of the contents.
     fn approval_lines(&self) -> Vec<Line<'static>> {
         let Some(view) = self.approval.as_ref().and_then(|c| c.current()) else {
             return Vec::new();
@@ -1090,29 +1091,32 @@ impl TuiProgressView {
         } else {
             String::new()
         };
-        let action = if view.expanded {
-            "enter hide"
+        // Only offer the notice-view toggle when there is a notice to view.
+        let action = if view.notices.is_empty() {
+            String::new()
+        } else if view.expanded {
+            " · enter hide".to_string()
         } else {
-            "enter view"
+            " · enter view".to_string()
         };
         lines.push(Line::from(Span::styled(
             format!(
-                "  ⚠ approval required: {}  [y] approve · [n] reject · {action}{queued}",
+                "  ⚠ approval required: {}  [y] approve · [n] reject{action}{queued}",
                 view.addr
             ),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )));
+        // Always show the notice file link(s) so the user can open the full text
+        // in an editor without expanding the inline preview.
+        for notice in &view.notices {
+            lines.push(Line::from(Span::styled(
+                format!("    → {}: {}", notice.name, notice.path),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
         if view.expanded {
-            if view.notices.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "    (no notice declared)".to_string(),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                )));
-            }
             for notice in &view.notices {
                 lines.push(Line::from(Span::styled(
                     format!("  ── {} ──", notice.name),

@@ -24,11 +24,14 @@ use std::io::Read;
 use std::sync::Arc;
 
 /// One rendered notice shown to the user before they approve/reject: the input
-/// group name and the concatenated text of every file that group resolves to.
+/// group name, the concatenated text of every file that group resolves to, and
+/// the on-disk path the full text was written to (so a front-end can offer a
+/// clickable "open in editor" link rather than only an inline preview).
 #[derive(Debug, Clone)]
 pub struct ApprovalNotice {
     pub name: String,
     pub content: String,
+    pub path: String,
 }
 
 /// A pending approval handed to the [`ApprovalHandler`]: the target being gated
@@ -122,9 +125,17 @@ impl Engine {
                 .with_context(|| {
                     format!("rendering approval notice `{name}` for {}", addr.format())
                 })?;
+            // Persist the full notice so the front-end can link to it (open in an
+            // editor) instead of relying on a scrollable inline preview.
+            let path = self
+                .write_notice_file(addr, name, &content)
+                .with_context(|| {
+                    format!("writing approval notice `{name}` for {}", addr.format())
+                })?;
             notices.push(ApprovalNotice {
                 name: name.clone(),
                 content,
+                path,
             });
         }
 
@@ -194,6 +205,28 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// Write a rendered notice under `<home>/approval/` and return its absolute
+    /// path. The file name is derived from the target addr + group name so it is
+    /// stable across runs (overwritten in place) and unique per (target, notice).
+    fn write_notice_file(&self, addr: &Addr, name: &str, content: &str) -> anyhow::Result<String> {
+        let dir = self.home.join("approval");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create approval dir {}", dir.display()))?;
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect()
+        };
+        let file = dir.join(format!(
+            "{}__{}.txt",
+            sanitize(&addr.format()),
+            sanitize(name)
+        ));
+        std::fs::write(&file, content)
+            .with_context(|| format!("write approval notice {}", file.display()))?;
+        Ok(file.to_string_lossy().into_owned())
     }
 }
 

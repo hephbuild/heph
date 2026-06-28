@@ -42,6 +42,7 @@ impl ApprovalHandler for TuiApprovalHandler {
             .map(|n| ApprovalNoticeView {
                 name: n.name,
                 content: n.content,
+                path: n.path,
             })
             .collect();
         let rx = self.center.request(req.addr, notices);
@@ -95,7 +96,12 @@ impl ApprovalHandler for CliApprovalHandler {
 fn log_notice(req: &ApprovalRequest) {
     tracing::info!("approval required: {}", req.addr);
     for notice in &req.notices {
-        tracing::info!("notice {}:\n{}", notice.name, notice.content);
+        tracing::info!(
+            "notice {} ({}):\n{}",
+            notice.name,
+            notice.path,
+            notice.content
+        );
     }
 }
 

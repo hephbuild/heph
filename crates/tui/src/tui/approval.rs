@@ -11,11 +11,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::oneshot;
 
-/// One rendered notice for display: the input group name and its text.
+/// One rendered notice for display: the input group name, its text, and the
+/// on-disk path the full text was written to (for an "open in editor" link).
 #[derive(Clone, Debug)]
 pub struct ApprovalNoticeView {
     pub name: String,
     pub content: String,
+    pub path: String,
 }
 
 struct Pending {
@@ -134,6 +136,7 @@ mod tests {
             vec![ApprovalNoticeView {
                 name: "plan".to_string(),
                 content: "do the thing".to_string(),
+                path: "/tmp/plan.txt".to_string(),
             }],
         );
         assert!(center.is_active());

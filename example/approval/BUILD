@@ -45,6 +45,7 @@ PLAN
 target(
     name = "deploy_db",
     driver = "bash",
+    labels = ["deploy"],
     approval = {"required": True, "notice": ["plan"]},
     deps = {"plan": plan},
     cache = False,
@@ -55,6 +56,7 @@ target(
 target(
     name = "wipe_staging",
     driver = "bash",
+    labels = ["deploy"],
     approval = True,
     cache = False,
     run = "echo 'wiping staging environment...'; echo 'staging reset complete.'",
