@@ -476,6 +476,15 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 
         let pkg = req.target_spec.addr.package.clone();
 
+        // The `secret` flag is threaded straight through; the engine validates
+        // that a secret target is uncached (see `validate_secret_cache`).
+        let cache = CacheConfig {
+            enabled: spec.cache.local,
+            remote_enabled: spec.cache.remote,
+            history: spec.cache.history,
+            secret: spec.secret,
+        };
+
         // Dep groups opted into read-only staging (stage once, hardlink in)
         // rather than copied into every sandbox.
         let read_only_groups: std::collections::HashSet<String> =
@@ -638,11 +647,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .collect(),
                 outputs,
                 support_files,
-                cache: CacheConfig {
-                    enabled: spec.cache.local,
-                    remote_enabled: spec.cache.remote,
-                    history: spec.cache.history,
-                },
+                cache,
                 pty: true,
                 hash,
                 transparent: false,
@@ -2207,6 +2212,28 @@ mod tests {
             .expect("hash_dep input present");
         assert!(hash_dep_input.hashed);
         assert!(!hash_dep_input.runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_secret_threads_flag() -> anyhow::Result<()> {
+        // The driver only threads `secret` into the cache config — it does not
+        // validate it (the engine does), so the caching values pass through.
+        let td = parse_with(HashMap::from([
+            ("secret".to_string(), hcore::htvalue::Value::Bool(true)),
+            ("cache".to_string(), hcore::htvalue::Value::Bool(false)),
+        ]))
+        .await?;
+        assert!(td.cache.secret, "secret flag threaded");
+        assert!(!td.cache.enabled, "cache=False passed through");
+        assert!(!td.cache.remote_enabled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_default_not_secret() -> anyhow::Result<()> {
+        let td = parse_with(HashMap::new()).await?;
+        assert!(!td.cache.secret);
         Ok(())
     }
 
