@@ -113,7 +113,9 @@ impl Driver for ManagedDriverBridge {
         req: RunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
-        match self.pick(&req.inputs)? {
+        let pick = self.pick(&req.inputs)?;
+        htelemetry::telemetry::record_sandbox(matches!(pick, Pick::Fuse));
+        match pick {
             Pick::Os => self.os.run_inner(req, ctoken, false).await,
             Pick::Fuse => {
                 let fuse = self.fuse.as_ref().expect("Pick::Fuse implies fuse is Some");
@@ -127,7 +129,12 @@ impl Driver for ManagedDriverBridge {
         req: RunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
-        match self.pick(&req.inputs)? {
+        let pick = self.pick(&req.inputs)?;
+        htelemetry::telemetry::record_sandbox(matches!(pick, Pick::Fuse));
+        // An interactive sandbox shell was actually entered (not just `--shell`
+        // requested then errored upstream).
+        htelemetry::telemetry::record_shell_session();
+        match pick {
             Pick::Os => self.os.run_inner(req, ctoken, true).await,
             Pick::Fuse => {
                 let fuse = self.fuse.as_ref().expect("Pick::Fuse implies fuse is Some");

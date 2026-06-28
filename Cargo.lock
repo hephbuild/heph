@@ -1300,6 +1300,7 @@ dependencies = [
  "plugin",
  "rayon",
  "sandboxfuse",
+ "telemetry",
  "tempfile",
  "tokio",
 ]
@@ -6137,6 +6138,7 @@ dependencies = [
  "futures",
  "libc",
  "ratatui",
+ "telemetry",
  "tempfile",
  "tokio",
  "tracing",

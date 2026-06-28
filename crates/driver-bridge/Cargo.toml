@@ -11,6 +11,7 @@ hcore = { package = "core", path = "../core" }
 hconfig = { package = "config", path = "../config" }
 hplugin = { package = "plugin", path = "../plugin" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
+htelemetry = { package = "telemetry", path = "../telemetry" }
 # The FUSE machinery (and its `fuser`/libfuse link) lives behind this crate so
 # the contract-level `driver-support` — and therefore every plugin — stays
 # fuse-free. Only crates that orchestrate the sandbox (this crate + the engine)

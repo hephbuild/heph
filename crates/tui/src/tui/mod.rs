@@ -23,7 +23,10 @@ pub use progress::{
 pub use stdout_buffer::BufferedStdout;
 
 pub fn should_use_tui(force_off: bool) -> bool {
-    !force_off && io::stderr().is_terminal()
+    let interactive = !force_off && io::stderr().is_terminal();
+    // Record the decision here, at the one place that makes it.
+    htelemetry::telemetry::record_interactive(interactive);
+    interactive
 }
 
 pub async fn run_app<A: App + 'static>(

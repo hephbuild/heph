@@ -143,10 +143,14 @@ impl Engine {
             addr: addr.format(),
             notices,
         };
+        // Counted before the prompt so a cancelled/errored gate still registers
+        // as requested even when no decision lands.
+        htelemetry::telemetry::record_approval_requested();
         let approved = handler
             .request_approval(req, rs.ctoken())
             .await
             .with_context(|| format!("requesting approval for {}", addr.format()))?;
+        htelemetry::telemetry::record_approval_decision(approved);
         if !approved {
             return Err(anyhow::Error::new(
                 crate::engine::error::ApprovalDeniedError { addr: addr.clone() },

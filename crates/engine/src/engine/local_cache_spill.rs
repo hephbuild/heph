@@ -204,6 +204,7 @@ impl SpillWriter {
             .map_err(io::Error::other)?;
 
         self.blob_writer = Some(blob_writer);
+        htelemetry::telemetry::record_cache_spill();
         Ok(())
     }
 }
