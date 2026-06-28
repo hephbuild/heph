@@ -116,8 +116,7 @@ pub fn build_spec(
         addr,
         driver: "sh".to_string(),
         config,
-        labels: vec![],
-        transitive: Default::default(),
+        ..Default::default()
     }
 }
 

@@ -228,7 +228,7 @@ pub fn build_spec(
         driver: TOOLCHAIN_DRIVER.to_string(),
         config,
         labels: vec!["go-toolchain".to_string()],
-        transitive: Default::default(),
+        ..Default::default()
     }
 }
 

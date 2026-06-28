@@ -139,8 +139,7 @@ fn build_spec_inner(
         addr,
         driver: "go_golist".to_string(),
         config,
-        labels: vec![],
-        transitive: Default::default(),
+        ..Default::default()
     })
 }
 

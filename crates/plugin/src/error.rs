@@ -175,6 +175,22 @@ impl fmt::Display for FrozenCheckError {
 
 impl std::error::Error for FrozenCheckError {}
 
+/// A target gated by `approval` was denied: the user rejected it interactively,
+/// or (in a non-interactive context with no `--auto-approve`) no decision could
+/// be obtained. Surfaced as the target's failure so the run exits non-zero.
+#[derive(Debug, Clone)]
+pub struct ApprovalDeniedError {
+    pub addr: Addr,
+}
+
+impl fmt::Display for ApprovalDeniedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "approval denied for {}", self.addr.format())
+    }
+}
+
+impl std::error::Error for ApprovalDeniedError {}
+
 /// A bounded slice of a process log prepared for display: the last lines of the
 /// full log, plus the real 1-based line number its first line had in the full log
 /// so the renderer can show true file positions (e.g. 91–100 for the last 10 of a

@@ -203,6 +203,22 @@ pub trait TUIAppView: Send {
     /// can be scrolled (the `Enter` key). No-op by default.
     fn search_confirm(&mut self) {}
 
+    /// Whether an approval-gated target is currently awaiting a decision. While
+    /// `true` the backend routes `y`/`n`/Enter to the approval methods below so
+    /// the user can resolve the prompt. Default `false` for views without an
+    /// approval gate.
+    fn approval_active(&self) -> bool {
+        false
+    }
+
+    /// Resolve the active approval prompt: `approve = true` runs the target,
+    /// `false` rejects it (failing the target). No-op by default.
+    fn approval_respond(&mut self, _approve: bool) {}
+
+    /// Expand/collapse the active prompt's notice body (the Enter key). No-op by
+    /// default.
+    fn approval_toggle_notice(&mut self) {}
+
     /// The lines for the pinned viewport, including the spinner row built from
     /// `spinner`. Called every render tick. `width` is the current terminal
     /// column count and `height` the reserved viewport row count, so the view can

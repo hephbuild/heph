@@ -309,8 +309,7 @@ mod tests {
                 ),
                 driver: "go_testmain".to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         }
     }
@@ -378,8 +377,7 @@ mod tests {
                 ),
                 driver: "go_testmain".to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         };
         let resp = driver().parse(req, &ct).await.unwrap();
@@ -412,8 +410,7 @@ mod tests {
                 ),
                 driver: "go_testmain".to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         };
         assert!(driver().parse(req, &ct).await.is_err());

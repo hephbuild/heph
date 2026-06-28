@@ -276,6 +276,7 @@ impl Engine {
             rs.events_sender(),
             rs.bg_pending(),
             Self::DEFAULT_LOG_TAIL_LINES,
+            None,
         );
         let targets = match self.local_cache.list_targets() {
             Ok(t) => t,

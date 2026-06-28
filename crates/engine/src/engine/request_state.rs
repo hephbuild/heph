@@ -230,6 +230,11 @@ pub struct RequestStateData {
     /// at the end of execution for rendering. Shared via `Arc<RequestStateData>`,
     /// so `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Addr, Arc<TargetFailure>>>,
+    /// Decision maker for `approval`-gated targets. `None` in non-interactive
+    /// contexts that never set one (gc, tests) — a target requiring approval then
+    /// fails with a clear error. Shared via `Arc<RequestStateData>`, so child
+    /// states inherit it.
+    pub approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
 }
 
 /// One frame of the live resolution path (the breadcrumb chain). Built as an
@@ -493,18 +498,22 @@ impl Engine {
             events,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             Self::DEFAULT_LOG_TAIL_LINES,
+            None,
         )
     }
 
     /// Like [`new_state_with_events`] but with a caller-supplied background-work
     /// counter, so the renderer that owns the other clone can watch this
-    /// request's sandbox cleanups drain during shutdown.
+    /// request's sandbox cleanups drain during shutdown. `approval` is the
+    /// front-end's decision maker for `approval`-gated targets (`None` to fail
+    /// any gated target).
     pub fn new_state_full(
         self: &Arc<Self>,
         fail_fast: bool,
         events: Option<crate::engine::event::EventSender>,
         bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
         log_tail_lines: usize,
+        approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
     ) -> Arc<RequestState> {
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
@@ -536,6 +545,7 @@ impl Engine {
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending,
             failures: Mutex::new(indexmap::IndexMap::new()),
+            approval,
         });
 
         let state = Arc::new(RequestState {

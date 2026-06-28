@@ -404,6 +404,7 @@ impl EProvider for Provider {
                             config: p.config.clone(),
                             labels: p.labels.clone(),
                             transitive: p.transitive.clone(),
+                            approval: p.approval.clone(),
                         },
                     });
                 }

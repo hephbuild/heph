@@ -15,7 +15,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{RawDef, RawDefBytes};
-use hplugin::provider::{State, TargetSpec};
+use hplugin::provider::{Approval, State, TargetSpec};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -499,6 +499,7 @@ pub fn target_spec_to_pb(t: &TargetSpec) -> pb::TargetSpec {
             .collect(),
         labels: t.labels.clone(),
         transitive: Some(sandbox_to_pb(&t.transitive)),
+        approval: Some(approval_to_pb(&t.approval)),
     }
 }
 
@@ -513,6 +514,21 @@ pub fn target_spec_from_pb(t: pb::TargetSpec) -> TargetSpec {
             .collect(),
         labels: t.labels,
         transitive: sandbox_from_pb(t.transitive.unwrap_or_default()),
+        approval: approval_from_pb(t.approval.unwrap_or_default()),
+    }
+}
+
+fn approval_to_pb(a: &Approval) -> pb::Approval {
+    pb::Approval {
+        required: a.required,
+        notice: a.notice.clone(),
+    }
+}
+
+fn approval_from_pb(a: pb::Approval) -> Approval {
+    Approval {
+        required: a.required,
+        notice: a.notice,
     }
 }
 
@@ -856,6 +872,10 @@ mod tests {
             config: HashMap::from([("cmd".to_string(), Value::String("echo".to_string()))]),
             labels: vec!["lbl".to_string()],
             transitive: Sandbox::default(),
+            approval: Approval {
+                required: true,
+                notice: vec!["plan".to_string()],
+            },
         };
         spec.transitive.push_dep(Dep {
             r#ref: TargetAddr {
@@ -877,6 +897,7 @@ mod tests {
         assert_eq!(back.transitive.deps.len(), 1);
         assert_eq!(back.transitive.deps[0].id, "id1");
         assert!(matches!(back.transitive.deps[0].mode, Mode::Link));
+        assert_eq!(back.approval, spec.approval);
     }
 
     #[test]

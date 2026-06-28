@@ -28,8 +28,7 @@ pub fn build_spec(addr: Addr, mod_files: &[String]) -> TargetSpec {
         addr,
         driver: hbuiltins::plugingroup::DRIVER_NAME.to_string(),
         config,
-        labels: vec![],
-        transitive: Default::default(),
+        ..Default::default()
     }
 }
 

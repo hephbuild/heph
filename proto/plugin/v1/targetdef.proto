@@ -5,6 +5,14 @@ package heph.plugin.v1;
 
 import "plugin/v1/common.proto";
 
+// Host-side approval gate. When `required`, the target's execution pauses for an
+// explicit user decision (interactive Y/N or `--auto-approve`). `notice` lists
+// input group names whose contents are shown to the user before they decide.
+message Approval {
+  bool required = 1;
+  repeated string notice = 2;
+}
+
 // Provider output. Mirrors driver::TargetSpec.
 message TargetSpec {
   Addr addr = 1;
@@ -12,6 +20,7 @@ message TargetSpec {
   map<string, Value> config = 3;
   repeated string labels = 4;
   Sandbox transitive = 5;
+  Approval approval = 6;
 }
 
 // Opaque driver-specific config blob. The host never inspects this; it is

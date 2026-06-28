@@ -1042,6 +1042,10 @@ pub struct TuiProgressView {
     /// substring matched against the target addr. Empty means no filtering.
     /// Persists after `Enter` confirms so the filtered list stays scrollable.
     search_query: RefCell<String>,
+    /// Pending approval prompts shared with the engine's approval handler. `None`
+    /// for commands without an approval gate. When a prompt is active it is
+    /// rendered at the top of the live body and `y`/`n`/Enter resolve it.
+    approval: Option<crate::tui::approval::ApprovalCenter>,
 }
 
 impl TuiProgressView {
@@ -1062,7 +1066,71 @@ impl TuiProgressView {
             finished_at_ms: None,
             search_active: Cell::new(false),
             search_query: RefCell::new(String::new()),
+            approval: None,
         }
+    }
+
+    /// Attach the shared approval queue so this view renders pending prompts and
+    /// resolves them from key events. Used by commands that gate execution.
+    pub fn with_approval(mut self, center: crate::tui::approval::ApprovalCenter) -> Self {
+        self.approval = Some(center);
+        self
+    }
+
+    /// Body rows for the active approval prompt, or empty when idle. The banner
+    /// carries the keys; when the target declares notices, each notice's file
+    /// path is shown as an "open in editor" link below it, and `enter` toggles an
+    /// inline (scrollable) preview of the contents.
+    fn approval_lines(&self) -> Vec<Line<'static>> {
+        let Some(view) = self.approval.as_ref().and_then(|c| c.current()) else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        // When more than one target is awaiting approval, show the total count so
+        // the user knows further prompts follow this one.
+        let total_pending = view.queued_behind + 1;
+        let queued = if total_pending > 1 {
+            format!(" · {total_pending} pending")
+        } else {
+            String::new()
+        };
+        // Only offer the notice-view toggle when there is a notice to view.
+        let action = if view.notices.is_empty() {
+            String::new()
+        } else if view.expanded {
+            " · enter hide".to_string()
+        } else {
+            " · enter view".to_string()
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ⚠ approval required: {}  [y] approve · [n] reject{action}{queued}",
+                view.addr
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        // Always show the notice file link(s) so the user can open the full text
+        // in an editor without expanding the inline preview.
+        for notice in &view.notices {
+            lines.push(Line::from(Span::styled(
+                format!("    → {}: {}", notice.name, notice.path),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        if view.expanded {
+            for notice in &view.notices {
+                lines.push(Line::from(Span::styled(
+                    format!("  ── {} ──", notice.name),
+                    Style::default().fg(Color::Cyan),
+                )));
+                for raw in notice.content.lines() {
+                    lines.push(Line::from(format!("  {raw}")));
+                }
+            }
+        }
+        lines
     }
 
     /// The selectable body views in cycle order: [`ViewMode::Default`] first,
@@ -1301,6 +1369,25 @@ impl TUIAppView for TuiProgressView {
         self.scope.set(next);
     }
 
+    fn approval_active(&self) -> bool {
+        self.approval.as_ref().is_some_and(|c| c.is_active())
+    }
+
+    fn approval_respond(&mut self, approve: bool) {
+        if let Some(center) = self.approval.as_ref() {
+            center.respond(approve);
+        }
+        // A resolved prompt shrinks the body; reset scroll so the live rows show.
+        self.scroll.set(0);
+    }
+
+    fn approval_toggle_notice(&mut self) {
+        if let Some(center) = self.approval.as_ref() {
+            center.toggle_expanded();
+        }
+        self.scroll.set(0);
+    }
+
     fn is_searching(&self) -> bool {
         self.search_active.get()
     }
@@ -1363,7 +1450,13 @@ impl TUIAppView for TuiProgressView {
         let query = self.search_query.borrow();
         let filter: &str = query.as_str();
         let body = match view {
-            ViewMode::Default => self.state.body_lines(now_ms),
+            // Pending approval prompts ride at the very top of the live body so a
+            // gated run is impossible to miss; the slow/lock rows follow.
+            ViewMode::Default => {
+                let mut b = self.approval_lines();
+                b.extend(self.state.body_lines(now_ms));
+                b
+            }
             ViewMode::Done => self.state.done_lines(self.scope.get(), filter),
             ViewMode::Failed => self.state.failed_lines(filter),
         };
@@ -2759,5 +2852,29 @@ mod tests {
             .map(|l| format!("{l}"))
             .collect();
         assert!(body.contains("more"), "collapse at top: {body}");
+    }
+
+    #[test]
+    fn approval_banner_shows_pending_count() {
+        let center = crate::tui::approval::ApprovalCenter::new();
+        // Two targets awaiting approval: the banner shows the active one plus the
+        // total pending count.
+        let _r1 = center.request("//a:1".to_string(), vec![]);
+        let _r2 = center.request("//a:2".to_string(), vec![]);
+        let view = TuiProgressView::new("run").with_approval(center);
+        let lines = view.approval_lines();
+        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(banner.contains("//a:1"), "active prompt: {banner}");
+        assert!(banner.contains("2 pending"), "count: {banner}");
+    }
+
+    #[test]
+    fn approval_banner_single_has_no_pending_count() {
+        let center = crate::tui::approval::ApprovalCenter::new();
+        let _r = center.request("//a:1".to_string(), vec![]);
+        let view = TuiProgressView::new("run").with_approval(center);
+        let lines = view.approval_lines();
+        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!banner.contains("pending"), "no count for one: {banner}");
     }
 }

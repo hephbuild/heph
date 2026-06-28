@@ -1,4 +1,5 @@
 pub mod app;
+pub mod approval;
 mod backend;
 pub mod color;
 pub mod log_sink;
@@ -12,6 +13,7 @@ pub mod tty;
 use std::io::{self, IsTerminal};
 
 pub use app::{App, AppContext, CIAppView, PauseGuard, TUIAppView};
+pub use approval::{ApprovalCenter, ApprovalNoticeView, ApprovalView};
 pub use log_sink::LogSink;
 pub use paused::paused;
 pub use progress::{

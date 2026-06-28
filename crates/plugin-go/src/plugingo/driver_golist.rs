@@ -541,8 +541,7 @@ mod tests {
                 addr: Addr::new(PkgBuf::from(pkg), "_golist".to_string(), Default::default()),
                 driver: "go_golist".to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         }
     }
@@ -573,9 +572,7 @@ mod tests {
                     Default::default(),
                 ),
                 driver: "go_golist".to_string(),
-                config: HashMap::new(),
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         };
         assert!(driver().parse(req, &ct).await.is_err());

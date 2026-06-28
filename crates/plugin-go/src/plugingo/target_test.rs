@@ -226,8 +226,7 @@ pub fn build_test_spec(
         addr,
         driver: "sh".to_string(),
         config,
-        labels: vec![],
-        transitive: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -310,7 +309,7 @@ pub fn test_spec(
         driver: driver.to_string(),
         config,
         labels: vec!["test".to_string(), "go-test".to_string()],
-        transitive: Default::default(),
+        ..Default::default()
     }
 }
 

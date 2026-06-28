@@ -2607,8 +2607,7 @@ fn build_testmain_spec(
         addr,
         driver: "go_testmain".to_string(),
         config,
-        labels: vec![],
-        transitive: Default::default(),
+        ..Default::default()
     }
 }
 

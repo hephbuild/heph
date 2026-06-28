@@ -221,6 +221,27 @@ pub async fn run<A: App + 'static>(
                     }))) if held && !view.is_searching() => {
                         quit = true;
                     }
+                    // Approval prompt active: `y`/`n` resolve the gated target and
+                    // Enter expands/collapses its notice. These precede the normal
+                    // shortcuts so a gated run is resolvable without other keys
+                    // (e.g. `n`/`a`) being intercepted first.
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('y'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.approval_active() => view.approval_respond(true),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('n'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.approval_active() => view.approval_respond(false),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.approval_active() && !view.is_searching() => {
+                        view.approval_toggle_notice()
+                    }
                     // While the `/` filter captures input, printable keys, Backspace
                     // and Enter edit the query instead of firing the shortcuts
                     // below. These arms must precede the char shortcuts.

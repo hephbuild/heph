@@ -159,8 +159,7 @@ impl EProvider for Provider {
                     addr: req.addr,
                     driver: DRIVER_NAME.to_string(),
                     config,
-                    labels: vec![],
-                    transitive: Default::default(),
+                    ..Default::default()
                 },
             })
         })
@@ -1263,8 +1262,7 @@ mod tests {
                 addr: parse_addr(&format!("//{PKG}:file")).unwrap(),
                 driver: DRIVER_NAME.to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         }
     }

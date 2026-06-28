@@ -9,7 +9,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::provider::{
-    FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
+    Approval, FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
 };
 use hwalk::{CachedWalker, EntryKind};
 use starlark::any::ProvidesStaticType;
@@ -348,10 +348,46 @@ pub(crate) struct OnTargetPayload {
     pub driver: String,
     pub labels: Vec<String>,
     pub transitive: Sandbox,
+    pub approval: Approval,
     pub config: HashMap<String, htvalue::Value>,
     /// Source call sites that produced this target (innermost `target()` call
     /// first). See [`hplugin::provider::ProvenanceFrame`].
     pub provenance: Vec<ProvenanceFrame>,
+}
+
+/// Parse a BUILD-file `approval` value into an [`Approval`]. Two spellings:
+/// - `approval = True` / `False` — bare required flag, no notice.
+/// - `approval = {"required": True, "notice": ["group", ...]}` — explicit form.
+///   `required` defaults to `False`; `notice` to `[]`. Unknown keys are an error
+///   (typos must fail loudly, not silently disable the gate).
+fn approval_from(v: htvalue::Value) -> anyhow::Result<Approval> {
+    match v {
+        htvalue::Value::Null() => Ok(Approval::default()),
+        htvalue::Value::Bool(required) => Ok(Approval {
+            required,
+            notice: vec![],
+        }),
+        htvalue::Value::Map(mut m) => {
+            let required = match m.remove("required") {
+                Some(htvalue::Value::Bool(b)) => b,
+                None => false,
+                Some(other) => {
+                    anyhow::bail!("approval `required` must be a bool, got {other:?}")
+                }
+            };
+            let notice = match m.remove("notice") {
+                Some(v) => parse_strings(&v).with_context(|| "approval `notice`")?,
+                None => vec![],
+            };
+            if !m.is_empty() {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                anyhow::bail!("approval has unknown entries: {keys:?}");
+            }
+            Ok(Approval { required, notice })
+        }
+        other => anyhow::bail!("approval must be a bool or map, got {other:?}"),
+    }
 }
 
 /// Parse a BUILD-file `sandbox`/`transitive` value (Starlark → `htvalue`) into a
@@ -658,6 +694,18 @@ pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
             "Sandbox applied transitively: `deps`, `tools`, `env`, `pass_env`, `runtime_pass_env`, `runtime_env`.",
             false,
         ),
+        f(
+            "approval",
+            ParamType::union(vec![
+                ParamType::Bool,
+                ParamType::map(ParamType::union(vec![
+                    ParamType::Bool,
+                    ParamType::list(ParamType::String),
+                ])),
+            ]),
+            "Require explicit approval before executing: `True`, or `{required, notice}` where `notice` lists input groups shown to the user.",
+            false,
+        ),
     ]
 }
 
@@ -686,6 +734,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         let mut driver = String::new();
         let mut labels: Vec<String> = vec![];
         let mut transitive: Sandbox = Default::default();
+        let mut approval: Approval = Default::default();
         let config = m
             .iter()
             .map(|e| -> anyhow::Result<Option<(String, htvalue::Value)>> {
@@ -717,6 +766,11 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                             .with_context(|| "transitive")?;
                         Ok(None)
                     }
+                    "approval" => {
+                        approval =
+                            approval_from(starlark_to_rust(e.1)).with_context(|| "approval")?;
+                        Ok(None)
+                    }
                     _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)))),
                 }
             })
@@ -744,6 +798,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             driver,
             labels,
             transitive,
+            approval,
             config,
             provenance,
         };
@@ -1329,6 +1384,70 @@ mod tests {
             ps.contains("provider state") || ps.contains("provider"),
             "doc: {ps}"
         );
+    }
+
+    #[test]
+    fn approval_bool_shorthand() {
+        let on = approval_from(htvalue::Value::Bool(true)).expect("parse");
+        assert!(on.required);
+        assert!(on.notice.is_empty());
+
+        let off = approval_from(htvalue::Value::Bool(false)).expect("parse");
+        assert!(!off.required);
+    }
+
+    #[test]
+    fn approval_absent_defaults_off() {
+        let a = approval_from(htvalue::Value::Null()).expect("parse");
+        assert_eq!(a, Approval::default());
+        assert!(!a.required);
+    }
+
+    #[test]
+    fn approval_map_form_with_notice() {
+        let v = htvalue::Value::Map(HashMap::from([
+            ("required".to_string(), htvalue::Value::Bool(true)),
+            (
+                "notice".to_string(),
+                htvalue::Value::List(vec![
+                    htvalue::Value::String("plan".to_string()),
+                    htvalue::Value::String("diff".to_string()),
+                ]),
+            ),
+        ]));
+        let a = approval_from(v).expect("parse");
+        assert!(a.required);
+        assert_eq!(a.notice, vec!["plan".to_string(), "diff".to_string()]);
+    }
+
+    #[test]
+    fn approval_map_required_defaults_false() {
+        let v = htvalue::Value::Map(HashMap::from([(
+            "notice".to_string(),
+            htvalue::Value::List(vec![htvalue::Value::String("plan".to_string())]),
+        )]));
+        let a = approval_from(v).expect("parse");
+        assert!(!a.required);
+        assert_eq!(a.notice, vec!["plan".to_string()]);
+    }
+
+    #[test]
+    fn approval_unknown_key_is_rejected() {
+        let v = htvalue::Value::Map(HashMap::from([(
+            "requierd".to_string(), // typo must fail, not silently disable the gate
+            htvalue::Value::Bool(true),
+        )]));
+        let err = approval_from(v).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
+    }
+
+    #[test]
+    fn approval_required_wrong_type_is_rejected() {
+        let v = htvalue::Value::Map(HashMap::from([(
+            "required".to_string(),
+            htvalue::Value::String("yes".to_string()),
+        )]));
+        assert!(approval_from(v).is_err());
     }
 
     fn run_pkg_blocking(provider: &Provider, pkg: &str) -> anyhow::Result<Arc<RunResult>> {

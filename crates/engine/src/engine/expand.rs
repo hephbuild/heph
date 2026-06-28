@@ -378,8 +378,7 @@ mod tests {
             addr: hmodel::htaddr::parse_addr(addr).expect("parse addr"),
             driver: "exec".to_string(),
             config,
-            labels: vec![],
-            transitive: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -394,8 +393,7 @@ mod tests {
             addr: hmodel::htaddr::parse_addr(addr).expect("parse addr"),
             driver: "group".to_string(),
             config,
-            labels: vec![],
-            transitive: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -523,8 +521,7 @@ mod tests {
             addr: hmodel::htaddr::parse_addr(addr).expect("parse addr"),
             driver: "exec".to_string(),
             config,
-            labels: vec![],
-            transitive: Default::default(),
+            ..Default::default()
         }
     }
 

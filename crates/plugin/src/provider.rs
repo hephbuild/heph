@@ -59,6 +59,17 @@ pub struct ProvenanceFrame {
     pub col_end: u32,
 }
 
+/// Host-side approval gate for a target. When `required`, the engine pauses the
+/// target's execution for an explicit user decision (interactive Y/N in the TUI,
+/// a stdin prompt in non-TUI mode, or `--auto-approve`). `notice` lists input
+/// group names (`origin_id`s) whose rendered contents are shown to the user
+/// before they decide.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Approval {
+    pub required: bool,
+    pub notice: Vec<String>,
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub addr: Addr,
@@ -66,6 +77,7 @@ pub struct TargetSpec {
     pub config: HashMap<String, Value>,
     pub labels: Vec<String>,
     pub transitive: Sandbox,
+    pub approval: Approval,
 }
 
 pub trait ProviderExecutor: Send + Sync {

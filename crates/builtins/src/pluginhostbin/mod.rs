@@ -84,9 +84,7 @@ impl EProvider for Provider {
                 target_spec: TargetSpec {
                     addr: req.addr,
                     driver: DRIVER_NAME.to_string(),
-                    config: Default::default(),
-                    labels: vec![],
-                    transitive: Default::default(),
+                    ..Default::default()
                 },
             })
         })
@@ -305,9 +303,7 @@ mod tests {
             target_spec: std::sync::Arc::new(TargetSpec {
                 addr: parse_addr(&format!("//@heph/bin:{}", bin_name)).unwrap(),
                 driver: DRIVER_NAME.to_string(),
-                config: Default::default(),
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         }
     }

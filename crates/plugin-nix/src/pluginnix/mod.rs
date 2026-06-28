@@ -510,8 +510,7 @@ mod tests {
                 addr: parse_addr(addr).unwrap(),
                 driver: DRIVER_NAME.to_string(),
                 config,
-                labels: vec![],
-                transitive: Default::default(),
+                ..Default::default()
             }),
         }
     }

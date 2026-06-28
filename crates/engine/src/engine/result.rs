@@ -1689,6 +1689,16 @@ impl Engine {
             .once(
                 key,
                 enclose!((self => engine, rs) move || async move {
+                    // Approval gate: an `approval`-required target pauses here for
+                    // an explicit user decision (interactive Y/N, stdin prompt, or
+                    // `--auto-approve`). Single-flighted by this memoizer cell, so
+                    // a target prompts at most once per request. Runs before the
+                    // execute semaphore is acquired, so a waiting prompt holds no
+                    // worker permit.
+                    engine
+                        .gate_approval(&rs, &spec, &def)
+                        .await
+                        .with_context(|| format!("approval {addr}"))?;
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
                     let (artifacts, sandbox_cleanup, sandbox_guards) = engine
                         .clone()
@@ -2079,6 +2089,12 @@ impl Engine {
         if def.hash.is_empty() {
             anyhow::bail!("missing hash");
         }
+
+        // Validate approval notices against the finalized input set at definition
+        // time — before any result resolution or execution — so a notice naming a
+        // non-existent input group fails fast and identically on every path.
+        Self::validate_approval(&spec, addr, def.inputs.iter().map(|i| i.origin_id.as_str()))
+            .with_context(|| "approval")?;
 
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),
@@ -4664,9 +4680,7 @@ mod tests {
         let spec = TargetSpec {
             addr: addr.clone(),
             driver: "blocking".to_string(),
-            config: HashMap::new(),
-            labels: vec![],
-            transitive: Default::default(),
+            ..Default::default()
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
@@ -4919,9 +4933,7 @@ mod tests {
         let spec = TargetSpec {
             addr: addr.clone(),
             driver: "blocking".to_string(),
-            config: HashMap::new(),
-            labels: vec![],
-            transitive: Default::default(),
+            ..Default::default()
         };
         engine
             .register_provider(move |_| Box::new(OneTargetProvider { spec }))
