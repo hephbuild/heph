@@ -1,11 +1,8 @@
 //! Front-end implementations of the engine's [`ApprovalHandler`] for the `run`
 //! command. The TUI handler surfaces the prompt on the live progress view and
 //! awaits a `y`/`n` keypress; the non-TUI handler prints the notice to stderr
-//! and either auto-approves or reads a decision from the controlling terminal.
+//! and only proceeds when `--auto-approve` was passed (it never prompts).
 
-use std::io::{Read, Write};
-
-use anyhow::Context;
 use async_trait::async_trait;
 
 use crate::engine::approval::{ApprovalHandler, ApprovalRequest};
@@ -58,9 +55,9 @@ impl ApprovalHandler for TuiApprovalHandler {
 }
 
 /// Non-TUI (CI / piped / `--no-tui`) handler: always print the notice to stderr,
-/// then auto-approve or prompt for `y`/`N` on the controlling terminal. Rejects
-/// (with a clear error) when no terminal is available and `--auto-approve` was
-/// not passed.
+/// then let the target through only when `--auto-approve` was passed. It never
+/// prompts — there is no interactive view to host a decision — so without the
+/// flag the gated target is rejected.
 pub struct CliApprovalHandler {
     auto_approve: bool,
 }
@@ -81,13 +78,14 @@ impl ApprovalHandler for CliApprovalHandler {
         print_notice(&req);
         if self.auto_approve {
             eprintln!("approval: auto-approved {} (--auto-approve)", req.addr);
-            return Ok(true);
+            Ok(true)
+        } else {
+            eprintln!(
+                "approval: {} requires approval; pass --auto-approve to proceed",
+                req.addr
+            );
+            Ok(false)
         }
-        let addr = req.addr.clone();
-        // The blocking tty read runs off the async worker.
-        tokio::task::spawn_blocking(move || prompt_tty(&addr))
-            .await
-            .map_err(|e| anyhow::anyhow!("approval prompt task failed: {e}"))?
     }
 }
 
@@ -101,43 +99,6 @@ fn print_notice(req: &ApprovalRequest) {
         eprintln!("── notice: {} ──", notice.name);
         eprintln!("{}", notice.content);
     }
-}
-
-/// Prompt for a `y`/`N` decision on the controlling terminal. Reads `/dev/tty`
-/// directly (not stdin, which may be a pipe). Returns `false` on anything but an
-/// affirmative answer; errors when no terminal is available.
-fn prompt_tty(addr: &str) -> anyhow::Result<bool> {
-    let mut tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "approval required for {addr} but no terminal is available \
-                 to prompt ({e}); pass --auto-approve to proceed non-interactively"
-            )
-        })?;
-    write!(tty, "Approve {addr}? [y/N] ").context("write approval prompt")?;
-    tty.flush().context("flush approval prompt")?;
-
-    // Read a single line. One byte at a time so we stop at the newline without
-    // consuming anything after it.
-    let mut answer = String::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match tty.read(&mut byte) {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                answer.push(byte[0] as char);
-            }
-            Err(e) => return Err(anyhow::anyhow!("reading approval answer: {e}")),
-        }
-    }
-    let answer = answer.trim().to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
 }
 
 #[cfg(test)]
@@ -198,5 +159,13 @@ mod tests {
         let handler = CliApprovalHandler::new(true);
         let ctoken = StdCancellationToken::new();
         assert!(handler.request_approval(req(), &ctoken).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cli_without_auto_approve_rejects() {
+        // Non-TUI never prompts: without --auto-approve the gated target is denied.
+        let handler = CliApprovalHandler::new(false);
+        let ctoken = StdCancellationToken::new();
+        assert!(!handler.request_approval(req(), &ctoken).await.unwrap());
     }
 }
