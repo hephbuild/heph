@@ -1300,6 +1300,7 @@ dependencies = [
  "plugin",
  "rayon",
  "sandboxfuse",
+ "telemetry",
  "tempfile",
  "tokio",
 ]

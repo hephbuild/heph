@@ -146,6 +146,7 @@ fn main() -> ExitCode {
     if telemetry_on {
         heph::telemetry::record_invocation(
             &matches,
+            &Cli::command(),
             exec_result.as_ref().err(),
             started_at.elapsed(),
         );

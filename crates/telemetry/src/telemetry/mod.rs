@@ -66,6 +66,31 @@ pub fn record_graph_size(total: u64) {
     COLLECTOR.record_graph_size(total);
 }
 
+/// Record that an approval-gated target asked the user for a decision.
+pub fn record_approval_requested() {
+    COLLECTOR.record_approval_requested();
+}
+
+/// Record the resolved outcome of an approval prompt (granted vs denied).
+pub fn record_approval_decision(granted: bool) {
+    COLLECTOR.record_approval_decision(granted);
+}
+
+/// Record that an interactive sandbox shell session was actually entered.
+pub fn record_shell_session() {
+    COLLECTOR.record_shell_session();
+}
+
+/// Record one execute's chosen sandbox backend (`fuse` vs unpack-copy).
+pub fn record_sandbox(fuse: bool) {
+    COLLECTOR.record_sandbox(fuse);
+}
+
+/// Record one local-cache blob spilling from the primary store to the FS store.
+pub fn record_cache_spill() {
+    COLLECTOR.record_cache_spill();
+}
+
 /// Read the global counters (largest-seen for `graph_size`, sums elsewhere).
 pub fn snapshot() -> TelemetrySnapshot {
     COLLECTOR.snapshot()
@@ -235,17 +260,55 @@ pub fn prewarm() {
     }
 }
 
-pub fn record_invocation(matches: &ArgMatches, error: Option<&anyhow::Error>, took: Duration) {
-    // Full subcommand path ("inspect deps", "tool gc"), plus the args set at
-    // every nesting level.
+pub fn record_invocation(
+    matches: &ArgMatches,
+    cmd: &clap::Command,
+    error: Option<&anyhow::Error>,
+    took: Duration,
+) {
+    // Full subcommand path ("inspect deps", "tool gc") plus the args set at every
+    // nesting level, walked in lockstep with the clap command model so positional
+    // selectors (an addr / label) are partitioned out of `flags` rather than
+    // mixed in with the real options.
     let mut parts = Vec::new();
-    let mut flags = set_args(matches);
-    let mut level = matches;
-    while let Some((name, sub)) = level.subcommand() {
-        parts.push(name);
-        flags.extend(set_args(sub));
-        level = sub;
+    let mut flags = Vec::new();
+    let mut positionals = Vec::new();
+    let mut expr: Option<String> = None;
+
+    let mut level_m = matches;
+    let mut level_c = Some(cmd);
+    loop {
+        match level_c {
+            Some(c) => {
+                let (f, p) = split_set_args(level_m, c);
+                flags.extend(f);
+                positionals.extend(p);
+            }
+            // Model desync (should not happen): keep the ids as flags rather
+            // than silently dropping them.
+            None => flags.extend(
+                level_m
+                    .ids()
+                    .filter(|id| {
+                        level_m.value_source(id.as_str()) == Some(ValueSource::CommandLine)
+                    })
+                    .map(|id| id.as_str().to_string()),
+            ),
+        }
+        // Deepest level that carries `--expr` wins (the subcommand's).
+        if let Ok(Some(v)) = level_m.try_get_one::<String>("expr") {
+            expr = Some(v.clone());
+        }
+        match level_m.subcommand() {
+            Some((name, sub_m)) => {
+                parts.push(name);
+                level_c = level_c.and_then(|c| c.find_subcommand(name));
+                level_m = sub_m;
+            }
+            None => break,
+        }
     }
+
     let command = if parts.is_empty() {
         "none".to_string()
     } else {
@@ -254,16 +317,19 @@ pub fn record_invocation(matches: &ArgMatches, error: Option<&anyhow::Error>, to
     flags.sort();
     flags.dedup();
 
-    // Selector shape from the positional args present: two args (`arg1` +
+    // Selector shape from the positional args present: two positionals (`arg1` +
     // `arg2`) is a label + package matcher; one is a single address. Structure
     // only — the actual label/address values are never read.
-    let request_shape = if flags.iter().any(|f| f == "arg2") {
+    let request_shape = if positionals.iter().any(|p| p == "arg2") {
         "label_matcher"
-    } else if flags.iter().any(|f| f == "arg1") {
+    } else if positionals.iter().any(|p| p == "arg1") {
         "addr"
     } else {
         "none"
     };
+
+    // Structural-only summary of any `--expr`; the text is never sent.
+    let query_expr = expr.as_deref().map(query_expr_shape);
 
     let failure = error.map(classify_failure);
 
@@ -271,6 +337,7 @@ pub fn record_invocation(matches: &ArgMatches, error: Option<&anyhow::Error>, to
         command: &command,
         request_shape,
         flags: &flags,
+        query_expr,
         success: failure.is_none(),
         failure,
         duration_ms: took.as_millis() as u64,
@@ -286,14 +353,59 @@ pub fn record_invocation(matches: &ArgMatches, error: Option<&anyhow::Error>, to
     }
 }
 
-/// Names of the args/flags explicitly set on the command line for one match
-/// level (top-level globals, or a subcommand's args). Names only — never the
-/// values, which can carry addresses/labels.
-fn set_args(m: &ArgMatches) -> Vec<String> {
-    m.ids()
-        .filter(|id| m.value_source(id.as_str()) == Some(ValueSource::CommandLine))
-        .map(|id| id.as_str().to_string())
-        .collect()
+/// Partition the args explicitly set on the command line at one match level into
+/// `(flags, positionals)`, using the clap command model to tell options from
+/// positionals. Names only — never the values, which can carry addresses/labels.
+fn split_set_args(m: &ArgMatches, cmd: &clap::Command) -> (Vec<String>, Vec<String>) {
+    let positional_ids: std::collections::HashSet<&str> = cmd
+        .get_arguments()
+        .filter(|a| a.is_positional())
+        .map(|a| a.get_id().as_str())
+        .collect();
+    let mut flags = Vec::new();
+    let mut positionals = Vec::new();
+    for id in m.ids() {
+        if m.value_source(id.as_str()) != Some(ValueSource::CommandLine) {
+            continue;
+        }
+        let name = id.as_str();
+        if positional_ids.contains(name) {
+            positionals.push(name.to_string());
+        } else {
+            flags.push(name.to_string());
+        }
+    }
+    (flags, positionals)
+}
+
+/// Non-PII structural summary of a `--expr` query selector.
+#[derive(Debug, Clone, Copy)]
+struct QueryExprShape {
+    /// Count of boolean operators (`&&`, `||`, `!`).
+    ops: u32,
+    /// Count of selector function calls (`label(`, `tree_output(`, …).
+    funcs: u32,
+}
+
+/// Summarize a query expression's *shape* only: how many boolean operators and
+/// selector-function calls it uses. The expression text is never sent — it can
+/// carry package paths / labels — so only these integer counts leave the host.
+fn query_expr_shape(expr: &str) -> QueryExprShape {
+    let ops = expr.matches("&&").count() + expr.matches("||").count() + expr.matches('!').count();
+    let funcs: usize = [
+        "label(",
+        "tree_output(",
+        "addr(",
+        "package_prefix(",
+        "package(",
+    ]
+    .iter()
+    .map(|f| expr.matches(f).count())
+    .sum();
+    QueryExprShape {
+        ops: ops as u32,
+        funcs: funcs as u32,
+    }
 }
 
 /// Coarse, non-PII failure class: user-cancelled vs a target that genuinely
@@ -321,10 +433,13 @@ struct ReportContext<'a> {
     /// `"addr"` (one arg — a single address), or `"none"`. Structure only, never
     /// the actual label/address value.
     request_shape: &'a str,
-    /// Names of the args/flags that were explicitly set — derived from the clap
-    /// matches, so this stays exhaustive for every command without per-command
-    /// code. Names only; never the values (an addr/label could be PII).
+    /// Names of the options that were explicitly set — derived from the clap
+    /// matches (positional selectors excluded; see `request_shape`), so this
+    /// stays exhaustive for every command without per-command code. Names only;
+    /// never the values (an addr/label could be PII).
     flags: &'a [String],
+    /// Structural-only summary of a `--expr` query selector, when one was given.
+    query_expr: Option<QueryExprShape>,
     /// Whether the command ultimately succeeded.
     success: bool,
     /// Coarse failure class on error: `"cancelled"`, `"target_failure"`, or
@@ -400,10 +515,31 @@ fn build_props(
     put("request_shape", ctx.request_shape.into());
     put("success", ctx.success.into());
     put("flags", ctx.flags.into());
+    // Query selector shape — counts only, never the expression text. Absent when
+    // no `--expr` was given.
+    if let Some(q) = ctx.query_expr {
+        put("query_expr_ops", q.ops.into());
+        put("query_expr_funcs", q.funcs.into());
+    }
     if let Some(failure) = ctx.failure {
         put("failure", failure.into());
     }
     put("duration_ms", ctx.duration_ms.into());
+    // Whether this run used the interactive TUI — the same predicate the CLI
+    // applies (`should_use_tui`): a terminal on stderr and no `--no-tui`. Read
+    // here (same process, so stderr's terminal-ness is unchanged since start) so
+    // no per-command wiring is needed.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && !ctx.flags.iter().any(|f| f == "no_tui");
+    put("interactive", interactive.into());
+    // Number of config profiles layered via `HEPH_PROFILES` (count only — names
+    // can be project-specific). Comma-separated, empty entries dropped, matching
+    // the config loader.
+    let profile_count = std::env::var("HEPH_PROFILES")
+        .ok()
+        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).count())
+        .unwrap_or(0);
+    put("config_profile_count", profile_count.into());
     // Aggregate run counters.
     put("result_targets", stats.targets.into());
     put("local_cache_hits", stats.local_cache_hits.into());
@@ -426,6 +562,21 @@ fn build_props(
     if stats.graph_size > 0 {
         put("graph_size", stats.graph_size.into());
     }
+    // Remote (shared) cache outcomes this run.
+    put("remote_cache_hits", stats.remote_cache_hits.into());
+    put("remote_cache_misses", stats.remote_cache_misses.into());
+    put("remote_cache_writes", stats.remote_cache_writes.into());
+    // Approval gate: how many targets prompted, and how those prompts resolved.
+    put("approvals_requested", stats.approvals_requested.into());
+    put("approvals_granted", stats.approvals_granted.into());
+    put("approvals_denied", stats.approvals_denied.into());
+    // Interactive sandbox shell sessions actually entered.
+    put("shell_sessions", stats.shell_sessions.into());
+    // Per-execute sandbox backend split: FUSE mount vs unpack-copy.
+    put("sandbox_fuse", stats.sandbox_fuse.into());
+    put("sandbox_os", stats.sandbox_os.into());
+    // Local-cache blobs that spilled from the primary store onto the FS store.
+    put("cache_spills", stats.cache_spills.into());
     // Enabled plugins (built-ins + config), as queryable arrays of type names.
     put("providers", plugins.providers.into());
     put("drivers", plugins.drivers.into());
@@ -577,11 +728,22 @@ mod tests {
             executes: 0,
             p99_execute_ms: 0,
             graph_size: 0,
+            remote_cache_hits: 0,
+            remote_cache_misses: 0,
+            remote_cache_writes: 0,
+            approvals_requested: 0,
+            approvals_granted: 0,
+            approvals_denied: 0,
+            shell_sessions: 0,
+            sandbox_fuse: 0,
+            sandbox_os: 0,
+            cache_spills: 0,
         };
         let ctx = ReportContext {
             command: "run",
             request_shape: "addr",
             flags: &[],
+            query_expr: None,
             success: true,
             failure: None,
             duration_ms: 1,
@@ -606,6 +768,108 @@ mod tests {
         // ...and omitted entirely when it can't be determined.
         let absent = build_props(&ctx, &snapshot, Plugins::default(), None);
         assert!(!absent.contains_key("repo_fingerprint"));
+    }
+
+    #[test]
+    fn split_set_args_separates_positionals_from_options() {
+        use clap::{Arg, ArgAction, Command};
+        let cmd = Command::new("run")
+            .arg(Arg::new("arg1").index(1))
+            .arg(Arg::new("force").long("force").action(ArgAction::SetTrue));
+        let m = cmd
+            .clone()
+            .try_get_matches_from(["run", "//pkg:target", "--force"])
+            .expect("parse");
+        let (flags, positionals) = split_set_args(&m, &cmd);
+        // The positional selector must NOT bleed into `flags` — that was the bug.
+        assert_eq!(flags, vec!["force".to_string()]);
+        assert_eq!(positionals, vec!["arg1".to_string()]);
+    }
+
+    #[test]
+    fn split_set_args_omits_unset_args() {
+        use clap::{Arg, ArgAction, Command};
+        let cmd = Command::new("run")
+            .arg(Arg::new("arg1").index(1))
+            .arg(Arg::new("force").long("force").action(ArgAction::SetTrue));
+        // Nothing on the command line → both sides empty (defaults aren't "set").
+        let m = cmd.clone().try_get_matches_from(["run"]).expect("parse");
+        let (flags, positionals) = split_set_args(&m, &cmd);
+        assert!(flags.is_empty());
+        assert!(positionals.is_empty());
+    }
+
+    #[test]
+    fn query_expr_shape_counts_ops_and_funcs() {
+        let s = query_expr_shape("label(foo) && !package(//a) || tree_output(//b)");
+        assert_eq!(s.ops, 3, "&&, !, ||");
+        assert_eq!(s.funcs, 3, "label(, package(, tree_output(");
+        // `package(` must not be counted inside `package_prefix(`.
+        let p = query_expr_shape("package_prefix(//a)");
+        assert_eq!(p.funcs, 1);
+        assert_eq!(p.ops, 0);
+    }
+
+    #[test]
+    fn build_props_carries_query_expr_and_new_counters() {
+        let snapshot = TelemetrySnapshot {
+            targets: 0,
+            local_cache_hits: 0,
+            local_cache_misses: 0,
+            artifacts: 0,
+            artifact_bytes: 0,
+            max_artifact_bytes: 0,
+            p99_artifact_bytes: 0,
+            sized_artifacts: 0,
+            executes: 0,
+            p99_execute_ms: 0,
+            graph_size: 0,
+            remote_cache_hits: 2,
+            remote_cache_misses: 3,
+            remote_cache_writes: 1,
+            approvals_requested: 4,
+            approvals_granted: 3,
+            approvals_denied: 1,
+            shell_sessions: 5,
+            sandbox_fuse: 6,
+            sandbox_os: 7,
+            cache_spills: 8,
+        };
+        let ctx = ReportContext {
+            command: "run",
+            request_shape: "addr",
+            flags: &[],
+            query_expr: Some(QueryExprShape { ops: 2, funcs: 1 }),
+            success: true,
+            failure: None,
+            duration_ms: 1,
+        };
+        let props = build_props(&ctx, &snapshot, Plugins::default(), None);
+        let n = |k: &str| props.get(k).and_then(|v| v.as_u64());
+        assert_eq!(n("query_expr_ops"), Some(2));
+        assert_eq!(n("query_expr_funcs"), Some(1));
+        assert_eq!(n("remote_cache_hits"), Some(2));
+        assert_eq!(n("remote_cache_misses"), Some(3));
+        assert_eq!(n("remote_cache_writes"), Some(1));
+        assert_eq!(n("approvals_requested"), Some(4));
+        assert_eq!(n("approvals_granted"), Some(3));
+        assert_eq!(n("approvals_denied"), Some(1));
+        assert_eq!(n("shell_sessions"), Some(5));
+        assert_eq!(n("sandbox_fuse"), Some(6));
+        assert_eq!(n("sandbox_os"), Some(7));
+        assert_eq!(n("cache_spills"), Some(8));
+        // Always-present environment shape.
+        assert!(props.contains_key("interactive"));
+        assert!(props.contains_key("config_profile_count"));
+
+        // No `--expr` → the query shape attrs are absent rather than zero.
+        let no_expr = ReportContext {
+            query_expr: None,
+            ..ctx
+        };
+        let props = build_props(&no_expr, &snapshot, Plugins::default(), None);
+        assert!(!props.contains_key("query_expr_ops"));
+        assert!(!props.contains_key("query_expr_funcs"));
     }
 
     #[test]

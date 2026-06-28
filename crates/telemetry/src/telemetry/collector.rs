@@ -111,6 +111,27 @@ pub struct TelemetryCollector {
     /// Total target count of a whole-graph (`//...`) query, when one ran. `0`
     /// means no whole-graph query was issued this process.
     graph_size: AtomicU64,
+    /// Remote (shared) cache outcomes, folded from the event stream.
+    remote_cache_hits: AtomicU64,
+    remote_cache_misses: AtomicU64,
+    /// Pushes to the remote cache (one per `RemoteCacheWriteStart`).
+    remote_cache_writes: AtomicU64,
+    /// Approval-gated targets that asked for a decision. The rest of the
+    /// approval counters partition the resolved subset of these.
+    approvals_requested: AtomicU64,
+    /// Granted vs denied; their sum is at most `approvals_requested` (the
+    /// shortfall was cancelled/errored before a decision landed).
+    approvals_granted: AtomicU64,
+    approvals_denied: AtomicU64,
+    /// Interactive sandbox shell sessions actually entered (`--shell`).
+    shell_sessions: AtomicU64,
+    /// Per-execute sandbox backend the bridge chose: a FUSE mount vs the
+    /// unpack-copy ("os") path.
+    sandbox_fuse: AtomicU64,
+    sandbox_os: AtomicU64,
+    /// Local-cache blobs that crossed the spill threshold and moved from the
+    /// primary store onto the FS blob store.
+    cache_spills: AtomicU64,
 }
 
 impl Default for TelemetryCollector {
@@ -134,6 +155,16 @@ impl TelemetryCollector {
             executes: AtomicU64::new(0),
             execute_ms_histogram: AtomicHistogram::new(),
             graph_size: AtomicU64::new(0),
+            remote_cache_hits: AtomicU64::new(0),
+            remote_cache_misses: AtomicU64::new(0),
+            remote_cache_writes: AtomicU64::new(0),
+            approvals_requested: AtomicU64::new(0),
+            approvals_granted: AtomicU64::new(0),
+            approvals_denied: AtomicU64::new(0),
+            shell_sessions: AtomicU64::new(0),
+            sandbox_fuse: AtomicU64::new(0),
+            sandbox_os: AtomicU64::new(0),
+            cache_spills: AtomicU64::new(0),
         }
     }
 
@@ -150,6 +181,15 @@ impl TelemetryCollector {
             }
             BuildEventKind::LocalCacheMiss { .. } => {
                 self.local_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            BuildEventKind::RemoteCacheHit { .. } => {
+                self.remote_cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            BuildEventKind::RemoteCacheMiss { .. } => {
+                self.remote_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            BuildEventKind::RemoteCacheWriteStart { .. } => {
+                self.remote_cache_writes.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -190,6 +230,46 @@ impl TelemetryCollector {
         self.graph_size.fetch_max(total, Ordering::Relaxed);
     }
 
+    /// Record that an approval-gated target asked the user for a decision.
+    /// Bumped before the prompt so a cancelled/errored gate is still counted as
+    /// requested even though no decision follows.
+    pub fn record_approval_requested(&self) {
+        self.approvals_requested.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the resolved outcome of an approval prompt. Not called when the
+    /// gate is cancelled or errors before a decision.
+    pub fn record_approval_decision(&self, granted: bool) {
+        let c = if granted {
+            &self.approvals_granted
+        } else {
+            &self.approvals_denied
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an interactive sandbox shell session was actually entered.
+    pub fn record_shell_session(&self) {
+        self.shell_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one execute's chosen sandbox backend: `fuse` true for a FUSE
+    /// mount, false for the unpack-copy ("os") path.
+    pub fn record_sandbox(&self, fuse: bool) {
+        let c = if fuse {
+            &self.sandbox_fuse
+        } else {
+            &self.sandbox_os
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that one local-cache blob spilled from the primary store to the
+    /// FS blob store (crossed the spill threshold).
+    pub fn record_cache_spill(&self) {
+        self.cache_spills.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read the accumulated counters at this instant.
     pub fn snapshot(&self) -> TelemetrySnapshot {
         TelemetrySnapshot {
@@ -204,6 +284,16 @@ impl TelemetryCollector {
             executes: self.executes.load(Ordering::Relaxed),
             p99_execute_ms: self.execute_ms_histogram.percentile_99(),
             graph_size: self.graph_size.load(Ordering::Relaxed),
+            remote_cache_hits: self.remote_cache_hits.load(Ordering::Relaxed),
+            remote_cache_misses: self.remote_cache_misses.load(Ordering::Relaxed),
+            remote_cache_writes: self.remote_cache_writes.load(Ordering::Relaxed),
+            approvals_requested: self.approvals_requested.load(Ordering::Relaxed),
+            approvals_granted: self.approvals_granted.load(Ordering::Relaxed),
+            approvals_denied: self.approvals_denied.load(Ordering::Relaxed),
+            shell_sessions: self.shell_sessions.load(Ordering::Relaxed),
+            sandbox_fuse: self.sandbox_fuse.load(Ordering::Relaxed),
+            sandbox_os: self.sandbox_os.load(Ordering::Relaxed),
+            cache_spills: self.cache_spills.load(Ordering::Relaxed),
         }
     }
 }
@@ -228,6 +318,16 @@ pub struct TelemetrySnapshot {
     /// Approximate 99th percentile per-target execute wall time (ms).
     pub p99_execute_ms: u64,
     pub graph_size: u64,
+    pub remote_cache_hits: u64,
+    pub remote_cache_misses: u64,
+    pub remote_cache_writes: u64,
+    pub approvals_requested: u64,
+    pub approvals_granted: u64,
+    pub approvals_denied: u64,
+    pub shell_sessions: u64,
+    pub sandbox_fuse: u64,
+    pub sandbox_os: u64,
+    pub cache_spills: u64,
 }
 
 #[cfg(test)]
@@ -270,6 +370,47 @@ mod tests {
         assert_eq!(s.targets, 2);
         assert_eq!(s.local_cache_hits, 1);
         assert_eq!(s.local_cache_misses, 2);
+    }
+
+    #[test]
+    fn observe_event_tallies_remote_cache() {
+        let c = TelemetryCollector::new();
+        let addr = || "//pkg:a".to_string();
+        c.observe_event(&BuildEventKind::RemoteCacheHit { addr: addr() });
+        c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });
+        c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });
+        c.observe_event(&BuildEventKind::RemoteCacheWriteStart { addr: addr() });
+        // The paired end event must not double-count the write.
+        c.observe_event(&BuildEventKind::RemoteCacheWriteEnd {
+            addr: addr(),
+            error: None,
+        });
+        let s = c.snapshot();
+        assert_eq!(s.remote_cache_hits, 1);
+        assert_eq!(s.remote_cache_misses, 2);
+        assert_eq!(s.remote_cache_writes, 1);
+    }
+
+    #[test]
+    fn approval_shell_sandbox_spill_counters() {
+        let c = TelemetryCollector::new();
+        c.record_approval_requested();
+        c.record_approval_requested();
+        c.record_approval_decision(true);
+        c.record_approval_decision(false);
+        c.record_shell_session();
+        c.record_sandbox(true);
+        c.record_sandbox(false);
+        c.record_sandbox(false);
+        c.record_cache_spill();
+        let s = c.snapshot();
+        assert_eq!(s.approvals_requested, 2);
+        assert_eq!(s.approvals_granted, 1);
+        assert_eq!(s.approvals_denied, 1);
+        assert_eq!(s.shell_sessions, 1);
+        assert_eq!(s.sandbox_fuse, 1);
+        assert_eq!(s.sandbox_os, 2);
+        assert_eq!(s.cache_spills, 1);
     }
 
     #[test]
