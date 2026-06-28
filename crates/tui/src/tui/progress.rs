@@ -1086,8 +1086,11 @@ impl TuiProgressView {
             return Vec::new();
         };
         let mut lines = Vec::new();
-        let queued = if view.queued_behind > 0 {
-            format!(" · +{} waiting", view.queued_behind)
+        // When more than one target is awaiting approval, show the total count so
+        // the user knows further prompts follow this one.
+        let total_pending = view.queued_behind + 1;
+        let queued = if total_pending > 1 {
+            format!(" · {total_pending} pending")
         } else {
             String::new()
         };
@@ -2849,5 +2852,29 @@ mod tests {
             .map(|l| format!("{l}"))
             .collect();
         assert!(body.contains("more"), "collapse at top: {body}");
+    }
+
+    #[test]
+    fn approval_banner_shows_pending_count() {
+        let center = crate::tui::approval::ApprovalCenter::new();
+        // Two targets awaiting approval: the banner shows the active one plus the
+        // total pending count.
+        let _r1 = center.request("//a:1".to_string(), vec![]);
+        let _r2 = center.request("//a:2".to_string(), vec![]);
+        let view = TuiProgressView::new("run").with_approval(center);
+        let lines = view.approval_lines();
+        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(banner.contains("//a:1"), "active prompt: {banner}");
+        assert!(banner.contains("2 pending"), "count: {banner}");
+    }
+
+    #[test]
+    fn approval_banner_single_has_no_pending_count() {
+        let center = crate::tui::approval::ApprovalCenter::new();
+        let _r = center.request("//a:1".to_string(), vec![]);
+        let view = TuiProgressView::new("run").with_approval(center);
+        let lines = view.approval_lines();
+        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!banner.contains("pending"), "no count for one: {banner}");
     }
 }

@@ -90,11 +90,11 @@ impl ApprovalHandler for CliApprovalHandler {
     }
 }
 
-/// Log the approval header and every notice's contents. Always runs in non-TUI
-/// mode, regardless of `--auto-approve`, so a gated target's notice is never
-/// silently skipped.
+/// Log every notice's contents. Always runs in non-TUI mode, regardless of
+/// `--auto-approve`, so a gated target's notice is never silently skipped. The
+/// target addr is carried by the auto-approved / requires-approval line, so no
+/// separate header is logged here.
 fn log_notice(req: &ApprovalRequest) {
-    tracing::info!("approval required: {}", req.addr);
     for notice in &req.notices {
         tracing::info!(
             "notice {} ({}):\n{}",
