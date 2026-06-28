@@ -19,6 +19,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hartifactcontent::WalkEntryKind;
 use hcore::hasync::StdCancellationToken;
+use hmodel::htaddr::Addr;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -62,26 +63,24 @@ fn input_in_group(origin_id: &str, name: &str) -> bool {
 
 impl Engine {
     /// Validate that every `approval.notice` name resolves to at least one input
-    /// group of the target. Run once the target is linked (before execution, on
-    /// every result path — including cache hits) so a notice naming a group that
-    /// does not exist fails fast and deterministically rather than only when the
-    /// target is actually executed.
-    pub(crate) fn validate_approval(
+    /// group of the target. Called from `get_def_inner` once the def's input set
+    /// is finalized — so a notice naming a group that does not exist fails at
+    /// definition time, before any result resolution or execution, and the error
+    /// is the same on every path (cache hit or miss). `origin_ids` are the
+    /// inputs' driver-encoded ids (see [`input_in_group`]).
+    pub(crate) fn validate_approval<'a>(
         spec: &TargetSpec,
-        def: &LinkedTargetDef,
+        addr: &Addr,
+        origin_ids: impl Iterator<Item = &'a str> + Clone,
     ) -> anyhow::Result<()> {
         if !spec.approval.required {
             return Ok(());
         }
         for name in &spec.approval.notice {
-            if !def
-                .inputs
-                .iter()
-                .any(|i| input_in_group(&i.origin_id, name))
-            {
+            if !origin_ids.clone().any(|oid| input_in_group(oid, name)) {
                 anyhow::bail!(
                     "approval notice references `{name}`, which is not an input group of {}",
-                    def.target.addr.format()
+                    addr.format()
                 );
             }
         }

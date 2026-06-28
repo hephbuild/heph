@@ -1012,11 +1012,6 @@ impl Engine {
                 let def = link_res.with_context(|| "link")?;
                 let meta = meta_res.with_context(|| "meta")?;
 
-                // Validate approval notices against the linked input set up front,
-                // so a notice naming a non-existent input group fails fast on every
-                // path (including cache hits), not lazily at execution time.
-                Self::validate_approval(&spec, &def).with_context(|| "approval")?;
-
                 let output_names = match outputs {
                     OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
                     OutputMatcher::All => Ok(def.target.output_names()),
@@ -2093,6 +2088,12 @@ impl Engine {
         if def.hash.is_empty() {
             anyhow::bail!("missing hash");
         }
+
+        // Validate approval notices against the finalized input set at definition
+        // time — before any result resolution or execution — so a notice naming a
+        // non-existent input group fails fast and identically on every path.
+        Self::validate_approval(&spec, addr, def.inputs.iter().map(|i| i.origin_id.as_str()))
+            .with_context(|| "approval")?;
 
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),
