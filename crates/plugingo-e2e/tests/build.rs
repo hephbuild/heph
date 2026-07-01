@@ -1,6 +1,6 @@
 mod common;
 
-use common::{artifact_paths, fixture, make_workspace, make_workspace_host, require_go};
+use common::{artifact_paths, fixture, make_workspace, make_workspace_hermetic, require_go};
 
 #[tokio::test]
 async fn test_simple_lib_build_lib() -> anyhow::Result<()> {
@@ -187,18 +187,37 @@ async fn test_thirdparty_asm_build_lib_compiles() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Same build, but with `gotool = "host"`: the provider uses the host `go`
-/// (resolved from PATH / `go env GOROOT` in-sandbox) instead of a hermetic SDK.
+/// Same build, but with the **hermetic** Go SDK (downloaded + staged) instead of
+/// the host `go` the rest of the suite uses. This is the dedicated coverage of
+/// the hermetic install/download path. It hits the network, so a download
+/// failure (offline CI) skips; any *other* failure fails loudly.
 #[tokio::test]
-async fn test_with_dep_cmd_build_host_toolchain() -> anyhow::Result<()> {
-    require_go!();
+async fn test_with_dep_cmd_build_hermetic_toolchain() -> anyhow::Result<()> {
     let dir = fixture("with_dep")?;
-    let ws = make_workspace_host(dir)?;
-    let result = ws.run("//cmd:build").await?;
-    assert!(
-        !artifact_paths(&result).is_empty(),
-        "host-toolchain cmd build should produce at least one artifact"
-    );
+    let ws = make_workspace_hermetic(dir)?;
+    match ws.run("//cmd:build").await {
+        Ok(result) => {
+            assert!(
+                !artifact_paths(&result).is_empty(),
+                "hermetic-toolchain cmd build should produce at least one artifact"
+            );
+        }
+        Err(e) => {
+            let msg = format!("{e:?}").to_lowercase();
+            let networky = msg.contains("download")
+                || msg.contains("dial")
+                || msg.contains("lookup")
+                || msg.contains("connection")
+                || msg.contains("proxy")
+                || msg.contains("timeout")
+                || msg.contains("go.dev");
+            if networky {
+                eprintln!("skipping hermetic install e2e (SDK download unavailable): {e:?}");
+            } else {
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 

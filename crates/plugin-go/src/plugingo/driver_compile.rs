@@ -321,23 +321,34 @@ impl ManagedDriver for GoCompileDriver {
         let pkg_dir = &req.sandbox_pkg_dir;
         let ws_root = req.sandbox_ws_dir.to_string_lossy().into_owned();
 
-        // GOROOT / go binary: hermetic staged SDK or host (mirrors go_golist).
-        let host = crate::plugingo::toolchain::is_host(&def.go_version);
-        let (goroot, go_bin) = if host {
-            let go_bin = crate::plugingo::toolchain::resolve_host_go()?;
-            let goroot = crate::plugingo::toolchain::host_goroot(&go_bin)?;
-            (goroot, go_bin)
-        } else {
-            let goroot = req
-                .sandbox_ws_dir
-                .join(crate::plugingo::toolchain::staged_goroot(&def.go_version));
-            let go_bin = goroot.join("bin").join("go");
-            if !go_bin.exists() {
-                anyhow::bail!(
-                    "go_compile: hermetic go binary missing at {go_bin:?} (gosdk dep not staged?)"
-                );
+        // GOROOT / go binary by toolchain kind (mirrors go_golist):
+        // - Hermetic: SDK staged into this sandbox by the `gosdk` dep.
+        // - Host (`gotool = "host"`): host `go` from PATH; GOROOT it reports.
+        // - Target (`gotool = "//pkg:go"`): `go` staged by the `gosdk` dep at a
+        //   path discovered from the dep's output; GOROOT it reports.
+        use crate::plugingo::toolchain::{self, Toolchain};
+        let toolchain = toolchain::classify(&def.go_version);
+        let (goroot, go_bin) = match toolchain {
+            Toolchain::Host => {
+                let go_bin = toolchain::resolve_host_go()?;
+                let goroot = toolchain::go_env_goroot(&go_bin)?;
+                (goroot, go_bin)
             }
-            (goroot, go_bin)
+            Toolchain::Target(_) => {
+                let go_bin = crate::plugingo::driver_golist::resolve_target_go(&req.inputs)?;
+                let goroot = toolchain::go_env_goroot(&go_bin)?;
+                (goroot, go_bin)
+            }
+            Toolchain::Hermetic(v) => {
+                let goroot = req.sandbox_ws_dir.join(toolchain::staged_goroot(v));
+                let go_bin = goroot.join("bin").join("go");
+                if !go_bin.exists() {
+                    anyhow::bail!(
+                        "go_compile: hermetic go binary missing at {go_bin:?} (gosdk dep not staged?)"
+                    );
+                }
+                (goroot, go_bin)
+            }
         };
 
         let gocache = pkg_dir.join(".heph-gocache");
@@ -355,7 +366,11 @@ impl ManagedDriver for GoCompileDriver {
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
         env.insert("CGO_ENABLED".to_string(), "0".to_string());
-        if host && let Ok(v) = std::env::var("PATH") {
+        // Non-hermetic toolchains (host or a hostbin/nix target wrapper) may need
+        // PATH; hermetic mode omits it to stay PATH-independent.
+        if !matches!(toolchain, Toolchain::Hermetic(_))
+            && let Ok(v) = std::env::var("PATH")
+        {
             env.insert("PATH".to_string(), v);
         }
 
