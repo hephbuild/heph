@@ -30,14 +30,20 @@ pub const END_MARKER: &str = "# END heph-generated";
 /// rewritten with the current [`BEGIN_MARKER`] text.
 pub const BEGIN_MARKER_PREFIX: &str = "# BEGIN heph-generated";
 
-/// Separator between a gitignore pattern and the trailing `# //pkg:target`
-/// comment naming the emitting target. The space-hash-space form keeps the
-/// comment valid gitignore syntax and round-trips through [`parse_entry`].
-const COMMENT_SEP: &str = " # ";
+/// Prefix marking an attribution comment line: `# //pkg:target`, rendered on its
+/// own line *above* the pattern it annotates.
+///
+/// git only treats a `#` as a comment when it is the **first** character of the
+/// line — a trailing `pattern # //pkg:target` is not a comment, it is the literal
+/// pattern `pattern # //pkg:target` (space and hash included), which matches a
+/// file of that exact name rather than `pattern`. So attribution must live on a
+/// preceding full-line comment; it round-trips through [`parse_section`].
+const COMMENT_PREFIX: &str = "# ";
 
 /// One managed `.gitignore` line: a root-anchored pattern plus the target that
-/// emits it. The target is rendered as a trailing `# //pkg:target` comment so a
-/// scoped rebuild can tell which lines it owns without re-scanning the graph.
+/// emits it. The target is rendered as a `# //pkg:target` comment on the line
+/// *above* the pattern so a scoped rebuild can tell which lines it owns without
+/// re-scanning the graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitignoreEntry {
     pub pattern: String,
@@ -48,11 +54,12 @@ pub struct GitignoreEntry {
 }
 
 impl GitignoreEntry {
-    /// Render as a single gitignore line: `pattern # //pkg:target`, or just the
-    /// bare pattern when the emitting target is unknown.
+    /// Render as gitignore text: a `# //pkg:target` attribution comment line
+    /// followed by the pattern line, or just the bare pattern when the emitting
+    /// target is unknown.
     fn to_line(&self) -> String {
         match &self.addr {
-            Some(addr) => format!("{}{COMMENT_SEP}{}", self.pattern, addr.format()),
+            Some(addr) => format!("{COMMENT_PREFIX}{}\n{}", addr.format(), self.pattern),
             None => self.pattern.clone(),
         }
     }
@@ -110,27 +117,15 @@ impl Engine {
     }
 }
 
-/// Parse a single managed-section line into a [`GitignoreEntry`]. Splits on the
-/// `# //pkg:target` comment and parses the target; a line without a parseable
-/// comment becomes an entry with `addr = None` (preserved verbatim on rebuild).
-fn parse_entry(line: &str) -> GitignoreEntry {
-    if let Some((pattern, comment)) = line.split_once(COMMENT_SEP)
-        && let Ok(addr) = parse_addr(comment.trim())
-    {
-        return GitignoreEntry {
-            pattern: pattern.to_string(),
-            addr: Some(addr),
-        };
-    }
-    GitignoreEntry {
-        pattern: line.to_string(),
-        addr: None,
-    }
-}
-
 /// Extract the entries currently inside the heph-managed marker section of
-/// `existing`. Returns an empty vec when no section is present. Marker lines and
-/// blank lines are skipped; every other line is parsed via [`parse_entry`].
+/// `existing`. Returns an empty vec when no section is present.
+///
+/// The section is a sequence of pattern lines, each optionally preceded by a
+/// `# //pkg:target` attribution comment on its own line. Walking is stateful: a
+/// parseable attribution comment is held and attached to the next pattern line;
+/// any other line (a bare pattern, or a comment that is not a valid target addr)
+/// is preserved verbatim as an un-attributed entry. Marker and blank lines are
+/// skipped.
 #[expect(
     clippy::string_slice,
     reason = "slice indices come from `find` on ASCII markers — always char-aligned"
@@ -145,12 +140,47 @@ pub fn parse_section(existing: &str) -> Vec<GitignoreEntry> {
     if end < start {
         return Vec::new();
     }
-    existing[start..end]
+
+    let mut entries = Vec::new();
+    let mut pending: Option<Addr> = None;
+    for line in existing[start..end]
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with(BEGIN_MARKER_PREFIX))
-        .map(parse_entry)
-        .collect()
+    {
+        if let Some(rest) = line.strip_prefix('#') {
+            // A `#` line is an attribution comment if the remainder parses as a
+            // target addr; flush any dangling pending comment as a bare line
+            // first so nothing is silently dropped, then hold this one.
+            if let Ok(addr) = parse_addr(rest.trim()) {
+                if let Some(prev) = pending.take() {
+                    entries.push(GitignoreEntry {
+                        pattern: format!("{COMMENT_PREFIX}{}", prev.format()),
+                        addr: None,
+                    });
+                }
+                pending = Some(addr);
+            } else {
+                entries.push(GitignoreEntry {
+                    pattern: line.to_string(),
+                    addr: None,
+                });
+            }
+            continue;
+        }
+        entries.push(GitignoreEntry {
+            pattern: line.to_string(),
+            addr: pending.take(),
+        });
+    }
+    // A trailing attribution comment with no following pattern is preserved.
+    if let Some(prev) = pending {
+        entries.push(GitignoreEntry {
+            pattern: format!("{COMMENT_PREFIX}{}", prev.format()),
+            addr: None,
+        });
+    }
+    entries
 }
 
 /// Merge a scoped rebuild into the existing section. Existing entries whose
@@ -280,12 +310,40 @@ mod tests {
     }
 
     #[test]
-    fn render_emits_target_comment() {
+    fn render_emits_target_comment_above_pattern() {
         let out = render("", &[attributed("/foo/gen.go", "//foo:gen")]);
         assert_eq!(
             out,
-            format!("{BEGIN_MARKER}\n/foo/gen.go # //foo:gen\n{END_MARKER}\n")
+            format!("{BEGIN_MARKER}\n# //foo:gen\n/foo/gen.go\n{END_MARKER}\n")
         );
+    }
+
+    /// Regression: attribution must be a full-line comment, never trailing.
+    /// git only honors `#` as a comment at the start of a line, so a
+    /// `pattern # //pkg:target` line is the literal pattern `pattern # //pkg:target`
+    /// and fails to ignore `pattern`. Every non-comment line must be a bare,
+    /// git-valid pattern with no inline `#`.
+    #[test]
+    fn render_never_emits_inline_comment() {
+        let out = render(
+            "",
+            &[
+                attributed("/foo/gen.go", "//foo:gen"),
+                attributed("/bar/gen.go", "//bar:gen"),
+            ],
+        );
+        for line in out.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !line.contains(" # "),
+                "pattern line carries an inline comment git would treat as literal: {line:?}"
+            );
+        }
+        // The pattern lines are the bare, anchored paths.
+        assert!(out.contains("\n/foo/gen.go\n"));
+        assert!(out.contains("\n/bar/gen.go\n"));
     }
 
     #[test]
