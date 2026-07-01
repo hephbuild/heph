@@ -107,7 +107,6 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
             Ok(())
         }
         Decision::Upgrade { target } => {
-            tracing::info!(from = current, to = %target, "self-upgrading heph");
             let binary = imp::ensure_binary(&target)?;
             // Replaces the process image; only returns on failure.
             imp::exec_into(&binary)?;
