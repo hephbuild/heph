@@ -25,7 +25,7 @@ use hbuiltins::pluginfs;
 use hcore::hasync::Cancellable;
 use hcore::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
-use hcore::htvalue::{Value, parse_strings};
+use hcore::htvalue::{Value, parse_map_string_strings, parse_strings};
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
 use hplugin::provider::{
@@ -448,15 +448,17 @@ impl ProviderTrait for Provider {
                     "link",
                     ParamType::strukt(vec![
                         ("flags", ParamType::list(ParamType::String)),
-                        ("deps", ParamType::list(ParamType::String)),
-                        ("runtime_deps", ParamType::list(ParamType::String)),
+                        ("deps", link_deps_param_type()),
+                        ("runtime_deps", link_deps_param_type()),
                     ]),
                     "Link settings for a `main` package's `build` (binary) target. \
                      `flags` are passed verbatim to `go tool link`; `deps` are target \
                      addresses staged into the link sandbox (hashed inputs) that the \
                      flags can reference; `runtime_deps` travel with the binary at run \
-                     time only (not hashed). By default applies only to this package; \
-                     set `recursive = True` to apply to descendant packages too.",
+                     time only (not hashed). `deps`/`runtime_deps` accept a list of \
+                     addresses or a `{group: [addr, …]}` map to name dep groups. By \
+                     default applies only to this package; set `recursive = True` to \
+                     apply to descendant packages too.",
                 ),
                 field(
                     "recursive",
@@ -921,6 +923,27 @@ fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test
 /// unsupported knobs instead of silently dropping them.
 const LINK_STATE_KEYS: &[&str] = &["flags", "deps", "runtime_deps"];
 
+/// Schema for `link` `deps`/`runtime_deps`: a list of addresses, or a
+/// `{group: addr | [addr, …]}` map naming dep groups. Mirrors the exec plugin's
+/// `deps` union so BUILD authors get the same shape everywhere.
+fn link_deps_param_type() -> ParamType {
+    let str_or_list = ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
+    ParamType::union(vec![
+        ParamType::String,
+        ParamType::list(ParamType::String),
+        ParamType::map(str_or_list),
+    ])
+}
+
+/// Merge a parsed `{group: [addr, …]}` map into a link dep accumulator so that
+/// recursive ancestor states and the package's own state combine per group.
+fn extend_link_deps(out: &mut BTreeMap<String, Vec<String>>, v: &Value) -> anyhow::Result<()> {
+    for (group, addrs) in parse_map_string_strings(v)? {
+        out.entry(group).or_default().extend(addrs);
+    }
+    Ok(())
+}
+
 /// Collect the link knobs (`flags`, `deps`, `runtime_deps`) from `link = {...}`
 /// provider_states applying to the binary's package — its own package plus any
 /// `recursive` ancestor. Applicable states accumulate (shallow->deep), so a
@@ -947,13 +970,12 @@ fn pick_link(states: &[State], addr_pkg: &str) -> anyhow::Result<target_bin::Lin
                 .extend(parse_strings(v).context("parsing link flags from go provider_state")?);
         }
         if let Some(v) = link_map.get("deps") {
-            out.deps
-                .extend(parse_strings(v).context("parsing link deps from go provider_state")?);
+            extend_link_deps(&mut out.deps, v)
+                .context("parsing link deps from go provider_state")?;
         }
         if let Some(v) = link_map.get("runtime_deps") {
-            out.runtime_deps.extend(
-                parse_strings(v).context("parsing link runtime_deps from go provider_state")?,
-            );
+            extend_link_deps(&mut out.runtime_deps, v)
+                .context("parsing link runtime_deps from go provider_state")?;
         }
     }
     Ok(out)
@@ -4474,8 +4496,83 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )];
         let link = pick_link(&states, "foo").unwrap();
         assert_eq!(link.flags, vec!["-s".to_string()]);
-        assert_eq!(link.deps, vec!["//a:b".to_string()]);
-        assert_eq!(link.runtime_deps, vec!["//c:d".to_string()]);
+        // A plain list lands in the default (empty) group.
+        assert_eq!(
+            link.deps,
+            BTreeMap::from([(String::new(), vec!["//a:b".to_string()])])
+        );
+        assert_eq!(
+            link.runtime_deps,
+            BTreeMap::from([(String::new(), vec!["//c:d".to_string()])])
+        );
+    }
+
+    #[test]
+    fn pick_link_deps_accept_named_group_map() {
+        let states = vec![state_with_link_map(
+            "foo",
+            vec![
+                (
+                    "deps",
+                    Value::Map(HashMap::from([(
+                        "assets".to_string(),
+                        Value::List(vec![Value::String("//a:b".to_string())]),
+                    )])),
+                ),
+                (
+                    "runtime_deps",
+                    Value::Map(HashMap::from([(
+                        "data".to_string(),
+                        Value::String("//c:d".to_string()),
+                    )])),
+                ),
+            ],
+        )];
+        let link = pick_link(&states, "foo").unwrap();
+        assert_eq!(
+            link.deps,
+            BTreeMap::from([("assets".to_string(), vec!["//a:b".to_string()])])
+        );
+        // A bare string value in a map entry is coerced to a single-element list.
+        assert_eq!(
+            link.runtime_deps,
+            BTreeMap::from([("data".to_string(), vec!["//c:d".to_string()])])
+        );
+    }
+
+    #[test]
+    fn pick_link_recursive_merges_deps_per_group() {
+        let states = vec![
+            with_recursive(state_with_link_map(
+                "foo",
+                vec![(
+                    "deps",
+                    Value::Map(HashMap::from([(
+                        "assets".to_string(),
+                        Value::List(vec![Value::String("//a:one".to_string())]),
+                    )])),
+                )],
+            )),
+            state_with_link_map(
+                "foo/bar",
+                vec![(
+                    "deps",
+                    Value::Map(HashMap::from([(
+                        "assets".to_string(),
+                        Value::List(vec![Value::String("//a:two".to_string())]),
+                    )])),
+                )],
+            ),
+        ];
+        let link = pick_link(&states, "foo/bar").unwrap();
+        // Same group name from ancestor + self accumulates shallow->deep.
+        assert_eq!(
+            link.deps,
+            BTreeMap::from([(
+                "assets".to_string(),
+                vec!["//a:one".to_string(), "//a:two".to_string()]
+            )])
+        );
     }
 
     #[test]

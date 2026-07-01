@@ -16,11 +16,28 @@ use std::collections::{BTreeMap, HashMap};
 ///   `flags` can reference their outputs.
 /// - `runtime_deps`: target addresses that travel with the binary at run time
 ///   only (not hashed — they do not invalidate the link cache).
+///
+/// `deps`/`runtime_deps` are grouped: a plain list lands in the default group
+/// (`""`), while a map lets the BUILD author name groups explicitly. The empty
+/// group is emitted under `link_deps`/`link_runtime_deps`; named groups are
+/// emitted under `link_deps_<name>`/`link_runtime_deps_<name>` so they never
+/// collide with the importcfg lib groups (stdlib/firstparty/thirdparty/sdk).
 #[derive(Debug, Default, Clone)]
 pub struct LinkConfig {
     pub flags: Vec<String>,
-    pub deps: Vec<String>,
-    pub runtime_deps: Vec<String>,
+    pub deps: BTreeMap<String, Vec<String>>,
+    pub runtime_deps: BTreeMap<String, Vec<String>>,
+}
+
+/// Map a user-provided dep group name onto the target's dep-group key. The
+/// default (empty) group keeps the historical `link_deps`/`link_runtime_deps`
+/// name; named groups are prefixed to stay clear of the importcfg lib groups.
+fn link_group_key(prefix: &str, group: &str) -> String {
+    if group.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}_{group}")
+    }
 }
 
 pub fn build_spec(
@@ -56,12 +73,15 @@ pub fn build_spec(
     if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
         deps.insert(sdk_group, sdk_val);
     }
-    // Link deps from provider_state land in their own group so they never collide
-    // with the importcfg lib groups (stdlib/firstparty/thirdparty/sdk).
-    if !link.deps.is_empty() {
+    // Link deps from provider_state land in their own group(s) so they never
+    // collide with the importcfg lib groups (stdlib/firstparty/thirdparty/sdk).
+    for (group, addrs) in &link.deps {
+        if addrs.is_empty() {
+            continue;
+        }
         deps.insert(
-            "link_deps".to_string(),
-            Value::List(link.deps.iter().cloned().map(Value::String).collect()),
+            link_group_key("link_deps", group),
+            Value::List(addrs.iter().cloned().map(Value::String).collect()),
         );
     }
 
@@ -73,20 +93,19 @@ pub fn build_spec(
     );
     // Runtime-only link deps: staged with the binary at run time, excluded from
     // the link's def hash (pluginexec excludes runtime_deps from the hash).
-    if !link.runtime_deps.is_empty() {
-        config.insert(
-            "runtime_deps".to_string(),
-            Value::Map(HashMap::from([(
-                "link_runtime_deps".to_string(),
-                Value::List(
-                    link.runtime_deps
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            )])),
-        );
+    let runtime_deps: HashMap<String, Value> = link
+        .runtime_deps
+        .iter()
+        .filter(|(_, addrs)| !addrs.is_empty())
+        .map(|(group, addrs)| {
+            (
+                link_group_key("link_runtime_deps", group),
+                Value::List(addrs.iter().cloned().map(Value::String).collect()),
+            )
+        })
+        .collect();
+    if !runtime_deps.is_empty() {
+        config.insert("runtime_deps".to_string(), Value::Map(runtime_deps));
     }
     if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
         config.insert(ro_k, ro_v);
@@ -346,7 +365,7 @@ mod tests {
     #[test]
     fn test_link_deps_added_to_deps_map() {
         let link = LinkConfig {
-            deps: vec!["//some:target".to_string()],
+            deps: BTreeMap::from([(String::new(), vec!["//some:target".to_string()])]),
             ..Default::default()
         };
         let spec = build_spec(
@@ -369,9 +388,47 @@ mod tests {
     }
 
     #[test]
+    fn test_link_deps_named_groups_are_prefixed() {
+        // A named dep group lands under `link_deps_<name>` — never colliding with
+        // the importcfg lib groups (stdlib/firstparty/thirdparty/sdk) — while the
+        // default (empty) group keeps the bare `link_deps` key.
+        let link = LinkConfig {
+            deps: BTreeMap::from([
+                (String::new(), vec!["//d:default".to_string()]),
+                ("assets".to_string(), vec!["//a:one".to_string()]),
+            ]),
+            ..Default::default()
+        };
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &link,
+            V,
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let group = match deps
+            .get("link_deps_assets")
+            .expect("link_deps_assets group present")
+        {
+            Value::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        assert!(matches!(&group[0], Value::String(s) if s == "//a:one"));
+        assert!(
+            deps.contains_key("link_deps"),
+            "default group keeps the bare link_deps key"
+        );
+    }
+
+    #[test]
     fn test_link_runtime_deps_added_to_runtime_deps_map() {
         let link = LinkConfig {
-            runtime_deps: vec!["//some:rt".to_string()],
+            runtime_deps: BTreeMap::from([(String::new(), vec!["//some:rt".to_string()])]),
             ..Default::default()
         };
         let spec = build_spec(
@@ -398,6 +455,38 @@ mod tests {
             _ => panic!("expected list"),
         };
         assert!(matches!(&group[0], Value::String(s) if s == "//some:rt"));
+    }
+
+    #[test]
+    fn test_link_runtime_deps_named_groups_are_prefixed() {
+        let link = LinkConfig {
+            runtime_deps: BTreeMap::from([("data".to_string(), vec!["//r:one".to_string()])]),
+            ..Default::default()
+        };
+        let spec = build_spec(
+            test_addr(),
+            "example.com/cmd",
+            &test_factors(),
+            &[],
+            &link,
+            V,
+        );
+        let rdeps = match spec
+            .config
+            .get("runtime_deps")
+            .expect("runtime_deps present")
+        {
+            Value::Map(m) => m,
+            _ => panic!("expected runtime_deps map"),
+        };
+        let group = match rdeps
+            .get("link_runtime_deps_data")
+            .expect("link_runtime_deps_data group present")
+        {
+            Value::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        assert!(matches!(&group[0], Value::String(s) if s == "//r:one"));
     }
 
     #[test]
