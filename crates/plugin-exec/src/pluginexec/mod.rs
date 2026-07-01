@@ -104,6 +104,26 @@ fn bash_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Convert a dep-map group name into a valid environment-variable name
+/// segment. POSIX env var names allow only `[A-Za-z0-9_]`; group names may
+/// contain other characters (`.`, `-`, `/`, etc.), so we uppercase and
+/// replace every char outside `[A-Z0-9_]` with `_`. The result is always
+/// used with a leading `SRC_`/`OUT_`/`TOOL_` prefix, so the first-char
+/// (no leading digit) rule is already satisfied by the caller.
+fn env_key_segment(group: &str) -> String {
+    group
+        .chars()
+        .map(|c| {
+            let u = c.to_ascii_uppercase();
+            if u.is_ascii_alphanumeric() || u == '_' {
+                u
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
     let cmds = (!run.is_empty()).then(|| run.join("\n"));
 
@@ -823,7 +843,7 @@ impl Driver {
             let key = if output.group.is_empty() {
                 "OUT".to_string()
             } else {
-                format!("OUT_{}", output.group.to_uppercase())
+                format!("OUT_{}", env_key_segment(&output.group))
             };
             let entry = env.entry(key).or_default();
             for path in &output.paths {
@@ -874,7 +894,7 @@ impl Driver {
             let src_key = if group.is_empty() {
                 "SRC".to_string()
             } else {
-                format!("SRC_{}", group.to_uppercase())
+                format!("SRC_{}", env_key_segment(group))
             };
 
             let mut list_f = {
@@ -957,7 +977,7 @@ impl Driver {
                 let tool_key = if group.is_empty() {
                     "TOOL".to_string()
                 } else {
-                    format!("TOOL_{}", group.to_uppercase())
+                    format!("TOOL_{}", env_key_segment(group))
                 };
                 // Per-group dedup for $TOOL_<G> values. `linked` is process-wide
                 // (avoids EEXIST on symlink); `group_seen` is per-group so each
@@ -1373,6 +1393,20 @@ mod tests {
     use hdriver_support::driver_managed::ManagedDriver;
     use hmodel::htaddr::Addr;
     use hplugin::driver::RunRequest;
+
+    #[test]
+    fn env_key_segment_sanitizes_invalid_chars() {
+        // Plain names just uppercase.
+        assert_eq!(env_key_segment("group"), "GROUP");
+        assert_eq!(env_key_segment("G1_a"), "G1_A");
+        // `.`, `-`, `/` (and other punctuation) become `_`, so the full
+        // `SRC_`/`OUT_`/`TOOL_` env var name stays POSIX-valid.
+        assert_eq!(env_key_segment("my-group"), "MY_GROUP");
+        assert_eq!(env_key_segment("my.group"), "MY_GROUP");
+        assert_eq!(env_key_segment("a/b:c"), "A_B_C");
+        // Non-ASCII collapses to `_` rather than leaking bytes.
+        assert_eq!(env_key_segment("café"), "CAF_");
+    }
 
     #[test]
     fn spec_path_to_target_path_normalizes_and_classifies() {
