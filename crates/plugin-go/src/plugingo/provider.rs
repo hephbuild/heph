@@ -3824,7 +3824,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 "each src dep must be a pluginfs addr, got: {}",
                 s
             );
-            assert!(s.contains(".go"), "src dep must reference a .go file: {}", s);
+            assert!(
+                s.contains(".go"),
+                "src dep must reference a .go file: {}",
+                s
+            );
         }
     }
 
