@@ -111,6 +111,7 @@ impl HephLspContext {
             Arc::clone(&self.registry),
             Arc::clone(&self.globals),
             Arc::new(hwalk::CachedWalker::disabled()),
+            Arc::new(hwalk::Ignore::default()),
         )
     }
 

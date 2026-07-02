@@ -378,27 +378,41 @@ impl ProviderTrait for Provider {
     }
 
     fn functions(&self) -> Vec<ProviderFunctionDef> {
-        vec![ProviderFunctionDef {
-            name: "build_addr".to_string(),
-            signature: FnSignature {
-                positional: vec![
-                    Param::required("pkg", ParamType::String),
-                    Param::required("goos", ParamType::String),
-                    Param::required("goarch", ParamType::String),
-                ],
-                named: vec![Param::optional(
-                    "tags",
-                    ParamType::list(ParamType::String),
-                    Value::List(vec![]),
-                )],
-                variadic: None,
-                returns: ParamType::String,
+        // `(pkg, goos, goarch, tags=[]) -> string` — shared by the addr-format fns.
+        let addr_signature = || FnSignature {
+            positional: vec![
+                Param::required("pkg", ParamType::String),
+                Param::required("goos", ParamType::String),
+                Param::required("goarch", ParamType::String),
+            ],
+            named: vec![Param::optional(
+                "tags",
+                ParamType::list(ParamType::String),
+                Value::List(vec![]),
+            )],
+            variadic: None,
+            returns: ParamType::String,
+        };
+        vec![
+            ProviderFunctionDef {
+                name: "build_addr".to_string(),
+                signature: addr_signature(),
+                doc: "Build the address of a Go package's `build` (binary) target for \
+                      a given GOOS/GOARCH (and optional build tags), as used in `deps`."
+                    .to_string(),
+                func: Arc::new(BuildAddrFn),
             },
-            doc: "Build the address of a Go package's `_golist` target for a given \
-                  GOOS/GOARCH (and optional build tags), as used in `deps`."
-                .to_string(),
-            func: Arc::new(BuildAddrFn),
-        }]
+            ProviderFunctionDef {
+                name: "compile_src_addr".to_string(),
+                signature: addr_signature(),
+                doc: "Build the address of a Go package's `go_compile_src` target — the \
+                      group of source files (Go, generated, embeds) its compile consumes \
+                      — for a given GOOS/GOARCH (and optional build tags), as used in \
+                      `deps`."
+                    .to_string(),
+                func: Arc::new(CompileSrcAddrFn),
+            },
+        ]
     }
 
     fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
@@ -474,53 +488,66 @@ impl ProviderTrait for Provider {
     }
 }
 
-/// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — format the heph
-/// address of a Go target without resolving anything. Takes a heph package (the addr's
-/// package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a thirdparty `@heph/go/thirdparty/…@v`
-/// path) and the platform factors, and returns the canonical addr
-/// string `//<pkg>:build@goos=…,goarch=…[,tags=…]`. Pure string transform — same
-/// factor encoding the provider uses internally ([`factors_to_args`]), so the result
-/// matches the addr the provider serves for that package.
-struct BuildAddrFn;
-
-impl BuildAddrFn {
-    fn arg_str<'a>(args: &'a FnArgs, idx: usize, name: &str) -> anyhow::Result<&'a str> {
+/// Shared impl for the `heph.go.*_addr` string-formatting functions. Takes a heph
+/// package (the addr's package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a
+/// thirdparty `@heph/go/thirdparty/…@v` path) and the platform factors, and returns
+/// the canonical addr `//<pkg>:<target>@goos=…,goarch=…[,tags=…]`. Pure string
+/// transform — same factor encoding the provider uses internally
+/// ([`factors_to_args`]), so the result matches the addr the provider serves.
+fn format_go_target_addr(fn_name: &str, target: &str, args: &FnArgs) -> anyhow::Result<Value> {
+    let arg_str = |idx: usize, name: &str| -> anyhow::Result<&str> {
         let v = args
             .named
             .get(name)
             .or_else(|| args.positional.get(idx))
-            .ok_or_else(|| anyhow::anyhow!("heph.go.build_addr: missing `{name}` argument"))?;
+            .ok_or_else(|| anyhow::anyhow!("{fn_name}: missing `{name}` argument"))?;
         match v {
             Value::String(s) => Ok(s.as_str()),
-            other => anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}"),
+            other => anyhow::bail!("{fn_name}: `{name}` must be a string, got {other:?}"),
         }
-    }
+    };
+    let pkg = arg_str(0, "pkg")?;
+    let goos = arg_str(1, "goos")?;
+    let goarch = arg_str(2, "goarch")?;
+
+    let mut build_tags = match args.named.get("tags") {
+        Some(v) => parse_strings(v).with_context(|| format!("{fn_name}: parsing `tags`"))?,
+        None => Vec::new(),
+    };
+    build_tags.sort();
+
+    let factors = Factors {
+        goos: goos.to_string(),
+        goarch: goarch.to_string(),
+        build_tags,
+    };
+    let addr = Addr::new(
+        PkgBuf::from(pkg),
+        target.to_string(),
+        factors_to_args(&factors),
+    );
+    Ok(Value::String(addr.format()))
 }
+
+/// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — the `//<pkg>:build` binary
+/// target's addr for the given factors.
+struct BuildAddrFn;
 
 #[async_trait]
 impl ProviderFn for BuildAddrFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        let pkg = Self::arg_str(&args, 0, "pkg")?;
-        let goos = Self::arg_str(&args, 1, "goos")?;
-        let goarch = Self::arg_str(&args, 2, "goarch")?;
+        format_go_target_addr("heph.go.build_addr", "build", &args)
+    }
+}
 
-        let mut build_tags = match args.named.get("tags") {
-            Some(v) => parse_strings(v).context("heph.go.build_addr: parsing `tags`")?,
-            None => Vec::new(),
-        };
-        build_tags.sort();
+/// `heph.go.compile_src_addr(pkg, goos, goarch, tags=[])` — the
+/// `//<pkg>:go_compile_src` group's addr for the given factors.
+struct CompileSrcAddrFn;
 
-        let factors = Factors {
-            goos: goos.to_string(),
-            goarch: goarch.to_string(),
-            build_tags,
-        };
-        let addr = Addr::new(
-            PkgBuf::from(pkg),
-            "build".to_string(),
-            factors_to_args(&factors),
-        );
-        Ok(Value::String(addr.format()))
+#[async_trait]
+impl ProviderFn for CompileSrcAddrFn {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        format_go_target_addr("heph.go.compile_src_addr", "go_compile_src", &args)
     }
 }
 
@@ -2768,6 +2795,57 @@ mod tests {
         };
         let err = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap_err();
         assert!(err.to_string().contains("missing `goarch`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_compile_src_addr_basic() {
+        let args = FnArgs {
+            positional: vec![
+                Value::String("mylib".into()),
+                Value::String("linux".into()),
+                Value::String("amd64".into()),
+            ],
+            named: HashMap::new(),
+        };
+        let v = CompileSrcAddrFn
+            .call(&build_addr_ctx(), args)
+            .await
+            .unwrap();
+        // Same factor encoding as build_addr, but the go_compile_src target name.
+        assert_eq!(
+            v,
+            Value::String("//mylib:go_compile_src@goarch=amd64,goos=linux".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compile_src_addr_tags_sorted() {
+        let mut named = HashMap::new();
+        named.insert(
+            "tags".to_string(),
+            Value::List(vec![
+                Value::String("foo".into()),
+                Value::String("bar".into()),
+            ]),
+        );
+        let args = FnArgs {
+            positional: vec![
+                Value::String("mylib".into()),
+                Value::String("darwin".into()),
+                Value::String("arm64".into()),
+            ],
+            named,
+        };
+        let v = CompileSrcAddrFn
+            .call(&build_addr_ctx(), args)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            Value::String(
+                "//mylib:go_compile_src@goarch=arm64,goos=darwin,tags=\"bar,foo\"".into()
+            )
+        );
     }
 
     fn run_str(spec: &hplugin::provider::TargetSpec) -> String {

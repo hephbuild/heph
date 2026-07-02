@@ -1184,6 +1184,7 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(std::sync::OnceLock::new()),
             Arc::new(hwalk::CachedWalker::disabled()),
+            Arc::new(hwalk::Ignore::default()),
         );
         // Mirror context.rs: a buffer that fails to eval falls back to a
         // source-only index (the realistic mid-edit case).
