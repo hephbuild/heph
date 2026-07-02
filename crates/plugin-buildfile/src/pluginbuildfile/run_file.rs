@@ -11,7 +11,7 @@ use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::provider::{
     Approval, FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
 };
-use hwalk::{CachedWalker, EntryKind};
+use hwalk::{CachedWalker, EntryKind, Ignore};
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
@@ -563,6 +563,11 @@ pub(crate) struct Extra<'a> {
     pub root: &'a Path,
     pub on_state: Box<dyn Fn(OnStatePayload) -> anyhow::Result<()>>,
     pub on_target: Box<dyn Fn(OnTargetPayload) -> anyhow::Result<()>>,
+    /// Enumerate every package in the workspace (dir with a matching BUILD file,
+    /// plus its ancestors), pruning `fs.skip`ped subtrees. Backs
+    /// `heph.core.packages()`; runs through the shared walker so unchanged dirs
+    /// skip the `readdir` syscall.
+    pub list_packages: Box<dyn Fn() -> anyhow::Result<Vec<String>>>,
     /// Capture each target's source call-stack provenance. Off on the normal
     /// build path (walking `eval.call_stack()` per `target()` call is needless
     /// overhead there); on only for the LSP, which needs it to map a source
@@ -944,6 +949,17 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
         Ok(hcore::htplatform::arch_raw().to_string())
     }
 
+    /// The number of CPUs available to the process, falling back to 1 when the
+    /// host count can't be determined.
+    fn num_cpu() -> starlark::Result<i32> {
+        let n = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        // `available_parallelism` returns a `usize`; clamp into Starlark's `i32`
+        // so an implausibly large host count can't overflow.
+        Ok(i32::try_from(n).unwrap_or(i32::MAX))
+    }
+
     /// The package currently being evaluated.
     fn pkg<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
         let extra = eval
@@ -952,6 +968,56 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
             .downcast_ref::<Extra>()
             .expect("evaluator extra must be of type Extra");
         Ok(extra.pkg.to_string())
+    }
+
+    /// The workspace packages matching `matcher`, as a sorted list of package
+    /// paths (no leading `//`). `matcher` is a heph query string (`//foo`,
+    /// `//foo/...`, combined with `&&`/`||`/`!`; relative `./x`/`..`/`.` resolve
+    /// against the current package). It is evaluated per package, so only
+    /// package-level matchers work — one that needs target/label info (e.g.
+    /// `label(x)` or `//pkg:name`) errors rather than silently matching nothing.
+    fn packages<'v>(
+        eval: &mut Evaluator<'v, '_, '_>,
+        matcher: &str,
+    ) -> starlark::Result<Value<'v>> {
+        use hmodel::htmatcher::MatchResult;
+        let extra = eval
+            .extra
+            .expect("evaluator extra must be set before calling heph.core.packages()")
+            .downcast_ref::<Extra>()
+            .expect("evaluator extra must be of type Extra");
+        let base = PkgBuf::from(extra.pkg);
+        let m = hmodel::htquery::parse(matcher, &base)
+            .map_err(|e| anyhow::anyhow!("heph.core.packages: invalid matcher `{matcher}`: {e}"))?;
+        let pkgs = (extra.list_packages)()
+            .map_err(|e| anyhow::anyhow!("heph.core.packages: enumerating packages: {e}"))?;
+
+        let mut matched: Vec<String> = Vec::new();
+        for pkg in pkgs {
+            // A synthetic package-only addr (empty target name): package matchers
+            // decide Yes/No; target-level matchers return Shrug, which we reject.
+            let addr = htaddr::Addr::new(
+                PkgBuf::from(pkg.as_str()),
+                String::new(),
+                Default::default(),
+            );
+            match m.matches_addr(&addr) {
+                MatchResult::MatchYes => matched.push(pkg),
+                MatchResult::MatchNo => {}
+                MatchResult::MatchShrug => {
+                    return Err(anyhow::anyhow!(
+                        "heph.core.packages: matcher `{matcher}` needs target-level info \
+                         (labels/output paths); only package matchers (//pkg, //pkg/...) \
+                         are supported"
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // `pkgs` arrives sorted, so `matched` is already sorted.
+        let heap = eval.heap();
+        Ok(heap.alloc(AllocList(matched.iter().map(|p| heap.alloc(p.as_str())))))
     }
 }
 
@@ -965,13 +1031,14 @@ impl Provider {
         let registry = self.function_registry.get().cloned().unwrap_or_default();
         let globals = self.globals.clone();
         let walker = self.walker.clone();
+        let skip = self.skip.clone();
         self.pkg_cache
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
                     hproc::process_supervisor::block_or_inline(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
-                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker);
+                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, skip);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
@@ -1001,9 +1068,13 @@ pub(crate) struct BuildFileLoader {
     /// Shared cross-run fs-walk cache. `find_build_files` lists each package dir
     /// through it, so an unchanged dir skips the `readdir` syscall.
     walker: Arc<CachedWalker>,
+    /// Engine `fs.skip` + provider skip config, used to prune directories when
+    /// `heph.core.packages()` walks the tree for the package set.
+    skip: Arc<Ignore>,
 }
 
 impl BuildFileLoader {
+    #[expect(clippy::too_many_arguments, reason = "loader threads provider fields")]
     pub(crate) fn new(
         root: PathBuf,
         patterns: Vec<glob::Pattern>,
@@ -1012,6 +1083,7 @@ impl BuildFileLoader {
         registry: Arc<ProviderFunctionRegistry>,
         globals: Arc<OnceLock<Globals>>,
         walker: Arc<CachedWalker>,
+        skip: Arc<Ignore>,
     ) -> Self {
         Self {
             root,
@@ -1022,6 +1094,7 @@ impl BuildFileLoader {
             registry,
             globals,
             walker,
+            skip,
         }
     }
 
@@ -1321,6 +1394,22 @@ fn eval_ast(
                     Ok(())
                 })
             },
+            list_packages: {
+                // Owned clones so the closure outlives this borrow of `loader`.
+                let walker = Arc::clone(&loader.walker);
+                let root = loader.root.clone();
+                let patterns = loader.patterns.clone();
+                let skip = Arc::clone(&loader.skip);
+                Box::new(move || {
+                    let mut set = HashSet::new();
+                    crate::pluginbuildfile::provider::find_packages_sync(
+                        &walker, &root, &root, &patterns, &skip, &mut set,
+                    )?;
+                    let mut pkgs: Vec<String> = set.into_iter().collect();
+                    pkgs.sort();
+                    Ok(pkgs)
+                })
+            },
         };
         let scoped = ScopedLoader {
             inner: loader,
@@ -1464,6 +1553,7 @@ mod tests {
             registry,
             provider.globals.clone(),
             provider.walker.clone(),
+            provider.skip.clone(),
         );
         loader.load_pkg(pkg)
     }
@@ -1486,6 +1576,7 @@ mod tests {
             Arc::new(ProviderFunctionRegistry::default()),
             Arc::new(OnceLock::new()),
             Arc::new(CachedWalker::disabled()),
+            Arc::new(Ignore::default()),
         )
     }
 
@@ -2445,6 +2536,69 @@ target(
         expect("arch", hcore::htplatform::arch());
         expect("os_raw", std::env::consts::OS);
         expect("arch_raw", std::env::consts::ARCH);
+    }
+
+    #[test]
+    fn test_heph_core_num_cpu() {
+        let content = r#"target(name = "t", driver = "d", n = heph.core.num_cpu())"#;
+        let config = run_target_config(content);
+        match config.get("n") {
+            // Host CPU count is machine-dependent, so assert only the invariant:
+            // it's a positive integer.
+            Some(htvalue::Value::Int(i)) => assert!(*i >= 1, "num_cpu should be >= 1, got {i}"),
+            other => panic!("expected num_cpu int, got {other:?}"),
+        }
+    }
+
+    /// Lay down `foo`, `foo/bar`, `other` packages (each a dir with a BUILD) and
+    /// evaluate `heph.core.packages("//foo/...")` from `foo`.
+    #[test]
+    fn test_heph_core_packages_prefix() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        for p in ["foo", "foo/bar", "other"] {
+            let d = root.join(p);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("BUILD"), "").unwrap();
+        }
+        fs::write(
+            root.join("foo/BUILD"),
+            r#"target(name = "t", driver = "d", pkgs = heph.core.packages("//foo/..."))"#,
+        )
+        .unwrap();
+        let provider = make_provider(&tmp);
+        let result = run_pkg_blocking(&provider, "foo").expect("eval foo");
+        let cfg = &result.targets[0].config;
+        let names: Vec<&str> = match cfg.get("pkgs").unwrap() {
+            htvalue::Value::List(v) => v
+                .iter()
+                .map(|e| match e {
+                    htvalue::Value::String(s) => s.as_str(),
+                    other => panic!("expected string pkg, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected pkgs list, got {other:?}"),
+        };
+        // `//foo/...` = the prefix `foo`: matches `foo` and `foo/bar`, not `other`
+        // (nor the root package).
+        assert_eq!(names, vec!["foo", "foo/bar"]);
+    }
+
+    /// A target-level matcher (`label(...)`) can't be decided from a package path,
+    /// so `heph.core.packages` errors rather than silently returning nothing.
+    #[test]
+    fn test_heph_core_packages_rejects_target_level_matcher() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), r#"X = heph.core.packages("label(foo)")"#).unwrap();
+        let provider = make_provider(&tmp);
+        let err = run_pkg_blocking(&provider, "p").unwrap_err();
+        assert!(
+            err.to_string().contains("target-level info")
+                || format!("{err:#}").contains("target-level info"),
+            "expected target-level-info error, got: {err:#}"
+        );
     }
 
     #[test]

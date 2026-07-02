@@ -234,7 +234,7 @@ impl Provider {
 /// Recursively discover packages under `path`, reading each directory through
 /// the shared [`CachedWalker`] (so an unchanged tree skips `readdir`). Filtering
 /// (build-file pattern, skip-dir pruning) is applied here.
-fn find_packages_sync(
+pub(crate) fn find_packages_sync(
     walker: &CachedWalker,
     path: &std::path::Path,
     root: &std::path::Path,

@@ -318,6 +318,7 @@ mod tests {
             Arc::new(hplugin::provider::ProviderFunctionRegistry::default()),
             Arc::new(std::sync::OnceLock::new()),
             Arc::new(hwalk::CachedWalker::disabled()),
+            Arc::new(hwalk::Ignore::default()),
         );
         let result = eval_source("BUILD", content.to_string(), "pkg", &loader).unwrap();
         DocIndex::build(&result, "pkg", content.to_string())

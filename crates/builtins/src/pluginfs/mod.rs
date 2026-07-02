@@ -37,11 +37,13 @@ pub const DRIVER_NAME: &str = "fs";
 /// generated file is never double-sourced.
 pub const CODEGEN_XATTR: &str = "user.heph.codegen";
 
-/// True if the file at `path` carries the codegen provenance xattr.
+/// True if the file at `path` carries the codegen provenance xattr — i.e. it is
+/// a tree file owned by a `codegen = "copy"` target. `in_place` outputs are never
+/// stamped, so any stamped file belongs to some *other* codegen target.
 ///
 /// A filesystem that does not support xattrs (or any IO error) is treated as
 /// "not stamped" so globbing/file reads never break on such trees.
-fn has_codegen_xattr(path: &std::path::Path) -> bool {
+pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
     matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
 }
 
@@ -230,6 +232,24 @@ impl EProvider for Provider {
                     .to_string(),
                 func: Arc::new(BaseFn),
             },
+            ProviderFunctionDef {
+                name: "parent".to_string(),
+                signature: FnSignature {
+                    positional: vec![Param::required("filename", ParamType::String)],
+                    named: vec![],
+                    variadic: None,
+                    // `null` when no ancestor holds the file, so callers can
+                    // `heph.fs.parent("go.mod") or default`.
+                    returns: ParamType::union(vec![ParamType::String, ParamType::Null]),
+                },
+                doc: "Search the current package directory and each of its \
+                      ancestors (up to the workspace root) for a file named \
+                      `filename`, returning the workspace-root-relative path of \
+                      the closest match, or `None` if no ancestor holds it. \
+                      Example: `heph.fs.parent(\"go.mod\")`."
+                    .to_string(),
+                func: Arc::new(ParentFn),
+            },
         ]
     }
 }
@@ -396,6 +416,47 @@ struct BaseFn;
 impl ProviderFn for BaseFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
         Ok(Value::String(path_base(str_arg("heph.fs.base", &args)?)))
+    }
+}
+
+/// `heph.fs.parent(filename)` — walk up from the calling package's directory,
+/// through each ancestor up to the workspace root, and return the
+/// workspace-root-relative path of the closest `filename`. The search is bounded
+/// at the root so it never wanders the host filesystem (hermeticity), and the
+/// starting directory itself is checked first. Returns `null` when no ancestor
+/// holds the file.
+struct ParentFn;
+
+#[async_trait]
+impl ProviderFn for ParentFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+        let filename = str_arg("heph.fs.parent", &args)?;
+        // A bare name is required — a nested path would make "closest parent"
+        // ambiguous and could escape the package with `..`.
+        if filename.is_empty() || filename.contains('/') {
+            anyhow::bail!(
+                "heph.fs.parent: filename must be a non-empty bare file name, got {filename:?}"
+            );
+        }
+
+        // Start at the calling package's directory and climb toward the root.
+        // `dir` stays root-relative so the returned path is too; `""` is the root.
+        let mut dir = std::path::PathBuf::from(ctx.pkg);
+        loop {
+            let candidate_abs = ctx.root.join(&dir).join(filename);
+            if candidate_abs.is_file() {
+                let rel = dir.join(filename);
+                let s = rel.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("heph.fs.parent: path is not valid UTF-8: {}", rel.display())
+                })?;
+                return Ok(Value::String(s.to_string()));
+            }
+            // `pop` returns false at the root of the relative path — stop there
+            // rather than climbing above the workspace root.
+            if !dir.pop() {
+                return Ok(Value::Null());
+            }
+        }
     }
 }
 
@@ -1198,6 +1259,96 @@ mod tests {
         let ctx = FnCallContext { pkg: "", root };
         let err = futures::executor::block_on(DirFn.call(&ctx, FnArgs::default())).unwrap_err();
         assert!(err.to_string().contains("missing path argument"), "{err}");
+    }
+
+    // ─── Parent (find-up) tests ────────────────────────────────────────────
+
+    /// Call `heph.fs.parent(filename)` from `pkg` rooted at `root`; `Null` → None.
+    fn call_parent(root: &std::path::Path, pkg: &str, filename: &str) -> Option<String> {
+        let ctx = FnCallContext { pkg, root };
+        let args = FnArgs {
+            positional: vec![Value::String(filename.to_string())],
+            named: Default::default(),
+        };
+        match futures::executor::block_on(ParentFn.call(&ctx, args)).unwrap() {
+            Value::String(s) => Some(s),
+            Value::Null() => None,
+            other => panic!("expected string or null, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parent_finds_in_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("go.mod"), "").unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        // From a/b, the closest go.mod is at the workspace root.
+        assert_eq!(
+            call_parent(root, "a/b", "go.mod").as_deref(),
+            Some("go.mod")
+        );
+    }
+
+    #[test]
+    fn test_parent_prefers_closest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("go.mod"), "").unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/go.mod"), "").unwrap();
+        // The nearer `a/go.mod` wins over the root one.
+        assert_eq!(
+            call_parent(root, "a/b", "go.mod").as_deref(),
+            Some("a/go.mod")
+        );
+    }
+
+    #[test]
+    fn test_parent_checks_starting_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/go.mod"), "").unwrap();
+        // The package's own directory is searched first.
+        assert_eq!(
+            call_parent(root, "a/b", "go.mod").as_deref(),
+            Some("a/b/go.mod")
+        );
+    }
+
+    #[test]
+    fn test_parent_not_found_is_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        assert_eq!(call_parent(root, "a/b", "go.mod"), None);
+    }
+
+    #[test]
+    fn test_parent_does_not_escape_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A file OUTSIDE the workspace root must never be returned.
+        fs::write(root.join("outside.txt"), "").unwrap();
+        let inner = root.join("ws");
+        fs::create_dir_all(inner.join("a")).unwrap();
+        assert_eq!(call_parent(&inner, "a", "outside.txt"), None);
+    }
+
+    #[test]
+    fn test_parent_rejects_nested_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = FnCallContext {
+            pkg: "",
+            root: tmp.path(),
+        };
+        let args = FnArgs {
+            positional: vec![Value::String("a/b".to_string())],
+            named: Default::default(),
+        };
+        let err = futures::executor::block_on(ParentFn.call(&ctx, args)).unwrap_err();
+        assert!(err.to_string().contains("bare file name"), "{err}");
     }
 
     // ─── Provider tests ────────────────────────────────────────────────────
