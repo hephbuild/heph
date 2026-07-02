@@ -1354,13 +1354,18 @@ impl ProviderInner {
                         if embedding && pkg_addrs.embed_files.is_empty() {
                             embed_src_addrs.push(pkg_static_embed_glob_addr(addr.package.as_str()));
                         }
+                        // The compile sources are carried by the package's
+                        // `go_compile_src` group, which resolves to the same
+                        // `go_files`; depending on it keeps the two from drifting.
+                        let compile_src =
+                            vec![self.go_compile_src_addr(addr, &factors).format()];
                         target_lib::build_spec(
                             addr.clone(),
                             &import_path,
                             pkg.name.as_deref().unwrap_or(""),
                             &factors,
                             &transitive.libs,
-                            &pkg_addrs.go_files,
+                            &compile_src,
                             &self.go_version,
                             embed_golist,
                             &pkg_addrs.embed_files,
@@ -1371,10 +1376,10 @@ impl ProviderInner {
                 Ok(GetResponse { target_spec: spec })
             }
             "go_compile_src" => {
-                // The `group` of every source file the package's library compile
-                // consumes (Go, assembly, headers, embeds), labeled
-                // `go_compile_src`. Mirrors `build_lib`'s no-source gate: a
-                // package with no Go files isn't compilable, so it has no group.
+                // The transparent `group` of the Go source files the package's
+                // library compile consumes — exactly `build_lib`'s default (`""`)
+                // dep group, which depends on this target. Mirrors `build_lib`'s
+                // no-source gate: a package with no Go files isn't compilable.
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
@@ -1382,16 +1387,7 @@ impl ProviderInner {
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
                     .await
                     .map_err(GetError::Other)?;
-                let spec = target_group::build_spec(
-                    addr.clone(),
-                    &[
-                        &pkg_addrs.go_files,
-                        &pkg_addrs.s_files,
-                        &pkg_addrs.h_files,
-                        &pkg_addrs.extra_h_files,
-                        &pkg_addrs.embed_files,
-                    ],
-                );
+                let spec = target_group::build_spec(addr.clone(), &pkg_addrs.go_files);
                 Ok(GetResponse { target_spec: spec })
             }
             "build" => {
@@ -2115,6 +2111,10 @@ impl ProviderInner {
 
     fn build_lib_addr(&self, addr: &Addr, factors: &Factors) -> Addr {
         self.make_addr_with_name(&addr.package, "build_lib", factors)
+    }
+
+    fn go_compile_src_addr(&self, addr: &Addr, factors: &Factors) -> Addr {
+        self.make_addr_with_name(&addr.package, "go_compile_src", factors)
     }
 
     fn make_addr_with_name(
@@ -3218,6 +3218,33 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
+    async fn test_build_lib_sources_via_go_compile_src_group() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
+        // build_lib's default (`""`) source group must be the go_compile_src
+        // target — not a re-listing of the go files — so the two never drift.
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected deps map, got {other:?}"),
+        };
+        let default_group = match deps.get("").unwrap() {
+            Value::List(v) => v,
+            other => panic!("expected default group list, got {other:?}"),
+        };
+        assert_eq!(
+            default_group.len(),
+            1,
+            "default group must be exactly the go_compile_src group: {default_group:?}"
+        );
+        assert!(
+            matches!(&default_group[0], Value::String(s) if s.contains(":go_compile_src")),
+            "default group must reference the go_compile_src target: {default_group:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_simple_lib_golist_target() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
@@ -3756,22 +3783,22 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
-    async fn test_simple_lib_build_lib_default_deps_are_pluginfs_addrs() {
+    async fn test_go_compile_src_deps_are_pluginfs_go_addrs() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        let deps = match resp.target_spec.config.get("deps").unwrap() {
-            Value::Map(m) => m,
-            _ => panic!("expected deps map"),
-        };
-        let src_list = match deps.get("").unwrap() {
+        // The compile sources now live on the `go_compile_src` group (build_lib
+        // depends on it); its deps must be the package's pluginfs `.go` files.
+        let resp = provider_get(&p, make_addr("", "go_compile_src"))
+            .await
+            .unwrap();
+        let src_list = match resp.target_spec.config.get("deps").unwrap() {
             Value::List(v) => v,
-            _ => panic!("expected list"),
+            _ => panic!("expected deps list"),
         };
         assert!(
             !src_list.is_empty(),
-            "default dep group must not be empty for a package with go files"
+            "go_compile_src must not be empty for a package with go files"
         );
         for entry in src_list {
             let s = match entry {
@@ -3783,11 +3810,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 "each src dep must be a pluginfs addr, got: {}",
                 s
             );
-            assert!(
-                s.ends_with(".go") || s.contains(".go"),
-                "src dep must reference a .go file: {}",
-                s
-            );
+            assert!(s.contains(".go"), "src dep must reference a .go file: {}", s);
         }
     }
 
