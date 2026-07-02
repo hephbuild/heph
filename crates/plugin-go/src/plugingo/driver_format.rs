@@ -57,6 +57,20 @@ fn govet_bin_and_config(
     Ok((bin, env))
 }
 
+/// Write the file list to a response file in the sandbox and return the
+/// `@<path>` argument for it. Passing thousands of paths on argv would overflow
+/// the OS limit (ARG_MAX); heph-govet expands `@file` (one path per line). The
+/// list file lives beside the sources but is never a declared output, so it is
+/// not collected.
+fn arg_file(pkg_dir: &std::path::Path, files: &[String]) -> anyhow::Result<OsString> {
+    let path = pkg_dir.join(".heph-format-files");
+    std::fs::write(&path, files.join("\n"))
+        .with_context(|| format!("write format arg file {path:?}"))?;
+    let mut arg = OsString::from("@");
+    arg.push(path.as_os_str());
+    Ok(arg)
+}
+
 /// Run `heph-govet` with `args`, returning (exit code or None-if-signal, stdout,
 /// stderr). Never fails on a non-zero exit — the caller interprets the code.
 async fn exec_govet(
@@ -251,8 +265,7 @@ impl ManagedDriver for GoFormatDriver {
         if files.is_empty() {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
-        let mut args = vec![OsString::from("-format")];
-        args.extend(files.iter().map(OsString::from));
+        let args = vec![OsString::from("-format"), arg_file(pkg_dir, &files)?];
 
         let (code, _stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, ctoken).await?;
         if code != Some(0) {
@@ -351,8 +364,11 @@ impl ManagedDriver for GoFormatCheckDriver {
         if files.is_empty() {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
-        let mut args = vec![OsString::from("-format"), OsString::from("-check")];
-        args.extend(files.iter().map(OsString::from));
+        let args = vec![
+            OsString::from("-format"),
+            OsString::from("-check"),
+            arg_file(pkg_dir, &files)?,
+        ];
 
         let (code, stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, ctoken).await?;
         match code {

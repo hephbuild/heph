@@ -2,8 +2,36 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"testing"
 )
+
+func TestExpandArgFiles(t *testing.T) {
+	dir := t.TempDir()
+	list := dir + "/files.txt"
+	if err := os.WriteFile(list, []byte("a.go\r\nb.go\n\nc.go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := expandArgFiles([]string{"lit.go", "@" + list})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	want := []string{"lit.go", "a.go", "b.go", "c.go"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+}
+
+func TestExpandArgFilesMissingFails(t *testing.T) {
+	if _, err := expandArgFiles([]string{"@/no/such/list"}); err == nil {
+		t.Fatal("missing arg file must error")
+	}
+}
 
 func TestEnabledFormattersDefaultsToGofmt(t *testing.T) {
 	got := enabledFormatters(nil)

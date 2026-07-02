@@ -37,7 +37,13 @@ func runFormat(args []string) {
 	if err := fs.Parse(args); err != nil {
 		fatal(err.Error())
 	}
-	files := fs.Args()
+	// Expand `@listfile` response-file args (one path per line) so a package
+	// with thousands of files does not overflow the OS argv limit (ARG_MAX). A
+	// bare path is taken literally; only a leading `@` triggers expansion.
+	files, err := expandArgFiles(fs.Args())
+	if err != nil {
+		fatal(err.Error())
+	}
 
 	cfg, err := loadConfig(os.Getenv(configEnvVar))
 	if err != nil {
@@ -75,6 +81,31 @@ func runFormat(args []string) {
 		}
 		os.Exit(1)
 	}
+}
+
+// expandArgFiles replaces every `@listfile` argument with the paths it contains
+// (one per line, blank lines ignored); non-`@` args pass through unchanged. This
+// lets the driver hand thousands of files to the formatter without hitting the
+// OS argv byte limit.
+func expandArgFiles(args []string) ([]string, error) {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if !strings.HasPrefix(a, "@") {
+			out = append(out, a)
+			continue
+		}
+		path := strings.TrimPrefix(a, "@")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read arg list %s: %w", path, err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if line = strings.TrimRight(line, "\r"); line != "" {
+				out = append(out, line)
+			}
+		}
+	}
+	return out, nil
 }
 
 // enabledFormatters resolves the formatter list from `formatters.enable`,
