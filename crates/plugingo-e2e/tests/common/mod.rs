@@ -204,6 +204,8 @@ fn make_workspace_ordered(
         .with_managed_driver(Box::new(plugingo::GoLintDriver::new()))
         .with_managed_driver(Box::new(plugingo::GoLintGateDriver::new()))
         .with_managed_driver(Box::new(plugingo::GoLintFixDriver::new()))
+        .with_managed_driver(Box::new(plugingo::GoFormatDriver::new()))
+        .with_managed_driver(Box::new(plugingo::GoFormatCheckDriver::new()))
         .build()
         .context("build plugingo workspace")
 }

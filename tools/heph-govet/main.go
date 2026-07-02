@@ -56,15 +56,29 @@ import (
 const configEnvVar = "HEPH_GOVET_GOLANGCI_CONFIG"
 
 func main() {
-	r := registry()
+	// Formatter subcommand: rewrites files, not go/analysis. Intercept before
+	// unitchecker (which would reject `-format`). See format.go.
+	if len(os.Args) > 1 && os.Args[1] == "-format" {
+		runFormat(os.Args[2:])
+		return
+	}
+
 	cfg, err := loadConfig(os.Getenv(configEnvVar))
 	if err != nil {
 		fatal(err.Error())
 	}
+	r := registry(cfg)
 	analyzers, linterOf, unknown, err := selectAnalyzers(cfg, r)
 	if err != nil {
 		fatal(err.Error())
 	}
+	// Per-linter settings: govet flags (printf.funcs, shadow.strict, …) and
+	// honnef initialisms/whitelists. Check selection already happened in the
+	// registry (filterChecks) and analyzer resolution (resolveGovet).
+	if err := applyGovetFlags(analyzers, cfg.Linters.Settings.Govet); err != nil {
+		fatal(err.Error())
+	}
+	applyHonnefConfig(cfg.Linters.Settings)
 	// Fail loudly on linters we can't run rather than silently dropping them.
 	if len(unknown) > 0 {
 		fatal(fmt.Sprintf(

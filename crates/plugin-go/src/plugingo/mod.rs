@@ -1,5 +1,6 @@
 mod addr_util;
 mod driver_compile;
+mod driver_format;
 mod driver_golist;
 mod driver_lint;
 mod driver_testmain;
@@ -19,6 +20,7 @@ mod thirdparty;
 mod toolchain;
 
 pub use driver_compile::GoCompileDriver;
+pub use driver_format::{GoFormatCheckDriver, GoFormatDriver};
 pub use driver_golist::GoGolistDriver;
 pub use driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;

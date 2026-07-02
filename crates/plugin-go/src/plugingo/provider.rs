@@ -623,7 +623,16 @@ impl ProviderInner {
                     // `_golist` result — no filesystem scan needed.
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     let names: &[&str] = if skip_tests {
-                        &["_golist", "build_lib", "build", "embed", "lint", "lint-fix"]
+                        &[
+                            "_golist",
+                            "build_lib",
+                            "build",
+                            "embed",
+                            "lint",
+                            "lint-fix",
+                            "format",
+                            "format-fix",
+                        ]
                     } else {
                         &[
                             "_golist",
@@ -632,6 +641,8 @@ impl ProviderInner {
                             "embed",
                             "lint",
                             "lint-fix",
+                            "format",
+                            "format-fix",
                             "embed_xtest",
                             "build_test",
                             "test",
@@ -762,7 +773,16 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "lint", "lint-fix", "_lint"];
+const GOLIST_TARGET_NAMES: &[&str] = &[
+    "build_lib",
+    "build",
+    "embed",
+    "lint",
+    "lint-fix",
+    "_lint",
+    "format",
+    "format-fix",
+];
 
 /// Workspace-relative package of the hermetic go/analysis unitchecker binary
 /// (`heph-govet`) staged read-only into every `go_lint` target. Built as an
@@ -1415,6 +1435,46 @@ impl ProviderInner {
                     &pkg_addrs.go_files,
                     &pkg.go_files,
                 );
+                Ok(GetResponse { target_spec: spec })
+            }
+            // Formatting: `format` is the check gate (fails on unformatted files),
+            // `format-fix` rewrites the sources in place (codegen). Both run the
+            // heph-govet `-format` mode; neither needs facts or dep archives.
+            "format" | "format-fix" => {
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+                // The formatter runs natively on the build host.
+                let govet_addr = Addr::new(
+                    PkgBuf::from(GOVET_TOOL_PKG),
+                    "build".to_string(),
+                    factors_to_args(&Factors {
+                        goos: current_goos(),
+                        goarch: current_goarch(),
+                        build_tags: vec![],
+                    }),
+                );
+                let config_addr = if self.workspace_root.join(".golangci.yml").exists() {
+                    Some(pluginfs::file_addr(".golangci.yml"))
+                } else {
+                    None
+                };
+                let params = crate::plugingo::driver_format::FormatParams {
+                    addr: addr.clone(),
+                    govet_addr: &govet_addr,
+                    src_addrs: &pkg_addrs.go_files,
+                    go_files: &pkg.go_files,
+                    config_addr: config_addr.as_ref(),
+                };
+                let spec = if addr.name == "format-fix" {
+                    crate::plugingo::driver_format::build_format_spec(params)
+                } else {
+                    crate::plugingo::driver_format::build_format_check_spec(params)
+                };
                 Ok(GetResponse { target_spec: spec })
             }
             // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
@@ -3563,6 +3623,41 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             Value::Map(m) => assert!(m.contains_key("src"), "fix declares src outputs"),
             _ => panic!("out not a map"),
         }
+    }
+
+    // Formatting targets resolve through the go provider: `format` is the check
+    // gate (no outputs), `format-fix` rewrites sources in place (declares them).
+    #[tokio::test]
+    async fn test_format_targets_resolve() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        let check = provider_get(&p, make_addr("cmd", "format")).await.unwrap();
+        assert_eq!(check.target_spec.driver, "go_format_check");
+        assert!(
+            check.target_spec.config.get("out").is_none(),
+            "check gate declares no outputs"
+        );
+
+        let fix = provider_get(&p, make_addr("cmd", "format-fix"))
+            .await
+            .unwrap();
+        assert_eq!(fix.target_spec.driver, "go_format");
+        // Stages the heph-govet tool + the package's own sources.
+        let deps = match fix.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("deps not a map"),
+        };
+        assert!(deps.iter().any(|(k, _)| k == "govet_tool"), "tool staged");
+        match deps.iter().find(|(k, _)| k.is_empty()).map(|(_, v)| v) {
+            Some(Value::List(l)) => assert!(!l.is_empty(), "sources staged"),
+            _ => panic!("default source group missing"),
+        }
+        assert!(
+            fix.target_spec.config.get("out").is_some(),
+            "fix declares in_place outputs"
+        );
     }
 
     // Regression: an imported package whose directory has Go files that are all

@@ -35,6 +35,14 @@ import (
 	"golang.org/x/tools/go/analysis/passes/unsafeptr"
 	"golang.org/x/tools/go/analysis/passes/unusedresult"
 
+	// Off-by-default vet passes (as in `go vet` / golangci): opt-in via
+	// `linters.settings.govet.enable` / `enable-all`.
+	"golang.org/x/tools/go/analysis/passes/fieldalignment"
+	"golang.org/x/tools/go/analysis/passes/nilness"
+	"golang.org/x/tools/go/analysis/passes/shadow"
+	"golang.org/x/tools/go/analysis/passes/sortslice"
+	"golang.org/x/tools/go/analysis/passes/unusedwrite"
+
 	"honnef.co/go/tools/analysis/lint"
 	"honnef.co/go/tools/simple"
 	"honnef.co/go/tools/staticcheck"
@@ -52,25 +60,42 @@ import (
 // like gofmt/gofumpt/goimports) or that need whole-program analysis (`unused`)
 // cannot run in the per-package unitchecker model and are intentionally absent —
 // see the package doc in main.go.
-func registry() map[string][]*analysis.Analyzer {
-	r := map[string][]*analysis.Analyzer{
-		// govet — the standard `go vet` analyzer set.
-		"govet": {
-			appends.Analyzer, asmdecl.Analyzer, assign.Analyzer, atomic.Analyzer,
-			bools.Analyzer, buildtag.Analyzer, cgocall.Analyzer, composite.Analyzer,
-			copylock.Analyzer, defers.Analyzer, directive.Analyzer, errorsas.Analyzer,
-			httpresponse.Analyzer, ifaceassert.Analyzer, loopclosure.Analyzer,
-			lostcancel.Analyzer, nilfunc.Analyzer, printf.Analyzer, shift.Analyzer,
-			sigchanyzer.Analyzer, slog.Analyzer, stdmethods.Analyzer,
-			stringintconv.Analyzer, structtag.Analyzer, testinggoroutine.Analyzer,
-			tests.Analyzer, timeformat.Analyzer, unmarshal.Analyzer,
-			unreachable.Analyzer, unsafeptr.Analyzer, unusedresult.Analyzer,
-		},
-		"staticcheck": honnefAnalyzers(staticcheck.Analyzers),
-		"gosimple":    honnefAnalyzers(simple.Analyzers),
-		"stylecheck":  honnefAnalyzers(stylecheck.Analyzers),
+func registry(cfg golangciConfig) map[string][]*analysis.Analyzer {
+	s := cfg.Linters.Settings
+	return map[string][]*analysis.Analyzer{
+		"govet":       resolveGovet(s.Govet),
+		"staticcheck": filterChecks(honnefAnalyzers(staticcheck.Analyzers), s.Staticcheck.Checks),
+		"gosimple":    filterChecks(honnefAnalyzers(simple.Analyzers), s.Gosimple.Checks),
+		"stylecheck":  filterChecks(honnefAnalyzers(stylecheck.Analyzers), s.Stylecheck.Checks),
 	}
-	return r
+}
+
+// govetEntry is a vet analyzer plus whether it belongs to the default `govet`
+// group. Off-by-default entries are opt-in via `settings.govet`.
+type govetEntry struct {
+	a         *analysis.Analyzer
+	defaultOn bool
+}
+
+// govetAll is every vet analyzer this binary can run, in deterministic order.
+// The default-on set matches `go vet`'s standard analyzers; the trailing few are
+// off by default (as in `go vet` / golangci) and enabled via settings.
+func govetAll() []govetEntry {
+	on := func(a *analysis.Analyzer) govetEntry { return govetEntry{a, true} }
+	off := func(a *analysis.Analyzer) govetEntry { return govetEntry{a, false} }
+	return []govetEntry{
+		on(appends.Analyzer), on(asmdecl.Analyzer), on(assign.Analyzer), on(atomic.Analyzer),
+		on(bools.Analyzer), on(buildtag.Analyzer), on(cgocall.Analyzer), on(composite.Analyzer),
+		on(copylock.Analyzer), on(defers.Analyzer), on(directive.Analyzer), on(errorsas.Analyzer),
+		on(httpresponse.Analyzer), on(ifaceassert.Analyzer), on(loopclosure.Analyzer),
+		on(lostcancel.Analyzer), on(nilfunc.Analyzer), on(printf.Analyzer), on(shift.Analyzer),
+		on(sigchanyzer.Analyzer), on(slog.Analyzer), on(stdmethods.Analyzer),
+		on(stringintconv.Analyzer), on(structtag.Analyzer), on(testinggoroutine.Analyzer),
+		on(tests.Analyzer), on(timeformat.Analyzer), on(unmarshal.Analyzer),
+		on(unreachable.Analyzer), on(unsafeptr.Analyzer), on(unusedresult.Analyzer),
+		off(shadow.Analyzer), off(fieldalignment.Analyzer), off(nilness.Analyzer),
+		off(sortslice.Analyzer), off(unusedwrite.Analyzer),
+	}
 }
 
 // honnefAnalyzers unwraps honnef.co/go/tools' lint.Analyzer wrappers into bare

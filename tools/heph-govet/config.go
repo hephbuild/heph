@@ -9,17 +9,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// golangciConfig is the minimal subset of `.golangci.yml` (schema version 2)
-// this driver understands: linter selection. Settings, exclusions, formatters
-// and `//nolint` handling are not parsed here yet — see the package doc.
+// golangciConfig is the subset of `.golangci.yml` (schema version 2) this driver
+// understands: linter selection, per-linter `settings`, exclusions, and the
+// `formatters` block. Presets, `run:`/`output:`/`severity:`/`issues:` and
+// `exclusions.rules[].source` are not parsed — see the package doc.
 type golangciConfig struct {
 	Version string `yaml:"version"`
 	Linters struct {
 		// "standard" (default), "all", "none", or "fast". Only standard/all/none
 		// are meaningful here; "fast" is treated as "standard".
-		Default    string   `yaml:"default"`
-		Enable     []string `yaml:"enable"`
-		Disable    []string `yaml:"disable"`
+		Default    string         `yaml:"default"`
+		Enable     []string       `yaml:"enable"`
+		Disable    []string       `yaml:"disable"`
+		Settings   linterSettings `yaml:"settings"`
 		Exclusions struct {
 			// Subset of golangci-lint exclusions: per-rule linter scoping plus
 			// path/text regexes. Presets and `source` matching are not parsed.
@@ -30,6 +32,61 @@ type golangciConfig struct {
 			} `yaml:"rules"`
 		} `yaml:"exclusions"`
 	} `yaml:"linters"`
+	Formatters formattersConfig `yaml:"formatters"`
+}
+
+// linterSettings is `linters.settings` — per-linter configuration for the
+// families this driver ships.
+type linterSettings struct {
+	Govet       govetSettings  `yaml:"govet"`
+	Staticcheck honnefSettings `yaml:"staticcheck"`
+	Gosimple    honnefSettings `yaml:"gosimple"`
+	Stylecheck  honnefSettings `yaml:"stylecheck"`
+}
+
+// govetSettings mirrors golangci-lint's `linters.settings.govet`: which vet
+// analyzers run, and per-analyzer flag values (e.g. `printf.funcs`).
+type govetSettings struct {
+	Enable     []string `yaml:"enable"`
+	Disable    []string `yaml:"disable"`
+	EnableAll  bool     `yaml:"enable-all"`
+	DisableAll bool     `yaml:"disable-all"`
+	// analyzer name → (flag name → value). Values are coerced to the flag's
+	// string form (lists join on comma, bools to "true"/"false").
+	Settings map[string]map[string]any `yaml:"settings"`
+}
+
+// honnefSettings mirrors golangci-lint's `linters.settings.{staticcheck,
+// gosimple,stylecheck}`. `checks` selects which checks in the family run
+// (patterns: "all", "SA1000", "-ST1003", globs like "SA1*"); the remaining
+// fields feed honnef's config (consumed by stylecheck's ST1001/ST1003/ST1013).
+type honnefSettings struct {
+	Checks                  []string `yaml:"checks"`
+	Initialisms             []string `yaml:"initialisms"`
+	DotImportWhitelist      []string `yaml:"dot-import-whitelist"`
+	HTTPStatusCodeWhitelist []string `yaml:"http-status-code-whitelist"`
+}
+
+// formattersConfig is the `formatters:` block: which formatters run and their
+// settings. Mirrors golangci-lint v2 for gofmt/gofumpt/goimports.
+type formattersConfig struct {
+	Enable   []string `yaml:"enable"`
+	Settings struct {
+		Gofmt struct {
+			Simplify     bool `yaml:"simplify"`
+			RewriteRules []struct {
+				Pattern     string `yaml:"pattern"`
+				Replacement string `yaml:"replacement"`
+			} `yaml:"rewrite-rules"`
+		} `yaml:"gofmt"`
+		Gofumpt struct {
+			ModulePath string `yaml:"module-path"`
+			ExtraRules bool   `yaml:"extra-rules"`
+		} `yaml:"gofumpt"`
+		Goimports struct {
+			LocalPrefixes []string `yaml:"local-prefixes"`
+		} `yaml:"goimports"`
+	} `yaml:"settings"`
 }
 
 // loadConfig reads and parses a `.golangci.yml` at path. A missing path yields

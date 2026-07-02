@@ -762,7 +762,7 @@ fn apply_edits(src: &[u8], edits: &mut [FixEdit]) -> Option<Vec<u8>> {
 
 /// All staged file paths for the inputs in dep `group` (origin `dep|group|*`).
 /// Free-function form used by the fix driver (mirrors [`GoLintDriver`]'s method).
-fn staged_paths_in_group(req: &ManagedRunRequest<'_, '_>, group: &str) -> Vec<String> {
+pub(crate) fn staged_paths_in_group(req: &ManagedRunRequest<'_, '_>, group: &str) -> Vec<String> {
     let prefix = format!("dep|{group}|");
     let mut out: Vec<String> = Vec::new();
     for m in &req.inputs {
