@@ -507,17 +507,9 @@ impl ManagedDriver for GoCompileDriver {
 
 impl GoCompileDriver {
     /// All staged file paths for the inputs in dep `group` (origin `dep|group|*`).
-    ///
-    /// The list file is keyed by origin_id (`input_<origin_id>.list`), and a
-    /// transparent group expands into several inputs that all inherit the parent
-    /// reference's origin_id — so they share one list file that already holds
-    /// every staged path. Read each distinct list file once (dedup by path) to
-    /// avoid multiplying every entry by the number of expanded inputs.
     fn group_staged_paths(&self, req: &ManagedRunRequest<'_, '_>, group: &str) -> Vec<String> {
         let prefix = format!("dep|{group}|");
         let mut out: Vec<String> = Vec::new();
-        let mut seen_lists: std::collections::HashSet<&std::path::Path> =
-            std::collections::HashSet::new();
         for m in &req.inputs {
             if !m.input.origin_id.starts_with(&prefix) {
                 continue;
@@ -525,9 +517,6 @@ impl GoCompileDriver {
             let Ok(list_path) = m.require_list_path() else {
                 continue;
             };
-            if !seen_lists.insert(list_path) {
-                continue;
-            }
             if let Ok(f) = std::fs::File::open(list_path) {
                 for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
                     if !line.is_empty() {
