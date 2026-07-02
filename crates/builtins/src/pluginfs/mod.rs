@@ -37,11 +37,13 @@ pub const DRIVER_NAME: &str = "fs";
 /// generated file is never double-sourced.
 pub const CODEGEN_XATTR: &str = "user.heph.codegen";
 
-/// True if the file at `path` carries the codegen provenance xattr.
+/// True if the file at `path` carries the codegen provenance xattr — i.e. it is
+/// a tree file owned by a `codegen = "copy"` target. `in_place` outputs are never
+/// stamped, so any stamped file belongs to some *other* codegen target.
 ///
 /// A filesystem that does not support xattrs (or any IO error) is treated as
 /// "not stamped" so globbing/file reads never break on such trees.
-fn has_codegen_xattr(path: &std::path::Path) -> bool {
+pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
     matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
 }
 

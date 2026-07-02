@@ -475,17 +475,6 @@ fn build_eresult(
 /// extended attributes (some tmpfs/NFS/FAT) must FAIL loudly rather than silently
 /// emit an unstamped output that would then be double-sourced. (`in_place` outputs
 /// are never stamped, so they remain usable on any filesystem.)
-/// True if `path` carries the codegen provenance xattr — i.e. it is a tree file
-/// owned by a `codegen = "copy"` target. `in_place` outputs are never stamped, so
-/// any stamped file belongs to some *other* codegen target and must not be
-/// clobbered by an `in_place` write-back.
-fn is_codegen_controlled(path: &std::path::Path) -> bool {
-    matches!(
-        xattr::get(path, hbuiltins::pluginfs::CODEGEN_XATTR),
-        Ok(Some(_))
-    )
-}
-
 fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()> {
     xattr::set(path, hbuiltins::pluginfs::CODEGEN_XATTR, value.as_bytes()).with_context(|| {
         format!(
@@ -1511,7 +1500,9 @@ impl Engine {
                     // target never touches a copy-owned tree file, so a
                     // divergence there is not drift this target would reconcile —
                     // don't flag it in the frozen check.
-                    if matches!(mode, CodegenMode::InPlace) && is_codegen_controlled(&tree_path) {
+                    if matches!(mode, CodegenMode::InPlace)
+                        && hbuiltins::pluginfs::has_codegen_xattr(&tree_path)
+                    {
                         continue;
                     }
                     let old_bytes = match std::fs::read(&tree_path) {
@@ -1590,7 +1581,9 @@ impl Engine {
                     // the codegen xattr) — doing so would clobber the copy
                     // target's output and leave the provenance pointing at the
                     // wrong producer. Leave such files to their owner.
-                    if matches!(mode, CodegenMode::InPlace) && is_codegen_controlled(&dest) {
+                    if matches!(mode, CodegenMode::InPlace)
+                        && hbuiltins::pluginfs::has_codegen_xattr(&dest)
+                    {
                         continue;
                     }
                     match entry.kind {
