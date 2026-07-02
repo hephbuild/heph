@@ -623,8 +623,327 @@ impl ManagedDriver for GoLintGateDriver {
             .with_context(|| format!("read lint report {report_path}"))?;
         let findings = report_findings(&bytes)?;
         if !findings.is_empty() {
-            anyhow::bail!("lint found {} issue(s):\n{}", findings.len(), findings.join("\n"));
+            anyhow::bail!(
+                "lint found {} issue(s):\n{}",
+                findings.len(),
+                findings.join("\n")
+            );
         }
+        Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fix driver: applies go/analysis suggested fixes back into source (codegen).
+//
+// `_lint`'s `-json` report already carries each diagnostic's `suggested_fixes`
+// (byte-offset text edits). `go_lint_fix` (the user-facing `lint-fix` target)
+// consumes that report plus the package's own `.go` sources, applies the edits,
+// and declares the rewritten sources as `codegen=in_place` outputs — so the
+// engine writes them back over the tracked source files. Purely mechanical: no
+// re-analysis, and it reuses `_lint`'s cache.
+// ---------------------------------------------------------------------------
+
+/// A single suggested-fix text edit: replace bytes `[start, end)` of `file`
+/// (basename) with `new`. `start`/`end` are 0-based byte offsets into the file
+/// as the analyzer parsed it; `_lint` and `lint-fix` stage byte-identical
+/// sources, so the offsets line up.
+struct FixEdit {
+    start: usize,
+    end: usize,
+    new: String,
+}
+
+/// Parse a `unitchecker -json` report into edits grouped by source-file
+/// basename. Only the FIRST suggested fix of each diagnostic is taken — extra
+/// fixes are alternatives, not additional edits (the go/analysis convention an
+/// auto-fixer follows). Diagnostics without a suggested fix contribute nothing.
+///
+/// Files are keyed by basename because the report's `filename` is an absolute
+/// path in the `_lint` sandbox; a package's Go files are flat (one directory),
+/// so basenames are unique within it.
+fn report_edits(json: &[u8]) -> anyhow::Result<HashMap<String, Vec<FixEdit>>> {
+    let mut out: HashMap<String, Vec<FixEdit>> = HashMap::new();
+    if json.iter().all(u8::is_ascii_whitespace) {
+        return Ok(out);
+    }
+    let root: serde_json::Value =
+        serde_json::from_slice(json).context("parse unitchecker json report")?;
+    let Some(by_pkg) = root.as_object() else {
+        return Ok(out);
+    };
+    for by_analyzer in by_pkg.values() {
+        let Some(by_analyzer) = by_analyzer.as_object() else {
+            continue;
+        };
+        for diags in by_analyzer.values() {
+            let Some(diags) = diags.as_array() else {
+                continue;
+            };
+            for d in diags {
+                let Some(first) = d
+                    .get("suggested_fixes")
+                    .and_then(|v| v.as_array())
+                    .and_then(|f| f.first())
+                else {
+                    continue;
+                };
+                let Some(edits) = first.get("edits").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for e in edits {
+                    let filename = e.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                    let new = e.get("new").and_then(|v| v.as_str()).unwrap_or("");
+                    let (Some(start), Some(end)) = (
+                        e.get("start")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|v| usize::try_from(v).ok()),
+                        e.get("end")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|v| usize::try_from(v).ok()),
+                    ) else {
+                        continue;
+                    };
+                    if filename.is_empty() || end < start {
+                        continue;
+                    }
+                    let base = std::path::Path::new(filename).file_name().map_or_else(
+                        || filename.to_string(),
+                        |s| s.to_string_lossy().into_owned(),
+                    );
+                    out.entry(base).or_default().push(FixEdit {
+                        start,
+                        end,
+                        new: new.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Apply `edits` to `src`, returning the rewritten bytes, or `None` when nothing
+/// applies. Edits are sorted by start offset; any that fall out of range or
+/// overlap an already-accepted edit are dropped (keeping the earliest — the same
+/// conflict rule go/analysis' own fix applier uses). The accepted, non-
+/// overlapping edits are then spliced in a single left-to-right pass.
+fn apply_edits(src: &[u8], edits: &mut [FixEdit]) -> Option<Vec<u8>> {
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+    let mut accepted: Vec<&FixEdit> = Vec::with_capacity(edits.len());
+    let mut last_end = 0usize;
+    for e in edits.iter() {
+        if e.start > e.end || e.end > src.len() {
+            continue;
+        }
+        // Overlaps the previously accepted edit → drop (earliest wins).
+        if !accepted.is_empty() && e.start < last_end {
+            continue;
+        }
+        accepted.push(e);
+        last_end = e.end;
+    }
+    if accepted.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(src.len());
+    let mut cursor = 0usize;
+    for e in accepted {
+        out.extend_from_slice(src.get(cursor..e.start).unwrap_or_default());
+        out.extend_from_slice(e.new.as_bytes());
+        cursor = e.end;
+    }
+    out.extend_from_slice(src.get(cursor..).unwrap_or_default());
+    Some(out)
+}
+
+/// All staged file paths for the inputs in dep `group` (origin `dep|group|*`).
+/// Free-function form used by the fix driver (mirrors [`GoLintDriver`]'s method).
+fn staged_paths_in_group(req: &ManagedRunRequest<'_, '_>, group: &str) -> Vec<String> {
+    let prefix = format!("dep|{group}|");
+    let mut out: Vec<String> = Vec::new();
+    for m in &req.inputs {
+        if !m.input.origin_id.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(list_path) = m.require_list_path() else {
+            continue;
+        };
+        if let Ok(f) = std::fs::File::open(list_path) {
+            for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+                if !line.is_empty() {
+                    out.push(line);
+                }
+            }
+        }
+    }
+    out
+}
+
+pub struct GoLintFixDriver;
+
+impl GoLintFixDriver {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for GoLintFixDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Spec)]
+struct GoLintFixSpec {
+    /// Dependencies, grouped by name → list of target addresses. The `report`
+    /// group carries the analyze target's `lint-report.json`; the default (`""`)
+    /// group the package `.go` sources rewritten in place.
+    deps: HashMap<String, Vec<String>>,
+    /// Declared outputs, grouped by name → list of package-relative paths (the
+    /// `.go` files, written back in place).
+    out: HashMap<String, Vec<String>>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct GoLintFixDef;
+
+const GO_LINT_FIX_FORMAT_VERSION: u32 = 1;
+
+#[async_trait]
+impl ManagedDriver for GoLintFixDriver {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        Ok(ConfigResponse {
+            name: "go_lint_fix".to_string(),
+        })
+    }
+
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        GoLintFixSpec::schema()
+    }
+
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
+        let pkg = req.target_spec.addr.package.clone();
+        let pkg_str = pkg.as_str();
+        let spec =
+            GoLintFixSpec::from(req.target_spec.config.clone()).context("parse go_lint_fix")?;
+
+        let mut inputs: Vec<Input> = Vec::new();
+        let mut groups: Vec<&String> = spec.deps.keys().collect();
+        groups.sort();
+        for group in groups {
+            for (i, addr_str) in spec.deps.get(group).expect("group key").iter().enumerate() {
+                inputs.push(Input {
+                    r#ref: TargetAddr::parse(addr_str, &pkg)
+                        .with_context(|| format!("parse dep addr {addr_str}"))?,
+                    mode: InputMode::Standard,
+                    origin_id: format!("dep|{group}|{i}"),
+                    annotations: BTreeMap::new(),
+                    hashed: true,
+                    runtime: true,
+                });
+            }
+        }
+
+        // The rewritten `.go` files are `codegen=in_place` outputs: the engine
+        // writes them back over the tracked source files after a top-level run.
+        let outputs: Vec<Output> = spec
+            .out
+            .iter()
+            .map(|(group, paths)| Output {
+                group: group.clone(),
+                paths: paths
+                    .iter()
+                    .map(|p| {
+                        let full_path = if pkg_str.is_empty() {
+                            p.clone()
+                        } else {
+                            format!("{pkg_str}/{p}")
+                        };
+                        TPath {
+                            content: Content::FilePath(full_path),
+                            codegen_tree: CodegenMode::InPlace,
+                            collect: true,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let hash = {
+            let mut h = DebugHasher::new(Xxh3Default::new(), || {
+                format!("go_lint_fix_{}", req.target_spec.addr.format())
+            });
+            GO_LINT_FIX_FORMAT_VERSION.hash(&mut h);
+            format!("{:x}", h.finish()).into_bytes()
+        };
+
+        Ok(ParseResponse {
+            target_def: TargetDef {
+                addr: req.target_spec.addr.clone(),
+                labels: req.target_spec.labels.clone(),
+                raw_def: Arc::new(GoLintFixDef),
+                inputs,
+                outputs,
+                support_files: vec![],
+                cache: CacheConfig::on(true),
+                pty: false,
+                hash,
+                transparent: false,
+            },
+        })
+    }
+
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
+        Ok(ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+
+    async fn run<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        // The analyze target's `-json` report (single staged file, dep|report|*).
+        let report_path = staged_paths_in_group(&req, "report")
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("go_lint_fix: no lint report staged"))?;
+        let report = std::fs::read(&report_path)
+            .with_context(|| format!("read lint report {report_path}"))?;
+        let mut edits_by_file = report_edits(&report)?;
+
+        // Apply the edits to each staged source, rewriting it in place. The
+        // default (`""`) group is staged as a plain writable copy (not read-only,
+        // so not hardlinked to a cache blob), so an in-place overwrite is safe.
+        for src in staged_paths_in_group(&req, "") {
+            let base = std::path::Path::new(&src)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned());
+            let Some(mut edits) = base.and_then(|b| edits_by_file.remove(&b)) else {
+                continue;
+            };
+            let orig = std::fs::read(&src).with_context(|| format!("read source for fix {src}"))?;
+            if let Some(fixed) = apply_edits(&orig, &mut edits)
+                && fixed != orig
+            {
+                std::fs::write(&src, &fixed)
+                    .with_context(|| format!("write fixed source {src}"))?;
+            }
+        }
+
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -725,6 +1044,7 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         config,
         labels: vec!["go-lint".to_string()],
         transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 
@@ -747,6 +1067,54 @@ pub fn build_lint_gate_spec(addr: Addr, analyze_addr: &Addr) -> TargetSpec {
         config,
         labels: vec!["go-lint".to_string()],
         transitive: Default::default(),
+        approval: Default::default(),
+    }
+}
+
+/// Build the user-facing `lint-fix` spec. Depends on the `report` output of the
+/// analyze target (`_lint`) plus the package's own `.go` sources, applies each
+/// diagnostic's suggested fix, and rewrites the sources in place (codegen).
+///
+/// `src_addrs` are the source file target addresses (the `""` dep group, staged
+/// writable and rewritten); `go_files` are their basenames (the declared
+/// `in_place` outputs). The two are the same files viewed as addr vs. filename.
+pub fn build_lint_fix_spec(
+    addr: Addr,
+    analyze_addr: &Addr,
+    src_addrs: &[String],
+    go_files: &[String],
+) -> TargetSpec {
+    let deps = BTreeMap::from([
+        (
+            "report".to_string(),
+            Value::List(vec![Value::String(format!(
+                "{}|report",
+                analyze_addr.format()
+            ))]),
+        ),
+        (
+            String::new(),
+            Value::List(src_addrs.iter().cloned().map(Value::String).collect()),
+        ),
+    ]);
+
+    let mut config: HashMap<String, Value> = HashMap::new();
+    config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
+    config.insert(
+        "out".to_string(),
+        Value::Map(HashMap::from([(
+            "src".to_string(),
+            Value::List(go_files.iter().cloned().map(Value::String).collect()),
+        )])),
+    );
+
+    TargetSpec {
+        addr,
+        driver: "go_lint_fix".to_string(),
+        config,
+        labels: vec!["go-lint".to_string()],
+        transitive: Default::default(),
+        approval: Default::default(),
     }
 }
 
@@ -861,11 +1229,7 @@ mod tests {
         let archive = lib("example.com/dep", "build_lib");
         let factsdep = (
             "example.com/dep".to_string(),
-            Addr::new(
-                PkgBuf::from("dep"),
-                "lint".to_string(),
-                Default::default(),
-            ),
+            Addr::new(PkgBuf::from("dep"), "lint".to_string(), Default::default()),
         );
         let s = spec(
             std::slice::from_ref(&archive),
@@ -902,7 +1266,11 @@ mod tests {
     #[test]
     fn config_group_present_only_when_config_addr_given() {
         assert!(!deps_map(&spec(&[], &[])).contains_key("config"));
-        let cfg = Addr::new(PkgBuf::from(""), ".golangci.yml".to_string(), Default::default());
+        let cfg = Addr::new(
+            PkgBuf::from(""),
+            ".golangci.yml".to_string(),
+            Default::default(),
+        );
         let s = spec_cfg(&[], &[], Some(&cfg));
         assert!(deps_map(&s).contains_key("config"));
     }
@@ -938,7 +1306,10 @@ mod tests {
         }"#;
         let f = report_findings(json).unwrap();
         assert_eq!(f.len(), 2);
-        assert!(f.iter().any(|s| s.contains("a.go:10:2") && s.contains("printf")));
+        assert!(
+            f.iter()
+                .any(|s| s.contains("a.go:10:2") && s.contains("printf"))
+        );
         assert!(f.iter().any(|s| s.contains("lostcancel")));
     }
 
@@ -971,6 +1342,201 @@ mod tests {
                 "gate must depend on the analyze target's report output: {s}"
             ),
             _ => panic!("not a string"),
+        }
+    }
+
+    // ---- fix ----
+
+    // The report's byte offsets index the file the analyzer parsed; edits are
+    // keyed by basename because the report's `filename` is an absolute sandbox
+    // path. Here `s1002` rewrites `if b == true` → `if b`.
+    #[test]
+    fn fix_extracts_edits_by_basename() {
+        let json = br#"{
+            "example.com/mylib": {
+                "gosimple": [
+                    {"posn": "/sandbox/mylib/a.go:3:5", "message": "S1002",
+                     "suggested_fixes": [
+                       {"message": "remove", "edits": [
+                         {"filename": "/sandbox/mylib/a.go", "start": 5, "end": 14, "new": "b"}
+                       ]}
+                     ]}
+                ]
+            }
+        }"#;
+        let edits = report_edits(json).unwrap();
+        let a = edits.get("a.go").expect("keyed by basename");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].start, 5);
+        assert_eq!(a[0].end, 14);
+        assert_eq!(a[0].new, "b");
+    }
+
+    #[test]
+    fn fix_ignores_diagnostics_without_suggested_fixes() {
+        let json = br#"{"m": {"printf": [{"posn": "a.go:1:1", "message": "no fix"}]}}"#;
+        assert!(report_edits(json).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fix_takes_only_the_first_suggested_fix() {
+        // Two alternative fixes for one diagnostic: only the first applies.
+        let json = br#"{"m": {"l": [{"posn": "a.go:1:1", "message": "x",
+            "suggested_fixes": [
+              {"message": "one", "edits": [{"filename": "a.go", "start": 0, "end": 1, "new": "A"}]},
+              {"message": "two", "edits": [{"filename": "a.go", "start": 2, "end": 3, "new": "B"}]}
+            ]}]}}"#;
+        let edits = report_edits(json).unwrap();
+        let a = edits.get("a.go").unwrap();
+        assert_eq!(a.len(), 1, "only the first fix's edits are taken");
+        assert_eq!(a[0].new, "A");
+    }
+
+    #[test]
+    fn apply_edits_splices_in_offset_order() {
+        let src = b"hello world";
+        let mut edits = vec![
+            FixEdit {
+                start: 6,
+                end: 11,
+                new: "rust".into(),
+            },
+            FixEdit {
+                start: 0,
+                end: 5,
+                new: "bye".into(),
+            },
+        ];
+        assert_eq!(apply_edits(src, &mut edits).unwrap(), b"bye rust");
+    }
+
+    #[test]
+    fn apply_edits_drops_overlapping_keeping_earliest() {
+        let src = b"abcdef";
+        // Second edit [1,4) overlaps the first [0,3): the earliest wins, second dropped.
+        let mut edits = vec![
+            FixEdit {
+                start: 0,
+                end: 3,
+                new: "X".into(),
+            },
+            FixEdit {
+                start: 1,
+                end: 4,
+                new: "Y".into(),
+            },
+        ];
+        assert_eq!(apply_edits(src, &mut edits).unwrap(), b"Xdef");
+    }
+
+    #[test]
+    fn apply_edits_drops_out_of_range() {
+        let src = b"abc";
+        let mut edits = vec![FixEdit {
+            start: 2,
+            end: 99,
+            new: "Z".into(),
+        }];
+        assert!(apply_edits(src, &mut edits).is_none());
+    }
+
+    #[test]
+    fn apply_edits_none_when_empty() {
+        assert!(apply_edits(b"abc", &mut []).is_none());
+    }
+
+    #[test]
+    fn apply_edits_pure_insertion() {
+        // Zero-width edit (start == end) inserts without deleting.
+        let src = b"ac";
+        let mut edits = vec![FixEdit {
+            start: 1,
+            end: 1,
+            new: "b".into(),
+        }];
+        assert_eq!(apply_edits(src, &mut edits).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn fix_spec_driver_deps_and_in_place_outputs() {
+        let analyze = Addr::new(
+            PkgBuf::from("mylib"),
+            "_lint".to_string(),
+            Default::default(),
+        );
+        let s = build_lint_fix_spec(
+            addr("lint-fix"),
+            &analyze,
+            &["//mylib:a.go".to_string()],
+            &["a.go".to_string()],
+        );
+        assert_eq!(s.driver, "go_lint_fix");
+
+        // Depends on `_lint`'s report + the sources (default group).
+        let deps = match s.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("deps not a map"),
+        };
+        match deps.get("report").unwrap() {
+            Value::List(l) => match &l[0] {
+                Value::String(v) => {
+                    assert!(
+                        v.contains(":_lint") && v.ends_with("|report"),
+                        "report dep: {v}"
+                    );
+                }
+                _ => panic!("report not string"),
+            },
+            _ => panic!("report not list"),
+        }
+        match deps.get("").unwrap() {
+            Value::List(l) => assert_eq!(l, &vec![Value::String("//mylib:a.go".to_string())]),
+            _ => panic!("sources not list"),
+        }
+
+        // Declares the `.go` files as outputs.
+        match s.config.get("out").unwrap() {
+            Value::Map(m) => match m.get("src").unwrap() {
+                Value::List(l) => assert_eq!(l, &vec![Value::String("a.go".to_string())]),
+                _ => panic!("src not list"),
+            },
+            _ => panic!("out not map"),
+        }
+    }
+
+    // The crux of the feature: parse() must mark the rewritten sources as
+    // `codegen=in_place` (pkg-prefixed) so the engine writes them back over the
+    // tracked source files.
+    #[tokio::test]
+    async fn fix_parse_declares_in_place_pkg_relative_outputs() {
+        let analyze = Addr::new(
+            PkgBuf::from("mylib"),
+            "_lint".to_string(),
+            Default::default(),
+        );
+        let spec = build_lint_fix_spec(
+            addr("lint-fix"),
+            &analyze,
+            &["//mylib:a.go".to_string()],
+            &["a.go".to_string()],
+        );
+        let req = ParseRequest {
+            request_id: "t".to_string(),
+            target_spec: Arc::new(spec),
+        };
+        let token = hcore::hasync::StdCancellationToken::new();
+        let resp = GoLintFixDriver::new().parse(req, &token).await.unwrap();
+        let out = &resp.target_def.outputs;
+        let path = out
+            .iter()
+            .flat_map(|o| &o.paths)
+            .next()
+            .expect("one output path");
+        assert_eq!(path.codegen_tree, CodegenMode::InPlace);
+        assert!(path.collect);
+        match &path.content {
+            Content::FilePath(p) => assert_eq!(p, "mylib/a.go", "output is pkg-relative"),
+            other => panic!("expected FilePath, got {other}"),
         }
     }
 }

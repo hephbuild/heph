@@ -623,7 +623,7 @@ impl ProviderInner {
                     // `_golist` result — no filesystem scan needed.
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     let names: &[&str] = if skip_tests {
-                        &["_golist", "build_lib", "build", "embed", "lint"]
+                        &["_golist", "build_lib", "build", "embed", "lint", "lint-fix"]
                     } else {
                         &[
                             "_golist",
@@ -631,6 +631,7 @@ impl ProviderInner {
                             "build",
                             "embed",
                             "lint",
+                            "lint-fix",
                             "embed_xtest",
                             "build_test",
                             "test",
@@ -761,7 +762,7 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "lint", "_lint"];
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "lint", "lint-fix", "_lint"];
 
 /// Workspace-relative package of the hermetic go/analysis unitchecker binary
 /// (`heph-govet`) staged read-only into every `go_lint` target. Built as an
@@ -1394,6 +1395,26 @@ impl ProviderInner {
                 let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
                 let spec =
                     crate::plugingo::driver_lint::build_lint_gate_spec(addr.clone(), &analyze_addr);
+                Ok(GetResponse { target_spec: spec })
+            }
+            // User-facing fix: consumes `_lint`'s report (suggested fixes) + the
+            // package sources, applies the edits, and rewrites the sources in
+            // place (codegen). Runs no analysis itself — reuses `_lint`'s cache.
+            "lint-fix" => {
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+                let spec = crate::plugingo::driver_lint::build_lint_fix_spec(
+                    addr.clone(),
+                    &analyze_addr,
+                    &pkg_addrs.go_files,
+                    &pkg.go_files,
+                );
                 Ok(GetResponse { target_spec: spec })
             }
             // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
@@ -3501,6 +3522,46 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 "gate must consume the analyze target's report output: {s}"
             ),
             _ => panic!("not a string"),
+        }
+    }
+
+    // The user-facing `lint-fix` target consumes `_lint`'s report (for the
+    // suggested fixes) plus the package sources, and rewrites the sources in
+    // place. It resolves through the go provider like the gate.
+    #[tokio::test]
+    async fn test_lint_fix_consumes_report_and_sources() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("cmd", "lint-fix"))
+            .await
+            .unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_fix");
+
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        // Report dep points at the analyze target's report output.
+        match deps.get("report").unwrap() {
+            Value::List(l) => match &l[0] {
+                Value::String(s) => assert!(
+                    s.contains(":_lint") && s.ends_with("|report"),
+                    "fix must consume the analyze target's report output: {s}"
+                ),
+                _ => panic!("report not a string"),
+            },
+            _ => panic!("report not a list"),
+        }
+        // Default group carries the package's own sources (rewritten in place).
+        match deps.get("").unwrap() {
+            Value::List(l) => assert!(!l.is_empty(), "fix must stage package sources"),
+            _ => panic!("sources not a list"),
+        }
+        // Declares its `.go` outputs (parse marks them codegen=in_place).
+        match resp.target_spec.config.get("out").unwrap() {
+            Value::Map(m) => assert!(m.contains_key("src"), "fix declares src outputs"),
+            _ => panic!("out not a map"),
         }
     }
 

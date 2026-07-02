@@ -11,8 +11,8 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoCompileDriver, GoGolistDriver, GoLintDriver, GoLintGateDriver, GoTestmainDriver,
-    GoToolchainDriver, Provider,
+    GoCompileDriver, GoGolistDriver, GoLintDriver, GoLintFixDriver, GoLintGateDriver,
+    GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{DynLogSink, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
@@ -101,6 +101,12 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "go_lint_gate".into(),
         driver: make_dyn_managed_driver(lint_gate),
+    });
+    // Fix: applies the report's suggested fixes back into source (codegen).
+    let lint_fix: Arc<dyn ManagedDriver> = Arc::new(GoLintFixDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_lint_fix".into(),
+        driver: make_dyn_managed_driver(lint_fix),
     });
 
     Ok(PluginComponents {
