@@ -10,6 +10,7 @@ use crate::plugingo::pkg_analysis::{
 };
 use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
+use crate::plugingo::target_group;
 use crate::plugingo::target_lib;
 use crate::plugingo::target_modfiles;
 use crate::plugingo::target_std;
@@ -623,13 +624,14 @@ impl ProviderInner {
                     // `_golist` result — no filesystem scan needed.
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     let names: &[&str] = if skip_tests {
-                        &["_golist", "build_lib", "build", "embed"]
+                        &["_golist", "build_lib", "build", "embed", "go_compile_src"]
                     } else {
                         &[
                             "_golist",
                             "build_lib",
                             "build",
                             "embed",
+                            "go_compile_src",
                             "embed_xtest",
                             "build_test",
                             "test",
@@ -760,7 +762,7 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed"];
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "go_compile_src"];
 
 /// Whether this provider owns `name` — the complete set of go targets it can
 /// generate: the pre-golist special targets, the `_golist`-resolved non-test
@@ -1366,6 +1368,30 @@ impl ProviderInner {
                         )
                     }
                 };
+                Ok(GetResponse { target_spec: spec })
+            }
+            "go_compile_src" => {
+                // The `group` of every source file the package's library compile
+                // consumes (Go, assembly, headers, embeds), labeled
+                // `go_compile_src`. Mirrors `build_lib`'s no-source gate: a
+                // package with no Go files isn't compilable, so it has no group.
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+                let spec = target_group::build_spec(
+                    addr.clone(),
+                    &[
+                        &pkg_addrs.go_files,
+                        &pkg_addrs.s_files,
+                        &pkg_addrs.h_files,
+                        &pkg_addrs.extra_h_files,
+                        &pkg_addrs.embed_files,
+                    ],
+                );
                 Ok(GetResponse { target_spec: spec })
             }
             "build" => {
@@ -3146,6 +3172,49 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let result = provider_get(&p, make_addr("", "build")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_list_includes_go_compile_src() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let names = provider_list(&p, "").await;
+        assert!(
+            names.iter().any(|n| n == "go_compile_src"),
+            "expected go_compile_src in list: {:?}",
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simple_lib_go_compile_src_group() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("", "go_compile_src"))
+            .await
+            .unwrap();
+        // A transparent `group` labeled `go_compile_src`, aggregating the
+        // package's compile sources as its `deps`.
+        assert_eq!(resp.target_spec.driver, "group");
+        assert!(
+            resp.target_spec
+                .labels
+                .contains(&"go_compile_src".to_string()),
+            "expected go_compile_src label: {:?}",
+            resp.target_spec.labels
+        );
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::List(v) => v,
+            other => panic!("expected deps list, got {other:?}"),
+        };
+        assert!(
+            deps.iter()
+                .any(|d| matches!(d, Value::String(s) if s.ends_with(".go"))),
+            "compile-src group must include the package's .go source(s): {:?}",
+            deps
+        );
     }
 
     #[tokio::test]

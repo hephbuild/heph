@@ -475,6 +475,17 @@ fn build_eresult(
 /// extended attributes (some tmpfs/NFS/FAT) must FAIL loudly rather than silently
 /// emit an unstamped output that would then be double-sourced. (`in_place` outputs
 /// are never stamped, so they remain usable on any filesystem.)
+/// True if `path` carries the codegen provenance xattr — i.e. it is a tree file
+/// owned by a `codegen = "copy"` target. `in_place` outputs are never stamped, so
+/// any stamped file belongs to some *other* codegen target and must not be
+/// clobbered by an `in_place` write-back.
+fn is_codegen_controlled(path: &std::path::Path) -> bool {
+    matches!(
+        xattr::get(path, hbuiltins::pluginfs::CODEGEN_XATTR),
+        Ok(Some(_))
+    )
+}
+
 fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()> {
     xattr::set(path, hbuiltins::pluginfs::CODEGEN_XATTR, value.as_bytes()).with_context(|| {
         format!(
@@ -1496,6 +1507,13 @@ impl Engine {
                         WalkEntryKind::Symlink { .. } => continue,
                     };
                     let tree_path = root.join(&entry.path);
+                    // Symmetric with the write-back guard below: an `in_place`
+                    // target never touches a copy-owned tree file, so a
+                    // divergence there is not drift this target would reconcile —
+                    // don't flag it in the frozen check.
+                    if matches!(mode, CodegenMode::InPlace) && is_codegen_controlled(&tree_path) {
+                        continue;
+                    }
                     let old_bytes = match std::fs::read(&tree_path) {
                         Ok(b) => b,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -1567,6 +1585,14 @@ impl Engine {
                     let entry = entry
                         .with_context(|| format!("read codegen entry for write-back: {group}"))?;
                     let dest = root.join(&entry.path);
+                    // An `in_place` target must not write back into a tree file
+                    // that another `codegen = "copy"` target owns (stamped with
+                    // the codegen xattr) — doing so would clobber the copy
+                    // target's output and leave the provenance pointing at the
+                    // wrong producer. Leave such files to their owner.
+                    if matches!(mode, CodegenMode::InPlace) && is_codegen_controlled(&dest) {
+                        continue;
+                    }
                     match entry.kind {
                         WalkEntryKind::File { mut data, x } => {
                             let mut new_bytes = Vec::new();
@@ -5390,6 +5416,56 @@ mod tests {
             assert!(
                 xattr::get(&src_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_none(),
                 "in_place output must NOT carry the codegen xattr"
+            );
+        }
+        Ok(())
+    }
+
+    /// An `in_place` target must NOT write back into a tree file that another
+    /// `copy` codegen target owns (stamped with the codegen xattr). Here `//pkg:cp`
+    /// generates+stamps `out.gen`; `//pkg:ip` (in_place) then regenerates `out.gen`
+    /// with different bytes. The guard leaves the copy-owned file untouched.
+    #[tokio::test]
+    async fn in_place_does_not_clobber_copy_controlled_file() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![
+            codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo copyowned > out.gen"),
+            // in_place over the same path, emitting DIFFERENT bytes.
+            codegen_run_target(
+                "//pkg:ip",
+                "in_place",
+                &["*.gen"],
+                "echo clobbered > out.gen",
+            ),
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+
+        // Skip the guard assertion (not the run) on a filesystem without xattrs —
+        // without a stamp there is nothing to protect and no way to detect one.
+        let probe = root.path().join(".xattr_probe");
+        std::fs::write(&probe, b"x")?;
+        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
+
+        // Copy first: writes+stamps out.gen. Then in_place tries to overwrite it.
+        resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
+            .await
+            .0
+            .expect("copy target resolves");
+        resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:ip")?)
+            .await
+            .0
+            .expect("in_place target resolves");
+
+        let gen_file = pkg_dir.join("out.gen");
+        if xattr_supported {
+            assert_eq!(
+                std::fs::read(&gen_file)?,
+                b"copyowned\n",
+                "in_place must not clobber a copy-controlled tree file",
+            );
+            assert!(
+                xattr::get(&gen_file, hbuiltins::pluginfs::CODEGEN_XATTR)?.is_some(),
+                "the copy target's provenance stamp must survive",
             );
         }
         Ok(())

@@ -10,6 +10,7 @@ mod pkg_analysis;
 mod provider;
 mod target_bin;
 mod target_golist;
+mod target_group;
 mod target_lib;
 mod target_modfiles;
 mod target_std;

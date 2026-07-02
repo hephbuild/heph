@@ -944,6 +944,17 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
         Ok(hcore::htplatform::arch_raw().to_string())
     }
 
+    /// The number of CPUs available to the process, falling back to 1 when the
+    /// host count can't be determined.
+    fn num_cpu() -> starlark::Result<i32> {
+        let n = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        // `available_parallelism` returns a `usize`; clamp into Starlark's `i32`
+        // so an implausibly large host count can't overflow.
+        Ok(i32::try_from(n).unwrap_or(i32::MAX))
+    }
+
     /// The package currently being evaluated.
     fn pkg<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
         let extra = eval
@@ -2445,6 +2456,18 @@ target(
         expect("arch", hcore::htplatform::arch());
         expect("os_raw", std::env::consts::OS);
         expect("arch_raw", std::env::consts::ARCH);
+    }
+
+    #[test]
+    fn test_heph_core_num_cpu() {
+        let content = r#"target(name = "t", driver = "d", n = heph.core.num_cpu())"#;
+        let config = run_target_config(content);
+        match config.get("n") {
+            // Host CPU count is machine-dependent, so assert only the invariant:
+            // it's a positive integer.
+            Some(htvalue::Value::Int(i)) => assert!(*i >= 1, "num_cpu should be >= 1, got {i}"),
+            other => panic!("expected num_cpu int, got {other:?}"),
+        }
     }
 
     #[test]
