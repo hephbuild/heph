@@ -33,31 +33,6 @@ async fn test_embed_build_lib_compiles_with_embedcfg() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `go_compile_src` group builds end-to-end for an embedding package: it
-/// aggregates the Go sources AND the embedded asset, so a green build (with a
-/// non-empty artifact set) proves the group resolves both lanes through the
-/// engine — the query group is real, not just a spec.
-#[tokio::test]
-async fn test_go_compile_src_group_builds_with_embeds() -> anyhow::Result<()> {
-    require_go!();
-    let dir = fixture("with_embed")?;
-    let ws = make_workspace(dir)?;
-    let result = ws.run("//:go_compile_src").await?;
-    let paths: Vec<String> = artifact_paths(&result)
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    assert!(
-        paths.iter().any(|p| p.ends_with(".go")),
-        "go_compile_src must carry the Go sources: {paths:?}"
-    );
-    assert!(
-        paths.iter().any(|p| p.contains("data.txt")),
-        "go_compile_src must carry the embedded asset: {paths:?}"
-    );
-    Ok(())
-}
-
 /// Embed a file living in a SUBDIRECTORY (`//go:embed resources/script.sh`).
 /// Regression: the non-go `**/*` source glob must stage subdir files into the
 /// `_golist` sandbox so `go list` resolves the pattern into `EmbedFiles`; a

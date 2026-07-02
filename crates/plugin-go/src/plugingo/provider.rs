@@ -10,7 +10,6 @@ use crate::plugingo::pkg_analysis::{
 };
 use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
-use crate::plugingo::target_group;
 use crate::plugingo::target_lib;
 use crate::plugingo::target_modfiles;
 use crate::plugingo::target_std;
@@ -378,41 +377,27 @@ impl ProviderTrait for Provider {
     }
 
     fn functions(&self) -> Vec<ProviderFunctionDef> {
-        // `(pkg, goos, goarch, tags=[]) -> string` — shared by the addr-format fns.
-        let addr_signature = || FnSignature {
-            positional: vec![
-                Param::required("pkg", ParamType::String),
-                Param::required("goos", ParamType::String),
-                Param::required("goarch", ParamType::String),
-            ],
-            named: vec![Param::optional(
-                "tags",
-                ParamType::list(ParamType::String),
-                Value::List(vec![]),
-            )],
-            variadic: None,
-            returns: ParamType::String,
-        };
-        vec![
-            ProviderFunctionDef {
-                name: "build_addr".to_string(),
-                signature: addr_signature(),
-                doc: "Build the address of a Go package's `build` (binary) target for \
-                      a given GOOS/GOARCH (and optional build tags), as used in `deps`."
-                    .to_string(),
-                func: Arc::new(BuildAddrFn),
+        vec![ProviderFunctionDef {
+            name: "build_addr".to_string(),
+            signature: FnSignature {
+                positional: vec![
+                    Param::required("pkg", ParamType::String),
+                    Param::required("goos", ParamType::String),
+                    Param::required("goarch", ParamType::String),
+                ],
+                named: vec![Param::optional(
+                    "tags",
+                    ParamType::list(ParamType::String),
+                    Value::List(vec![]),
+                )],
+                variadic: None,
+                returns: ParamType::String,
             },
-            ProviderFunctionDef {
-                name: "compile_src_addr".to_string(),
-                signature: addr_signature(),
-                doc: "Build the address of a Go package's `go_compile_src` target — the \
-                      group of source files (Go, generated, embeds) its compile consumes \
-                      — for a given GOOS/GOARCH (and optional build tags), as used in \
-                      `deps`."
-                    .to_string(),
-                func: Arc::new(CompileSrcAddrFn),
-            },
-        ]
+            doc: "Build the address of a Go package's `_golist` target for a given \
+                  GOOS/GOARCH (and optional build tags), as used in `deps`."
+                .to_string(),
+            func: Arc::new(BuildAddrFn),
+        }]
     }
 
     fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
@@ -488,66 +473,53 @@ impl ProviderTrait for Provider {
     }
 }
 
-/// Shared impl for the `heph.go.*_addr` string-formatting functions. Takes a heph
-/// package (the addr's package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a
-/// thirdparty `@heph/go/thirdparty/…@v` path) and the platform factors, and returns
-/// the canonical addr `//<pkg>:<target>@goos=…,goarch=…[,tags=…]`. Pure string
-/// transform — same factor encoding the provider uses internally
-/// ([`factors_to_args`]), so the result matches the addr the provider serves.
-fn format_go_target_addr(fn_name: &str, target: &str, args: &FnArgs) -> anyhow::Result<Value> {
-    let arg_str = |idx: usize, name: &str| -> anyhow::Result<&str> {
+/// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — format the heph
+/// address of a Go target without resolving anything. Takes a heph package (the addr's
+/// package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a thirdparty `@heph/go/thirdparty/…@v`
+/// path) and the platform factors, and returns the canonical addr
+/// string `//<pkg>:build@goos=…,goarch=…[,tags=…]`. Pure string transform — same
+/// factor encoding the provider uses internally ([`factors_to_args`]), so the result
+/// matches the addr the provider serves for that package.
+struct BuildAddrFn;
+
+impl BuildAddrFn {
+    fn arg_str<'a>(args: &'a FnArgs, idx: usize, name: &str) -> anyhow::Result<&'a str> {
         let v = args
             .named
             .get(name)
             .or_else(|| args.positional.get(idx))
-            .ok_or_else(|| anyhow::anyhow!("{fn_name}: missing `{name}` argument"))?;
+            .ok_or_else(|| anyhow::anyhow!("heph.go.build_addr: missing `{name}` argument"))?;
         match v {
             Value::String(s) => Ok(s.as_str()),
-            other => anyhow::bail!("{fn_name}: `{name}` must be a string, got {other:?}"),
+            other => anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}"),
         }
-    };
-    let pkg = arg_str(0, "pkg")?;
-    let goos = arg_str(1, "goos")?;
-    let goarch = arg_str(2, "goarch")?;
-
-    let mut build_tags = match args.named.get("tags") {
-        Some(v) => parse_strings(v).with_context(|| format!("{fn_name}: parsing `tags`"))?,
-        None => Vec::new(),
-    };
-    build_tags.sort();
-
-    let factors = Factors {
-        goos: goos.to_string(),
-        goarch: goarch.to_string(),
-        build_tags,
-    };
-    let addr = Addr::new(
-        PkgBuf::from(pkg),
-        target.to_string(),
-        factors_to_args(&factors),
-    );
-    Ok(Value::String(addr.format()))
+    }
 }
-
-/// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — the `//<pkg>:build` binary
-/// target's addr for the given factors.
-struct BuildAddrFn;
 
 #[async_trait]
 impl ProviderFn for BuildAddrFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        format_go_target_addr("heph.go.build_addr", "build", &args)
-    }
-}
+        let pkg = Self::arg_str(&args, 0, "pkg")?;
+        let goos = Self::arg_str(&args, 1, "goos")?;
+        let goarch = Self::arg_str(&args, 2, "goarch")?;
 
-/// `heph.go.compile_src_addr(pkg, goos, goarch, tags=[])` — the
-/// `//<pkg>:go_compile_src` group's addr for the given factors.
-struct CompileSrcAddrFn;
+        let mut build_tags = match args.named.get("tags") {
+            Some(v) => parse_strings(v).context("heph.go.build_addr: parsing `tags`")?,
+            None => Vec::new(),
+        };
+        build_tags.sort();
 
-#[async_trait]
-impl ProviderFn for CompileSrcAddrFn {
-    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        format_go_target_addr("heph.go.compile_src_addr", "go_compile_src", &args)
+        let factors = Factors {
+            goos: goos.to_string(),
+            goarch: goarch.to_string(),
+            build_tags,
+        };
+        let addr = Addr::new(
+            PkgBuf::from(pkg),
+            "build".to_string(),
+            factors_to_args(&factors),
+        );
+        Ok(Value::String(addr.format()))
     }
 }
 
@@ -651,14 +623,13 @@ impl ProviderInner {
                     // `_golist` result — no filesystem scan needed.
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     let names: &[&str] = if skip_tests {
-                        &["_golist", "build_lib", "build", "embed", "go_compile_src"]
+                        &["_golist", "build_lib", "build", "embed"]
                     } else {
                         &[
                             "_golist",
                             "build_lib",
                             "build",
                             "embed",
-                            "go_compile_src",
                             "embed_xtest",
                             "build_test",
                             "test",
@@ -789,7 +760,7 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "go_compile_src"];
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed"];
 
 /// Whether this provider owns `name` — the complete set of go targets it can
 /// generate: the pre-golist special targets, the `_golist`-resolved non-test
@@ -1395,41 +1366,6 @@ impl ProviderInner {
                         )
                     }
                 };
-                Ok(GetResponse { target_spec: spec })
-            }
-            "go_compile_src" => {
-                // A transparent `group` of every source input the package's
-                // library compile consumes: on-disk and generated (other-target)
-                // Go sources, plus embeds — the Go-resolved embed files and the
-                // `go_embed_src` lane. Mirrors `build_lib`'s no-source gate: a
-                // package with no Go files isn't compilable, so it has no group.
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                // Embeds staged for the compile, computed exactly as `build_lib`
-                // does so the group reflects the real compile inputs.
-                let embedding = !pkg.embed_patterns.is_empty() || !pkg.embed_files.is_empty();
-                let mut embed_src_addrs = if embedding {
-                    compute_embed_src_addrs(addr.package.as_str(), &req.states)
-                        .map_err(GetError::Other)?
-                } else {
-                    Vec::new()
-                };
-                if embedding && pkg_addrs.embed_files.is_empty() {
-                    embed_src_addrs.push(pkg_static_embed_glob_addr(addr.package.as_str()));
-                }
-                let spec = target_group::build_spec(
-                    addr.clone(),
-                    &[
-                        &pkg_addrs.go_files,
-                        &pkg_addrs.embed_files,
-                        &embed_src_addrs,
-                    ],
-                );
                 Ok(GetResponse { target_spec: spec })
             }
             "build" => {
@@ -2797,57 +2733,6 @@ mod tests {
         assert!(err.to_string().contains("missing `goarch`"), "{err}");
     }
 
-    #[tokio::test]
-    async fn test_compile_src_addr_basic() {
-        let args = FnArgs {
-            positional: vec![
-                Value::String("mylib".into()),
-                Value::String("linux".into()),
-                Value::String("amd64".into()),
-            ],
-            named: HashMap::new(),
-        };
-        let v = CompileSrcAddrFn
-            .call(&build_addr_ctx(), args)
-            .await
-            .unwrap();
-        // Same factor encoding as build_addr, but the go_compile_src target name.
-        assert_eq!(
-            v,
-            Value::String("//mylib:go_compile_src@goarch=amd64,goos=linux".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_compile_src_addr_tags_sorted() {
-        let mut named = HashMap::new();
-        named.insert(
-            "tags".to_string(),
-            Value::List(vec![
-                Value::String("foo".into()),
-                Value::String("bar".into()),
-            ]),
-        );
-        let args = FnArgs {
-            positional: vec![
-                Value::String("mylib".into()),
-                Value::String("darwin".into()),
-                Value::String("arm64".into()),
-            ],
-            named,
-        };
-        let v = CompileSrcAddrFn
-            .call(&build_addr_ctx(), args)
-            .await
-            .unwrap();
-        assert_eq!(
-            v,
-            Value::String(
-                "//mylib:go_compile_src@goarch=arm64,goos=darwin,tags=\"bar,foo\"".into()
-            )
-        );
-    }
-
     fn run_str(spec: &hplugin::provider::TargetSpec) -> String {
         match spec.config.get("run").unwrap() {
             Value::String(s) => s.clone(),
@@ -3261,49 +3146,6 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let result = provider_get(&p, make_addr("", "build")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
-    }
-
-    #[tokio::test]
-    async fn test_list_includes_go_compile_src() {
-        require_go!();
-        let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let names = provider_list(&p, "").await;
-        assert!(
-            names.iter().any(|n| n == "go_compile_src"),
-            "expected go_compile_src in list: {:?}",
-            names
-        );
-    }
-
-    #[tokio::test]
-    async fn test_simple_lib_go_compile_src_group() {
-        require_go!();
-        let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("", "go_compile_src"))
-            .await
-            .unwrap();
-        // A transparent `group` labeled `go_compile_src`, aggregating the
-        // package's compile sources as its `deps`.
-        assert_eq!(resp.target_spec.driver, "group");
-        assert!(
-            resp.target_spec
-                .labels
-                .contains(&"go_compile_src".to_string()),
-            "expected go_compile_src label: {:?}",
-            resp.target_spec.labels
-        );
-        let deps = match resp.target_spec.config.get("deps").unwrap() {
-            Value::List(v) => v,
-            other => panic!("expected deps list, got {other:?}"),
-        };
-        assert!(
-            deps.iter()
-                .any(|d| matches!(d, Value::String(s) if s.ends_with(".go"))),
-            "compile-src group must include the package's .go source(s): {:?}",
-            deps
-        );
     }
 
     #[tokio::test]
@@ -3823,36 +3665,6 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
-    async fn test_go_compile_src_includes_embeds() {
-        require_go!();
-        let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "go_compile_src"))
-            .await
-            .unwrap();
-        let deps: Vec<&str> = match resp.target_spec.config.get("deps").unwrap() {
-            Value::List(v) => v
-                .iter()
-                .map(|d| match d {
-                    Value::String(s) => s.as_str(),
-                    _ => panic!("expected string dep"),
-                })
-                .collect(),
-            other => panic!("expected deps list, got {other:?}"),
-        };
-        // The compile-src group carries both the Go sources and the embedded
-        // asset (server.go embeds static/index.html).
-        assert!(
-            deps.iter().any(|s| s.contains(".go")),
-            "go_compile_src must include Go sources: {deps:?}"
-        );
-        assert!(
-            deps.iter().any(|s| s.contains("index.html")),
-            "go_compile_src must include the embedded asset: {deps:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_simple_lib_build_lib_no_embed() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
@@ -3875,22 +3687,22 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
-    async fn test_go_compile_src_deps_are_pluginfs_go_addrs() {
+    async fn test_simple_lib_build_lib_default_deps_are_pluginfs_addrs() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        // The compile sources now live on the `go_compile_src` group (build_lib
-        // depends on it); its deps must be the package's pluginfs `.go` files.
-        let resp = provider_get(&p, make_addr("", "go_compile_src"))
-            .await
-            .unwrap();
-        let src_list = match resp.target_spec.config.get("deps").unwrap() {
+        let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let src_list = match deps.get("").unwrap() {
             Value::List(v) => v,
-            _ => panic!("expected deps list"),
+            _ => panic!("expected list"),
         };
         assert!(
             !src_list.is_empty(),
-            "go_compile_src must not be empty for a package with go files"
+            "default dep group must not be empty for a package with go files"
         );
         for entry in src_list {
             let s = match entry {
@@ -3903,7 +3715,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 s
             );
             assert!(
-                s.contains(".go"),
+                s.ends_with(".go") || s.contains(".go"),
                 "src dep must reference a .go file: {}",
                 s
             );
