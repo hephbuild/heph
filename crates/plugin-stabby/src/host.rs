@@ -6,6 +6,7 @@ use crate::abi::{
     QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
     StableFunctionRegistry, StableLogSink, StableRead,
 };
+use crate::vtable::dynify;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -61,11 +62,10 @@ impl StableArtifactContent for HostArtifactContent {
             .content
             .reader()
             .unwrap_or_else(|_| Box::new(std::io::empty()));
-        stabby::boxed::Box::new(HostRead {
+        dynify(stabby::boxed::Box::new(HostRead {
             inner: std::cell::RefCell::new(inner),
             buf: std::cell::RefCell::new(vec![0u8; READ_CHUNK]),
-        })
-        .into()
+        }))
     }
 
     extern "C" fn hashout(&self) -> SString {
@@ -98,7 +98,7 @@ pub struct HostLogSink;
 impl HostLogSink {
     /// Wrap as an ABI-stable [`DynLogSink`] to pass over the seam.
     pub fn wrap() -> DynLogSink {
-        stabby::boxed::Box::new(HostLogSink).into()
+        dynify(stabby::boxed::Box::new(HostLogSink))
     }
 }
 
@@ -147,13 +147,13 @@ pub struct HostFunctionRegistry {
 impl HostFunctionRegistry {
     /// Wrap the aggregate registry as an ABI-stable [`DynFunctionRegistry`].
     pub fn wrap(inner: Arc<ProviderFunctionRegistry>) -> DynFunctionRegistry {
-        stabby::boxed::Box::new(HostFunctionRegistry { inner }).into()
+        dynify(stabby::boxed::Box::new(HostFunctionRegistry { inner }))
     }
 }
 
 impl StableFunctionRegistry for HostFunctionRegistry {
     extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             let req = match pb::CallRegisteredRequest::decode(&req[..]) {
                 Ok(r) => r,
                 Err(e) => return unary(err_body(format!("call_registered decode: {e}"))),
@@ -187,8 +187,7 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                 })),
                 Err(e) => unary(err_body(format!("{e:#}"))),
             }
-        })
-        .into()
+        }))
     }
 }
 
@@ -200,7 +199,7 @@ pub struct HostExecutor {
 impl HostExecutor {
     /// Wrap a per-request engine executor as an ABI-stable [`DynExecutor`].
     pub fn wrap(inner: Arc<dyn ProviderExecutor>) -> DynExecutor {
-        stabby::boxed::Box::new(HostExecutor { inner }).into()
+        dynify(stabby::boxed::Box::new(HostExecutor { inner }))
     }
 }
 
@@ -242,7 +241,7 @@ impl StableExecutor for HostExecutor {
     }
 
     extern "C" fn result<'a>(&'a self, addr: StableAddr) -> DynFuture<'a, ResultOutcome> {
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             let parsed = addr_from_stable(&addr);
             match self.inner.result(&parsed).await {
                 Ok(eres) => {
@@ -252,10 +251,10 @@ impl StableExecutor for HostExecutor {
                     // guest. Nothing is buffered whole here.
                     let mut artifacts: SVec<DynArtifact> = SVec::new();
                     for art in eres.artifacts.iter() {
-                        let handle: DynArtifact = stabby::boxed::Box::new(HostArtifactContent {
-                            content: Arc::clone(art),
-                        })
-                        .into();
+                        let handle: DynArtifact =
+                            dynify(stabby::boxed::Box::new(HostArtifactContent {
+                                content: Arc::clone(art),
+                            }));
                         artifacts.push(handle);
                     }
                     ResultOutcome {
@@ -274,8 +273,7 @@ impl StableExecutor for HostExecutor {
                     artifacts: SVec::new(),
                 },
             }
-        })
-        .into()
+        }))
     }
 
     extern "C" fn query<'a>(
@@ -283,7 +281,7 @@ impl StableExecutor for HostExecutor {
         matcher_pb: SVec<u8>,
         extra_skip: SVec<SString>,
     ) -> DynFuture<'a, QueryOutcome> {
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             let matcher = match plugin_abi::pb::Matcher::decode(&matcher_pb[..]) {
                 Ok(m) => plugin_abi::convert::matcher_from_pb(m),
                 Err(e) => {
@@ -307,7 +305,6 @@ impl StableExecutor for HostExecutor {
                     addrs: SVec::new(),
                 },
             }
-        })
-        .into()
+        }))
     }
 }

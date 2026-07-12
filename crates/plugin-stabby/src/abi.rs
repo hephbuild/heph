@@ -2,6 +2,10 @@
 //! cdylib boundary. Pure stabby — no domain deps — so both host and guest depend
 //! on the exact same layout. Conversions to/from the engine's native types live
 //! in [`crate::host`] / [`crate::guest`].
+//!
+//! Every `Dyn…` handle below must be built with [`crate::vtable::dynify`], never a
+//! bare `.into()`: stabby's process-global vtable registry corrupts if one thread
+//! registers a first-use vtable while another reads the registry.
 
 // Engine futures are `Send` but not `Sync` (BoxFuture), so the ABI returns the
 // Send-only stabby future (`DynFuture` would additionally require `Sync`).
