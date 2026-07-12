@@ -1,0 +1,24 @@
+[package]
+name = "plugin-http"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hmodel = { package = "model", path = "../model" }
+hplugin = { package = "plugin", path = "../plugin" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+anyhow = "1.0.102"
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1.89"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+sha2 = "0.10"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

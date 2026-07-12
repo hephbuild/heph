@@ -6,6 +6,7 @@
 use anyhow::Context as _;
 use heph::pluginbuildfile;
 use heph::pluginexec;
+use heph::pluginhttp;
 use heph::pluginstatictarget;
 use htestkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
 use plugin_go::plugingo;
@@ -199,7 +200,7 @@ fn make_workspace_ordered(
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
         .with_managed_driver(Box::new(plugingo::GoGolistDriver::new()))
         .with_managed_driver(Box::new(plugingo::GoToolchainDriver))
-        .with_managed_driver(Box::new(plugingo::GoGovetDriver))
+        .with_managed_driver(Box::new(pluginhttp::Driver))
         .with_managed_driver(Box::new(plugingo::GoCompileDriver::new()))
         .with_managed_driver(Box::new(plugingo::GoTestmainDriver))
         .with_managed_driver(Box::new(plugingo::GoLintDriver::new()))

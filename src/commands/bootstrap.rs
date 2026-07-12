@@ -7,7 +7,9 @@ use tokio::sync::mpsc;
 
 use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
-use crate::{engine, pluginbuildfile, pluginexec, pluginhostbin, pluginnix, plugintextfile};
+use crate::{
+    engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, plugintextfile,
+};
 
 /// Builds the multi-thread runtime used by every command entry point.
 ///
@@ -110,6 +112,9 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
     e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
     e.register_driver(|_| Box::new(plugintextfile::Driver))?;
+    // `http_fetch`: downloads a URL (templated over the target's addr args) into a
+    // cacheable file output — how tool binaries are provisioned off the internet.
+    e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
@@ -237,6 +242,7 @@ mod tests {
         e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
         e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
         e.register_driver(|_| Box::new(plugintextfile::Driver))?;
+        e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
         e.register_managed_driver(|_| {
             Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
         })?;

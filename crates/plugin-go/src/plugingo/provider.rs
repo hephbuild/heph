@@ -52,12 +52,15 @@ pub struct Config {
     /// absent here downloads unverified (the toolchain driver warns); supply an
     /// entry to enforce verification. Empty for `gotool = "host"`.
     pub sdk_checksums: HashMap<String, String>,
-    /// Which `heph-govet` binary the lint/format targets run. Either a heph
-    /// release tag (downloaded from that release —
-    /// `//@heph/go/govet/<tag>:heph-govet`) or [`govet::SOURCE`] (build
-    /// `//tools/heph-govet:build` from the workspace). Set via the optional
-    /// `govet` provider option; defaults to this plugin's own release tag, or
-    /// `source` on a dev build (see [`govet::default_spec`]).
+    /// Addr of the `heph-govet` binary the lint/format targets exec. Defaults to
+    /// [`govet::default_addr`] — the `http_fetch` target that downloads the
+    /// binary published in this plugin's own heph release. Point it at a build
+    /// target (e.g. `//tools/heph-govet:build`, inside heph's own repo) to use a
+    /// from-source binary instead. Set via the optional `govet` provider option.
+    ///
+    /// The addr is taken verbatim if it carries args; otherwise the host's go
+    /// factors (`goos`/`goarch`) are added, since the tool always runs natively
+    /// (see [`ProviderInner::govet_tool_addr`]).
     pub govet: String,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
@@ -84,7 +87,7 @@ impl Default for Config {
         Self {
             go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
             sdk_checksums: HashMap::new(),
-            govet: govet::default_spec(),
+            govet: govet::default_addr(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -107,7 +110,7 @@ pub(crate) struct ProviderInner {
     /// [`Config::sdk_checksums`]). Also carries the optional `heph-govet` binary
     /// checksums, under [`govet::checksum_key`]'s `govet/…` namespace.
     sdk_checksums: HashMap<String, String>,
-    /// `heph-govet` binary selection: release tag or `source` (see [`Config::govet`]).
+    /// Addr of the `heph-govet` binary lint/format exec (see [`Config::govet`]).
     govet: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
@@ -250,12 +253,12 @@ impl Provider {
         // so `gotool = "host"` needs none.
         let sdk_checksums: HashMap<String, String> =
             hplugin::config::decode_opt(opts, "go provider", "checksums")?.unwrap_or_default();
-        // Optional: which `heph-govet` binary lint/format run. Unset → the
-        // release this plugin was built from (see `govet::default_spec`), which
-        // published the matching binary; `"source"` builds it from
-        // `//tools/heph-govet` (heph's own repo only).
+        // Optional: the addr of the `heph-govet` binary lint/format exec. Unset →
+        // the `http_fetch` target that downloads the binary published in this
+        // plugin's own release (see `govet::default_addr`). Point it at a build
+        // target (`//tools/heph-govet:build`) to run one built from source.
         let govet: String = hplugin::config::decode_opt(opts, "go provider", "govet")?
-            .unwrap_or_else(govet::default_spec);
+            .unwrap_or_else(govet::default_addr);
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
@@ -809,11 +812,17 @@ const GOLIST_TARGET_NAMES: &[&str] = &[
 ];
 
 /// Workspace-relative package of heph's own go/analysis unitchecker binary
-/// (`heph-govet`) — built as an ordinary `build` (package main) target like any
-/// other first-party binary. Used only under `govet = "source"`: this package
-/// exists in the heph repo, not in a workspace consuming the plugin, which
-/// downloads the released binary instead (see [`govet`]).
+/// (`heph-govet`), built as an ordinary `build` (package main) target like any
+/// other first-party binary. It exists only in heph's repo — which is why the
+/// `govet` option points at it from *there* (`govet = "//tools/heph-govet:build"`)
+/// while every other workspace uses the default download target (see [`govet`]).
+/// Referenced by the tests that exercise the from-source flavor.
+#[cfg(test)]
 const GOVET_TOOL_PKG: &str = "tools/heph-govet";
+/// The `govet` option heph's own repo (and this crate's tests) uses: build the
+/// tool from source rather than download a release that a dev build has none of.
+#[cfg(test)]
+const GOVET_SOURCE_ADDR: &str = "//tools/heph-govet:build";
 
 /// First-party iff the dep package is neither stdlib (`@heph/go/std/…`) nor
 /// thirdparty (`…@heph/go/thirdparty/…`). `go_lint` generates facts deps only
@@ -1211,17 +1220,17 @@ impl ProviderInner {
             return Ok(GetResponse { target_spec: spec });
         }
 
-        // `heph-govet`, the analysis/format driver binary the lint and format
-        // targets exec: `//@heph/go/govet/<tag>:heph-govet` downloads the binary
-        // published in heph release `<tag>` for the host platform. Only reached
-        // when `govet` selects a release (the `source` sentinel resolves to the
-        // in-workspace `//tools/heph-govet:build` instead).
+        // `heph-govet`, the analysis/format binary the lint and format targets
+        // exec: `//@heph/go/govet/<tag>:heph-govet` is an `http_fetch` over the
+        // asset published in heph release `<tag>` (the URL templates over this
+        // addr's `goos`/`goarch` args). This is what the `govet` option defaults
+        // to; pointing it at a build target instead never reaches here.
         if addr.name == govet::GOVET_NAME
             && let Some(tag) = govet::tag_from_pkg(addr.package.as_str())
         {
-            let (goos, goarch) = (current_goos(), current_goarch());
-            let sha256 = govet::expected_sha256(&self.sdk_checksums, tag, &goos, &goarch);
-            let spec = govet::build_spec(addr.clone(), tag, &goos, &goarch, &sha256);
+            let sha256 =
+                govet::expected_sha256(&self.sdk_checksums, tag, &factors.goos, &factors.goarch);
+            let spec = govet::build_spec(addr.clone(), tag, &sha256);
             return Ok(GetResponse { target_spec: spec });
         }
 
@@ -1488,7 +1497,7 @@ impl ProviderInner {
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
                     .await
                     .map_err(GetError::Other)?;
-                let govet_addr = self.govet_tool_addr();
+                let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
                 let config_addr = if self.workspace_root.join(".golangci.yml").exists() {
                     Some(pluginfs::file_addr(".golangci.yml"))
                 } else {
@@ -1548,7 +1557,7 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                let govet_addr = self.govet_tool_addr();
+                let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
 
                 // A workspace-root `.golangci.yml` drives linter selection. Absent
                 // → the standard analyzer set. The file is a hashed input, so a
@@ -2297,28 +2306,47 @@ impl ProviderInner {
         self.make_addr_with_name(&addr.package, "build_lib", factors)
     }
 
-    /// Addr of the `heph-govet` binary the lint and format targets exec. It runs
-    /// natively on the build host — it analyzes code for any GOOS/GOARCH but is
-    /// never itself cross-compiled — so it is always keyed by host factors, not
-    /// the analyzed target's.
+    /// Addr of the `heph-govet` binary the lint and format targets exec: the
+    /// `govet` option (default: the release-download target, see [`govet`]).
     ///
-    /// A release tag resolves to the downloaded binary published in that heph
-    /// release (`//@heph/go/govet/<tag>:heph-govet`); the `source` sentinel
-    /// resolves to a from-source build of heph's own `//tools/heph-govet`, which
-    /// only exists in the heph repo (see [`govet`]).
-    fn govet_tool_addr(&self) -> Addr {
-        if govet::is_source(&self.govet) {
-            return Addr::new(
-                PkgBuf::from(GOVET_TOOL_PKG),
-                "build".to_string(),
-                factors_to_args(&Factors {
-                    goos: current_goos(),
-                    goarch: current_goarch(),
-                    build_tags: vec![],
-                }),
+    /// The tool runs natively on the build host — it analyzes code for any
+    /// GOOS/GOARCH but is never itself cross-compiled — so an addr given without
+    /// args is keyed by the *host's* factors, not the analyzed target's. That
+    /// makes both flavors work unqualified: `//tools/heph-govet:build` builds for
+    /// the host, and the download target's URL template renders the host's asset.
+    /// An addr that carries its own args is taken verbatim.
+    fn govet_tool_addr(&self) -> anyhow::Result<Addr> {
+        let addr = hmodel::htaddr::parse_addr(&self.govet).with_context(|| {
+            format!(
+                "go provider: `govet` must be a target addr (got {:?}) — omit it to download the \
+                 released heph-govet, or point it at a build target like \
+                 \"//tools/heph-govet:build\"",
+                self.govet
+            )
+        })?;
+
+        if govet::is_dev_default(&addr) {
+            anyhow::bail!(
+                "go provider: this is a dev build of heph ({}), and no release publishes a \
+                 heph-govet binary for it — set the `govet` option to a source build \
+                 (\"//tools/heph-govet:build\") or to a released tag's download target \
+                 (\"//@heph/go/govet/<tag>:heph-govet\")",
+                hcore::version::VERSION
             );
         }
-        govet::govet_addr(&self.govet)
+
+        if !addr.args.is_empty() {
+            return Ok(addr);
+        }
+        Ok(Addr::new(
+            addr.package.clone(),
+            addr.name.clone(),
+            factors_to_args(&Factors {
+                goos: current_goos(),
+                goarch: current_goarch(),
+                build_tags: vec![],
+            }),
+        ))
     }
 
     fn make_addr_with_name(
@@ -3160,56 +3188,105 @@ mod tests {
         Addr::new(PkgBuf::from(package), name.to_string(), Default::default())
     }
 
-    /// A provider whose `govet` option pins release `tag` (the released-build
-    /// path — a dev build defaults to `source` instead).
-    fn provider_with_govet(root: PathBuf, spec: &str) -> Provider {
+    /// A provider whose `govet` option is `addr` (the option is an addr: a build
+    /// target for a from-source tool, or a download target).
+    fn provider_with_govet(root: PathBuf, addr: &str) -> Provider {
         Provider::with_config(
             root,
             Config {
-                govet: spec.to_string(),
+                govet: addr.to_string(),
                 ..Default::default()
             },
         )
         .expect("build provider")
     }
 
+    /// A `govet` build addr resolves verbatim, with the *host's* factors added:
+    /// the tool always runs natively, whatever platform the analyzed code targets.
     #[test]
-    fn test_govet_tool_addr_source_builds_from_workspace() {
+    fn test_govet_tool_addr_source_build_gets_host_factors() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let p = provider_with_govet(tmp.path().to_path_buf(), govet::SOURCE);
-        let addr = p.inner.govet_tool_addr();
-        assert_eq!(addr.package.as_str(), "tools/heph-govet");
+        let p = provider_with_govet(tmp.path().to_path_buf(), GOVET_SOURCE_ADDR);
+        let addr = p.inner.govet_tool_addr().expect("resolve govet addr");
+        assert_eq!(addr.package.as_str(), GOVET_TOOL_PKG);
         assert_eq!(addr.name, "build");
+        assert_eq!(addr.args.get("goos"), Some(&current_goos()));
+        assert_eq!(addr.args.get("goarch"), Some(&current_goarch()));
     }
 
     #[test]
-    fn test_govet_tool_addr_release_downloads_published_binary() {
+    fn test_govet_tool_addr_defaults_to_the_release_download_target() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let p = provider_with_govet(tmp.path().to_path_buf(), "v0.1.234");
-        let addr = p.inner.govet_tool_addr();
+        let p = provider_with_govet(
+            tmp.path().to_path_buf(),
+            "//@heph/go/govet/v0.1.234:heph-govet",
+        );
+        let addr = p.inner.govet_tool_addr().expect("resolve govet addr");
         assert_eq!(addr.package.as_str(), "@heph/go/govet/v0.1.234");
         assert_eq!(addr.name, govet::GOVET_NAME);
+        // The download target renders its URL from these.
+        assert_eq!(addr.args.get("goos"), Some(&current_goos()));
     }
 
-    /// The synthesized download target: `//@heph/go/govet/<tag>:heph-govet`
-    /// resolves without a `go list` (it is answered before package decoding, like
-    /// the toolchain), and carries the tag + host platform the driver fetches.
+    /// Explicit args win over the host default — e.g. pinning a linux tool binary.
+    #[test]
+    fn test_govet_tool_addr_keeps_explicit_args() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = provider_with_govet(
+            tmp.path().to_path_buf(),
+            "//@heph/go/govet/v0.1.234:heph-govet@goos=linux,goarch=amd64",
+        );
+        let addr = p.inner.govet_tool_addr().expect("resolve govet addr");
+        assert_eq!(addr.args.get("goos"), Some(&"linux".to_string()));
+        assert_eq!(addr.args.get("goarch"), Some(&"amd64".to_string()));
+    }
+
+    /// A dev build's default addr points at a release tag no CI run ever published.
+    /// Fail with the fix rather than let it 404 mid-build.
+    #[test]
+    fn test_govet_tool_addr_dev_default_is_a_config_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(tmp.path().to_path_buf()).expect("provider");
+        let err = p
+            .inner
+            .govet_tool_addr()
+            .expect_err("dev build has no released heph-govet");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dev build"), "got: {msg}");
+        assert!(msg.contains("//tools/heph-govet:build"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_govet_tool_addr_rejects_a_non_addr() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = provider_with_govet(tmp.path().to_path_buf(), "source");
+        let err = p.inner.govet_tool_addr().expect_err("not an addr");
+        assert!(
+            format!("{err:#}").contains("must be a target addr"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The synthesized download target: `//@heph/go/govet/<tag>:heph-govet` is an
+    /// `http_fetch` over the release asset. It resolves without a `go list` (it is
+    /// answered before package decoding, like the toolchain), and the URL templates
+    /// over the addr args so the driver fetches the host's asset.
     #[tokio::test]
-    async fn test_get_govet_download_target() {
+    async fn test_get_govet_download_target_is_an_http_fetch() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = Provider::new(tmp.path().to_path_buf()).expect("provider");
         let resp = provider_get(&p, govet::govet_addr("v0.1.234"))
             .await
             .expect("govet target resolves");
-        assert_eq!(resp.target_spec.driver, "go_govet");
+        assert_eq!(resp.target_spec.driver, "http_fetch");
         assert!(matches!(
-            resp.target_spec.config.get("tag"),
-            Some(Value::String(s)) if s == "v0.1.234"
+            resp.target_spec.config.get("url"),
+            Some(Value::String(u)) if u.ends_with("/v0.1.234/heph-govet_{goos}_{goarch}")
         ));
-        assert!(matches!(
-            resp.target_spec.config.get("goos"),
-            Some(Value::String(s)) if *s == current_goos()
-        ));
+        assert_eq!(
+            resp.target_spec.config.get("executable"),
+            Some(&Value::Bool(true))
+        );
     }
 
     /// An explicit `checksums` entry pins the binary of a tag this build knows
@@ -3644,7 +3721,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_dep_lint_driver_and_facts_wiring() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        // From-source govet, as heph's own repo configures it.
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
         // The analyze target (`_lint`) runs heph-govet and produces facts+report.
         let resp = provider_get(&p, make_addr("cmd", "_lint")).await.unwrap();
@@ -3660,8 +3738,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "_lint must stage the heph-govet tool: got {:?}",
             deps.keys().collect::<Vec<_>>()
         );
-        // Dev builds default to `govet = "source"`, so the staged tool is heph's
-        // own in-workspace build of it.
+        // `govet` points at a build target, so the staged tool is the one built
+        // from heph's own workspace sources.
         let govet_dep = match deps.get("govet_tool").expect("govet_tool group") {
             Value::List(items) => match items.first().expect("one govet dep") {
                 Value::String(s) => s.clone(),
@@ -3695,15 +3773,18 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(out.contains_key("facts") && out.contains_key("report"));
     }
 
-    /// On a released build (`govet` = a heph tag — what every consuming workspace
-    /// gets), the analyze and format targets stage the *downloaded* `heph-govet`
-    /// published in that release, not a from-source build: a workspace consuming
-    /// the plugin has no `tools/heph-govet` package to build.
+    /// With `govet` left at its default (the release download target — what every
+    /// consuming workspace gets), the analyze and format targets stage the
+    /// *downloaded* heph-govet, not a from-source build: a workspace consuming the
+    /// plugin has no `tools/heph-govet` package to build.
     #[tokio::test]
-    async fn test_lint_and_format_stage_downloaded_govet_on_release_build() {
+    async fn test_lint_and_format_stage_downloaded_govet_by_default() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
-        let p = provider_with_govet(sandbox.path().to_path_buf(), "v0.1.234");
+        let p = provider_with_govet(
+            sandbox.path().to_path_buf(),
+            "//@heph/go/govet/v0.1.234:heph-govet",
+        );
 
         for name in ["_lint", "format", "format-fix"] {
             let resp = provider_get(&p, make_addr("cmd", name)).await.unwrap();
@@ -3799,7 +3880,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_format_targets_resolve() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
         let check = provider_get(&p, make_addr("cmd", "format")).await.unwrap();
         assert_eq!(check.target_spec.driver, "go_format_check");

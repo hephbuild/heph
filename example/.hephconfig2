@@ -28,6 +28,14 @@ plugins:
         "1.26.4/linux/arm64": "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768"
         "1.26.4/darwin/amd64": "05dc9b5f9997744520aaebb3d5deaa7c755371aebbfb7f97c2511a9f3367538d"
         "1.26.4/darwin/arm64": "b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53"
+      # The `heph-govet` binary the `lint` / `format` targets exec, as an addr.
+      # Defaults to `//@heph/go/govet/<tag>:heph-govet` — an `http_fetch` target
+      # that downloads the binary published in the plugin's own heph release, so
+      # a released plugin needs no configuration at all. A plugin built from
+      # source (what `install-go-plugin` installs here) reports v0.0.0-dev, which
+      # no release publishes: point it at a build target in *this* workspace, or
+      # at a released tag's download target.
+      #govet: "//@heph/go/govet/v0.1.234:heph-govet"
 #fuse:
 #  enabled: true
 # Remote (shared) caches. Each entry is keyed by a name and has a `uri` plus

@@ -29,6 +29,7 @@ pub use hmodel::{htaddr, htmatcher, htpkg, htquery};
 pub use hplugin::htspec;
 pub use hplugin_buildfile::pluginbuildfile;
 pub use hplugin_exec::pluginexec;
+pub use hplugin_http::pluginhttp;
 pub use hplugin_nix::pluginnix;
 pub use hplugin_query::pluginquery;
 #[cfg(target_os = "macos")]
