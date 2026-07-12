@@ -1,5 +1,6 @@
 mod common;
 
+use anyhow::Context as _;
 use common::{artifact_paths, fixture, make_workspace, make_workspace_host, require_go};
 
 #[tokio::test]
@@ -229,5 +230,31 @@ async fn test_embed_mixed_build_testmain_lib() -> anyhow::Result<()> {
         !artifact_paths(&result).is_empty(),
         "testmain_lib should compile"
     );
+    Ok(())
+}
+
+/// The embedded asset is produced by a codegen target that itself runs a Go tool
+/// built in-tree — so the asset's target transitively depends on that package's
+/// `_golist`, while `_golist`'s own source set is a *query* over the codegen root.
+/// A query candidate that cycles is skipped, and which side of a cycle is detected
+/// depends on scheduling — so this must not resolve differently run to run.
+///
+/// Run twice: the failure this guards ("//go:embed pattern(s) matched no files")
+/// is scheduling-dependent, so a single green run proves little.
+#[tokio::test]
+async fn test_embed_generated_by_in_tree_tool_resolves_deterministically() -> anyhow::Result<()> {
+    require_go!();
+    // Host go: a hermetic SDK would re-download per attempt.
+    for attempt in 0..2 {
+        let ws = make_workspace_host(fixture("embed_gen_tool")?)?;
+        let result = ws
+            .run("//app:build_lib")
+            .await
+            .with_context(|| format!("attempt {attempt}"))?;
+        assert!(
+            !artifact_paths(&result).is_empty(),
+            "attempt {attempt}: build_lib must compile"
+        );
+    }
     Ok(())
 }
