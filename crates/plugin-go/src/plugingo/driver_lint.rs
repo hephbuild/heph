@@ -13,6 +13,13 @@
 //!     a separate cheap target so facts are produced/cached even when a package
 //!     currently has findings.
 //!
+//! Two user-facing targets sit on that one analyze unit:
+//!
+//!   - `lint-check` (`go_lint_gate`) — the read-only checker: consumes the report,
+//!     fails on findings, writes nothing;
+//!   - `lint` (`go_lint_fix`) — the fixer: applies the report's suggested fixes
+//!     back into the sources (`codegen=in_place`).
+//!
 //! This is the nogo model. Per-package caching falls out of the engine's
 //! content-hashing of inputs: a package re-lints only when its own sources, a
 //! dep's archive, or a dep's facts change. Interprocedural analyzers (printf
@@ -637,7 +644,7 @@ impl ManagedDriver for GoLintGateDriver {
 // Fix driver: applies go/analysis suggested fixes back into source (codegen).
 //
 // `_lint`'s `-json` report already carries each diagnostic's `suggested_fixes`
-// (byte-offset text edits). `go_lint_fix` (the user-facing `lint-fix` target)
+// (byte-offset text edits). `go_lint_fix` (the user-facing `lint` target)
 // consumes that report plus the package's own `.go` sources, applies the edits,
 // and declares the rewritten sources as `codegen=in_place` outputs — so the
 // engine writes them back over the tracked source files. Purely mechanical: no
@@ -646,7 +653,7 @@ impl ManagedDriver for GoLintGateDriver {
 
 /// A single suggested-fix text edit: replace bytes `[start, end)` of `file`
 /// (basename) with `new`. `start`/`end` are 0-based byte offsets into the file
-/// as the analyzer parsed it; `_lint` and `lint-fix` stage byte-identical
+/// as the analyzer parsed it; `_lint` and `lint` stage byte-identical
 /// sources, so the offsets line up.
 struct FixEdit {
     start: usize,
@@ -1042,7 +1049,10 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         addr: p.addr,
         driver: "go_lint".to_string(),
         config,
-        labels: vec!["go-lint".to_string()],
+        // `_lint` is the analyze unit both user-facing targets consume, not one of
+        // them: it gets its own label so a `--label go-lint` (fixer) or
+        // `--label go-lint-check` sweep doesn't also select it.
+        labels: vec!["go-lint-analyze".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -1065,17 +1075,16 @@ pub fn build_lint_gate_spec(addr: Addr, analyze_addr: &Addr) -> TargetSpec {
         addr,
         driver: "go_lint_gate".to_string(),
         config,
-        // The user-facing check target: `go-lint` selects it among go targets,
-        // `lint` selects every language's check gate at once (`heph run
-        // --label lint //...`). `_lint` carries only `go-lint` — it is the
-        // analyze unit the gate consumes, not a gate itself.
-        labels: vec!["go-lint".to_string(), "lint".to_string()],
+        // The read-only checker (`lint-check`): `go-lint-check` selects it among go
+        // targets, `lint-check` selects every language's checker at once
+        // (`--label lint-check //...`). The plain `lint` label belongs to the fixer.
+        labels: vec!["go-lint-check".to_string(), "lint-check".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
     }
 }
 
-/// Build the user-facing `lint-fix` spec. Depends on the `report` output of the
+/// Build the user-facing `lint` (fixer) spec. Depends on the `report` output of the
 /// analyze target (`_lint`) plus the package's own `.go` sources, applies each
 /// diagnostic's suggested fix, and rewrites the sources in place (codegen).
 ///
@@ -1116,10 +1125,10 @@ pub fn build_lint_fix_spec(
         addr,
         driver: "go_lint_fix".to_string(),
         config,
-        // The fix flavor is labelled apart from the check gate: `go-lint-fix`
-        // (this language's fixer) and `fix` (every language's), so a
-        // `--label lint` sweep never rewrites sources.
-        labels: vec!["go-lint-fix".to_string(), "fix".to_string()],
+        // The plain `lint` target is the FIXER, so it owns the plain labels:
+        // `go-lint` (this language's) and `lint` (every language's), plus `fix` for
+        // a fixers-only sweep. Checking without rewriting is `lint-check`.
+        labels: vec!["go-lint".to_string(), "lint".to_string(), "fix".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -1265,34 +1274,36 @@ mod tests {
         assert!(out.contains_key("report"));
     }
 
+    /// `_lint` is the analyze unit, not a user-facing target: its label keeps it out
+    /// of both the `go-lint` (fixer) and `go-lint-check` (checker) sweeps.
     #[test]
-    fn has_go_lint_label() {
-        assert!(spec(&[], &[]).labels.contains(&"go-lint".to_string()));
+    fn analyze_unit_has_its_own_label() {
+        assert_eq!(spec(&[], &[]).labels, vec!["go-lint-analyze"]);
     }
 
-    /// The check gate carries the cross-language `lint` label as well as `go-lint`,
-    /// so `--label lint` sweeps every language's gate. The fixer carries `fix` (and
-    /// `go-lint-fix`) instead — never `lint` — so a check sweep never rewrites source.
+    /// `lint` fixes and `lint-check` only reports, and the labels say so: the fixer
+    /// owns the plain `go-lint`/`lint` labels (plus `fix`), the checker owns
+    /// `go-lint-check`/`lint-check`. So `--label lint-check` can never rewrite source.
     #[test]
-    fn gate_and_fix_labels_separate_checking_from_fixing() {
+    fn check_and_fix_labels_separate_checking_from_fixing() {
         let analyze = Addr::new(
             PkgBuf::from("mylib"),
             "_lint".to_string(),
             Default::default(),
         );
-        let gate = build_lint_gate_spec(addr("lint"), &analyze);
-        assert_eq!(gate.labels, vec!["go-lint", "lint"]);
+        let check = build_lint_gate_spec(addr("lint-check"), &analyze);
+        assert_eq!(check.labels, vec!["go-lint-check", "lint-check"]);
 
         let fix = build_lint_fix_spec(
-            addr("lint-fix"),
+            addr("lint"),
             &analyze,
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
         );
-        assert_eq!(fix.labels, vec!["go-lint-fix", "fix"]);
+        assert_eq!(fix.labels, vec!["go-lint", "lint", "fix"]);
         assert!(
-            !fix.labels.contains(&"lint".to_string()),
-            "a `--label lint` sweep must not pick up the fixer"
+            !check.labels.contains(&"fix".to_string()),
+            "a `--label fix` sweep must not pick up the read-only checker"
         );
     }
 
@@ -1359,7 +1370,7 @@ mod tests {
             "_lint".to_string(),
             Default::default(),
         );
-        let s = build_lint_gate_spec(addr("lint"), &analyze);
+        let s = build_lint_gate_spec(addr("lint-check"), &analyze);
         assert_eq!(s.driver, "go_lint_gate");
         let deps = match s.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -1498,7 +1509,7 @@ mod tests {
             Default::default(),
         );
         let s = build_lint_fix_spec(
-            addr("lint-fix"),
+            addr("lint"),
             &analyze,
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
@@ -1548,7 +1559,7 @@ mod tests {
             Default::default(),
         );
         let spec = build_lint_fix_spec(
-            addr("lint-fix"),
+            addr("lint"),
             &analyze,
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],

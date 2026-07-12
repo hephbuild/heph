@@ -655,10 +655,10 @@ impl ProviderInner {
                             "build_lib",
                             "build",
                             "embed",
+                            "lint-check",
                             "lint",
-                            "lint-fix",
+                            "format-check",
                             "format",
-                            "format-fix",
                         ]
                     } else {
                         &[
@@ -666,10 +666,10 @@ impl ProviderInner {
                             "build_lib",
                             "build",
                             "embed",
+                            "lint-check",
                             "lint",
-                            "lint-fix",
+                            "format-check",
                             "format",
-                            "format-fix",
                             "embed_xtest",
                             "build_test",
                             "test",
@@ -804,11 +804,11 @@ const GOLIST_TARGET_NAMES: &[&str] = &[
     "build_lib",
     "build",
     "embed",
+    "lint-check",
     "lint",
-    "lint-fix",
     "_lint",
+    "format-check",
     "format",
-    "format-fix",
 ];
 
 /// Workspace-relative package of heph's own go/analysis unitchecker binary
@@ -1467,10 +1467,10 @@ impl ProviderInner {
                 };
                 Ok(GetResponse { target_spec: spec })
             }
-            // User-facing gate: depends on `_lint`'s report and fails on findings.
-            // `_lint` always exits 0 so facts cache regardless; the gate is the
-            // thing that fails.
-            "lint" => {
+            // User-facing check gate: depends on `_lint`'s report and fails on
+            // findings. `_lint` always exits 0 so facts cache regardless; the gate
+            // is the thing that fails.
+            "lint-check" => {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
@@ -1479,10 +1479,11 @@ impl ProviderInner {
                     crate::plugingo::driver_lint::build_lint_gate_spec(addr.clone(), &analyze_addr);
                 Ok(GetResponse { target_spec: spec })
             }
-            // User-facing fix: consumes `_lint`'s report (suggested fixes) + the
-            // package sources, applies the edits, and rewrites the sources in
-            // place (codegen). Runs no analysis itself — reuses `_lint`'s cache.
-            "lint-fix" => {
+            // The plain `lint` target FIXES: it consumes `_lint`'s report (suggested
+            // fixes) + the package sources, applies the edits, and rewrites the
+            // sources in place (codegen). Runs no analysis itself — reuses `_lint`'s
+            // cache. Use `lint-check` to only report.
+            "lint" => {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
@@ -1499,10 +1500,10 @@ impl ProviderInner {
                 );
                 Ok(GetResponse { target_spec: spec })
             }
-            // Formatting: `format` is the check gate (fails on unformatted files),
-            // `format-fix` rewrites the sources in place (codegen). Both run the
+            // Formatting: `format-check` is the gate (fails on unformatted files),
+            // `format` rewrites the sources in place (codegen). Both run the
             // heph-govet `-format` mode; neither needs facts or dep archives.
-            "format" | "format-fix" => {
+            "format-check" | "format" => {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
@@ -1523,7 +1524,7 @@ impl ProviderInner {
                     go_files: &pkg.go_files,
                     config_addr: config_addr.as_ref(),
                 };
-                let spec = if addr.name == "format-fix" {
+                let spec = if addr.name == "format" {
                     crate::plugingo::driver_format::build_format_spec(params)
                 } else {
                     crate::plugingo::driver_format::build_format_check_spec(params)
@@ -3279,7 +3280,7 @@ mod tests {
         let sandbox = copy_fixture("with_dep");
         // Default `govet` — i.e. the dev build's (nonexistent) release target.
         let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
-        for name in ["_lint", "lint", "format", "format-fix"] {
+        for name in ["_lint", "lint-check", "lint", "format-check", "format"] {
             provider_get(&p, make_addr("cmd", name))
                 .await
                 .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
@@ -3816,7 +3817,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "//@heph/go/govet/v0.1.234:heph-govet",
         );
 
-        for name in ["_lint", "format", "format-fix"] {
+        for name in ["_lint", "format-check", "format"] {
             let resp = provider_get(&p, make_addr("cmd", name)).await.unwrap();
             let deps = match resp.target_spec.config.get("deps").unwrap() {
                 Value::Map(m) => m,
@@ -3844,7 +3845,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         require_go!();
         let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("cmd", "lint")).await.unwrap();
+        let resp = provider_get(&p, make_addr("cmd", "lint-check"))
+            .await
+            .unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint_gate");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
@@ -3864,7 +3867,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         }
     }
 
-    // The user-facing `lint-fix` target consumes `_lint`'s report (for the
+    // The user-facing `lint` (fixer) target consumes `_lint`'s report (for the
     // suggested fixes) plus the package sources, and rewrites the sources in
     // place. It resolves through the go provider like the gate.
     #[tokio::test]
@@ -3872,9 +3875,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         require_go!();
         let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("cmd", "lint-fix"))
-            .await
-            .unwrap();
+        let resp = provider_get(&p, make_addr("cmd", "lint")).await.unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint_fix");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
@@ -3905,23 +3906,23 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     // Formatting targets resolve through the go provider: `format` is the check
-    // gate (no outputs), `format-fix` rewrites sources in place (declares them).
+    // gate (no outputs), `format` rewrites sources in place (declares them).
     #[tokio::test]
     async fn test_format_targets_resolve() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
-        let check = provider_get(&p, make_addr("cmd", "format")).await.unwrap();
+        let check = provider_get(&p, make_addr("cmd", "format-check"))
+            .await
+            .unwrap();
         assert_eq!(check.target_spec.driver, "go_format_check");
         assert!(
             check.target_spec.config.get("out").is_none(),
             "check gate declares no outputs"
         );
 
-        let fix = provider_get(&p, make_addr("cmd", "format-fix"))
-            .await
-            .unwrap();
+        let fix = provider_get(&p, make_addr("cmd", "format")).await.unwrap();
         assert_eq!(fix.target_spec.driver, "go_format");
         // Stages the heph-govet tool + the package's own sources.
         let deps = match fix.target_spec.config.get("deps").unwrap() {
