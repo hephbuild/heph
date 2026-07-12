@@ -326,6 +326,15 @@ impl ManagedDriver for GoLintDriver {
             // intra-package for that one dependency only.
             let facts_group = import_path_to_facts_group(ip);
             if let Ok(facts) = self.single_staged_path(&req, &facts_group) {
+                // unitchecker gob-decodes whatever this points at, so a wrong file
+                // surfaces as a cryptic "decoding facts: unexpected EOF". The dep
+                // selects `|facts`, so the only staged file is the facts one — assert
+                // it rather than trust it.
+                anyhow::ensure!(
+                    facts.ends_with(LINT_FACTS),
+                    "staged facts for {ip} is {facts}, not a {LINT_FACTS} — the facts dep must \
+                     select the analyze target's `facts` output group"
+                );
                 package_vetx.insert(ip.clone(), facts);
             }
         }
@@ -1020,7 +1029,16 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         .map(|(import_path, dep_addr)| (import_path_to_dep_group(import_path), str_one(dep_addr)))
         .collect();
     for (import_path, lint_addr) in p.facts_libs {
-        deps.insert(import_path_to_facts_group(import_path), str_one(lint_addr));
+        // `|facts` selects the analyze target's facts output ONLY. Without it the
+        // whole `_lint` target stages — facts *and* `lint-report.json` — and the
+        // consumer, which takes the single staged path of the group, gets whichever
+        // sorts first: `lint-report.json` (`-` < `.`). unitchecker then gob-decodes
+        // the JSON report as facts ("unexpected EOF"). The gate is explicit the same
+        // way (`|report`).
+        deps.insert(
+            import_path_to_facts_group(import_path),
+            Value::List(vec![Value::String(format!("{}|facts", lint_addr.format()))]),
+        );
     }
     deps.insert(
         String::new(),
@@ -1276,6 +1294,29 @@ mod tests {
         let m = deps_map(&s);
         assert!(m.contains_key("lib_example_com_dep"), "archive group");
         assert!(m.contains_key("facts_example_com_dep"), "facts group");
+    }
+
+    /// A facts dep must select the analyze target's `facts` output group. Staging the
+    /// whole `_lint` target would also stage `lint-report.json`, which sorts *before*
+    /// `lint.facts` (`-` < `.`), so the consumer — which takes the single staged path
+    /// of the group — would hand the JSON report to unitchecker as gob facts and fail
+    /// with "unexpected EOF".
+    #[test]
+    fn facts_deps_select_the_facts_output_group() {
+        let factsdep = (
+            "example.com/dep".to_string(),
+            Addr::new(PkgBuf::from("dep"), "_lint".to_string(), Default::default()),
+        );
+        let s = spec(&[], std::slice::from_ref(&factsdep));
+        let m = deps_map(&s);
+        let facts = m
+            .get("facts_example_com_dep")
+            .and_then(|v| v.first())
+            .expect("one facts dep");
+        assert!(
+            facts.ends_with("|facts"),
+            "facts dep must select the facts output, else the report stages too: {facts}"
+        );
     }
 
     #[test]

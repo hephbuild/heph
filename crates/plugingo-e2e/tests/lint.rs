@@ -42,3 +42,22 @@ async fn test_format_check_execs_the_downloaded_govet() -> anyhow::Result<()> {
     ws.run("//lib:format-check").await?;
     Ok(())
 }
+
+/// A dependent package: its dep's facts feed the analysis. A package that exports
+/// no facts writes a **zero-byte** `lint.facts` (x/tools `Set.Encode` returns nil),
+/// and consuming that must be a no-op, not a decode failure.
+#[tokio::test]
+async fn test_lint_consumes_a_deps_empty_facts() -> anyhow::Result<()> {
+    require_go!();
+    let ws = common::make_workspace_host(common::fixture("with_dep")?)?;
+
+    // cmd imports lib, so lib's facts are wired into cmd's analysis.
+    let result = ws.run("//cmd:_lint").await?;
+
+    let paths = common::artifact_paths(&result);
+    assert!(
+        paths.iter().any(|p| p.ends_with("lint.facts")),
+        "analyze must produce facts, got {paths:?}"
+    );
+    Ok(())
+}
