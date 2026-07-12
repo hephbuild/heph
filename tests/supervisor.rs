@@ -218,19 +218,25 @@ fn supervisor_reaps_tracked_pgid_on_eof() {
 #[derive(Debug)]
 struct SocketSink(Mutex<UnixStream>);
 
-impl heph::process_supervisor::SupervisorSink for SocketSink {
-    fn track(&self, pgid: i32) -> anyhow::Result<()> {
-        let mut sock = self.0.lock().expect("lock");
-        writeln!(sock, "TRACK {pgid}")?;
+impl SocketSink {
+    fn send(&self, line: &str) -> anyhow::Result<()> {
+        let mut sock = self
+            .0
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("socket mutex poisoned"))?;
+        writeln!(sock, "{line}")?;
         sock.flush()?;
         Ok(())
     }
+}
+
+impl heph::process_supervisor::SupervisorSink for SocketSink {
+    fn track(&self, pgid: i32) -> anyhow::Result<()> {
+        self.send(&format!("TRACK {pgid}"))
+    }
 
     fn untrack(&self, pgid: i32) -> anyhow::Result<()> {
-        let mut sock = self.0.lock().expect("lock");
-        writeln!(sock, "UNTRACK {pgid}")?;
-        sock.flush()?;
-        Ok(())
+        self.send(&format!("UNTRACK {pgid}"))
     }
 
     fn register_fuse_root(&self, _root: &std::path::Path) -> anyhow::Result<()> {

@@ -101,9 +101,8 @@ pub fn load(
         // per spawn. Same older-SDK tolerance as the log sink.
         // SAFETY: get_stabbied checks the symbol's stabby type report against
         // `SetSupervisorFn` before returning it.
-        if let Ok(set_supervisor) =
-            unsafe { lib.get_stabbied::<SetSupervisorFn>(SET_SUPERVISOR_SYMBOL) }
-        {
+        let set_supervisor = unsafe { lib.get_stabbied::<SetSupervisorFn>(SET_SUPERVISOR_SYMBOL) };
+        if let Ok(set_supervisor) = set_supervisor {
             set_supervisor(crate::host::HostSupervisor::wrap());
         }
         comps
