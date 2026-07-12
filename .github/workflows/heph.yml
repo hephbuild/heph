@@ -92,12 +92,24 @@ jobs:
           go-version-file: tools/heph-govet/go.mod
           cache-dependency-path: tools/heph-govet/go.sum
 
+      # Every platform heph supports. The binary runs natively on whichever host
+      # lints, so a supported host with no published asset could not lint at all.
+      #
+      # The four cross-compiles are independent, so they run as parallel steps
+      # (`background: true` + `wait-all`) rather than a sequential loop: same
+      # runner, four concurrent `go build`s, four separate logs. Each writes its
+      # own `<name>.sha256` sidecar instead of appending to `$GITHUB_OUTPUT` —
+      # concurrent appends to that file would interleave, and the collector step
+      # below turns the sidecars into job outputs once they have all landed.
       - name: Test
         working-directory: tools/heph-govet
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: "-trimpath -buildvcs=false"
         run: go test ./...
+        background: true
 
-      - name: Build
-        id: build
+      - name: Build linux/amd64
         working-directory: tools/heph-govet
         env:
           # Reproducible-ish and lean: no VCS stamping, no debug info. The binary
@@ -105,30 +117,67 @@ jobs:
           # identity, and the plugin pins that tag.
           CGO_ENABLED: "0"
           GOFLAGS: "-trimpath -buildvcs=false"
+          GOOS: linux
+          GOARCH: amd64
+        run: "$GITHUB_WORKSPACE/.github/workflows/govet-build.sh"
+        background: true
+
+      - name: Build linux/arm64
+        working-directory: tools/heph-govet
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: "-trimpath -buildvcs=false"
+          GOOS: linux
+          GOARCH: arm64
+        run: "$GITHUB_WORKSPACE/.github/workflows/govet-build.sh"
+        background: true
+
+      - name: Build darwin/amd64
+        working-directory: tools/heph-govet
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: "-trimpath -buildvcs=false"
+          GOOS: darwin
+          GOARCH: amd64
+        run: "$GITHUB_WORKSPACE/.github/workflows/govet-build.sh"
+        background: true
+
+      - name: Build darwin/arm64
+        working-directory: tools/heph-govet
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: "-trimpath -buildvcs=false"
+          GOOS: darwin
+          GOARCH: arm64
+        run: "$GITHUB_WORKSPACE/.github/workflows/govet-build.sh"
+        background: true
+
+      # Barrier: every build (and the test run) must land before the checksums are
+      # collected and the artifacts uploaded.
+      - wait-all:
+
+      - name: Collect checksums
+        id: build
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          # Every platform heph supports. The binary runs natively on the host
-          # that lints, so a host with no asset here could not lint at all — and
-          # cross-compiling one more Go binary costs seconds, unlike the Rust
-          # matrix (which is why darwin/amd64 is built here even though its Rust
-          # artifacts are not currently published).
-          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            goos="${platform%/*}"
-            goarch="${platform#*/}"
-            name="heph-govet_${goos}_${goarch}"
-            GOOS="$goos" GOARCH="$goarch" go build -ldflags="-s -w" -o "$GITHUB_WORKSPACE/dist/$name" .
-            sha=$(sha256sum "$GITHUB_WORKSPACE/dist/$name" | cut -d' ' -f1)
+          for f in dist/*.sha256; do
+            name=$(basename "$f" .sha256)          # heph-govet_<goos>_<goarch>
+            sha=$(cat "$f")
             echo "$name $sha"
-            echo "sha256_${goos}_${goarch}=$sha" >> $GITHUB_OUTPUT
+            echo "sha256_${name#heph-govet_}=$sha" >> $GITHUB_OUTPUT
           done
 
       # Named `heph-govet_*`, so the `heph*` download pattern in `upload_artifacts`
-      # picks them up and publishes them as release assets alongside the rest.
+      # picks them up and publishes them as release assets alongside the rest. The
+      # `.sha256` sidecars are internal to this job and are not published.
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
           name: heph-govet
-          path: dist/heph-govet_*
+          # Only the binaries become release assets; the `.sha256` sidecars are
+          # internal to this job.
+          path: |
+            dist/heph-govet_*
+            !dist/*.sha256
 
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
