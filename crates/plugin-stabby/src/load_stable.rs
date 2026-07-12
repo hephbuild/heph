@@ -10,6 +10,7 @@ use crate::abi::{
     StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
+use crate::vtable::dynify;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
@@ -214,10 +215,9 @@ impl StableItemStream for HostItemStream {
 }
 
 fn host_item_stream(items: Vec<Vec<u8>>) -> DynItemStream {
-    stabby::boxed::Box::new(HostItemStream {
+    dynify(stabby::boxed::Box::new(HostItemStream {
         items: std::sync::Mutex::new(items.into_iter()),
-    })
-    .into()
+    }))
 }
 
 /// Drain a bidi `run` response stream to its terminal result. Blocking (called on a
@@ -712,10 +712,9 @@ impl StableItemStream for HostChannelItemStream {
 }
 
 fn host_channel_item_stream(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> DynItemStream {
-    stabby::boxed::Box::new(HostChannelItemStream {
+    dynify(stabby::boxed::Box::new(HostChannelItemStream {
         rx: std::sync::Mutex::new(rx),
-    })
-    .into()
+    }))
 }
 
 /// One build event, framed as the envelope `StreamItem` carrying its serde-JSON
