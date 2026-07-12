@@ -52,8 +52,9 @@ struct HttpFetchSpec {
     /// reproducible as the remote server.
     #[spec(ty = ParamType::String)]
     sha256: Option<String>,
-    /// Output filename, relative to the target's package. Defaults to the target
-    /// name.
+    /// Output filename, relative to the target's package. Defaults to the URL's
+    /// last path segment (`…/heph-govet_linux_amd64` → `heph-govet_linux_amd64`),
+    /// which is what the server is serving; set it to rename the fetched file.
     #[spec(ty = ParamType::String)]
     out: Option<String>,
     /// Mark the fetched file executable (a downloaded tool binary).
@@ -111,7 +112,11 @@ impl ManagedDriver for Driver {
         let url = render(&spec.url, &addr.args)
             .with_context(|| format!("render url of {}", addr.format()))?;
 
-        let out_rel = spec.out.unwrap_or_else(|| addr.name.clone());
+        let out_rel = match spec.out {
+            Some(out) => out,
+            None => file_name_of(&url)
+                .with_context(|| format!("{url:?} has no file name — set `out` explicitly"))?,
+        };
         let pkg = addr.package.as_str();
         let out = if pkg.is_empty() {
             out_rel
@@ -205,6 +210,20 @@ impl ManagedDriver for Driver {
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
+}
+
+/// The file name a URL fetches to: its last path segment, minus any `?query` /
+/// `#fragment`. `None` when that segment is empty (`https://x/`, a bare host, a
+/// path ending in `/`) — there is nothing to name the output after, so the target
+/// must say `out` itself.
+fn file_name_of(url: &str) -> Option<String> {
+    // Drop the scheme so `https://host` (authority only, no path) has no segment
+    // to mistake the host for.
+    let authority_and_path = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    let path = authority_and_path.split(['?', '#']).next()?;
+    let (_authority, path) = path.split_once('/')?;
+    let name = path.rsplit('/').next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Substitute `{arg}` placeholders in `template` from the target addr's `args`.
@@ -452,13 +471,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_name_of_takes_the_urls_last_segment() {
+        assert_eq!(
+            file_name_of("https://x/y/heph-govet_linux_amd64").as_deref(),
+            Some("heph-govet_linux_amd64")
+        );
+        // Query/fragment are not part of the name.
+        assert_eq!(
+            file_name_of("https://x/y/tool.tar.gz?token=abc#frag").as_deref(),
+            Some("tool.tar.gz")
+        );
+        // Nothing to name the file after → the target must say `out`.
+        assert_eq!(file_name_of("https://x/y/"), None);
+        assert_eq!(file_name_of("https://x"), None);
+    }
+
+    /// `out` defaults to the URL's last segment — the name the server serves the
+    /// file under — and is written under the target's package.
     #[tokio::test]
-    async fn parse_renders_url_from_args_and_declares_pkg_relative_output() {
+    async fn parse_defaults_out_to_the_urls_last_segment() {
+        let config = HashMap::from([(
+            "url".to_string(),
+            Value::String("https://x/rel/tool_{goos}.bin".to_string()),
+        )]);
+        let resp = Driver
+            .parse(
+                parse_req("//tools/dl:fetch@goos=linux", config),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse");
+
+        let def = resp.target_def.def::<HttpFetchDef>();
+        assert_eq!(def.url, "https://x/rel/tool_linux.bin");
+        // Named after the URL, not after the target (`fetch`).
+        assert_eq!(def.out, "tools/dl/tool_linux.bin");
+        assert!(matches!(
+            &resp.target_def.outputs[0].paths[0].content,
+            Content::FilePath(p) if p == "tools/dl/tool_linux.bin"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parse_honors_an_explicit_out_and_renders_url_from_args() {
         let config = HashMap::from([
             (
                 "url".to_string(),
-                Value::String("https://x/{goos}/tool".to_string()),
+                Value::String("https://x/{goos}/tool_{goos}".to_string()),
             ),
+            ("out".to_string(), Value::String("tool".to_string())),
             ("executable".to_string(), Value::Bool(true)),
         ]);
         let req = parse_req("//tools/dl:tool@goos=linux", config);
@@ -468,13 +530,26 @@ mod tests {
             .expect("parse");
 
         let def = resp.target_def.def::<HttpFetchDef>();
-        assert_eq!(def.url, "https://x/linux/tool");
+        assert_eq!(def.url, "https://x/linux/tool_linux");
         assert_eq!(def.out, "tools/dl/tool");
         assert!(def.executable);
-        assert!(matches!(
-            &resp.target_def.outputs[0].paths[0].content,
-            Content::FilePath(p) if p == "tools/dl/tool"
-        ));
+    }
+
+    #[tokio::test]
+    async fn parse_fails_when_the_url_names_no_file_and_out_is_absent() {
+        let config = HashMap::from([(
+            "url".to_string(),
+            Value::String("https://x/dir/".to_string()),
+        )]);
+        let err = Driver
+            .parse(
+                parse_req("//tools/dl:tool", config),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("no file name to default to");
+        assert!(format!("{err:#}").contains("set `out`"), "got: {err:#}");
     }
 
     /// The rendered URL (not the template) feeds the hash, so the same target

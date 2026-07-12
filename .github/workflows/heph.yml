@@ -67,19 +67,21 @@ jobs:
   # as a release asset (`heph-govet_<os>_<arch>`) and the plugin downloads the one
   # published in its own release.
   #
-  # Pure Go, so one runner cross-compiles every platform in ~a minute. Its
-  # per-platform SHA-256s are job outputs: the Rust `build` job bakes them into
-  # the plugin (`HEPH_GOVET_SHA256_*`), which then verifies the asset it
+  # Pure Go, so one runner cross-compiles every supported platform in ~a minute.
+  # Its per-platform SHA-256s are job outputs: the Rust `build` job bakes them
+  # into the plugin (`HEPH_GOVET_SHA256_*`), which then verifies the asset it
   # downloads — no checksum for a user to configure, and a tampered asset fails
-  # the build closed. That is why `build` waits on this job.
+  # the build closed. That baking is the only reason `build` needs this job; it
+  # deliberately depends on nothing itself (no codegen, no devenv — just the Go
+  # sources), so it runs concurrently with `gen` and adds no critical path.
   govet:
     name: Build heph-govet
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: gen
     outputs:
       sha256_linux_amd64: ${{ steps.build.outputs.sha256_linux_amd64 }}
       sha256_linux_arm64: ${{ steps.build.outputs.sha256_linux_arm64 }}
+      sha256_darwin_amd64: ${{ steps.build.outputs.sha256_darwin_amd64 }}
       sha256_darwin_arm64: ${{ steps.build.outputs.sha256_darwin_arm64 }}
     steps:
       - name: Checkout
@@ -105,10 +107,12 @@ jobs:
           GOFLAGS: "-trimpath -buildvcs=false"
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          # Only the platforms heph itself publishes a binary + plugin cdylib for
-          # — the govet binary always runs natively on the host, so any other
-          # platform would have nothing to run it.
-          for platform in linux/amd64 linux/arm64 darwin/arm64; do
+          # Every platform heph supports. The binary runs natively on the host
+          # that lints, so a host with no asset here could not lint at all — and
+          # cross-compiling one more Go binary costs seconds, unlike the Rust
+          # matrix (which is why darwin/amd64 is built here even though its Rust
+          # artifacts are not currently published).
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             goos="${platform%/*}"
             goarch="${platform#*/}"
             name="heph-govet_${goos}_${goarch}"
@@ -185,6 +189,7 @@ jobs:
           # runs on.
           HEPH_GOVET_SHA256_LINUX_AMD64: "${{needs.govet.outputs.sha256_linux_amd64}}"
           HEPH_GOVET_SHA256_LINUX_ARM64: "${{needs.govet.outputs.sha256_linux_arm64}}"
+          HEPH_GOVET_SHA256_DARWIN_AMD64: "${{needs.govet.outputs.sha256_darwin_amd64}}"
           HEPH_GOVET_SHA256_DARWIN_ARM64: "${{needs.govet.outputs.sha256_darwin_arm64}}"
         run: |
           # Go plugin cdylib carries its native extension (.so on Linux, .dylib on
