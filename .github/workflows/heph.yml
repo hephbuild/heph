@@ -61,11 +61,76 @@ jobs:
             !.devenv/
           include-hidden-files: true
 
+  # `heph-govet` — the go/analysis unitchecker + formatter binary the go plugin's
+  # lint/format targets exec. It is heph's own tool, not the user's: a workspace
+  # consuming the plugin has no `tools/heph-govet` to build it from, so it ships
+  # as a release asset (`heph-govet_<os>_<arch>`) and the plugin downloads the one
+  # published in its own release.
+  #
+  # Pure Go, so one runner cross-compiles every platform in ~a minute. Its
+  # per-platform SHA-256s are job outputs: the Rust `build` job bakes them into
+  # the plugin (`HEPH_GOVET_SHA256_*`), which then verifies the asset it
+  # downloads — no checksum for a user to configure, and a tampered asset fails
+  # the build closed. That is why `build` waits on this job.
+  govet:
+    name: Build heph-govet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: gen
+    outputs:
+      sha256_linux_amd64: ${{ steps.build.outputs.sha256_linux_amd64 }}
+      sha256_linux_arm64: ${{ steps.build.outputs.sha256_linux_arm64 }}
+      sha256_darwin_arm64: ${{ steps.build.outputs.sha256_darwin_arm64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/heph-govet/go.mod
+          cache-dependency-path: tools/heph-govet/go.sum
+
+      - name: Test
+        working-directory: tools/heph-govet
+        run: go test ./...
+
+      - name: Build
+        id: build
+        working-directory: tools/heph-govet
+        env:
+          # Reproducible-ish and lean: no VCS stamping, no debug info. The binary
+          # carries no version — the release tag it is published under is its
+          # identity, and the plugin pins that tag.
+          CGO_ENABLED: "0"
+          GOFLAGS: "-trimpath -buildvcs=false"
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          # Only the platforms heph itself publishes a binary + plugin cdylib for
+          # — the govet binary always runs natively on the host, so any other
+          # platform would have nothing to run it.
+          for platform in linux/amd64 linux/arm64 darwin/arm64; do
+            goos="${platform%/*}"
+            goarch="${platform#*/}"
+            name="heph-govet_${goos}_${goarch}"
+            GOOS="$goos" GOARCH="$goarch" go build -ldflags="-s -w" -o "$GITHUB_WORKSPACE/dist/$name" .
+            sha=$(sha256sum "$GITHUB_WORKSPACE/dist/$name" | cut -d' ' -f1)
+            echo "$name $sha"
+            echo "sha256_${goos}_${goarch}=$sha" >> $GITHUB_OUTPUT
+          done
+
+      # Named `heph-govet_*`, so the `heph*` download pattern in `upload_artifacts`
+      # picks them up and publishes them as release assets alongside the rest.
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: heph-govet
+          path: dist/heph-govet_*
+
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
-    needs: gen
+    needs: [gen, govet]
     strategy:
       fail-fast: false
       matrix:
@@ -113,6 +178,14 @@ jobs:
           CARGO_TARGET_DIR: "./target"
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           HEPH_BUILD_VERSION: "${{needs.gen.outputs.version}}"
+          # Checksums of the heph-govet assets this same run publishes. Baked into
+          # the go plugin so it verifies the binary it downloads at build time
+          # (see crates/plugin-go/src/plugingo/govet.rs). All platforms are baked
+          # into every build: the plugin picks the one matching the host it later
+          # runs on.
+          HEPH_GOVET_SHA256_LINUX_AMD64: "${{needs.govet.outputs.sha256_linux_amd64}}"
+          HEPH_GOVET_SHA256_LINUX_ARM64: "${{needs.govet.outputs.sha256_linux_arm64}}"
+          HEPH_GOVET_SHA256_DARWIN_ARM64: "${{needs.govet.outputs.sha256_darwin_arm64}}"
         run: |
           # Go plugin cdylib carries its native extension (.so on Linux, .dylib on
           # macOS); the distribution manifest records each artifact's URL
@@ -194,7 +267,7 @@ jobs:
 
   upload_artifacts:
     name: Pre-release
-    needs: [gen, build]
+    needs: [gen, govet, build]
     if: always() && needs.gen.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10

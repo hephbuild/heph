@@ -11,8 +11,8 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoCompileDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver, GoLintDriver,
-    GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoCompileDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver, GoGovetDriver,
+    GoLintDriver, GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{DynLogSink, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
@@ -79,6 +79,13 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "go_toolchain".into(),
         driver: make_dyn_managed_driver(toolchain),
+    });
+    // heph-govet: downloads the analysis/format driver binary published in this
+    // plugin's own heph release (the lint/format targets exec it).
+    let govet: Arc<dyn ManagedDriver> = Arc::new(GoGovetDriver);
+    drivers.push(NamedDriver {
+        name: "go_govet".into(),
+        driver: make_dyn_managed_driver(govet),
     });
     let compile: Arc<dyn ManagedDriver> = Arc::new(GoCompileDriver::new());
     drivers.push(NamedDriver {
