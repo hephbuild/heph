@@ -451,7 +451,10 @@ pub fn build_format_spec(p: FormatParams) -> TargetSpec {
         addr: p.addr,
         driver: "go_format".to_string(),
         config,
-        labels: vec!["go-format".to_string()],
+        // The fix flavor: `go-format-fix` (this language's) + `fix` (every
+        // language's), never the `format` check label — a `--label format` sweep
+        // must not rewrite sources.
+        labels: vec!["go-format-fix".to_string(), "fix".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -466,7 +469,9 @@ pub fn build_format_check_spec(p: FormatParams) -> TargetSpec {
         addr: p.addr,
         driver: "go_format_check".to_string(),
         config,
-        labels: vec!["go-format".to_string()],
+        // The user-facing check target: `go-format` among go targets, `format`
+        // across every language.
+        labels: vec!["go-format".to_string(), "format".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -504,6 +509,22 @@ mod tests {
             Value::Map(m) => m.iter().map(|(k, _)| k.clone()).collect(),
             _ => panic!("deps not a map"),
         }
+    }
+
+    /// Same split as lint: the check gate is `go-format` + `format`, the fixer is
+    /// `go-format-fix` + `fix`, so a `--label format` sweep never rewrites source.
+    #[test]
+    fn check_and_fix_labels_separate_checking_from_fixing() {
+        let g = govet();
+        let check = build_format_check_spec(params(&g, None));
+        assert_eq!(check.labels, vec!["go-format", "format"]);
+
+        let fix = build_format_spec(params(&g, None));
+        assert_eq!(fix.labels, vec!["go-format-fix", "fix"]);
+        assert!(
+            !fix.labels.contains(&"format".to_string()),
+            "a `--label format` sweep must not pick up the fixer"
+        );
     }
 
     #[test]

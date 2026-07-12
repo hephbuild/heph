@@ -1065,7 +1065,11 @@ pub fn build_lint_gate_spec(addr: Addr, analyze_addr: &Addr) -> TargetSpec {
         addr,
         driver: "go_lint_gate".to_string(),
         config,
-        labels: vec!["go-lint".to_string()],
+        // The user-facing check target: `go-lint` selects it among go targets,
+        // `lint` selects every language's check gate at once (`heph run
+        // --label lint //...`). `_lint` carries only `go-lint` — it is the
+        // analyze unit the gate consumes, not a gate itself.
+        labels: vec!["go-lint".to_string(), "lint".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -1112,7 +1116,10 @@ pub fn build_lint_fix_spec(
         addr,
         driver: "go_lint_fix".to_string(),
         config,
-        labels: vec!["go-lint".to_string()],
+        // The fix flavor is labelled apart from the check gate: `go-lint-fix`
+        // (this language's fixer) and `fix` (every language's), so a
+        // `--label lint` sweep never rewrites sources.
+        labels: vec!["go-lint-fix".to_string(), "fix".to_string()],
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -1261,6 +1268,32 @@ mod tests {
     #[test]
     fn has_go_lint_label() {
         assert!(spec(&[], &[]).labels.contains(&"go-lint".to_string()));
+    }
+
+    /// The check gate carries the cross-language `lint` label as well as `go-lint`,
+    /// so `--label lint` sweeps every language's gate. The fixer carries `fix` (and
+    /// `go-lint-fix`) instead — never `lint` — so a check sweep never rewrites source.
+    #[test]
+    fn gate_and_fix_labels_separate_checking_from_fixing() {
+        let analyze = Addr::new(
+            PkgBuf::from("mylib"),
+            "_lint".to_string(),
+            Default::default(),
+        );
+        let gate = build_lint_gate_spec(addr("lint"), &analyze);
+        assert_eq!(gate.labels, vec!["go-lint", "lint"]);
+
+        let fix = build_lint_fix_spec(
+            addr("lint-fix"),
+            &analyze,
+            &["//mylib:a.go".to_string()],
+            &["a.go".to_string()],
+        );
+        assert_eq!(fix.labels, vec!["go-lint-fix", "fix"]);
+        assert!(
+            !fix.labels.contains(&"lint".to_string()),
+            "a `--label lint` sweep must not pick up the fixer"
+        );
     }
 
     #[test]
