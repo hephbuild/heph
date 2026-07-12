@@ -1049,10 +1049,10 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         addr: p.addr,
         driver: "go_lint".to_string(),
         config,
-        // `_lint` is the analyze unit both user-facing targets consume, not one of
-        // them: it gets its own label so a `--label go-lint` (fixer) or
-        // `--label go-lint-check` sweep doesn't also select it.
-        labels: vec!["go-lint-analyze".to_string()],
+        // No labels: `_lint` is the analyze unit `lint` / `lint-check` consume, not
+        // a target anyone selects. Labels are the selection surface, so it has none
+        // — it is reached only as a dep.
+        labels: vec![],
         transitive: Default::default(),
         approval: Default::default(),
     }
@@ -1274,11 +1274,11 @@ mod tests {
         assert!(out.contains_key("report"));
     }
 
-    /// `_lint` is the analyze unit, not a user-facing target: its label keeps it out
-    /// of both the `go-lint` (fixer) and `go-lint-check` (checker) sweeps.
+    /// `_lint` is the analyze unit `lint`/`lint-check` consume, not something anyone
+    /// selects: no labels at all, so no label sweep can reach it.
     #[test]
-    fn analyze_unit_has_its_own_label() {
-        assert_eq!(spec(&[], &[]).labels, vec!["go-lint-analyze"]);
+    fn analyze_unit_has_no_labels() {
+        assert!(spec(&[], &[]).labels.is_empty());
     }
 
     /// `lint` fixes and `lint-check` only reports, and the labels say so: the fixer
