@@ -107,6 +107,16 @@ pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, &[], HOST_GO)
 }
 
+/// A published heph release whose `heph-govet_<goos>_<goarch>` assets the lint
+/// suite downloads (via the built-in `http_fetch` driver, as a real workspace
+/// does). Pinned rather than "latest" so the fetch is reproducible.
+pub const GOVET_RELEASE: &str = "v1.0.0-alpha-build.177.721+g21169b25";
+
+/// The `govet` provider option pointing at [`GOVET_RELEASE`]'s download target.
+pub fn govet_addr() -> String {
+    format!("//@heph/go/govet/{GOVET_RELEASE}:heph-govet")
+}
+
 /// Like [`make_workspace`] but with `fs.skip` entries, mirroring a config file's
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
 /// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
@@ -151,6 +161,7 @@ fn make_workspace_ordered(
                         foreign_name_guard,
                         sdk_checksums: sdk_checksums_for(&gotool),
                         go_version: gotool,
+                        govet: govet_addr(),
                         ..Default::default()
                     },
                 )
@@ -187,6 +198,7 @@ fn make_workspace_ordered(
                         foreign_name_guard,
                         sdk_checksums: sdk_checksums_for(&gotool),
                         go_version: gotool,
+                        govet: govet_addr(),
                         ..Default::default()
                     },
                 )

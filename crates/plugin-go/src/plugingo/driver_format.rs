@@ -133,12 +133,22 @@ fn parse_inputs(spec: &GoFormatSpec, pkg: &hmodel::htpkg::PkgBuf) -> anyhow::Res
     let mut groups: Vec<&String> = spec.deps.keys().collect();
     groups.sort();
     for group in groups {
+        // Read-only (one shared tool) *and* per-file: whole-tree read-only staging
+        // symlinks the subtree in and lists only its root directory, which
+        // `single_staged_path` would then hand to exec (a directory → EACCES).
+        // Per-file staging hardlinks each file and lists it, so we exec the binary.
         let read_only = group.as_str() == GOVET_TOOL_GROUP;
         let annotations = if read_only {
-            BTreeMap::from([(
-                hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                "true".to_string(),
-            )])
+            BTreeMap::from([
+                (
+                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+                    "true".to_string(),
+                ),
+            ])
         } else {
             BTreeMap::new()
         };

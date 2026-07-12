@@ -195,13 +195,24 @@ impl ManagedDriver for GoLintDriver {
         groups.sort();
         for group in groups {
             let addrs = spec.deps.get(group).expect("group key from same map");
-            // The govet binary is staged read-only (one tool, shared, hardlinked).
+            // The govet binary is staged read-only (one tool, shared, hardlinked)
+            // and **per-file**: without that, staging symlinks the whole subtree in
+            // and records only its root *directory* in the list file, so
+            // `single_staged_path` would hand a directory to exec (EACCES). Per-file
+            // staging hardlinks each file and lists it, so the path we exec is the
+            // binary itself.
             let read_only = group.as_str() == GOVET_TOOL_GROUP;
             let annotations = if read_only {
-                BTreeMap::from([(
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
+                BTreeMap::from([
+                    (
+                        hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                        "true".to_string(),
+                    ),
+                    (
+                        hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+                        "true".to_string(),
+                    ),
+                ])
             } else {
                 BTreeMap::new()
             };
@@ -409,15 +420,26 @@ impl GoLintDriver {
     }
 
     /// The single staged path for a one-output group (lib archive, facts, tool).
+    ///
+    /// Rejects a directory: read-only staging lists only a subtree *root* unless the
+    /// input opts into per-file staging, and handing that directory to `exec` fails
+    /// as a bare `Permission denied` far from the cause. Fail with the reason here.
     fn single_staged_path(
         &self,
         req: &ManagedRunRequest<'_, '_>,
         group: &str,
     ) -> anyhow::Result<String> {
-        self.group_staged_paths(req, group)
+        let path = self
+            .group_staged_paths(req, group)
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("no staged file for dep group {group}"))
+            .ok_or_else(|| anyhow::anyhow!("no staged file for dep group {group}"))?;
+        anyhow::ensure!(
+            !std::path::Path::new(&path).is_dir(),
+            "staged path for dep group {group} is a directory ({path}), not a file — the input \
+             must opt into per-file staging (STAGE_PER_FILE_ANNOTATION) for its files to be listed"
+        );
+        Ok(path)
     }
 
     /// Run `heph-govet`, returning captured stdout (the `-json` report). A

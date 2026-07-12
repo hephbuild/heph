@@ -143,3 +143,39 @@ target(
     );
     Ok(())
 }
+
+/// A fetched binary consumed as a **tool** — the read-only, shared-stage path (what
+/// the go plugin's lint/format drivers use for heph-govet) — must still be
+/// executable in the consumer's sandbox.
+#[tokio::test]
+async fn test_http_fetch_tool_is_executable_when_staged_read_only() -> anyhow::Result<()> {
+    let (url, _hits) = serve(SCRIPT, 4);
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "rotool",
+        &format!(
+            r#"
+target(
+    name = "dl",
+    driver = "http_fetch",
+    url = "{url}/tool.sh",
+    executable = True,
+)
+target(
+    name = "use",
+    driver = "bash",
+    run = "$TOOL_T > $OUT",
+    out = "out.txt",
+    tools = {{"t": ["//rotool:dl"]}},
+)
+"#
+        ),
+    );
+
+    let result = ws.run("//rotool:use").await?;
+    assert_eq!(
+        common::artifact_string(&result).trim(),
+        "fetched-and-executed"
+    );
+    Ok(())
+}
