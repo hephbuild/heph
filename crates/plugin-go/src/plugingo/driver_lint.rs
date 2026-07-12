@@ -339,6 +339,13 @@ impl ManagedDriver for GoLintDriver {
             }
         }
 
+        // `unsafe` is a pseudo-package: it has no archive, so `go list` never reports
+        // it as a lib and it has no `lib_*` dep group. unitchecker still resolves it
+        // through ImportMap like any other import (the gc importer then returns
+        // `types.Unsafe` without opening a file), so a package importing `unsafe`
+        // fails with `can't resolve import ""` unless the map carries it.
+        import_map.insert("unsafe".to_string(), "unsafe".to_string());
+
         let go_files = self.group_staged_paths(&req, "");
         let vetx_output = pkg_dir.join(LINT_FACTS);
 

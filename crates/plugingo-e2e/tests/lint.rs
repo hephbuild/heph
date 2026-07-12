@@ -61,3 +61,22 @@ async fn test_lint_consumes_a_deps_empty_facts() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `unsafe` is a pseudo-package: no archive, so `go list` never reports it as a lib
+/// and it gets no `lib_*` dep group. unitchecker nonetheless resolves every import
+/// through the cfg's ImportMap, so a package importing `unsafe` fails with
+/// `could not import unsafe (can't resolve import "")` unless the driver maps it.
+#[tokio::test]
+async fn test_lint_package_importing_unsafe() -> anyhow::Result<()> {
+    require_go!();
+    let ws = common::make_workspace_host(common::fixture("lint_unsafe")?)?;
+
+    let result = ws.run("//mem:_lint").await?;
+
+    let paths = common::artifact_paths(&result);
+    assert!(
+        paths.iter().any(|p| p.ends_with("lint.facts")),
+        "analyze must produce facts, got {paths:?}"
+    );
+    Ok(())
+}
