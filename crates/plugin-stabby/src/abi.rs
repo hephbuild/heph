@@ -332,6 +332,27 @@ pub trait StableLogSink {
 /// An owned, ABI-stable handle to the host's log sink.
 pub type DynLogSink = stabby::dynptr!(stabby::boxed::Box<dyn StableLogSink + Send + Sync>);
 
+/// The host's process-supervisor client, handed to a loaded plugin.
+///
+/// A cdylib statically links its OWN copy of the `proc` crate, so the supervisor
+/// tracker the host initialised at startup is invisible to it — a plugin that
+/// spawns children (plugin-go: every `go` compile) would register none of them,
+/// and a hard kill of the host would orphan them. The host hands the plugin this
+/// handle (via [`SET_SUPERVISOR_SYMBOL`]) and the plugin routes its own
+/// `register_child` through it, into the host's socket to the sidecar.
+///
+/// Each method returns an error message, empty on success — small and rare (once
+/// per spawned process), so the allocation is noise next to the fork+exec.
+#[stabby::stabby]
+pub trait StableSupervisor {
+    extern "C" fn track(&self, pgid: i32) -> SString;
+    extern "C" fn untrack(&self, pgid: i32) -> SString;
+    extern "C" fn register_fuse_root(&self, root: SString) -> SString;
+}
+
+/// An owned, ABI-stable handle to the host's process supervisor.
+pub type DynSupervisor = stabby::dynptr!(stabby::boxed::Box<dyn StableSupervisor + Send + Sync>);
+
 /// The cdylib create-entry symbol name (exported with `#[stabby::export]`,
 /// loaded host-side with `get_stabbied`).
 pub const CREATE_SYMBOL: &[u8] = b"heph_plugin_create";
@@ -343,6 +364,15 @@ pub const SET_LOG_SINK_SYMBOL: &[u8] = b"heph_plugin_set_log_sink";
 
 /// The set-log-sink entry's function-pointer type.
 pub type SetLogSinkFn = extern "C" fn(DynLogSink);
+
+/// Optional cdylib symbol: install a host [`DynSupervisor`] so children the plugin
+/// spawns are tracked by the host's supervisor sidecar. The host calls it right
+/// after load if present; a plugin built against an older SDK does not export it
+/// and keeps the previous (unregistered) behaviour.
+pub const SET_SUPERVISOR_SYMBOL: &[u8] = b"heph_plugin_set_supervisor";
+
+/// The set-supervisor entry's function-pointer type.
+pub type SetSupervisorFn = extern "C" fn(DynSupervisor);
 
 /// The create entry's function-pointer type. The config crosses as prost-encoded
 /// `pb::CreateConfig` bytes (not a stabby struct), so adding config fields is an

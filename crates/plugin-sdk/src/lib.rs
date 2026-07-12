@@ -20,6 +20,8 @@ mod guest;
 mod logsink;
 #[cfg(feature = "stabby")]
 mod serve;
+#[cfg(feature = "stabby")]
+mod supervisor;
 
 /// In-process stable-ABI cdylib transport (opt-in via the `stabby` feature).
 ///
@@ -35,6 +37,7 @@ pub mod stabby {
     pub use crate::guest::GuestExecutor;
     pub use crate::logsink::install_log_sink;
     pub use crate::serve::{make_dyn_hook, make_dyn_managed_driver, make_dyn_provider};
+    pub use crate::supervisor::{install_supervisor, supervisor_sink};
 
     /// Decode the cdylib create-entry config (`pb::CreateConfig`) from its prost
     /// bytes, and convert its structured `options` map into a plugin `options:`

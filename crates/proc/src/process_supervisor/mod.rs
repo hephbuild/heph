@@ -15,6 +15,13 @@
 //! it would require writing the pid from inside `pre_exec` over the inherited
 //! socket. Deferred.
 //!
+//! A cdylib plugin is loaded into the host process but statically links its own
+//! copy of this crate, so the `TRACKER` static it sees is not the one [`init`]
+//! filled. The host hands it a [`SupervisorSink`] over the plugin ABI and the
+//! plugin calls [`init_with_sink`], which routes its children's `TRACK` lines
+//! through the host's socket. Without that, every plugin-spawned child (all of
+//! plugin-go's compiles) misses the supervisor.
+//!
 //! Set `heph_DISABLE_REAPER=1` to bypass the sidecar — [`init`] becomes a
 //! no-op and [`register_child`] returns `None`. The actual wait path lives
 //! in [`crate::proc_exec`].
@@ -29,7 +36,7 @@ mod client;
 mod protocol;
 mod server;
 
-pub use client::{ProcessTracker, TrackGuard};
+pub use client::{ProcessTracker, SupervisorSink, TrackGuard};
 pub use server::run_supervisor_main;
 
 static TRACKER: OnceLock<Arc<ProcessTracker>> = OnceLock::new();
@@ -129,6 +136,27 @@ pub fn init() -> anyhow::Result<()> {
         .set(tracker)
         .map_err(|_already_set| anyhow::anyhow!("process supervisor already initialised"))?;
     Ok(())
+}
+
+/// Adopt a host-provided [`SupervisorSink`] as this copy-of-the-crate's tracker.
+///
+/// A cdylib plugin is dlopen'd into the host process but statically links its own
+/// `proc`, so the `TRACKER` static it sees is *not* the one [`init`] filled — its
+/// children would silently miss the supervisor and leak on a hard kill of the
+/// host. The host calls this across the plugin ABI right after load, wiring the
+/// plugin's tracker to the host's socket-owning one.
+///
+/// Idempotent: a second call (or one made after [`init`] already ran in this
+/// binary, i.e. the host itself) keeps the existing tracker. A no-op when the
+/// reaper is disabled — there is nothing to forward to.
+pub fn init_with_sink(sink: Box<dyn SupervisorSink>) {
+    if reaper_disabled() {
+        return;
+    }
+    // `set` is a no-op if a tracker is already installed (or if a concurrent init
+    // wins the race): the loser's sink is dropped and the winner's tracker used.
+    // Both reach the same supervisor.
+    drop(TRACKER.set(Arc::new(ProcessTracker::from_sink(sink))));
 }
 
 /// Run `f` synchronously. On macOS, uses `block_in_place` so the calling

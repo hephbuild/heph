@@ -6,8 +6,9 @@
 
 use crate::abi::{
     CREATE_SYMBOL, CreateFn, DynExecutor, DynHook, DynItemStream, DynManagedDriver, DynProvider,
-    SET_LOG_SINK_SYMBOL, SetLogSinkFn, StableCancelDyn, StableHookDyn, StableItemStream,
-    StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn, StableProviderDyn,
+    SET_LOG_SINK_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogSinkFn, SetSupervisorFn, StableCancelDyn,
+    StableHookDyn, StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
+    StableProviderDyn,
 };
 use crate::host::HostExecutor;
 use crate::vtable::dynify;
@@ -93,6 +94,17 @@ pub fn load(
         // `SetLogSinkFn` before returning it.
         if let Ok(set_sink) = unsafe { lib.get_stabbied::<SetLogSinkFn>(SET_LOG_SINK_SYMBOL) } {
             set_sink(crate::host::HostLogSink::wrap());
+        }
+        // Optional: hand the plugin the host's supervisor client. The plugin's own
+        // copy of the `proc` crate has an uninitialised tracker (statics are not
+        // shared across the dylib boundary), so without this every child it spawns
+        // goes unregistered — no reaping on a hard kill of the host, and a warning
+        // per spawn. Same older-SDK tolerance as the log sink.
+        // SAFETY: get_stabbied checks the symbol's stabby type report against
+        // `SetSupervisorFn` before returning it.
+        let set_supervisor = unsafe { lib.get_stabbied::<SetSupervisorFn>(SET_SUPERVISOR_SYMBOL) };
+        if let Ok(set_supervisor) = set_supervisor {
+            set_supervisor(crate::host::HostSupervisor::wrap());
         }
         comps
     };

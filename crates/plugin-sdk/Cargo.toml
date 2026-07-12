@@ -21,6 +21,9 @@ anyhow = "1.0.102"
 hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", default-features = false, optional = true }
 plugin-abi = { path = "../plugin-abi", features = ["convert"], optional = true }
 hdriver-support = { package = "driver-support", path = "../driver-support", optional = true }
+# The cdylib's own copy of `proc` — its supervisor tracker is wired to the host's
+# over the ABI so children the plugin spawns are reaped by the host's sidecar.
+hproc = { package = "proc", path = "../proc", optional = true }
 stabby = { version = "72.1.8", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 futures = { version = "0.3.32", optional = true }
@@ -45,6 +48,7 @@ stabby = [
     "dep:hplugin-stabby",
     "dep:plugin-abi",
     "dep:hdriver-support",
+    "dep:hproc",
     "dep:stabby",
     "dep:async-trait",
     "dep:futures",

@@ -18,10 +18,16 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// ABI semantic version. Major must match exactly between host and plugin;
 /// minor is negotiated to `min(host, plugin)` at handshake.
 ///
+/// 0.4.0: new optional `heph_plugin_set_supervisor` entry (`StableSupervisor` /
+/// `DynSupervisor`) so a plugin's children register with the host's process
+/// supervisor. Additive: no existing vtable or struct changed, and the host
+/// tolerates a plugin that does not export the symbol — a minor bump signalling
+/// the new capability, not a break.
+///
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.3.0";
+pub const ABI_SEMVER: &str = "0.4.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;
