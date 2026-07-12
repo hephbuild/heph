@@ -5,12 +5,16 @@
 //!   1. Tracked process-groups are reaped when the parent's socket end closes.
 //!   2. Untracked groups are *not* killed on EOF.
 //!   3. Grandchildren are reaped via the process-group kill (setsid → killpg).
+//!   4. A child registered through a `SupervisorSink` — the path a dlopen'd
+//!      cdylib plugin takes, since its own copy of the tracker static was never
+//!      initialised — reaches the same sidecar and is reaped too.
 //!
 //! Tests use `tempfile::TempDir` for any filesystem state and unique pids
 //! everywhere so concurrent runs cannot collide.
 
 #![cfg(unix)]
 
+use heph::process_supervisor::{ProcessTracker, TrackGuard};
 use std::io::Write as _;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
@@ -205,6 +209,94 @@ fn supervisor_reaps_tracked_pgid_on_eof() {
         "supervisor should have SIGKILLed pid {sleep_pid} after socket EOF"
     );
 
+    drop(supervisor.wait());
+}
+
+/// The host end of the plugin seam: a sink whose `track`/`untrack` write the wire
+/// protocol on the supervisor socket, exactly as the host's socket-owning tracker
+/// does. A cdylib plugin's tracker forwards into one of these across the ABI.
+#[derive(Debug)]
+struct SocketSink(Mutex<UnixStream>);
+
+impl heph::process_supervisor::SupervisorSink for SocketSink {
+    fn track(&self, pgid: i32) -> anyhow::Result<()> {
+        let mut sock = self.0.lock().expect("lock");
+        writeln!(sock, "TRACK {pgid}")?;
+        sock.flush()?;
+        Ok(())
+    }
+
+    fn untrack(&self, pgid: i32) -> anyhow::Result<()> {
+        let mut sock = self.0.lock().expect("lock");
+        writeln!(sock, "UNTRACK {pgid}")?;
+        sock.flush()?;
+        Ok(())
+    }
+
+    fn register_fuse_root(&self, _root: &std::path::Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn sink_backed_tracker_registers_child_with_supervisor() {
+    // A plugin cdylib links its own `proc`, so its `TRACKER` static is never
+    // filled by the host's `init` — it gets a sink-backed tracker instead. A child
+    // registered through it must still be reaped by the host's sidecar.
+    let mut sleep_child = spawn_sleep_session_leader(120);
+    let sleep_pid = sleep_child.id();
+    let (parent, mut supervisor) = spawn_supervisor();
+
+    let tracker = std::sync::Arc::new(ProcessTracker::from_sink(Box::new(SocketSink(Mutex::new(
+        parent,
+    )))));
+    tracker
+        .track(sleep_pid as i32)
+        .expect("sink-backed track must reach the host socket");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Dropping the tracker drops the socket → supervisor sees EOF → reaps.
+    drop(tracker);
+
+    assert!(
+        await_child_exit(&mut sleep_child, REAP_TIMEOUT),
+        "child tracked via a SupervisorSink must be SIGKILLed on socket EOF (pid {sleep_pid})"
+    );
+
+    drop(supervisor.wait());
+}
+
+#[test]
+fn sink_backed_tracker_untracks_on_guard_drop() {
+    // `TrackGuard` must release the pgid through the sink too — otherwise a
+    // plugin's finished children stay tracked and get SIGKILLed at host exit
+    // even though they were already reaped.
+    let mut sleep_child = spawn_sleep_session_leader(120);
+    let sleep_pid = sleep_child.id();
+    let (parent, mut supervisor) = spawn_supervisor();
+
+    let tracker = std::sync::Arc::new(ProcessTracker::from_sink(Box::new(SocketSink(Mutex::new(
+        parent,
+    )))));
+    tracker.track(sleep_pid as i32).expect("track");
+    drop(TrackGuard::new(
+        std::sync::Arc::clone(&tracker),
+        sleep_pid as i32,
+    ));
+
+    std::thread::sleep(Duration::from_millis(100));
+    drop(tracker);
+
+    // The UNTRACK from the guard's drop removed it: EOF must leave it alive.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        sleep_child.try_wait().expect("try_wait").is_none(),
+        "untracked pid {sleep_pid} must survive supervisor EOF"
+    );
+
+    drop(sleep_child.kill());
+    drop(sleep_child.wait());
     drop(supervisor.wait());
 }
 

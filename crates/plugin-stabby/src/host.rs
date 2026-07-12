@@ -2,9 +2,9 @@
 //! a loaded plugin can call back via direct stabby vtable dispatch.
 
 use crate::abi::{
-    DynArtifact, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead, NoteDepOutcome,
-    QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
-    StableFunctionRegistry, StableLogSink, StableRead,
+    DynArtifact, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead, DynSupervisor,
+    NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
+    StableFunctionRegistry, StableLogSink, StableRead, StableSupervisor,
 };
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
@@ -116,6 +116,44 @@ impl StableLogSink for HostLogSink {
             4 => tracing::debug!(target: "heph::plugin", plugin = %target, "{message}"),
             _ => tracing::trace!(target: "heph::plugin", plugin = %target, "{message}"),
         }
+    }
+}
+
+/// Host-side process-supervisor handle handed to a loaded plugin. Forwards onto
+/// the host's tracker — the one that owns the socket to the sidecar — so children
+/// a plugin spawns are reaped like any host-spawned child. See [`StableSupervisor`].
+pub struct HostSupervisor;
+
+impl HostSupervisor {
+    /// Wrap as an ABI-stable [`DynSupervisor`] to pass over the seam.
+    pub fn wrap() -> DynSupervisor {
+        stabby::boxed::Box::new(HostSupervisor).into()
+    }
+}
+
+/// Encode a supervisor call's outcome for the seam: empty on success, else the
+/// full error chain.
+fn sup_result(r: anyhow::Result<()>) -> SString {
+    match r {
+        Ok(()) => SString::new(),
+        Err(e) => SString::from(format!("{e:#}").as_str()),
+    }
+}
+
+impl StableSupervisor for HostSupervisor {
+    extern "C" fn track(&self, pgid: i32) -> SString {
+        sup_result(hproc::process_supervisor::tracker().track(pgid))
+    }
+
+    extern "C" fn untrack(&self, pgid: i32) -> SString {
+        sup_result(hproc::process_supervisor::tracker().untrack(pgid))
+    }
+
+    extern "C" fn register_fuse_root(&self, root: SString) -> SString {
+        sup_result(
+            hproc::process_supervisor::tracker()
+                .register_fuse_root(std::path::PathBuf::from(root.to_string())),
+        )
     }
 }
 
