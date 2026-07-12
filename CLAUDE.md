@@ -33,6 +33,8 @@ Open the PR before running the full test suite — CI runs `tst` anyway, so runn
 3. Commit, push, open the PR. CI takes it from there.
 4. Only then run `tst` locally if you want a faster signal than CI.
 
+The same applies to subsequent pushes on an open PR: push the fix and let CI run the suite, don't run `tst` locally first.
+
 Exception: for a major change — one touching the engine core, provider/driver traits, caching, or anything with wide blast radius — run the full `tst` suite locally *before* opening the PR. The cost of a broken PR is higher than the wait.
 
 @.claude/rust.md
