@@ -1228,6 +1228,19 @@ impl ProviderInner {
         if addr.name == govet::GOVET_NAME
             && let Some(tag) = govet::tag_from_pkg(addr.package.as_str())
         {
+            // A dev build's default tag names a release that was never published.
+            // Diagnosed here — where something actually asks for the tool — so that
+            // merely listing a lint target's spec still works on a dev build: a
+            // `query` / `//...` walk asks every target for its spec, and that must
+            // not require owning a heph-govet.
+            if govet::is_dev_tag(tag) {
+                return Err(GetError::Other(anyhow::anyhow!(
+                    "go provider: this is a dev build of heph ({tag}), and no release publishes \
+                     a heph-govet binary for it — set the `govet` option to a source build \
+                     (\"//tools/heph-govet:build\") or to a released tag's download target \
+                     (\"//@heph/go/govet/<tag>:heph-govet\")"
+                )));
+            }
             let sha256 =
                 govet::expected_sha256(&self.sdk_checksums, tag, &factors.goos, &factors.goarch);
             let spec = govet::build_spec(addr.clone(), tag, &sha256);
@@ -2315,6 +2328,13 @@ impl ProviderInner {
     /// makes both flavors work unqualified: `//tools/heph-govet:build` builds for
     /// the host, and the download target's URL template renders the host's asset.
     /// An addr that carries its own args is taken verbatim.
+    ///
+    /// *Naming* the tool is not *resolving* it: a dev build's default addr points
+    /// at a release that was never published, but that is diagnosed when the govet
+    /// target itself is looked up (see the `GOVET_NAME` arm of `handle_get`) — not
+    /// here. A lint/format spec must still resolve on a dev build, or a bulk
+    /// `query` / `//...` walk (which asks every target for its spec) would die on
+    /// a machine that has no business owning a heph-govet.
     fn govet_tool_addr(&self) -> anyhow::Result<Addr> {
         let addr = hmodel::htaddr::parse_addr(&self.govet).with_context(|| {
             format!(
@@ -2324,16 +2344,6 @@ impl ProviderInner {
                 self.govet
             )
         })?;
-
-        if govet::is_dev_default(&addr) {
-            anyhow::bail!(
-                "go provider: this is a dev build of heph ({}), and no release publishes a \
-                 heph-govet binary for it — set the `govet` option to a source build \
-                 (\"//tools/heph-govet:build\") or to a released tag's download target \
-                 (\"//@heph/go/govet/<tag>:heph-govet\")",
-                hcore::version::VERSION
-            );
-        }
 
         if !addr.args.is_empty() {
             return Ok(addr);
@@ -3242,18 +3252,38 @@ mod tests {
     }
 
     /// A dev build's default addr points at a release tag no CI run ever published.
-    /// Fail with the fix rather than let it 404 mid-build.
-    #[test]
-    fn test_govet_tool_addr_dev_default_is_a_config_error() {
+    /// *Resolving* it fails with the fix in the message — but only then: naming it
+    /// (what every lint/format spec does) must stay fine, or a `query` / `//...`
+    /// spec walk would die on any dev build. See the sibling test below.
+    #[tokio::test]
+    async fn test_get_govet_dev_default_target_is_a_config_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = Provider::new(tmp.path().to_path_buf()).expect("provider");
-        let err = p
-            .inner
-            .govet_tool_addr()
-            .expect_err("dev build has no released heph-govet");
+        let dev = govet::govet_addr(hcore::version::VERSION);
+        let err = match provider_get(&p, dev).await {
+            Err(GetError::Other(e)) => e,
+            Err(other) => panic!("expected a config error, got {other:?}"),
+            Ok(_) => panic!("a dev build has no released heph-govet to resolve"),
+        };
         let msg = format!("{err:#}");
         assert!(msg.contains("dev build"), "got: {msg}");
         assert!(msg.contains("//tools/heph-govet:build"), "got: {msg}");
+    }
+
+    /// The lint/format specs of a dev build still resolve: they only *name* the
+    /// govet addr. A bulk spec walk (`heph query`, `//...`) asks every target for
+    /// its spec, and a dev build has no business owning a heph-govet to do that.
+    #[tokio::test]
+    async fn test_lint_and_format_specs_resolve_on_a_dev_build() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        // Default `govet` — i.e. the dev build's (nonexistent) release target.
+        let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
+        for name in ["_lint", "lint", "format", "format-fix"] {
+            provider_get(&p, make_addr("cmd", name))
+                .await
+                .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
+        }
     }
 
     #[test]

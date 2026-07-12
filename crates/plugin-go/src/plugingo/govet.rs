@@ -30,12 +30,17 @@
 //! unverified (the driver warns) unless a `checksums` entry supplies one (see
 //! [`checksum_key`]).
 
-use crate::plugingo::factors::{current_goarch, current_goos};
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
-use hmodel::htpkg::PkgBuf;
 use hplugin::provider::TargetSpec;
 use std::collections::HashMap;
+
+// Only the test-only `govet_addr` builds an addr from scratch; production resolves
+// it from the `govet` option instead (see `ProviderInner::govet_tool_addr`).
+#[cfg(test)]
+use crate::plugingo::factors::{current_goarch, current_goos};
+#[cfg(test)]
+use hmodel::htpkg::PkgBuf;
 
 /// The dev-build version stamped into [`hcore::version::VERSION`] when
 /// `HEPH_BUILD_VERSION` is unset. No release carries this tag, so a dev build has
@@ -60,18 +65,20 @@ pub const GOVET_NAME: &str = "heph-govet";
 
 /// The addr the `govet` option defaults to: this plugin's own release download
 /// target. On a dev build the tag is `v0.0.0-dev`, which no release publishes —
-/// heph's own repo overrides the option with `//tools/heph-govet:build` (see
-/// [`is_dev_default`], which turns a forgotten override into a real error rather
-/// than a 404 mid-build).
+/// heph's own repo overrides the option with `//tools/heph-govet:build`. Resolving
+/// the dev target fails with that fix in the message (see [`is_dev_tag`]) rather
+/// than 404-ing mid-build.
 pub fn default_addr() -> String {
     format!("//{}:{GOVET_NAME}", govet_pkg(hcore::version::VERSION))
 }
 
-/// Whether `addr` is the default download target of a **dev** build — i.e. it
-/// points at a release tag that does not exist. Callers surface this as a
-/// configuration error telling the user to set `govet` to a source build.
-pub fn is_dev_default(addr: &Addr) -> bool {
-    tag_from_pkg(addr.package.as_str()) == Some(DEV_VERSION)
+/// Whether `tag` is the dev-build version — a release that was never published, so
+/// it has no `heph-govet` asset. The provider surfaces this when the govet target
+/// is *resolved* (not when a lint spec merely names it, which must keep working on
+/// a dev build so bulk spec walks do), telling the user to point `govet` at a
+/// source build.
+pub fn is_dev_tag(tag: &str) -> bool {
+    tag == DEV_VERSION
 }
 
 /// Release asset name for `(goos, goarch)`, e.g. `heph-govet_darwin_arm64`.
@@ -256,8 +263,10 @@ mod tests {
             Some(hcore::version::VERSION)
         );
         // The test binary is never built from a release, so the default addr is
-        // the (nonexistent) dev tag — callers must surface that, not 404.
-        assert!(is_dev_default(&addr));
+        // the (nonexistent) dev tag — resolving it must surface that, not 404.
+        assert!(is_dev_tag(
+            tag_from_pkg(addr.package.as_str()).expect("tag")
+        ));
     }
 
     #[test]
