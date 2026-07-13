@@ -1085,6 +1085,26 @@ fn pkg_pattern(pkg: &str) -> String {
     format!("//{pkg}")
 }
 
+/// Default query scope for a package's source/embed lanes, when no codegen root is
+/// declared: the package's **subtree**, so a generator sitting in a sub-package of
+/// the consuming Go package is in scope (`app/openapi` bundling a spec that `app`
+/// embeds). `tree_output(pkg)` still gates membership, so the wider scope cannot
+/// admit a target whose output lands elsewhere.
+///
+/// The **root** package is the exception: its subtree is the entire workspace,
+/// which includes the synthetic provider namespaces (`//@heph/…`) that are not
+/// source packages at all — resolving every target in the repo to a def just to
+/// answer this query is both wasteful and, with foreign names in play, wrong. A
+/// root-level Go package that generates into a sub-package must declare a codegen
+/// root (which is exactly what that option is for).
+fn default_scope(pkg: &str) -> String {
+    if pkg.is_empty() {
+        pkg_pattern(pkg)
+    } else {
+        pkg_prefix_pattern(pkg)
+    }
+}
+
 /// Query-language pattern selecting every package under `pkg` (`//...` for root).
 fn pkg_prefix_pattern(pkg: &str) -> String {
     if pkg.is_empty() {
@@ -1110,11 +1130,24 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     let mut addrs = vec![non_go_glob_addr.format()];
 
     let codegen_root = pick_codegen_root(states);
-    // Scope: every package under the codegen root if one is declared, else just
-    // the target's own package.
+    // Scope: every package under the codegen root if one is declared, else the
+    // target's own package *and everything under it*.
+    //
+    // The subtree — not the bare package — is the floor: a generator commonly sits
+    // in a sub-package of the Go package that consumes its output (`app/openapi`
+    // bundling a spec into `app/openapi/openapi_gen.yaml`, embedded by `app`).
+    // Its output lands inside the consumer's tree, so `tree_output` matches it, but
+    // a `//pkg`-only scope rejects it before that term is ever reached — and the fs
+    // glob can't cover for it either, since codegen-stamped files are skipped
+    // there. The file then reached `go list` only when its on-disk copy happened to
+    // be unstamped, which is how this surfaced: an embed that resolved on some runs
+    // and failed with "//go:embed pattern(s) matched no files" on others.
+    //
+    // Widening the floor cannot pull in a foreign target: `tree_output(pkg)` still
+    // requires the output to land in *this* package's tree.
     let scope = match codegen_root {
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
-        None => pkg_pattern(pkg_str),
+        None => default_scope(pkg_str),
     };
     // Cheapest-first by resolution tier: `scope` resolves at the no-IO addr
     // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
@@ -1158,9 +1191,11 @@ fn pick_embed_deps(states: &[State]) -> Option<&State> {
 ///    targets that don't carry the label.
 fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
     let codegen_root = pick_codegen_root(states);
+    // Same floor as the go_src lane (see `compute_pkg_src_addrs`): the subtree, so a
+    // generator in a sub-package of the embedding package is in scope.
     let scope = match codegen_root {
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
-        None => pkg_pattern(pkg_str),
+        None => default_scope(pkg_str),
     };
     // Cheapest-first by resolution tier (see `compute_pkg_src_addrs`): `scope`
     // (addr) < `label` (spec/`get_spec`) < `tree_output` (def/`get_def`).
@@ -5313,7 +5348,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
-    async fn golist_default_uses_package_matcher_for_go_src_query() {
+    async fn golist_root_package_keeps_an_exact_go_src_query_scope() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -5332,12 +5367,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .iter()
             .find(|s| s.contains("label(go_src)"))
             .expect("go_src query addr present");
-        // Default scope is the target's exact package — a bare `//pkg` pattern,
-        // never a `/...` prefix.
+        // This fixture's go package is the *root* package, whose subtree is the whole
+        // workspace (synthetic `//@heph/…` namespaces included) — so it keeps the
+        // exact-package scope. Every other package scopes to its subtree, so a
+        // generator in a sub-package is reachable; see `default_scope`.
         assert!(
             !go_src_query.contains("..."),
-            "default must select an exact package (no prefix), got: {go_src_query}"
+            "the root package must keep an exact scope, got: {go_src_query}"
         );
+        // `tree_output` is what keeps the widened scope honest: a target in the
+        // subtree is only a source if its codegen output lands in *this* package.
         assert!(
             go_src_query.contains("tree_output("),
             "go_src query must carry tree_output, got: {go_src_query}"
@@ -5436,6 +5475,19 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             embed.find("label(go_embed_src)").unwrap() < embed.find("tree_output(").unwrap(),
             "go_embed_src query must check label before tree_output: {embed}"
         );
+    }
+
+    /// A non-root package scopes its source query to its own subtree, so a generator
+    /// in a sub-package is reachable. The root package does not: its subtree is the
+    /// whole workspace, including the synthetic `//@heph/…` provider namespaces.
+    #[test]
+    fn default_scope_is_the_subtree_except_at_the_root() {
+        assert_eq!(default_scope("app"), "//app/...");
+        assert_eq!(
+            default_scope("mgmt/go/cmd/exporter/rest"),
+            "//mgmt/go/cmd/exporter/rest/..."
+        );
+        assert_eq!(default_scope(""), "//");
     }
 
     #[test]
