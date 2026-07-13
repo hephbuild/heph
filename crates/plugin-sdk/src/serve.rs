@@ -29,6 +29,7 @@ use hplugin_stabby::abi::{
     StableHook, StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta,
     StableProvider,
 };
+use hplugin_stabby::vtable::dynify;
 use plugin_abi::convert;
 use plugin_abi::pb;
 use plugin_abi::pb::frame::Body;
@@ -99,10 +100,9 @@ impl StableItemStream for GuestItemStream {
 }
 
 fn make_item_stream(frames: Box<dyn Iterator<Item = Vec<u8>> + Send>) -> DynItemStream {
-    stabby::boxed::Box::new(GuestItemStream {
+    dynify(stabby::boxed::Box::new(GuestItemStream {
         frames: std::sync::Mutex::new(frames),
-    })
-    .into()
+    }))
 }
 
 /// Lazily map a provider's fallible item iterator into encoded `StreamItem` frames,
@@ -185,22 +185,20 @@ fn get_error_kind(e: &anyhow::Error) -> pb::get_error::Kind {
 /// Wrap a real provider as an ABI-stable [`hplugin_stabby::abi::DynProvider`] handle
 /// (in-process; the cdylib entry produces the same handle across the boundary).
 pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::DynProvider {
-    stabby::boxed::Box::new(StableProviderImpl {
+    dynify(stabby::boxed::Box::new(StableProviderImpl {
         provider,
         cancels: Arc::new(CancelRegistry::default()),
-    })
-    .into()
+    }))
 }
 
 /// Wrap a real managed driver as an ABI-stable [`hplugin_stabby::abi::DynManagedDriver`].
 pub fn make_dyn_managed_driver(
     driver: Arc<dyn ManagedDriver>,
 ) -> hplugin_stabby::abi::DynManagedDriver {
-    stabby::boxed::Box::new(StableManagedDriverImpl {
+    dynify(stabby::boxed::Box::new(StableManagedDriverImpl {
         driver,
         cancels: Arc::new(CancelRegistry::default()),
-    })
-    .into()
+    }))
 }
 
 /// In-flight calls keyed by `request_id`, so [`StableCancel::cancel`] can trip the
@@ -527,14 +525,13 @@ impl StableProvider for StableProviderImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
         let cancels = Arc::clone(&self.cancels);
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             match pb::ProviderMethod::try_from(method as i32) {
                 Ok(pb::ProviderMethod::Probe) => provider_probe(provider, req, cancels).await,
                 Ok(pb::ProviderMethod::CallFunction) => provider_call_function(provider, req).await,
                 _ => unimplemented(method),
             }
-        })
-        .into()
+        }))
     }
 
     extern "C" fn invoke_server_stream<'a>(
@@ -543,7 +540,7 @@ impl StableProvider for StableProviderImpl {
         req: SVec<u8>,
     ) -> DynFuture<'a, DynItemStream> {
         let provider = Arc::clone(&self.provider);
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             match pb::ProviderMethod::try_from(method as i32) {
                 Ok(pb::ProviderMethod::List) => provider_list_stream(provider, req).await,
                 Ok(pb::ProviderMethod::ListPackages) => {
@@ -551,8 +548,7 @@ impl StableProvider for StableProviderImpl {
                 }
                 _ => unimplemented_item_stream(method),
             }
-        })
-        .into()
+        }))
     }
 
     extern "C" fn invoke_client_stream<'a>(
@@ -561,7 +557,9 @@ impl StableProvider for StableProviderImpl {
         // No client-streaming provider RPC yet; the request stream is dropped.
         _req: DynItemStream,
     ) -> DynFuture<'a, SVec<u8>> {
-        stabby::boxed::Box::new(async move { unimplemented(method) }).into()
+        dynify(stabby::boxed::Box::new(
+            async move { unimplemented(method) },
+        ))
     }
 
     extern "C" fn invoke_bidi<'a>(
@@ -569,7 +567,9 @@ impl StableProvider for StableProviderImpl {
         method: u32,
         _req: DynItemStream,
     ) -> DynFuture<'a, DynItemStream> {
-        stabby::boxed::Box::new(async move { unimplemented_item_stream(method) }).into()
+        dynify(stabby::boxed::Box::new(async move {
+            unimplemented_item_stream(method)
+        }))
     }
 
     extern "C" fn invoke_exec<'a>(
@@ -580,13 +580,12 @@ impl StableProvider for StableProviderImpl {
     ) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
         let cancels = Arc::clone(&self.cancels);
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             match pb::ProviderMethod::try_from(method as i32) {
                 Ok(pb::ProviderMethod::Get) => provider_get(provider, req, exec, cancels).await,
                 _ => unimplemented(method),
             }
-        })
-        .into()
+        }))
     }
 
     extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry) {
@@ -742,7 +741,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
         let cancels = Arc::clone(&self.cancels);
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             match pb::DriverMethod::try_from(method as i32) {
                 Ok(pb::DriverMethod::Parse) => driver_parse(driver, req, cancels).await,
                 Ok(pb::DriverMethod::ApplyTransitive) => {
@@ -750,8 +749,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 }
                 _ => unimplemented(method),
             }
-        })
-        .into()
+        }))
     }
 
     // No unary->stream or stream->unary driver RPC yet; provisioned, Unimplemented.
@@ -760,7 +758,9 @@ impl StableManagedDriver for StableManagedDriverImpl {
         method: u32,
         _req: SVec<u8>,
     ) -> DynFuture<'a, DynItemStream> {
-        stabby::boxed::Box::new(async move { unimplemented_item_stream(method) }).into()
+        dynify(stabby::boxed::Box::new(async move {
+            unimplemented_item_stream(method)
+        }))
     }
 
     extern "C" fn invoke_client_stream<'a>(
@@ -768,7 +768,9 @@ impl StableManagedDriver for StableManagedDriverImpl {
         method: u32,
         _req: DynItemStream,
     ) -> DynFuture<'a, SVec<u8>> {
-        stabby::boxed::Box::new(async move { unimplemented(method) }).into()
+        dynify(stabby::boxed::Box::new(
+            async move { unimplemented(method) },
+        ))
     }
 
     // `run` is the one bidi RPC: request stream = RunInFrame (run request, then live
@@ -780,13 +782,12 @@ impl StableManagedDriver for StableManagedDriverImpl {
     ) -> DynFuture<'a, DynItemStream> {
         let driver = Arc::clone(&self.driver);
         let cancels = Arc::clone(&self.cancels);
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             match pb::DriverMethod::try_from(method as i32) {
                 Ok(pb::DriverMethod::Run) => run_bidi(driver, req, cancels).await,
                 _ => unimplemented_item_stream(method),
             }
-        })
-        .into()
+        }))
     }
 }
 
@@ -808,7 +809,9 @@ impl StableItemStream for ChannelItemStream {
 }
 
 fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> DynItemStream {
-    stabby::boxed::Box::new(ChannelItemStream { rx: Mutex::new(rx) }).into()
+    dynify(stabby::boxed::Box::new(ChannelItemStream {
+        rx: Mutex::new(rx),
+    }))
 }
 
 fn run_out_err(msg: String) -> pb::RunOutFrame {
@@ -1060,7 +1063,7 @@ impl Content for DiskInputContent {
 
 /// Wrap an author `Hook` as an ABI-stable [`hplugin_stabby::abi::DynHook`].
 pub fn make_dyn_hook(hook: Arc<dyn Hook>) -> hplugin_stabby::abi::DynHook {
-    stabby::boxed::Box::new(StableHookImpl { hook }).into()
+    dynify(stabby::boxed::Box::new(StableHookImpl { hook }))
 }
 
 /// Wraps an author `Hook` as a [`StableHook`].
@@ -1091,13 +1094,12 @@ impl StableHook for StableHookImpl {
         req: DynItemStream,
     ) -> DynFuture<'a, SVec<u8>> {
         let hook = Arc::clone(&self.hook);
-        stabby::boxed::Box::new(async move {
+        dynify(stabby::boxed::Box::new(async move {
             match pb::HookMethod::try_from(method as i32) {
                 Ok(pb::HookMethod::OnEvents) => hook_on_events(hook, req).await,
                 _ => unimplemented(method),
             }
-        })
-        .into()
+        }))
     }
 }
 

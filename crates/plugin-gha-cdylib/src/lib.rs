@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use hplugin::hook::Hook;
 use hplugin_gha::GhaHook;
-use plugin_sdk::stabby::abi::{DynLogSink, NamedHook, PluginComponents};
+use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedHook, PluginComponents};
 use plugin_sdk::stabby::{
-    create_config_from_bytes, install_log_sink, make_dyn_hook, options_from_pb_map,
+    create_config_from_bytes, install_log_sink, install_supervisor, make_dyn_hook,
+    options_from_pb_map,
 };
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
@@ -33,6 +34,14 @@ pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginCompone
 #[stabby::export]
 pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
     install_log_sink(sink);
+}
+
+/// Stable ABI supervisor entry: the host hands the plugin its process-supervisor
+/// client, so any child this plugin spawns is tracked by the host's sidecar rather
+/// than by this cdylib's own (uninitialised) copy of the `proc` tracker.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
+    install_supervisor(sup);
 }
 
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
