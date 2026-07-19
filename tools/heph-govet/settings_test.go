@@ -62,10 +62,17 @@ func TestResolveGovetEnableAll(t *testing.T) {
 	}
 }
 
-func TestFilterChecksEmptyKeepsAll(t *testing.T) {
-	in := []*analysis.Analyzer{{Name: "SA1000"}, {Name: "SA4006"}}
-	if len(filterChecks(in, nil)) != 2 {
-		t.Fatal("empty checks must keep all")
+func TestFilterChecksEmptyAppliesGolangciDefault(t *testing.T) {
+	// Empty `checks` applies golangci's default set: all SA/S checks stay, but
+	// the noisy ST100x comment/naming checks (e.g. ST1000) are off — matching
+	// golangci-lint, not honnef's stricter "all".
+	in := []*analysis.Analyzer{{Name: "SA1000"}, {Name: "SA4006"}, {Name: "ST1000"}, {Name: "ST1003"}}
+	got := names(filterChecks(in, nil))
+	if !got["SA1000"] || !got["SA4006"] {
+		t.Fatalf("SA checks must stay enabled by default: %v", got)
+	}
+	if got["ST1000"] || got["ST1003"] {
+		t.Fatalf("ST1000/ST1003 must be off by default (golangci default): %v", got)
 	}
 }
 

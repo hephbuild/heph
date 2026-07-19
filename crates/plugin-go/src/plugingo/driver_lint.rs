@@ -605,9 +605,24 @@ fn relativize_report_paths(json: &[u8], ws_root: &std::path::Path) -> Vec<u8> {
     serde_json::to_vec(&root).unwrap_or_else(|_| json.to_vec())
 }
 
+/// The golangci-lint linter NAME that owns an analyzer, derived from the honnef
+/// check-code convention: `SA*` → staticcheck, `ST*` → stylecheck, any other
+/// `S*` → gosimple. Everything else is a `go vet` pass (`printf`, `lostcancel`,
+/// …), which golangci exposes under `govet`. This mirrors heph-govet's own
+/// analyzer→linter map, so a finding prints the name a user would `//nolint:`.
+fn golangci_linter_of(analyzer: &str) -> &str {
+    match analyzer.strip_prefix('S') {
+        Some(rest) if rest.starts_with('A') => "staticcheck",
+        Some(rest) if rest.starts_with('T') => "stylecheck",
+        Some(_) => "gosimple",
+        None => "govet",
+    }
+}
+
 /// Parse a `unitchecker -json` report into a flat list of human-readable
 /// findings. The report shape is `{ "import/path": { "analyzer": [ {"posn":…,
-/// "message":…}, … ] } }`; an empty object (`{}`) means no findings.
+/// "message":…}, … ] } }`; an empty object (`{}`) means no findings. Each
+/// finding names the golangci linter that produced it and the underlying check.
 fn report_findings(json: &[u8]) -> anyhow::Result<Vec<String>> {
     if json.iter().all(u8::is_ascii_whitespace) {
         return Ok(Vec::new());
@@ -629,7 +644,8 @@ fn report_findings(json: &[u8]) -> anyhow::Result<Vec<String>> {
             for d in diags {
                 let posn = d.get("posn").and_then(|v| v.as_str()).unwrap_or("");
                 let message = d.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                out.push(format!("{posn}: {message} ({analyzer}) [{pkg}]"));
+                let linter = golangci_linter_of(analyzer);
+                out.push(format!("{posn}: {message} ({linter}: {analyzer}) [{pkg}]"));
             }
         }
     }
@@ -1499,6 +1515,34 @@ mod tests {
     fn gate_empty_analyzer_arrays_yield_no_findings() {
         let json = br#"{"example.com/mylib": {"printf": []}}"#;
         assert!(report_findings(json).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gate_finding_names_the_golangci_linter() {
+        let json = br#"{
+            "example.com/mylib": {
+                "ST1000": [{"posn": "a.go:1:1", "message": "package comment"}],
+                "printf": [{"posn": "b.go:2:2", "message": "wrong arg"}]
+            }
+        }"#;
+        let f = report_findings(json).unwrap();
+        assert!(
+            f.iter().any(|s| s.contains("(stylecheck: ST1000)")),
+            "ST1000 must name the stylecheck linter: {f:?}"
+        );
+        assert!(
+            f.iter().any(|s| s.contains("(govet: printf)")),
+            "vet passes must name govet: {f:?}"
+        );
+    }
+
+    #[test]
+    fn golangci_linter_mapping() {
+        assert_eq!(golangci_linter_of("SA1000"), "staticcheck");
+        assert_eq!(golangci_linter_of("ST1000"), "stylecheck");
+        assert_eq!(golangci_linter_of("S1002"), "gosimple");
+        assert_eq!(golangci_linter_of("printf"), "govet");
+        assert_eq!(golangci_linter_of("lostcancel"), "govet");
     }
 
     // ---- relativize ----

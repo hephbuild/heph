@@ -43,15 +43,27 @@ func resolveGovet(s govetSettings) []*analysis.Analyzer {
 	return out
 }
 
+// golangciDefaultChecks is golangci-lint's default value for
+// `linters.settings.staticcheck.checks`. honnef's own default is ["all"], but
+// golangci overrides it to silence the noisy ST100x style/comment checks —
+// notably ST1000 ("at least one file in a package should have a package
+// comment"). We apply the same default when a family's `checks` is unset so
+// heph-govet's out-of-the-box findings match `golangci-lint`'s, rather than
+// honnef's stricter standalone default.
+var golangciDefaultChecks = []string{
+	"all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022",
+}
+
 // filterChecks narrows a honnef family's analyzers by golangci `checks`
-// patterns. Empty → every check runs (honnef's "all" default). Otherwise the
-// patterns are applied in order over the family's check names (the analyzer
-// Name, e.g. "SA1000"): "all"/"*" enable everything, "none" clear, a bare
-// pattern enables matches, a "-"-prefixed pattern disables them. Patterns may be
-// globs (path.Match semantics, e.g. "SA1*", "ST10??").
+// patterns. Empty → golangci's default set ([`golangciDefaultChecks`]), NOT
+// honnef's stricter "all". Otherwise the patterns are applied in order over the
+// family's check names (the analyzer Name, e.g. "SA1000"): "all"/"*" enable
+// everything, "none" clear, a bare pattern enables matches, a "-"-prefixed
+// pattern disables them. Patterns may be globs (path.Match semantics, e.g.
+// "SA1*", "ST10??").
 func filterChecks(in []*analysis.Analyzer, checks []string) []*analysis.Analyzer {
 	if len(checks) == 0 {
-		return in
+		checks = golangciDefaultChecks
 	}
 	enabled := make(map[string]bool, len(in))
 	apply := func(pat string, on bool) {
