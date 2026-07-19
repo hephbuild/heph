@@ -150,6 +150,39 @@ func TestSuppressedExcludeRules(t *testing.T) {
 	}
 }
 
+func TestMatchTextPrefixesHonnefWithCode(t *testing.T) {
+	// golangci matches staticcheck text rules against `CODE: message`.
+	if got := matchText("staticcheck", "SA1019", "nrn.ResourceSite is deprecated"); got != "SA1019: nrn.ResourceSite is deprecated" {
+		t.Errorf("staticcheck text should be code-prefixed, got %q", got)
+	}
+	// go vet messages are matched unprefixed.
+	if got := matchText("govet", "printf", "wrong arg"); got != "wrong arg" {
+		t.Errorf("govet text must be unprefixed, got %q", got)
+	}
+}
+
+func TestSuppressedStaticcheckTextRuleWithCodePrefix(t *testing.T) {
+	// A rule copied from a golangci config, including the `SA1019:` prefix.
+	var cfg golangciConfig
+	cfg.Linters.Exclusions.Generated = "disable"
+	cfg.Linters.Exclusions.Rules = []excludeRuleYAML{
+		{
+			Path: `(.+)\.go$`,
+			Text: "SA1019: nrn.ResourceSite is deprecated: Use ResourceClient or ResourceGateway",
+		},
+	}
+	s, err := newSuppressor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// heph-govet feeds the code-prefixed form to the suppressor (see withFilter).
+	msg := matchText("staticcheck", "SA1019",
+		"nrn.ResourceSite is deprecated: Use ResourceClient or ResourceGateway")
+	if !s.suppressed("staticcheck", "workers/auditupdown/process.go", 117, msg) {
+		t.Errorf("golangci-format SA1019 text rule should suppress; matched against %q", msg)
+	}
+}
+
 func TestSuppressedGeneratedFile(t *testing.T) {
 	dir := t.TempDir()
 	gen := filepath.Join(dir, "gql_generated.go")

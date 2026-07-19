@@ -385,7 +385,7 @@ func withFilter(a *analysis.Analyzer, linter string, s *suppressor) *analysis.An
 		shim := *pass
 		shim.Report = func(d analysis.Diagnostic) {
 			pos := pass.Fset.Position(d.Pos)
-			if s.suppressed(linter, pos.Filename, pos.Line, d.Message) {
+			if s.suppressed(linter, pos.Filename, pos.Line, matchText(linter, a.Name, d.Message)) {
 				return
 			}
 			pass.Report(d)
@@ -393,4 +393,17 @@ func withFilter(a *analysis.Analyzer, linter string, s *suppressor) *analysis.An
 		return orig(&shim)
 	}
 	return &w
+}
+
+// matchText renders the message form that `exclusions.rules[].text` (and preset
+// patterns) are matched against, mirroring golangci-lint. golangci prefixes
+// honnef (staticcheck) messages with the check code — `SA1019: <message>` — and
+// matches text rules against that form, so a golangci config's rule like
+// `text: "SA1019: nrn.ResourceSite is deprecated"` works verbatim here. go vet
+// messages are matched unprefixed, as golangci does.
+func matchText(linter, analyzerName, message string) string {
+	if linter == "staticcheck" {
+		return analyzerName + ": " + message
+	}
+	return message
 }

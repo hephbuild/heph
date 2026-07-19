@@ -686,7 +686,11 @@ impl ManagedDriver for GoLintGateDriver {
                     origin_id: format!("dep|{group}|{i}"),
                     annotations: BTreeMap::new(),
                     hashed: true,
-                    runtime: true,
+                    // The golangci config is a hash-only input: it re-keys the
+                    // target on any `.golangci.yml` change without staging the
+                    // file (this target never reads it — it only consumes the
+                    // analyze report). Every other dep is staged as usual.
+                    runtime: group.as_str() != "config",
                 });
             }
         }
@@ -977,7 +981,11 @@ impl ManagedDriver for GoLintFixDriver {
                     origin_id: format!("dep|{group}|{i}"),
                     annotations: BTreeMap::new(),
                     hashed: true,
-                    runtime: true,
+                    // The golangci config is a hash-only input: it re-keys the
+                    // target on any `.golangci.yml` change without staging the
+                    // file (this target never reads it — it only consumes the
+                    // analyze report). Every other dep is staged as usual.
+                    runtime: group.as_str() != "config",
                 });
             }
         }
@@ -1192,14 +1200,28 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
 
 /// Build the user-facing `lint` gate spec. Depends on the `report` output of the
 /// analyze target (`_lint`) and fails the build when it contains findings.
-pub fn build_lint_gate_spec(addr: Addr, analyze_addr: &Addr) -> TargetSpec {
-    let deps = BTreeMap::from([(
+///
+/// `config_addr` (the module's `.golangci.yml`) is attached as a hash-only dep
+/// so any config change re-keys the gate directly — not just transitively
+/// through `_lint`'s report.
+pub fn build_lint_gate_spec(
+    addr: Addr,
+    analyze_addr: &Addr,
+    config_addr: Option<&Addr>,
+) -> TargetSpec {
+    let mut deps = BTreeMap::from([(
         "report".to_string(),
         Value::List(vec![Value::String(format!(
             "{}|report",
             analyze_addr.format()
         ))]),
     )]);
+    if let Some(cfg) = config_addr {
+        deps.insert(
+            "config".to_string(),
+            Value::List(vec![Value::String(cfg.format())]),
+        );
+    }
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
 
@@ -1228,8 +1250,9 @@ pub fn build_lint_fix_spec(
     analyze_addr: &Addr,
     src_addrs: &[String],
     go_files: &[String],
+    config_addr: Option<&Addr>,
 ) -> TargetSpec {
-    let deps = BTreeMap::from([
+    let mut deps = BTreeMap::from([
         (
             "report".to_string(),
             Value::List(vec![Value::String(format!(
@@ -1242,6 +1265,13 @@ pub fn build_lint_fix_spec(
             Value::List(src_addrs.iter().cloned().map(Value::String).collect()),
         ),
     ]);
+    // Hash-only dep: a `.golangci.yml` change re-keys the fixer directly.
+    if let Some(cfg) = config_addr {
+        deps.insert(
+            "config".to_string(),
+            Value::List(vec![Value::String(cfg.format())]),
+        );
+    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
@@ -1446,7 +1476,7 @@ mod tests {
             "_lint".to_string(),
             Default::default(),
         );
-        let check = build_lint_gate_spec(addr("lint-check"), &analyze);
+        let check = build_lint_gate_spec(addr("lint-check"), &analyze, None);
         assert_eq!(check.labels, vec!["go-lint-check", "lint-check"]);
 
         let fix = build_lint_fix_spec(
@@ -1454,6 +1484,7 @@ mod tests {
             &analyze,
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
+            None,
         );
         assert_eq!(fix.labels, vec!["go-lint", "lint", "fix"]);
         assert!(
@@ -1609,7 +1640,7 @@ mod tests {
             "_lint".to_string(),
             Default::default(),
         );
-        let s = build_lint_gate_spec(addr("lint-check"), &analyze);
+        let s = build_lint_gate_spec(addr("lint-check"), &analyze, None);
         assert_eq!(s.driver, "go_lint_gate");
         let deps = match s.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -1626,6 +1657,56 @@ mod tests {
             ),
             _ => panic!("not a string"),
         }
+    }
+
+    #[tokio::test]
+    async fn gate_and_fix_take_golangci_config_as_hash_only_dep() {
+        let analyze = Addr::new(
+            PkgBuf::from("mylib"),
+            "_lint".to_string(),
+            Default::default(),
+        );
+        let cfg = Addr::new(PkgBuf::from(""), "file".to_string(), Default::default());
+
+        let gate = build_lint_gate_spec(addr("lint-check"), &analyze, Some(&cfg));
+        assert!(
+            deps_map(&gate).contains_key("config"),
+            "gate must depend on the golangci config so a config change re-keys it"
+        );
+        // Without a config addr, no config dep (keeps the no-config path clean).
+        let gate_none = build_lint_gate_spec(addr("lint-check"), &analyze, None);
+        assert!(!deps_map(&gate_none).contains_key("config"));
+
+        let fix = build_lint_fix_spec(
+            addr("lint"),
+            &analyze,
+            &["//mylib:a.go".to_string()],
+            &["a.go".to_string()],
+            Some(&cfg),
+        );
+        assert!(deps_map(&fix).contains_key("config"));
+
+        // parse() marks the `config` group hash-only (runtime:false): it re-keys
+        // the target but is never staged (the gate never reads the file).
+        let token = hcore::hasync::StdCancellationToken::new();
+        let parsed = GoLintGateDriver
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: Arc::new(gate),
+                },
+                &token,
+            )
+            .await
+            .unwrap();
+        let cfg_input = parsed
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.origin_id.starts_with("dep|config|"))
+            .expect("config input present");
+        assert!(cfg_input.hashed, "config must contribute to the hash");
+        assert!(!cfg_input.runtime, "config must not be staged (hash-only)");
     }
 
     // ---- fix ----
@@ -1752,6 +1833,7 @@ mod tests {
             &analyze,
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
+            None,
         );
         assert_eq!(s.driver, "go_lint_fix");
 
@@ -1802,6 +1884,7 @@ mod tests {
             &analyze,
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
+            None,
         );
         let req = ParseRequest {
             request_id: "t".to_string(),

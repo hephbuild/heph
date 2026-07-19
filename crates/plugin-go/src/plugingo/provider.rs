@@ -1500,13 +1500,18 @@ impl ProviderInner {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                // Lint only where the module opts in with a golangci config.
-                if self.golangci_config_addr(&module_root).is_none() {
-                    return Err(GetError::NotFound);
-                }
+                // Lint only where the module opts in with a golangci config;
+                // attach it as a hash-only dep so a config change re-keys the gate.
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
+                };
                 let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
-                let spec =
-                    crate::plugingo::driver_lint::build_lint_gate_spec(addr.clone(), &analyze_addr);
+                let spec = crate::plugingo::driver_lint::build_lint_gate_spec(
+                    addr.clone(),
+                    &analyze_addr,
+                    Some(&config_addr),
+                );
                 Ok(GetResponse { target_spec: spec })
             }
             // The plain `lint` target FIXES: it consumes `_lint`'s report (suggested
@@ -1517,9 +1522,10 @@ impl ProviderInner {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                if self.golangci_config_addr(&module_root).is_none() {
-                    return Err(GetError::NotFound);
-                }
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
+                };
                 let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
                 let pkg_addrs = self
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
@@ -1530,6 +1536,7 @@ impl ProviderInner {
                     &analyze_addr,
                     &pkg_addrs.go_files,
                     &pkg.go_files,
+                    Some(&config_addr),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
