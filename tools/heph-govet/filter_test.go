@@ -42,6 +42,62 @@ func F(b bool) {
 	}
 }
 
+func TestScanNolintWordBoundary(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.go")
+	// `//nolintlint` and `//nolinter` share the `nolint` prefix but are NOT
+	// nolint directives: they must not suppress anything (and in particular must
+	// not be read as a bare `//nolint` that suppresses every linter).
+	src := `package p
+
+func F(b bool) {
+	_ = b == true //nolintlint
+	_ = b == false //nolinter:staticcheck
+	_ = b == b //nolint:gosimple
+}
+`
+	if err := os.WriteFile(file, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx := scanNolint(file)
+
+	if idx[4] != nil {
+		t.Errorf("line 4 //nolintlint must not be a directive, got %v", idx[4])
+	}
+	if idx[5] != nil {
+		t.Errorf("line 5 //nolinter must not be a directive, got %v", idx[5])
+	}
+	// The genuine directive still matches.
+	if !idx[6]["gosimple"] {
+		t.Errorf("line 6 //nolint:gosimple should match, got %v", idx[6])
+	}
+}
+
+func TestScanNolintAllIsWildcard(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.go")
+	// `//nolint:all` is golangci's wildcard — it must suppress every linter on
+	// the line, exactly like a bare `//nolint`.
+	if err := os.WriteFile(file, []byte("package p\n_ = 0 //nolint:all\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx := scanNolint(file)
+	if !idx[2]["*"] {
+		t.Errorf("//nolint:all should set the * wildcard, got %v", idx[2])
+	}
+
+	s, err := newSuppressor(golangciConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.suppressed("gosimple", file, 2, "msg") {
+		t.Error("//nolint:all must suppress gosimple")
+	}
+	if !s.suppressed("staticcheck", file, 2, "msg") {
+		t.Error("//nolint:all must suppress staticcheck")
+	}
+}
+
 func TestSuppressedNolintScoping(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "a.go")

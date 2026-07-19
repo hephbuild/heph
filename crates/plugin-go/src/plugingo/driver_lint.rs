@@ -400,6 +400,13 @@ impl ManagedDriver for GoLintDriver {
                 ctoken,
             )
             .await?;
+        // unitchecker reports absolute paths into *this* sandbox (the `posn`
+        // strings and each suggested-fix `filename`). The gate that prints them
+        // runs in a *different* sandbox where those paths no longer exist, so
+        // rewrite them to workspace-root-relative here, at production time —
+        // where the sandbox root is known and the report is cached. Basenames
+        // are preserved, so the fixer's `report_edits` keying still holds.
+        let report = relativize_report_paths(&report, &req.sandbox_ws_dir);
         std::fs::write(pkg_dir.join(LINT_REPORT), report).context("write lint report")?;
 
         if !vetx_output.exists() {
@@ -536,6 +543,67 @@ struct GoLintGateSpec {
 struct GoLintGateDef;
 
 const GO_LINT_GATE_FORMAT_VERSION: u32 = 1;
+
+/// Rewrite every absolute sandbox path in a `unitchecker -json` report to be
+/// relative to the sandbox workspace root (`ws_root`), leaving the rest of the
+/// JSON untouched. Two path-bearing fields are rewritten:
+///
+///   - each diagnostic's `posn` (`"<file>:<line>:<col>"`), printed by the gate;
+///   - each suggested fix edit's `filename`, consumed by the fixer.
+///
+/// This runs in the `_lint` sandbox, the only place the absolute paths are valid
+/// and the workspace root is known — the gate and fixer that consume the report
+/// run in different sandboxes. A path not under `ws_root` (there should be none)
+/// is left as-is. On any JSON parse error the original bytes are returned
+/// unchanged, so a malformed report surfaces at the consumer rather than here.
+fn relativize_report_paths(json: &[u8], ws_root: &std::path::Path) -> Vec<u8> {
+    let mut prefix = ws_root.to_string_lossy().into_owned();
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    let strip = |s: &str| -> Option<String> { s.strip_prefix(&prefix).map(str::to_string) };
+
+    let Ok(mut root) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return json.to_vec();
+    };
+    if let Some(by_pkg) = root.as_object_mut() {
+        for by_analyzer in by_pkg.values_mut() {
+            let Some(by_analyzer) = by_analyzer.as_object_mut() else {
+                continue;
+            };
+            for diags in by_analyzer.values_mut() {
+                let Some(diags) = diags.as_array_mut() else {
+                    continue;
+                };
+                for d in diags {
+                    // `posn` = "<file>:<line>:<col>"; only the file part is a path.
+                    if let Some(posn) = d.get("posn").and_then(|v| v.as_str())
+                        && let Some(rel) = strip(posn)
+                    {
+                        d["posn"] = serde_json::Value::String(rel);
+                    }
+                    let Some(fixes) = d.get_mut("suggested_fixes").and_then(|v| v.as_array_mut())
+                    else {
+                        continue;
+                    };
+                    for fix in fixes {
+                        let Some(edits) = fix.get_mut("edits").and_then(|v| v.as_array_mut()) else {
+                            continue;
+                        };
+                        for e in edits {
+                            if let Some(fname) = e.get("filename").and_then(|v| v.as_str())
+                                && let Some(rel) = strip(fname)
+                            {
+                                e["filename"] = serde_json::Value::String(rel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    serde_json::to_vec(&root).unwrap_or_else(|_| json.to_vec())
+}
 
 /// Parse a `unitchecker -json` report into a flat list of human-readable
 /// findings. The report shape is `{ "import/path": { "analyzer": [ {"posn":…,
@@ -704,9 +772,9 @@ struct FixEdit {
 /// fixes are alternatives, not additional edits (the go/analysis convention an
 /// auto-fixer follows). Diagnostics without a suggested fix contribute nothing.
 ///
-/// Files are keyed by basename because the report's `filename` is an absolute
-/// path in the `_lint` sandbox; a package's Go files are flat (one directory),
-/// so basenames are unique within it.
+/// Files are keyed by basename because the report's `filename` is a
+/// sandbox-relative path (see [`relativize_report_paths`]); a package's Go files
+/// are flat (one directory), so basenames are unique within it.
 fn report_edits(json: &[u8]) -> anyhow::Result<HashMap<String, Vec<FixEdit>>> {
     let mut out: HashMap<String, Vec<FixEdit>> = HashMap::new();
     if json.iter().all(u8::is_ascii_whitespace) {
@@ -1431,6 +1499,57 @@ mod tests {
     fn gate_empty_analyzer_arrays_yield_no_findings() {
         let json = br#"{"example.com/mylib": {"printf": []}}"#;
         assert!(report_findings(json).unwrap().is_empty());
+    }
+
+    // ---- relativize ----
+
+    #[test]
+    fn relativize_strips_ws_root_from_posn_and_filenames() {
+        let ws = std::path::Path::new("/sandbox/abc/ws");
+        let json = br#"{
+            "example.com/mylib": {
+                "gosimple": [
+                    {
+                        "posn": "/sandbox/abc/ws/mylib/a.go:10:2",
+                        "message": "should omit comparison",
+                        "suggested_fixes": [
+                            {"edits": [
+                                {"filename": "/sandbox/abc/ws/mylib/a.go", "start": 5, "end": 7, "new": ""}
+                            ]}
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let out = relativize_report_paths(json, ws);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let diag = &v["example.com/mylib"]["gosimple"][0];
+        assert_eq!(diag["posn"], "mylib/a.go:10:2");
+        assert_eq!(
+            diag["suggested_fixes"][0]["edits"][0]["filename"],
+            "mylib/a.go"
+        );
+        // The findings the gate prints are now package-relative.
+        let findings = report_findings(&out).unwrap();
+        assert!(
+            findings.iter().all(|f| !f.contains("/sandbox/")),
+            "findings still carry an absolute path: {findings:?}"
+        );
+        // And the fixer still keys edits by basename.
+        assert!(report_edits(&out).unwrap().contains_key("a.go"));
+    }
+
+    #[test]
+    fn relativize_leaves_paths_outside_ws_root_and_bad_json_untouched() {
+        let ws = std::path::Path::new("/sandbox/abc/ws");
+        let json = br#"{"p": {"printf": [{"posn": "/elsewhere/a.go:1:1", "message": "m"}]}}"#;
+        let out = relativize_report_paths(json, ws);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["p"]["printf"][0]["posn"], "/elsewhere/a.go:1:1");
+
+        // Non-JSON input is returned verbatim so the consumer sees the real error.
+        assert_eq!(relativize_report_paths(b"not json", ws), b"not json");
+        assert_eq!(relativize_report_paths(b"{}", ws), b"{}");
     }
 
     #[test]

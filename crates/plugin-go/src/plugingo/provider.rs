@@ -643,40 +643,31 @@ impl ProviderInner {
                             dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
                         >)
                 }
-                GoPackageKind::FirstParty { .. } => {
+                GoPackageKind::FirstParty { module_root, .. } => {
                     // Emit the full candidate set unconditionally for any dir
                     // under a go.mod (decode_package guarantees that). Each
                     // variant is filtered at `get` time by inspecting the
                     // `_golist` result — no filesystem scan needed.
+                    //
+                    // Lint/format variants are the exception: they exist only for
+                    // modules that opt in with a golangci config at the go.mod
+                    // root, so gate them here (matching the `get`-time gate) to
+                    // avoid advertising targets that would resolve to NotFound.
+                    let lint_enabled = self.golangci_config_addr(module_root).is_some();
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
-                    let names: &[&str] = if skip_tests {
-                        &[
-                            "_golist",
-                            "build_lib",
-                            "build",
-                            "embed",
-                            "lint-check",
-                            "lint",
-                            "format-check",
-                            "format",
-                        ]
-                    } else {
-                        &[
-                            "_golist",
-                            "build_lib",
-                            "build",
-                            "embed",
-                            "lint-check",
-                            "lint",
-                            "format-check",
-                            "format",
+                    let mut names: Vec<&str> = vec!["_golist", "build_lib", "build", "embed"];
+                    if lint_enabled {
+                        names.extend_from_slice(&["lint-check", "lint", "format-check", "format"]);
+                    }
+                    if !skip_tests {
+                        names.extend_from_slice(&[
                             "embed_xtest",
                             "build_test",
                             "test",
                             "build_xtest",
                             "xtest",
-                        ]
-                    };
+                        ]);
+                    }
                     let responses: Vec<anyhow::Result<ListResponse>> = names
                         .iter()
                         .map(|name| {
@@ -1509,6 +1500,10 @@ impl ProviderInner {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
+                // Lint only where the module opts in with a golangci config.
+                if self.golangci_config_addr(&module_root).is_none() {
+                    return Err(GetError::NotFound);
+                }
                 let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
                 let spec =
                     crate::plugingo::driver_lint::build_lint_gate_spec(addr.clone(), &analyze_addr);
@@ -1520,6 +1515,9 @@ impl ProviderInner {
             // cache. Use `lint-check` to only report.
             "lint" => {
                 if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                if self.golangci_config_addr(&module_root).is_none() {
                     return Err(GetError::NotFound);
                 }
                 let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
@@ -1542,16 +1540,19 @@ impl ProviderInner {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
+                // Format only where the module opts in with a golangci config
+                // (the same gate as lint); the config also carries formatter
+                // settings (gofumpt/goimports).
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
+                };
                 let pkg_addrs = self
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
                     .await
                     .map_err(GetError::Other)?;
                 let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
-                let config_addr = if self.workspace_root.join(".golangci.yml").exists() {
-                    Some(pluginfs::file_addr(".golangci.yml"))
-                } else {
-                    None
-                };
+                let config_addr = Some(config_addr);
                 let params = crate::plugingo::driver_format::FormatParams {
                     addr: addr.clone(),
                     govet_addr: &govet_addr,
@@ -1589,10 +1590,25 @@ impl ProviderInner {
                 // One facts dep per first-party transitive lib: its `_lint` target
                 // (same package + factors as its `build_lib`) produces the
                 // `lint.facts` this package consumes for interprocedural analysis.
+                //
+                // A dep is only linted if ITS module opts in with a golangci
+                // config, so a dep in a config-less module has no `_lint` target.
+                // Skip those (they degrade to no-facts, like stdlib) rather than
+                // wiring a dependency that would resolve to NotFound and break the
+                // importer's lint — the same module-root gate the dep's own `_lint`
+                // arm applies.
                 let facts_libs: Vec<(String, Addr)> = transitive
                     .libs
                     .iter()
-                    .filter(|(_, dep)| is_firstparty_pkg(dep.package.as_str()))
+                    .filter(|(_, dep)| {
+                        is_firstparty_pkg(dep.package.as_str())
+                            && crate::plugingo::addr_util::find_go_mod(
+                                &self.workspace_root.join(dep.package.as_str()),
+                            )
+                            .is_some_and(|(dep_module_root, _)| {
+                                self.golangci_config_addr(&dep_module_root).is_some()
+                            })
+                    })
                     .map(|(ip, dep)| {
                         (
                             ip.clone(),
@@ -1608,14 +1624,15 @@ impl ProviderInner {
 
                 let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
 
-                // A workspace-root `.golangci.yml` drives linter selection. Absent
-                // → the standard analyzer set. The file is a hashed input, so a
-                // config edit re-lints every package.
-                let config_addr = if self.workspace_root.join(".golangci.yml").exists() {
-                    Some(pluginfs::file_addr(".golangci.yml"))
-                } else {
-                    None
+                // The module's `.golangci.yml`/`.golangci.yaml` (at the go.mod
+                // root) drives linter selection AND opts the module into linting:
+                // no config → no `_lint` target. The file is a hashed input, so a
+                // config edit re-lints the module.
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
                 };
+                let config_addr = Some(config_addr);
 
                 let spec = crate::plugingo::driver_lint::build_lint_spec(
                     crate::plugingo::driver_lint::LintParams {
@@ -2402,6 +2419,23 @@ impl ProviderInner {
         factors: &Factors,
     ) -> Addr {
         Addr::new(package.clone(), name.to_string(), factors_to_args(factors))
+    }
+
+    /// The addr of the module's golangci-lint config, if the module root (the
+    /// `go.mod` directory) holds one. Lint/format targets exist ONLY for modules
+    /// that have such a config — the presence of a `.golangci.yml`/`.golangci.yaml`
+    /// at the module root is what opts a module into linting. The returned addr
+    /// (a workspace-relative `fs:file`) is a hashed input to the lint/format
+    /// targets, so editing the config re-lints the module.
+    fn golangci_config_addr(&self, module_root: &Path) -> Option<Addr> {
+        for name in [".golangci.yml", ".golangci.yaml"] {
+            let abs = module_root.join(name);
+            if abs.exists() {
+                let rel = abs.strip_prefix(&self.workspace_root).unwrap_or(&abs);
+                return Some(pluginfs::file_addr(&rel.to_string_lossy()));
+            }
+        }
+        None
     }
 
     /// Build the cache key for `collect_*_libs`. Imports are sorted+deduped so
@@ -3234,6 +3268,13 @@ mod tests {
         Addr::new(PkgBuf::from(package), name.to_string(), Default::default())
     }
 
+    /// Write a minimal `.golangci.yml` at a fixture's module root so its lint and
+    /// format targets are enabled — the provider synthesizes them only for
+    /// modules that opt in with a golangci config at the go.mod root.
+    fn enable_golangci(root: &Path) {
+        std::fs::write(root.join(".golangci.yml"), "linters:\n  default: standard\n").unwrap();
+    }
+
     /// A provider whose `govet` option is `addr` (the option is an addr: a build
     /// target for a from-source tool, or a download target).
     fn provider_with_govet(root: PathBuf, addr: &str) -> Provider {
@@ -3313,6 +3354,7 @@ mod tests {
     async fn test_lint_and_format_specs_resolve_on_a_dev_build() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
         // Default `govet` — i.e. the dev build's (nonexistent) release target.
         let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
         for name in ["_lint", "lint-check", "lint", "format-check", "format"] {
@@ -3787,6 +3829,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_dep_lint_driver_and_facts_wiring() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
         // From-source govet, as heph's own repo configures it.
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
@@ -3847,6 +3890,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_lint_and_format_stage_downloaded_govet_by_default() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
         let p = provider_with_govet(
             sandbox.path().to_path_buf(),
             "//@heph/go/govet/v0.1.234:heph-govet",
@@ -3879,6 +3923,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_lint_gate_depends_on_analyze_report() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "lint-check"))
             .await
@@ -3909,6 +3954,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_lint_fix_consumes_report_and_sources() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "lint")).await.unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint_fix");
@@ -3946,6 +3992,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_format_targets_resolve() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
         let check = provider_get(&p, make_addr("cmd", "format-check"))
@@ -3972,6 +4019,59 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             fix.target_spec.config.get("out").is_some(),
             "fix declares in_place outputs"
+        );
+    }
+
+    // Lint/format targets exist ONLY for modules that opt in with a golangci
+    // config at the go.mod root. Without one, get resolves them to NotFound and
+    // list omits them entirely (while the build/test targets stay).
+    #[tokio::test]
+    async fn test_lint_targets_absent_without_golangci_config() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        // Deliberately NO `.golangci.yml`.
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        for name in ["_lint", "lint-check", "lint", "format-check", "format"] {
+            assert!(
+                matches!(provider_get(&p, make_addr("cmd", name)).await, Err(GetError::NotFound)),
+                "{name} must be NotFound without a golangci config"
+            );
+        }
+
+        let names = provider_list(&p, "cmd").await;
+        for gated in ["lint-check", "lint", "format-check", "format"] {
+            assert!(
+                !names.iter().any(|n| n == gated),
+                "{gated} must not be listed without a golangci config: {names:?}"
+            );
+        }
+        // The non-lint targets are unaffected.
+        assert!(
+            names.iter().any(|n| n == "build_lib"),
+            "build_lib must still be listed: {names:?}"
+        );
+    }
+
+    // A `.golangci.yaml` (the other YAML extension) opts a module in just as
+    // `.golangci.yml` does.
+    #[tokio::test]
+    async fn test_lint_enabled_by_golangci_yaml_extension() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        std::fs::write(
+            sandbox.path().join(".golangci.yaml"),
+            "linters:\n  default: standard\n",
+        )
+        .unwrap();
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+        provider_get(&p, make_addr("cmd", "lint-check"))
+            .await
+            .expect("lint-check resolves with a .golangci.yaml");
+        let names = provider_list(&p, "cmd").await;
+        assert!(
+            names.iter().any(|n| n == "lint-check"),
+            "lint-check listed with .golangci.yaml: {names:?}"
         );
     }
 

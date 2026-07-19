@@ -89,7 +89,13 @@ func (s *suppressor) nolintCovers(linter, file string, line int) bool {
 	return set["*"] || set[linter]
 }
 
-var nolintRe = regexp.MustCompile(`//\s*nolint(:\s*([\w,\s-]+))?`)
+// nolintRe matches a `//nolint` directive comment. The `\b` after `nolint` is
+// load-bearing: without it, `//nolintlint`, `//nolinter`, etc. would match the
+// `nolint` prefix with an empty linter group and be treated as a bare
+// `//nolint` — silently suppressing *every* linter on that line. The boundary
+// requires `nolint` to be followed by `:`, whitespace, or end-of-comment, as
+// golangci-lint does.
+var nolintRe = regexp.MustCompile(`//\s*nolint\b(:\s*([\w,\s-]+))?`)
 
 // scanNolint indexes a file's `//nolint[:l1,l2]` directives by the lines they
 // cover. A trailing directive covers its own line; a directive on its own line
@@ -119,7 +125,15 @@ func scanNolint(file string) map[int]map[string]bool {
 			set["*"] = true
 		} else {
 			for _, n := range strings.Split(names, ",") {
-				if n = strings.TrimSpace(n); n != "" {
+				n = strings.TrimSpace(n)
+				switch {
+				case n == "":
+					// skip empty entries (e.g. trailing comma)
+				case n == "all":
+					// golangci's `//nolint:all` is the wildcard — same as bare
+					// `//nolint`, it suppresses every linter on the line.
+					set["*"] = true
+				default:
 					set[n] = true
 				}
 			}
