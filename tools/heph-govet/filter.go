@@ -238,8 +238,18 @@ func (s *suppressor) isGenerated(file string) bool {
 	return g
 }
 
-// detectGenerated scans a file's header (the comment lines above the `package`
-// clause, where generated markers live) for a generated-file marker.
+// generatedScanLines bounds how far into a file we look for a generated marker.
+// Generators put it in the header, but not always above the `package` clause
+// (some tools emit `package foo` first, then the `// Code generated … DO NOT
+// EDIT` comment). golangci scans the file, not just the pre-package lines, so we
+// scan a generous prefix rather than stopping at `package` — while capping the
+// work on large hand-written files that will never carry a marker.
+const generatedScanLines = 200
+
+// detectGenerated scans a file's leading lines for a generated-file marker. The
+// marker may sit above or just below the `package` clause, so the scan does not
+// stop at `package`. "strict" honors only the Go-convention `// Code generated
+// … DO NOT EDIT.` line; "lax" also accepts golangci's looser comment substrings.
 func detectGenerated(file, mode string) bool {
 	f, err := os.Open(file)
 	if err != nil {
@@ -249,12 +259,8 @@ func detectGenerated(file, mode string) bool {
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
+	for line := 0; line < generatedScanLines && sc.Scan(); line++ {
 		trimmed := strings.TrimSpace(sc.Text())
-		// Markers precede the package clause; stop once real code begins.
-		if strings.HasPrefix(trimmed, "package ") {
-			return false
-		}
 		if strictGeneratedRe.MatchString(trimmed) {
 			return true
 		}
