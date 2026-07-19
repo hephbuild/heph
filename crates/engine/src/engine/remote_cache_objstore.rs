@@ -30,12 +30,14 @@ use object_store::buffered::BufWriter;
 use object_store::gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder};
 use object_store::limit::LimitStore;
 use object_store::{
-    CredentialProvider, ObjectStore, ObjectStoreExt, parse_url_opts, path::Path as ObjPath,
+    ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, RetryConfig, parse_url_opts,
+    path::Path as ObjPath,
 };
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::OnceCell;
 use tokio_util::io::StreamReader;
@@ -43,6 +45,84 @@ use url::Url;
 
 /// OAuth scope for read/write access to GCS objects — what a remote cache needs.
 const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
+
+// A cache blob is a whole build output — multi-GiB is normal. object_store's
+// default request timeout (30s) is applied end-to-end, "from connecting until
+// the response body has finished", so a large blob can never finish a body read
+// in one window: reqwest aborts it, object_store resumes via a `Range` request
+// but burns one entry from its retry budget, and the budget exhausts long before
+// the object lands — the cache then disables itself.
+//
+// A per-request timeout is the wrong tool for a stream: it bounds total transfer
+// time (which scales with object size and link speed), not liveness. We instead
+// bound *inactivity* — an HTTP/2 keep-alive ping detects a dead or stalled peer
+// within seconds and surfaces it as a stream error, which object_store resumes
+// from the current offset. GCS and S3 both negotiate HTTP/2, so the ping applies
+// to real transfers; the connect timeout still guards the initial handshake.
+
+/// HTTP/2 keep-alive ping interval — how often a liveness ping is sent on an
+/// otherwise-quiet connection (mid-stream or idle).
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long to wait for a ping ack before declaring the connection dead.
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Apply the shared liveness config to any [`ClientOptions`]: drop the total
+/// request timeout (wrong for a streamed multi-GiB body) and detect dead peers
+/// via HTTP/2 keep-alive pings instead.
+fn tune_client_options(options: ClientOptions) -> ClientOptions {
+    options
+        .with_timeout_disabled()
+        .with_http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .with_http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+        .with_http2_keep_alive_while_idle()
+}
+
+/// Client options for the explicit store builders.
+fn client_options() -> ClientOptions {
+    tune_client_options(ClientOptions::default())
+}
+
+/// Retry budget for the explicit store builders. The default (10 retries /
+/// 180s elapsed) is sized for small objects; a genuine reset an hour into a
+/// multi-GiB transfer would hit the 180s elapsed cap and fail despite using a
+/// single retry. Widen it so resume-via-`Range` has room. Kept under the ~1h
+/// GCS bearer lifetime, and safe past object_store's "<5min" guidance because
+/// our credential provider refreshes the token on every re-signed request and a
+/// GET/GCS transfer carries no signed payload to go stale.
+fn retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 20,
+        retry_timeout: Duration::from_secs(30 * 60),
+        ..Default::default()
+    }
+}
+
+/// Extra options fed to [`parse_url_opts`] for networked schemes, matching
+/// [`tune_client_options`] through the only interface that path exposes —
+/// string keys. There is no "disable timeout" string, so the total timeout is
+/// lifted to a value unbounded for any real transfer (liveness is enforced by
+/// the keep-alive pings, not this ceiling). Local schemes (`file`, `memory`)
+/// have no HTTP client and reject client config keys, so they get nothing.
+fn transfer_opts(scheme: &str) -> Vec<(String, String)> {
+    match scheme {
+        "file" | "memory" => Vec::new(),
+        _ => vec![
+            ("timeout".to_string(), "43200s".to_string()),
+            (
+                "http2_keep_alive_interval".to_string(),
+                format!("{}s", H2_KEEPALIVE_INTERVAL.as_secs()),
+            ),
+            (
+                "http2_keep_alive_timeout".to_string(),
+                format!("{}s", H2_KEEPALIVE_TIMEOUT.as_secs()),
+            ),
+            (
+                "http2_keep_alive_while_idle".to_string(),
+                "true".to_string(),
+            ),
+        ],
+    }
+}
 
 /// One remote object store plus the path prefix carved out of its URI. Object
 /// keys handed to [`RemoteCacheBackend`] are joined under `prefix`, so two
@@ -74,6 +154,8 @@ impl ObjStoreBackend {
                 let store = GoogleCloudStorageBuilder::from_env()
                     .with_url(uri)
                     .with_credentials(provider)
+                    .with_client_options(client_options())
+                    .with_retry(retry_config())
                     .build()
                     .with_context(|| {
                         format!(
@@ -88,8 +170,12 @@ impl ObjStoreBackend {
                 (Box::new(store), prefix)
             } else {
                 // Pass the environment through so s3/gcs/azure builders pick up
-                // credentials exactly as their `from_env` constructors would.
-                parse_url_opts(&url, std::env::vars())
+                // credentials exactly as their `from_env` constructors would,
+                // followed by a lifted request timeout so large streamed blobs
+                // don't abort on the 30s default (last-wins: an explicit env
+                // `timeout` still overrides).
+                let opts = std::env::vars().chain(transfer_opts(url.scheme()));
+                parse_url_opts(&url, opts)
                     .with_context(|| format!("open remote cache store for {uri}"))?
             };
         let store: Arc<dyn ObjectStore> = Arc::new(LimitStore::new(store, max_concurrency));
@@ -381,6 +467,42 @@ mod tests {
             r#"{"type": "authorized_user", "client_id": "x", "refresh_token": "y"}"#,
         );
         assert_eq!(read_adc_type(&path).as_deref(), Some("authorized_user"));
+    }
+
+    #[test]
+    fn transfer_opts_tunes_networked_schemes_only() {
+        // Networked schemes lift the total timeout (so a multi-GiB body isn't
+        // chopped by the 30s default) and enable HTTP/2 keep-alive pings so a
+        // dead peer is still detected without a total-transfer cap.
+        for scheme in ["gs", "s3", "az", "http", "https"] {
+            let opts = transfer_opts(scheme);
+            assert!(
+                opts.iter().any(|(k, _)| k == "timeout"),
+                "scheme {scheme} missing timeout"
+            );
+            assert!(
+                opts.iter().any(|(k, _)| k == "http2_keep_alive_interval"),
+                "scheme {scheme} missing keep-alive interval"
+            );
+            assert!(
+                opts.iter().any(|(k, _)| k == "http2_keep_alive_timeout"),
+                "scheme {scheme} missing keep-alive timeout"
+            );
+        }
+        // Local schemes have no HTTP client and reject client config keys.
+        assert!(transfer_opts("file").is_empty());
+        assert!(transfer_opts("memory").is_empty());
+    }
+
+    #[test]
+    fn retry_config_widens_budget_within_token_lifetime() {
+        let r = retry_config();
+        // Bigger than the 10-retry / 180s default so resume-via-Range survives a
+        // reset deep into a long transfer...
+        assert!(r.max_retries > 10);
+        assert!(r.retry_timeout > Duration::from_secs(180));
+        // ...but under the ~1h GCS bearer lifetime.
+        assert!(r.retry_timeout < Duration::from_secs(60 * 60));
     }
 
     #[test]
