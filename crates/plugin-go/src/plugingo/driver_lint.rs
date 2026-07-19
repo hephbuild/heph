@@ -605,17 +605,17 @@ fn relativize_report_paths(json: &[u8], ws_root: &std::path::Path) -> Vec<u8> {
     serde_json::to_vec(&root).unwrap_or_else(|_| json.to_vec())
 }
 
-/// The golangci-lint linter NAME that owns an analyzer, derived from the honnef
-/// check-code convention: `SA*` → staticcheck, `ST*` → stylecheck, any other
-/// `S*` → gosimple. Everything else is a `go vet` pass (`printf`, `lostcancel`,
-/// …), which golangci exposes under `govet`. This mirrors heph-govet's own
-/// analyzer→linter map, so a finding prints the name a user would `//nolint:`.
+/// The golangci-lint linter NAME that owns an analyzer, so a finding prints the
+/// name a user would put in a `//nolint:` directive. golangci v2 folded gosimple
+/// and stylecheck into `staticcheck`, so every honnef check (SA/S/ST — the codes
+/// all start with an uppercase `S`) reports as `staticcheck`. Everything else is
+/// a `go vet` pass (`printf`, `lostcancel`, … — lowercase names), exposed as
+/// `govet`. Mirrors heph-govet's own analyzer→linter map (`nolintLinterName`).
 fn golangci_linter_of(analyzer: &str) -> &str {
-    match analyzer.strip_prefix('S') {
-        Some(rest) if rest.starts_with('A') => "staticcheck",
-        Some(rest) if rest.starts_with('T') => "stylecheck",
-        Some(_) => "gosimple",
-        None => "govet",
+    if analyzer.starts_with('S') {
+        "staticcheck"
+    } else {
+        "govet"
     }
 }
 
@@ -1526,9 +1526,11 @@ mod tests {
             }
         }"#;
         let f = report_findings(json).unwrap();
+        // golangci v2 folds stylecheck into staticcheck, so ST1000's nolint name
+        // is `staticcheck`.
         assert!(
-            f.iter().any(|s| s.contains("(stylecheck: ST1000)")),
-            "ST1000 must name the stylecheck linter: {f:?}"
+            f.iter().any(|s| s.contains("(staticcheck: ST1000)")),
+            "ST1000 must name the staticcheck linter (v2): {f:?}"
         );
         assert!(
             f.iter().any(|s| s.contains("(govet: printf)")),
@@ -1538,11 +1540,14 @@ mod tests {
 
     #[test]
     fn golangci_linter_mapping() {
+        // v2: all honnef families (SA/S/ST) report as staticcheck.
         assert_eq!(golangci_linter_of("SA1000"), "staticcheck");
-        assert_eq!(golangci_linter_of("ST1000"), "stylecheck");
-        assert_eq!(golangci_linter_of("S1002"), "gosimple");
+        assert_eq!(golangci_linter_of("ST1000"), "staticcheck");
+        assert_eq!(golangci_linter_of("S1002"), "staticcheck");
         assert_eq!(golangci_linter_of("printf"), "govet");
         assert_eq!(golangci_linter_of("lostcancel"), "govet");
+        assert_eq!(golangci_linter_of("shadow"), "govet");
+        assert_eq!(golangci_linter_of("slog"), "govet");
     }
 
     // ---- relativize ----

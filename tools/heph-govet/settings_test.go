@@ -98,6 +98,36 @@ func TestFilterChecksGlob(t *testing.T) {
 	}
 }
 
+func TestNolintLinterNameCollapsesHonnefToStaticcheck(t *testing.T) {
+	// golangci v2 merged gosimple/stylecheck into staticcheck, so all three
+	// honnef families are suppressed with //nolint:staticcheck.
+	for _, fam := range []string{"staticcheck", "gosimple", "stylecheck"} {
+		if got := nolintLinterName(fam); got != "staticcheck" {
+			t.Errorf("nolintLinterName(%q) = %q, want staticcheck", fam, got)
+		}
+	}
+	if got := nolintLinterName("govet"); got != "govet" {
+		t.Errorf("nolintLinterName(govet) = %q, want govet", got)
+	}
+}
+
+func TestSelectAnalyzersLinterOfUsesStaticcheckForHonnef(t *testing.T) {
+	var cfg golangciConfig
+	cfg.Linters.Default = "all"
+	r := registry(cfg)
+	_, linterOf, _, err := selectAnalyzers(cfg, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for a, name := range linterOf {
+		// honnef check codes start with an uppercase 'S' (SA/S/ST); vet passes
+		// are lowercase words.
+		if strings.HasPrefix(a.Name, "S") && name != "staticcheck" {
+			t.Errorf("honnef %s mapped to %q, want staticcheck", a.Name, name)
+		}
+	}
+}
+
 func TestCoerceFlag(t *testing.T) {
 	if got := coerceFlag([]any{"A", "B"}); got != "A,B" {
 		t.Fatalf("list join: got %q", got)

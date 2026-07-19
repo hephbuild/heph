@@ -157,11 +157,25 @@ func selectAnalyzers(cfg golangciConfig, r map[string][]*analysis.Analyzer) ([]*
 		for _, a := range r[n] {
 			if !seen[a] {
 				seen[a] = true
-				linterOf[a] = n
+				linterOf[a] = nolintLinterName(n)
 				out = append(out, a)
 			}
 		}
 	}
 	sort.Strings(unknown)
 	return out, linterOf, unknown, nil
+}
+
+// nolintLinterName maps a registry linter name to the golangci-lint v2 linter
+// name used for `//nolint` and `exclusions.rules` matching. golangci v2 removed
+// the separate `gosimple` and `stylecheck` linters and folded their checks into
+// `staticcheck`, so every honnef check (SA/S/ST) is suppressed with
+// `//nolint:staticcheck` — the name heph-govet reports for these findings too.
+func nolintLinterName(registryName string) string {
+	switch registryName {
+	case "staticcheck", "gosimple", "stylecheck":
+		return "staticcheck"
+	default:
+		return registryName
+	}
 }
