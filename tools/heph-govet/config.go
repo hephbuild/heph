@@ -11,28 +11,46 @@ import (
 
 // golangciConfig is the subset of `.golangci.yml` (schema version 2) this driver
 // understands: linter selection, per-linter `settings`, exclusions, and the
-// `formatters` block. Presets, `run:`/`output:`/`severity:`/`issues:` and
+// `formatters` block. `run:`/`output:`/`severity:`/`issues:` and
 // `exclusions.rules[].source` are not parsed — see the package doc.
 type golangciConfig struct {
 	Version string `yaml:"version"`
 	Linters struct {
 		// "standard" (default), "all", "none", or "fast". Only standard/all/none
 		// are meaningful here; "fast" is treated as "standard".
-		Default    string         `yaml:"default"`
-		Enable     []string       `yaml:"enable"`
-		Disable    []string       `yaml:"disable"`
-		Settings   linterSettings `yaml:"settings"`
-		Exclusions struct {
-			// Subset of golangci-lint exclusions: per-rule linter scoping plus
-			// path/text regexes. Presets and `source` matching are not parsed.
-			Rules []struct {
-				Linters []string `yaml:"linters"`
-				Path    string   `yaml:"path"`
-				Text    string   `yaml:"text"`
-			} `yaml:"rules"`
-		} `yaml:"exclusions"`
+		Default    string           `yaml:"default"`
+		Enable     []string         `yaml:"enable"`
+		Disable    []string         `yaml:"disable"`
+		Settings   linterSettings   `yaml:"settings"`
+		Exclusions exclusionsConfig `yaml:"exclusions"`
 	} `yaml:"linters"`
 	Formatters formattersConfig `yaml:"formatters"`
+}
+
+// exclusionsConfig mirrors golangci-lint v2's `linters.exclusions`: generated-
+// file handling, built-in exclusion presets, per-rule scoping, and whole-file
+// path filters. `rules[].source` matching is the only sub-feature not parsed.
+type exclusionsConfig struct {
+	// "lax" (default), "strict", or "disable" — how generated files are
+	// detected and excluded. Empty is treated as "lax", matching golangci.
+	Generated string `yaml:"generated"`
+	// Built-in exclusion presets: "comments", "common-false-positives",
+	// "legacy", "std-error-handling". Each expands to a set of exclude rules.
+	Presets []string          `yaml:"presets"`
+	Rules   []excludeRuleYAML `yaml:"rules"`
+	// Whole-file path regexes: `paths` excludes issues in matching files;
+	// `paths-except` excludes issues in files that match NONE of them.
+	Paths       []string `yaml:"paths"`
+	PathsExcept []string `yaml:"paths-except"`
+}
+
+// excludeRuleYAML is one `exclusions.rules` entry. All present conditions are
+// AND-ed; `path-except` negates (the rule does not apply to matching paths).
+type excludeRuleYAML struct {
+	Linters    []string `yaml:"linters"`
+	Path       string   `yaml:"path"`
+	PathExcept string   `yaml:"path-except"`
+	Text       string   `yaml:"text"`
 }
 
 // linterSettings is `linters.settings` — per-linter configuration for the

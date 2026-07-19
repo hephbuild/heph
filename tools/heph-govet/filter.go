@@ -11,61 +11,181 @@ import (
 )
 
 // suppressor decides whether a diagnostic should be dropped before it reaches
-// the report, replicating the two golangci-lint features that live in its runner
-// (not in the analyzers): `//nolint` directives and `linters.exclusions.rules`.
+// the report, replicating the golangci-lint features that live in its runner
+// (not in the analyzers): `//nolint` directives and the full
+// `linters.exclusions` block — `generated`, `presets`, `rules`, `paths`, and
+// `paths-except`.
 //
 // It is applied by wrapping each selected analyzer's Pass.Report (see
 // wrapAnalyzers): the analysis itself is unchanged, only emission is filtered.
 type suppressor struct {
+	// excludes is the union of `exclusions.rules` and the expanded `presets`.
 	excludes []excludeRule
+	// paths / pathsExcept are whole-file filters: a file matching `paths` is
+	// dropped entirely; when `pathsExcept` is non-empty, a file matching NONE of
+	// them is dropped.
+	paths       []*regexp.Regexp
+	pathsExcept []*regexp.Regexp
+	// generated is "lax" (default), "strict", or "disable".
+	generated string
 	// nolint is the lazily-scanned per-file directive index: file -> line ->
 	// set of golangci linter names ("*" = all linters).
 	nolint map[string]map[int]map[string]bool
+	// genCache memoizes the per-file generated-detection result.
+	genCache map[string]bool
 }
 
 type excludeRule struct {
-	linters map[string]bool // empty → applies to every linter
-	path    *regexp.Regexp  // nil → any path
-	text    *regexp.Regexp  // nil → any message
+	linters    map[string]bool // empty → applies to every linter
+	path       *regexp.Regexp  // nil → any path
+	pathExcept *regexp.Regexp  // non-nil → rule skipped when the path matches
+	text       *regexp.Regexp  // nil → any message
 }
 
 func newSuppressor(cfg golangciConfig) (*suppressor, error) {
-	s := &suppressor{nolint: map[string]map[int]map[string]bool{}}
-	for i, r := range cfg.Linters.Exclusions.Rules {
-		var er excludeRule
-		if len(r.Linters) > 0 {
-			er.linters = map[string]bool{}
-			for _, l := range r.Linters {
-				er.linters[l] = true
-			}
-		}
-		if r.Path != "" {
-			re, err := regexp.Compile(r.Path)
-			if err != nil {
-				return nil, fmt.Errorf("exclusions.rules[%d].path: %w", i, err)
-			}
-			er.path = re
-		}
-		if r.Text != "" {
-			re, err := regexp.Compile(r.Text)
-			if err != nil {
-				return nil, fmt.Errorf("exclusions.rules[%d].text: %w", i, err)
-			}
-			er.text = re
+	ex := cfg.Linters.Exclusions
+	s := &suppressor{
+		nolint:    map[string]map[int]map[string]bool{},
+		genCache:  map[string]bool{},
+		generated: normalizeGenerated(ex.Generated),
+	}
+
+	// Explicit rules first, then the expansion of any enabled presets.
+	for i, r := range ex.Rules {
+		er, err := compileExcludeRule(r.Linters, r.Path, r.PathExcept, r.Text)
+		if err != nil {
+			return nil, fmt.Errorf("exclusions.rules[%d]: %w", i, err)
 		}
 		s.excludes = append(s.excludes, er)
 	}
+	presetRules, err := expandPresets(ex.Presets)
+	if err != nil {
+		return nil, err
+	}
+	s.excludes = append(s.excludes, presetRules...)
+
+	for i, p := range ex.Paths {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("exclusions.paths[%d]: %w", i, err)
+		}
+		s.paths = append(s.paths, re)
+	}
+	for i, p := range ex.PathsExcept {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("exclusions.paths-except[%d]: %w", i, err)
+		}
+		s.pathsExcept = append(s.pathsExcept, re)
+	}
 	return s, nil
+}
+
+// normalizeGenerated maps the config value to a mode, defaulting empty to "lax"
+// (golangci-lint's default: generated files are excluded unless opted out).
+func normalizeGenerated(v string) string {
+	switch v {
+	case "strict", "disable":
+		return v
+	default:
+		return "lax"
+	}
+}
+
+// compileExcludeRule builds an excludeRule from its raw config strings.
+func compileExcludeRule(linters []string, path, pathExcept, text string) (excludeRule, error) {
+	var er excludeRule
+	if len(linters) > 0 {
+		er.linters = map[string]bool{}
+		for _, l := range linters {
+			er.linters[nolintLinterName(l)] = true
+		}
+	}
+	if path != "" {
+		re, err := regexp.Compile(path)
+		if err != nil {
+			return er, fmt.Errorf("path: %w", err)
+		}
+		er.path = re
+	}
+	if pathExcept != "" {
+		re, err := regexp.Compile(pathExcept)
+		if err != nil {
+			return er, fmt.Errorf("path-except: %w", err)
+		}
+		er.pathExcept = re
+	}
+	if text != "" {
+		re, err := regexp.Compile(text)
+		if err != nil {
+			return er, fmt.Errorf("text: %w", err)
+		}
+		er.text = re
+	}
+	return er, nil
+}
+
+// expandPresets turns the enabled preset names into exclude rules. An unknown
+// preset name is an error (fail loudly, per heph's "fail or fix" rule).
+func expandPresets(presets []string) ([]excludeRule, error) {
+	if len(presets) == 0 {
+		return nil, nil
+	}
+	enabled := map[string]bool{}
+	for _, p := range presets {
+		if !knownPresets[p] {
+			return nil, fmt.Errorf("exclusions.presets: unknown preset %q "+
+				"(known: comments, common-false-positives, legacy, std-error-handling)", p)
+		}
+		enabled[p] = true
+	}
+	var out []excludeRule
+	for _, pp := range presetPatterns {
+		if !enabled[pp.preset] {
+			continue
+		}
+		er, err := compileExcludeRule(pp.linters, "", "", pp.text)
+		if err != nil {
+			return nil, fmt.Errorf("preset %s (%s): %w", pp.preset, pp.id, err)
+		}
+		out = append(out, er)
+	}
+	return out, nil
 }
 
 // suppressed reports whether a finding by golangci `linter` at file:line with
 // `msg` should be dropped.
 func (s *suppressor) suppressed(linter, file string, line int, msg string) bool {
+	// Whole-file filters first — cheapest, and they short-circuit everything.
+	if s.generated != "disable" && s.isGenerated(file) {
+		return true
+	}
+	for _, re := range s.paths {
+		if re.MatchString(file) {
+			return true
+		}
+	}
+	if len(s.pathsExcept) > 0 {
+		matched := false
+		for _, re := range s.pathsExcept {
+			if re.MatchString(file) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return true
+		}
+	}
+
 	for _, er := range s.excludes {
 		if len(er.linters) > 0 && !er.linters[linter] {
 			continue
 		}
 		if er.path != nil && !er.path.MatchString(file) {
+			continue
+		}
+		if er.pathExcept != nil && er.pathExcept.MatchString(file) {
 			continue
 		}
 		if er.text != nil && !er.text.MatchString(msg) {
@@ -87,6 +207,67 @@ func (s *suppressor) nolintCovers(linter, file string, line int) bool {
 		return false
 	}
 	return set["*"] || set[linter]
+}
+
+// strictGeneratedRe is the Go convention for a generated-file marker
+// (https://go.dev/s/generatedcode): a line comment of exactly this form.
+var strictGeneratedRe = regexp.MustCompile(`^//\s*Code generated .* DO NOT EDIT\.$`)
+
+// laxGeneratedMarkers are the case-insensitive header substrings golangci-lint's
+// "lax" mode also treats as marking a generated file.
+var laxGeneratedMarkers = []string{
+	"autogenerated by",
+	"automatically generated",
+	"code generated",
+	"do not edit",
+	"@generated",
+	"generated by",
+	"generated file",
+	"this file was generated",
+}
+
+// isGenerated reports whether `file` is a generated file under the configured
+// mode, memoized per file. "strict" honors only the Go-convention marker; "lax"
+// (the default) also accepts the looser header substrings golangci uses.
+func (s *suppressor) isGenerated(file string) bool {
+	if g, ok := s.genCache[file]; ok {
+		return g
+	}
+	g := detectGenerated(file, s.generated)
+	s.genCache[file] = g
+	return g
+}
+
+// detectGenerated scans a file's header (the comment lines above the `package`
+// clause, where generated markers live) for a generated-file marker.
+func detectGenerated(file, mode string) bool {
+	f, err := os.Open(file)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		trimmed := strings.TrimSpace(sc.Text())
+		// Markers precede the package clause; stop once real code begins.
+		if strings.HasPrefix(trimmed, "package ") {
+			return false
+		}
+		if strictGeneratedRe.MatchString(trimmed) {
+			return true
+		}
+		if mode == "lax" && strings.HasPrefix(trimmed, "//") {
+			lower := strings.ToLower(trimmed)
+			for _, m := range laxGeneratedMarkers {
+				if strings.Contains(lower, m) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // nolintRe matches a `//nolint` directive comment. The `\b` after `nolint` is

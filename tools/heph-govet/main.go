@@ -26,15 +26,16 @@
 // enable/disable/default). The config path is passed via the
 // HEPH_GOVET_GOLANGCI_CONFIG environment variable by the heph go_lint driver.
 //
-// `//nolint` directives and `linters.exclusions.rules` (path/text/linter
-// scoping) ARE honored: each analyzer's emission is wrapped with a suppressor
-// (see filter.go), so the report this binary writes is already filtered.
+// `//nolint` directives and the full `linters.exclusions` block ARE honored —
+// `generated`, `presets`, `rules` (linter/path/path-except/text scoping),
+// `paths`, and `paths-except`: each analyzer's emission is wrapped with a
+// suppressor (see filter.go), so the report this binary writes is already
+// filtered.
 //
 // Not supported in this per-package model (by design):
 //   - formatters (gofmt, gofumpt, goimports) — not go/analysis analyzers;
 //   - `unused` — needs whole-program analysis, incompatible with per-unit facts;
-//   - exclusion presets and `exclusions.rules[].source` matching (only
-//     path/text/linter scoping is parsed).
+//   - `exclusions.rules[].source` matching (source-line regexes).
 //
 // # Invocation (by the heph go_lint driver)
 //
