@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -51,8 +52,18 @@ func runFormat(args []string) {
 	}
 	enabled := enabledFormatters(cfg.Formatters.Enable)
 
+	skip, err := newFormatSkip(cfg.Formatters)
+	if err != nil {
+		fatal(err.Error())
+	}
+
 	var unformatted []string
 	for _, file := range files {
+		// Generated / path-excluded files are not ours to format: skip them
+		// from both the rewrite and the check, exactly as golangci-lint does.
+		if skip.excluded(file) {
+			continue
+		}
 		src, err := os.ReadFile(file)
 		if err != nil {
 			fatal(fmt.Sprintf("read %s: %v", file, err))
@@ -106,6 +117,41 @@ func expandArgFiles(args []string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// formatSkip decides which files formatting leaves untouched, mirroring
+// golangci-lint v2's `formatters.exclusions`: generated files (mode "lax" by
+// default, "strict", or "disable") and whole-file path regexes.
+type formatSkip struct {
+	generated string // "lax" | "strict" | "disable"
+	paths     []*regexp.Regexp
+}
+
+// newFormatSkip compiles the exclusion config once. An invalid path regex fails
+// loudly rather than silently formatting a file the config meant to exempt.
+func newFormatSkip(fc formattersConfig) (formatSkip, error) {
+	s := formatSkip{generated: normalizeGenerated(fc.Exclusions.Generated)}
+	for _, p := range fc.Exclusions.Paths {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return s, fmt.Errorf("formatters.exclusions.paths %q: %w", p, err)
+		}
+		s.paths = append(s.paths, re)
+	}
+	return s, nil
+}
+
+// excluded reports whether `file` should be skipped from formatting.
+func (s formatSkip) excluded(file string) bool {
+	if s.generated != "disable" && detectGenerated(file, s.generated) {
+		return true
+	}
+	for _, re := range s.paths {
+		if re.MatchString(file) {
+			return true
+		}
+	}
+	return false
 }
 
 // enabledFormatters resolves the formatter list from `formatters.enable`,

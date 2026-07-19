@@ -88,7 +88,16 @@ type honnefSettings struct {
 // formattersConfig is the `formatters:` block: which formatters run and their
 // settings. Mirrors golangci-lint v2 for gofmt/gofumpt/goimports.
 type formattersConfig struct {
-	Enable   []string `yaml:"enable"`
+	Enable []string `yaml:"enable"`
+	// Exclusions mirrors golangci-lint v2's `formatters.exclusions`: generated
+	// files are skipped from formatting (default "lax"), plus whole-file path
+	// regexes. Skipped files are neither rewritten (`format`) nor reported
+	// (`format-check`) — a generated file's own formatter output is not ours to
+	// enforce.
+	Exclusions struct {
+		Generated string   `yaml:"generated"`
+		Paths     []string `yaml:"paths"`
+	} `yaml:"exclusions"`
 	Settings struct {
 		Gofmt struct {
 			Simplify     bool `yaml:"simplify"`
