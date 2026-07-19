@@ -797,7 +797,7 @@ const GOLIST_TARGET_NAMES: &[&str] = &[
     "embed",
     "lint-check",
     "lint",
-    "_lint",
+    "_lint-analyze",
     "format-check",
     "format",
 ];
@@ -1493,8 +1493,8 @@ impl ProviderInner {
                 };
                 Ok(GetResponse { target_spec: spec })
             }
-            // User-facing check gate: depends on `_lint`'s report and fails on
-            // findings. `_lint` always exits 0 so facts cache regardless; the gate
+            // User-facing check gate: depends on `_lint-analyze`'s report and fails on
+            // findings. `_lint-analyze` always exits 0 so facts cache regardless; the gate
             // is the thing that fails.
             "lint-check" => {
                 if pkg.go_files.is_empty() {
@@ -1506,7 +1506,8 @@ impl ProviderInner {
                     Some(a) => a,
                     None => return Err(GetError::NotFound),
                 };
-                let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
+                let analyze_addr =
+                    self.make_addr_with_name(&addr.package, "_lint-analyze", &factors);
                 let spec = crate::plugingo::driver_lint::build_lint_gate_spec(
                     addr.clone(),
                     &analyze_addr,
@@ -1514,9 +1515,9 @@ impl ProviderInner {
                 );
                 Ok(GetResponse { target_spec: spec })
             }
-            // The plain `lint` target FIXES: it consumes `_lint`'s report (suggested
+            // The plain `lint` target FIXES: it consumes `_lint-analyze`'s report (suggested
             // fixes) + the package sources, applies the edits, and rewrites the
-            // sources in place (codegen). Runs no analysis itself — reuses `_lint`'s
+            // sources in place (codegen). Runs no analysis itself — reuses `_lint-analyze`'s
             // cache. Use `lint-check` to only report.
             "lint" => {
                 if pkg.go_files.is_empty() {
@@ -1526,7 +1527,8 @@ impl ProviderInner {
                     Some(a) => a,
                     None => return Err(GetError::NotFound),
                 };
-                let analyze_addr = self.make_addr_with_name(&addr.package, "_lint", &factors);
+                let analyze_addr =
+                    self.make_addr_with_name(&addr.package, "_lint-analyze", &factors);
                 let pkg_addrs = self
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
                     .await
@@ -1576,7 +1578,7 @@ impl ProviderInner {
             }
             // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
             // dependents) + `lint-report.json` (consumed by the gate).
-            "_lint" => {
+            "_lint-analyze" => {
                 // Mirrors `build_lib`: a package with no Go source files isn't
                 // analyzable. Tests/xtests are linted via their own variants
                 // later; this is the normal-source unit.
@@ -1594,15 +1596,15 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                // One facts dep per first-party transitive lib: its `_lint` target
+                // One facts dep per first-party transitive lib: its `_lint-analyze` target
                 // (same package + factors as its `build_lib`) produces the
                 // `lint.facts` this package consumes for interprocedural analysis.
                 //
                 // A dep is only linted if ITS module opts in with a golangci
-                // config, so a dep in a config-less module has no `_lint` target.
+                // config, so a dep in a config-less module has no `_lint-analyze` target.
                 // Skip those (they degrade to no-facts, like stdlib) rather than
                 // wiring a dependency that would resolve to NotFound and break the
-                // importer's lint — the same module-root gate the dep's own `_lint`
+                // importer's lint — the same module-root gate the dep's own `_lint-analyze`
                 // arm applies.
                 let facts_libs: Vec<(String, Addr)> = transitive
                     .libs
@@ -1619,7 +1621,11 @@ impl ProviderInner {
                     .map(|(ip, dep)| {
                         (
                             ip.clone(),
-                            Addr::new(dep.package.clone(), "_lint".to_string(), dep.args.clone()),
+                            Addr::new(
+                                dep.package.clone(),
+                                "_lint-analyze".to_string(),
+                                dep.args.clone(),
+                            ),
                         )
                     })
                     .collect();
@@ -1633,7 +1639,7 @@ impl ProviderInner {
 
                 // The module's `.golangci.yml`/`.golangci.yaml` (at the go.mod
                 // root) drives linter selection AND opts the module into linting:
-                // no config → no `_lint` target. The file is a hashed input, so a
+                // no config → no `_lint-analyze` target. The file is a hashed input, so a
                 // config edit re-lints the module.
                 let config_addr = match self.golangci_config_addr(&module_root) {
                     Some(a) => a,
@@ -3368,7 +3374,13 @@ mod tests {
         enable_golangci(sandbox.path());
         // Default `govet` — i.e. the dev build's (nonexistent) release target.
         let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
-        for name in ["_lint", "lint-check", "lint", "format-check", "format"] {
+        for name in [
+            "_lint-analyze",
+            "lint-check",
+            "lint",
+            "format-check",
+            "format",
+        ] {
             provider_get(&p, make_addr("cmd", name))
                 .await
                 .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
@@ -3844,8 +3856,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // From-source govet, as heph's own repo configures it.
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
-        // The analyze target (`_lint`) runs heph-govet and produces facts+report.
-        let resp = provider_get(&p, make_addr("cmd", "_lint")).await.unwrap();
+        // The analyze target (`_lint-analyze`) runs heph-govet and produces facts+report.
+        let resp = provider_get(&p, make_addr("cmd", "_lint-analyze"))
+            .await
+            .unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
@@ -3855,7 +3869,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // The unitchecker binary is staged for every analyze target.
         assert!(
             deps.keys().any(|k| k == "govet_tool"),
-            "_lint must stage the heph-govet tool: got {:?}",
+            "_lint-analyze must stage the heph-govet tool: got {:?}",
             deps.keys().collect::<Vec<_>>()
         );
         // `govet` points at a build target, so the staged tool is the one built
@@ -3873,15 +3887,15 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
 
         // cmd imports the first-party `lib`, so its facts feed cmd's analysis:
-        // a `facts_*` group must reference lib's `_lint` target (not its archive).
+        // a `facts_*` group must reference lib's `_lint-analyze` target (not its archive).
         let has_lib_facts = deps.iter().any(|(k, v)| {
             k.starts_with("facts_")
                 && matches!(v, Value::List(items) if items.iter().any(|it|
-                    matches!(it, Value::String(s) if s.contains(":_lint"))))
+                    matches!(it, Value::String(s) if s.contains(":_lint-analyze"))))
         });
         assert!(
             has_lib_facts,
-            "cmd _lint must consume lib's facts via a facts_* group: got {:?}",
+            "cmd _lint-analyze must consume lib's facts via a facts_* group: got {:?}",
             deps.keys().collect::<Vec<_>>()
         );
 
@@ -3907,7 +3921,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "//@heph/go/govet/v0.1.234:heph-govet",
         );
 
-        for name in ["_lint", "format-check", "format"] {
+        for name in ["_lint-analyze", "format-check", "format"] {
             let resp = provider_get(&p, make_addr("cmd", name)).await.unwrap();
             let deps = match resp.target_spec.config.get("deps").unwrap() {
                 Value::Map(m) => m,
@@ -3927,7 +3941,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         }
     }
 
-    // The user-facing `lint` target is the gate: it depends on `_lint`'s report
+    // The user-facing `lint` target is the gate: it depends on `_lint-analyze`'s report
     // output and fails on findings, leaving fact production (and caching) to the
     // always-exit-0 analyze target.
     #[tokio::test]
@@ -3951,14 +3965,14 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         };
         match &report[0] {
             Value::String(s) => assert!(
-                s.contains(":_lint") && s.ends_with("|report"),
+                s.contains(":_lint-analyze") && s.ends_with("|report"),
                 "gate must consume the analyze target's report output: {s}"
             ),
             _ => panic!("not a string"),
         }
     }
 
-    // The user-facing `lint` (fixer) target consumes `_lint`'s report (for the
+    // The user-facing `lint` (fixer) target consumes `_lint-analyze`'s report (for the
     // suggested fixes) plus the package sources, and rewrites the sources in
     // place. It resolves through the go provider like the gate.
     #[tokio::test]
@@ -3978,7 +3992,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         match deps.get("report").unwrap() {
             Value::List(l) => match &l[0] {
                 Value::String(s) => assert!(
-                    s.contains(":_lint") && s.ends_with("|report"),
+                    s.contains(":_lint-analyze") && s.ends_with("|report"),
                     "fix must consume the analyze target's report output: {s}"
                 ),
                 _ => panic!("report not a string"),
@@ -4043,7 +4057,13 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // Deliberately NO `.golangci.yml`.
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
-        for name in ["_lint", "lint-check", "lint", "format-check", "format"] {
+        for name in [
+            "_lint-analyze",
+            "lint-check",
+            "lint",
+            "format-check",
+            "format",
+        ] {
             assert!(
                 matches!(
                     provider_get(&p, make_addr("cmd", name)).await,

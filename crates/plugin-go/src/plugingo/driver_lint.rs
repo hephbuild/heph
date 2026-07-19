@@ -511,7 +511,7 @@ impl GoLintDriver {
 // ---------------------------------------------------------------------------
 // Gate driver: fails the build when a package's lint report has findings.
 //
-// `go_lint` (the analyze target, `_lint`) always exits 0 so facts are produced
+// `go_lint` (the analyze target, `_lint-analyze`) always exits 0 so facts are produced
 // and cached even for a package with findings — otherwise dependents could not
 // build their own facts. `go_lint_gate` (the user-facing `lint` target) consumes
 // the analyze target's `report` output and is the thing that actually fails:
@@ -551,7 +551,7 @@ const GO_LINT_GATE_FORMAT_VERSION: u32 = 1;
 ///   - each diagnostic's `posn` (`"<file>:<line>:<col>"`), printed by the gate;
 ///   - each suggested fix edit's `filename`, consumed by the fixer.
 ///
-/// This runs in the `_lint` sandbox, the only place the absolute paths are valid
+/// This runs in the `_lint-analyze` sandbox, the only place the absolute paths are valid
 /// and the workspace root is known — the gate and fixer that consume the report
 /// run in different sandboxes. A path not under `ws_root` (there should be none)
 /// is left as-is. On any JSON parse error the original bytes are returned
@@ -770,17 +770,17 @@ impl ManagedDriver for GoLintGateDriver {
 // ---------------------------------------------------------------------------
 // Fix driver: applies go/analysis suggested fixes back into source (codegen).
 //
-// `_lint`'s `-json` report already carries each diagnostic's `suggested_fixes`
+// `_lint-analyze`'s `-json` report already carries each diagnostic's `suggested_fixes`
 // (byte-offset text edits). `go_lint_fix` (the user-facing `lint` target)
 // consumes that report plus the package's own `.go` sources, applies the edits,
 // and declares the rewritten sources as `codegen=in_place` outputs — so the
 // engine writes them back over the tracked source files. Purely mechanical: no
-// re-analysis, and it reuses `_lint`'s cache.
+// re-analysis, and it reuses `_lint-analyze`'s cache.
 // ---------------------------------------------------------------------------
 
 /// A single suggested-fix text edit: replace bytes `[start, end)` of `file`
 /// (basename) with `new`. `start`/`end` are 0-based byte offsets into the file
-/// as the analyzer parsed it; `_lint` and `lint` stage byte-identical
+/// as the analyzer parsed it; `_lint-analyze` and `lint` stage byte-identical
 /// sources, so the offsets line up.
 struct FixEdit {
     start: usize,
@@ -1130,7 +1130,7 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         .collect();
     for (import_path, lint_addr) in p.facts_libs {
         // `|facts` selects the analyze target's facts output ONLY. Without it the
-        // whole `_lint` target stages — facts *and* `lint-report.json` — and the
+        // whole `_lint-analyze` target stages — facts *and* `lint-report.json` — and the
         // consumer, which takes the single staged path of the group, gets whichever
         // sorts first: `lint-report.json` (`-` < `.`). unitchecker then gob-decodes
         // the JSON report as facts ("unexpected EOF"). The gate is explicit the same
@@ -1189,7 +1189,7 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         addr: p.addr,
         driver: "go_lint".to_string(),
         config,
-        // No labels: `_lint` is the analyze unit `lint` / `lint-check` consume, not
+        // No labels: `_lint-analyze` is the analyze unit `lint` / `lint-check` consume, not
         // a target anyone selects. Labels are the selection surface, so it has none
         // — it is reached only as a dep.
         labels: vec![],
@@ -1199,11 +1199,11 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
 }
 
 /// Build the user-facing `lint` gate spec. Depends on the `report` output of the
-/// analyze target (`_lint`) and fails the build when it contains findings.
+/// analyze target (`_lint-analyze`) and fails the build when it contains findings.
 ///
 /// `config_addr` (the module's `.golangci.yml`) is attached as a hash-only dep
 /// so any config change re-keys the gate directly — not just transitively
-/// through `_lint`'s report.
+/// through `_lint-analyze`'s report.
 pub fn build_lint_gate_spec(
     addr: Addr,
     analyze_addr: &Addr,
@@ -1239,7 +1239,7 @@ pub fn build_lint_gate_spec(
 }
 
 /// Build the user-facing `lint` (fixer) spec. Depends on the `report` output of the
-/// analyze target (`_lint`) plus the package's own `.go` sources, applies each
+/// analyze target (`_lint-analyze`) plus the package's own `.go` sources, applies each
 /// diagnostic's suggested fix, and rewrites the sources in place (codegen).
 ///
 /// `src_addrs` are the source file target addresses (the `""` dep group, staged
@@ -1419,7 +1419,7 @@ mod tests {
     }
 
     /// A facts dep must select the analyze target's `facts` output group. Staging the
-    /// whole `_lint` target would also stage `lint-report.json`, which sorts *before*
+    /// whole `_lint-analyze` target would also stage `lint-report.json`, which sorts *before*
     /// `lint.facts` (`-` < `.`), so the consumer — which takes the single staged path
     /// of the group — would hand the JSON report to unitchecker as gob facts and fail
     /// with "unexpected EOF".
@@ -1427,7 +1427,11 @@ mod tests {
     fn facts_deps_select_the_facts_output_group() {
         let factsdep = (
             "example.com/dep".to_string(),
-            Addr::new(PkgBuf::from("dep"), "_lint".to_string(), Default::default()),
+            Addr::new(
+                PkgBuf::from("dep"),
+                "_lint-analyze".to_string(),
+                Default::default(),
+            ),
         );
         let s = spec(&[], std::slice::from_ref(&factsdep));
         let m = deps_map(&s);
@@ -1459,7 +1463,7 @@ mod tests {
         assert!(out.contains_key("report"));
     }
 
-    /// `_lint` is the analyze unit `lint`/`lint-check` consume, not something anyone
+    /// `_lint-analyze` is the analyze unit `lint`/`lint-check` consume, not something anyone
     /// selects: no labels at all, so no label sweep can reach it.
     #[test]
     fn analyze_unit_has_no_labels() {
@@ -1473,7 +1477,7 @@ mod tests {
     fn check_and_fix_labels_separate_checking_from_fixing() {
         let analyze = Addr::new(
             PkgBuf::from("mylib"),
-            "_lint".to_string(),
+            "_lint-analyze".to_string(),
             Default::default(),
         );
         let check = build_lint_gate_spec(addr("lint-check"), &analyze, None);
@@ -1637,7 +1641,7 @@ mod tests {
     fn gate_spec_driver_and_report_dep() {
         let analyze = Addr::new(
             PkgBuf::from("mylib"),
-            "_lint".to_string(),
+            "_lint-analyze".to_string(),
             Default::default(),
         );
         let s = build_lint_gate_spec(addr("lint-check"), &analyze, None);
@@ -1652,7 +1656,7 @@ mod tests {
         };
         match &report[0] {
             Value::String(s) => assert!(
-                s.contains(":_lint") && s.ends_with("|report"),
+                s.contains(":_lint-analyze") && s.ends_with("|report"),
                 "gate must depend on the analyze target's report output: {s}"
             ),
             _ => panic!("not a string"),
@@ -1663,7 +1667,7 @@ mod tests {
     async fn gate_and_fix_take_golangci_config_as_hash_only_dep() {
         let analyze = Addr::new(
             PkgBuf::from("mylib"),
-            "_lint".to_string(),
+            "_lint-analyze".to_string(),
             Default::default(),
         );
         let cfg = Addr::new(PkgBuf::from(""), "file".to_string(), Default::default());
@@ -1825,7 +1829,7 @@ mod tests {
     fn fix_spec_driver_deps_and_in_place_outputs() {
         let analyze = Addr::new(
             PkgBuf::from("mylib"),
-            "_lint".to_string(),
+            "_lint-analyze".to_string(),
             Default::default(),
         );
         let s = build_lint_fix_spec(
@@ -1837,7 +1841,7 @@ mod tests {
         );
         assert_eq!(s.driver, "go_lint_fix");
 
-        // Depends on `_lint`'s report + the sources (default group).
+        // Depends on `_lint-analyze`'s report + the sources (default group).
         let deps = match s.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("deps not a map"),
@@ -1846,7 +1850,7 @@ mod tests {
             Value::List(l) => match &l[0] {
                 Value::String(v) => {
                     assert!(
-                        v.contains(":_lint") && v.ends_with("|report"),
+                        v.contains(":_lint-analyze") && v.ends_with("|report"),
                         "report dep: {v}"
                     );
                 }
@@ -1876,7 +1880,7 @@ mod tests {
     async fn fix_parse_declares_in_place_pkg_relative_outputs() {
         let analyze = Addr::new(
             PkgBuf::from("mylib"),
-            "_lint".to_string(),
+            "_lint-analyze".to_string(),
             Default::default(),
         );
         let spec = build_lint_fix_spec(

@@ -3,11 +3,11 @@ mod common;
 use common::require_go;
 
 /// End-to-end lint against the *downloaded* heph-govet: the `http_fetch` target
-/// fetches the released binary, the engine caches and stages it, and `_lint` execs
+/// fetches the released binary, the engine caches and stages it, and `_lint-analyze` execs
 /// it as an `x/tools` unitchecker over a real package.
 ///
 /// This is the shape that broke in production ("wait for heph-govet: Permission
-/// denied"): nothing below the `_lint` target's own `run` was at fault — the bits
+/// denied"): nothing below the `_lint-analyze` target's own `run` was at fault — the bits
 /// on the staged file are right — so the failure can only be reproduced by
 /// actually exec'ing it, which is what this does.
 #[tokio::test]
@@ -15,8 +15,8 @@ async fn test_lint_execs_the_downloaded_govet() -> anyhow::Result<()> {
     require_go!();
     let ws = common::make_workspace_host(common::fixture("with_dep")?)?;
 
-    // `_lint` is the analyze unit: it runs heph-govet and writes facts + report.
-    let result = ws.run("//lib:_lint").await?;
+    // `_lint-analyze` is the analyze unit: it runs heph-govet and writes facts + report.
+    let result = ws.run("//lib:_lint-analyze").await?;
 
     let paths = common::artifact_paths(&result);
     assert!(
@@ -52,7 +52,7 @@ async fn test_lint_consumes_a_deps_empty_facts() -> anyhow::Result<()> {
     let ws = common::make_workspace_host(common::fixture("with_dep")?)?;
 
     // cmd imports lib, so lib's facts are wired into cmd's analysis.
-    let result = ws.run("//cmd:_lint").await?;
+    let result = ws.run("//cmd:_lint-analyze").await?;
 
     let paths = common::artifact_paths(&result);
     assert!(
@@ -71,7 +71,7 @@ async fn test_lint_package_importing_unsafe() -> anyhow::Result<()> {
     require_go!();
     let ws = common::make_workspace_host(common::fixture("lint_unsafe")?)?;
 
-    let result = ws.run("//mem:_lint").await?;
+    let result = ws.run("//mem:_lint-analyze").await?;
 
     let paths = common::artifact_paths(&result);
     assert!(
