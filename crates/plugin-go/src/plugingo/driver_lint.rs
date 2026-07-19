@@ -587,7 +587,8 @@ fn relativize_report_paths(json: &[u8], ws_root: &std::path::Path) -> Vec<u8> {
                         continue;
                     };
                     for fix in fixes {
-                        let Some(edits) = fix.get_mut("edits").and_then(|v| v.as_array_mut()) else {
+                        let Some(edits) = fix.get_mut("edits").and_then(|v| v.as_array_mut())
+                        else {
                             continue;
                         };
                         for e in edits {

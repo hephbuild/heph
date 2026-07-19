@@ -3272,7 +3272,11 @@ mod tests {
     /// format targets are enabled — the provider synthesizes them only for
     /// modules that opt in with a golangci config at the go.mod root.
     fn enable_golangci(root: &Path) {
-        std::fs::write(root.join(".golangci.yml"), "linters:\n  default: standard\n").unwrap();
+        std::fs::write(
+            root.join(".golangci.yml"),
+            "linters:\n  default: standard\n",
+        )
+        .unwrap();
     }
 
     /// A provider whose `govet` option is `addr` (the option is an addr: a build
@@ -4034,7 +4038,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
         for name in ["_lint", "lint-check", "lint", "format-check", "format"] {
             assert!(
-                matches!(provider_get(&p, make_addr("cmd", name)).await, Err(GetError::NotFound)),
+                matches!(
+                    provider_get(&p, make_addr("cmd", name)).await,
+                    Err(GetError::NotFound)
+                ),
                 "{name} must be NotFound without a golangci config"
             );
         }
