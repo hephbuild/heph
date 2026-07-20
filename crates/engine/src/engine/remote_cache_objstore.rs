@@ -24,7 +24,7 @@ use crate::engine::remote_cache::RemoteCacheBackend;
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
-use futures::{Stream, TryStreamExt};
+use futures::TryStreamExt;
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as AdcBuilder};
 use object_store::buffered::BufWriter;
 use object_store::gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder};
@@ -33,53 +33,49 @@ use object_store::{
     ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, RetryConfig, parse_url_opts,
     path::Path as ObjPath,
 };
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::OnceCell;
+use tokio::time::{Instant, Sleep, sleep};
 use tokio_util::io::StreamReader;
 use url::Url;
 
 /// OAuth scope for read/write access to GCS objects — what a remote cache needs.
 const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 
-// A cache blob is a whole build output — multi-GiB is normal. object_store's
-// default request timeout (30s) is applied end-to-end, "from connecting until
-// the response body has finished", so a large blob can never finish a body read
-// in one window: reqwest aborts it, object_store resumes via a `Range` request
-// but burns one entry from its retry budget, and the budget exhausts long before
-// the object lands — the cache then disables itself.
+// Liveness for a cache transfer.
 //
-// A per-request timeout is the wrong tool for a stream: it bounds total transfer
-// time (which scales with object size and link speed), not liveness. We instead
-// bound *inactivity* — an HTTP/2 keep-alive ping detects a dead or stalled peer
-// within seconds and surfaces it as a stream error, which object_store resumes
-// from the current offset. GCS and S3 both negotiate HTTP/2, so the ping applies
-// to real transfers; the connect timeout still guards the initial handshake.
+// object_store's GCS/S3 client is HTTP/1.1 (its `ClientOptions` default is
+// `http1_only`), so there is no HTTP/2 keep-alive ping to detect a dead or
+// trickling peer — the only liveness knob that actually applies is the
+// per-request timeout. A *disabled* timeout (a previous attempt at supporting
+// multi-GiB blobs) is therefore unsafe: a stalled or pathologically slow
+// connection is never reset and the transfer hangs indefinitely.
+//
+// So we keep the timeout FINITE but generous — enough for a large blob on a
+// healthy link, while a genuinely stuck attempt is aborted and object_store
+// resumes from the current offset via a `Range` request on a fresh connection
+// (usually fast). During a transfer, [`InactivityReader`] adds a tighter bound:
+// if no bytes arrive for `INACTIVITY_TIMEOUT`, the read fails fast rather than
+// waiting out the whole request timeout.
 
-/// HTTP/2 keep-alive ping interval — how often a liveness ping is sent on an
-/// otherwise-quiet connection (mid-stream or idle).
-const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
-/// How long to wait for a ping ack before declaring the connection dead.
-const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-request (per-attempt) timeout. Lifted well above object_store's 30s
+/// default so a large blob isn't chopped mid-body, but finite so a stalled or
+/// trickling connection is eventually reset and resumed.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Abort a transfer that delivers no bytes for this long — catches a stall
+/// without waiting out the full [`REQUEST_TIMEOUT`].
+const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Apply the shared liveness config to any [`ClientOptions`]: drop the total
-/// request timeout (wrong for a streamed multi-GiB body) and detect dead peers
-/// via HTTP/2 keep-alive pings instead.
-fn tune_client_options(options: ClientOptions) -> ClientOptions {
-    options
-        .with_timeout_disabled()
-        .with_http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
-        .with_http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
-        .with_http2_keep_alive_while_idle()
-}
-
-/// Client options for the explicit store builders.
+/// Client options for the explicit store builders: a generous but finite request
+/// timeout (see the liveness note above).
 fn client_options() -> ClientOptions {
-    tune_client_options(ClientOptions::default())
+    ClientOptions::default().with_timeout(REQUEST_TIMEOUT)
 }
 
 /// Retry budget for the explicit store builders. The default (10 retries /
@@ -97,30 +93,17 @@ fn retry_config() -> RetryConfig {
     }
 }
 
-/// Extra options fed to [`parse_url_opts`] for networked schemes, matching
-/// [`tune_client_options`] through the only interface that path exposes —
-/// string keys. There is no "disable timeout" string, so the total timeout is
-/// lifted to a value unbounded for any real transfer (liveness is enforced by
-/// the keep-alive pings, not this ceiling). Local schemes (`file`, `memory`)
-/// have no HTTP client and reject client config keys, so they get nothing.
+/// Extra options fed to [`parse_url_opts`] for networked schemes: the same
+/// finite request timeout as [`client_options`], through the string-key
+/// interface that path exposes. Local schemes (`file`, `memory`) have no HTTP
+/// client and reject client config keys, so they get nothing.
 fn transfer_opts(scheme: &str) -> Vec<(String, String)> {
     match scheme {
         "file" | "memory" => Vec::new(),
-        _ => vec![
-            ("timeout".to_string(), "43200s".to_string()),
-            (
-                "http2_keep_alive_interval".to_string(),
-                format!("{}s", H2_KEEPALIVE_INTERVAL.as_secs()),
-            ),
-            (
-                "http2_keep_alive_timeout".to_string(),
-                format!("{}s", H2_KEEPALIVE_TIMEOUT.as_secs()),
-            ),
-            (
-                "http2_keep_alive_while_idle".to_string(),
-                "true".to_string(),
-            ),
-        ],
+        _ => vec![(
+            "timeout".to_string(),
+            format!("{}s", REQUEST_TIMEOUT.as_secs()),
+        )],
     }
 }
 
@@ -190,24 +173,54 @@ impl ObjStoreBackend {
     }
 }
 
-/// Stream adapter that enters `span` on every `poll_next`. The object byte
-/// stream is consumed lazily — long after [`open_read`](ObjStoreBackend::open_read)
-/// returns — so object_store's internal retry log (`"Encountered error while
-/// reading response body…"`, emitted mid-stream) only inherits our span fields
-/// (cache `key`, object `path`) if the span is active during those polls. Plain
-/// `tracing::Instrument` covers futures, not streams, hence this wrapper.
-struct SpanStream<S> {
-    span: tracing::Span,
-    inner: S,
+/// `AsyncRead` adapter that fails a transfer stalled for `timeout` — no bytes
+/// delivered within the window. The object_store GCS client is HTTP/1.1 with no
+/// keep-alive ping, so without this a dead-but-not-closed connection would hang
+/// until the (generous) per-request timeout; this bounds a stall tightly. The
+/// deadline is extended on every read that yields bytes.
+struct InactivityReader<R> {
+    inner: R,
+    timeout: Duration,
+    deadline: Pin<Box<Sleep>>,
 }
 
-impl<S: Stream + Unpin> Stream for SpanStream<S> {
-    type Item = S::Item;
+impl<R> InactivityReader<R> {
+    fn new(inner: R, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            deadline: Box::pin(sleep(timeout)),
+        }
+    }
+}
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<S::Item>> {
+impl<R: AsyncRead + Unpin> AsyncRead for InactivityReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let _guard = this.span.enter();
-        Pin::new(&mut this.inner).poll_next(cx)
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                // Any forward progress (bytes read) resets the inactivity clock.
+                // EOF (a ready read with no new bytes) passes through untouched.
+                if buf.filled().len() != before {
+                    let next = Instant::now() + this.timeout;
+                    this.deadline.as_mut().reset(next);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => match this.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("remote read stalled: no data for {:?}", this.timeout),
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
     }
 }
 
@@ -224,17 +237,11 @@ impl RemoteCacheBackend for ObjStoreBackend {
         let path = self.object_path(key);
         match self.store.get(&path).await {
             Ok(res) => {
-                // The byte stream is read downstream, where object_store may log
-                // body-read retries. Wrap it in a span carrying the cache key and
-                // object path so those logs (and any surfaced error) name the
-                // artifact that flaked instead of a bare HTTP message.
-                let span = tracing::info_span!("remote_get", key = %key, path = %path);
-                let stream = SpanStream {
-                    span,
-                    inner: res.into_stream(),
-                }
-                .map_err(enclose!((path) move |e| stream_read_err(&path, e)));
-                Ok(Some(Box::pin(StreamReader::new(stream))))
+                let stream = res
+                    .into_stream()
+                    .map_err(enclose!((path) move |e| stream_read_err(&path, e)));
+                let reader = InactivityReader::new(StreamReader::new(stream), INACTIVITY_TIMEOUT);
+                Ok(Some(Box::pin(reader)))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e).with_context(|| format!("open remote object {path}")),
@@ -408,31 +415,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn span_stream_forwards_items_and_errors_in_order() {
-        use futures::StreamExt;
-        let items: Vec<object_store::Result<u8>> = vec![
-            Ok(1),
-            Ok(2),
-            Err(object_store::Error::Generic {
-                store: "S3",
-                source: "boom".into(),
-            }),
-        ];
-        let span = tracing::info_span!("remote_get", key = "k", path = "p");
-        let s = SpanStream {
-            span,
-            inner: futures::stream::iter(items),
-        };
-        let out: Vec<_> = s.collect().await;
-        // The span wrapper is transparent: every item and the trailing error
-        // pass through unchanged and in order.
-        assert_eq!(out.len(), 3);
-        assert!(matches!(out[0], Ok(1)));
-        assert!(matches!(out[1], Ok(2)));
-        assert!(out[2].is_err());
-    }
-
-    #[tokio::test]
     async fn file_backend_streams() {
         let dir = tempfile::tempdir().expect("tempdir");
         let uri = format!("file://{}", dir.path().display());
@@ -470,28 +452,60 @@ mod tests {
     }
 
     #[test]
-    fn transfer_opts_tunes_networked_schemes_only() {
-        // Networked schemes lift the total timeout (so a multi-GiB body isn't
-        // chopped by the 30s default) and enable HTTP/2 keep-alive pings so a
-        // dead peer is still detected without a total-transfer cap.
+    fn transfer_opts_sets_finite_timeout_on_networked_schemes_only() {
+        // Networked schemes lift the total timeout above object_store's 30s
+        // default (so a large body isn't chopped) but keep it finite — no
+        // h2-keep-alive keys, since the client is HTTP/1.1 and would ignore them.
         for scheme in ["gs", "s3", "az", "http", "https"] {
             let opts = transfer_opts(scheme);
-            assert!(
-                opts.iter().any(|(k, _)| k == "timeout"),
-                "scheme {scheme} missing timeout"
+            assert_eq!(
+                opts.iter()
+                    .find(|(k, _)| k == "timeout")
+                    .map(|(_, v)| v.as_str()),
+                Some(format!("{}s", REQUEST_TIMEOUT.as_secs()).as_str()),
+                "scheme {scheme} should carry the finite request timeout"
             );
             assert!(
-                opts.iter().any(|(k, _)| k == "http2_keep_alive_interval"),
-                "scheme {scheme} missing keep-alive interval"
-            );
-            assert!(
-                opts.iter().any(|(k, _)| k == "http2_keep_alive_timeout"),
-                "scheme {scheme} missing keep-alive timeout"
+                !opts.iter().any(|(k, _)| k.starts_with("http2_keep_alive")),
+                "scheme {scheme} must not set inert h2 keep-alive keys"
             );
         }
         // Local schemes have no HTTP client and reject client config keys.
         assert!(transfer_opts("file").is_empty());
         assert!(transfer_opts("memory").is_empty());
+    }
+
+    #[tokio::test]
+    async fn inactivity_reader_passes_data_through() {
+        use tokio::io::AsyncReadExt;
+        let data: &[u8] = b"hello remote cache world";
+        let mut r = InactivityReader::new(data, Duration::from_secs(30));
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.expect("read");
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn inactivity_reader_times_out_on_stall() {
+        use tokio::io::AsyncReadExt;
+
+        // A reader that never yields bytes and never wakes — only the inactivity
+        // deadline can make progress.
+        struct Never;
+        impl AsyncRead for Never {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let mut r = InactivityReader::new(Never, Duration::from_millis(50));
+        let mut buf = [0u8; 16];
+        let err = r.read(&mut buf).await.expect_err("must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
