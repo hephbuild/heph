@@ -1,5 +1,6 @@
 use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
+use enclose::enclose;
 use futures::TryStreamExt;
 use hmodel::htmatcher;
 use std::collections::BTreeSet;
@@ -8,32 +9,35 @@ use std::sync::Arc;
 impl Engine {
     /// Collect the unique set of labels declared by every target matching `m`.
     ///
-    /// Enumerates the matching targets via `query`, resolves each target's spec,
-    /// and unions their `labels`. Returned sorted (via `BTreeSet`) for stable
-    /// output.
+    /// Enumerates the matching targets via `query` and folds each target's spec
+    /// `labels` into a sorted `BTreeSet`. Specs are resolved off the query stream
+    /// with a bounded in-flight set, so only the label set — never the full spec
+    /// list — is held in memory.
     pub async fn labels(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &htmatcher::Matcher,
     ) -> anyhow::Result<BTreeSet<String>> {
-        let stream = Arc::clone(&self).query(rs.clone(), m);
-        tokio::pin!(stream);
-        let mut addrs = Vec::new();
-        while let Some(addr) = stream.try_next().await? {
-            addrs.push(addr);
-        }
+        // Cap in-flight spec resolutions; the engine's own semaphores gate the
+        // real work, this just bounds the orchestration set held off the stream.
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .saturating_mul(2);
 
-        // Fan out spec resolution. `try_join_all` over the memoizer-backed
-        // `get_spec` is the measured-fastest fanout shape here.
-        let specs = futures::future::try_join_all(
-            addrs
-                .iter()
-                .map(|addr| Arc::clone(&self).get_spec(rs.clone(), addr)),
-        )
-        .await?;
+        let specs = Arc::clone(&self)
+            .query(rs.clone(), m)
+            .map_ok(move |addr| {
+                enclose!((self => engine, rs) async move {
+                    engine.get_spec(rs, &addr).await
+                })
+            })
+            .try_buffer_unordered(concurrency);
+        tokio::pin!(specs);
 
+        // Fold labels in as each spec resolves; the spec is dropped immediately.
         let mut labels = BTreeSet::new();
-        for spec in specs {
+        while let Some(spec) = specs.try_next().await? {
             for label in &spec.labels {
                 labels.insert(label.clone());
             }
