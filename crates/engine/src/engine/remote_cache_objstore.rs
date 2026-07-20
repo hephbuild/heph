@@ -94,8 +94,15 @@ impl HttpConnector for NegotiatingConnector {
         ensure_rustls_provider_installed();
         // Default builder = ALPN offering h2 + http/1.1 (server picks), env
         // proxies honored, no gzip/brotli features so blobs aren't decompressed.
+        //
+        // `http2_adaptive_window` grows the HTTP/2 flow-control window under load
+        // (like Go's client). Without it, multiplexing every transfer over one
+        // connection would throttle aggregate throughput on a fixed 64 KiB
+        // window — the very reason object_store defaults to HTTP/1.1. With it, we
+        // get h2's few-connections benefit *and* full throughput.
         let client = reqwest012::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .http2_adaptive_window(true)
             .build()
             .map_err(|e| object_store::Error::Generic {
                 store: "remote-cache",
