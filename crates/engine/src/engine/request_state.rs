@@ -343,15 +343,16 @@ impl RequestState {
             at_unix_ms: crate::engine::event::now_unix_ms(),
             kind,
         };
-        // Fan out to every registered hook (best-effort, sync push).
-        for hook in &self.data.hooks {
-            hook.on_event(&event);
-        }
-        if let Some(tx) = &self.data.events {
-            // A closed receiver (consumer gone) is expected; events are
-            // best-effort, so dropping the send result is intentional.
-            drop(tx.send(event));
-        }
+        self.data.dispatch(event);
+    }
+
+    /// The shared request data, for consumers that must fan an event out
+    /// themselves after `self` is no longer borrowable — notably
+    /// [`emit_scope`](crate::engine::event::emit_scope)'s end-of-scope drop guard,
+    /// which fires after the scoped future (which borrowed the `RequestState`)
+    /// has been dropped.
+    pub(crate) fn data(&self) -> Arc<RequestStateData> {
+        Arc::clone(&self.data)
     }
 
     /// Emit the `MaxWorkers` capacity event at most once per request. Safe to
@@ -455,6 +456,24 @@ impl RequestState {
             self.data.dep_dag.lock().add_dep(parent, addr)
         } else {
             Ok(())
+        }
+    }
+}
+
+impl RequestStateData {
+    /// Fan a fully-built event out to every registered hook and the event
+    /// channel (both best-effort). The single delivery path for a `BuildEvent`,
+    /// shared by [`RequestState::emit`] and [`emit_scope`](crate::engine::event::emit_scope)'s
+    /// drop guard so paired `*End` events reach hooks, not just the channel.
+    pub(crate) fn dispatch(&self, event: crate::engine::event::BuildEvent) {
+        // Fan out to every registered hook (best-effort, sync push).
+        for hook in &self.hooks {
+            hook.on_event(&event);
+        }
+        if let Some(tx) = &self.events {
+            // A closed receiver (consumer gone) is expected; events are
+            // best-effort, so dropping the send result is intentional.
+            drop(tx.send(event));
         }
     }
 }
@@ -831,6 +850,66 @@ mod tests {
         assert!(
             rec.closed.load(Ordering::Acquire),
             "on_close fires when the request state drops"
+        );
+        Ok(())
+    }
+
+    // The `*End` event of an `emit_scope` fans out to registered hooks — not just
+    // the renderer channel. Regression: the end-of-scope drop guard used to emit
+    // via the event sender only, so an out-of-process hook (e.g. the GHA status
+    // plugin) saw every `*Start` but no `*End`, tallying `done`/`built` as zero.
+    // Exercised with no renderer channel (events = None), the exact failing case.
+    #[tokio::test]
+    async fn emit_scope_end_reaches_hooks_without_renderer() -> anyhow::Result<()> {
+        use crate::engine::hook::Hook;
+        use hcore::events::{BuildEvent, BuildEventKind};
+
+        #[derive(Default)]
+        struct Rec {
+            ends: Mutex<Vec<String>>,
+        }
+        impl Hook for Rec {
+            fn name(&self) -> String {
+                "rec".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                if let BuildEventKind::ResultEnd { addr, .. } = &ev.kind {
+                    self.ends.lock().push(addr.clone());
+                }
+            }
+            fn on_close(&self) {}
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut e = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let rec = Arc::new(Rec::default());
+        e.register_hook(Arc::clone(&rec) as Arc<dyn Hook>)?;
+        let engine = Arc::new(e);
+
+        // No renderer channel (events = None): the hook is the only consumer.
+        let state = engine.new_state_with_events(true, None);
+        crate::engine::event::emit_scope(
+            &state,
+            BuildEventKind::ResultStart {
+                addr: "//a:b".into(),
+            },
+            |error| BuildEventKind::ResultEnd {
+                addr: "//a:b".into(),
+                error,
+            },
+            async { anyhow::Ok(()) },
+        )
+        .await?;
+
+        assert_eq!(
+            rec.ends.lock().clone(),
+            vec!["//a:b".to_string()],
+            "the *End event must reach the hook even with no renderer channel"
         );
         Ok(())
     }

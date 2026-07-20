@@ -6,8 +6,9 @@
 //! with a wall-clock timestamp at emit time (`at_unix_ms`), so elapsed times stay
 //! correct even when the client and server are split across a channel.
 
-use crate::engine::request_state::RequestState;
+use crate::engine::request_state::{RequestState, RequestStateData};
 use std::future::Future;
+use std::sync::Arc;
 
 // Event types moved to `heph-core::events` (shared by the TUI + telemetry
 // without an engine dep); re-exported so `engine::event::BuildEventKind` etc.
@@ -17,22 +18,25 @@ pub use hcore::events::{BuildEvent, BuildEventKind, EventReceiver, EventSender, 
 /// Internal drop-guard so the `*End` event fires on early-return (`?`) **and** on
 /// cancellation (the awaited future is dropped mid-flight). Once armed, the guard
 /// emits exactly one end event when dropped.
+///
+/// Holds the shared [`RequestStateData`] (not just the event channel) so the end
+/// event fans out to registered hooks too — an out-of-process hook (e.g. the GHA
+/// status plugin) must see `ResultEnd`/`ExecuteEnd`, or every count it tallies
+/// against paired scopes reads zero.
 struct EndGuard {
-    tx: Option<EventSender>,
+    data: Option<Arc<RequestStateData>>,
     make_end: Option<Box<dyn FnOnce(Option<String>) -> BuildEventKind + Send>>,
     error: Option<String>,
 }
 
 impl Drop for EndGuard {
     fn drop(&mut self) {
-        if let (Some(tx), Some(make_end)) = (self.tx.take(), self.make_end.take()) {
+        if let (Some(data), Some(make_end)) = (self.data.take(), self.make_end.take()) {
             let kind = make_end(self.error.take());
-            // A closed receiver (consumer gone, e.g. TUI shut down) is expected;
-            // dropping the send result is intentional, events are best-effort.
-            drop(tx.send(BuildEvent {
+            data.dispatch(BuildEvent {
                 at_unix_ms: now_unix_ms(),
                 kind,
-            }));
+            });
         }
     }
 }
@@ -51,7 +55,7 @@ pub async fn emit_scope<T>(
 ) -> anyhow::Result<T> {
     rs.emit(start);
     let mut guard = EndGuard {
-        tx: rs.events_sender(),
+        data: Some(rs.data()),
         make_end: Some(Box::new(make_end)),
         error: None,
     };
