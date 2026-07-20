@@ -335,6 +335,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.25"
+          # pluginmanifest has no external deps (no go.sum) — nothing to cache,
+          # and the default cache lookup warns about a missing root go.mod.
+          cache: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
