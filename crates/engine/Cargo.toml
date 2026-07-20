@@ -53,6 +53,15 @@ rayon = "1.12.0"
 # rustls-tls avoids a system OpenSSL link; blocking runs on its own thread so it
 # is safe to call from inside the async runtime (see plugin_load::download_plugin).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# object_store 0.13 talks to reqwest 0.12 internally. To inject our own HTTP
+# client into its store builders (so cache transfers negotiate HTTP/2 via ALPN
+# and fall back to HTTP/1.1, instead of object_store's HTTP/1.1-only default that
+# storms connections under a wide fan-out), we build a reqwest 0.12 `Client` and
+# hand it to `object_store::client::HttpClient::new`. That requires the SAME
+# reqwest major as object_store, hence this second, renamed dependency. No
+# gzip/brotli features → responses are not auto-decompressed (cache blobs stay
+# raw). rustls-native-roots matches object_store's own TLS setup.
+reqwest012 = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "stream"] }
 rusqlite = { version = "0.39", features = ["bundled", "blob"] }
 rustc-hash = "2"
 # Needed only to install a process-wide rustls crypto provider for

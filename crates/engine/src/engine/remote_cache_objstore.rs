@@ -27,6 +27,7 @@ use enclose::enclose;
 use futures::TryStreamExt;
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as AdcBuilder};
 use object_store::buffered::BufWriter;
+use object_store::client::{HttpClient, HttpConnector};
 use object_store::gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder};
 use object_store::limit::LimitStore;
 use object_store::{
@@ -72,19 +73,36 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// without waiting out the full [`REQUEST_TIMEOUT`].
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Client options for the explicit store builders: HTTP/2 plus a generous but
-/// finite request timeout.
+/// HTTP connector that replaces object_store's HTTP/1.1-only client with a
+/// reqwest client that negotiates HTTP/2 via ALPN and gracefully falls back to
+/// HTTP/1.1 — matching the Go client, and honoring `HTTP(S)_PROXY`/`NO_PROXY`
+/// from the environment.
 ///
-/// object_store's client defaults to HTTP/1.1. Under a wide `//...` fan-out that
-/// opens a request per cache artifact, h1 needs a fresh TCP+TLS connection per
-/// concurrent request; they pile up (TIME_WAIT / ephemeral-port / conntrack
-/// exhaustion) until new connects time out ("error sending request"). HTTP/2
-/// multiplexes every request onto a handful of connections — the same thing the
-/// Go client did, where this workload was never a problem.
-fn client_options() -> ClientOptions {
-    ClientOptions::default()
-        .with_http2_only()
-        .with_timeout(REQUEST_TIMEOUT)
+/// Why: object_store's `ClientOptions` defaults to `http1_only` and offers no
+/// ALPN-negotiate mode (only force-h1 or force-h2-prior-knowledge). Under a wide
+/// `//...` fan-out that opens a request per cache artifact, HTTP/1.1 needs a
+/// fresh TCP+TLS connection per concurrent request; they pile up (TIME_WAIT /
+/// ephemeral-port / conntrack exhaustion) until new connects time out ("error
+/// sending request"). HTTP/2 multiplexes every request onto a handful of
+/// connections. object_store lets us swap the client via `with_http_connector`.
+#[derive(Debug)]
+struct NegotiatingConnector;
+
+impl HttpConnector for NegotiatingConnector {
+    fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
+        // reqwest 0.12 rustls uses the process-default crypto provider.
+        ensure_rustls_provider_installed();
+        // Default builder = ALPN offering h2 + http/1.1 (server picks), env
+        // proxies honored, no gzip/brotli features so blobs aren't decompressed.
+        let client = reqwest012::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| object_store::Error::Generic {
+                store: "remote-cache",
+                source: Box::new(e),
+            })?;
+        Ok(HttpClient::new(client))
+    }
 }
 
 /// Retry budget for the explicit store builders. The default (10 retries /
@@ -102,21 +120,18 @@ fn retry_config() -> RetryConfig {
     }
 }
 
-/// Extra options fed to [`parse_url_opts`] for networked schemes, matching
-/// [`client_options`] through the string-key interface that path exposes: HTTP/2
-/// (multiplex to avoid the h1 connection storm) plus the finite request timeout.
-/// Local schemes (`file`, `memory`) have no HTTP client and reject client config
-/// keys, so they get nothing.
+/// Extra options fed to [`parse_url_opts`] for networked schemes (s3/azure/http):
+/// a finite request timeout above object_store's 30s default. GCS does not use
+/// this path — it goes through [`NegotiatingConnector`]. Local schemes (`file`,
+/// `memory`) have no HTTP client and reject client config keys, so they get
+/// nothing.
 fn transfer_opts(scheme: &str) -> Vec<(String, String)> {
     match scheme {
         "file" | "memory" => Vec::new(),
-        _ => vec![
-            ("http2_only".to_string(), "true".to_string()),
-            (
-                "timeout".to_string(),
-                format!("{}s", REQUEST_TIMEOUT.as_secs()),
-            ),
-        ],
+        _ => vec![(
+            "timeout".to_string(),
+            format!("{}s", REQUEST_TIMEOUT.as_secs()),
+        )],
     }
 }
 
@@ -139,41 +154,41 @@ impl ObjStoreBackend {
     /// simultaneous connections.
     pub fn from_uri(uri: &str, max_concurrency: usize) -> anyhow::Result<Self> {
         let url = Url::parse(uri).with_context(|| format!("parse remote cache uri {uri}"))?;
-        let (store, prefix): (Box<dyn ObjectStore>, ObjPath) =
-            if url.scheme() == "gs" && adc_is_external_account() {
+        let (store, prefix): (Box<dyn ObjectStore>, ObjPath) = if url.scheme() == "gs" {
+            // Always drive GCS through the NegotiatingConnector so transfers use
+            // HTTP/2 (falling back to HTTP/1.1) instead of object_store's
+            // connection-storming HTTP/1.1-only default.
+            let mut builder = GoogleCloudStorageBuilder::from_env()
+                .with_url(uri)
+                .with_retry(retry_config())
+                .with_http_connector(NegotiatingConnector);
+            if adc_is_external_account() {
                 // object_store can't decode an external_account ADC. Inject a
-                // `google-cloud-auth`-backed bearer provider so the GCS builder
-                // skips ADC parsing; the federation handshake happens lazily on
-                // the first request inside the provider.
+                // `google-cloud-auth`-backed bearer provider so the builder skips
+                // ADC parsing; the federation handshake happens lazily on the
+                // first request inside the provider.
                 let provider: GcpCredentialProvider =
                     Arc::new(ExternalAccountCredentialProvider::new());
-                let store = GoogleCloudStorageBuilder::from_env()
-                    .with_url(uri)
-                    .with_credentials(provider)
-                    .with_client_options(client_options())
-                    .with_retry(retry_config())
-                    .build()
-                    .with_context(|| {
-                        format!(
-                            "build GCS store for {uri} (external_account ADC via google-cloud-auth)"
-                        )
-                    })?;
-                // The builder consumes only the bucket from the URL; derive the
-                // key prefix exactly as `parse_url_opts` would (path minus the
-                // leading slash, percent-decoded).
-                let prefix = ObjPath::from_url_path(url.path())
-                    .with_context(|| format!("parse object prefix from {uri}"))?;
-                (Box::new(store), prefix)
-            } else {
-                // Pass the environment through so s3/gcs/azure builders pick up
-                // credentials exactly as their `from_env` constructors would,
-                // followed by a lifted request timeout so large streamed blobs
-                // don't abort on the 30s default (last-wins: an explicit env
-                // `timeout` still overrides).
-                let opts = std::env::vars().chain(transfer_opts(url.scheme()));
-                parse_url_opts(&url, opts)
-                    .with_context(|| format!("open remote cache store for {uri}"))?
-            };
+                builder = builder.with_credentials(provider);
+            }
+            let store = builder
+                .build()
+                .with_context(|| format!("build GCS store for {uri}"))?;
+            // The builder consumes only the bucket from the URL; derive the key
+            // prefix exactly as `parse_url_opts` would (path minus the leading
+            // slash, percent-decoded).
+            let prefix = ObjPath::from_url_path(url.path())
+                .with_context(|| format!("parse object prefix from {uri}"))?;
+            (Box::new(store), prefix)
+        } else {
+            // s3/azure/http/memory/file: object_store's native path. Pass the
+            // environment through so builders pick up credentials as their
+            // `from_env` constructors would, plus a lifted-but-finite request
+            // timeout (last-wins: an explicit env `timeout` still overrides).
+            let opts = std::env::vars().chain(transfer_opts(url.scheme()));
+            parse_url_opts(&url, opts)
+                .with_context(|| format!("open remote cache store for {uri}"))?
+        };
         let store: Arc<dyn ObjectStore> = Arc::new(LimitStore::new(store, max_concurrency));
         Ok(Self { store, prefix })
     }
@@ -465,19 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn transfer_opts_sets_http2_and_finite_timeout_on_networked_schemes_only() {
-        // Networked schemes force HTTP/2 (multiplex, to avoid the h1 connection
-        // storm) and lift the total timeout above object_store's 30s default
-        // while keeping it finite.
-        for scheme in ["gs", "s3", "az", "http", "https"] {
+    fn transfer_opts_sets_finite_timeout_on_networked_schemes_only() {
+        // s3/azure/http lift the total timeout above object_store's 30s default
+        // while keeping it finite. GCS uses the connector, not this path.
+        for scheme in ["s3", "az", "http", "https"] {
             let opts = transfer_opts(scheme);
-            assert_eq!(
-                opts.iter()
-                    .find(|(k, _)| k == "http2_only")
-                    .map(|(_, v)| v.as_str()),
-                Some("true"),
-                "scheme {scheme} should force http2"
-            );
             assert_eq!(
                 opts.iter()
                     .find(|(k, _)| k == "timeout")
@@ -489,6 +496,14 @@ mod tests {
         // Local schemes have no HTTP client and reject client config keys.
         assert!(transfer_opts("file").is_empty());
         assert!(transfer_opts("memory").is_empty());
+    }
+
+    #[test]
+    fn negotiating_connector_builds_a_client() {
+        // Smoke test: the connector builds an ALPN-negotiating reqwest client
+        // (installs the rustls provider, honors env proxies) without error.
+        HttpConnector::connect(&NegotiatingConnector, &ClientOptions::default())
+            .expect("connector builds a client");
     }
 
     #[tokio::test]
