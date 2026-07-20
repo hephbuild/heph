@@ -19,7 +19,12 @@ strip = "none"
 codegen-units = 16
 lto = "thin"
 opt-level = 3 # Prioritizes speed.
-strip = "debuginfo" # Drop DWARF, keep .symtab so backtraces resolve function names.
+# Emit line-table DWARF and keep it (no strip) so in-process backtraces
+# (`--diag-backtrace`, panic backtraces) resolve to function names + file:line.
+# `.symtab` alone is not enough — std's symbolizer reads DWARF. Costs binary
+# size; worth it for diagnosability.
+debug = "line-tables-only"
+strip = "none"
 
 [workspace.lints.clippy]
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
