@@ -4,6 +4,7 @@ mod deps_explorer;
 mod functions;
 mod hashin;
 mod hashout;
+mod labels;
 mod packages;
 mod revdeps;
 mod spec;
@@ -34,6 +35,18 @@ pub enum InspectCommands {
     ///
     /// `heph inspect packages //cmd/...`
     Packages(packages::Args),
+    /// List the unique labels declared across matching targets
+    ///
+    /// Enumerates every target in the packages matching the given matcher,
+    /// collects the labels each declares, and prints the sorted, deduplicated
+    /// set one per line. With no argument, scans the whole workspace.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect labels`
+    ///
+    /// `heph inspect labels //cmd/...`
+    Labels(labels::Args),
     /// Print a target's input hash
     ///
     /// Computes and prints the content hash of all the target's declared
@@ -116,6 +129,7 @@ impl InspectCommands {
     pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match self {
             InspectCommands::Packages(args) => packages::execute(args, sink, global),
+            InspectCommands::Labels(args) => labels::execute(args, sink, global),
             InspectCommands::Hashin(args) => hashin::execute(args, sink, global),
             InspectCommands::Hashout(args) => hashout::execute(args, sink, global),
             InspectCommands::Spec(args) => spec::execute(args, sink, global),
