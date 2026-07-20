@@ -166,10 +166,12 @@ pub fn is_cancelled(e: &anyhow::Error) -> bool {
 /// channels: the per-request failure registry (rich, deduped `TargetFailure`s,
 /// recorded when a provider/driver runs a target) and the returned `res`. Given
 /// `ctx`, the request state `rs`, an engine `res`, and `$val => $body` (the
-/// success output), it resolves them with the TUI paused:
+/// success output), it resolves them (pausing the TUI only for the success/error
+/// output that prints inline):
 ///
-/// - registry non-empty → render the rich boxes and exit with silent
-///   [`AlreadyRendered`]; the returned `res` is a collateral marker, dropped;
+/// - registry non-empty → carry the failures out as [`PendingFailures`], to be
+///   rendered by `render_anyhow` *after* the viewport is torn down; the returned
+///   `res` is a collateral marker, dropped;
 /// - registry empty, `res` Ok → bind the value as `$val` and run `$body` (may use
 ///   `?`), then exit `Ok`;
 /// - registry empty, `res` Err → a cancellation exits `cancelled`; any other error
@@ -192,11 +194,17 @@ macro_rules! finalize {
             .err()
             .is_some_and($crate::commands::errors::is_cancelled);
         let failures = $rs.take_failures();
-        let printed: ::anyhow::Result<()> = $crate::tui::paused!($ctx, {
-            if !failures.is_empty() {
-                $crate::commands::errors::render_failures(&failures);
-                Ok(())
-            } else {
+        if !failures.is_empty() {
+            // Do NOT render here: mid-run the TUI is only *paused*, so the resume
+            // re-anchor and the final viewport collapse would wipe the boxes off
+            // screen. Carry the failures out; `render_anyhow` in `main` prints
+            // them once the viewport is fully torn down. `res` is a collateral
+            // marker, dropped.
+            ::core::result::Result::<(), ::anyhow::Error>::Err(
+                $crate::commands::errors::PendingFailures(failures).into(),
+            )
+        } else {
+            let printed: ::anyhow::Result<()> = $crate::tui::paused!($ctx, {
                 match res {
                     Ok($val) => $body,
                     // A cancellation is surfaced by `finish_exit`; any other error
@@ -204,47 +212,51 @@ macro_rules! finalize {
                     Err(e) if !cancelled => Err(e),
                     Err(_) => Ok(()),
                 }
-            }
-        });
-        printed?;
-        $crate::commands::errors::finish_exit(failures.is_empty(), cancelled)
+            });
+            printed?;
+            $crate::commands::errors::finish_exit(cancelled)
+        }
     }};
 }
 pub(crate) use finalize;
 
-/// Map the (no-failures, cancelled) state to an exit result. Failures → silent
-/// [`AlreadyRendered`]; else cancellation → `cancelled`; else `Ok(())`.
-pub(crate) fn finish_exit(no_failures: bool, cancelled: bool) -> anyhow::Result<()> {
-    if !no_failures {
-        return Err(AlreadyRendered.into());
-    }
+/// Map the cancelled flag to an exit result for the no-failures path. Registry
+/// failures never reach here — they are carried out as [`PendingFailures`] and
+/// rendered by `render_anyhow`.
+pub(crate) fn finish_exit(cancelled: bool) -> anyhow::Result<()> {
     if cancelled {
         anyhow::bail!("cancelled");
     }
     Ok(())
 }
 
-/// A failure that has already been rendered (e.g. the per-target diagnostics
-/// printed by `render_failures`). Carried up only to set a non-zero exit code —
-/// `render_anyhow` swallows it so nothing extra is printed.
+/// Per-target failures collected in the request registry, carried up so
+/// [`render_anyhow`] can render their rich boxes *after* the interactive viewport
+/// is fully torn down. Rendering them mid-run (while the TUI is only paused) let
+/// the resume re-anchor and the final viewport collapse wipe the boxes off
+/// screen; deferring to `main`'s post-teardown `render_anyhow` prints them on a
+/// terminal nothing repaints over. Carrying the failures — rather than a bare
+/// "already rendered" marker — is what lets that late render reproduce the boxes.
 #[derive(Debug)]
-pub struct AlreadyRendered;
+pub struct PendingFailures(pub Vec<Arc<TargetFailure>>);
 
-impl std::fmt::Display for AlreadyRendered {
+impl std::fmt::Display for PendingFailures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "build failed")
     }
 }
 
-impl std::error::Error for AlreadyRendered {}
+impl std::error::Error for PendingFailures {}
 
 /// Render an `anyhow::Error` to stderr. If a [`TargetFailure`] is in the chain
 /// it gets the rich box treatment; otherwise the error's cause chain is printed
 /// in the same `×` / `╰─▶` style. Always renders something, so callers need no
 /// fallback.
 pub fn render_anyhow(e: &anyhow::Error) -> bool {
-    // Already-rendered failures carry no extra output — swallow them.
-    if downcast_chain_ref::<AlreadyRendered>(e).is_some() {
+    // Registry failures deferred from `finalize!`: render their rich boxes now
+    // that the viewport is torn down and nothing repaints over stderr.
+    if let Some(pf) = downcast_chain_ref::<PendingFailures>(e) {
+        render_failures(&pf.0);
         return true;
     }
     if let Some(tf) = downcast_chain_ref::<TargetFailure>(e) {
@@ -304,28 +316,34 @@ mod tests {
     }
 
     #[test]
-    fn finish_exit_maps_state_to_exit() {
-        // Recorded failures → silent AlreadyRendered (boxes already printed),
-        // and take priority over cancellation.
-        let e = finish_exit(false, false).unwrap_err();
-        assert!(downcast_chain_ref::<AlreadyRendered>(&e).is_some());
-        let e = finish_exit(false, true).unwrap_err();
-        assert!(downcast_chain_ref::<AlreadyRendered>(&e).is_some());
-
-        // No failures + cancellation → `cancelled`.
-        let e = finish_exit(true, true).unwrap_err();
+    fn finish_exit_maps_cancelled_to_exit() {
+        // Cancellation (no registry failures) → `cancelled`.
+        let e = finish_exit(true).unwrap_err();
         assert_eq!(e.to_string(), "cancelled");
 
-        // No failures, not cancelled → Ok.
-        assert!(finish_exit(true, false).is_ok());
+        // Not cancelled → Ok.
+        assert!(finish_exit(false).is_ok());
     }
 
     #[test]
-    fn already_rendered_is_swallowed_but_handled() {
-        // The marker counts as handled (no fallback log in main.rs) and prints
-        // nothing extra — the diagnostics were already shown by render_failures.
-        let e = anyhow::Error::new(AlreadyRendered).context("3 target(s) failed");
+    fn render_anyhow_renders_deferred_pending_failures() {
+        // Regression: in interactive TUI mode the registry failures used to be
+        // printed mid-run inside a `paused!` block, where the resume re-anchor +
+        // final viewport collapse wiped them. `finalize!` now carries them out as
+        // `PendingFailures`; `render_anyhow` (called post-teardown in `main`) must
+        // reproduce the rich boxes for every carried failure and claim the error
+        // as handled so nothing extra is logged.
+        let a = crate::htaddr::parse_addr("//simple_fail:d1").unwrap();
+        let b = crate::htaddr::parse_addr("//simple_fail:d2").unwrap();
+        let fa = TargetFailure::new(a, None, anyhow::anyhow!("boom a"));
+        let fb = TargetFailure::new(b, None, anyhow::anyhow!("boom b"));
+        let e = anyhow::Error::new(PendingFailures(vec![Arc::new(fa), Arc::new(fb)]))
+            .context("2 target(s) failed");
         assert!(render_anyhow(&e));
+        // The carried failures survive the wrapping context so the late render can
+        // reach them (they would be lost if `finalize!` had only kept a marker).
+        let pf = downcast_chain_ref::<PendingFailures>(&e).expect("carried failures");
+        assert_eq!(pf.0.len(), 2);
     }
 
     #[test]
