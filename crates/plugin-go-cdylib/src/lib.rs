@@ -11,7 +11,8 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoCompileDriver, GoGolistDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoCompileDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver, GoLintDriver,
+    GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
@@ -97,6 +98,35 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "go_testmain".into(),
         driver: make_dyn_managed_driver(testmain),
+    });
+    // Per-package go/analysis (vet) with serialized facts, nogo-style.
+    let lint: Arc<dyn ManagedDriver> = Arc::new(GoLintDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_lint".into(),
+        driver: make_dyn_managed_driver(lint),
+    });
+    // Gate: fails the build when a package's lint report has findings.
+    let lint_gate: Arc<dyn ManagedDriver> = Arc::new(GoLintGateDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_lint_gate".into(),
+        driver: make_dyn_managed_driver(lint_gate),
+    });
+    // Fix: applies the report's suggested fixes back into source (codegen).
+    let lint_fix: Arc<dyn ManagedDriver> = Arc::new(GoLintFixDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_lint_fix".into(),
+        driver: make_dyn_managed_driver(lint_fix),
+    });
+    // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
+    let format: Arc<dyn ManagedDriver> = Arc::new(GoFormatDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_format".into(),
+        driver: make_dyn_managed_driver(format),
+    });
+    let format_check: Arc<dyn ManagedDriver> = Arc::new(GoFormatCheckDriver::new());
+    drivers.push(NamedDriver {
+        name: "go_format_check".into(),
+        driver: make_dyn_managed_driver(format_check),
     });
 
     Ok(PluginComponents {

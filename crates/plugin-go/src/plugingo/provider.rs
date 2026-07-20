@@ -4,6 +4,7 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::errors::NoGoFilesError;
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
+use crate::plugingo::govet;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
     is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires, parse_go_sum_modules,
@@ -51,6 +52,16 @@ pub struct Config {
     /// absent here downloads unverified (the toolchain driver warns); supply an
     /// entry to enforce verification. Empty for `gotool = "host"`.
     pub sdk_checksums: HashMap<String, String>,
+    /// Addr of the `heph-govet` binary the lint/format targets exec. Defaults to
+    /// [`govet::default_addr`] — the `http_fetch` target that downloads the
+    /// binary published in this plugin's own heph release. Point it at a build
+    /// target (e.g. `//tools/heph-govet:build`, inside heph's own repo) to use a
+    /// from-source binary instead. Set via the optional `govet` provider option.
+    ///
+    /// The addr is taken verbatim if it carries args; otherwise the host's go
+    /// factors (`goos`/`goarch`) are added, since the tool always runs natively
+    /// (see [`ProviderInner::govet_tool_addr`]).
+    pub govet: String,
     /// Directories pruned during package discovery: engine skip dirs/globs plus
     /// this provider's own `skip` option. See [`hwalk::Ignore`].
     pub skip: Arc<Ignore>,
@@ -76,6 +87,7 @@ impl Default for Config {
         Self {
             go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
             sdk_checksums: HashMap::new(),
+            govet: govet::default_addr(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
             walker: Arc::new(CachedWalker::disabled()),
@@ -95,8 +107,11 @@ pub(crate) struct ProviderInner {
     /// Go release the hermetic toolchain is pinned to (see [`Config::go_version`]).
     go_version: String,
     /// Expected SDK tarball checksums by [`toolchain::checksum_key`] (see
-    /// [`Config::sdk_checksums`]).
+    /// [`Config::sdk_checksums`]). Also carries the optional `heph-govet` binary
+    /// checksums, under [`govet::checksum_key`]'s `govet/…` namespace.
     sdk_checksums: HashMap<String, String>,
+    /// Addr of the `heph-govet` binary lint/format exec (see [`Config::govet`]).
+    govet: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
     skip: Arc<Ignore>,
     /// Shared cross-run fs-walk cache backing the package walk. See [`Config::walker`].
@@ -219,7 +234,11 @@ impl Provider {
         //     inside the sandbox; non-hermetic, see [`toolchain::HOST`]), or
         //   - a pinned version like `"1.26.4"` → download + manage that SDK
         //     hermetically (`//@heph/go/toolchain/<version>:go`).
-        hplugin::config::deny_unknown("go provider", opts, &["gotool", "skip", "checksums"])?;
+        hplugin::config::deny_unknown(
+            "go provider",
+            opts,
+            &["gotool", "govet", "skip", "checksums"],
+        )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -234,6 +253,12 @@ impl Provider {
         // so `gotool = "host"` needs none.
         let sdk_checksums: HashMap<String, String> =
             hplugin::config::decode_opt(opts, "go provider", "checksums")?.unwrap_or_default();
+        // Optional: the addr of the `heph-govet` binary lint/format exec. Unset →
+        // the `http_fetch` target that downloads the binary published in this
+        // plugin's own release (see `govet::default_addr`). Point it at a build
+        // target (`//tools/heph-govet:build`) to run one built from source.
+        let govet: String = hplugin::config::decode_opt(opts, "go provider", "govet")?
+            .unwrap_or_else(govet::default_addr);
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
         // `skip` option so both prune the same workspace-relative paths.
         let mut globs = skip_globs.to_vec();
@@ -246,6 +271,7 @@ impl Provider {
             Config {
                 go_version,
                 sdk_checksums,
+                govet,
                 skip,
                 walker,
                 ..Default::default()
@@ -259,6 +285,7 @@ impl Provider {
                 workspace_root,
                 go_version: config.go_version,
                 sdk_checksums: config.sdk_checksums,
+                govet: config.govet,
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
@@ -616,27 +643,31 @@ impl ProviderInner {
                             dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
                         >)
                 }
-                GoPackageKind::FirstParty { .. } => {
+                GoPackageKind::FirstParty { module_root, .. } => {
                     // Emit the full candidate set unconditionally for any dir
                     // under a go.mod (decode_package guarantees that). Each
                     // variant is filtered at `get` time by inspecting the
                     // `_golist` result — no filesystem scan needed.
+                    //
+                    // Lint/format variants are the exception: they exist only for
+                    // modules that opt in with a golangci config at the go.mod
+                    // root, so gate them here (matching the `get`-time gate) to
+                    // avoid advertising targets that would resolve to NotFound.
+                    let lint_enabled = self.golangci_config_addr(module_root).is_some();
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
-                    let names: &[&str] = if skip_tests {
-                        &["_golist", "build_lib", "build", "embed"]
-                    } else {
-                        &[
-                            "_golist",
-                            "build_lib",
-                            "build",
-                            "embed",
+                    let mut names: Vec<&str> = vec!["_golist", "build_lib", "build", "embed"];
+                    if lint_enabled {
+                        names.extend_from_slice(&["lint-check", "lint", "format-check", "format"]);
+                    }
+                    if !skip_tests {
+                        names.extend_from_slice(&[
                             "embed_xtest",
                             "build_test",
                             "test",
                             "build_xtest",
                             "xtest",
-                        ]
-                    };
+                        ]);
+                    }
                     let responses: Vec<anyhow::Result<ListResponse>> = names
                         .iter()
                         .map(|name| {
@@ -760,7 +791,39 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed"];
+const GOLIST_TARGET_NAMES: &[&str] = &[
+    "build_lib",
+    "build",
+    "embed",
+    "lint-check",
+    "lint",
+    "_lint-analyze",
+    "format-check",
+    "format",
+];
+
+/// Workspace-relative package of heph's own go/analysis unitchecker binary
+/// (`heph-govet`), built as an ordinary `build` (package main) target like any
+/// other first-party binary. It exists only in heph's repo — which is why the
+/// `govet` option points at it from *there* (`govet = "//tools/heph-govet:build"`)
+/// while every other workspace uses the default download target (see [`govet`]).
+/// Referenced by the tests that exercise the from-source flavor.
+#[cfg(test)]
+const GOVET_TOOL_PKG: &str = "tools/heph-govet";
+/// The `govet` option heph's own repo (and this crate's tests) uses: build the
+/// tool from source rather than download a release that a dev build has none of.
+#[cfg(test)]
+const GOVET_SOURCE_ADDR: &str = "//tools/heph-govet:build";
+
+/// First-party iff the dep package is neither stdlib (`@heph/go/std/…`) nor
+/// thirdparty (`…@heph/go/thirdparty/…`). `go_lint` generates facts deps only
+/// for first-party packages: std/thirdparty contribute export-data (type info)
+/// via their `build_lib` archives but are not linted, so interprocedural
+/// analyzers reason fully across first-party boundaries and fall back to
+/// intra-package across std/thirdparty edges.
+fn is_firstparty_pkg(pkg: &str) -> bool {
+    !pkg.starts_with("@heph/go/std/") && !pkg.contains("@heph/go/thirdparty/")
+}
 
 /// Whether this provider owns `name` — the complete set of go targets it can
 /// generate: the pre-golist special targets, the `_golist`-resolved non-test
@@ -1013,6 +1076,26 @@ fn pkg_pattern(pkg: &str) -> String {
     format!("//{pkg}")
 }
 
+/// Default query scope for a package's source/embed lanes, when no codegen root is
+/// declared: the package's **subtree**, so a generator sitting in a sub-package of
+/// the consuming Go package is in scope (`app/openapi` bundling a spec that `app`
+/// embeds). `tree_output(pkg)` still gates membership, so the wider scope cannot
+/// admit a target whose output lands elsewhere.
+///
+/// The **root** package is the exception: its subtree is the entire workspace,
+/// which includes the synthetic provider namespaces (`//@heph/…`) that are not
+/// source packages at all — resolving every target in the repo to a def just to
+/// answer this query is both wasteful and, with foreign names in play, wrong. A
+/// root-level Go package that generates into a sub-package must declare a codegen
+/// root (which is exactly what that option is for).
+fn default_scope(pkg: &str) -> String {
+    if pkg.is_empty() {
+        pkg_pattern(pkg)
+    } else {
+        pkg_prefix_pattern(pkg)
+    }
+}
+
 /// Query-language pattern selecting every package under `pkg` (`//...` for root).
 fn pkg_prefix_pattern(pkg: &str) -> String {
     if pkg.is_empty() {
@@ -1038,11 +1121,24 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     let mut addrs = vec![non_go_glob_addr.format()];
 
     let codegen_root = pick_codegen_root(states);
-    // Scope: every package under the codegen root if one is declared, else just
-    // the target's own package.
+    // Scope: every package under the codegen root if one is declared, else the
+    // target's own package *and everything under it*.
+    //
+    // The subtree — not the bare package — is the floor: a generator commonly sits
+    // in a sub-package of the Go package that consumes its output (`app/openapi`
+    // bundling a spec into `app/openapi/openapi_gen.yaml`, embedded by `app`).
+    // Its output lands inside the consumer's tree, so `tree_output` matches it, but
+    // a `//pkg`-only scope rejects it before that term is ever reached — and the fs
+    // glob can't cover for it either, since codegen-stamped files are skipped
+    // there. The file then reached `go list` only when its on-disk copy happened to
+    // be unstamped, which is how this surfaced: an embed that resolved on some runs
+    // and failed with "//go:embed pattern(s) matched no files" on others.
+    //
+    // Widening the floor cannot pull in a foreign target: `tree_output(pkg)` still
+    // requires the output to land in *this* package's tree.
     let scope = match codegen_root {
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
-        None => pkg_pattern(pkg_str),
+        None => default_scope(pkg_str),
     };
     // Cheapest-first by resolution tier: `scope` resolves at the no-IO addr
     // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
@@ -1086,9 +1182,11 @@ fn pick_embed_deps(states: &[State]) -> Option<&State> {
 ///    targets that don't carry the label.
 fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
     let codegen_root = pick_codegen_root(states);
+    // Same floor as the go_src lane (see `compute_pkg_src_addrs`): the subtree, so a
+    // generator in a sub-package of the embedding package is in scope.
     let scope = match codegen_root {
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
-        None => pkg_pattern(pkg_str),
+        None => default_scope(pkg_str),
     };
     // Cheapest-first by resolution tier (see `compute_pkg_src_addrs`): `scope`
     // (addr) < `label` (spec/`get_spec`) < `tree_output` (def/`get_def`).
@@ -1145,6 +1243,33 @@ impl ProviderInner {
                 .map(String::as_str)
                 .unwrap_or("");
             let spec = toolchain::build_spec(addr.clone(), version, &goos, &goarch, sha256);
+            return Ok(GetResponse { target_spec: spec });
+        }
+
+        // `heph-govet`, the analysis/format binary the lint and format targets
+        // exec: `//@heph/go/govet/<tag>:heph-govet` is an `http_fetch` over the
+        // asset published in heph release `<tag>` (the URL templates over this
+        // addr's `goos`/`goarch` args). This is what the `govet` option defaults
+        // to; pointing it at a build target instead never reaches here.
+        if addr.name == govet::GOVET_NAME
+            && let Some(tag) = govet::tag_from_pkg(addr.package.as_str())
+        {
+            // A dev build's default tag names a release that was never published.
+            // Diagnosed here — where something actually asks for the tool — so that
+            // merely listing a lint target's spec still works on a dev build: a
+            // `query` / `//...` walk asks every target for its spec, and that must
+            // not require owning a heph-govet.
+            if govet::is_dev_tag(tag) {
+                return Err(GetError::Other(anyhow::anyhow!(
+                    "go provider: this is a dev build of heph ({tag}), and no release publishes \
+                     a heph-govet binary for it — set the `govet` option to a source build \
+                     (\"//tools/heph-govet:build\") or to a released tag's download target \
+                     (\"//@heph/go/govet/<tag>:heph-govet\")"
+                )));
+            }
+            let sha256 =
+                govet::expected_sha256(&self.sdk_checksums, tag, &factors.goos, &factors.goarch);
+            let spec = govet::build_spec(addr.clone(), tag, &sha256);
             return Ok(GetResponse { target_spec: spec });
         }
 
@@ -1366,6 +1491,175 @@ impl ProviderInner {
                         )
                     }
                 };
+                Ok(GetResponse { target_spec: spec })
+            }
+            // User-facing check gate: depends on `_lint-analyze`'s report and fails on
+            // findings. `_lint-analyze` always exits 0 so facts cache regardless; the gate
+            // is the thing that fails.
+            "lint-check" => {
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                // Lint only where the module opts in with a golangci config;
+                // attach it as a hash-only dep so a config change re-keys the gate.
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
+                };
+                let analyze_addr =
+                    self.make_addr_with_name(&addr.package, "_lint-analyze", &factors);
+                let spec = crate::plugingo::driver_lint::build_lint_gate_spec(
+                    addr.clone(),
+                    &analyze_addr,
+                    Some(&config_addr),
+                );
+                Ok(GetResponse { target_spec: spec })
+            }
+            // The plain `lint` target FIXES: it consumes `_lint-analyze`'s report (suggested
+            // fixes) + the package sources, applies the edits, and rewrites the
+            // sources in place (codegen). Runs no analysis itself — reuses `_lint-analyze`'s
+            // cache. Use `lint-check` to only report.
+            "lint" => {
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
+                };
+                let analyze_addr =
+                    self.make_addr_with_name(&addr.package, "_lint-analyze", &factors);
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+                let spec = crate::plugingo::driver_lint::build_lint_fix_spec(
+                    addr.clone(),
+                    &analyze_addr,
+                    &pkg_addrs.go_files,
+                    &pkg.go_files,
+                    Some(&config_addr),
+                );
+                Ok(GetResponse { target_spec: spec })
+            }
+            // Formatting: `format-check` is the gate (fails on unformatted files),
+            // `format` rewrites the sources in place (codegen). Both run the
+            // heph-govet `-format` mode; neither needs facts or dep archives.
+            "format-check" | "format" => {
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                // Format only where the module opts in with a golangci config
+                // (the same gate as lint); the config also carries formatter
+                // settings (gofumpt/goimports).
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
+                };
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+                let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
+                let config_addr = Some(config_addr);
+                let params = crate::plugingo::driver_format::FormatParams {
+                    addr: addr.clone(),
+                    govet_addr: &govet_addr,
+                    src_addrs: &pkg_addrs.go_files,
+                    go_files: &pkg.go_files,
+                    config_addr: config_addr.as_ref(),
+                };
+                let spec = if addr.name == "format" {
+                    crate::plugingo::driver_format::build_format_spec(params)
+                } else {
+                    crate::plugingo::driver_format::build_format_check_spec(params)
+                };
+                Ok(GetResponse { target_spec: spec })
+            }
+            // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
+            // dependents) + `lint-report.json` (consumed by the gate).
+            "_lint-analyze" => {
+                // Mirrors `build_lib`: a package with no Go source files isn't
+                // analyzable. Tests/xtests are linted via their own variants
+                // later; this is the normal-source unit.
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let transitive = Arc::clone(&self)
+                    .collect_direct_libs(
+                        Arc::clone(&req.executor),
+                        &pkg,
+                        &[],
+                        &factors,
+                        &module_root,
+                    )
+                    .await
+                    .map_err(GetError::Other)?;
+
+                // One facts dep per first-party transitive lib: its `_lint-analyze` target
+                // (same package + factors as its `build_lib`) produces the
+                // `lint.facts` this package consumes for interprocedural analysis.
+                //
+                // A dep is only linted if ITS module opts in with a golangci
+                // config, so a dep in a config-less module has no `_lint-analyze` target.
+                // Skip those (they degrade to no-facts, like stdlib) rather than
+                // wiring a dependency that would resolve to NotFound and break the
+                // importer's lint — the same module-root gate the dep's own `_lint-analyze`
+                // arm applies.
+                let facts_libs: Vec<(String, Addr)> = transitive
+                    .libs
+                    .iter()
+                    .filter(|(_, dep)| {
+                        is_firstparty_pkg(dep.package.as_str())
+                            && crate::plugingo::addr_util::find_go_mod(
+                                &self.workspace_root.join(dep.package.as_str()),
+                            )
+                            .is_some_and(|(dep_module_root, _)| {
+                                self.golangci_config_addr(&dep_module_root).is_some()
+                            })
+                    })
+                    .map(|(ip, dep)| {
+                        (
+                            ip.clone(),
+                            Addr::new(
+                                dep.package.clone(),
+                                "_lint-analyze".to_string(),
+                                dep.args.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+
+                let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
+
+                // The module's `.golangci.yml`/`.golangci.yaml` (at the go.mod
+                // root) drives linter selection AND opts the module into linting:
+                // no config → no `_lint-analyze` target. The file is a hashed input, so a
+                // config edit re-lints the module.
+                let config_addr = match self.golangci_config_addr(&module_root) {
+                    Some(a) => a,
+                    None => return Err(GetError::NotFound),
+                };
+                let config_addr = Some(config_addr);
+
+                let spec = crate::plugingo::driver_lint::build_lint_spec(
+                    crate::plugingo::driver_lint::LintParams {
+                        addr: addr.clone(),
+                        import_path: &import_path,
+                        factors: &factors,
+                        go_version: &self.go_version,
+                        transitive_libs: &transitive.libs,
+                        facts_libs: &facts_libs,
+                        src_addrs: &pkg_addrs.go_files,
+                        govet_addr: &govet_addr,
+                        config_addr: config_addr.as_ref(),
+                    },
+                );
                 Ok(GetResponse { target_spec: spec })
             }
             "build" => {
@@ -2091,6 +2385,46 @@ impl ProviderInner {
         self.make_addr_with_name(&addr.package, "build_lib", factors)
     }
 
+    /// Addr of the `heph-govet` binary the lint and format targets exec: the
+    /// `govet` option (default: the release-download target, see [`govet`]).
+    ///
+    /// The tool runs natively on the build host — it analyzes code for any
+    /// GOOS/GOARCH but is never itself cross-compiled — so an addr given without
+    /// args is keyed by the *host's* factors, not the analyzed target's. That
+    /// makes both flavors work unqualified: `//tools/heph-govet:build` builds for
+    /// the host, and the download target's URL template renders the host's asset.
+    /// An addr that carries its own args is taken verbatim.
+    ///
+    /// *Naming* the tool is not *resolving* it: a dev build's default addr points
+    /// at a release that was never published, but that is diagnosed when the govet
+    /// target itself is looked up (see the `GOVET_NAME` arm of `handle_get`) — not
+    /// here. A lint/format spec must still resolve on a dev build, or a bulk
+    /// `query` / `//...` walk (which asks every target for its spec) would die on
+    /// a machine that has no business owning a heph-govet.
+    fn govet_tool_addr(&self) -> anyhow::Result<Addr> {
+        let addr = hmodel::htaddr::parse_addr(&self.govet).with_context(|| {
+            format!(
+                "go provider: `govet` must be a target addr (got {:?}) — omit it to download the \
+                 released heph-govet, or point it at a build target like \
+                 \"//tools/heph-govet:build\"",
+                self.govet
+            )
+        })?;
+
+        if !addr.args.is_empty() {
+            return Ok(addr);
+        }
+        Ok(Addr::new(
+            addr.package.clone(),
+            addr.name.clone(),
+            factors_to_args(&Factors {
+                goos: current_goos(),
+                goarch: current_goarch(),
+                build_tags: vec![],
+            }),
+        ))
+    }
+
     fn make_addr_with_name(
         &self,
         package: &hmodel::htpkg::PkgBuf,
@@ -2098,6 +2432,23 @@ impl ProviderInner {
         factors: &Factors,
     ) -> Addr {
         Addr::new(package.clone(), name.to_string(), factors_to_args(factors))
+    }
+
+    /// The addr of the module's golangci-lint config, if the module root (the
+    /// `go.mod` directory) holds one. Lint/format targets exist ONLY for modules
+    /// that have such a config — the presence of a `.golangci.yml`/`.golangci.yaml`
+    /// at the module root is what opts a module into linting. The returned addr
+    /// (a workspace-relative `fs:file`) is a hashed input to the lint/format
+    /// targets, so editing the config re-lints the module.
+    fn golangci_config_addr(&self, module_root: &Path) -> Option<Addr> {
+        for name in [".golangci.yml", ".golangci.yaml"] {
+            let abs = module_root.join(name);
+            if abs.exists() {
+                let rel = abs.strip_prefix(&self.workspace_root).unwrap_or(&abs);
+                return Some(pluginfs::file_addr(&rel.to_string_lossy()));
+            }
+        }
+        None
     }
 
     /// Build the cache key for `collect_*_libs`. Imports are sorted+deduped so
@@ -2930,6 +3281,172 @@ mod tests {
         Addr::new(PkgBuf::from(package), name.to_string(), Default::default())
     }
 
+    /// Write a minimal `.golangci.yml` at a fixture's module root so its lint and
+    /// format targets are enabled — the provider synthesizes them only for
+    /// modules that opt in with a golangci config at the go.mod root.
+    fn enable_golangci(root: &Path) {
+        std::fs::write(
+            root.join(".golangci.yml"),
+            "linters:\n  default: standard\n",
+        )
+        .unwrap();
+    }
+
+    /// A provider whose `govet` option is `addr` (the option is an addr: a build
+    /// target for a from-source tool, or a download target).
+    fn provider_with_govet(root: PathBuf, addr: &str) -> Provider {
+        Provider::with_config(
+            root,
+            Config {
+                govet: addr.to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("build provider")
+    }
+
+    /// A `govet` build addr resolves verbatim, with the *host's* factors added:
+    /// the tool always runs natively, whatever platform the analyzed code targets.
+    #[test]
+    fn test_govet_tool_addr_source_build_gets_host_factors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = provider_with_govet(tmp.path().to_path_buf(), GOVET_SOURCE_ADDR);
+        let addr = p.inner.govet_tool_addr().expect("resolve govet addr");
+        assert_eq!(addr.package.as_str(), GOVET_TOOL_PKG);
+        assert_eq!(addr.name, "build");
+        assert_eq!(addr.args.get("goos"), Some(&current_goos()));
+        assert_eq!(addr.args.get("goarch"), Some(&current_goarch()));
+    }
+
+    #[test]
+    fn test_govet_tool_addr_defaults_to_the_release_download_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = provider_with_govet(
+            tmp.path().to_path_buf(),
+            "//@heph/go/govet/v0.1.234:heph-govet",
+        );
+        let addr = p.inner.govet_tool_addr().expect("resolve govet addr");
+        assert_eq!(addr.package.as_str(), "@heph/go/govet/v0.1.234");
+        assert_eq!(addr.name, govet::GOVET_NAME);
+        // The download target renders its URL from these.
+        assert_eq!(addr.args.get("goos"), Some(&current_goos()));
+    }
+
+    /// Explicit args win over the host default — e.g. pinning a linux tool binary.
+    #[test]
+    fn test_govet_tool_addr_keeps_explicit_args() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = provider_with_govet(
+            tmp.path().to_path_buf(),
+            "//@heph/go/govet/v0.1.234:heph-govet@goos=linux,goarch=amd64",
+        );
+        let addr = p.inner.govet_tool_addr().expect("resolve govet addr");
+        assert_eq!(addr.args.get("goos"), Some(&"linux".to_string()));
+        assert_eq!(addr.args.get("goarch"), Some(&"amd64".to_string()));
+    }
+
+    /// A dev build's default addr points at a release tag no CI run ever published.
+    /// *Resolving* it fails with the fix in the message — but only then: naming it
+    /// (what every lint/format spec does) must stay fine, or a `query` / `//...`
+    /// spec walk would die on any dev build. See the sibling test below.
+    #[tokio::test]
+    async fn test_get_govet_dev_default_target_is_a_config_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(tmp.path().to_path_buf()).expect("provider");
+        let dev = govet::govet_addr(hcore::version::VERSION);
+        let err = match provider_get(&p, dev).await {
+            Err(GetError::Other(e)) => e,
+            Err(other) => panic!("expected a config error, got {other:?}"),
+            Ok(_) => panic!("a dev build has no released heph-govet to resolve"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dev build"), "got: {msg}");
+        assert!(msg.contains("//tools/heph-govet:build"), "got: {msg}");
+    }
+
+    /// The lint/format specs of a dev build still resolve: they only *name* the
+    /// govet addr. A bulk spec walk (`heph query`, `//...`) asks every target for
+    /// its spec, and a dev build has no business owning a heph-govet to do that.
+    #[tokio::test]
+    async fn test_lint_and_format_specs_resolve_on_a_dev_build() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        // Default `govet` — i.e. the dev build's (nonexistent) release target.
+        let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
+        for name in [
+            "_lint-analyze",
+            "lint-check",
+            "lint",
+            "format-check",
+            "format",
+        ] {
+            provider_get(&p, make_addr("cmd", name))
+                .await
+                .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn test_govet_tool_addr_rejects_a_non_addr() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = provider_with_govet(tmp.path().to_path_buf(), "source");
+        let err = p.inner.govet_tool_addr().expect_err("not an addr");
+        assert!(
+            format!("{err:#}").contains("must be a target addr"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The synthesized download target: `//@heph/go/govet/<tag>:heph-govet` is an
+    /// `http_fetch` over the release asset. It resolves without a `go list` (it is
+    /// answered before package decoding, like the toolchain), and the URL templates
+    /// over the addr args so the driver fetches the host's asset.
+    #[tokio::test]
+    async fn test_get_govet_download_target_is_an_http_fetch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(tmp.path().to_path_buf()).expect("provider");
+        let resp = provider_get(&p, govet::govet_addr("v0.1.234"))
+            .await
+            .expect("govet target resolves");
+        assert_eq!(resp.target_spec.driver, "http_fetch");
+        assert!(matches!(
+            resp.target_spec.config.get("url"),
+            Some(Value::String(u)) if u.ends_with("/v0.1.234/heph-govet_{goos}_{goarch}")
+        ));
+        assert_eq!(
+            resp.target_spec.config.get("executable"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    /// An explicit `checksums` entry pins the binary of a tag this build knows
+    /// nothing about (the plugin's own release checksums are baked in at compile
+    /// time, so they need no config).
+    #[tokio::test]
+    async fn test_get_govet_download_target_uses_configured_checksum() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (goos, goarch) = (current_goos(), current_goarch());
+        let p = Provider::with_config(
+            tmp.path().to_path_buf(),
+            Config {
+                sdk_checksums: HashMap::from([(
+                    govet::checksum_key("v0.1.234", &goos, &goarch),
+                    "cafebabe".to_string(),
+                )]),
+                ..Default::default()
+            },
+        )
+        .expect("provider");
+        let resp = provider_get(&p, govet::govet_addr("v0.1.234"))
+            .await
+            .expect("govet target resolves");
+        assert!(matches!(
+            resp.target_spec.config.get("sha256"),
+            Some(Value::String(s)) if s == "cafebabe"
+        ));
+    }
+
     #[test]
     fn collect_go_packages_respects_skip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3328,6 +3845,267 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             has_lib_dep,
             "cmd build_lib should depend on lib: got {:?}",
             deps.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_dep_lint_driver_and_facts_wiring() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        // From-source govet, as heph's own repo configures it.
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        // The analyze target (`_lint-analyze`) runs heph-govet and produces facts+report.
+        let resp = provider_get(&p, make_addr("cmd", "_lint-analyze"))
+            .await
+            .unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint");
+
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        // The unitchecker binary is staged for every analyze target.
+        assert!(
+            deps.keys().any(|k| k == "govet_tool"),
+            "_lint-analyze must stage the heph-govet tool: got {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+        // `govet` points at a build target, so the staged tool is the one built
+        // from heph's own workspace sources.
+        let govet_dep = match deps.get("govet_tool").expect("govet_tool group") {
+            Value::List(items) => match items.first().expect("one govet dep") {
+                Value::String(s) => s.clone(),
+                other => panic!("govet dep must be a string, got {other:?}"),
+            },
+            other => panic!("govet_tool must be a list, got {other:?}"),
+        };
+        assert!(
+            govet_dep.starts_with("//tools/heph-govet:build"),
+            "source govet must build the in-workspace tool: got {govet_dep}"
+        );
+
+        // cmd imports the first-party `lib`, so its facts feed cmd's analysis:
+        // a `facts_*` group must reference lib's `_lint-analyze` target (not its archive).
+        let has_lib_facts = deps.iter().any(|(k, v)| {
+            k.starts_with("facts_")
+                && matches!(v, Value::List(items) if items.iter().any(|it|
+                    matches!(it, Value::String(s) if s.contains(":_lint-analyze"))))
+        });
+        assert!(
+            has_lib_facts,
+            "cmd _lint-analyze must consume lib's facts via a facts_* group: got {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+
+        // Both the facts and report artifacts are declared outputs.
+        let out = match resp.target_spec.config.get("out").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected out map"),
+        };
+        assert!(out.contains_key("facts") && out.contains_key("report"));
+    }
+
+    /// With `govet` left at its default (the release download target — what every
+    /// consuming workspace gets), the analyze and format targets stage the
+    /// *downloaded* heph-govet, not a from-source build: a workspace consuming the
+    /// plugin has no `tools/heph-govet` package to build.
+    #[tokio::test]
+    async fn test_lint_and_format_stage_downloaded_govet_by_default() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(
+            sandbox.path().to_path_buf(),
+            "//@heph/go/govet/v0.1.234:heph-govet",
+        );
+
+        for name in ["_lint-analyze", "format-check", "format"] {
+            let resp = provider_get(&p, make_addr("cmd", name)).await.unwrap();
+            let deps = match resp.target_spec.config.get("deps").unwrap() {
+                Value::Map(m) => m,
+                other => panic!("{name}: expected deps map, got {other:?}"),
+            };
+            let govet_dep = match deps.get("govet_tool").expect("govet_tool group") {
+                Value::List(items) => match items.first().expect("one govet dep") {
+                    Value::String(s) => s.clone(),
+                    other => panic!("{name}: govet dep must be a string, got {other:?}"),
+                },
+                other => panic!("{name}: govet_tool must be a list, got {other:?}"),
+            };
+            assert!(
+                govet_dep.starts_with("//@heph/go/govet/v0.1.234:heph-govet"),
+                "{name} must stage the downloaded heph-govet: got {govet_dep}"
+            );
+        }
+    }
+
+    // The user-facing `lint` target is the gate: it depends on `_lint-analyze`'s report
+    // output and fails on findings, leaving fact production (and caching) to the
+    // always-exit-0 analyze target.
+    #[tokio::test]
+    async fn test_lint_gate_depends_on_analyze_report() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("cmd", "lint-check"))
+            .await
+            .unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_gate");
+
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let report = match deps.get("report").unwrap() {
+            Value::List(l) => l,
+            _ => panic!("report not a list"),
+        };
+        match &report[0] {
+            Value::String(s) => assert!(
+                s.contains(":_lint-analyze") && s.ends_with("|report"),
+                "gate must consume the analyze target's report output: {s}"
+            ),
+            _ => panic!("not a string"),
+        }
+    }
+
+    // The user-facing `lint` (fixer) target consumes `_lint-analyze`'s report (for the
+    // suggested fixes) plus the package sources, and rewrites the sources in
+    // place. It resolves through the go provider like the gate.
+    #[tokio::test]
+    async fn test_lint_fix_consumes_report_and_sources() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("cmd", "lint")).await.unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_fix");
+
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        // Report dep points at the analyze target's report output.
+        match deps.get("report").unwrap() {
+            Value::List(l) => match &l[0] {
+                Value::String(s) => assert!(
+                    s.contains(":_lint-analyze") && s.ends_with("|report"),
+                    "fix must consume the analyze target's report output: {s}"
+                ),
+                _ => panic!("report not a string"),
+            },
+            _ => panic!("report not a list"),
+        }
+        // Default group carries the package's own sources (rewritten in place).
+        match deps.get("").unwrap() {
+            Value::List(l) => assert!(!l.is_empty(), "fix must stage package sources"),
+            _ => panic!("sources not a list"),
+        }
+        // Declares its `.go` outputs (parse marks them codegen=in_place).
+        match resp.target_spec.config.get("out").unwrap() {
+            Value::Map(m) => assert!(m.contains_key("src"), "fix declares src outputs"),
+            _ => panic!("out not a map"),
+        }
+    }
+
+    // Formatting targets resolve through the go provider: `format` is the check
+    // gate (no outputs), `format` rewrites sources in place (declares them).
+    #[tokio::test]
+    async fn test_format_targets_resolve() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let check = provider_get(&p, make_addr("cmd", "format-check"))
+            .await
+            .unwrap();
+        assert_eq!(check.target_spec.driver, "go_format_check");
+        assert!(
+            check.target_spec.config.get("out").is_none(),
+            "check gate declares no outputs"
+        );
+
+        let fix = provider_get(&p, make_addr("cmd", "format")).await.unwrap();
+        assert_eq!(fix.target_spec.driver, "go_format");
+        // Stages the heph-govet tool + the package's own sources.
+        let deps = match fix.target_spec.config.get("deps").unwrap() {
+            Value::Map(m) => m,
+            _ => panic!("deps not a map"),
+        };
+        assert!(deps.iter().any(|(k, _)| k == "govet_tool"), "tool staged");
+        match deps.iter().find(|(k, _)| k.is_empty()).map(|(_, v)| v) {
+            Some(Value::List(l)) => assert!(!l.is_empty(), "sources staged"),
+            _ => panic!("default source group missing"),
+        }
+        assert!(
+            fix.target_spec.config.get("out").is_some(),
+            "fix declares in_place outputs"
+        );
+    }
+
+    // Lint/format targets exist ONLY for modules that opt in with a golangci
+    // config at the go.mod root. Without one, get resolves them to NotFound and
+    // list omits them entirely (while the build/test targets stay).
+    #[tokio::test]
+    async fn test_lint_targets_absent_without_golangci_config() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        // Deliberately NO `.golangci.yml`.
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        for name in [
+            "_lint-analyze",
+            "lint-check",
+            "lint",
+            "format-check",
+            "format",
+        ] {
+            assert!(
+                matches!(
+                    provider_get(&p, make_addr("cmd", name)).await,
+                    Err(GetError::NotFound)
+                ),
+                "{name} must be NotFound without a golangci config"
+            );
+        }
+
+        let names = provider_list(&p, "cmd").await;
+        for gated in ["lint-check", "lint", "format-check", "format"] {
+            assert!(
+                !names.iter().any(|n| n == gated),
+                "{gated} must not be listed without a golangci config: {names:?}"
+            );
+        }
+        // The non-lint targets are unaffected.
+        assert!(
+            names.iter().any(|n| n == "build_lib"),
+            "build_lib must still be listed: {names:?}"
+        );
+    }
+
+    // A `.golangci.yaml` (the other YAML extension) opts a module in just as
+    // `.golangci.yml` does.
+    #[tokio::test]
+    async fn test_lint_enabled_by_golangci_yaml_extension() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        std::fs::write(
+            sandbox.path().join(".golangci.yaml"),
+            "linters:\n  default: standard\n",
+        )
+        .unwrap();
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+        provider_get(&p, make_addr("cmd", "lint-check"))
+            .await
+            .expect("lint-check resolves with a .golangci.yaml");
+        let names = provider_list(&p, "cmd").await;
+        assert!(
+            names.iter().any(|n| n == "lint-check"),
+            "lint-check listed with .golangci.yaml: {names:?}"
         );
     }
 
@@ -4704,7 +5482,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     }
 
     #[tokio::test]
-    async fn golist_default_uses_package_matcher_for_go_src_query() {
+    async fn golist_root_package_keeps_an_exact_go_src_query_scope() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -4723,12 +5501,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .iter()
             .find(|s| s.contains("label(go_src)"))
             .expect("go_src query addr present");
-        // Default scope is the target's exact package — a bare `//pkg` pattern,
-        // never a `/...` prefix.
+        // This fixture's go package is the *root* package, whose subtree is the whole
+        // workspace (synthetic `//@heph/…` namespaces included) — so it keeps the
+        // exact-package scope. Every other package scopes to its subtree, so a
+        // generator in a sub-package is reachable; see `default_scope`.
         assert!(
             !go_src_query.contains("..."),
-            "default must select an exact package (no prefix), got: {go_src_query}"
+            "the root package must keep an exact scope, got: {go_src_query}"
         );
+        // `tree_output` is what keeps the widened scope honest: a target in the
+        // subtree is only a source if its codegen output lands in *this* package.
         assert!(
             go_src_query.contains("tree_output("),
             "go_src query must carry tree_output, got: {go_src_query}"
@@ -4827,6 +5609,19 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             embed.find("label(go_embed_src)").unwrap() < embed.find("tree_output(").unwrap(),
             "go_embed_src query must check label before tree_output: {embed}"
         );
+    }
+
+    /// A non-root package scopes its source query to its own subtree, so a generator
+    /// in a sub-package is reachable. The root package does not: its subtree is the
+    /// whole workspace, including the synthetic `//@heph/…` provider namespaces.
+    #[test]
+    fn default_scope_is_the_subtree_except_at_the_root() {
+        assert_eq!(default_scope("app"), "//app/...");
+        assert_eq!(
+            default_scope("mgmt/go/cmd/exporter/rest"),
+            "//mgmt/go/cmd/exporter/rest/..."
+        );
+        assert_eq!(default_scope(""), "//");
     }
 
     #[test]

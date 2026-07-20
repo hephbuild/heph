@@ -10,6 +10,20 @@ pub struct GlobalOptions {
     /// Write CPU pprof on exit
     #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
     pub pprof_cpu: Option<PathBuf>,
+    /// Install a SIGUSR1 handler that appends the signalled thread's backtrace to
+    /// FILE — for diagnosing hangs where ptrace/perf/core dumps are blocked
+    /// (locked-down CI containers). Off unless passed; bare `--diag-backtrace`
+    /// writes to /tmp/heph-backtrace.log. See the `diag` module for the
+    /// sweep-all-threads recipe.
+    #[arg(
+        long = "diag-backtrace",
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "/tmp/heph-backtrace.log",
+        global = true,
+        hide = true
+    )]
+    pub diag_backtrace: Option<PathBuf>,
     /// Disable the interactive TUI (force CI/log-only output)
     #[arg(long = "no-tui", global = true)]
     pub no_tui: bool,
@@ -57,5 +71,26 @@ mod tests {
     fn auto_approve_is_opt_in() {
         assert!(!parse(&["heph"]).auto_approve);
         assert!(parse(&["heph", "--auto-approve"]).auto_approve);
+    }
+
+    #[test]
+    fn diag_backtrace_is_opt_in() {
+        use std::path::Path;
+        // Absent → off.
+        assert!(parse(&["heph"]).diag_backtrace.is_none());
+        // Bare flag → default file.
+        assert_eq!(
+            parse(&["heph", "--diag-backtrace"])
+                .diag_backtrace
+                .as_deref(),
+            Some(Path::new("/tmp/heph-backtrace.log"))
+        );
+        // Explicit path honored.
+        assert_eq!(
+            parse(&["heph", "--diag-backtrace", "/tmp/x.log"])
+                .diag_backtrace
+                .as_deref(),
+            Some(Path::new("/tmp/x.log"))
+        );
     }
 }

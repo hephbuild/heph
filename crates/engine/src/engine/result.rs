@@ -1770,10 +1770,15 @@ impl Engine {
                         }
                     }
 
-                    // Only emit a LocalCacheWrite span (and run `cache_locally`)
-                    // when there is something to store — an all-passthrough
-                    // target writes nothing here, so no "cache write" phase.
-                    let cached = if to_cache.is_empty() {
+                    // Run `cache_locally` (and emit a LocalCacheWrite span)
+                    // whenever the target is genuinely cacheable — even with
+                    // zero outputs. Writing an empty manifest is what lets a
+                    // no-output gate/check target (e.g. `go_lint_gate`,
+                    // `go_format_check`) register a cache HIT on re-run; the
+                    // read side already treats an empty-artifact manifest as a
+                    // hit. Skip only the tmp/all-passthrough path
+                    // (`use_tmp_cache`), which persists nothing.
+                    let cached = if to_cache.is_empty() && use_tmp_cache {
                         Ok(Vec::new())
                     } else {
                         let write_addr = addr.format();
@@ -4793,6 +4798,47 @@ mod tests {
             exec_count.load(Ordering::SeqCst),
             1,
             "second request must hit the cross-request on-disk cache, not re-execute"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_output_cacheable_target_hits_cache_on_second_run() {
+        // Regression: a cacheable target that produces NO artifacts (a gate/check
+        // like `go_lint_gate` / `go_format_check`) must still write a manifest so
+        // a later run is a cache hit. Pre-fix, `execute_and_cache_inner` skipped
+        // `cache_locally` whenever there was nothing to store, so no manifest was
+        // ever written and every run re-executed ("0 cached").
+        let exec_count = SArc::new(AtomicUsize::new(0));
+        let (engine, _dir, addr) =
+            blocking_engine_outputs(SArc::clone(&exec_count), vec![]).expect("engine");
+
+        let r1 = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("first run resolves");
+        let r2 = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("second run resolves");
+
+        assert!(r1.artifacts.is_empty(), "target declares no outputs");
+        assert!(r2.artifacts.is_empty(), "target declares no outputs");
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            1,
+            "second run must hit the cache, not re-execute a zero-output target"
         );
     }
 

@@ -1441,6 +1441,7 @@ dependencies = [
  "r2d2",
  "r2d2_sqlite",
  "rayon",
+ "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rusqlite",
  "rustc-hash",
@@ -2118,6 +2119,7 @@ dependencies = [
  "plugin",
  "plugin-buildfile",
  "plugin-exec",
+ "plugin-http",
  "plugin-nix",
  "plugin-query",
  "posthog-rs",
@@ -3870,6 +3872,25 @@ dependencies = [
  "plugin-sdk",
  "stabby",
  "walk",
+]
+
+[[package]]
+name = "plugin-http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "model",
+ "plugin",
+ "reqwest 0.13.4",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

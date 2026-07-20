@@ -3,6 +3,7 @@
 use anyhow::Result;
 use heph::pluginbuildfile;
 use heph::pluginexec;
+use heph::pluginhttp;
 use heph::pluginstatictarget;
 use htestkit::WorkspaceBuilder;
 
@@ -28,7 +29,8 @@ impl Workspace {
             .expect("workspace tempdir")
             .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
             .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
-            .with_managed_driver(Box::new(pluginexec::Driver::new_bash()));
+            .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+            .with_managed_driver(Box::new(pluginhttp::Driver));
         let builder = if let Some(p) = p {
             builder.with_parallelism(p)
         } else {

@@ -3,7 +3,10 @@ use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
 use std::process::ExitCode;
-use tracing::{error, info, warn};
+use tracing::error;
+
+mod diag;
+mod pprof_dump;
 
 #[derive(Parser)]
 #[command(name = "heph")]
@@ -111,19 +114,21 @@ fn main() -> ExitCode {
     }
     let started_at = std::time::Instant::now();
 
-    let pprof_guard = if cli.global.pprof_cpu.is_some() {
-        match pprof::ProfilerGuardBuilder::default()
-            .frequency(1000)
-            .build()
-        {
-            Ok(guard) => Some(guard),
+    // Opt-in hang diagnostics: install the SIGUSR1 → thread-backtrace dumper.
+    if let Some(path) = &cli.global.diag_backtrace {
+        diag::install(path);
+    }
+
+    // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.
+    let pprof_watcher = match cli.global.pprof_cpu.clone() {
+        Some(path) => match pprof_dump::start(path) {
+            Ok(watcher) => Some(watcher),
             Err(e) => {
-                error!(error = %e, "Failed to start CPU profiler");
+                error!(error = %format!("{e:#}"), "Failed to start CPU profiler");
                 return ExitCode::FAILURE;
             }
-        }
-    } else {
-        None
+        },
+        None => None,
     };
 
     let exec_result = cli.command.execute(sink, &cli.global);
@@ -152,51 +157,9 @@ fn main() -> ExitCode {
         );
     }
 
-    if let (Some(guard), Some(path)) = (pprof_guard, cli.global.pprof_cpu) {
-        match guard
-            .report()
-            .frames_post_processor(|frames| {
-                frames.frames.retain(|syms| {
-                    syms.iter().all(|s| {
-                        let name = s.name();
-                        !name.starts_with("tokio::runtime")
-                            && !name.starts_with("tokio::task")
-                            && !name.starts_with("tokio::park")
-                            && !name.starts_with("tokio::loom")
-                            && !name.starts_with("tokio::time::driver")
-                            && !name.starts_with("std::thread")
-                            && !name.starts_with("std::panicking")
-                            && !name.starts_with("_pthread")
-                            && !name.starts_with("__pthread")
-                    })
-                });
-            })
-            .build()
-        {
-            Err(e) => warn!(error = %e, "Failed to build CPU profile report"),
-            Ok(report) => {
-                use pprof::protos::Message;
-                match report.pprof() {
-                    Err(e) => warn!(error = %e, "Failed to build pprof profile"),
-                    Ok(profile) => {
-                        let mut content = Vec::new();
-                        match profile.encode(&mut content) {
-                            Err(e) => {
-                                warn!(error = %e, "Failed to encode pprof profile")
-                            }
-                            Ok(()) => match std::fs::write(&path, &content) {
-                                Err(e) => {
-                                    warn!(path = %path.display(), error = %e, "Failed to write pprof file")
-                                }
-                                Ok(()) => {
-                                    info!(path = %path.display(), "CPU profile written")
-                                }
-                            },
-                        }
-                    }
-                }
-            }
-        }
+    // Flush the final (filtered) report and stop the watcher.
+    if let Some(watcher) = pprof_watcher {
+        watcher.shutdown();
     }
 
     result
