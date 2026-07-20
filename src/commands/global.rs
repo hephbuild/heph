@@ -10,6 +10,12 @@ pub struct GlobalOptions {
     /// Write CPU pprof on exit
     #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
     pub pprof_cpu: Option<PathBuf>,
+    /// Install a SIGUSR1 handler that dumps the signalled thread's backtrace to
+    /// stderr — for diagnosing hangs where ptrace/perf/core dumps are blocked
+    /// (locked-down CI containers). Off by default; see the `diag` module for
+    /// the sweep-all-threads recipe.
+    #[arg(long = "diag-backtrace", global = true, hide = true)]
+    pub diag_backtrace: bool,
     /// Disable the interactive TUI (force CI/log-only output)
     #[arg(long = "no-tui", global = true)]
     pub no_tui: bool,
@@ -57,5 +63,11 @@ mod tests {
     fn auto_approve_is_opt_in() {
         assert!(!parse(&["heph"]).auto_approve);
         assert!(parse(&["heph", "--auto-approve"]).auto_approve);
+    }
+
+    #[test]
+    fn diag_backtrace_is_opt_in() {
+        assert!(!parse(&["heph"]).diag_backtrace);
+        assert!(parse(&["heph", "--diag-backtrace"]).diag_backtrace);
     }
 }

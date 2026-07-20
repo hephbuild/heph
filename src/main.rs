@@ -5,6 +5,7 @@ use heph::log;
 use std::process::ExitCode;
 use tracing::error;
 
+mod diag;
 mod pprof_dump;
 
 #[derive(Parser)]
@@ -112,6 +113,11 @@ fn main() -> ExitCode {
         heph::telemetry::prewarm();
     }
     let started_at = std::time::Instant::now();
+
+    // Opt-in hang diagnostics: install the SIGUSR1 → thread-backtrace dumper.
+    if cli.global.diag_backtrace {
+        diag::install();
+    }
 
     // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.
     let pprof_watcher = match cli.global.pprof_cpu.clone() {
