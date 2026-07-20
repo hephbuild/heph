@@ -208,6 +208,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+          # No go.mod at repo root (Rust project); disable module caching to
+          # avoid the "Dependencies file is not found" restore-cache warning.
+          cache: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
