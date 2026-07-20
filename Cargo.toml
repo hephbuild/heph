@@ -19,7 +19,7 @@ strip = "none"
 codegen-units = 16
 lto = "thin"
 opt-level = 3 # Prioritizes speed.
-strip = true # Ensures debug symbols are removed.
+strip = "debuginfo" # Drop DWARF, keep .symtab so backtraces resolve function names.
 
 [workspace.lints.clippy]
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing

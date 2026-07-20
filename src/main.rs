@@ -115,8 +115,8 @@ fn main() -> ExitCode {
     let started_at = std::time::Instant::now();
 
     // Opt-in hang diagnostics: install the SIGUSR1 → thread-backtrace dumper.
-    if cli.global.diag_backtrace {
-        diag::install();
+    if let Some(path) = &cli.global.diag_backtrace {
+        diag::install(path);
     }
 
     // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.
