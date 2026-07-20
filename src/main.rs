@@ -2,22 +2,10 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
-use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::error;
 
-/// Set by the `SIGUSR2` handler; polled by the pprof-dump watcher thread. Lets a
-/// stuck/hung run be profiled in place: `kill -USR2 <pid>` writes the CPU profile
-/// accumulated so far to the `--pprof-cpu` path, without waiting for exit (which
-/// a hang never reaches) or needing ptrace/core dumps (both blocked in locked-down
-/// CI containers).
-static PPROF_DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// Set by `main` after the command finishes so the watcher writes a final report
-/// and exits.
-static PPROF_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+mod pprof_dump;
 
 #[derive(Parser)]
 #[command(name = "heph")]
@@ -125,20 +113,12 @@ fn main() -> ExitCode {
     }
     let started_at = std::time::Instant::now();
 
-    // When `--pprof-cpu` is set, start the sampler and hand the guard to a
-    // dedicated watcher thread. The watcher writes the profile on `SIGUSR2`
-    // (mid-run, for hangs) and once more at shutdown (filtered).
+    // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.
     let pprof_watcher = match cli.global.pprof_cpu.clone() {
-        Some(path) => match pprof::ProfilerGuardBuilder::default()
-            .frequency(1000)
-            .build()
-        {
-            Ok(guard) => {
-                install_pprof_dump_signal();
-                Some(spawn_pprof_watcher(guard, path))
-            }
+        Some(path) => match pprof_dump::start(path) {
+            Ok(watcher) => Some(watcher),
             Err(e) => {
-                error!(error = %e, "Failed to start CPU profiler");
+                error!(error = %format!("{e:#}"), "Failed to start CPU profiler");
                 return ExitCode::FAILURE;
             }
         },
@@ -171,108 +151,12 @@ fn main() -> ExitCode {
         );
     }
 
-    // Signal the watcher to write its final (filtered) report and exit.
-    if let Some(handle) = pprof_watcher {
-        PPROF_SHUTDOWN.store(true, Ordering::Relaxed);
-        if let Err(e) = handle.join() {
-            warn!("pprof watcher thread panicked: {e:?}");
-        }
+    // Flush the final (filtered) report and stop the watcher.
+    if let Some(watcher) = pprof_watcher {
+        watcher.shutdown();
     }
 
     result
-}
-
-/// `SIGUSR2` handler: request an on-demand CPU-profile dump. Only stores to an
-/// atomic, so it is async-signal-safe.
-extern "C" fn pprof_sigusr2(_sig: libc::c_int) {
-    PPROF_DUMP_REQUESTED.store(true, Ordering::Relaxed);
-}
-
-/// Install the `SIGUSR2` → dump-request handler. Called once, before the tokio
-/// runtime starts.
-fn install_pprof_dump_signal() {
-    let handler = pprof_sigusr2 as extern "C" fn(libc::c_int);
-    // SAFETY: the handler only stores to an `AtomicBool` (async-signal-safe),
-    // and this runs once at startup before other threads matter.
-    unsafe {
-        libc::signal(libc::SIGUSR2, handler as libc::sighandler_t);
-    }
-}
-
-/// Own the profiler guard on a dedicated thread. Poll for `SIGUSR2` dump
-/// requests (mid-run snapshots for diagnosing hangs) and, on shutdown, write a
-/// final report with the tokio/std runtime frames filtered out.
-fn spawn_pprof_watcher(guard: pprof::ProfilerGuard<'static>, path: PathBuf) -> JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("pprof-dump".to_string())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_millis(200));
-                if PPROF_DUMP_REQUESTED.swap(false, Ordering::Relaxed) {
-                    // Unfiltered on purpose: a hang might be *in* the runtime, so
-                    // show every frame.
-                    dump_pprof(&guard, &path, false);
-                }
-                if PPROF_SHUTDOWN.load(Ordering::Relaxed) {
-                    break;
-                }
-            }
-            dump_pprof(&guard, &path, true);
-        })
-        .expect("spawn pprof-dump thread")
-}
-
-/// Build the current pprof report and write it to `path`. When `filter_runtime`
-/// is set, drop pure tokio/std scheduler frames (the exit-time report); the
-/// on-demand dump keeps everything.
-fn dump_pprof(guard: &pprof::ProfilerGuard<'_>, path: &Path, filter_runtime: bool) {
-    use pprof::protos::Message;
-    let report = if filter_runtime {
-        guard
-            .report()
-            .frames_post_processor(|frames| {
-                frames.frames.retain(|syms| {
-                    syms.iter().all(|s| {
-                        let name = s.name();
-                        !name.starts_with("tokio::runtime")
-                            && !name.starts_with("tokio::task")
-                            && !name.starts_with("tokio::park")
-                            && !name.starts_with("tokio::loom")
-                            && !name.starts_with("tokio::time::driver")
-                            && !name.starts_with("std::thread")
-                            && !name.starts_with("std::panicking")
-                            && !name.starts_with("_pthread")
-                            && !name.starts_with("__pthread")
-                    })
-                });
-            })
-            .build()
-    } else {
-        guard.report().build()
-    };
-    let report = match report {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, "Failed to build CPU profile report");
-            return;
-        }
-    };
-    let profile = match report.pprof() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "Failed to build pprof profile");
-            return;
-        }
-    };
-    let mut content = Vec::new();
-    if let Err(e) = profile.encode(&mut content) {
-        warn!(error = %e, "Failed to encode pprof profile");
-        return;
-    }
-    match std::fs::write(path, &content) {
-        Ok(()) => info!(path = %path.display(), "CPU profile written"),
-        Err(e) => warn!(path = %path.display(), error = %e, "Failed to write pprof file"),
-    }
 }
 
 /// Detect the hidden `__supervisor --ipc-fd <N>` invocation without dragging
