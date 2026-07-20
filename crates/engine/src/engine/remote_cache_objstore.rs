@@ -72,10 +72,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// without waiting out the full [`REQUEST_TIMEOUT`].
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Client options for the explicit store builders: a generous but finite request
-/// timeout (see the liveness note above).
+/// Client options for the explicit store builders: HTTP/2 plus a generous but
+/// finite request timeout.
+///
+/// object_store's client defaults to HTTP/1.1. Under a wide `//...` fan-out that
+/// opens a request per cache artifact, h1 needs a fresh TCP+TLS connection per
+/// concurrent request; they pile up (TIME_WAIT / ephemeral-port / conntrack
+/// exhaustion) until new connects time out ("error sending request"). HTTP/2
+/// multiplexes every request onto a handful of connections — the same thing the
+/// Go client did, where this workload was never a problem.
 fn client_options() -> ClientOptions {
-    ClientOptions::default().with_timeout(REQUEST_TIMEOUT)
+    ClientOptions::default()
+        .with_http2_only()
+        .with_timeout(REQUEST_TIMEOUT)
 }
 
 /// Retry budget for the explicit store builders. The default (10 retries /
@@ -93,17 +102,21 @@ fn retry_config() -> RetryConfig {
     }
 }
 
-/// Extra options fed to [`parse_url_opts`] for networked schemes: the same
-/// finite request timeout as [`client_options`], through the string-key
-/// interface that path exposes. Local schemes (`file`, `memory`) have no HTTP
-/// client and reject client config keys, so they get nothing.
+/// Extra options fed to [`parse_url_opts`] for networked schemes, matching
+/// [`client_options`] through the string-key interface that path exposes: HTTP/2
+/// (multiplex to avoid the h1 connection storm) plus the finite request timeout.
+/// Local schemes (`file`, `memory`) have no HTTP client and reject client config
+/// keys, so they get nothing.
 fn transfer_opts(scheme: &str) -> Vec<(String, String)> {
     match scheme {
         "file" | "memory" => Vec::new(),
-        _ => vec![(
-            "timeout".to_string(),
-            format!("{}s", REQUEST_TIMEOUT.as_secs()),
-        )],
+        _ => vec![
+            ("http2_only".to_string(), "true".to_string()),
+            (
+                "timeout".to_string(),
+                format!("{}s", REQUEST_TIMEOUT.as_secs()),
+            ),
+        ],
     }
 }
 
@@ -452,22 +465,25 @@ mod tests {
     }
 
     #[test]
-    fn transfer_opts_sets_finite_timeout_on_networked_schemes_only() {
-        // Networked schemes lift the total timeout above object_store's 30s
-        // default (so a large body isn't chopped) but keep it finite — no
-        // h2-keep-alive keys, since the client is HTTP/1.1 and would ignore them.
+    fn transfer_opts_sets_http2_and_finite_timeout_on_networked_schemes_only() {
+        // Networked schemes force HTTP/2 (multiplex, to avoid the h1 connection
+        // storm) and lift the total timeout above object_store's 30s default
+        // while keeping it finite.
         for scheme in ["gs", "s3", "az", "http", "https"] {
             let opts = transfer_opts(scheme);
+            assert_eq!(
+                opts.iter()
+                    .find(|(k, _)| k == "http2_only")
+                    .map(|(_, v)| v.as_str()),
+                Some("true"),
+                "scheme {scheme} should force http2"
+            );
             assert_eq!(
                 opts.iter()
                     .find(|(k, _)| k == "timeout")
                     .map(|(_, v)| v.as_str()),
                 Some(format!("{}s", REQUEST_TIMEOUT.as_secs()).as_str()),
                 "scheme {scheme} should carry the finite request timeout"
-            );
-            assert!(
-                !opts.iter().any(|(k, _)| k.starts_with("http2_keep_alive")),
-                "scheme {scheme} must not set inert h2 keep-alive keys"
             );
         }
         // Local schemes have no HTTP client and reject client config keys.
