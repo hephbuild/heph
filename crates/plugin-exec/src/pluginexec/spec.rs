@@ -1,15 +1,13 @@
-use anyhow::Context;
-use hcore::htvalue::Value;
-use hcore::htvalue::signature::ParamType;
 use hplugin::driver::targetdef::path::CodegenMode;
-use hplugin::htspec::{FromSpecValue, Spec, SpecStruct};
+use hplugin::htspec::{Spec, TargetSpecCache};
 use std::collections::HashMap;
 
 /// Exec-driver target config. `#[derive(Spec)]` generates `TargetSpec::from`
 /// (parser) and `TargetSpec::schema` (LSP schema) from these fields, so the two
 /// can never drift; doc comments below become the schema docs. `codegen` is a
-/// [`SpecEnum`](hplugin::htspec::SpecEnum); `cache` is a bool shorthand or a
-/// [`SpecStruct`] dict ([`CacheDict`]).
+/// [`SpecEnum`](hplugin::htspec::SpecEnum); `cache` is the shared
+/// [`TargetSpecCache`] knob (a bool shorthand or a `{enabled, remote, history}`
+/// dict).
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
     /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
@@ -47,86 +45,11 @@ pub(crate) struct TargetSpec {
     pub runtime_env: HashMap<String, String>,
 }
 
-pub(crate) struct TargetSpecCache {
-    pub local: bool,
-    pub remote: bool,
-    /// How many cache revisions to retain for this target. Default 1.
-    pub history: u32,
-}
-
-impl Default for TargetSpecCache {
-    fn default() -> Self {
-        TargetSpecCache {
-            local: true,
-            remote: true,
-            history: 1,
-        }
-    }
-}
-
-/// The dict form of `cache`: `{"enabled": bool, "remote": bool, "history": int}`,
-/// each key optional and defaulting (enabled/remote true, history 1). The
-/// `SpecStruct` derive parses the map and rejects unknown keys.
-#[derive(SpecStruct)]
-struct CacheDict {
-    #[spec(rename = "enabled", default = true)]
-    local: bool,
-    #[spec(default = true)]
-    remote: bool,
-    #[spec(default = 1u32, parse = parse_cache_history)]
-    history: u32,
-}
-
-impl From<CacheDict> for TargetSpecCache {
-    fn from(d: CacheDict) -> Self {
-        TargetSpecCache {
-            local: d.local,
-            remote: d.remote,
-            history: d.history,
-        }
-    }
-}
-
-/// The `cache` attribute accepts either a bare bool (legacy: `cache =
-/// True/False` toggles both local and remote, history 1) or the [`CacheDict`]
-/// form. This is shape-dispatch (not `SpecUnion`): a map *commits* to the dict
-/// arm so its specific parse errors (unknown key, bad `history`) surface,
-/// rather than being masked by a generic "expected bool | map" union error.
-impl FromSpecValue for TargetSpecCache {
-    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
-        match v {
-            // A bare bool toggles both local and remote; history stays at 1.
-            Value::Bool(b) => Ok(TargetSpecCache {
-                local: *b,
-                remote: *b,
-                history: 1,
-            }),
-            Value::Map(_) => CacheDict::from_spec_value(v).map(TargetSpecCache::from),
-            _ => anyhow::bail!("`cache` must be a bool or a dict"),
-        }
-    }
-
-    fn spec_param_type() -> ParamType {
-        ParamType::union(vec![ParamType::Bool, CacheDict::spec_param_type()])
-    }
-}
-
-fn parse_cache_history(v: &Value) -> anyhow::Result<u32> {
-    let n: i64 = match v {
-        Value::Int(i) => *i,
-        Value::Uint(u) => i64::try_from(*u).context("`cache.history` too large")?,
-        _ => anyhow::bail!("`cache.history` must be an integer"),
-    };
-    if n < 1 {
-        anyhow::bail!("`cache.history` must be >= 1, got {n}");
-    }
-    u32::try_from(n).context("`cache.history` too large")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use hcore::htvalue::Value;
+    use hcore::htvalue::signature::ParamType;
     use hplugin::driver::DriverField;
 
     fn make_spec(

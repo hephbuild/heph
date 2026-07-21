@@ -15,8 +15,8 @@
 //!     (`map[...]`);
 //!   * `#[derive(SpecEnum)]` — a string-valued enum;
 //!   * `#[derive(SpecUnion)]` — a value accepting one of several shapes; or a
-//!     hand-written impl for a bespoke shape (see `TargetSpecCache` in
-//!     `pluginexec::spec`).
+//!     hand-written impl for a bespoke shape (see [`TargetSpecCache`], the
+//!     shared `cache` attribute).
 
 use hcore::htvalue::signature::ParamType;
 use hcore::htvalue::{
@@ -25,6 +25,9 @@ use hcore::htvalue::{
 };
 
 pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
+
+mod cache;
+pub use cache::TargetSpecCache;
 
 // The `Spec` derive macro emits `crate::htspec::DriverField` / `DriverSchema`
 // (portable across the monolith re-export and this crate). Re-export them here
