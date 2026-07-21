@@ -9,9 +9,7 @@ use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::sandbox::EnvValue;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{
-    CacheConfig, Input, InputMode, Output, TargetDef as EngineTargetDef,
-};
+use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr, outputartifact,
@@ -658,11 +656,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .collect(),
                 outputs,
                 support_files,
-                cache: CacheConfig {
-                    enabled: spec.cache.local,
-                    remote_enabled: spec.cache.remote,
-                    history: spec.cache.history,
-                },
+                cache: spec.cache.into(),
                 pty: true,
                 hash,
                 transparent: false,
@@ -1393,6 +1387,7 @@ mod tests {
     use hdriver_support::driver_managed::ManagedDriver;
     use hmodel::htaddr::Addr;
     use hplugin::driver::RunRequest;
+    use hplugin::driver::targetdef::CacheConfig;
 
     #[test]
     fn env_key_segment_sanitizes_invalid_chars() {

@@ -25,12 +25,12 @@ use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{CacheConfig, Output, TargetDef};
+use hplugin::driver::targetdef::{Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse,
 };
-use hplugin::htspec::Spec;
+use hplugin::htspec::{Spec, TargetSpecCache};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -59,6 +59,12 @@ struct HttpFetchSpec {
     out: Option<String>,
     /// Mark the fetched file executable (a downloaded tool binary).
     executable: bool,
+    /// Caching for the fetched file. Defaults to on for both the local and
+    /// remote cache — a fetch is content-addressed (pinned by `sha256`), so it
+    /// is safe to share. `cache = False` disables both tiers; the dict form
+    /// `{enabled, remote, history}` toggles them independently (e.g.
+    /// `cache = {"remote": False}` keeps the fetch local-only).
+    cache: TargetSpecCache,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -156,7 +162,7 @@ impl ManagedDriver for Driver {
                     }],
                 }],
                 support_files: vec![],
-                cache: CacheConfig::on(true),
+                cache: spec.cache.into(),
                 pty: false,
                 hash,
                 transparent: false,
@@ -573,6 +579,77 @@ mod tests {
             .expect("parse darwin");
 
         assert_ne!(linux.target_def.hash, darwin.target_def.hash);
+    }
+
+    /// A fetch defaults to caching in both the local and remote tiers: the
+    /// bytes are content-addressed, so they are safe to share.
+    #[tokio::test]
+    async fn parse_defaults_to_local_and_remote_cache() {
+        let config = HashMap::from([(
+            "url".to_string(),
+            Value::String("https://x/tool".to_string()),
+        )]);
+        let resp = Driver
+            .parse(
+                parse_req("//tools/dl:tool", config),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse");
+
+        let cache = resp.target_def.cache;
+        assert!(cache.enabled, "local cache on by default");
+        assert!(cache.remote_enabled, "remote cache on by default");
+    }
+
+    /// `cache = False` turns off both tiers.
+    #[tokio::test]
+    async fn parse_cache_false_disables_both_tiers() {
+        let config = HashMap::from([
+            (
+                "url".to_string(),
+                Value::String("https://x/tool".to_string()),
+            ),
+            ("cache".to_string(), Value::Bool(false)),
+        ]);
+        let resp = Driver
+            .parse(
+                parse_req("//tools/dl:tool", config),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse");
+
+        let cache = resp.target_def.cache;
+        assert!(!cache.enabled);
+        assert!(!cache.remote_enabled);
+    }
+
+    /// The dict form toggles the tiers independently: keep the fetch local but
+    /// off the remote cache.
+    #[tokio::test]
+    async fn parse_cache_dict_can_disable_remote_only() {
+        let config = HashMap::from([
+            (
+                "url".to_string(),
+                Value::String("https://x/tool".to_string()),
+            ),
+            (
+                "cache".to_string(),
+                Value::Map(HashMap::from([("remote".to_string(), Value::Bool(false))])),
+            ),
+        ]);
+        let resp = Driver
+            .parse(
+                parse_req("//tools/dl:tool", config),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse");
+
+        let cache = resp.target_def.cache;
+        assert!(cache.enabled, "local stays on");
+        assert!(!cache.remote_enabled, "remote disabled");
     }
 
     #[tokio::test]
