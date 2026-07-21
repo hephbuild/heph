@@ -67,6 +67,13 @@ pub struct Engine {
     /// memory and never touch the SQLite WAL; entries over the per-entry cap
     /// spill to `local_cache`. See [`LocalCacheTmp`].
     pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
+    /// Mem-only store for `secret` targets. Unlike [`local_cache_tmp`], it never
+    /// spills to disk — secret outputs must be held in memory only. Backed by a
+    /// deny-durable, so an unexpected spill errors loudly instead of writing the
+    /// secret to disk.
+    ///
+    /// [`local_cache_tmp`]: Self::local_cache_tmp
+    pub(crate) local_cache_secret: Arc<dyn LocalCache>,
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
@@ -348,6 +355,16 @@ impl Engine {
                 cfg.tmp_cache.capacity_bytes,
             ));
 
+        // Secret targets: a mem-only store with effectively unbounded limits so
+        // entries never spill, backed by a deny-durable so any spill (which must
+        // not happen) errors instead of writing a secret to disk.
+        let local_cache_secret: Arc<dyn LocalCache> =
+            Arc::new(crate::engine::local_cache_tmp::LocalCacheTmp::new(
+                Arc::new(crate::engine::local_cache::DenyDurable),
+                usize::MAX,
+                u64::MAX,
+            ));
+
         // Best-effort sweep of stale `sandboxfuse<pid>` dirs from crashed runs.
         sweep_stale_sandboxfuse_dirs(&home);
 
@@ -376,6 +393,7 @@ impl Engine {
             home: home.clone(),
             local_cache,
             local_cache_tmp,
+            local_cache_secret,
             walker,
             providers: vec![],
             providers_by_name: HashMap::new(),
