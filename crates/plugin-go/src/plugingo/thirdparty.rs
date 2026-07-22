@@ -364,7 +364,10 @@ mod tests {
             crate::plugingo::toolchain::HOST,
         );
         let env = pass_env(&spec);
-        assert!(env.contains(&"PATH".to_string()), "host must pass PATH: {env:?}");
+        assert!(
+            env.contains(&"PATH".to_string()),
+            "host must pass PATH: {env:?}"
+        );
         // Module/proxy knobs stay inherited too (merged, not lost).
         for v in ["GOMODCACHE", "GOPROXY", "GOCACHE"] {
             assert!(env.contains(&v.to_string()), "must keep {v}: {env:?}");
@@ -380,7 +383,10 @@ mod tests {
             !env.contains(&"PATH".to_string()),
             "hermetic must not leak host PATH: {env:?}"
         );
-        assert!(env.contains(&"GOMODCACHE".to_string()), "must keep module env: {env:?}");
+        assert!(
+            env.contains(&"GOMODCACHE".to_string()),
+            "must keep module env: {env:?}"
+        );
     }
 
     // ---- build_lib_spec ----
