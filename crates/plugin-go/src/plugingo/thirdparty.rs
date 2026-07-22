@@ -1,5 +1,5 @@
 use crate::plugingo::addr_util::{
-    go_build_env, go_goroot_prelude, go_host_pass_env_config, go_sdk_dep, go_sdk_read_only_config,
+    go_build_env, go_goroot_prelude, go_host_runtime_pass_env, go_sdk_dep, go_sdk_read_only_config,
     to_run_value,
 };
 use crate::plugingo::driver_compile::{CompileParams, build_compile_spec};
@@ -71,9 +71,6 @@ pub fn build_download_spec(
     if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
         config.insert(ro_k, ro_v);
     }
-    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
-        config.insert(pe_k, pe_v);
-    }
     // Glob form (contains `*`) — pluginexec packs every matching file under
     // the target's pkg into the artifact, preserving relative paths.
     config.insert(
@@ -88,27 +85,34 @@ pub fn build_download_spec(
     config.insert("env".to_string(), go_build_env());
     // GOPROXY/GOMODCACHE/etc must be inherited at runtime so network fetches
     // and modcache placement match the user's host config. (Modules are
-    // content-addressed and go.sum-verified, so this stays reproducible.)
+    // content-addressed and go.sum-verified, so this stays reproducible.) For a
+    // host/target toolchain, `go` itself is non-hermetic and must be resolvable
+    // from the sandbox — merge in `go_host_runtime_pass_env` (PATH, HOME, …)
+    // rather than clobbering it with a second `runtime_pass_env` insert.
+    let mut pass_env: Vec<String> = [
+        "HOME",
+        "GOMODCACHE",
+        "GOPATH",
+        "GOCACHE",
+        "GOPROXY",
+        "GONOSUMDB",
+        "GOSUMDB",
+        "GOFLAGS",
+        "GOPRIVATE",
+        "GONOSUMCHECK",
+        "GOINSECURE",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    for name in go_host_runtime_pass_env(go_version) {
+        if !pass_env.contains(&name) {
+            pass_env.push(name);
+        }
+    }
     config.insert(
         "runtime_pass_env".to_string(),
-        Value::List(
-            [
-                "HOME",
-                "GOMODCACHE",
-                "GOPATH",
-                "GOCACHE",
-                "GOPROXY",
-                "GONOSUMDB",
-                "GOSUMDB",
-                "GOFLAGS",
-                "GOPRIVATE",
-                "GONOSUMCHECK",
-                "GOINSECURE",
-            ]
-            .iter()
-            .map(|s| Value::String((*s).to_string()))
-            .collect(),
-        ),
+        Value::List(pass_env.into_iter().map(Value::String).collect()),
     );
 
     TargetSpec {
@@ -332,6 +336,56 @@ mod tests {
                 crate::plugingo::toolchain::staged_goroot(V)
             )),
             "download must point GOROOT at the staged SDK: {run}"
+        );
+    }
+
+    fn pass_env(spec: &TargetSpec) -> Vec<String> {
+        match spec.config.get("runtime_pass_env").unwrap() {
+            Value::List(v) => v
+                .iter()
+                .map(|e| match e {
+                    Value::String(s) => s.clone(),
+                    _ => panic!("pass-env entry not a string"),
+                })
+                .collect(),
+            _ => panic!("runtime_pass_env not a list"),
+        }
+    }
+
+    #[test]
+    fn test_download_host_toolchain_passes_path_and_module_env() {
+        // Host `go` is resolved from the sandbox PATH, so PATH must be inherited
+        // — the earlier double `runtime_pass_env` insert clobbered it, breaking
+        // `gotool: host` with `go: command not found`.
+        let spec = build_download_spec(
+            download_addr(),
+            "github.com/go-logr/logr",
+            "v1.4.2",
+            crate::plugingo::toolchain::HOST,
+        );
+        let env = pass_env(&spec);
+        assert!(
+            env.contains(&"PATH".to_string()),
+            "host must pass PATH: {env:?}"
+        );
+        // Module/proxy knobs stay inherited too (merged, not lost).
+        for v in ["GOMODCACHE", "GOPROXY", "GOCACHE"] {
+            assert!(env.contains(&v.to_string()), "must keep {v}: {env:?}");
+        }
+    }
+
+    #[test]
+    fn test_download_hermetic_toolchain_does_not_pass_path() {
+        // Hermetic `go` is staged, never resolved from PATH.
+        let spec = build_download_spec(download_addr(), "github.com/go-logr/logr", "v1.4.2", V);
+        let env = pass_env(&spec);
+        assert!(
+            !env.contains(&"PATH".to_string()),
+            "hermetic must not leak host PATH: {env:?}"
+        );
+        assert!(
+            env.contains(&"GOMODCACHE".to_string()),
+            "must keep module env: {env:?}"
         );
     }
 
