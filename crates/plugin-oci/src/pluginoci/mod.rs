@@ -34,15 +34,18 @@ use hplugin::driver::{
 use hplugin::htspec::{Spec, TargetSpecCache};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 pub const DRIVER_NAME: &str = "oci_image";
 
-/// Archive format the build emits.
+pub mod load;
+pub mod push;
+
+/// Archive format an image is built/consumed as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum ImageFormat {
+pub(crate) enum ImageFormat {
     /// OCI image layout archive (`--output type=oci`). Portable, standard;
     /// pushed/loaded daemonlessly with `skopeo`.
     Oci,
@@ -60,7 +63,16 @@ impl ImageFormat {
         }
     }
 
-    fn parse(s: &str) -> anyhow::Result<Self> {
+    /// The containers/image transport name for reading this archive as a source
+    /// (skopeo `<transport>:<path>`).
+    pub(crate) fn transport(self) -> &'static str {
+        match self {
+            ImageFormat::Oci => "oci-archive",
+            ImageFormat::Docker => "docker-archive",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "oci" => Ok(ImageFormat::Oci),
             "docker" => Ok(ImageFormat::Docker),
@@ -385,19 +397,9 @@ impl ManagedDriver for Driver {
             &metadata_file,
         );
 
-        // The build is blocking; keep it off the async runtime. Cancellation is
-        // honored by ceasing to await (the child is not killed mid-syscall —
-        // same tradeoff as http_fetch).
-        let work = tokio::task::spawn_blocking(move || run_docker(&argv));
-        let build = async {
-            work.await
-                .context("oci_image build task panicked")?
-                .context("docker buildx build")
-        };
-        tokio::select! {
-            r = build => r?,
-            () = ctoken.cancelled() => anyhow::bail!("oci_image: build cancelled"),
-        }
+        run_cmd_cancellable(argv, ctoken, "docker buildx build")
+            .await
+            .context("oci_image build")?;
 
         let metadata = std::fs::read_to_string(&metadata_file)
             .with_context(|| format!("read buildx metadata {metadata_file:?}"))?;
@@ -409,24 +411,78 @@ impl ManagedDriver for Driver {
     }
 }
 
-/// Run `docker buildx build`, failing with the captured stderr on a non-zero
-/// exit. `argv[0]` is the binary.
-fn run_docker(argv: &[String]) -> anyhow::Result<()> {
-    let (bin, args) = argv
-        .split_first()
-        .context("empty docker argv (internal bug)")?;
+/// Run a subprocess to completion, failing with the captured stderr on a
+/// non-zero exit. `argv[0]` is the binary. `what` names the operation for error
+/// context. Pure blocking work.
+fn run_cmd(argv: &[String], what: &str) -> anyhow::Result<()> {
+    let (bin, args) = argv.split_first().context("empty argv (internal bug)")?;
     let output = std::process::Command::new(bin)
         .args(args)
         .output()
         .with_context(|| format!("spawn {bin}"))?;
     if !output.status.success() {
         anyhow::bail!(
-            "docker buildx build failed ({}): {}",
+            "{what} failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
     }
     Ok(())
+}
+
+/// Run `argv` off the async runtime, racing it against cancellation. The child
+/// is not killed mid-syscall (same tradeoff as http_fetch) — cancellation stops
+/// awaiting it.
+pub(crate) async fn run_cmd_cancellable(
+    argv: Vec<String>,
+    ctoken: &(dyn Cancellable + Send + Sync),
+    what: &'static str,
+) -> anyhow::Result<()> {
+    let work = tokio::task::spawn_blocking(move || run_cmd(&argv, what));
+    let run = async {
+        work.await
+            .with_context(|| format!("{what} task panicked"))?
+            .context(what)
+    };
+    tokio::select! {
+        r = run => r,
+        () = ctoken.cancelled() => anyhow::bail!("{what}: cancelled"),
+    }
+}
+
+/// Absolute path to the single file a Dep input materialized into the sandbox.
+/// Reads the input's `.list` file (one absolute path per line — see
+/// `driver_managed.rs::list_path_for`). Errors unless exactly one file was
+/// produced, so a caller expecting one archive fails loudly on a mis-declared
+/// dep.
+pub(crate) fn dep_single_file(
+    req: &ManagedRunRequest<'_, '_>,
+    origin_id: &str,
+) -> anyhow::Result<PathBuf> {
+    let m = req
+        .inputs
+        .iter()
+        .find(|m| {
+            m.input.origin_id == origin_id
+                && matches!(
+                    m.input.artifact.r#type,
+                    hplugin::driver::inputartifact::Type::Dep
+                )
+        })
+        .with_context(|| format!("no dep input {origin_id:?} in sandbox"))?;
+    let list_path = m.require_list_path()?;
+    // The `.list` file holds one absolute materialized path per line.
+    let content = std::fs::read_to_string(list_path)
+        .with_context(|| format!("read dep list {list_path:?}"))?;
+    let mut paths = content.lines().filter(|l| !l.is_empty());
+    let first = paths
+        .next()
+        .with_context(|| format!("dep {origin_id:?} produced no files"))?;
+    anyhow::ensure!(
+        paths.next().is_none(),
+        "dep {origin_id:?} produced more than one file; expected exactly one archive"
+    );
+    Ok(PathBuf::from(first))
 }
 
 fn basename(path: &str) -> anyhow::Result<&std::ffi::OsStr> {
