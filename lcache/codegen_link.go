@@ -52,7 +52,12 @@ func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error
 				return err
 			}
 
-			err = tar.UntarContext(ctx, tarf, e.Root.Root.Abs(), tar.UntarOptions{})
+			err = tar.UntarContext(ctx, tarf, e.Root.Root.Abs(), tar.UntarOptions{
+				Xattrs: map[string][]byte{
+					xfs.CodegenXattr: []byte(target.Addr),
+					xfs.V0Xattr:      []byte("1"),
+				},
+			})
 			_ = tarf.Close()
 			if err != nil {
 				return err

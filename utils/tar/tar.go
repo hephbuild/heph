@@ -148,6 +148,9 @@ type UntarOptions struct {
 	RO       bool
 	Dedup    *sets.StringSet
 	Progress func(written int64)
+	// Xattrs, if set, are written as extended attributes on each extracted
+	// regular file and symlink. Used to stamp codegen provenance.
+	Xattrs map[string][]byte
 }
 
 func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
@@ -231,6 +234,10 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
 
+			if err := writeXattrs(dest, o.Xattrs); err != nil {
+				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
+			}
+
 			recordFile(hdr.Name)
 		case tar.TypeDir:
 			err := os.MkdirAll(dest, os.FileMode(hdr.Mode))
@@ -252,12 +259,26 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 			if err != nil {
 				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
+
+			if err := writeXattrs(dest, o.Xattrs); err != nil {
+				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
+			}
 		default:
 			return fmt.Errorf("untar: unsupported type %v", hdr.Typeflag)
 		}
 
 		return nil
 	})
+}
+
+func writeXattrs(dest string, xattrs map[string][]byte) error {
+	for name, value := range xattrs {
+		if err := xfs.SetXattr(dest, name, value); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func UntarList(ctx context.Context, in io.ReadCloser, listPath string, progresss func(read int64)) ([]string, error) {
