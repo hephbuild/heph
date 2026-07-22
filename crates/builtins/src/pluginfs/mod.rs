@@ -47,6 +47,27 @@ pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
     matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
 }
 
+/// True if `path` is a symlink whose target resolves inside a `.heph*` directory
+/// (e.g. `.heph3/cache/...`). Such links point at engine-internal artifacts —
+/// materialized cache outputs, not raw workspace source — so they must be
+/// skipped by source reads exactly like a stamped codegen file.
+///
+/// A non-symlink, a dangling link, or any IO error is treated as "not a heph
+/// link" so source reads never break on such trees.
+pub fn is_heph_symlink(path: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    target.components().any(|c| {
+        matches!(c, std::path::Component::Normal(name)
+            if name.to_str().is_some_and(|n| n.starts_with(".heph")))
+    })
+}
+
 /// Returns the `Addr` for a single-file fs target.
 /// Consumers use this to reference a file without knowing the internal address format.
 pub fn file_addr(path: &str) -> Addr {
@@ -743,8 +764,9 @@ fn emit_glob_file(
         return Ok(());
     }
     // Skip net-new codegen outputs stamped back into the tree — sourcing them
-    // here would double-source the generated content.
-    if has_codegen_xattr(abs) {
+    // here would double-source the generated content. Same for symlinks into a
+    // `.heph*` dir: they point at engine-internal artifacts, not raw source.
+    if has_codegen_xattr(abs) || is_heph_symlink(abs) {
         return Ok(());
     }
     let Some(rel_str) = rel.to_str() else {
@@ -982,8 +1004,10 @@ impl hplugin::driver::Driver for Driver {
 
                 // A file() over a net-new codegen output (stamped back into the
                 // tree) resolves to nothing — the generated content must only be
-                // sourced from its generator, never re-read as raw source.
-                if has_codegen_xattr(&abs) {
+                // sourced from its generator, never re-read as raw source. A
+                // symlink into a `.heph*` dir (engine-internal artifact) is
+                // skipped the same way.
+                if has_codegen_xattr(&abs) || is_heph_symlink(&abs) {
                     return Ok(RunResponse {
                         artifacts: vec![],
                         ..Default::default()
@@ -2742,5 +2766,119 @@ mod tests {
 
         assert_eq!(res.artifacts.len(), 1);
         assert_eq!(res.artifacts[0].name, "plain.rs");
+    }
+
+    // ─── `.heph*` symlink exclusion ────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_driver_run_glob_excludes_heph_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let driver = Driver::default();
+        let tmp = tempdir().unwrap();
+
+        // Engine-internal artifact living under a `.heph*` dir, plus a symlink
+        // to it inside the workspace tree.
+        let cache = tmp.path().join(".heph3").join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let blob = cache.join("blob.rs");
+        fs::write(&blob, b"generated").unwrap();
+        symlink(&blob, tmp.path().join("linked.rs")).unwrap();
+
+        let plain = tmp.path().join("plain.rs");
+        fs::write(&plain, b"plain").unwrap();
+
+        let config =
+            std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["plain.rs"],
+            "symlink into a .heph* dir must be excluded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_driver_run_file_heph_symlink_yields_nothing() {
+        use std::os::unix::fs::symlink;
+
+        let driver = Driver::default();
+        let tmp = tempdir().unwrap();
+
+        let cache = tmp.path().join(".heph3").join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let blob = cache.join("blob.rs");
+        fs::write(&blob, b"generated").unwrap();
+        symlink(&blob, tmp.path().join("linked.rs")).unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "f".to_string(),
+            Value::String("linked.rs".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        assert!(
+            res.artifacts.is_empty(),
+            "file() over a .heph* symlink must yield no artifacts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_heph_symlink_only_targets_heph_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+
+        // Plain file: not a symlink.
+        let plain = tmp.path().join("plain.rs");
+        fs::write(&plain, b"x").unwrap();
+        assert!(!is_heph_symlink(&plain));
+
+        // Symlink to a normal (non-.heph) file.
+        let normal = tmp.path().join("normal.rs");
+        fs::write(&normal, b"x").unwrap();
+        let link_normal = tmp.path().join("link_normal.rs");
+        symlink(&normal, &link_normal).unwrap();
+        assert!(!is_heph_symlink(&link_normal));
+
+        // Symlink into a `.heph*` dir.
+        let cache = tmp.path().join(".heph3").join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let blob = cache.join("blob.rs");
+        fs::write(&blob, b"x").unwrap();
+        let link_heph = tmp.path().join("link_heph.rs");
+        symlink(&blob, &link_heph).unwrap();
+        assert!(is_heph_symlink(&link_heph));
     }
 }
