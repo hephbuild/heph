@@ -258,8 +258,8 @@ impl ManagedDriver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
-        let spec = OciImageSpec::from(req.target_spec.config.clone())
-            .context("parse oci_image config")?;
+        let spec =
+            OciImageSpec::from(req.target_spec.config.clone()).context("parse oci_image config")?;
         let pkg = addr.package.clone();
         let pkg_str = addr.package.as_str();
 
@@ -303,8 +303,9 @@ impl ManagedDriver for Driver {
         };
 
         let hash = {
-            let mut h =
-                DebugHasher::new(Xxh3Default::new(), || format!("oci_image_{}", addr.format()));
+            let mut h = DebugHasher::new(Xxh3Default::new(), || {
+                format!("oci_image_{}", addr.format())
+            });
             def.hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };
@@ -644,10 +645,7 @@ mod tests {
             ("format".to_string(), Value::String("tarball".to_string())),
         ]);
         let err = Driver::new()
-            .parse(
-                parse_req("//app:img", config),
-                &StdCancellationToken::new(),
-            )
+            .parse(parse_req("//app:img", config), &StdCancellationToken::new())
             .await
             .err()
             .expect("bad format must fail parse");
