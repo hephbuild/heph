@@ -2182,6 +2182,7 @@ dependencies = [
  "plugin-exec",
  "plugin-http",
  "plugin-nix",
+ "plugin-oci",
  "plugin-query",
  "posthog-rs",
  "pprof",
@@ -4006,6 +4007,24 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-oci"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "core",
+ "driver-support",
+ "model",
+ "plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "xxhash-rust",
 ]
 
