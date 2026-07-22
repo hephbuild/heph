@@ -218,8 +218,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         }
     }
 
@@ -278,8 +277,7 @@ mod tests {
             goos: "darwin".into(),
             goarch: "arm64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let spec = install_spec(install_addr(&factors), &factors, V);
         let env = match spec.config.get("env").unwrap() {

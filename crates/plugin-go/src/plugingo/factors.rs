@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 pub const ENV_FACTORS: &[(&str, &str)] =
     &[("goexperiment", "GOEXPERIMENT"), ("godebug", "GODEBUG")];
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Factors {
     pub goos: String,
     pub goarch: String,
@@ -118,8 +118,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         assert!(f.go_list_flags().is_empty());
     }
@@ -130,8 +129,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec!["foo".into(), "bar".into()],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         assert_eq!(f.go_list_flags(), vec!["-tags", "foo,bar"]);
     }

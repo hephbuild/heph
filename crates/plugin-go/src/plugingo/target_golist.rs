@@ -178,8 +178,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         }
     }
 
@@ -442,8 +441,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec!["integration".to_string()],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let spec = build_spec_stdlib(test_addr(), "fmt", &factors, V).unwrap();
         assert!(
@@ -465,7 +463,7 @@ mod tests {
                 "GOEXPERIMENT".to_string(),
                 "rangefunc".to_string(),
             )]),
-            ldflags: vec![],
+            ..Default::default()
         };
         let spec = build_spec_stdlib(test_addr(), "fmt", &factors, "/usr/local/go").unwrap();
         let env = match spec.config.get("env").unwrap() {

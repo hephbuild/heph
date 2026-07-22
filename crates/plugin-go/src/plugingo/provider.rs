@@ -568,10 +568,7 @@ impl ProviderTrait for Provider {
                 ),
                 field(
                     "build",
-                    ParamType::strukt(vec![(
-                        "env",
-                        ParamType::map(ParamType::String),
-                    )]),
+                    ParamType::strukt(vec![("env", ParamType::map(ParamType::String))]),
                     "Build-env settings for this package's Go compile/list/link targets. \
                      `env` (map[string]) sets build-env knobs keyed by the Go env var \
                      (e.g. `GOEXPERIMENT`, `GODEBUG`); they land in the hashed build env \
@@ -627,8 +624,7 @@ impl ProviderInner {
                 goos: current_goos(),
                 goarch: current_goarch(),
                 build_tags: vec![],
-                env: Default::default(),
-                ldflags: vec![],
+                ..Default::default()
             };
 
             let kind = match decode_package(&req.package, &self.workspace_root) {
@@ -2526,8 +2522,7 @@ impl ProviderInner {
                 goos: current_goos(),
                 goarch: current_goarch(),
                 build_tags: vec![],
-                env: Default::default(),
-                ldflags: vec![],
+                ..Default::default()
             }),
         ))
     }
@@ -5536,7 +5531,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             vec![env_entry("GOEXPERIMENT", "rangefunc")],
         )];
         let env = pick_build_env(&states, "foo").unwrap();
-        assert_eq!(env.get("GOEXPERIMENT").map(String::as_str), Some("rangefunc"));
+        assert_eq!(
+            env.get("GOEXPERIMENT").map(String::as_str),
+            Some("rangefunc")
+        );
     }
 
     #[test]

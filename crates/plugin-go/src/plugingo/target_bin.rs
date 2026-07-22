@@ -209,8 +209,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         }
     }
 
@@ -417,9 +416,14 @@ mod tests {
             .expect("link line present")
             .to_string();
         // provider_state flags precede the addr-level ldflags factor.
-        let x_pos = link_line.find("-X main.version=9").expect("link.flags present");
+        let x_pos = link_line
+            .find("-X main.version=9")
+            .expect("link.flags present");
         let w_pos = link_line.find(" -w ").expect("ldflags factor present");
-        assert!(x_pos < w_pos, "link.flags precede ldflags factor: {link_line}");
+        assert!(
+            x_pos < w_pos,
+            "link.flags precede ldflags factor: {link_line}"
+        );
     }
 
     #[test]

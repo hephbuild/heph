@@ -689,8 +689,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let addr = encode_stdlib("fmt", &factors);
         assert_eq!(addr.package.as_str(), "@heph/go/std/fmt");
@@ -703,8 +702,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "", &factors);
         assert_eq!(
@@ -719,8 +717,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let addr = encode_thirdparty("github.com/foo/bar", "v1.0.0", "", "", &factors);
         assert_eq!(
@@ -735,8 +732,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "go", &factors);
         assert_eq!(
@@ -788,8 +784,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let addr = encode_thirdparty(
             "k8s.io/apimachinery",
@@ -820,8 +815,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
-            env: Default::default(),
-            ldflags: vec![],
+            ..Default::default()
         };
         let addr = encode_firstparty(&src, ws.path(), &factors);
         assert_eq!(addr.package.as_str(), "mylib");
