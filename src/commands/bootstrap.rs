@@ -134,8 +134,11 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
     // `oci_image`: builds a container image archive (OCI or docker format) from a
     // Dockerfile + build context into a cacheable target output, shelling out to
-    // host `docker buildx`.
+    // host `docker buildx`. `oci_push` / `oci_load` are non-cached actions that
+    // ship that archive to a registry (skopeo) / the local daemon (docker/skopeo).
     e.register_managed_driver(|_| Box::new(pluginoci::Driver::new()))?;
+    e.register_managed_driver(|_| Box::new(pluginoci::push::Driver::new()))?;
+    e.register_managed_driver(|_| Box::new(pluginoci::load::Driver::new()))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
@@ -300,6 +303,8 @@ mod tests {
         e.register_driver(|_| Box::new(plugintextfile::Driver))?;
         e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
         e.register_managed_driver(|_| Box::new(pluginoci::Driver::new()))?;
+        e.register_managed_driver(|_| Box::new(pluginoci::push::Driver::new()))?;
+        e.register_managed_driver(|_| Box::new(pluginoci::load::Driver::new()))?;
         e.register_managed_driver(|_| {
             Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
         })?;
