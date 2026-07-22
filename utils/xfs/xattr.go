@@ -12,6 +12,9 @@ import (
 // skip these so a generated file is never double-sourced.
 const CodegenXattr = "user.heph.codegen"
 
+// V0Xattr marks a file as written by the v0 tree layout. Value is always "1".
+const V0Xattr = "user.heph.v0"
+
 // SetXattr writes an extended attribute on path. Filesystems that do not support
 // xattrs (or any not-supported error) are treated as a no-op so trees on such
 // filesystems never break; other errors are returned.
