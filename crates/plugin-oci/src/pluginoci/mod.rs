@@ -41,6 +41,7 @@ use xxhash_rust::xxh3::Xxh3Default;
 pub const DRIVER_NAME: &str = "oci_image";
 
 pub mod load;
+pub mod pull;
 pub mod push;
 
 /// Archive format an image is built/consumed as.
