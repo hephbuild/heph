@@ -102,8 +102,20 @@ struct OciImageSpec {
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     target: Option<String>,
     /// Target platforms (`--platform`), e.g. `["linux/amd64", "linux/arm64"]`.
-    /// Empty builds for the host platform.
+    /// Empty builds for the host platform. Multi-platform builds need a
+    /// container-driver builder (`docker buildx create --driver docker-container`);
+    /// the default daemon builder only builds one platform.
     platforms: Vec<String>,
+    /// BuildKit build secrets, as raw `--secret` specs, e.g.
+    /// `["id=npmrc,src=.npmrc"]` or `["id=token,env=TOKEN"]`, consumed in the
+    /// Dockerfile via `RUN --mount=type=secret`. Hashed (they can change the
+    /// image). Secrets are not written into the image, but keep sensitive values
+    /// out of the ref by preferring `env=` sources.
+    secrets: Vec<String>,
+    /// SSH forwarding, as raw `--ssh` specs, e.g. `["default"]` or
+    /// `["id=github,src=/path/to/key"]`, consumed via `RUN --mount=type=ssh`.
+    /// Hashed.
+    ssh: Vec<String>,
     /// BuildKit `--cache-from` refs (registry or inline), e.g.
     /// `["type=registry,ref=reg/img:cache"]`. A build *optimization* — excluded
     /// from the input hash, so changing it never busts the heph cache.
@@ -132,6 +144,8 @@ struct OciImageDef {
     build_args: BTreeMap<String, String>,
     target: Option<String>,
     platforms: Vec<String>,
+    secrets: Vec<String>,
+    ssh: Vec<String>,
     /// Layer-cache sources — NOT hashed (build optimization only).
     cache_from: Vec<String>,
     /// Layer-cache destinations — NOT hashed.
@@ -151,6 +165,8 @@ impl Hash for OciImageDef {
         self.build_args.hash(state);
         self.target.hash(state);
         self.platforms.hash(state);
+        self.secrets.hash(state);
+        self.ssh.hash(state);
         // `cache_from` / `cache_to` are deliberately excluded: they are build
         // optimizations, not part of the image's identity.
     }
@@ -194,6 +210,14 @@ fn build_argv(
     for (k, v) in &def.build_args {
         argv.push("--build-arg".to_string());
         argv.push(format!("{k}={v}"));
+    }
+    for secret in &def.secrets {
+        argv.push("--secret".to_string());
+        argv.push(secret.clone());
+    }
+    for ssh in &def.ssh {
+        argv.push("--ssh".to_string());
+        argv.push(ssh.clone());
     }
     for from in &def.cache_from {
         argv.push("--cache-from".to_string());
@@ -311,6 +335,8 @@ impl ManagedDriver for Driver {
             build_args: spec.build_args.into_iter().collect(),
             target: spec.target,
             platforms: spec.platforms,
+            secrets: spec.secrets,
+            ssh: spec.ssh,
             cache_from: spec.cache_from,
             cache_to: spec.cache_to,
         };
@@ -542,6 +568,8 @@ mod tests {
             ]),
             target: Some("runtime".to_string()),
             platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
+            secrets: vec!["id=token,env=TOKEN".to_string()],
+            ssh: vec!["default".to_string()],
             cache_from: vec!["type=registry,ref=reg/app:cache".to_string()],
             cache_to: vec!["type=inline".to_string()],
         };
@@ -565,6 +593,8 @@ mod tests {
         let a = argv.iter().position(|x| x == "A=1").unwrap();
         let b = argv.iter().position(|x| x == "B=2").unwrap();
         assert!(a < b, "build args must be sorted: {argv:?}");
+        assert!(joined.contains("--secret id=token,env=TOKEN"), "{joined}");
+        assert!(joined.contains("--ssh default"), "{joined}");
         assert!(joined.contains("--cache-from type=registry,ref=reg/app:cache"));
         assert!(joined.contains("--cache-to type=inline"));
         // Context dir is the last arg.
@@ -581,6 +611,8 @@ mod tests {
             build_args: BTreeMap::new(),
             target: None,
             platforms: vec![],
+            secrets: vec![],
+            ssh: vec![],
             cache_from: vec![],
             cache_to: vec![],
         };
