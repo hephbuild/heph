@@ -139,6 +139,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     e.register_managed_driver(|_| Box::new(pluginoci::Driver::new()))?;
     e.register_managed_driver(|_| Box::new(pluginoci::push::Driver::new()))?;
     e.register_managed_driver(|_| Box::new(pluginoci::load::Driver::new()))?;
+    e.register_managed_driver(|_| Box::new(pluginoci::pull::Driver::new()))?;
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
@@ -305,6 +306,7 @@ mod tests {
         e.register_managed_driver(|_| Box::new(pluginoci::Driver::new()))?;
         e.register_managed_driver(|_| Box::new(pluginoci::push::Driver::new()))?;
         e.register_managed_driver(|_| Box::new(pluginoci::load::Driver::new()))?;
+        e.register_managed_driver(|_| Box::new(pluginoci::pull::Driver::new()))?;
         e.register_managed_driver(|_| {
             Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
         })?;
