@@ -321,24 +321,15 @@ impl ManagedDriver for GoCompileDriver {
         let pkg_dir = &req.sandbox_pkg_dir;
         let ws_root = req.sandbox_ws_dir.to_string_lossy().into_owned();
 
-        // GOROOT / go binary: hermetic staged SDK or host (mirrors go_golist).
-        let host = crate::plugingo::toolchain::is_host(&def.go_version);
-        let (goroot, go_bin) = if host {
-            let go_bin = crate::plugingo::toolchain::resolve_host_go()?;
-            let goroot = crate::plugingo::toolchain::host_goroot(&go_bin)?;
-            (goroot, go_bin)
-        } else {
-            let goroot = req
-                .sandbox_ws_dir
-                .join(crate::plugingo::toolchain::staged_goroot(&def.go_version));
-            let go_bin = goroot.join("bin").join("go");
-            if !go_bin.exists() {
-                anyhow::bail!(
-                    "go_compile: hermetic go binary missing at {go_bin:?} (gosdk dep not staged?)"
-                );
-            }
-            (goroot, go_bin)
-        };
+        // GOROOT / go binary for the selected toolchain — host, target-ref, or
+        // hermetic staged SDK (mirrors go_golist, see `resolve_toolchain_go`).
+        use crate::plugingo::toolchain::Toolchain;
+        let (goroot, go_bin) = crate::plugingo::toolchain::resolve_toolchain_go(
+            &def.go_version,
+            &req.inputs,
+            &req.sandbox_ws_dir,
+            "go_compile",
+        )?;
 
         let gocache = pkg_dir.join(".heph-gocache");
         std::fs::create_dir_all(&gocache)
@@ -355,7 +346,13 @@ impl ManagedDriver for GoCompileDriver {
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
         env.insert("CGO_ENABLED".to_string(), "0".to_string());
-        if host && let Ok(v) = std::env::var("PATH") {
+        // Non-hermetic toolchains (host, or a hostbin/nix target wrapper) may need
+        // PATH; hermetic mode omits it to stay PATH-independent.
+        if !matches!(
+            crate::plugingo::toolchain::classify(&def.go_version),
+            Toolchain::Hermetic(_)
+        ) && let Ok(v) = std::env::var("PATH")
+        {
             env.insert("PATH".to_string(), v);
         }
 

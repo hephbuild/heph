@@ -240,26 +240,15 @@ impl ManagedDriver for GoGolistDriver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<GoGolistDef>();
 
-        // GOROOT and the `go` binary come from either the hermetic SDK staged
-        // into this sandbox by the `gosdk` dep, or — when the provider selects
-        // `gotool = "host"` — the host `go` resolved from this process's PATH.
-        let host = crate::plugingo::toolchain::is_host(&def.go_version);
-        let (goroot, go_bin) = if host {
-            let go_bin = crate::plugingo::toolchain::resolve_host_go()?;
-            let goroot = crate::plugingo::toolchain::host_goroot(&go_bin)?;
-            (goroot, go_bin)
-        } else {
-            let goroot = req
-                .sandbox_ws_dir
-                .join(crate::plugingo::toolchain::staged_goroot(&def.go_version));
-            let go_bin = goroot.join("bin").join("go");
-            if !go_bin.exists() {
-                anyhow::bail!(
-                    "go_golist: hermetic go binary missing at {go_bin:?} (gosdk dep not staged?)"
-                );
-            }
-            (goroot, go_bin)
-        };
+        // GOROOT and the `go` binary depend on the selected toolchain (host,
+        // target-ref, or hermetic) — see [`toolchain::resolve_toolchain_go`].
+        use crate::plugingo::toolchain::Toolchain;
+        let (goroot, go_bin) = crate::plugingo::toolchain::resolve_toolchain_go(
+            &def.go_version,
+            &req.inputs,
+            &req.sandbox_ws_dir,
+            "go_golist",
+        )?;
         // Sandbox-local build cache so `go list` neither reads nor writes the
         // host GOCACHE.
         let gocache = req.sandbox_pkg_dir.join(".heph-gocache");
@@ -301,10 +290,14 @@ impl ManagedDriver for GoGolistDriver {
                 env.insert(name.to_string(), v);
             }
         }
-        // Host toolchain: the `go` subprocess may need PATH (e.g. to locate
-        // ancillary tools). Hermetic mode deliberately omits it to stay
-        // PATH-independent.
-        if host && let Ok(v) = std::env::var("PATH") {
+        // Non-hermetic toolchains: the `go` subprocess (or a hostbin/nix wrapper)
+        // may need PATH — to locate ancillary tools, or for the wrapper itself.
+        // Hermetic mode deliberately omits it to stay PATH-independent.
+        if !matches!(
+            crate::plugingo::toolchain::classify(&def.go_version),
+            Toolchain::Hermetic(_)
+        ) && let Ok(v) = std::env::var("PATH")
+        {
             env.insert("PATH".to_string(), v);
         }
 

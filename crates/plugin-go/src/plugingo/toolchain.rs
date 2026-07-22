@@ -13,6 +13,15 @@
 //! (resolved from `PATH` / `go env GOROOT` inside the sandbox): no SDK target,
 //! no `gosdk` dep, host env passed through. Non-hermetic by construction.
 //!
+//! With `gotool = "//pkg:go"` ([`is_target_ref`]) the toolchain comes from
+//! another *target* — e.g. `//@heph/bin:go` (host `go` exposed by the hostbin
+//! provider) or a `//some/pkg:go` built by the nix driver. The build deps that
+//! target in the `gosdk` group exactly like the hermetic SDK, but its staged
+//! path is not known ahead of time, so `go`/`GOROOT` are resolved from the
+//! staged output at runtime (auto-detecting a GOROOT directory vs. a bare `go`
+//! binary; see [`addr_util::go_goroot_prelude`] and the golist driver). How
+//! hermetic the result is then depends entirely on what that target produces.
+//!
 //! The SDK is one cacheable output (the full tree: `go` + `pkg/tool` + `lib` +
 //! `src` + version/env metadata; `api/test/doc/misc` excluded — nothing reads
 //! them). Consumers don't copy it: it is staged read-only once and exposed to
@@ -30,7 +39,9 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
-use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::driver_managed::{
+    ManagedDriver, ManagedRunInput, ManagedRunRequest, ManagedRunResponse,
+};
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
@@ -66,6 +77,43 @@ pub const HOST: &str = "host";
 /// Whether `spec` selects the host toolchain (vs. a hermetic pinned version).
 pub fn is_host(spec: &str) -> bool {
     spec == HOST
+}
+
+/// Whether `spec` selects a **target** toolchain: an explicit target address
+/// providing the `go` toolchain, distinguished by a leading `//`. Examples:
+/// `//@heph/bin:go` (host `go` exposed by the hostbin provider) or
+/// `//some/pkg:go` (a `go` built by the nix driver). The build deps that target
+/// in the `gosdk` group, stages its single output, and resolves `go`/`GOROOT`
+/// from it at runtime — auto-detecting a full GOROOT tree (a directory whose
+/// `bin/go` is used) vs. a bare `go` binary (a file), with `GOROOT` taken from
+/// whatever that `go` reports.
+pub fn is_target_ref(spec: &str) -> bool {
+    spec.starts_with("//")
+}
+
+/// The three ways the required `gotool` provider option selects the toolchain.
+/// Threaded everywhere as the `go_version` string; classify with [`classify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toolchain<'a> {
+    /// `gotool = "host"` — host `go` resolved from `PATH` / `go env GOROOT`.
+    Host,
+    /// `gotool = "//pkg:go"` — a target producing the toolchain (hostbin, nix, …).
+    Target(&'a str),
+    /// `gotool = "1.26.4"` — a pinned hermetic SDK downloaded from go.dev.
+    Hermetic(&'a str),
+}
+
+/// Classify a `gotool` value into the toolchain it selects. `"host"` →
+/// [`Toolchain::Host`]; anything starting with `//` → [`Toolchain::Target`];
+/// everything else is taken as a pinned hermetic version.
+pub fn classify(spec: &str) -> Toolchain<'_> {
+    if is_host(spec) {
+        Toolchain::Host
+    } else if is_target_ref(spec) {
+        Toolchain::Target(spec)
+    } else {
+        Toolchain::Hermetic(spec)
+    }
 }
 
 /// Base provider package for the hermetic toolchain. The concrete target lives
@@ -196,6 +244,90 @@ pub(crate) fn host_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path:
         anyhow::bail!("`{go_bin:?} env GOROOT` returned empty");
     }
     Ok(std::path::PathBuf::from(goroot))
+}
+
+/// Resolve the `go` binary from a target-ref toolchain (`gotool = "//pkg:go"`)
+/// staged into this sandbox via the `gosdk` dep. The dep's output is either a
+/// full GOROOT tree (we pick its `bin/go`) or a single `go` binary (a hostbin or
+/// nix wrapper); when both shapes appear, prefer a `.../bin/go`.
+pub(crate) fn resolve_target_go(inputs: &[ManagedRunInput]) -> anyhow::Result<std::path::PathBuf> {
+    let prefix = format!("dep|{}|", crate::plugingo::addr_util::GO_SDK_DEP_GROUP);
+    let gosdk = inputs
+        .iter()
+        .find(|m| m.input.origin_id.starts_with(&prefix))
+        .context("go toolchain: target `gosdk` dep not staged")?;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for entry in gosdk
+        .input
+        .artifact
+        .content
+        .as_ref()
+        .walk()
+        .context("walk target toolchain output")?
+    {
+        let entry = entry.context("read target toolchain entry")?;
+        if entry.path.file_name().and_then(|n| n.to_str()) == Some("go") {
+            candidates.push(gosdk.unpack_root.join(&entry.path));
+        }
+    }
+
+    pick_go_binary(candidates).context("go toolchain: no `go` binary in target toolchain output")
+}
+
+/// Pick the `go` binary among the toolchain output's `go`-named entries,
+/// preferring a `.../bin/go` (a full GOROOT tree) over a bare `go` wrapper
+/// (hostbin/nix). Returns `None` when no candidate is present.
+pub(crate) fn pick_go_binary(
+    mut candidates: Vec<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    // `false` (parent is `bin`) sorts before `true`. Stable so ties keep input order.
+    candidates.sort_by_key(|p| {
+        p.parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            != Some("bin")
+    });
+    candidates.into_iter().next()
+}
+
+/// Resolve `(GOROOT, go binary)` for the toolchain selected by `version`, shared
+/// by every driver that runs a `go` subprocess (`go_golist`, `go_compile`, …):
+/// - **Host** (`gotool = "host"`): host `go` from `PATH`; GOROOT is what it reports.
+/// - **Target** (`gotool = "//pkg:go"`): the `go` staged by the `gosdk` dep at a
+///   path discovered from the dep's output; GOROOT is what it reports.
+/// - **Hermetic** (`gotool = "1.26.4"`): the SDK staged at the deterministic
+///   `staged_goroot` path under `sandbox_ws_dir`.
+///
+/// `driver` names the caller for the hermetic "not staged" error message.
+pub(crate) fn resolve_toolchain_go(
+    version: &str,
+    inputs: &[ManagedRunInput],
+    sandbox_ws_dir: &std::path::Path,
+    driver: &str,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    match classify(version) {
+        Toolchain::Host => {
+            let go_bin = resolve_host_go()?;
+            let goroot = host_goroot(&go_bin)?;
+            Ok((goroot, go_bin))
+        }
+        Toolchain::Target(_) => {
+            let go_bin = resolve_target_go(inputs)?;
+            let goroot = host_goroot(&go_bin)?;
+            Ok((goroot, go_bin))
+        }
+        Toolchain::Hermetic(v) => {
+            let goroot = sandbox_ws_dir.join(staged_goroot(v));
+            let go_bin = goroot.join("bin").join("go");
+            if !go_bin.exists() {
+                anyhow::bail!(
+                    "{driver}: hermetic go binary missing at {go_bin:?} (gosdk dep not staged?)"
+                );
+            }
+            Ok((goroot, go_bin))
+        }
+    }
 }
 
 /// Build the `TargetSpec` for the toolchain download target for `version`.
@@ -519,6 +651,44 @@ mod tests {
         // Not a toolchain package, or nested.
         assert_eq!(version_from_pkg("mylib"), None);
         assert_eq!(version_from_pkg("@heph/go/toolchain/1.26.4/extra"), None);
+    }
+
+    #[test]
+    fn test_classify_distinguishes_host_target_hermetic() {
+        assert_eq!(classify("host"), Toolchain::Host);
+        assert_eq!(classify("1.26.4"), Toolchain::Hermetic("1.26.4"));
+        assert_eq!(
+            classify("//@heph/bin:go"),
+            Toolchain::Target("//@heph/bin:go")
+        );
+        assert_eq!(
+            classify("//some/pkg:go"),
+            Toolchain::Target("//some/pkg:go")
+        );
+        // A bare version is never mistaken for a target ref.
+        assert!(!is_target_ref("1.26.4"));
+        assert!(!is_target_ref("host"));
+        assert!(is_target_ref("//@heph/bin:go"));
+    }
+
+    #[test]
+    fn test_pick_go_binary_prefers_goroot_tree_bin_go() {
+        use std::path::PathBuf;
+        // hostbin wrapper only → use it.
+        assert_eq!(
+            pick_go_binary(vec![PathBuf::from("__heph/hostbin/go")]),
+            Some(PathBuf::from("__heph/hostbin/go"))
+        );
+        // Both a wrapper and a full tree → prefer the tree's bin/go.
+        assert_eq!(
+            pick_go_binary(vec![
+                PathBuf::from("ws/wrap/go"),
+                PathBuf::from("ws/sdk/go/bin/go"),
+            ]),
+            Some(PathBuf::from("ws/sdk/go/bin/go"))
+        );
+        // No candidates → None.
+        assert_eq!(pick_go_binary(vec![]), None);
     }
 
     #[test]
