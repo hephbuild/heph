@@ -178,9 +178,15 @@ pub fn build_test_spec(
 ) -> TargetSpec {
     let mut script = go_run_prelude(go_version);
     script.extend(write_importcfg_script(all_libs, None));
-    script.push(
-        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"".to_string(),
-    );
+    // Variant ldflags inserted verbatim before `-o`.
+    let ldflags = if factors.ldflags.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", factors.ldflags.join(" "))
+    };
+    script.push(format!(
+        "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode=pie{ldflags} -o test_binary \"$SRC_TESTMAIN\""
+    ));
 
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
     deps.insert(
@@ -211,13 +217,14 @@ pub fn build_test_spec(
             Value::List(vec![Value::String("test_binary".to_string())]),
         )])),
     );
-    config.insert(
-        "runtime_env".to_string(),
-        Value::Map(HashMap::from([
-            ("GOOS".to_string(), Value::String(factors.goos.clone())),
-            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-        ])),
-    );
+    let mut runtime_env = HashMap::from([
+        ("GOOS".to_string(), Value::String(factors.goos.clone())),
+        ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
+    ]);
+    if let Some(exp) = factors.goexperiment_env() {
+        runtime_env.insert("GOEXPERIMENT".to_string(), Value::String(exp));
+    }
+    config.insert("runtime_env".to_string(), Value::Map(runtime_env));
     // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
     config.insert("env".to_string(), go_build_env());
@@ -360,6 +367,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            ..Default::default()
         }
     }
 

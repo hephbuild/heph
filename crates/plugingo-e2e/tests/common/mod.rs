@@ -97,6 +97,101 @@ fn sdk_checksums_for(gotool: &str) -> std::collections::HashMap<String, String> 
         .collect()
 }
 
+/// A minimal provider that injects the Go build *variants* every e2e workspace
+/// needs, without editing each fixture's BUILD file. Its `probe` returns, for the
+/// root package, a `provider="go"` state declaring two variants:
+///   - `host`: the build host's own GOOS/GOARCH (the default the suite uses),
+///   - `linux_amd64`: pinned linux/amd64 (for the build-tag cross-compile tests).
+/// Every other endpoint is empty — targets/packages come from the real providers.
+struct VariantInjector;
+
+impl VariantInjector {
+    fn variants_state() -> hplugin::provider::State {
+        use hcore::htvalue::Value;
+        let variant = |goos: &str, goarch: &str| {
+            Value::Map(std::collections::HashMap::from([
+                ("goos".to_string(), Value::String(goos.to_string())),
+                ("goarch".to_string(), Value::String(goarch.to_string())),
+            ]))
+        };
+        let variants = Value::Map(std::collections::HashMap::from([
+            (
+                "host".to_string(),
+                variant(hcore::htplatform::os(), hcore::htplatform::arch()),
+            ),
+            ("linux_amd64".to_string(), variant("linux", "amd64")),
+        ]));
+        hplugin::provider::State {
+            package: hmodel::htpkg::PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: std::collections::HashMap::from([("variants".to_string(), variants)]),
+        }
+    }
+}
+
+impl hplugin::provider::Provider for VariantInjector {
+    fn config(
+        &self,
+        _req: hplugin::provider::ConfigRequest,
+    ) -> anyhow::Result<hplugin::provider::ConfigResponse> {
+        Ok(hplugin::provider::ConfigResponse {
+            name: "go-variant-injector".to_string(),
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        _req: hplugin::provider::ListRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<hplugin::provider::ListResponse>> + Send>,
+        >,
+    > {
+        Box::pin(async move { Ok(Box::new(std::iter::empty()) as Box<_>) })
+    }
+
+    fn list_packages<'a>(
+        &'a self,
+        _req: hplugin::provider::ListPackagesRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<hplugin::provider::ListPackageResponse>> + Send>,
+        >,
+    > {
+        Box::pin(async move { Ok(Box::new(std::iter::empty()) as Box<_>) })
+    }
+
+    fn get<'a>(
+        &'a self,
+        _req: hplugin::provider::GetRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<hplugin::provider::GetResponse, hplugin::provider::GetError>,
+    > {
+        Box::pin(async move { Err(hplugin::provider::GetError::NotFound) })
+    }
+
+    fn probe<'a>(
+        &'a self,
+        req: hplugin::provider::ProbeRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<hplugin::provider::ProbeResponse>> {
+        Box::pin(async move {
+            let states = if req.package.as_str().is_empty() {
+                vec![Self::variants_state()]
+            } else {
+                vec![]
+            };
+            Ok(hplugin::provider::ProbeResponse { states })
+        })
+    }
+}
+
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
 }
@@ -150,6 +245,10 @@ fn make_workspace_ordered(
     let go_bin = go_bin_path();
     // `fs` is auto-registered by `Engine::new`.
     let mut b = WorkspaceBuilder::from_dir(dir).with_fs_skip(fs_skip.iter().copied());
+
+    // Inject the Go build variants (`host`, `linux_amd64`) every fixture builds
+    // against, so targets resolve `@v=…` without each BUILD declaring them.
+    b = b.with_provider(|_| Box::new(VariantInjector));
 
     if go_first {
         let gotool = gotool.clone();

@@ -4,7 +4,7 @@
 use crate::abi::{
     DynArtifact, DynExecutor, DynFunctionRegistry, DynLogSink, DynRead, DynSupervisor,
     NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
-    StableFunctionRegistry, StableLogSink, StableRead, StableSupervisor,
+    StableFunctionRegistry, StableLogSink, StableRead, StableSupervisor, StatesOutcome,
 };
 use crate::vtable::dynify;
 use hcore::hartifactcontent::Content;
@@ -341,6 +341,27 @@ impl StableExecutor for HostExecutor {
                     ok: false,
                     message: e.to_string().into(),
                     addrs: SVec::new(),
+                },
+            }
+        }))
+    }
+
+    extern "C" fn states<'a>(&'a self, pkg: SString) -> DynFuture<'a, StatesOutcome> {
+        dynify(stabby::boxed::Box::new(async move {
+            let pkg = PkgBuf::from(pkg.to_string());
+            match self.inner.states(&pkg).await {
+                Ok(states) => StatesOutcome {
+                    ok: true,
+                    message: SString::new(),
+                    states: states
+                        .iter()
+                        .map(|s| SVec::from(convert::state_to_pb(s).encode_to_vec().as_slice()))
+                        .collect(),
+                },
+                Err(e) => StatesOutcome {
+                    ok: false,
+                    message: e.to_string().into(),
+                    states: SVec::new(),
                 },
             }
         }))

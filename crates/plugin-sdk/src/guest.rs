@@ -7,8 +7,9 @@ use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
+use hmodel::htpkg::PkgBuf;
 use hplugin::eresult::{ArtifactMeta, EResult};
-use hplugin::provider::ProviderExecutor;
+use hplugin::provider::{ProviderExecutor, State};
 use hplugin_stabby::abi::{
     DynArtifact, DynExecutor, DynRead, StableAddr, StableArtifactContentDyn, StableExecutorDyn,
     StableReadDyn,
@@ -108,6 +109,23 @@ impl ProviderExecutor for GuestExecutor {
                 let mut out = Vec::with_capacity(r.addrs.len());
                 for a in r.addrs.iter() {
                     out.push(hmodel::htaddr::parse_addr(a)?);
+                }
+                Ok(out)
+            } else {
+                anyhow::bail!("{}", r.message)
+            }
+        })
+    }
+
+    fn states<'a>(&'a self, pkg: &'a PkgBuf) -> BoxFuture<'a, Result<Vec<State>>> {
+        Box::pin(async move {
+            let r = self.exec.states(pkg.as_str().into()).await;
+            if r.ok {
+                let mut out = Vec::with_capacity(r.states.len());
+                for b in r.states.iter() {
+                    let pb = plugin_abi::pb::State::decode(&b[..])
+                        .context("decoding pb::State from host states callback")?;
+                    out.push(plugin_abi::convert::state_from_pb(pb));
                 }
                 Ok(out)
             } else {

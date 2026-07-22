@@ -100,6 +100,13 @@ struct GoLintSpec {
     /// Go release whose semantics drive the analysis (cfg `GoVersion`).
     #[spec(required)]
     go_version: String,
+    /// Variant build tags (affect which files are analyzed).
+    build_tags: Vec<String>,
+    /// Variant `GOEXPERIMENT` values (sorted).
+    goexperiment: Vec<String>,
+    /// Variant `CGO_ENABLED` (`"0"`/`"1"`).
+    #[spec(required)]
+    cgo_enabled: String,
     /// Import paths of the transitive libs, deterministic order — each maps to a
     /// `lib_<sanitized>` dep group (archive, for type info) and, when the dep is
     /// itself linted, a `facts_<sanitized>` group (its serialized facts).
@@ -116,6 +123,9 @@ struct GoLintDef {
     goos: String,
     goarch: String,
     go_version: String,
+    build_tags: Vec<String>,
+    goexperiment: Vec<String>,
+    cgo_enabled: String,
     import_paths: Vec<String>,
 }
 
@@ -131,6 +141,9 @@ impl Hash for GoLintDef {
         self.goos.hash(state);
         self.goarch.hash(state);
         self.go_version.hash(state);
+        self.build_tags.hash(state);
+        self.goexperiment.hash(state);
+        self.cgo_enabled.hash(state);
         // Order-invariant, exactly as `go_compile` does: the closure walk dedups
         // through a per-process-randomized HashSet, so hash a sorted view or the
         // cache key flips every run.
@@ -234,6 +247,9 @@ impl ManagedDriver for GoLintDriver {
             goos: spec.goos,
             goarch: spec.goarch,
             go_version: spec.go_version,
+            build_tags: spec.build_tags,
+            goexperiment: spec.goexperiment,
+            cgo_enabled: spec.cgo_enabled,
             import_paths: spec.import_paths,
         };
 
@@ -1169,6 +1185,34 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
         "go_version".to_string(),
         Value::String(p.go_version.to_string()),
     );
+    if !p.factors.build_tags.is_empty() {
+        config.insert(
+            "build_tags".to_string(),
+            Value::List(
+                p.factors
+                    .build_tags
+                    .iter()
+                    .map(|t| Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !p.factors.goexperiment.is_empty() {
+        config.insert(
+            "goexperiment".to_string(),
+            Value::List(
+                p.factors
+                    .goexperiment
+                    .iter()
+                    .map(|t| Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    config.insert(
+        "cgo_enabled".to_string(),
+        Value::String(p.factors.cgo_enabled_env().to_string()),
+    );
     config.insert("import_paths".to_string(), Value::List(import_paths));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
     config.insert(
@@ -1308,6 +1352,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            ..Default::default()
         }
     }
 

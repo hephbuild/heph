@@ -94,6 +94,17 @@ pub struct QueryOutcome {
     pub addrs: SVec<SString>,
 }
 
+/// Outcome of a `states` call. `State` has no canonical string form, so each
+/// state crosses as prost-encoded `pb::State` bytes — mirroring how `query`'s
+/// matcher crosses as `SVec<u8>`.
+#[stabby::stabby]
+pub struct StatesOutcome {
+    pub ok: bool,
+    pub message: SString,
+    /// Each entry is a prost-encoded `pb::State`.
+    pub states: SVec<SVec<u8>>,
+}
+
 /// The host callback surface, called by the plugin while serving `get`/`parse`.
 /// Mirrors `hplugin::provider::ProviderExecutor`. Implemented host-side over the
 /// real engine executor ([`crate::host`]); consumed guest-side wrapped back into
@@ -114,6 +125,9 @@ pub trait StableExecutor {
         matcher_pb: SVec<u8>,
         extra_skip: SVec<SString>,
     ) -> DynFuture<'a, QueryOutcome>;
+    /// Fetch provider states for `pkg` and its ancestry (config lookup; no dep
+    /// edge). `pkg` is the package path string.
+    extern "C" fn states<'a>(&'a self, pkg: SString) -> DynFuture<'a, StatesOutcome>;
 }
 
 /// An owned, ABI-stable handle to a host executor — what the host passes into the

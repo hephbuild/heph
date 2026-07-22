@@ -120,6 +120,25 @@ pub trait ProviderExecutor: Send + Sync {
     fn note_dep<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move { self.result(addr).await.map(|_| ()) })
     }
+
+    /// Fetch the provider states declared for `pkg` and its package ancestry
+    /// (every `provider_state` up the tree, all providers), backed by the
+    /// engine's memoized `probe_segments` — repeated calls for the same package
+    /// are near-free.
+    ///
+    /// Unlike `result`/`query`, this registers **no** `DepDag` edge: states are
+    /// build *configuration*, not a build dependency, so reading them must not
+    /// couple the caller into a cycle. Used by a provider that must resolve
+    /// config declared in a package outside the target's own ancestry — e.g. the
+    /// go plugin resolving a variant pinned by a `vp` addr arg to a sibling
+    /// subtree, whose defining `provider_state` is absent from `GetRequest.states`
+    /// (which the engine gathers only along the target package's ancestry).
+    ///
+    /// Default returns empty — real executors (engine, cdylib guest) override it;
+    /// test mocks that never resolve a foreign-subtree variant can keep the default.
+    fn states<'a>(&'a self, _pkg: &'a PkgBuf) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
 }
 
 /// The [`ProviderExecutor`] callback surface, addressed by request scope id

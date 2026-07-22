@@ -58,12 +58,17 @@ pub fn build_spec(
         .unwrap_or(import_path)
         .to_string();
 
+    // Link flags = the variant's ldflags first, then any per-package `link`
+    // provider_state flags (so a package can append/override).
+    let mut link_flags = factors.ldflags.clone();
+    link_flags.extend(link.flags.iter().cloned());
+
     let mut run = go_run_prelude(go_version);
     run.extend(generate_link_script(
         import_path,
         &binary_name,
         transitive_libs,
-        &link.flags,
+        &link_flags,
     ));
 
     let mut deps: BTreeMap<String, Value> = transitive_libs
@@ -124,13 +129,14 @@ pub fn build_spec(
             Value::List(vec![Value::String(binary_name)]),
         )])),
     );
-    config.insert(
-        "runtime_env".to_string(),
-        Value::Map(HashMap::from([
-            ("GOOS".to_string(), Value::String(factors.goos.clone())),
-            ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-        ])),
-    );
+    let mut runtime_env = HashMap::from([
+        ("GOOS".to_string(), Value::String(factors.goos.clone())),
+        ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
+    ]);
+    if let Some(exp) = factors.goexperiment_env() {
+        runtime_env.insert("GOEXPERIMENT".to_string(), Value::String(exp));
+    }
+    config.insert("runtime_env".to_string(), Value::Map(runtime_env));
     // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
     // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
     config.insert("env".to_string(), go_build_env());
@@ -197,6 +203,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            ..Default::default()
         }
     }
 

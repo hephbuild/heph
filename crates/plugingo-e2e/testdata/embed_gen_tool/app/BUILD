@@ -9,7 +9,7 @@ target(
         "$TOOL_GEN > $OUT",
     ],
     out = "openapi/openapi_gen.yaml",
-    tools = {"gen": ["//tool:build"]},
+    tools = {"gen": ["//tool:build@v=host"]},
     labels = ["go_embed_src"],
     codegen = "copy",
 )

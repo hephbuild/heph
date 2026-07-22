@@ -8,7 +8,7 @@ async fn test_simple_lib_build_lib() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("simple_lib")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "build_lib should produce at least one artifact"
@@ -26,7 +26,7 @@ async fn test_embed_build_lib_compiles_with_embedcfg() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("with_embed")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "embedding build_lib should compile and produce an archive"
@@ -43,7 +43,7 @@ async fn test_embed_subdir_build_lib_compiles_with_embedcfg() -> anyhow::Result<
     require_go!();
     let dir = fixture("with_embed_subdir")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "subdir-embedding build_lib should compile and produce an archive"
@@ -58,7 +58,7 @@ async fn test_embed_nested_pkg_build_lib_compiles_with_embedcfg() -> anyhow::Res
     require_go!();
     let dir = fixture("with_embed_nested")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//app:build_lib").await?;
+    let result = ws.run("//app:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "nested-package subdir-embedding build_lib should compile"
@@ -75,7 +75,7 @@ async fn test_embed_buildtagged_file_compiles_with_embedcfg() -> anyhow::Result<
     require_go!();
     let dir = fixture("with_embed_buildtag")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//app:build_lib@goarch=amd64,goos=linux").await?;
+    let result = ws.run("//app:build_lib@v=linux_amd64").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "build-tagged embedding build_lib should compile for goos=linux"
@@ -92,7 +92,7 @@ async fn test_embed_group_go_embed_src_compiles() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("with_embed_group")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "go_embed_src group embedding build_lib should compile"
@@ -110,7 +110,7 @@ async fn test_embed_generated_go_embed_src_compiles() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("with_embed_gen")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "generated go_embed_src embedding build_lib should compile"
@@ -126,9 +126,7 @@ async fn test_embed_buildtagged_build_test_lib_compiles() -> anyhow::Result<()> 
     require_go!();
     let dir = fixture("with_embed_buildtag")?;
     let ws = make_workspace(dir)?;
-    let result = ws
-        .run("//app:build_test_lib@goarch=amd64,goos=linux")
-        .await?;
+    let result = ws.run("//app:build_test_lib@v=linux_amd64").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "build-tagged build_test_lib should compile for goos=linux"
@@ -141,7 +139,7 @@ async fn test_with_dep_cmd_build() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("with_dep")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//cmd:build").await?;
+    let result = ws.run("//cmd:build@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "cmd build should produce at least one artifact"
@@ -161,7 +159,7 @@ async fn test_thirdparty_asm_build_lib_compiles() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("thirdparty_asm")?;
     let ws = make_workspace(dir)?;
-    let lib = "//@heph/go/thirdparty/github.com/klauspost/cpuid/v2@v2.2.5:build_lib";
+    let lib = "//@heph/go/thirdparty/github.com/klauspost/cpuid/v2@v2.2.5:build_lib@v=host";
     match ws.run(lib).await {
         Ok(result) => {
             assert!(
@@ -195,7 +193,7 @@ async fn test_with_dep_cmd_build_host_toolchain() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("with_dep")?;
     let ws = make_workspace_host(dir)?;
-    let result = ws.run("//cmd:build").await?;
+    let result = ws.run("//cmd:build@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "host-toolchain cmd build should produce at least one artifact"
@@ -212,7 +210,7 @@ async fn test_embed_mixed_go_src_and_go_embed_src_compiles() -> anyhow::Result<(
     require_go!();
     let dir = fixture("with_embed_mixed")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "mixed go_src + go_embed_src embedding build_lib should compile"
@@ -225,7 +223,7 @@ async fn test_embed_mixed_build_testmain_lib() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("with_embed_mixed")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build_testmain_lib").await?;
+    let result = ws.run("//:build_testmain_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "testmain_lib should compile"
@@ -248,7 +246,7 @@ async fn test_embed_generated_by_in_tree_tool_resolves_deterministically() -> an
     for attempt in 0..2 {
         let ws = make_workspace_host(fixture("embed_gen_tool")?)?;
         let result = ws
-            .run("//app:build_lib")
+            .run("//app:build_lib@v=host")
             .await
             .with_context(|| format!("attempt {attempt}"))?;
         assert!(
@@ -273,7 +271,7 @@ async fn test_embed_generated_by_in_tree_tool_resolves_deterministically() -> an
 async fn test_embed_generated_in_subpackage_of_the_embedder() -> anyhow::Result<()> {
     require_go!();
     let ws = make_workspace_host(fixture("embed_gen_subpkg")?)?;
-    let result = ws.run("//app:build_lib").await?;
+    let result = ws.run("//app:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "build_lib embedding a sub-package's generated asset must compile"

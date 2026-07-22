@@ -82,6 +82,22 @@ impl ProviderExecutor for EngineProviderExecutor {
         Box::pin(async move { self.rs.track_dep(addr).map_err(anyhow::Error::new) })
     }
 
+    fn states<'a>(
+        &'a self,
+        pkg: &'a PkgBuf,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<State>>> {
+        Box::pin(async move {
+            let engine = self
+                .engine
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
+            // Memoized per-package walk of the ancestry; registers no DepDag edge
+            // (states are config, not a build dependency).
+            let states = Arc::clone(&engine).probe_segments(&self.rs, pkg).await?;
+            Ok(states.as_ref().clone())
+        })
+    }
+
     fn query<'a>(
         &'a self,
         m: &'a Matcher,

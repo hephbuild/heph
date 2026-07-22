@@ -3975,8 +3975,11 @@ name = "plugingo-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core",
  "futures",
  "heph",
+ "model",
+ "plugin",
  "plugin-go",
  "tempfile",
  "testkit",

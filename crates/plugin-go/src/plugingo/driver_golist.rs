@@ -43,6 +43,12 @@ struct GoGolistSpec {
     go_version: String,
     /// Go build tags.
     build_tags: Vec<String>,
+    /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
+    goexperiment: Vec<String>,
+    /// `CGO_ENABLED` from the variant (`"0"`/`"1"`). Affects `go list` file
+    /// selection (cgo files).
+    #[spec(required)]
+    cgo_enabled: String,
     /// For thirdparty packages: the `download` target whose filtered outputs are
     /// staged into consumers' sandboxes.
     #[spec(ty = ParamType::String)]
@@ -72,6 +78,8 @@ struct GoGolistDef {
     goarch: String,
     go_version: String,
     build_tags: Vec<String>,
+    goexperiment: Vec<String>,
+    cgo_enabled: String,
     dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
     /// will be staged into consumers' sandboxes. Threaded through so
@@ -87,7 +95,7 @@ struct GoGolistDef {
 /// `go_compile`; cached `_golist` artifacts from intermediate builds of that
 /// work could carry empty `EmbedFiles` for a now-resolvable embed, surfacing as
 /// `compute embedcfg: //go:embed pattern(s) matched no files` until evicted.
-const GO_GOLIST_FORMAT_VERSION: u32 = 15;
+const GO_GOLIST_FORMAT_VERSION: u32 = 16;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -97,6 +105,8 @@ impl Hash for GoGolistDef {
         self.goarch.hash(state);
         self.go_version.hash(state);
         self.build_tags.hash(state);
+        self.goexperiment.hash(state);
+        self.cgo_enabled.hash(state);
         self.dep_inputs.hash(state);
         self.thirdparty_download_addr.hash(state);
         // The hermetic SDK arrives via dep_inputs (group `gosdk`); the engine
@@ -171,6 +181,8 @@ impl ManagedDriver for GoGolistDriver {
             goarch: spec.goarch,
             go_version: spec.go_version,
             build_tags: spec.build_tags,
+            goexperiment: spec.goexperiment,
+            cgo_enabled: spec.cgo_enabled,
             dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
         };
@@ -267,12 +279,15 @@ impl ManagedDriver for GoGolistDriver {
         // resolution is reproducible regardless of host config.
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
-        // Pin CGO_ENABLED=0 to keep this list call's view of transitive deps
-        // consistent with the bash-driven compile/link sandboxes. Letting Go
-        // autodetect produces drift across hosts (PATH-dependent) — e.g. an
-        // Ubuntu host with gcc on PATH pulls runtime/cgo here but later link
-        // steps run without it, breaking importcfg.
-        env.insert("CGO_ENABLED".to_string(), "0".to_string());
+        // Pin CGO_ENABLED to the variant's value (default off) to keep this list
+        // call's view of transitive deps consistent with the bash-driven
+        // compile/link sandboxes. Letting Go autodetect produces drift across
+        // hosts (PATH-dependent) — e.g. an Ubuntu host with gcc on PATH pulls
+        // runtime/cgo here but later link steps run without it, breaking importcfg.
+        env.insert("CGO_ENABLED".to_string(), def.cgo_enabled.clone());
+        if !def.goexperiment.is_empty() {
+            env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
+        }
         // Thirdparty module *metadata* listing still consults the host module
         // cache / proxy (modules are content-addressed and verified by go.sum),
         // matching the v1 plugin; first-party and stdlib reads stay fully
@@ -493,6 +508,7 @@ mod tests {
         );
         config.insert("goos".to_string(), Value::String("linux".to_string()));
         config.insert("goarch".to_string(), Value::String("amd64".to_string()));
+        config.insert("cgo_enabled".to_string(), Value::String("0".to_string()));
         config.insert(
             "go_version".to_string(),
             Value::String(crate::plugingo::toolchain::DEFAULT_GO_VERSION.to_string()),
