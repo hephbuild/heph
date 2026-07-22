@@ -13,7 +13,9 @@ use futures::TryStreamExt;
 
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content};
+use crate::engine::error::TargetNotFoundError;
 use crate::engine::request_state::RequestState;
+use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
 use hmodel::htmatcher::{MatchResult, Matcher};
 
@@ -101,7 +103,21 @@ impl Engine {
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
-            let def = Arc::clone(&self).get_def(rs.clone(), &addr).await?;
+            // A provider may `list` an addr it cannot `get` standalone (e.g. go's
+            // `//pkg:build` for a non-main package, resolved only as an in-context
+            // dep). Such a target emits no codegen-copy output here, so skip it on
+            // a self-addr NotFound — matching the query resolver and `validate`.
+            // Any other failure propagates.
+            let def = match Arc::clone(&self).get_def(rs.clone(), &addr).await {
+                Ok(def) => def,
+                Err(e)
+                    if downcast_chain_ref::<TargetNotFoundError>(&e)
+                        .is_some_and(|nf| nf.addr == addr) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             for output in &def.target_def.outputs {
                 for path in &output.paths {
                     if path.codegen_tree == CodegenMode::Copy {
@@ -269,6 +285,7 @@ pub fn render(existing: &str, entries: &[GitignoreEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Config;
     use hmodel::htpkg::PkgBuf;
 
     /// Bare entry (no emitting target) — renders as just the pattern.
@@ -474,5 +491,115 @@ mod tests {
             merged,
             vec![attributed("/foo/new.go", "//foo:gen"), bare("/legacy")]
         );
+    }
+
+    /// A provider that *lists* an addr but returns `NotFound` from `get` —
+    /// mimicking the go provider's `//pkg:build` for a non-main package, which
+    /// resolves only as an in-context dep. The gitignore walk must skip such a
+    /// target rather than surface its `get_def` failure. This is the bug behind
+    /// `heph tool gen-gitignore //pkg/...` erroring with `target not found:
+    /// //pkg:build@…` for a library-only go package.
+    struct GhostProvider;
+
+    impl crate::engine::provider::Provider for GhostProvider {
+        fn config(
+            &self,
+            _req: crate::engine::provider::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::provider::ConfigResponse> {
+            Ok(crate::engine::provider::ConfigResponse {
+                name: "ghost".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: crate::engine::provider::ListRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<Item = anyhow::Result<crate::engine::provider::ListResponse>>
+                        + Send,
+                >,
+            >,
+        > {
+            let pkg = req.package.clone();
+            Box::pin(async move {
+                let items: Vec<anyhow::Result<crate::engine::provider::ListResponse>> =
+                    if pkg.as_str() == "virt" {
+                        vec![Ok(crate::engine::provider::ListResponse {
+                            addr: Addr::new(pkg, "build".to_string(), Default::default()),
+                        })]
+                    } else {
+                        vec![]
+                    };
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: crate::engine::provider::ListPackagesRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<
+                            Item = anyhow::Result<crate::engine::provider::ListPackageResponse>,
+                        > + Send,
+                >,
+            >,
+        > {
+            Box::pin(async {
+                let items: Vec<anyhow::Result<crate::engine::provider::ListPackageResponse>> =
+                    vec![Ok(crate::engine::provider::ListPackageResponse {
+                        pkg: PkgBuf::from("virt"),
+                    })];
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: crate::engine::provider::GetRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<crate::engine::provider::GetResponse, crate::engine::provider::GetError>,
+        > {
+            // Listed but unresolvable standalone.
+            Box::pin(async { Err(crate::engine::provider::GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: crate::engine::provider::ProbeRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<crate::engine::provider::ProbeResponse>>
+        {
+            Box::pin(async { Ok(crate::engine::provider::ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_but_unresolvable_target_is_skipped() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|_| Box::new(GhostProvider))?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        // The listed `//virt:build` resolves straight to the walk (no spec
+        // resolution), so its `get_def` NotFound is what the skip must absorb:
+        // no error, no entries.
+        let entries = Arc::clone(&engine)
+            .codegen_copy_gitignore_patterns(rs, &Matcher::PackagePrefix(PkgBuf::from("virt")))
+            .await?;
+
+        assert!(entries.is_empty(), "ghost target skipped: {entries:?}");
+        Ok(())
     }
 }
