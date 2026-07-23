@@ -335,4 +335,75 @@ mod tests {
             "lists available: {err}"
         );
     }
+
+    /// Mock executor exercising the `states(pkg)` callback only. `result`/`query`
+    /// panic — `resolve_internal` must never reach them. `states(pkg)` returns the
+    /// registered states for that exact package (mirroring the engine, which
+    /// returns states for `pkg`'s whole ancestry, all providers).
+    struct StatesExec {
+        by_pkg: HashMap<String, Vec<State>>,
+    }
+
+    impl ProviderExecutor for StatesExec {
+        fn result<'a>(
+            &'a self,
+            _addr: &'a Addr,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<hplugin::eresult::EResult>>>
+        {
+            unimplemented!("resolve_internal must not resolve a result")
+        }
+
+        fn query<'a>(
+            &'a self,
+            _m: &'a hmodel::htmatcher::Matcher,
+            _skip: &'a [String],
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+            unimplemented!("resolve_internal must not query")
+        }
+
+        fn states<'a>(
+            &'a self,
+            pkg: &'a PkgBuf,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<State>>> {
+            let out = self.by_pkg.get(pkg.as_str()).cloned().unwrap_or_default();
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    // The load-bearing case for cross-subtree deps: `release` is defined ONLY at
+    // `//cmd`. Building `//cmd:build@v=release` threads `vp=cmd` onto its dep
+    // `//lib:build_lib@v=release,vp=cmd`. When THAT dep resolves, the engine only
+    // hands it `//lib`'s ancestry — which does NOT contain `//cmd`'s variant (cmd
+    // is a sibling). `resolve_internal` must fall back to `executor.states(cmd)`.
+    #[tokio::test]
+    async fn resolve_internal_fetches_sibling_vp_via_executor() {
+        let lib_ancestry: Vec<State> = vec![]; // //lib sees no variant of its own
+        let exec = StatesExec {
+            by_pkg: HashMap::from([(
+                "cmd".to_string(),
+                vec![go_state("cmd", &[("release", linux_amd64())])],
+            )]),
+        };
+        let vref = VariantRef::new("release", "cmd");
+        let f = resolve_internal(&vref, &lib_ancestry, &exec)
+            .await
+            .expect("sibling variant must resolve via executor.states");
+        assert_eq!((f.goos.as_str(), f.goarch.as_str()), ("linux", "amd64"));
+    }
+
+    // When `vp` IS in the target's own ancestry (the common root-defined case),
+    // the provided states satisfy the lookup and the executor is never touched
+    // (its `states` returns nothing here, and `result`/`query` would panic).
+    #[tokio::test]
+    async fn resolve_internal_uses_provided_states_without_executor() {
+        let states = vec![go_state("", &[("release", linux_amd64())])];
+        let exec = StatesExec {
+            by_pkg: HashMap::new(),
+        };
+        let vref = VariantRef::new("release", "");
+        let f = resolve_internal(&vref, &states, &exec)
+            .await
+            .expect("root variant resolves from provided states");
+        assert_eq!(f.goos, "linux");
+    }
 }
