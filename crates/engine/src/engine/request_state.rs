@@ -198,6 +198,12 @@ pub struct RequestStateData {
     /// Inner memoizer for `Engine::probe_segments`. Keyed by `(provider_name, pkg)`
     /// so a given provider's probe of a given package runs at most once per request.
     pub mem_probe_inner: Memoizer<(String, PkgBuf), ProbeStatesResult>,
+    /// Memoizer for `ProviderExecutor::states_under`. Keyed by the subtree prefix,
+    /// so the (potentially whole-workspace) package walk + probes for a given
+    /// prefix run at most once per request — a `list` that calls it repeatedly
+    /// (e.g. the go go_src query listing many packages) pays the walk once, not
+    /// once per package.
+    pub mem_states_under: Memoizer<PkgBuf, ProbeStatesResult>,
     /// When false, fanout sites await every concurrent child instead of
     /// short-circuiting on the first error; errors are aggregated into a
     /// `MultiError`. Defaults to true (current behavior).
@@ -563,6 +569,7 @@ impl Engine {
             mem_packages: Memoizer::with_tag("packages"),
             mem_probe: Memoizer::with_tag("probe"),
             mem_probe_inner: Memoizer::with_tag("probe_inner"),
+            mem_states_under: Memoizer::with_tag("states_under"),
             fail_fast,
             log_tail_lines,
             events,

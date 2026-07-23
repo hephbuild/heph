@@ -1130,8 +1130,9 @@ fn pkg_prefix_pattern(pkg: &str) -> String {
 ///
 /// Excludes the `go` provider: these labels are carried by buildfile-emitted
 /// codegen targets, never by go targets. Skipping the go provider avoids
-/// resolving (and cascade-building) the go provider's own targets, whose spec
-/// resolution pulls in the whole golist/std graph.
+/// resolving (and cascade-building) the go provider's own variant-parameterized
+/// targets — which are multiplied per variant and whose spec resolution pulls in
+/// the whole per-variant golist/std graph.
 fn go_test_data_query_addr(pkg: &str) -> Addr {
     let expr = format!("{} && label(go_test_data)", pkg_pattern(pkg));
     hplugin_query::pluginquery::query_addr(&expr, "", &["go"])
@@ -1177,9 +1178,9 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
     // def tier (`get_def`, the most expensive). Order terms by that cost so the
     // engine's left-to-right `&&` bails at the cheapest possible tier.
-    // Exclude the `go` provider: `go_src` labels only buildfile codegen targets,
-    // never go targets — skipping go avoids spec-resolving (and cascade-building)
-    // the go provider's own targets just to reject them on the label.
+    // Exclude the `go` provider: `go_src` labels only its buildfile codegen
+    // targets, never go targets — skipping go avoids resolving (and cascade-
+    // building) the go provider's per-variant targets.
     let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
     let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &["go"]);
     addrs.push(go_src_query_addr.format());

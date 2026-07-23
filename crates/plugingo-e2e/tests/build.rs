@@ -147,6 +147,26 @@ async fn test_with_dep_cmd_build() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// End-to-end proof of the cross-subtree variant universe: the `release` variant
+/// is declared ONLY at `//cmd` (via its BUILD `provider_state`). Building
+/// `//cmd:build@v=release` threads `vp=cmd` onto the `//lib` dependency, whose own
+/// ancestry does not contain `release` (cmd is a sibling of lib). Resolving it
+/// therefore exercises the real engine `states_under` path — the module universe
+/// — not the ancestry fast path. A green build means the whole cross-subtree
+/// resolution works through the actual engine, not just a mocked executor.
+#[tokio::test]
+async fn test_variant_declared_at_sibling_resolves_via_universe() -> anyhow::Result<()> {
+    require_go!();
+    let dir = fixture("variant_sibling")?;
+    let ws = make_workspace(dir)?;
+    let result = ws.run("//cmd:build@v=release").await?;
+    assert!(
+        !artifact_paths(&result).is_empty(),
+        "a variant declared at a sibling package must resolve for the lib dep and build"
+    );
+    Ok(())
+}
+
 /// End-to-end proof of the `go_compile` **assembly** pipeline (symabis →
 /// compile → per-`.s` asm → `pack r`). First-party packages never carry `.s`
 /// files in this provider, so asm is only reachable through a thirdparty module:

@@ -99,43 +99,57 @@ impl ProviderExecutor for EngineProviderExecutor {
                 .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
             let rs = self.rs.clone();
 
-            // Enumerate every package at or under `prefix`, then union each
-            // package's own `provider_state`s (all providers). Per-package probes
-            // are memoized (`mem_probe_inner`), so repeated subtree gathers are
-            // cheap. Registers no DepDag edge — states are config, not a dep.
-            let matcher = Matcher::PackagePrefix(prefix.clone());
-            let pkg_iter = engine.packages(&matcher, &rs).await?;
-            let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
+            // Memoize the whole subtree gather per prefix: a `list` that calls
+            // `states_under` for many packages (e.g. the go go_src query) then pays
+            // the package walk + probes once, not once per package — which would
+            // otherwise flood the blocking pool with concurrent `list_packages`
+            // walks. Registers no DepDag edge — states are config, not a dep.
+            let states = rs
+                .data
+                .mem_states_under
+                .once(
+                    prefix.clone(),
+                    enclose!((engine, rs, prefix.clone() => prefix) move || async move {
+                        // Enumerate every package at or under `prefix`, then union
+                        // each package's own `provider_state`s (all providers).
+                        let matcher = Matcher::PackagePrefix(prefix);
+                        let pkg_iter = engine.packages(&matcher, &rs).await?;
+                        let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
 
-            let mut acc: Vec<State> = Vec::new();
-            for pkg_str in pkgs {
-                let pkg = PkgBuf::from(pkg_str.as_str());
-                for provider in engine.providers.iter() {
-                    let inner = rs
-                        .data
-                        .mem_probe_inner
-                        .once(
-                            (provider.name.clone(), pkg.clone()),
-                            enclose!((provider, rs, pkg) move || async move {
-                                let res = provider
-                                    .provider
-                                    .probe(
-                                        ProbeRequest {
-                                            request_id: rs.request_id().to_string(),
-                                            package: pkg,
-                                        },
-                                        rs.ctoken(),
+                        let mut acc: Vec<State> = Vec::new();
+                        for pkg_str in pkgs {
+                            let pkg = PkgBuf::from(pkg_str.as_str());
+                            for provider in engine.providers.iter() {
+                                let inner = rs
+                                    .data
+                                    .mem_probe_inner
+                                    .once(
+                                        (provider.name.clone(), pkg.clone()),
+                                        enclose!((provider, rs, pkg) move || async move {
+                                            let res = provider
+                                                .provider
+                                                .probe(
+                                                    ProbeRequest {
+                                                        request_id: rs.request_id().to_string(),
+                                                        package: pkg,
+                                                    },
+                                                    rs.ctoken(),
+                                                )
+                                                .await?;
+                                            Ok(Arc::new(res.states))
+                                        }),
                                     )
-                                    .await?;
-                                Ok(Arc::new(res.states))
-                            }),
-                        )
-                        .await
-                        .map_err(unwrap_arc_err)?;
-                    acc.extend(inner.iter().cloned());
-                }
-            }
-            Ok(acc)
+                                    .await
+                                    .map_err(unwrap_arc_err)?;
+                                acc.extend(inner.iter().cloned());
+                            }
+                        }
+                        Ok(Arc::new(acc))
+                    }),
+                )
+                .await
+                .map_err(unwrap_arc_err)?;
+            Ok(states.as_ref().clone())
         })
     }
 
