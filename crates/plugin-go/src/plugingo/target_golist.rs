@@ -130,10 +130,6 @@ fn build_spec_inner(
             ),
         );
     }
-    config.insert(
-        "cgo_enabled".to_string(),
-        Value::String(factors.cgo_enabled_env().to_string()),
-    );
     if !deps.is_empty() {
         config.insert("deps".to_string(), Value::Map(deps));
     }

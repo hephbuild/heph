@@ -444,7 +444,6 @@ impl ProviderTrait for Provider {
             ("goexperiment", ParamType::list(ParamType::String)),
             ("gcflags", ParamType::list(ParamType::String)),
             ("ldflags", ParamType::list(ParamType::String)),
-            ("cgo_enabled", ParamType::Bool),
         ]);
         Some(StateSchema {
             fields: vec![
@@ -454,8 +453,8 @@ impl ProviderTrait for Provider {
                     "Named Go build variants for this package (and its descendants, via \
                      closest-ancestor lookup). Maps a variant name to a static factor set: \
                      `goos`/`goarch` (required), plus optional `tags` (build tags), \
-                     `goexperiment` (GOEXPERIMENT), `gcflags` (extra `go tool compile` flags), \
-                     `ldflags` (extra `go tool link` flags) and `cgo_enabled` (default False). \
+                     `goexperiment` (GOEXPERIMENT), `gcflags` (extra `go tool compile` flags) \
+                     and `ldflags` (extra `go tool link` flags). \
                      A user-facing target selects one with `@v=NAME`, resolving the closest \
                      ancestor package that defines that name; variants do NOT compound across \
                      the tree (each definition is self-contained).",

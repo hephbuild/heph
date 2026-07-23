@@ -25,9 +25,6 @@ pub struct Factors {
     /// Flags passed verbatim to `go tool link` (the `-ldflags` equivalent).
     /// Order preserved.
     pub ldflags: Vec<String>,
-    /// `CGO_ENABLED`. Defaults to false — heph Go builds are cgo-off unless a
-    /// variant opts in.
-    pub cgo_enabled: bool,
 }
 
 impl Factors {
@@ -38,11 +35,6 @@ impl Factors {
         } else {
             Some(self.goexperiment.join(","))
         }
-    }
-
-    /// `CGO_ENABLED` env value (`"0"`/`"1"`).
-    pub fn cgo_enabled_env(&self) -> &'static str {
-        if self.cgo_enabled { "1" } else { "0" }
     }
 }
 
@@ -115,13 +107,5 @@ mod tests {
         assert_eq!(f.goexperiment_env(), None);
         f.goexperiment = vec!["arenas".into(), "loopvar".into()];
         assert_eq!(f.goexperiment_env(), Some("arenas,loopvar".to_string()));
-    }
-
-    #[test]
-    fn test_cgo_enabled_env() {
-        let mut f = Factors::default();
-        assert_eq!(f.cgo_enabled_env(), "0");
-        f.cgo_enabled = true;
-        assert_eq!(f.cgo_enabled_env(), "1");
     }
 }

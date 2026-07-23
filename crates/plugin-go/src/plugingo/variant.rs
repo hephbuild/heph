@@ -33,7 +33,6 @@ const VARIANT_KEYS: &[&str] = &[
     "goexperiment",
     "gcflags",
     "ldflags",
-    "cgo_enabled",
 ];
 
 /// Parse one variant definition (`Value::Map`) into concrete [`Factors`].
@@ -73,11 +72,6 @@ fn parse_variant_def(name: &str, v: &Value) -> anyhow::Result<Factors> {
     goexperiment.sort();
     let gcflags = list("gcflags")?;
     let ldflags = list("ldflags")?;
-    let cgo_enabled = match m.get("cgo_enabled") {
-        Some(Value::Bool(b)) => *b,
-        Some(other) => bail!("go variant `{name}`: `cgo_enabled` must be a bool, got: {other:?}"),
-        None => false,
-    };
     Ok(Factors {
         goos,
         goarch,
@@ -85,7 +79,6 @@ fn parse_variant_def(name: &str, v: &Value) -> anyhow::Result<Factors> {
         goexperiment,
         gcflags,
         ldflags,
-        cgo_enabled,
     })
 }
 
@@ -301,7 +294,6 @@ mod tests {
                 "ldflags",
                 Value::List(vec![Value::String("-s".into()), Value::String("-w".into())]),
             ),
-            ("cgo_enabled", Value::Bool(true)),
         ]);
         let f = parse_variant_def("release", &def).unwrap();
         assert_eq!(f.goos, "linux");
@@ -310,7 +302,6 @@ mod tests {
         assert_eq!(f.goexperiment, vec!["arenas"]);
         assert_eq!(f.gcflags, vec!["-l", "-N"]); // order preserved
         assert_eq!(f.ldflags, vec!["-s", "-w"]);
-        assert!(f.cgo_enabled);
     }
 
     #[test]

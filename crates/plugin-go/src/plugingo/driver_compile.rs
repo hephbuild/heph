@@ -100,9 +100,6 @@ struct GoCompileSpec {
     goexperiment: Vec<String>,
     /// Extra flags passed verbatim to `go tool compile` (the variant's gcflags).
     gcflags: Vec<String>,
-    /// `CGO_ENABLED` from the variant (`"0"`/`"1"`).
-    #[spec(required)]
-    cgo_enabled: String,
     /// Import paths of the transitive libs, in deterministic order — each maps to
     /// a `lib_<sanitized>` dep group carrying that archive, used to build
     /// importcfg.
@@ -127,7 +124,6 @@ struct GoCompileDef {
     go_version: String,
     goexperiment: Vec<String>,
     gcflags: Vec<String>,
-    cgo_enabled: String,
     import_paths: Vec<String>,
     s_files: Vec<String>,
     embed_variant: Option<EmbedVariant>,
@@ -154,7 +150,6 @@ impl Hash for GoCompileDef {
         // `gcflags` order is semantically meaningful, so hash as-is.
         self.goexperiment.hash(state);
         self.gcflags.hash(state);
-        self.cgo_enabled.hash(state);
         // `import_paths` order is not semantically meaningful — it comes from a
         // closure walk that dedups through a per-process-randomized `HashSet`,
         // and `run()` re-sorts before writing importcfg, so the archive is
@@ -262,7 +257,6 @@ impl ManagedDriver for GoCompileDriver {
             go_version: spec.go_version,
             goexperiment: spec.goexperiment,
             gcflags: spec.gcflags,
-            cgo_enabled: spec.cgo_enabled,
             import_paths: spec.import_paths,
             s_files: spec.s_files,
             embed_variant,
@@ -364,7 +358,7 @@ impl ManagedDriver for GoCompileDriver {
         );
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
-        env.insert("CGO_ENABLED".to_string(), def.cgo_enabled.clone());
+        env.insert("CGO_ENABLED".to_string(), "0".to_string());
         if !def.goexperiment.is_empty() {
             env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
         }
@@ -827,10 +821,6 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         str_list(&p.factors.goexperiment),
     );
     config.insert("gcflags".to_string(), str_list(&p.factors.gcflags));
-    config.insert(
-        "cgo_enabled".to_string(),
-        Value::String(p.factors.cgo_enabled_env().to_string()),
-    );
     config.insert("import_paths".to_string(), Value::List(import_paths));
     config.insert("s_files".to_string(), str_list(p.s_files));
     config.insert(
@@ -1115,7 +1105,6 @@ mod driver_tests {
             go_version: "1.26.4".to_string(),
             goexperiment: vec![],
             gcflags: vec![],
-            cgo_enabled: "0".to_string(),
             import_paths: ips.iter().map(|s| s.to_string()).collect(),
             s_files: vec![],
             embed_variant: None,
