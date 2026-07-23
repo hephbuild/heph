@@ -1401,6 +1401,17 @@ impl ProviderInner {
             return Err(GetError::NotFound);
         }
 
+        // A name this provider doesn't own can't be a variant target — decline so
+        // the engine falls through to the owning provider. `foreign_name_guard`
+        // above is the on-by-default fast path (before `decode_package`); this
+        // unconditional check covers the guard-off case, where a foreign name (e.g.
+        // a buildfile codegen target sharing a Go package dir, spec-resolved via a
+        // go-first registration) must decline rather than error out of variant
+        // resolution below.
+        if !is_known_go_target_name(&addr.name) {
+            return Err(GetError::NotFound);
+        }
+
         // Everything below is variant-parameterized. Resolve the addr's variant —
         // a bare `@v` (binary/entry target) resolves by module-bounded ancestry;
         // `@v,vp` (library / dependency target) resolves `(name, vp)` against the
