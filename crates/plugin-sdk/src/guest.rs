@@ -117,14 +117,14 @@ impl ProviderExecutor for GuestExecutor {
         })
     }
 
-    fn states<'a>(&'a self, pkg: &'a PkgBuf) -> BoxFuture<'a, Result<Vec<State>>> {
+    fn states_under<'a>(&'a self, prefix: &'a PkgBuf) -> BoxFuture<'a, Result<Vec<State>>> {
         Box::pin(async move {
-            let r = self.exec.states(pkg.as_str().into()).await;
+            let r = self.exec.states_under(prefix.as_str().into()).await;
             if r.ok {
                 let mut out = Vec::with_capacity(r.states.len());
                 for b in r.states.iter() {
                     let pb = plugin_abi::pb::State::decode(&b[..])
-                        .context("decoding pb::State from host states callback")?;
+                        .context("decoding pb::State from host states_under callback")?;
                     out.push(plugin_abi::convert::state_from_pb(pb));
                 }
                 Ok(out)

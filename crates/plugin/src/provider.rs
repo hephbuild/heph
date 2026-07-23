@@ -22,6 +22,12 @@ pub struct ListRequest {
     pub request_id: String,
     pub package: PkgBuf,
     pub states: Vec<State>,
+    /// Engine callback surface, so `list` can gather config beyond the package's
+    /// ancestry `states` — e.g. the go plugin fetching a module's variant universe
+    /// via [`ProviderExecutor::states_under`] to enumerate library variants.
+    /// Providers that don't need it ignore it; non-engine call sites (LSP, tests)
+    /// pass [`NoopExecutor`].
+    pub executor: Arc<dyn ProviderExecutor>,
 }
 pub struct ListResponse {
     pub addr: Addr,
@@ -121,23 +127,45 @@ pub trait ProviderExecutor: Send + Sync {
         Box::pin(async move { self.result(addr).await.map(|_| ()) })
     }
 
-    /// Fetch the provider states declared for `pkg` and its package ancestry
-    /// (every `provider_state` up the tree, all providers), backed by the
-    /// engine's memoized `probe_segments` — repeated calls for the same package
-    /// are near-free.
+    /// Fetch the provider states declared for every package **at or under**
+    /// `prefix` (each package's own `provider_state`s, all providers) — the
+    /// downward subtree, not the upward ancestry that `GetRequest.states`
+    /// carries.
     ///
     /// Unlike `result`/`query`, this registers **no** `DepDag` edge: states are
     /// build *configuration*, not a build dependency, so reading them must not
-    /// couple the caller into a cycle. Used by a provider that must resolve
-    /// config declared in a package outside the target's own ancestry — e.g. the
-    /// go plugin resolving a variant pinned by a `vp` addr arg to a sibling
-    /// subtree, whose defining `provider_state` is absent from `GetRequest.states`
-    /// (which the engine gathers only along the target package's ancestry).
+    /// couple the caller into a cycle. Used by a provider that needs config
+    /// declared across a whole subtree — e.g. the go plugin gathering a Go
+    /// module's variant *universe* (every `variants` declaration under the
+    /// `go.mod` root, siblings included) to resolve/enumerate library variants,
+    /// which `GetRequest.states` (ancestry-only) cannot supply.
     ///
     /// Default returns empty — real executors (engine, cdylib guest) override it;
-    /// test mocks that never resolve a foreign-subtree variant can keep the default.
-    fn states<'a>(&'a self, _pkg: &'a PkgBuf) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+    /// test mocks that never gather a subtree can keep the default.
+    fn states_under<'a>(
+        &'a self,
+        _prefix: &'a PkgBuf,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
         Box::pin(async move { Ok(Vec::new()) })
+    }
+}
+
+/// A [`ProviderExecutor`] that resolves nothing — for call sites that build a
+/// [`ListRequest`] outside the engine (LSP, tests) where no real callback surface
+/// exists. `result`/`query` error if reached; `note_dep`/`states_under` are no-ops.
+#[derive(Debug, Default)]
+pub struct NoopExecutor;
+
+impl ProviderExecutor for NoopExecutor {
+    fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+        Box::pin(async move { anyhow::bail!("NoopExecutor: cannot resolve {}", addr.format()) })
+    }
+    fn query<'a>(
+        &'a self,
+        _m: &'a Matcher,
+        _extra_skip: &'a [String],
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+        Box::pin(async move { anyhow::bail!("NoopExecutor: cannot query") })
     }
 }
 

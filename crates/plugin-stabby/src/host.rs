@@ -346,10 +346,10 @@ impl StableExecutor for HostExecutor {
         }))
     }
 
-    extern "C" fn states<'a>(&'a self, pkg: SString) -> DynFuture<'a, StatesOutcome> {
+    extern "C" fn states_under<'a>(&'a self, prefix: SString) -> DynFuture<'a, StatesOutcome> {
         dynify(stabby::boxed::Box::new(async move {
-            let pkg = PkgBuf::from(pkg.to_string());
-            match self.inner.states(&pkg).await {
+            let prefix = PkgBuf::from(prefix.to_string());
+            match self.inner.states_under(&prefix).await {
                 Ok(states) => StatesOutcome {
                     ok: true,
                     message: SString::new(),

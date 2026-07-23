@@ -47,9 +47,15 @@ type BoxedResultFuture<'a> =
 
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
 /// does not need to store it separately.
-struct EngineProviderExecutor {
+pub(crate) struct EngineProviderExecutor {
     engine: Weak<Engine>,
     rs: Arc<RequestState>,
+}
+
+impl EngineProviderExecutor {
+    pub(crate) fn new(engine: Weak<Engine>, rs: Arc<RequestState>) -> Self {
+        Self { engine, rs }
+    }
 }
 
 impl ProviderExecutor for EngineProviderExecutor {
@@ -82,19 +88,54 @@ impl ProviderExecutor for EngineProviderExecutor {
         Box::pin(async move { self.rs.track_dep(addr).map_err(anyhow::Error::new) })
     }
 
-    fn states<'a>(
+    fn states_under<'a>(
         &'a self,
-        pkg: &'a PkgBuf,
+        prefix: &'a PkgBuf,
     ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<State>>> {
         Box::pin(async move {
             let engine = self
                 .engine
                 .upgrade()
                 .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
-            // Memoized per-package walk of the ancestry; registers no DepDag edge
-            // (states are config, not a build dependency).
-            let states = Arc::clone(&engine).probe_segments(&self.rs, pkg).await?;
-            Ok(states.as_ref().clone())
+            let rs = self.rs.clone();
+
+            // Enumerate every package at or under `prefix`, then union each
+            // package's own `provider_state`s (all providers). Per-package probes
+            // are memoized (`mem_probe_inner`), so repeated subtree gathers are
+            // cheap. Registers no DepDag edge — states are config, not a dep.
+            let matcher = Matcher::PackagePrefix(prefix.clone());
+            let pkg_iter = engine.packages(&matcher, &rs).await?;
+            let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
+
+            let mut acc: Vec<State> = Vec::new();
+            for pkg_str in pkgs {
+                let pkg = PkgBuf::from(pkg_str.as_str());
+                for provider in engine.providers.iter() {
+                    let inner = rs
+                        .data
+                        .mem_probe_inner
+                        .once(
+                            (provider.name.clone(), pkg.clone()),
+                            enclose!((provider, rs, pkg) move || async move {
+                                let res = provider
+                                    .provider
+                                    .probe(
+                                        ProbeRequest {
+                                            request_id: rs.request_id().to_string(),
+                                            package: pkg,
+                                        },
+                                        rs.ctoken(),
+                                    )
+                                    .await?;
+                                Ok(Arc::new(res.states))
+                            }),
+                        )
+                        .await
+                        .map_err(unwrap_arc_err)?;
+                    acc.extend(inner.iter().cloned());
+                }
+            }
+            Ok(acc)
         })
     }
 
@@ -139,6 +180,10 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     .filter(|s| s.provider == provider.name)
                                     .cloned()
                                     .collect(),
+                                executor: Arc::new(EngineProviderExecutor::new(
+                                    Arc::downgrade(&engine),
+                                    rs.clone(),
+                                )),
                             },
                             rs.ctoken(),
                         )

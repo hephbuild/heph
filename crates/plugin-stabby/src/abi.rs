@@ -94,9 +94,9 @@ pub struct QueryOutcome {
     pub addrs: SVec<SString>,
 }
 
-/// Outcome of a `states` call. `State` has no canonical string form, so each
-/// state crosses as prost-encoded `pb::State` bytes — mirroring how `query`'s
-/// matcher crosses as `SVec<u8>`.
+/// Outcome of a `states_under` call. `State` has no canonical string form, so
+/// each state crosses as prost-encoded `pb::State` bytes — mirroring how
+/// `query`'s matcher crosses as `SVec<u8>`.
 #[stabby::stabby]
 pub struct StatesOutcome {
     pub ok: bool,
@@ -125,9 +125,9 @@ pub trait StableExecutor {
         matcher_pb: SVec<u8>,
         extra_skip: SVec<SString>,
     ) -> DynFuture<'a, QueryOutcome>;
-    /// Fetch provider states for `pkg` and its ancestry (config lookup; no dep
-    /// edge). `pkg` is the package path string.
-    extern "C" fn states<'a>(&'a self, pkg: SString) -> DynFuture<'a, StatesOutcome>;
+    /// Fetch provider states for every package at or under `prefix` — the
+    /// downward subtree (config lookup; no dep edge). `prefix` is a package path.
+    extern "C" fn states_under<'a>(&'a self, prefix: SString) -> DynFuture<'a, StatesOutcome>;
 }
 
 /// An owned, ABI-stable handle to a host executor — what the host passes into the
@@ -223,6 +223,16 @@ pub trait StableProvider {
         req: SVec<u8>,
         exec: DynExecutor,
     ) -> DynFuture<'a, SVec<u8>>;
+    /// Server-streaming **with** a native [`DynExecutor`] — for `list`, whose
+    /// enumeration may call back (e.g. the go plugin gathering a module's variant
+    /// universe via `states_under`). Combines the `invoke_server_stream` and
+    /// `invoke_exec` cardinalities.
+    extern "C" fn invoke_exec_server_stream<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+        exec: DynExecutor,
+    ) -> DynFuture<'a, DynItemStream>;
     extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry);
 }
 

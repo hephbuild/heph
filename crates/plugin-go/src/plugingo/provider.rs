@@ -594,35 +594,66 @@ impl ProviderInner {
                 return empty();
             }
 
-            // Every build/list target is variant-parameterized: list one copy per
-            // variant applicable to this package (each pinned to its defining
-            // package via `vp`). A package with no variants declared in scope lists
-            // no build targets — there is no implicit default variant.
-            let variants = variant::applicable(&req.states);
+            // Every build/list target is variant-parameterized. Two enumeration
+            // scopes:
+            //   - **entry / binary** targets (`build`, `test`, `lint`, …) list the
+            //     module-bounded *ancestry* variants — the ones a user can select
+            //     at this package.
+            //   - **library / intermediate** targets (`build_lib`, `_golist`, …)
+            //     list the whole module *universe* (fetched via `states_under`), so
+            //     a variant declared at a sibling package is still enumerated — the
+            //     forms a cross-subtree consumer pins with `vp`.
+            // A package with no variants in scope lists no build targets — there is
+            // no implicit default variant.
+            let module_root = match &*kind {
+                GoPackageKind::FirstParty { module_root, .. }
+                | GoPackageKind::ThirdParty { module_root, .. } => module_root
+                    .strip_prefix(&self.workspace_root)
+                    .unwrap_or(module_root)
+                    .to_string_lossy()
+                    .into_owned(),
+                GoPackageKind::Stdlib { .. } => String::new(),
+            };
+            let ancestry = variant::ancestry_variants(&req.states, &module_root);
+            // First-party libs enumerate the module universe; stdlib/thirdparty
+            // (rarely listed directly, and always consumed with a `vp` pin) fall
+            // back to ancestry.
+            let universe = if matches!(&*kind, GoPackageKind::FirstParty { .. }) {
+                let module_states = req
+                    .executor
+                    .states_under(&hmodel::htpkg::PkgBuf::from(module_root.as_str()))
+                    .await?;
+                variant::universe_variants(&module_states)?
+            } else {
+                ancestry.clone()
+            };
+            let vrefs_for = |name: &str| -> &[VariantRef] {
+                if is_entry_target_name(name) {
+                    &ancestry
+                } else {
+                    &universe
+                }
+            };
+
+            let push_names = |addrs: &mut Vec<Addr>, names: &[&str]| {
+                for name in names {
+                    for vref in vrefs_for(name) {
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            (*name).to_string(),
+                            vref.to_args(),
+                        ));
+                    }
+                }
+            };
 
             let mut addrs: Vec<Addr> = Vec::new();
             match &*kind {
                 GoPackageKind::Stdlib { .. } => {
-                    for vref in &variants {
-                        for name in ["_golist", "build_lib"] {
-                            addrs.push(Addr::new(
-                                req.package.clone(),
-                                name.to_string(),
-                                vref.to_args(),
-                            ));
-                        }
-                    }
+                    push_names(&mut addrs, &["_golist", "build_lib"]);
                 }
                 GoPackageKind::ThirdParty { subpath, .. } => {
-                    for vref in &variants {
-                        for name in ["_golist", "build_lib"] {
-                            addrs.push(Addr::new(
-                                req.package.clone(),
-                                name.to_string(),
-                                vref.to_args(),
-                            ));
-                        }
-                    }
+                    push_names(&mut addrs, &["_golist", "build_lib"]);
                     // The `download` target lives at the module root only and is
                     // variant-independent (one per module@version).
                     if subpath.is_empty() {
@@ -634,37 +665,24 @@ impl ProviderInner {
                     }
                 }
                 GoPackageKind::FirstParty { module_root, .. } => {
-                    // Emit the full candidate set unconditionally for any dir
-                    // under a go.mod (decode_package guarantees that). Each target
-                    // is filtered at `get` time by inspecting the `_golist` result.
-                    //
-                    // Lint/format targets are the exception: they exist only for
-                    // modules that opt in with a golangci config at the go.mod
-                    // root, so gate them here (matching the `get`-time gate) to
-                    // avoid advertising targets that would resolve to NotFound.
+                    // Lint/format targets exist only for modules that opt in with a
+                    // golangci config at the go.mod root, so gate them here
+                    // (matching the `get`-time gate) to avoid advertising targets
+                    // that would resolve to NotFound.
                     let lint_enabled = self.golangci_config_addr(module_root).is_some();
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
-                    let mut names: Vec<&str> = vec!["_golist", "build_lib", "build", "embed"];
+                    push_names(&mut addrs, &["_golist", "build_lib", "build", "embed"]);
                     if lint_enabled {
-                        names.extend_from_slice(&["lint-check", "lint", "format-check", "format"]);
+                        push_names(
+                            &mut addrs,
+                            &["lint-check", "lint", "format-check", "format"],
+                        );
                     }
                     if !skip_tests {
-                        names.extend_from_slice(&[
-                            "embed_xtest",
-                            "build_test",
-                            "test",
-                            "build_xtest",
-                            "xtest",
-                        ]);
-                    }
-                    for vref in &variants {
-                        for name in &names {
-                            addrs.push(Addr::new(
-                                req.package.clone(),
-                                (*name).to_string(),
-                                vref.to_args(),
-                            ));
-                        }
+                        push_names(
+                            &mut addrs,
+                            &["embed_xtest", "build_test", "test", "build_xtest", "xtest"],
+                        );
                     }
                 }
             }
@@ -774,6 +792,18 @@ const TEST_TARGET_NAMES: &[&str] = &[
 
 fn is_test_target_name(name: &str) -> bool {
     TEST_TARGET_NAMES.contains(&name)
+}
+
+/// User-facing **entry / binary** target names — the ones a user selects a
+/// variant on directly (bare `@v`, resolved by module-bounded ancestry). Every
+/// other target is a **library / intermediate** (carries `vp`, resolved against
+/// the module universe). Used by `list` to choose the enumeration scope
+/// (ancestry vs universe) per target name.
+fn is_entry_target_name(name: &str) -> bool {
+    matches!(
+        name,
+        "build" | "test" | "xtest" | "lint-check" | "lint" | "format-check" | "format"
+    )
 }
 
 /// Targets handled by `handle_get` *before* the `_golist` resolve (no go list
@@ -1290,7 +1320,9 @@ impl ProviderInner {
         // is variant-parameterized (std is compiled with the variant's factors), so
         // resolve the variant here.
         if addr.package.as_str() == target_std::STD_PKG && addr.name == "install" {
-            let (factors, _vref) = variant::resolve(addr, &req.states, req.executor.as_ref())
+            // std:install is always internal (carries `vp`), so it takes the
+            // library/universe branch — `module_root` is unused.
+            let (factors, _vref) = variant::resolve(addr, &req.states, "", req.executor.as_ref())
                 .await
                 .map_err(GetError::Other)?;
             let spec = target_std::install_spec(addr.clone(), &factors, &self.go_version);
@@ -1369,12 +1401,26 @@ impl ProviderInner {
         }
 
         // Everything below is variant-parameterized. Resolve the addr's variant —
-        // `v` (user targets) or the `v`+`vp` pin (internal / dependency targets) —
-        // into the concrete `factors` this target builds with, plus the `vref` to
-        // thread verbatim onto every sub-target and dependency address.
-        let (factors, vref) = variant::resolve(addr, &req.states, req.executor.as_ref())
-            .await
-            .map_err(GetError::Other)?;
+        // a bare `@v` (binary/entry target) resolves by module-bounded ancestry;
+        // `@v,vp` (library / dependency target) resolves `(name, vp)` against the
+        // module universe. Returns the concrete `factors` this target builds with,
+        // plus the `vref` to thread onto every sub-target and dependency address.
+        //
+        // `module_root` bounds ancestry resolution at the go.mod dir (not repo
+        // root); it is unused for the `vp` (library) branch.
+        let module_root = match &*kind {
+            GoPackageKind::FirstParty { module_root, .. }
+            | GoPackageKind::ThirdParty { module_root, .. } => module_root
+                .strip_prefix(&self.workspace_root)
+                .unwrap_or(module_root)
+                .to_string_lossy()
+                .into_owned(),
+            GoPackageKind::Stdlib { .. } => String::new(),
+        };
+        let (factors, vref) =
+            variant::resolve(addr, &req.states, &module_root, req.executor.as_ref())
+                .await
+                .map_err(GetError::Other)?;
 
         // _golist — generate spec without executing go list (before stdlib check so
         // stdlib packages can also expose a _golist target for cached dep resolution)
@@ -3102,6 +3148,21 @@ mod tests {
     }
 
     impl ProviderExecutor for GoListTestExecutor {
+        // The test fixtures are single-module workspaces (go.mod at root), so the
+        // module universe = the root `host` variant. Serve it for `states_under`
+        // of the root prefix; deeper prefixes have no declarations.
+        fn states_under<'a>(
+            &'a self,
+            prefix: &'a hmodel::htpkg::PkgBuf,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<hplugin::provider::State>>> {
+            let states = if prefix.as_str().is_empty() {
+                vec![host_variant_state()]
+            } else {
+                vec![]
+            };
+            Box::pin(async move { Ok(states) })
+        }
+
         fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
             Box::pin(async move {
                 if addr.name != "_golist" {
@@ -4530,12 +4591,90 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             request_id: "test".to_string(),
             package: PkgBuf::from(package),
             states: vec![host_variant_state()],
+            executor: test_executor(&p.inner.workspace_root),
         };
         p.list(req, &ctoken)
             .await
             .unwrap()
             .map(|r| r.unwrap().addr.name.clone())
             .collect()
+    }
+
+    /// The completeness fix: a library target must list a variant declared at a
+    /// **sibling** package (reachable only via the module universe / `states_under`),
+    /// not just the package's own ancestry. Entry targets stay ancestry-scoped.
+    #[tokio::test]
+    async fn list_library_enumerates_sibling_variant_from_universe() {
+        let sandbox = copy_fixture("simple_lib"); // a library package at the module root
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        // `release` declared ONLY at sibling package `other` — not in the root
+        // lib's ancestry. `states_under` (the module universe) surfaces it.
+        struct SiblingUniverse;
+        impl ProviderExecutor for SiblingUniverse {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                unimplemented!("list must not resolve results")
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                unimplemented!("list must not query")
+            }
+            fn states_under<'a>(
+                &'a self,
+                prefix: &'a PkgBuf,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+                let release = Value::Map(HashMap::from([
+                    ("goos".to_string(), Value::String("linux".into())),
+                    ("goarch".to_string(), Value::String("amd64".into())),
+                ]));
+                let states = if prefix.as_str().is_empty() {
+                    vec![State {
+                        package: PkgBuf::from("other"),
+                        provider: "go".to_string(),
+                        state: HashMap::from([(
+                            "variants".to_string(),
+                            Value::Map(HashMap::from([("release".to_string(), release)])),
+                        )]),
+                    }]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move { Ok(states) })
+            }
+        }
+
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from(""),
+            states: vec![], // no ancestry variants for this package
+            executor: Arc::new(SiblingUniverse),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        // build_lib (library) lists the sibling's variant, pinned via `vp`.
+        assert!(
+            addrs.iter().any(|a| a.name == "build_lib"
+                && a.args.get("v").map(String::as_str) == Some("release")
+                && a.args.get("vp").map(String::as_str) == Some("other")),
+            "sibling-declared variant must be listed on build_lib: {addrs:?}"
+        );
+        // build (entry) is ancestry-scoped — nothing declared in ancestry, so it
+        // is not listed.
+        assert!(
+            !addrs.iter().any(|a| a.name == "build"),
+            "entry target must not list a variant absent from ancestry: {addrs:?}"
+        );
     }
 
     #[tokio::test]
@@ -5407,6 +5546,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 with_recursive(state_with_test_skip("", true)),
                 host_variant_state(),
             ],
+            executor: test_executor(sandbox.path()),
         };
         let names: Vec<String> = p
             .list(req, &ctoken)

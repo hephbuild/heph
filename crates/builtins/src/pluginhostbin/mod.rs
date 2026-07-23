@@ -287,6 +287,7 @@ mod tests {
                     request_id: "test".to_string(),
                     package: PkgBuf::from(PKG),
                     states: vec![],
+                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
                 },
                 &ctoken,
             )
