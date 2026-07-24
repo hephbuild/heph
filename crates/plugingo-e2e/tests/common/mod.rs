@@ -192,14 +192,29 @@ impl hplugin::provider::Provider for VariantInjector {
     }
 }
 
+/// Default workspace: builds with the **host** `go` (gotool = "host"). This is
+/// what almost every e2e test should use — it reuses the host toolchain's
+/// prebuilt std, so it stages no hermetic SDK and builds no std from source,
+/// which is dramatically less disk and time. (Staging a full hermetic SDK + std
+/// tree per isolated test workspace is what exhausted the CI runner disk.) Only
+/// the few tests that specifically exercise the hermetic toolchain use
+/// [`make_workspace_hermetic`]. Requires `go` on PATH (guard with `require_go!`).
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
+    make_workspace_ordered(dir, false, true, &[], HOST_GO)
 }
 
-/// Build the workspace using the **host** `go` (gotool = "host") instead of a
-/// hermetic SDK. Requires `go` on PATH (guard call sites with `require_go!`).
+/// Alias for [`make_workspace`] kept for call sites that spell the host toolchain
+/// explicitly.
 pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, &[], HOST_GO)
+    make_workspace(dir)
+}
+
+/// Build the workspace against the pinned **hermetic** Go SDK ([`HERMETIC_GO`]) —
+/// downloaded and staged, with std compiled from source. Expensive (disk + time),
+/// so reserve it for the *select few* tests that must prove the hermetic
+/// toolchain path itself; everything else uses [`make_workspace`] (host `go`).
+pub fn make_workspace_hermetic(dir: TempDir) -> anyhow::Result<Workspace> {
+    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
 }
 
 /// A published heph release whose `heph-govet_<goos>_<goarch>` assets the lint
@@ -216,7 +231,7 @@ pub fn govet_addr() -> String {
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
 /// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, skip, HERMETIC_GO)
+    make_workspace_ordered(dir, false, true, skip, HOST_GO)
 }
 
 /// Same as [`make_workspace`] but registers the **go provider before** the
@@ -231,7 +246,7 @@ pub fn make_workspace_go_first(
     dir: TempDir,
     foreign_name_guard: bool,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, true, foreign_name_guard, &[], HERMETIC_GO)
+    make_workspace_ordered(dir, true, foreign_name_guard, &[], HOST_GO)
 }
 
 fn make_workspace_ordered(

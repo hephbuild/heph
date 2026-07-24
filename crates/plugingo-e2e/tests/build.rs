@@ -1,7 +1,10 @@
 mod common;
 
 use anyhow::Context as _;
-use common::{artifact_paths, fixture, make_workspace, make_workspace_host, require_go};
+use common::{
+    artifact_paths, fixture, make_workspace, make_workspace_hermetic, make_workspace_host,
+    require_go,
+};
 
 #[tokio::test]
 async fn test_simple_lib_build_lib() -> anyhow::Result<()> {
@@ -134,11 +137,15 @@ async fn test_embed_buildtagged_build_test_lib_compiles() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The deliberate **hermetic** toolchain build: this is the one build test that
+/// stages the pinned Go SDK and compiles std from source (its host-`go`
+/// counterpart is `test_with_dep_cmd_build_host_toolchain`). Every other build
+/// test uses the host toolchain (`make_workspace`) to keep disk/time down.
 #[tokio::test]
 async fn test_with_dep_cmd_build() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("with_dep")?;
-    let ws = make_workspace(dir)?;
+    let ws = make_workspace_hermetic(dir)?;
     let result = ws.run("//cmd:build@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
