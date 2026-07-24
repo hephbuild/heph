@@ -251,13 +251,12 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 
 			recordFile(hdr.Name)
 
-			if xfs.PathExists(dest) {
-				return nil
-			}
-
-			err := os.Symlink(hdr.Linkname, dest)
-			if err != nil {
-				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
+			// The symlink may already be there, still (re)write the xattrs, they may be missing
+			if !xfs.PathExists(dest) {
+				err := os.Symlink(hdr.Linkname, dest)
+				if err != nil {
+					return fmt.Errorf("untar: %v: %w", hdr.Name, err)
+				}
 			}
 
 			if err := writeXattrs(dest, o.Xattrs); err != nil {
