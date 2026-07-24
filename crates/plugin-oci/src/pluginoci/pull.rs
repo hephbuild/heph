@@ -27,7 +27,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{ImageFormat, run_cmd_cancellable};
+use super::{ImageFormat, Tool, ensure_tool_supports_format, run_cmd_cancellable};
 
 pub const DRIVER_NAME: &str = "oci_pull";
 
@@ -45,8 +45,14 @@ struct OciPullSpec {
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     out: Option<String>,
     /// Pull from an insecure (HTTP / self-signed) registry — passes
-    /// `--src-tls-verify=false` to skopeo.
+    /// `--src-tls-verify=false` to skopeo. Ignored by the `docker` tool, which
+    /// takes insecure registries from the daemon config.
     insecure: bool,
+    /// Tool to pull with: `skopeo` (default for an `oci` archive) or `docker`
+    /// (default for a `docker` archive — `docker pull` + `docker save`, no
+    /// skopeo needed). `docker` can only produce a `docker` archive.
+    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    tool: Option<String>,
     /// Caching for the pulled archive. Defaults to on for both tiers. A pull is
     /// content-addressed only when the ref is digest-pinned.
     cache: TargetSpecCache,
@@ -59,6 +65,7 @@ struct OciPullDef {
     /// Workspace-relative output archive path.
     out: String,
     insecure: bool,
+    tool: Tool,
 }
 
 const OCI_PULL_FORMAT_VERSION: u32 = 1;
@@ -70,7 +77,37 @@ impl Hash for OciPullDef {
         self.format.transport().hash(state);
         self.out.hash(state);
         self.insecure.hash(state);
+        self.tool.label().hash(state);
     }
+}
+
+/// Pull an image into a docker-format archive with the docker CLI: pull it into
+/// the daemon, then `docker save` it to `out_tar`. No skopeo.
+async fn docker_pull(
+    docker_bin: &str,
+    src: &str,
+    out_tar: &std::path::Path,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<()> {
+    run_cmd_cancellable(
+        vec![docker_bin.to_string(), "pull".to_string(), src.to_string()],
+        ctoken,
+        "docker pull (oci_pull)",
+    )
+    .await?;
+    run_cmd_cancellable(
+        vec![
+            docker_bin.to_string(),
+            "save".to_string(),
+            src.to_string(),
+            "-o".to_string(),
+            out_tar.to_string_lossy().into_owned(),
+        ],
+        ctoken,
+        "docker save (oci_pull)",
+    )
+    .await?;
+    Ok(())
 }
 
 /// Assemble the `skopeo copy` argv for a pull. Pure so it can be unit-tested
@@ -109,6 +146,7 @@ fn ws_path(pkg: &str, rel: &str) -> String {
 
 pub struct Driver {
     skopeo_bin: String,
+    docker_bin: String,
 }
 
 impl Default for Driver {
@@ -121,13 +159,15 @@ impl Driver {
     pub fn new() -> Self {
         Driver {
             skopeo_bin: "skopeo".to_string(),
+            docker_bin: "docker".to_string(),
         }
     }
 
     #[cfg(test)]
-    fn with_binary(bin: impl Into<String>) -> Self {
+    fn with_binaries(skopeo: impl Into<String>, docker: impl Into<String>) -> Self {
         Driver {
-            skopeo_bin: bin.into(),
+            skopeo_bin: skopeo.into(),
+            docker_bin: docker.into(),
         }
     }
 }
@@ -153,6 +193,8 @@ impl ManagedDriver for Driver {
         let spec =
             OciPullSpec::from(req.target_spec.config.clone()).context("parse oci_pull config")?;
         let format = ImageFormat::parse(spec.format.as_deref().unwrap_or("oci"))?;
+        let tool = Tool::parse_opt(spec.tool.as_deref(), format)?;
+        ensure_tool_supports_format(tool, format)?;
         let out_rel = spec.out.unwrap_or_else(|| "image.tar".to_string());
         let out = ws_path(addr.package.as_str(), &out_rel);
 
@@ -174,6 +216,7 @@ impl ManagedDriver for Driver {
             format,
             out: out.clone(),
             insecure: spec.insecure,
+            tool,
         };
         let hash = {
             let mut h =
@@ -227,16 +270,25 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("out {:?} has no file name", def.out))?;
         let out_tar = req.sandbox_pkg_dir.join(out_name);
 
-        let argv = pull_argv(
-            &self.skopeo_bin,
-            &def.src,
-            def.format,
-            &out_tar,
-            def.insecure,
-        );
-        run_cmd_cancellable(argv, ctoken, "skopeo copy (oci_pull)")
-            .await
-            .with_context(|| format!("pull image {}", def.src))?;
+        match def.tool {
+            Tool::Skopeo => {
+                let argv = pull_argv(
+                    &self.skopeo_bin,
+                    &def.src,
+                    def.format,
+                    &out_tar,
+                    def.insecure,
+                );
+                run_cmd_cancellable(argv, ctoken, "skopeo copy (oci_pull)")
+                    .await
+                    .with_context(|| format!("pull image {}", def.src))?;
+            }
+            Tool::Docker => {
+                docker_pull(&self.docker_bin, &def.src, &out_tar, ctoken)
+                    .await
+                    .with_context(|| format!("pull image {}", def.src))?;
+            }
+        }
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -358,11 +410,45 @@ mod tests {
         assert_ne!(a.target_def.hash, b.target_def.hash);
     }
 
+    /// A docker-format pull defaults to the `docker` tool (docker pull + save) —
+    /// no skopeo needed.
+    #[tokio::test]
+    async fn parse_docker_format_defaults_to_docker_tool() {
+        let resp = parse(
+            "//base:x",
+            cfg(&[
+                ("ref", Value::String("alpine@sha256:abc".to_string())),
+                ("format", Value::String("docker".to_string())),
+            ]),
+        )
+        .await;
+        assert_eq!(resp.target_def.def::<OciPullDef>().tool, Tool::Docker);
+    }
+
+    /// docker save only makes a docker archive — docker+oci is rejected.
+    #[tokio::test]
+    async fn parse_docker_tool_with_oci_format_fails() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//base:x",
+                    cfg(&[
+                        ("ref", Value::String("alpine@sha256:abc".to_string())),
+                        ("tool", Value::String("docker".to_string())),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("docker+oci must fail");
+        assert!(format!("{err:#}").contains("oci"), "got: {err:#}");
+    }
+
     #[test]
-    fn with_binary_overrides_skopeo_bin() {
-        assert_eq!(
-            Driver::with_binary("/fake/skopeo").skopeo_bin,
-            "/fake/skopeo"
-        );
+    fn with_binaries_overrides() {
+        let d = Driver::with_binaries("/fake/skopeo", "/fake/docker");
+        assert_eq!(d.skopeo_bin, "/fake/skopeo");
+        assert_eq!(d.docker_bin, "/fake/docker");
     }
 }
