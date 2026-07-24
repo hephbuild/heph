@@ -313,24 +313,21 @@ pub(crate) fn build_source_map(
         }
         let source_addr_str = managed_input.input.source_addr.format();
         let filters = &managed_input.input.filters;
-        // Walk artifact directly instead of reading list_path: after group
-        // expansion, multiple inputs share parent origin_id → list_path_for
-        // gives them one shared file (opened append). Reading that shared
-        // list per-input would let the last-iterated input's source_addr
-        // overwrite earlier ones for paths only the earlier inputs produced.
+        // Enumerate the artifact's own paths directly instead of reading
+        // list_path: after group expansion, multiple inputs share parent
+        // origin_id → list_path_for gives them one shared file (opened append).
+        // Reading that shared list per-input would let the last-iterated input's
+        // source_addr overwrite earlier ones for paths only the earlier inputs
+        // produced. `entry_paths` is header-only for tar-backed content, so this
+        // maps paths without reading the file bytes.
         let content = managed_input.input.artifact.content.as_ref();
-        for entry in content
-            .walk()
-            .with_context(|| format!("walk content for source_map (source={source_addr_str})"))?
-        {
-            let entry = entry
-                .with_context(|| format!("read entry for source_map (source={source_addr_str})"))?;
-            if !filters.is_empty() && !filters.iter().any(|f| Path::new(f) == entry.path.as_path())
-            {
+        for rel in content.entry_paths().with_context(|| {
+            format!("enumerate content for source_map (source={source_addr_str})")
+        })? {
+            if !filters.is_empty() && !filters.iter().any(|f| Path::new(f) == rel.as_path()) {
                 continue;
             }
-            let rel = entry.path.to_string_lossy().into_owned();
-            source_map.insert(rel, source_addr_str.clone());
+            source_map.insert(rel.to_string_lossy().into_owned(), source_addr_str.clone());
         }
     }
     Ok(source_map)
