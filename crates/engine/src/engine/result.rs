@@ -1365,27 +1365,45 @@ impl Engine {
                 // `/nix/store/...` wrapper paths) set it false so a wrapper built
                 // on one machine is never pulled onto another that lacks that
                 // store path — which would `exec` a missing path (status 127).
-                let downloaded =
-                    if def.target.cache.remote_enabled && self.remote_caches.has_readable() {
-                        let addr_s = addr.format();
-                        crate::engine::event::emit_scope(
-                            &rs,
-                            crate::engine::event::BuildEventKind::RemoteCacheReadStart {
-                                addr: addr_s.clone(),
-                            },
-                            move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
-                                addr: addr_s,
-                                error,
-                            },
-                            self.download_from_remote(ctoken, addr, opts.hashin.as_str()),
-                        )
-                        .await?
-                    } else {
-                        None
-                    };
+                let remote_attempted =
+                    def.target.cache.remote_enabled && self.remote_caches.has_readable();
+                let downloaded = if remote_attempted {
+                    let addr_s = addr.format();
+                    crate::engine::event::emit_scope(
+                        &rs,
+                        crate::engine::event::BuildEventKind::RemoteCacheReadStart {
+                            addr: addr_s.clone(),
+                        },
+                        move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
+                            addr: addr_s,
+                            error,
+                        },
+                        self.download_from_remote(ctoken, addr, opts.hashin.as_str()),
+                    )
+                    .await?
+                } else {
+                    None
+                };
                 match downloaded {
-                    Some(manifest) => (None, Some(Arc::new(manifest))),
+                    Some(manifest) => {
+                        // A remote pull that landed a revision is a cache hit —
+                        // "already built elsewhere", execution skipped. Emit it so
+                        // the cached count (TUI, GHA, telemetry) reflects remote
+                        // hits, not just local ones.
+                        rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
+                            addr: addr.format(),
+                        });
+                        (None, Some(Arc::new(manifest)))
+                    }
                     None => {
+                        // Only a real remote lookup that came back empty is a
+                        // remote miss; skip the event when no readable remote was
+                        // consulted at all.
+                        if remote_attempted {
+                            rs.emit(crate::engine::event::BuildEventKind::RemoteCacheMiss {
+                                addr: addr.format(),
+                            });
+                        }
                         let (cached, meta) = self
                             .clone()
                             .execute_and_cache_inner(rs.clone(), opts)
@@ -3257,6 +3275,76 @@ mod tests {
                 |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
             ),
             "remote-on target must use the remote hit, not execute: {events:?}"
+        );
+        Ok(())
+    }
+
+    /// A remote pull that lands a revision must emit `RemoteCacheHit` (not just
+    /// the `RemoteCacheRead` span) so the cached count downstream — TUI header,
+    /// GHA summary, telemetry — includes remote hits, not only local ones. A
+    /// remote lookup that comes back empty must emit `RemoteCacheMiss`.
+    #[tokio::test]
+    async fn remote_hit_and_miss_emit_cache_events() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+
+        // Cold engine, empty remote: the pull misses, so a `RemoteCacheMiss`
+        // fires and the target executes.
+        let (miss_engine, _miss_home) =
+            engine_with_remote(vec![static_target("//pkg:t", &[], &[])], &remote_uri)?;
+        let (res, events) = resolve_collecting_events(&miss_engine, &addr).await;
+        res.expect("target must resolve on a remote miss");
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::RemoteCacheMiss { addr } if addr == "//pkg:t")
+            ),
+            "empty remote must emit RemoteCacheMiss: {events:?}"
+        );
+        assert!(
+            !events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::RemoteCacheHit { addr } if addr == "//pkg:t")
+            ),
+            "a miss must not emit RemoteCacheHit: {events:?}"
+        );
+
+        // Seed the remote deterministically: a fresh engine sharing the remote
+        // executes and uploads, guaranteeing the revision is present to pull.
+        let (seeder, _seeder_home) =
+            engine_with_remote(vec![static_target("//pkg:t", &[], &[])], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        seeder
+            .clone()
+            .result_addr(
+                seed_rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drain_bg(&seed_rs).await;
+        assert!(
+            count_files(remote.path()) > 0,
+            "seed must populate the remote"
+        );
+
+        // Cold engine against the seeded remote: the pull hits, emitting
+        // `RemoteCacheHit` and skipping execution.
+        let (hit_engine, _hit_home) =
+            engine_with_remote(vec![static_target("//pkg:t", &[], &[])], &remote_uri)?;
+        let (res, events) = resolve_collecting_events(&hit_engine, &addr).await;
+        res.expect("target must resolve on a remote hit");
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::RemoteCacheHit { addr } if addr == "//pkg:t")
+            ),
+            "a remote pull must emit RemoteCacheHit: {events:?}"
+        );
+        assert!(
+            !events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
+            ),
+            "a remote hit must not execute: {events:?}"
         );
         Ok(())
     }
