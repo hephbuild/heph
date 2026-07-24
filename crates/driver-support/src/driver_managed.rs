@@ -1,7 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hartifactcontent;
-use hcore::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
 use hcore::hasync::{self, Cancellable};
 use hplugin::driver::inputartifact;
 use hplugin::driver::outputartifact::Content::TarPath;
@@ -381,17 +380,15 @@ pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {
 /// claimed by the *same* `source_addr` more than once — a diamond dependency, or
 /// a target depended on twice — resolves to a single owner and is allowed.
 ///
-/// Only file and symlink paths are compared — directory entries are skipped, so
-/// shared parent directories never trip the check (two targets may populate
+/// Only file and symlink paths are compared — directory entries are excluded,
+/// so shared parent directories never trip the check (two targets may populate
 /// disjoint files under a common dir). `filters` are honored so a
 /// partially-consumed input only claims the paths it exposes.
 ///
-/// Enumerates each input header-only: it builds a [`TarIndex`] over the
-/// seekable reader, which seeks past file data instead of reading it, so the
-/// check stays cheap and — crucially — does not read the input bytes the FUSE
-/// path is designed never to touch. Only content with no seekable reader falls
-/// back to a full [`Content::walk`], and those inputs get unpacked (their bytes
-/// read) regardless.
+/// Path enumeration goes through [`Content::entry_paths`], which the tar-backed
+/// cache artifact implements as a header-only scan (seeking past file data), so
+/// the check stays cheap and does not read the input bytes the FUSE path is
+/// designed never to touch — the format detail stays behind the trait.
 ///
 /// Runs on the execution (cache-miss) path before any input is materialized, so
 /// a collision fails fast with both producers named rather than silently
@@ -403,7 +400,7 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
     for (unpack_root, inputs) in groups {
         for input in inputs {
             let producer = input.source_addr.format();
-            let paths = input_claim_paths(input).with_context(|| {
+            let paths = input.artifact.content.entry_paths().with_context(|| {
                 format!(
                     "enumerate paths for output-collision check \
                      (origin_id={}, source_addr={producer})",
@@ -434,36 +431,6 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
         }
     }
     Ok(())
-}
-
-/// Relative file/symlink paths an input contributes, for collision checking.
-/// Prefers the seekable header-only [`TarIndex`] (seeks past data); falls back
-/// to a full [`Content::walk`] only when the content has no seekable reader.
-/// Directory entries are excluded — collisions are at file granularity.
-fn input_claim_paths(input: &RunInput) -> anyhow::Result<Vec<PathBuf>> {
-    if let Some(reader) = input
-        .artifact
-        .content
-        .seekable_reader()
-        .context("open seekable reader")?
-    {
-        let index = TarIndex::build(reader).context("build tar index")?;
-        return Ok(index
-            .entries
-            .into_iter()
-            .filter(|(_, e)| !matches!(e.kind, IndexEntryKind::Dir))
-            .map(|(path, _)| path)
-            .collect());
-    }
-    // Non-seekable: full walk (reads data). walk() already yields only
-    // file/symlink entries, no directories.
-    input
-        .artifact
-        .content
-        .walk()
-        .context("walk content")?
-        .map(|e| e.map(|e| e.path))
-        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -607,7 +574,7 @@ fn pack_to_artifact_tar(
 mod source_map_tests {
     use super::*;
     use hcore::hartifactcontent::tar::{TarPacker, TarWalker};
-    use hcore::hartifactcontent::{Content, ReadSeek, WalkEntry};
+    use hcore::hartifactcontent::{Content, WalkEntry};
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::inputartifact::{InputArtifact, Type};
     use std::io::{Cursor, Read};
@@ -623,11 +590,6 @@ mod source_map_tests {
         }
         fn hashout(&self) -> anyhow::Result<String> {
             Ok(String::new())
-        }
-        // Real artifacts are seekable, so the collision check enumerates paths
-        // via the header-only `TarIndex` path; mirror that here.
-        fn seekable_reader(&self) -> anyhow::Result<Option<Box<dyn ReadSeek + Send>>> {
-            Ok(Some(Box::new(Cursor::new(self.0.clone()))))
         }
     }
 
@@ -868,66 +830,5 @@ mod source_map_tests {
             make_input("dep|b|0", "//pkg:_b", &[("pkg/x.txt", "2")]),
         ]);
         detect_output_collisions(&groups).expect("filtered-out path must not collide");
-    }
-
-    /// Pack a single explicit directory entry plus a file under it.
-    fn pack_dir_and_file(dir: &str, file: &str, body: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut b = tar::Builder::new(&mut buf);
-            let mut dh = tar::Header::new_gnu();
-            dh.set_entry_type(tar::EntryType::Directory);
-            dh.set_size(0);
-            dh.set_mode(0o755);
-            b.append_data(&mut dh, dir, std::io::empty())
-                .expect("append dir");
-            let mut fh = tar::Header::new_gnu();
-            fh.set_entry_type(tar::EntryType::Regular);
-            fh.set_size(body.len() as u64);
-            fh.set_mode(0o644);
-            b.append_data(&mut fh, file, body.as_bytes())
-                .expect("append file");
-            b.finish().expect("finish");
-        }
-        buf
-    }
-
-    fn make_raw_input(origin_id: &str, source_addr: &str, tar: Vec<u8>) -> ManagedRunInput {
-        ManagedRunInput {
-            input: RunInput {
-                artifact: InputArtifact {
-                    r#type: Type::Dep,
-                    origin_id: origin_id.to_string(),
-                    content: Arc::new(TarBytes(tar)),
-                },
-                origin_id: origin_id.to_string(),
-                source_addr: parse_addr(source_addr).expect("parse addr"),
-                filters: vec![],
-                annotations: BTreeMap::new(),
-            },
-            list_path: Some(PathBuf::from("/dev/null")),
-            unpack_root: PathBuf::from("/ws"),
-        }
-    }
-
-    // Two targets whose archives both carry an *explicit* directory entry for
-    // the same shared dir must not collide on that directory — only the file
-    // paths under it matter. (The header-only TarIndex path indexes dir
-    // entries; the check must skip them, matching walk() semantics.)
-    #[test]
-    fn shared_explicit_dir_entry_does_not_collide() {
-        let groups = group(vec![
-            make_raw_input(
-                "dep|a|0",
-                "//pkg:_a",
-                pack_dir_and_file("shared/", "shared/a.txt", "a"),
-            ),
-            make_raw_input(
-                "dep|b|0",
-                "//pkg:_b",
-                pack_dir_and_file("shared/", "shared/b.txt", "b"),
-            ),
-        ]);
-        detect_output_collisions(&groups).expect("shared dir entry must not collide");
     }
 }

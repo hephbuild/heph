@@ -179,6 +179,21 @@ impl hartifactcontent::Content for CacheArtifact {
         Ok(self.hashout.clone())
     }
 
+    fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        match &self.content_type {
+            // Header-only: index the tar over the seekable reader (seeks past
+            // file data) instead of walking and reading every byte.
+            hartifactcontent::Type::Tar => {
+                let reader = self.seekable_reader()?.ok_or_else(|| {
+                    anyhow::anyhow!("tar cache artifact {} has no seekable reader", self.name)
+                })?;
+                Ok(hcore::hartifactcontent::tar_index::TarIndex::build(reader)?.entry_paths())
+            }
+            // No index for cpio yet — fall back to the walk-based default.
+            hartifactcontent::Type::Cpio => self.walk()?.map(|r| r.map(|e| e.path)).collect(),
+        }
+    }
+
     fn seekable_reader(
         &self,
     ) -> anyhow::Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
