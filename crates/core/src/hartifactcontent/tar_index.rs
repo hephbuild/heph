@@ -74,6 +74,18 @@ impl TarIndex {
         }
         Ok(Self { entries })
     }
+
+    /// Relative paths of the file and symlink entries, directory entries
+    /// excluded — the header-only enumeration backing
+    /// [`Content::entry_paths`](crate::hartifactcontent::Content::entry_paths)
+    /// for tar-backed content.
+    pub fn entry_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| !matches!(e.kind, IndexEntryKind::Dir))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +138,41 @@ mod tests {
         let mut out = vec![0u8; b.size as usize];
         cur.read_exact(&mut out).expect("read");
         assert_eq!(out, b"world!");
+    }
+
+    #[test]
+    fn entry_paths_excludes_directories() {
+        // Pack an explicit directory entry plus a file under it. entry_paths
+        // must return the file (and any symlink) but not the directory.
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut dh = tar::Header::new_gnu();
+            dh.set_entry_type(tar::EntryType::Directory);
+            dh.set_size(0);
+            dh.set_mode(0o755);
+            b.append_data(&mut dh, "d/", std::io::empty())
+                .expect("append dir");
+            let mut fh = tar::Header::new_gnu();
+            fh.set_entry_type(tar::EntryType::Regular);
+            fh.set_size(3);
+            fh.set_mode(0o644);
+            b.append_data(&mut fh, "d/f.txt", &b"abc"[..])
+                .expect("append file");
+            b.finish().expect("finish");
+        }
+        let idx = TarIndex::build(Cursor::new(buf)).expect("build");
+        let paths = idx.entry_paths();
+        assert!(
+            paths.contains(&PathBuf::from("d/f.txt")),
+            "file must be listed: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p == std::path::Path::new("d/") || p == std::path::Path::new("d")),
+            "directory entry must be excluded: {paths:?}"
+        );
     }
 
     #[cfg(unix)]

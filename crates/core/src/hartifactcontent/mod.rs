@@ -40,6 +40,17 @@ pub trait Content: Send + Sync {
     fn reader(&self) -> anyhow::Result<Box<dyn io::Read>>;
     fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>;
     fn hashout(&self) -> anyhow::Result<String>;
+    /// Relative paths of the file and symlink entries in this content —
+    /// directory entries excluded. Intended for callers that only need the set
+    /// of materialized paths (e.g. output-collision detection), not the bytes.
+    ///
+    /// The default enumerates via [`Content::walk`], which for stream-only
+    /// backings reads (and discards) file data to advance. Seekable, indexable
+    /// backings (tar-backed cache artifacts) override this with a header-only
+    /// scan that seeks past data — keeping the format detail behind the trait.
+    fn entry_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        self.walk()?.map(|r| r.map(|e| e.path)).collect()
+    }
     /// Returns a seekable handle to the underlying bytes when the backing
     /// store supports random access (sqlite blobs, on-disk files). Backends
     /// without efficient seek (pipes, streams) return `Ok(None)` and the

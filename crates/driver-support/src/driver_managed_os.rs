@@ -1,6 +1,6 @@
 use crate::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, list_path_for,
-    resolve_unpack_root, write_source_map,
+    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, detect_output_collisions,
+    invoke_inner, list_path_for, resolve_unpack_root, write_source_map,
 };
 use anyhow::Context;
 use hcore::hartifactcontent;
@@ -62,6 +62,12 @@ impl ManagedDriverOs {
             let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
             groups.entry(unpack_root).or_default().push(input);
         }
+
+        // Reject two distinct targets producing the same sandbox file before we
+        // materialize anything — the copy path would otherwise silently
+        // last-write-wins.
+        detect_output_collisions(&groups)
+            .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
 
         let mut inputs: Vec<ManagedRunInput> = Vec::new();
         for (unpack_root, group) in groups {

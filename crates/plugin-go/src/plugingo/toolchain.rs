@@ -257,18 +257,20 @@ pub(crate) fn resolve_target_go(inputs: &[ManagedRunInput]) -> anyhow::Result<st
         .find(|m| m.input.origin_id.starts_with(&prefix))
         .context("go toolchain: target `gosdk` dep not staged")?;
 
+    // Only paths are needed to locate the `go` binary — `entry_paths` is
+    // header-only for tar-backed content, so we don't read the whole SDK tree
+    // (~thousands of files) just to match a filename.
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    for entry in gosdk
+    for rel in gosdk
         .input
         .artifact
         .content
         .as_ref()
-        .walk()
-        .context("walk target toolchain output")?
+        .entry_paths()
+        .context("enumerate target toolchain output")?
     {
-        let entry = entry.context("read target toolchain entry")?;
-        if entry.path.file_name().and_then(|n| n.to_str()) == Some("go") {
-            candidates.push(gosdk.unpack_root.join(&entry.path));
+        if rel.file_name().and_then(|n| n.to_str()) == Some("go") {
+            candidates.push(gosdk.unpack_root.join(&rel));
         }
     }
 

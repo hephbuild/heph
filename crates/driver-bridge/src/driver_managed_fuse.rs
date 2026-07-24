@@ -3,8 +3,8 @@ use hcore::hartifactcontent;
 use hcore::hartifactcontent::tar_index::TarIndex;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, invoke_inner, list_path_for,
-    resolve_unpack_root, write_source_map,
+    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, detect_output_collisions,
+    invoke_inner, list_path_for, resolve_unpack_root, write_source_map,
 };
 use hplugin::driver::{RunInput, RunRequest, RunResponse, SandboxGuard};
 use hsandboxfuse as sandboxfuse;
@@ -65,6 +65,12 @@ impl ManagedDriverFuse {
             let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
             groups.entry(unpack_root).or_default().push(input);
         }
+
+        // Reject two distinct targets producing the same sandbox file before we
+        // register any slot — overlapping layer paths would otherwise silently
+        // shadow by registration order.
+        detect_output_collisions(&groups)
+            .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
 
         let mut slot_guards: Vec<sandboxfuse::SlotGuard> = Vec::new();
         let mut inputs: Vec<ManagedRunInput> = Vec::new();
