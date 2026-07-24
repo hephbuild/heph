@@ -1520,6 +1520,26 @@ impl ProviderInner {
             let Some((vref, _)) = chosen else {
                 return Err(GetError::NotFound);
             };
+            // The magic target must resolve exactly where the real `build` does —
+            // a `main` package. A non-main / library / directory-only package (no
+            // buildable Go files) has no `build`, so decline here on the *magic*
+            // addr rather than emit a `group` whose `build@v=…` dep can't resolve.
+            // Declining on the self addr lets the codegen/query/`validate` walks
+            // skip it (they match a self-addr `TargetNotFound`); a cross-addr dep
+            // NotFound would surface instead. Checked via the chosen variant's
+            // `_golist` (engine-cached; the real `build@v=…` reads the same one).
+            let golist_addr = self.make_addr_with_name(&addr.package, "_golist", &vref);
+            match self
+                .read_golist_package(Arc::clone(&req.executor), &golist_addr)
+                .await
+            {
+                Ok(pkg) if pkg.name.as_deref() == Some("main") => {}
+                Ok(_) => return Err(GetError::NotFound),
+                Err(e) if downcast_chain_ref::<NoGoFilesError>(&e).is_some() => {
+                    return Err(GetError::NotFound);
+                }
+                Err(e) => return Err(GetError::Other(e)),
+            }
             let target = Addr::new(
                 addr.package.clone(),
                 "build".to_string(),
@@ -5802,13 +5822,14 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
     }
 
-    /// The magic host-default `build`: a bare `//pkg:build` resolves to a `group`
-    /// target forwarding to `build@v=<host-matching variant>`.
+    /// The magic host-default `build`: a bare `//pkg:build` on a `main` package
+    /// resolves to a `group` target forwarding to `build@v=<host-matching variant>`.
     #[tokio::test]
     async fn magic_build_returns_group_forwarding_to_host_variant() {
-        let sandbox = copy_fixture("with_test");
+        require_go!();
+        let sandbox = copy_fixture("with_dep"); // `cmd` is `package main`
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let addr = Addr::new(PkgBuf::from("pkg"), "build".to_string(), Default::default());
+        let addr = Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default());
         let resp = provider_get(&p, addr).await.expect("magic build resolves");
         let spec = resp.target_spec;
         assert_eq!(spec.driver, "group");
@@ -5818,16 +5839,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         };
         assert_eq!(
             deps,
-            &vec![Value::String("//pkg:build@v=host".into())],
+            &vec![Value::String("//cmd:build@v=host".into())],
             "magic build must forward to the host variant"
         );
     }
 
     /// No ancestry variant matches the host os/arch → the magic bare `build` does
-    /// not resolve (there is nothing to forward to).
+    /// not resolve (there is nothing to forward to). Checked before `go list`.
     #[tokio::test]
     async fn magic_build_not_found_without_host_variant() {
-        let sandbox = copy_fixture("with_test");
+        let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let cross = State {
             package: PkgBuf::from(""),
@@ -5845,7 +5866,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         };
         let req = GetRequest {
             request_id: "test".to_string(),
-            addr: Addr::new(PkgBuf::from("pkg"), "build".to_string(), Default::default()),
+            addr: Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default()),
             states: vec![cross],
             executor: test_executor(sandbox.path()),
         };
@@ -5853,6 +5874,25 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             matches!(res, Err(GetError::NotFound)),
             "magic build must NotFound when no host variant exists"
+        );
+    }
+
+    /// Regression: the magic bare `build` on a NON-main package (a library or a
+    /// directory that only holds go sub-packages) must resolve to a self-addr
+    /// `NotFound` — exactly like the real `build@v=…` — so the codegen/query
+    /// walks skip it, rather than emitting a `group` whose `build@v=…` dep can't
+    /// resolve (which surfaced as a cross-addr `target not found` in
+    /// `heph tool gen-gitignore`).
+    #[tokio::test]
+    async fn magic_build_not_found_for_non_main_package() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep"); // `lib` is a library (package lib)
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(PkgBuf::from("lib"), "build".to_string(), Default::default());
+        let res = provider_get(&p, addr).await;
+        assert!(
+            matches!(res, Err(GetError::NotFound)),
+            "magic build on a non-main package must NotFound"
         );
     }
 
