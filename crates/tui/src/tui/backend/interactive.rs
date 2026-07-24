@@ -214,12 +214,21 @@ pub async fn run<A: App + 'static>(
                         // Also quits a viewport held open after the run finished.
                         quit = true;
                     }
+                    // `q` off the main view returns to it (like Esc); on the main
+                    // view it quits a held (finished) viewport. Ignored mid-search
+                    // (captured as query input below).
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Char('q'),
                         kind: KeyEventKind::Press,
                         ..
-                    }))) if held && !view.is_searching() => {
-                        quit = true;
+                    }))) if !view.is_searching() => {
+                        if view.is_on_main_view() {
+                            if held {
+                                quit = true;
+                            }
+                        } else {
+                            view.back_to_main();
+                        }
                     }
                     // Approval prompt active: `y`/`n` resolve the gated target and
                     // Enter expands/collapses its notice. These precede the normal
@@ -305,12 +314,19 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) => view.search_start(),
-                    // Esc clears the filter whether mid-type or already confirmed.
+                    // Esc clears the filter whether mid-type or already confirmed;
+                    // with no filter active it returns to the main view.
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Esc,
                         kind: KeyEventKind::Press,
                         ..
-                    }))) => view.search_cancel(),
+                    }))) => {
+                        if view.has_active_filter() {
+                            view.search_cancel();
+                        } else {
+                            view.back_to_main();
+                        }
+                    }
                     Some(Ok(Event::Resize(w, _))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is

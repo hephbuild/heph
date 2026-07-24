@@ -117,6 +117,12 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
+/// Paint a header span as the active tab: a blue background with white text so
+/// the selected view reads as highlighted in the status line.
+fn highlight_span(s: &Span<'static>) -> Span<'static> {
+    Span::styled(s.content.clone(), s.style.bg(Color::Blue).fg(Color::White))
+}
+
 /// One braille cell per group of [`WORKERS_PER_CELL`] worker slots. Busy slots
 /// fill left-to-right across cells; an all-idle cell is dim grey, any-busy cell
 /// is blue at the glyph matching its busy count.
@@ -237,17 +243,24 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
 }
 
 /// Which body the TUI viewport is showing. The default view is the live
-/// slow-target / lock-wait breakdown; the [`ViewMode::Failed`] view lists every
-/// errored target and the [`ViewMode::Done`] view every completed one. `Tab`
-/// cycles through `[Default]` plus one entry per [`HeaderItem::Tab`] the header
-/// model exposes.
+/// slow-target / lock-wait breakdown; the list views each mirror one header
+/// counter — [`ViewMode::Done`] the completed count, [`ViewMode::Matched`] the
+/// matched total, [`ViewMode::Cached`] the cached count, [`ViewMode::Failed`]
+/// the failed count. `Tab` cycles through `[Default]` plus one entry per
+/// tab-bound header segment the header model exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     /// The live breakdown: slow targets + lock waits (or idle art when empty).
     Default,
     /// The list of completed (successfully finished) targets, scoped by the
-    /// active [`CountScope`] (matched set vs every observed target).
+    /// active [`CountScope`] (matched set vs every observed target). Mirrors the
+    /// `X` of the header's `X / Y done`.
     Done,
+    /// The list of matched top-level targets. Mirrors the `Y` of the header's
+    /// `X / Y done`.
+    Matched,
+    /// The list of targets that hit cache. Mirrors the header's cached count.
+    Cached,
     /// The list of failed targets.
     Failed,
 }
@@ -287,6 +300,38 @@ pub enum HeaderItem {
         mode: ViewMode,
         spans: Vec<Span<'static>>,
     },
+    /// A single header segment composed of several parts rendered with NO
+    /// internal ` · ` separator (the parts bake in their own connective text,
+    /// e.g. ` / ` and ` done`). Each part may bind to its own body view and is
+    /// highlighted independently while that view is active — this is how the
+    /// `X / Y done` segment highlights `X` (Done) and `Y` (Matched) separately.
+    Split(Vec<HeaderPart>),
+}
+
+/// One part of a [`HeaderItem::Split`] segment: its spans plus an optional body
+/// view. `Some(mode)` makes the part a tab — selectable via `Tab` and
+/// highlighted while `mode` is the active view; `None` is inert connective text.
+pub struct HeaderPart {
+    mode: Option<ViewMode>,
+    spans: Vec<Span<'static>>,
+}
+
+impl HeaderPart {
+    /// An inert (non-selectable) text part.
+    fn text(s: impl Into<String>) -> Self {
+        HeaderPart {
+            mode: None,
+            spans: vec![Span::raw(s.into())],
+        }
+    }
+
+    /// A text part bound to a body view.
+    fn tab(mode: ViewMode, s: impl Into<String>) -> Self {
+        HeaderPart {
+            mode: Some(mode),
+            spans: vec![Span::raw(s.into())],
+        }
+    }
 }
 
 impl HeaderItem {
@@ -305,9 +350,12 @@ impl HeaderItem {
 
     /// The item's spans, regardless of variant (used by tests).
     #[cfg(test)]
-    fn spans(&self) -> &[Span<'static>] {
+    fn spans(&self) -> Vec<Span<'static>> {
         match self {
-            HeaderItem::Text(spans) | HeaderItem::Tab { spans, .. } => spans,
+            HeaderItem::Text(spans) | HeaderItem::Tab { spans, .. } => spans.clone(),
+            HeaderItem::Split(parts) => {
+                parts.iter().flat_map(|p| p.spans.iter().cloned()).collect()
+            }
         }
     }
 }
@@ -647,6 +695,29 @@ impl BuildState {
         (done, format!("{cached} cached"), format!("{failed} failed"))
     }
 
+    /// The done segment split for per-view header tabs: `(count, total)`.
+    /// `count` is the finished number (bound to the Done view); `total` is the
+    /// denominator (bound to the Matched view, `~`-prefixed while the matcher is
+    /// still streaming). `total` is `None` before any `Matched` event, where the
+    /// segment reads `{built} done` with no denominator. Mirrors the string built
+    /// by [`BuildState::count_fields`] so the split header and plain summary agree.
+    pub fn done_parts(&self, scope: CountScope) -> (String, Option<String>) {
+        match scope {
+            CountScope::All => {
+                let done = self.finished.len();
+                let total = done + self.in_flight_results.len();
+                (done.to_string(), Some(total.to_string()))
+            }
+            CountScope::Matched => match self.matched_progress() {
+                Some((done, total, complete)) => {
+                    let tilde = if complete { "" } else { "~" };
+                    (done.to_string(), Some(format!("{tilde}{total}")))
+                }
+                None => (self.built.to_string(), None),
+            },
+        }
+    }
+
     /// The textual count segment shared by the live header and the final
     /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
     /// braille — callers prepend the elapsed field themselves.
@@ -698,6 +769,58 @@ impl BuildState {
                 Line::from(Span::styled(
                     format!("  {addr}"),
                     Style::default().fg(Color::Green),
+                ))
+            })
+            .collect()
+    }
+
+    /// Body rows for the [`ViewMode::Matched`] view: every matched top-level
+    /// target, sorted for a stable order (the matched set is a `HashSet`).
+    /// Finished targets render green, still-pending ones default-white. Empty
+    /// before any `Matched` event arrives.
+    pub fn matched_lines(&self, filter: &str) -> Vec<Line<'static>> {
+        let mut addrs: Vec<&String> = self
+            .matched
+            .iter()
+            .filter(|a| addr_matches(a, filter))
+            .collect();
+        addrs.sort();
+        addrs
+            .into_iter()
+            .map(|addr| {
+                let color = if self.finished.contains(addr) {
+                    Color::Green
+                } else {
+                    Color::White
+                };
+                Line::from(Span::styled(format!("  {addr}"), Style::default().fg(color)))
+            })
+            .collect()
+    }
+
+    /// Body rows for the [`ViewMode::Cached`] view: every target that hit cache
+    /// (local or remote), scoped like the header's cached count — `Matched` keeps
+    /// only matched top-level targets (all cache hits before any `Matched` event),
+    /// `All` lists every cached target. Sorted for a stable order (cache hits are
+    /// a `HashSet`). Empty when nothing has hit cache.
+    pub fn cached_lines(&self, scope: CountScope, filter: &str) -> Vec<Line<'static>> {
+        let mut addrs: Vec<&String> = self
+            .cache_hit
+            .iter()
+            .filter(|a| match scope {
+                CountScope::All => true,
+                CountScope::Matched if self.matched_seen => self.matched.contains(*a),
+                CountScope::Matched => true,
+            })
+            .filter(|a| addr_matches(a, filter))
+            .collect();
+        addrs.sort();
+        addrs
+            .into_iter()
+            .map(|addr| {
+                Line::from(Span::styled(
+                    format!("  {addr}"),
+                    Style::default().fg(Color::Cyan),
                 ))
             })
             .collect()
@@ -922,11 +1045,26 @@ impl BuildHeader {
 
 impl ProgressHeader for BuildHeader {
     fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
-        let (done, cached, failed) = core.count_fields(scope);
+        let (_, cached, failed) = core.count_fields(scope);
+        // The done segment `X / Y done` splits into two independent tabs: `X`
+        // (the finished count → Done view) and `Y` (the matched total → Matched
+        // view). The connective ` / ` and trailing ` done` are inert text. Before
+        // any `Matched` event there is no denominator, so it reads `{built} done`
+        // with only the Done tab.
+        let (done_n, total) = core.done_parts(scope);
+        let mut done_parts = vec![HeaderPart::tab(ViewMode::Done, done_n)];
+        match total {
+            Some(total) => {
+                done_parts.push(HeaderPart::text(" / "));
+                done_parts.push(HeaderPart::tab(ViewMode::Matched, total));
+                done_parts.push(HeaderPart::text(" done"));
+            }
+            None => done_parts.push(HeaderPart::text(" done")),
+        }
         let mut items = vec![
-            // The done count is a tab into the completed-targets view.
-            HeaderItem::tab(ViewMode::Done, done),
-            HeaderItem::text(cached),
+            HeaderItem::Split(done_parts),
+            // The cached count is a tab into the cached-targets view.
+            HeaderItem::tab(ViewMode::Cached, cached),
             // The failed count is a tab into the failed-targets view.
             HeaderItem::tab(ViewMode::Failed, failed),
         ];
@@ -1138,18 +1276,17 @@ impl TuiProgressView {
     /// order. `Tab` walks this list.
     fn view_modes(&self) -> Vec<ViewMode> {
         let mut modes = vec![ViewMode::Default];
-        modes.extend(
-            self.model
-                .header(&self.state, self.scope.get())
-                .iter()
-                .filter_map(|i| {
-                    if let HeaderItem::Tab { mode, .. } = i {
-                        Some(*mode)
-                    } else {
-                        None
-                    }
-                }),
-        );
+        for item in self.model.header(&self.state, self.scope.get()) {
+            match item {
+                HeaderItem::Tab { mode, .. } => modes.push(mode),
+                // A split segment contributes each of its tab-bound parts, in
+                // order — so `X / Y done` yields Done then Matched.
+                HeaderItem::Split(parts) => {
+                    modes.extend(parts.into_iter().filter_map(|p| p.mode));
+                }
+                HeaderItem::Text(_) => {}
+            }
+        }
         modes
     }
 
@@ -1190,8 +1327,15 @@ impl TuiProgressView {
             }
         }
         if self.finished_at_ms.is_some() {
+            // Off the main view `q`/esc step back to it (which then auto-exits);
+            // on the main view they quit. Reflect that in the notice.
+            let notice = if self.view.get() == ViewMode::Default {
+                "  ✓ finished — press q or Ctrl-C to quit"
+            } else {
+                "  ✓ finished — esc/q back to main · Ctrl-C to quit"
+            };
             return Line::from(Span::styled(
-                "  ✓ finished — press q or Ctrl-C to quit",
+                notice,
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -1202,14 +1346,16 @@ impl TuiProgressView {
             CountScope::Matched => "a all",
             CountScope::All => "a matched",
         };
-        // `/` only filters the list tabs, so only advertise it off the live view.
-        let search_hint = if self.view.get() == ViewMode::Default {
-            ""
+        // `/` filters and `esc` steps back — both only apply off the live view.
+        let (search_hint, back_hint) = if self.view.get() == ViewMode::Default {
+            ("", "")
         } else {
-            " · / search"
+            (" · / search", " · esc back")
         };
         Line::from(Span::styled(
-            format!("  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}"),
+            format!(
+                "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}{back_hint}"
+            ),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -1235,13 +1381,23 @@ impl TuiProgressView {
                 } if *mode == active => {
                     // Active tab: paint a background so the selected view reads
                     // as highlighted in the header.
-                    spans.extend(item_spans.iter().map(|s| {
-                        Span::styled(s.content.clone(), s.style.bg(Color::Blue).fg(Color::White))
-                    }));
+                    spans.extend(item_spans.iter().map(highlight_span));
                 }
                 HeaderItem::Tab {
                     spans: item_spans, ..
                 } => spans.extend(item_spans.iter().cloned()),
+                // A split segment renders its parts back-to-back with no ` · `
+                // between them; each tab-bound part highlights independently when
+                // its own view is active.
+                HeaderItem::Split(parts) => {
+                    for part in parts {
+                        if part.mode == Some(active) {
+                            spans.extend(part.spans.iter().map(highlight_span));
+                        } else {
+                            spans.extend(part.spans.iter().cloned());
+                        }
+                    }
+                }
             }
         }
         spans
@@ -1369,6 +1525,24 @@ impl TUIAppView for TuiProgressView {
         self.scope.set(next);
     }
 
+    fn is_on_main_view(&self) -> bool {
+        self.view.get() == ViewMode::Default
+    }
+
+    fn has_active_filter(&self) -> bool {
+        self.search_active.get() || !self.search_query.borrow().is_empty()
+    }
+
+    fn back_to_main(&mut self) {
+        self.view.set(ViewMode::Default);
+        // Reset the same per-tab state a `Tab` switch does: scroll, pan, and any
+        // filter scoped to the tab we are leaving.
+        self.scroll.set(0);
+        self.hscroll.set(0);
+        self.search_active.set(false);
+        self.search_query.borrow_mut().clear();
+    }
+
     fn approval_active(&self) -> bool {
         self.approval.as_ref().is_some_and(|c| c.is_active())
     }
@@ -1458,6 +1632,8 @@ impl TUIAppView for TuiProgressView {
                 b
             }
             ViewMode::Done => self.state.done_lines(self.scope.get(), filter),
+            ViewMode::Matched => self.state.matched_lines(filter),
+            ViewMode::Cached => self.state.cached_lines(self.scope.get(), filter),
             ViewMode::Failed => self.state.failed_lines(filter),
         };
         let filtering = !filter.is_empty();
@@ -1479,6 +1655,20 @@ impl TUIAppView for TuiProgressView {
                 // Done view with nothing completed: a single dim placeholder.
                 ViewMode::Done => lines.push(Line::from(Span::styled(
                     "  no completed targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+                // Matched view before any match streamed: a dim placeholder.
+                ViewMode::Matched => lines.push(Line::from(Span::styled(
+                    "  no matched targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+                // Cached view with nothing cached: a dim placeholder.
+                ViewMode::Cached => lines.push(Line::from(Span::styled(
+                    "  no cached targets",
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::DIM),
@@ -2481,16 +2671,17 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_default_done_failed_and_back() {
+    fn tab_cycles_default_done_matched_cached_failed_and_back() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, execute_start("//slow:x")));
-        v.apply(&ev(1, matched(&["//a:ok"], true)));
+        v.apply(&ev(1, matched(&["//a:ok", "//a:pending"], true)));
         v.apply(&ev(2, result_start("//a:ok")));
-        v.apply(&ev(3, result_end("//a:ok", None)));
-        v.apply(&ev(4, result_start("//a:bad")));
-        v.apply(&ev(5, result_end("//a:bad", Some("boom".into()))));
+        v.apply(&ev(3, local_cache_hit("//a:ok")));
+        v.apply(&ev(4, result_end("//a:ok", None)));
+        v.apply(&ev(5, result_start("//a:bad")));
+        v.apply(&ev(6, result_end("//a:bad", Some("boom".into()))));
 
-        // Default view shows the slow row, not the done/failed targets.
+        // Default view shows the slow row, not the list targets.
         let body = |v: &TuiProgressView| -> String {
             v.render("⠋", 10_000, 80, 8)
                 .iter()
@@ -2506,6 +2697,20 @@ mod tests {
         let done_body = body(&v);
         assert!(done_body.contains("//a:ok"), "{done_body}");
         assert!(!done_body.contains("//slow:x"), "{done_body}");
+
+        // Tab → matched view: shows every matched target (done + pending).
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Matched);
+        let matched_body = body(&v);
+        assert!(matched_body.contains("//a:ok"), "{matched_body}");
+        assert!(matched_body.contains("//a:pending"), "{matched_body}");
+
+        // Tab → cached view: shows the cache-hit target only.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Cached);
+        let cached_body = body(&v);
+        assert!(cached_body.contains("//a:ok"), "{cached_body}");
+        assert!(!cached_body.contains("//a:pending"), "{cached_body}");
 
         // Tab → failed view: shows the failed target.
         v.tab(true);
@@ -2623,9 +2828,10 @@ mod tests {
         assert!(!fixed.contains("//web:server"), "{fixed}");
 
         // Switching tabs drops the filter and exits search input.
-        v.tab(true); // Failed
+        v.tab(true); // → Matched
         assert!(!v.is_searching());
-        v.tab(true); // back to Default
+        // Return to the Done tab (Default → Done) and confirm the full list.
+        v.back_to_main();
         v.tab(true); // Done again — full list, no filter
         let full = body(&v);
         assert!(full.contains("//web:server"), "{full}");
@@ -2728,14 +2934,21 @@ mod tests {
     #[test]
     fn shift_tab_cycles_backwards() {
         let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, result_start("//a:bad")));
-        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
+        // A matched event gives the `X / Y done` denominator, so the Matched tab
+        // is present and all five modes exist.
+        v.apply(&ev(0, matched(&["//a:ok"], true)));
+        v.apply(&ev(1, result_start("//a:bad")));
+        v.apply(&ev(2, result_end("//a:bad", Some("boom".into()))));
 
-        // Three modes (Default, Done, Failed): backward from Default wraps to
-        // the last (Failed), then steps back through Done to Default.
+        // Five modes (Default, Done, Matched, Cached, Failed): backward from
+        // Default wraps to the last (Failed), then steps back to Default.
         assert_eq!(v.view.get(), ViewMode::Default);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Failed);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Cached);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Matched);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Done);
         v.tab(false);
@@ -2758,8 +2971,9 @@ mod tests {
         assert_eq!(plain.style.bg, None);
 
         // Active (failed view): the segment is highlighted with a background.
-        v.tab(true); // → Done
-        v.tab(true); // → Failed
+        // Failed is the last tab; a single shift-tab lands on it regardless of
+        // how many middle tabs the current state exposes.
+        v.tab(false); // → Failed
         let header = v.render("⠋", 100, 120, 8);
         let hl = header[0]
             .spans
@@ -2772,8 +2986,7 @@ mod tests {
     #[test]
     fn failed_view_with_no_failures_shows_placeholder() {
         let mut v = TuiProgressView::new("L");
-        v.tab(true); // → Done
-        v.tab(true); // → Failed, but nothing has failed
+        v.tab(false); // → Failed (last tab), but nothing has failed
         let body: String = v
             .render("⠋", 10_000, 80, 8)
             .iter()
@@ -2876,5 +3089,139 @@ mod tests {
         let lines = view.approval_lines();
         let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!banner.contains("pending"), "no count for one: {banner}");
+    }
+
+    /// The `X / Y done` header splits into two independent tabs: the Done view
+    /// highlights `X` (finished count), the Matched view highlights `Y` (total).
+    #[test]
+    fn done_segment_highlights_x_on_done_and_y_on_matched() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//a:x", "//a:y", "//a:z"], true)));
+        v.apply(&ev(1, result_start("//a:x")));
+        v.apply(&ev(2, result_end("//a:x", None)));
+
+        // Background colour of the header span whose content is exactly `content`.
+        let bg_of = |v: &TuiProgressView, content: &str| -> Option<Color> {
+            v.render("⠋", 100, 120, 8)[0]
+                .spans
+                .iter()
+                .find(|s| s.content == content)
+                .and_then(|s| s.style.bg)
+        };
+
+        // Default view: neither the count nor the total is highlighted.
+        assert_eq!(bg_of(&v, "1"), None);
+        assert_eq!(bg_of(&v, "3"), None);
+
+        // Done view highlights `X` (the "1"), leaving `Y` plain.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Done);
+        assert_eq!(bg_of(&v, "1"), Some(Color::Blue));
+        assert_eq!(bg_of(&v, "3"), None);
+
+        // Matched view highlights `Y` (the "3"), leaving `X` plain.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Matched);
+        assert_eq!(bg_of(&v, "3"), Some(Color::Blue));
+        assert_eq!(bg_of(&v, "1"), None);
+    }
+
+    #[test]
+    fn matched_view_lists_all_matched_targets_and_filters() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, matched(&["//a:done", "//a:pending"], true)));
+        s.apply(&ev(1, result_start("//a:done")));
+        s.apply(&ev(2, result_end("//a:done", None)));
+
+        // Both the finished and the still-pending matched target are listed.
+        let lines = s.matched_lines("");
+        assert_eq!(lines.len(), 2);
+        let joined: String = lines.iter().map(|l| format!("{l}")).collect();
+        assert!(joined.contains("//a:done"), "{joined}");
+        assert!(joined.contains("//a:pending"), "{joined}");
+
+        // Filter narrows to the matching addr.
+        let filtered = s.matched_lines("pending");
+        assert_eq!(filtered.len(), 1);
+        assert!(format!("{}", filtered[0]).contains("//a:pending"));
+    }
+
+    #[test]
+    fn cached_tab_highlights_and_lists_cache_hits_by_scope() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//a:hit"], true)));
+        v.apply(&ev(1, local_cache_hit("//a:hit")));
+        v.apply(&ev(2, result_end("//a:hit", None)));
+        // A transitive dep also hits cache — only in the `All` scope.
+        v.apply(&ev(3, local_cache_hit("//dep:hit")));
+
+        v.tab(true); // Done
+        v.tab(true); // Matched
+        v.tab(true); // Cached
+        assert_eq!(v.view.get(), ViewMode::Cached);
+
+        // The cached segment is highlighted while its view is active.
+        let header = v.render("⠋", 100, 120, 8);
+        let hl = header[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("cached"))
+            .expect("cached span");
+        assert_eq!(hl.style.bg, Some(Color::Blue));
+
+        // Matched scope (default) lists only the matched hit.
+        let body: String = v
+            .render("⠋", 10_000, 80, 8)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(body.contains("//a:hit"), "{body}");
+        assert!(!body.contains("//dep:hit"), "{body}");
+    }
+
+    #[test]
+    fn cached_lines_respect_matched_and_all_scope() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, matched(&["//a:top"], true)));
+        s.apply(&ev(1, local_cache_hit("//a:top")));
+        s.apply(&ev(2, local_cache_hit("//dep:lib")));
+
+        let m: String = s
+            .cached_lines(CountScope::Matched, "")
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(m.contains("//a:top"), "{m}");
+        assert!(!m.contains("//dep:lib"), "{m}");
+
+        let a: String = s
+            .cached_lines(CountScope::All, "")
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert!(a.contains("//a:top"), "{a}");
+        assert!(a.contains("//dep:lib"), "{a}");
+    }
+
+    #[test]
+    fn back_to_main_returns_from_list_tab_and_resets_filter() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
+        v.apply(&ev(1, result_start("//web:server")));
+        v.apply(&ev(2, result_end("//web:server", None)));
+
+        v.tab(true); // Done
+        assert!(!v.is_on_main_view());
+        v.search_start();
+        v.search_input('w');
+        assert!(v.has_active_filter());
+
+        // Esc/q off the main view route here: back to Default, filter cleared.
+        v.back_to_main();
+        assert!(v.is_on_main_view());
+        assert_eq!(v.view.get(), ViewMode::Default);
+        assert!(!v.has_active_filter());
+        assert!(!v.is_searching());
+        assert_eq!(v.scroll.get(), 0);
     }
 }

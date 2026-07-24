@@ -178,6 +178,26 @@ pub trait TUIAppView: Send {
     /// a scope toggle.
     fn toggle_scope(&mut self) {}
 
+    /// Whether the view is showing its main (default) body rather than a tabbed
+    /// list. The backend uses this to route `q`: on the main view `q` quits a
+    /// held viewport, off it `q` returns to the main view. Default `true` (a view
+    /// with no tabs is always "on main").
+    fn is_on_main_view(&self) -> bool {
+        true
+    }
+
+    /// Whether a `/` filter is currently applied (being typed or confirmed). The
+    /// backend routes `Esc`: with a filter active it clears the filter, otherwise
+    /// it returns to the main view. Default `false`.
+    fn has_active_filter(&self) -> bool {
+        false
+    }
+
+    /// Return to the main (default) body from a tabbed list view, resetting
+    /// scroll and any active filter. Bound to `Esc`/`q` off the main view. No-op
+    /// by default for views without tabs.
+    fn back_to_main(&mut self) {}
+
     /// Whether the view is currently capturing keystrokes into a search query
     /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
     /// Enter and Esc to the search methods below instead of the normal shortcuts.
