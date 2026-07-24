@@ -235,9 +235,80 @@ pub enum GetError {
 /// `heph.<provider name>.<function name>`. Args and the return value are the loose
 /// dynamic [`Value`] type so calls can cross provider boundaries (in-process now,
 /// out-of-process plugins later).
+///
+/// A function may also *declare* targets and provider-state as a side effect of
+/// being called — see [`FnOutcome`]. This is what turns a provider function into a
+/// "build-file plugin": a convenience wrapper that a BUILD file calls to emit fully
+/// configured `target(...)`/`provider_state(...)` declarations, without the author
+/// shipping a cdylib. The host (the buildfile provider) merges the declared targets
+/// into the calling package exactly as if the BUILD file had written them.
 #[async_trait]
 pub trait ProviderFn: Send + Sync {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value>;
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome>;
+}
+
+/// A target a provider function declares when called from a BUILD file. Mirrors the
+/// arguments of the `target()` builtin; the host merges each declaration into the
+/// caller's package ([`FnCallContext::pkg`]) as if the BUILD file had written the
+/// `target(...)` call itself. An empty `driver` falls back to the declaring
+/// package's provider default, same as `target()`.
+#[derive(Debug, Clone, Default)]
+pub struct DeclaredTarget {
+    pub name: String,
+    pub driver: String,
+    pub labels: Vec<String>,
+    pub transitive: Sandbox,
+    pub approval: Approval,
+    pub config: HashMap<String, Value>,
+}
+
+/// Package-level provider state a provider function declares, mirroring the
+/// `provider_state(provider=…, **args)` builtin.
+#[derive(Debug, Clone, Default)]
+pub struct DeclaredState {
+    pub provider: String,
+    pub args: HashMap<String, Value>,
+}
+
+/// What a [`ProviderFn`] returns: the [`Value`] substituted at the call site, plus
+/// any targets and provider-state the call declared. Value-only functions (the
+/// common case — `glob`, `join`, …) build this with `Value::into` or
+/// [`FnOutcome::value`]; a wrapper function that stands up a target also pushes
+/// [`DeclaredTarget`]s / [`DeclaredState`]s.
+///
+/// Declarations are honored only for **in-process** provider functions. The
+/// out-of-process plugin ABI (`CallFunction`) carries the return value alone, so
+/// crossing it with a non-empty declaration set is a hard error rather than a
+/// silent drop — see the CallFunction wire handlers. Extending the ABI to carry
+/// declarations is the follow-up that unlocks out-of-process (e.g. JS) plugins.
+#[derive(Debug)]
+pub struct FnOutcome {
+    pub value: Value,
+    pub targets: Vec<DeclaredTarget>,
+    pub states: Vec<DeclaredState>,
+}
+
+impl FnOutcome {
+    /// A value-only outcome — no declarations. The common case.
+    pub fn value(value: Value) -> Self {
+        Self {
+            value,
+            targets: Vec::new(),
+            states: Vec::new(),
+        }
+    }
+
+    /// True when the call declared no targets or provider-state, so the outcome is
+    /// safe to carry across a value-only (out-of-process) boundary.
+    pub fn is_value_only(&self) -> bool {
+        self.targets.is_empty() && self.states.is_empty()
+    }
+}
+
+impl From<Value> for FnOutcome {
+    fn from(value: Value) -> Self {
+        FnOutcome::value(value)
+    }
 }
 
 /// One exposed function: its bare name (no `heph.<provider>.` prefix), its

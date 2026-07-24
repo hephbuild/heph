@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use hcore::hartifactcontent::tar::TarPacker;
 use hcore::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
 use hcore::hasync::StdCancellationToken;
-use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunInput, ManagedRunRequest};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::{
@@ -20,8 +19,8 @@ use hplugin::driver::{
 };
 use hplugin::hook::Hook;
 use hplugin::provider::{
-    ConfigRequest, FnArgs, FnCallContext, GetError, GetRequest, ListPackagesRequest, ListRequest,
-    ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
+    ConfigRequest, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest, ListPackagesRequest,
+    ListRequest, ProbeRequest, Provider, ProviderExecutor, ProviderFn, ProviderFunctionDef,
     ProviderFunctionRegistry,
 };
 use hplugin_stabby::abi::{
@@ -606,8 +605,17 @@ async fn provider_call_function(
             .collect(),
     };
     let body = match def.func.call(&ctx, args).await {
-        Ok(v) => Body::CallFunctionResp(pb::CallFunctionResponse {
-            value: Some(convert::value_to_pb(&v)),
+        // The CallFunction wire carries the return value alone. A function that
+        // declared targets / provider-state would lose them across the seam, so
+        // fail loudly rather than silently drop — carrying declarations over the
+        // ABI is the follow-up that unlocks out-of-process (e.g. JS) plugins.
+        Ok(o) if !o.is_value_only() => err_body(
+            "declaring targets/provider_state from an out-of-process plugin function \
+             is not yet supported over the plugin ABI"
+                .to_string(),
+        ),
+        Ok(o) => Body::CallFunctionResp(pb::CallFunctionResponse {
+            value: Some(convert::value_to_pb(&o.value)),
         }),
         Err(e) => err_body(err_message(&e)),
     };
@@ -861,7 +869,7 @@ struct GuestRegisteredFn {
 
 #[async_trait::async_trait]
 impl ProviderFn for GuestRegisteredFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
         let pb_req = pb::CallRegisteredRequest {
             provider: self.provider.clone(),
             name: self.name.clone(),
@@ -881,7 +889,7 @@ impl ProviderFn for GuestRegisteredFn {
             .await;
         match pb::Frame::decode(&bytes[..])?.body {
             Some(Body::CallFunctionResp(r)) => {
-                Ok(convert::value_from_pb(r.value.unwrap_or_default()))
+                Ok(convert::value_from_pb(r.value.unwrap_or_default()).into())
             }
             Some(Body::Error(e)) => anyhow::bail!("{}", e.message),
             other => anyhow::bail!("unexpected call_registered response: {other:?}"),
@@ -1486,8 +1494,8 @@ mod tests {
     use hcore::htvalue::Value;
     use hcore::htvalue::signature::{FnSignature, Param, ParamType};
     use hplugin::provider::{
-        ConfigResponse, GetResponse, ListPackageResponse, ListResponse, ProbeResponse, ProviderFn,
-        ProviderFunctionDef,
+        ConfigResponse, FnOutcome, GetResponse, ListPackageResponse, ListResponse, ProbeResponse,
+        ProviderFn, ProviderFunctionDef,
     };
     use std::path::Path;
 
@@ -1499,7 +1507,7 @@ mod tests {
     struct EchoFn;
     #[async_trait::async_trait]
     impl ProviderFn for EchoFn {
-        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<Value> {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> Result<FnOutcome> {
             let msg = match args.positional.first() {
                 Some(Value::String(s)) => s.clone(),
                 _ => anyhow::bail!("echo: `msg` must be a string"),
@@ -1512,7 +1520,8 @@ mod tests {
                 "{}:{}",
                 ctx.pkg,
                 msg.repeat(usize::try_from(times).unwrap_or(0))
-            )))
+            ))
+            .into())
         }
     }
 
@@ -2316,7 +2325,7 @@ mod tests {
             },
         ))
         .expect("call echo");
-        assert_eq!(out, Value::String("mypkg:hi".into()));
+        assert_eq!(out.value, Value::String("mypkg:hi".into()));
 
         // Named arg crosses and is honored.
         let mut named = std::collections::HashMap::new();
@@ -2329,7 +2338,7 @@ mod tests {
             },
         ))
         .expect("call echo times=3");
-        assert_eq!(out, Value::String("mypkg:ababab".into()));
+        assert_eq!(out.value, Value::String("mypkg:ababab".into()));
 
         // The provider's state schema crosses too (Some, with its one field).
         let schema = host.state_schema().expect("state schema crosses as Some");
@@ -2441,7 +2450,7 @@ mod tests {
             },
         ))
         .expect("call proxied echo");
-        assert_eq!(out, Value::String("callerpkg:yo".into()));
+        assert_eq!(out.value, Value::String("callerpkg:yo".into()));
     }
 
     // A managed driver's config schema survives the round trip (LSP kwargs).

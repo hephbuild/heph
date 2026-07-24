@@ -282,16 +282,15 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
             .downcast_ref::<Extra>()
             .expect("evaluator extra must be of type Extra");
 
-        // No public accessor returns an arbitrary positional slice; read up to a
-        // fixed cap and let the signature validator enforce the real arity. Eight
-        // is far beyond any provider function (the widest takes one positional);
-        // more than that trips Starlark's own too-many-args error first.
-        let (_, optional) =
-            starlark::__derive_refs::parse_args::parse_positional::<0, 8>(args, eval.heap())?;
-        let positional: Vec<htvalue::Value> = optional
-            .iter()
-            .flatten()
-            .map(starlark_to_rust)
+        // Collect positional and named args verbatim, then let the declared
+        // signature (`validate_args` below) enforce arity / names / types — it is
+        // the canonical guard. `positions()` (rather than `parse_positional`, which
+        // rejects *all* named args via `no_named_args`) is what lets a provider
+        // function — a build-file plugin's rule — take named arguments like
+        // `foo_codegen(name = …, srcs = …)`.
+        let positional: Vec<htvalue::Value> = args
+            .positions(eval.heap())?
+            .map(|v| starlark_to_rust(&v))
             .collect::<anyhow::Result<_>>()
             .map_err(starlark::Error::new_other)?;
         let named: HashMap<String, htvalue::Value> = args
@@ -314,16 +313,61 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         };
         let fn_args = FnArgs { positional, named };
 
-        let result = futures::executor::block_on(self.func.call(&ctx, fn_args))
+        let outcome = futures::executor::block_on(self.func.call(&ctx, fn_args))
             .map_err(starlark::Error::new_other)?;
+
+        // A provider function may declare targets / provider-state (a "build-file
+        // plugin" wrapping a driver). Merge each into the calling package through
+        // the same sinks the `target()` / `provider_state()` builtins use, so a
+        // declared target is indistinguishable from a hand-written one. Capture the
+        // call-site provenance once (when enabled) and stamp it on every declared
+        // target, so tooling traces them back to the `heph.<plugin>.<fn>(…)` call.
+        if !outcome.targets.is_empty() {
+            let provenance = if extra.capture_provenance {
+                capture_provenance(eval)
+            } else {
+                Vec::new()
+            };
+            for dt in outcome.targets {
+                if dt.name.is_empty() {
+                    return Err(starlark::Error::new_other(anyhow::anyhow!(
+                        "{}: declared target name cannot be empty",
+                        self.display
+                    )));
+                }
+                (extra.on_target)(OnTargetPayload {
+                    name: dt.name,
+                    driver: dt.driver,
+                    labels: dt.labels,
+                    transitive: dt.transitive,
+                    approval: dt.approval,
+                    config: dt.config,
+                    provenance: provenance.clone(),
+                })
+                .map_err(starlark::Error::new_other)?;
+            }
+        }
+        for ds in outcome.states {
+            if ds.provider.is_empty() {
+                return Err(starlark::Error::new_other(anyhow::anyhow!(
+                    "{}: declared provider_state is missing provider",
+                    self.display
+                )));
+            }
+            (extra.on_state)(OnStatePayload {
+                provider: ds.provider,
+                args: ds.args,
+            })
+            .map_err(starlark::Error::new_other)?;
+        }
 
         // Native `return_type` is documentation-only for native fns, so validate
         // the actual return value here.
         self.signature
-            .validate_return(&self.display, &result)
+            .validate_return(&self.display, &outcome.value)
             .map_err(starlark::Error::new_other)?;
 
-        Ok(rust_to_starlark(eval.heap(), &result))
+        Ok(rust_to_starlark(eval.heap(), &outcome.value))
     }
 }
 
@@ -1694,6 +1738,7 @@ fn eval_ast(
 mod tests {
     use super::*;
     use hcore::htvalue::signature::Param;
+    use hplugin::provider::{DeclaredState, DeclaredTarget, FnOutcome};
     use std::fs;
     use tempfile::tempdir;
 
@@ -3506,16 +3551,12 @@ target(name = "t_in_app", driver = SHARED)
     struct EchoFn;
     #[async_trait::async_trait]
     impl ProviderFn for EchoFn {
-        async fn call(
-            &self,
-            ctx: &FnCallContext<'_>,
-            args: FnArgs,
-        ) -> anyhow::Result<htvalue::Value> {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
             let arg = match args.positional.first() {
                 Some(htvalue::Value::String(s)) => s.clone(),
                 _ => anyhow::bail!("echo expects a string"),
             };
-            Ok(htvalue::Value::String(format!("{}:{}", ctx.pkg, arg)))
+            Ok(htvalue::Value::String(format!("{}:{}", ctx.pkg, arg)).into())
         }
     }
 
@@ -3555,6 +3596,195 @@ target(name = "t_in_app", driver = SHARED)
         match result.targets[0].config.get("v") {
             Some(htvalue::Value::String(s)) => assert_eq!(s, "mypkg:hi"),
             other => panic!("expected echoed string, got {other:?}"),
+        }
+    }
+
+    /// A "build-file plugin" function: called from a BUILD file, it declares a
+    /// fully-configured `exec` target plus package provider-state, and returns the
+    /// new target's address. This is the wrapper pattern a tool author ships instead
+    /// of a cdylib.
+    struct CodegenFn;
+    #[async_trait::async_trait]
+    impl ProviderFn for CodegenFn {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+            let name = match args.named.get("name") {
+                Some(htvalue::Value::String(s)) => s.clone(),
+                _ => anyhow::bail!("codegen expects a string `name`"),
+            };
+            let addr = format!("//{}:{}", ctx.pkg, name);
+            let mut config = HashMap::new();
+            config.insert(
+                "run".to_string(),
+                htvalue::Value::List(vec![
+                    htvalue::Value::String("gen".to_string()),
+                    htvalue::Value::String("$OUT".to_string()),
+                ]),
+            );
+            let outcome = FnOutcome {
+                value: htvalue::Value::String(addr),
+                targets: vec![DeclaredTarget {
+                    name,
+                    driver: "exec".to_string(),
+                    config,
+                    ..Default::default()
+                }],
+                states: vec![DeclaredState {
+                    provider: "codegen".to_string(),
+                    args: HashMap::from([(
+                        "toolchain".to_string(),
+                        htvalue::Value::String("v1".to_string()),
+                    )]),
+                }],
+            };
+            Ok(outcome)
+        }
+    }
+
+    fn provider_with_fn(
+        tmp_dir: &tempfile::TempDir,
+        name: &str,
+        f: Arc<dyn ProviderFn>,
+    ) -> Provider {
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "codegen",
+            vec![hplugin::provider::ProviderFunctionDef {
+                name: name.to_string(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![Param::required("name", ParamType::String)],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: f,
+            }],
+        );
+        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+        provider
+    }
+
+    #[test]
+    fn test_provider_function_declares_target() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        // The BUILD file only calls the plugin function — no `target()` of its own.
+        fs::write(
+            pkg.join("BUILD"),
+            r#"a = heph.codegen.rule(name = "gen_a")"#,
+        )
+        .unwrap();
+
+        let provider = provider_with_fn(&tmp_dir, "rule", Arc::new(CodegenFn));
+        let result = run_pkg_blocking(&provider, "mypkg").unwrap();
+
+        // The declared target lands in the calling package as if hand-written.
+        assert_eq!(result.targets.len(), 1, "one declared target");
+        let t = &result.targets[0];
+        assert_eq!(t.name, "gen_a");
+        assert_eq!(t.driver, "exec");
+        assert_eq!(
+            expect_string_list(t.config.get("run")),
+            vec!["gen".to_string(), "$OUT".to_string()]
+        );
+
+        // The declared provider_state lands in the package too.
+        assert_eq!(result.states.len(), 1, "one declared state");
+        assert_eq!(result.states[0].provider, "codegen");
+        assert_eq!(
+            result.states[0].args.get("toolchain"),
+            Some(&htvalue::Value::String("v1".to_string()))
+        );
+    }
+
+    /// A plugin function returning an empty target name must fail loudly, mirroring
+    /// the `target()` builtin's own guard — a wrapper bug must not emit a nameless
+    /// target.
+    struct EmptyNameFn;
+    #[async_trait::async_trait]
+    impl ProviderFn for EmptyNameFn {
+        async fn call(&self, _ctx: &FnCallContext<'_>, _args: FnArgs) -> anyhow::Result<FnOutcome> {
+            Ok(FnOutcome {
+                value: htvalue::Value::Null(),
+                targets: vec![DeclaredTarget {
+                    name: String::new(),
+                    driver: "exec".to_string(),
+                    ..Default::default()
+                }],
+                states: vec![],
+            })
+        }
+    }
+
+    #[test]
+    fn test_provider_function_empty_target_name_errors() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), r#"heph.codegen.rule(name = "x")"#).unwrap();
+
+        let provider = provider_with_fn(&tmp_dir, "rule", Arc::new(EmptyNameFn));
+        let err = run_pkg_blocking(&provider, "mypkg").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("name cannot be empty"), "{chain}");
+    }
+
+    /// A provider function reads a *named* argument. Guards that provider
+    /// functions accept named args at all — the `positions()`/`names_map()` path
+    /// in `invoke`, not `parse_positional` (which rejects every named arg).
+    struct NamedEchoFn;
+    #[async_trait::async_trait]
+    impl ProviderFn for NamedEchoFn {
+        async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+            let msg = match args.named.get("msg") {
+                Some(htvalue::Value::String(s)) => s.clone(),
+                _ => anyhow::bail!("echo expects a string `msg`"),
+            };
+            Ok(htvalue::Value::String(msg).into())
+        }
+    }
+
+    #[test]
+    fn test_provider_function_accepts_named_arg() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"target(name = "t", driver = "d", v = heph.codegen.rule(msg = "hey"))"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+        let mut reg = ProviderFunctionRegistry::default();
+        reg.insert_provider(
+            "codegen",
+            vec![hplugin::provider::ProviderFunctionDef {
+                name: "rule".to_string(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![Param::required("msg", ParamType::String)],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: Arc::new(NamedEchoFn),
+            }],
+        );
+        assert!(provider.function_registry.set(Arc::new(reg)).is_ok());
+
+        let result = run_pkg_blocking(&provider, "mypkg").unwrap();
+        match result.targets[0].config.get("v") {
+            Some(htvalue::Value::String(s)) => assert_eq!(s, "hey"),
+            other => panic!("expected named-arg echo, got {other:?}"),
         }
     }
 
