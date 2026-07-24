@@ -641,6 +641,18 @@ jobs:
           name: repo
           path: .
 
+      # `tst` links a test binary per workspace crate; with the nix store and the
+      # heavy dep graph this can exhaust the ~14 GB ubuntu-latest root disk mid-link
+      # ("No space left on device"). Drop preinstalled toolchains this job never
+      # uses to reclaim ~15 GB before the build. Linux only (paths are linux, and
+      # the macOS runner is not disk-constrained here).
+      - name: Free disk space (linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
       - name: Setup Nix + devenv
         uses: ./.github/actions/setup-nix
         with:
