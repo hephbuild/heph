@@ -1121,7 +1121,14 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     } else {
         format!("{}/**/*", pkg_str)
     };
-    let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &["**/*.go"]);
+    // Exclude `.go` (their own lane) and the module files `go.mod`/`go.sum`:
+    // the latter are delivered into `_golist` by the modfiles (`_go_mod`) lane
+    // as `fs:file` deps. Without excluding them here the non-go glob and the
+    // modfiles dep both produce `go.mod`/`go.sum` in the sandbox — two
+    // different targets writing the same file, which the sandbox runner now
+    // rejects as an output collision.
+    let non_go_glob_addr =
+        pluginfs::glob_addr(&non_go_glob, &["**/*.go", "**/go.mod", "**/go.sum"]);
     let mut addrs = vec![non_go_glob_addr.format()];
 
     let codegen_root = pick_codegen_root(states);
@@ -5641,6 +5648,27 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             !addrs.iter().any(|s| s.contains("go_embed_src")),
             "golist srcfiles must NOT reference the go_embed_src lane: {addrs:?}"
+        );
+    }
+
+    // Regression: the root non-go glob (`**/*` minus `.go`) also captured
+    // `go.mod`/`go.sum`, which the modfiles (`_go_mod`) lane already delivers
+    // into `_golist` as `fs:file` deps. Both producing the same sandbox file is
+    // an output collision, so the glob must exclude the module files.
+    #[test]
+    fn compute_pkg_src_addrs_glob_excludes_module_files() {
+        let addrs = compute_pkg_src_addrs("", &[]).unwrap();
+        let glob = addrs
+            .iter()
+            .find(|s| s.contains(":glob@"))
+            .expect("non-go glob present in golist srcfiles");
+        assert!(
+            glob.contains("**/go.mod"),
+            "glob must exclude go.mod: {glob}"
+        );
+        assert!(
+            glob.contains("**/go.sum"),
+            "glob must exclude go.sum: {glob}"
         );
     }
 
