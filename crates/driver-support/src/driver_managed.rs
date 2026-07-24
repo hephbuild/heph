@@ -10,7 +10,7 @@ use hplugin::driver::{
     ParseResponse, RunInput, RunRequest, outputartifact,
 };
 use hplugin::provider::TargetSpec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -374,6 +374,65 @@ pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Reject two *different* producer targets writing the same file into one
+/// sandbox. Keyed on producer identity (`source_addr`), per the sandbox
+/// isolation model: a materialized path has exactly one owning target. A path
+/// claimed by the *same* `source_addr` more than once — a diamond dependency, or
+/// a target depended on twice — resolves to a single owner and is allowed.
+///
+/// Only file and symlink paths are compared: the content walk yields no
+/// directory entries, so shared parent directories never trip the check (two
+/// targets may populate disjoint files under a common dir). `filters` are
+/// honored so a partially-consumed input only claims the paths it exposes.
+///
+/// Runs on the execution (cache-miss) path before any input is materialized, so
+/// a collision fails fast with both producers named rather than silently
+/// last-write-wins in the sandbox (regular deps `File::create`-truncate; FUSE
+/// layers shadow by registration order — neither surfaces the conflict).
+pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> anyhow::Result<()> {
+    // Absolute sandbox path -> the source_addr of the target that claimed it.
+    let mut owners: HashMap<PathBuf, String> = HashMap::new();
+    for (unpack_root, inputs) in groups {
+        for input in inputs {
+            let producer = input.source_addr.format();
+            for entry in input.artifact.content.walk().with_context(|| {
+                format!(
+                    "walk content for output-collision check \
+                     (origin_id={}, source_addr={producer})",
+                    input.origin_id,
+                )
+            })? {
+                let entry = entry.with_context(|| {
+                    format!("read entry for output-collision check (source_addr={producer})")
+                })?;
+                if !input.filters.is_empty()
+                    && !input
+                        .filters
+                        .iter()
+                        .any(|f| Path::new(f) == entry.path.as_path())
+                {
+                    continue;
+                }
+                let abs = unpack_root.join(&entry.path);
+                match owners.get(&abs) {
+                    Some(existing) if *existing != producer => anyhow::bail!(
+                        "output collision: {} is produced by two different targets \
+                         ({existing} and {producer}); a sandbox file may be provided by \
+                         only one target",
+                        abs.display(),
+                    ),
+                    // Same producer (diamond / depended twice) — one owner, allowed.
+                    Some(_) => {}
+                    None => {
+                        owners.insert(abs, producer.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Output collection helpers
 // ---------------------------------------------------------------------
@@ -694,5 +753,82 @@ mod source_map_tests {
             msg.contains("out") && msg.contains("data"),
             "must name path+group: {msg}"
         );
+    }
+
+    fn group(inputs: Vec<ManagedRunInput>) -> BTreeMap<PathBuf, Vec<RunInput>> {
+        let mut m: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
+        for mi in inputs {
+            m.entry(mi.unpack_root.clone()).or_default().push(mi.input);
+        }
+        m
+    }
+
+    // Two *different* targets writing the same sandbox path must fail, naming
+    // both producers — not silently last-write-wins.
+    #[test]
+    fn collision_between_two_targets_errors() {
+        let groups = group(vec![
+            make_input("dep|a|0", "//pkg:_a", &[("pkg/x.txt", "1")]),
+            make_input("dep|b|0", "//pkg:_b", &[("pkg/x.txt", "2")]),
+        ]);
+        let err = detect_output_collisions(&groups).expect_err("expected collision");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("two different targets"), "got: {msg}");
+        assert!(
+            msg.contains("//pkg:_a") && msg.contains("//pkg:_b"),
+            "must name both producers: {msg}"
+        );
+        assert!(msg.contains("pkg/x.txt"), "must name the path: {msg}");
+    }
+
+    // The same target contributing a path twice (diamond dep / depended twice)
+    // is one owner — allowed.
+    #[test]
+    fn same_target_twice_is_allowed() {
+        let groups = group(vec![
+            make_input("dep|a|0", "//pkg:_a", &[("pkg/x.txt", "1")]),
+            make_input("dep|a|1", "//pkg:_a", &[("pkg/x.txt", "1")]),
+        ]);
+        detect_output_collisions(&groups).expect("same producer must not collide");
+    }
+
+    // Different targets under a shared directory but at disjoint files: no
+    // collision (only file paths are compared, not the parent dir).
+    #[test]
+    fn disjoint_files_under_shared_dir_ok() {
+        let groups = group(vec![
+            make_input("dep|a|0", "//pkg:_a", &[("pkg/a.txt", "1")]),
+            make_input("dep|b|0", "//pkg:_b", &[("pkg/b.txt", "2")]),
+        ]);
+        detect_output_collisions(&groups).expect("disjoint files must not collide");
+    }
+
+    // The same relative path in two *different* unpack roots is two distinct
+    // sandbox paths — not a collision.
+    #[test]
+    fn same_rel_path_different_unpack_root_ok() {
+        let mut a = make_input("dep|a|0", "//pkg:_a", &[("pkg/x.txt", "1")]);
+        let mut b = make_input("dep|b|0", "//pkg:_b", &[("pkg/x.txt", "2")]);
+        a.unpack_root = PathBuf::from("/sandbox/exec_toolsA");
+        b.unpack_root = PathBuf::from("/sandbox/exec_toolsB");
+        let groups = group(vec![a, b]);
+        detect_output_collisions(&groups).expect("distinct roots must not collide");
+    }
+
+    // A filtered input only claims the paths it actually exposes: a path it
+    // filters out cannot collide with another target's file at that path.
+    #[test]
+    fn filtered_out_path_does_not_collide() {
+        let mut a = make_input(
+            "dep|a|0",
+            "//pkg:_a",
+            &[("pkg/x.txt", "1"), ("pkg/y.txt", "1")],
+        );
+        a.input.filters = vec!["pkg/y.txt".to_string()];
+        let groups = group(vec![
+            a,
+            make_input("dep|b|0", "//pkg:_b", &[("pkg/x.txt", "2")]),
+        ]);
+        detect_output_collisions(&groups).expect("filtered-out path must not collide");
     }
 }
