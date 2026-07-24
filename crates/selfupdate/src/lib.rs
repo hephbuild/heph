@@ -292,7 +292,9 @@ mod imp {
             let mut err = std::io::stderr();
             let mut frame = 0usize;
             while !progress.done.load(Ordering::SeqCst) {
-                let glyph = SPINNER_FRAMES.get(frame % SPINNER_FRAMES.len()).unwrap_or(&"");
+                let glyph = SPINNER_FRAMES
+                    .get(frame % SPINNER_FRAMES.len())
+                    .unwrap_or(&"");
                 frame = frame.wrapping_add(1);
                 let line = progress_line(
                     glyph,
