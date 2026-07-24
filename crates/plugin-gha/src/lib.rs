@@ -838,6 +838,32 @@ mod tests {
     }
 
     #[test]
+    fn cached_count_includes_remote_hits() {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: vec!["//a:local".into(), "//a:remote".into()],
+                complete: true,
+            },
+        ));
+        // One local hit and one remote hit — both are cache hits.
+        t.apply(&ev(
+            1,
+            BuildEventKind::LocalCacheHit {
+                addr: "//a:local".into(),
+            },
+        ));
+        t.apply(&ev(
+            2,
+            BuildEventKind::RemoteCacheHit {
+                addr: "//a:remote".into(),
+            },
+        ));
+        assert_eq!(t.cached_count(), 2, "remote hit must count as cached");
+    }
+
+    #[test]
     fn status_emoji_tracks_invocation_outcome() {
         let mut t = Tally::default();
         t.apply(&ev(
