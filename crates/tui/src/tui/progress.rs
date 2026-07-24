@@ -793,7 +793,10 @@ impl BuildState {
                 } else {
                     Color::White
                 };
-                Line::from(Span::styled(format!("  {addr}"), Style::default().fg(color)))
+                Line::from(Span::styled(
+                    format!("  {addr}"),
+                    Style::default().fg(color),
+                ))
             })
             .collect()
     }
