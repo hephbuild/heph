@@ -30,8 +30,8 @@ use async_trait::async_trait;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
 use hplugin::provider::{
-    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
+    ConfigRequest, ConfigResponse, FnArgs, FnCallContext, FnOutcome, GetError, GetRequest,
+    GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest,
     ProbeResponse, Provider as EProvider, ProviderFn, ProviderFunctionDef,
 };
 use std::collections::HashMap;
@@ -239,8 +239,8 @@ struct PureFn(fn(&FnArgs) -> anyhow::Result<Value>);
 
 #[async_trait]
 impl ProviderFn for PureFn {
-    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        (self.0)(&args)
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+        (self.0)(&args).map(FnOutcome::from)
     }
 }
 
@@ -745,6 +745,7 @@ mod tests {
                 args,
             )
             .await
+            .map(|o| o.value)
         })
     }
 

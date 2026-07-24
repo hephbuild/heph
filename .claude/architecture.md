@@ -10,6 +10,7 @@
 - **`Driver`** (`src/engine/driver.rs`) — executes targets. Given a `TargetSpec` from a provider, a driver `parse`s it into a `TargetDef` (with inputs/outputs/sandbox config), then `run`s it to produce `OutputArtifact`s.
 - **`Engine`** (`src/engine/engine.rs`) — holds the provider and driver registries plus a local cache. Entry point for all queries and execution.
 - **`RequestState`** (`src/engine/request_state.rs`) — per-request context: cancellation token, and `Memoizer` instances for deduplicating in-flight `result` and `execute` calls. Dropped automatically cleans up the request registry.
+- **Provider functions** (`ProviderFn`, `crates/plugin/src/provider.rs`) — a provider may expose functions surfaced in BUILD files as `heph.<provider>.<fn>(…)`. A function returns an `FnOutcome`: the value substituted at the call site plus any `target()`/`provider_state()` it **declared**. Declaring functions are the "build-file plugin" primitive — a wrapper (e.g. a codegen rule around the `exec` driver) that stands up targets for its caller. The buildfile provider checks declarations exactly as it checks `target()` (including parsing `transitive` through the same code), sorts them by name so a function's iteration order never reaches a def hash, and merges them into the calling package. **In-process (first-party) functions only, today:** the out-of-process plugin ABI carries the return value alone, so a cdylib function that declares anything is a hard error until the ABI carries declarations.
 
 ## Execution Flow
 
