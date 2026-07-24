@@ -208,10 +208,16 @@ pub fn defined_variant_names(states: &[State]) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// The `(name, defining-pkg)` pairs applicable to a **binary/entry** target: one
+/// The `(VariantRef, Factors)` pairs applicable to a **binary/entry** target: one
 /// per variant name declared in the module-bounded ancestry, pinned to its
-/// closest declaring package. `states` is the target package's ancestry.
-pub fn ancestry_variants(states: &[State], module_root: &str) -> Vec<VariantRef> {
+/// closest declaring package, with its resolved factors. `states` is the target
+/// package's ancestry. Callers map away the `Factors` when they only need the
+/// refs; those that must inspect factors (e.g. filter `test` targets to the host
+/// `goos`/`goarch`) keep them.
+pub fn ancestry_variants_with_factors(
+    states: &[State],
+    module_root: &str,
+) -> Vec<(VariantRef, Factors)> {
     let mut names = std::collections::BTreeSet::new();
     for s in states {
         if under_module_root(s.package.as_str(), module_root)
@@ -225,7 +231,7 @@ pub fn ancestry_variants(states: &[State], module_root: &str) -> Vec<VariantRef>
         .filter_map(|name| {
             resolve_ancestry(&name, states, module_root)
                 .ok()
-                .map(|(_, v)| v)
+                .map(|(f, v)| (v, f))
         })
         .collect()
 }

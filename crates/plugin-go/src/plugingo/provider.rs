@@ -414,16 +414,19 @@ impl ProviderTrait for Provider {
             signature: FnSignature {
                 positional: vec![
                     Param::required("pkg", ParamType::String),
-                    Param::required("v", ParamType::String),
+                    Param::optional("variant", ParamType::String, Value::String(String::new())),
                 ],
                 named: vec![],
                 variadic: None,
                 returns: ParamType::String,
             },
-            doc: "Build the address of a Go package's user-facing `build` target for \
-                  a given variant name, as used in `deps` — returns \
-                  `//<pkg>:build@v=<variant>`. The provider resolves the variant \
-                  (and pins the defining package) when the target is built."
+            doc: "Build the address of a Go package's user-facing `build` target, as \
+                  used in `deps`. With a variant name, returns \
+                  `//<pkg>:build@v=<variant>`. Omit `variant` (or pass \"\") to get \
+                  the magic host-default target `//<pkg>:build` — a `group` that \
+                  forwards to the first variant matching this machine's os/arch. The \
+                  provider resolves the variant (and pins the defining package) when \
+                  built."
                 .to_string(),
             func: Arc::new(BuildAddrFn),
         }]
@@ -542,18 +545,40 @@ impl BuildAddrFn {
             other => anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}"),
         }
     }
+
+    /// Optional string arg: `None` when absent, error when present but non-string.
+    fn opt_arg_str<'a>(
+        args: &'a FnArgs,
+        idx: usize,
+        name: &str,
+    ) -> anyhow::Result<Option<&'a str>> {
+        match args.named.get(name).or_else(|| args.positional.get(idx)) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(other) => {
+                anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}")
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl ProviderFn for BuildAddrFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
         let pkg = Self::arg_str(&args, 0, "pkg")?;
-        let v = Self::arg_str(&args, 1, "v")?;
+        let v = Self::opt_arg_str(&args, 1, "variant")?.unwrap_or("");
 
-        // A user-facing `build` target carries only `v`; the provider resolves the
-        // closest variant definition (and fills in `vp`) when the target is built.
-        let args = BTreeMap::from([("v".to_string(), v.to_string())]);
-        let addr = Addr::new(PkgBuf::from(pkg), "build".to_string(), args);
+        // With a variant name, a user-facing `build` target carries only `v` (the
+        // provider resolves the closest variant and fills in `vp` when built).
+        // Without one, return the magic host-default `//<pkg>:build` — a bare,
+        // variant-less addr the provider serves as a `group` forwarding to the
+        // first variant matching this machine's os/arch.
+        let addr_args = if v.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("v".to_string(), v.to_string())])
+        };
+        let addr = Addr::new(PkgBuf::from(pkg), "build".to_string(), addr_args);
         Ok(Value::String(addr.format()))
     }
 }
@@ -614,7 +639,19 @@ impl ProviderInner {
                     .into_owned(),
                 GoPackageKind::Stdlib { .. } => String::new(),
             };
-            let ancestry = variant::ancestry_variants(&req.states, &module_root);
+            let ancestry_pairs = variant::ancestry_variants_with_factors(&req.states, &module_root);
+            let ancestry: Vec<VariantRef> = ancestry_pairs.iter().map(|(v, _)| v.clone()).collect();
+            // Runnable `test`/`xtest` targets execute the built binary, so they
+            // only make sense for the host platform — enumerate them for the
+            // ancestry variants whose `goos`/`goarch` match this machine. The
+            // corresponding `build_test`/`build_xtest` (cross-compilable) still
+            // list for every variant, below.
+            let (host_goos, host_goarch) = (current_goos(), current_goarch());
+            let ancestry_host: Vec<VariantRef> = ancestry_pairs
+                .iter()
+                .filter(|(_, f)| f.goos == host_goos && f.goarch == host_goarch)
+                .map(|(v, _)| v.clone())
+                .collect();
             // First-party libs enumerate the module universe; stdlib/thirdparty
             // (rarely listed directly, and always consumed with a `vp` pin) fall
             // back to ancestry.
@@ -628,7 +665,9 @@ impl ProviderInner {
                 ancestry.clone()
             };
             let vrefs_for = |name: &str| -> &[VariantRef] {
-                if is_entry_target_name(name) {
+                if is_run_test_target_name(name) {
+                    &ancestry_host
+                } else if is_entry_target_name(name) {
                     &ancestry
                 } else {
                     &universe
@@ -672,6 +711,16 @@ impl ProviderInner {
                     let lint_enabled = self.golangci_config_addr(module_root).is_some();
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
                     push_names(&mut addrs, &["_golist", "build_lib", "build", "embed"]);
+                    // Magic host-default `build` (bare, no `@v`): a `group`
+                    // forwarding to the first host-matching variant. Listed only
+                    // when such a variant exists in ancestry.
+                    if !ancestry_host.is_empty() {
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "build".to_string(),
+                            Default::default(),
+                        ));
+                    }
                     if lint_enabled {
                         push_names(
                             &mut addrs,
@@ -804,6 +853,29 @@ fn is_entry_target_name(name: &str) -> bool {
         name,
         "build" | "test" | "xtest" | "lint-check" | "lint" | "format-check" | "format"
     )
+}
+
+/// **Runnable** test target names — the ones that execute the built test binary
+/// (as opposed to `build_test`/`build_xtest`, which only cross-compile it). Only
+/// these are gated to the host `goos`/`goarch` in `list`, since a test binary
+/// built for another platform can't run here.
+fn is_run_test_target_name(name: &str) -> bool {
+    matches!(name, "test" | "xtest")
+}
+
+/// Spec for the magic host-default `build` (bare `//pkg:build`): a `group` target
+/// that re-exports the outputs of the concrete `build@v=<variant>` it forwards to.
+fn magic_build_group_spec(addr: Addr, target: &Addr) -> hplugin::provider::TargetSpec {
+    let config = HashMap::from([(
+        "deps".to_string(),
+        Value::List(vec![Value::String(target.format())]),
+    )]);
+    hplugin::provider::TargetSpec {
+        addr,
+        driver: hbuiltins::plugingroup::DRIVER_NAME.to_string(),
+        config,
+        ..Default::default()
+    }
 }
 
 /// Targets handled by `handle_get` *before* the `_golist` resolve (no go list
@@ -1429,6 +1501,35 @@ impl ProviderInner {
                 .into_owned(),
             GoPackageKind::Stdlib { .. } => String::new(),
         };
+
+        // Magic host-default `build`: a bare `//pkg:build` (no `@v`) is served as a
+        // `group` target forwarding to `build@v=<variant>` for the first ancestry
+        // variant matching this machine's goos/goarch. It gives `//pkg:build` an
+        // ergonomic host default without an implicit variant on the real per-variant
+        // build. Intercept before `variant::resolve`, which requires an explicit `v`.
+        // First-party only — `build` (and thus its host-default) exists solely for
+        // first-party packages, matching what `list` emits.
+        if addr.name == "build"
+            && !addr.args.contains_key("v")
+            && matches!(&*kind, GoPackageKind::FirstParty { .. })
+        {
+            let (host_goos, host_goarch) = (current_goos(), current_goarch());
+            let chosen = variant::ancestry_variants_with_factors(&req.states, &module_root)
+                .into_iter()
+                .find(|(_, f)| f.goos == host_goos && f.goarch == host_goarch);
+            let Some((vref, _)) = chosen else {
+                return Err(GetError::NotFound);
+            };
+            let target = Addr::new(
+                addr.package.clone(),
+                "build".to_string(),
+                BTreeMap::from([("v".to_string(), vref.name.clone())]),
+            );
+            return Ok(GetResponse {
+                target_spec: magic_build_group_spec(addr.clone(), &target),
+            });
+        }
+
         let (factors, vref) =
             variant::resolve(addr, &req.states, &module_root, req.executor.as_ref())
                 .await
@@ -3088,7 +3189,7 @@ mod tests {
     async fn test_build_addr_named_args() {
         let mut named = HashMap::new();
         named.insert("pkg".to_string(), Value::String("mylib".into()));
-        named.insert("v".to_string(), Value::String("release".into()));
+        named.insert("variant".to_string(), Value::String("release".into()));
         let args = FnArgs {
             positional: vec![],
             named,
@@ -3097,14 +3198,27 @@ mod tests {
         assert_eq!(v, Value::String("//mylib:build@v=release".into()));
     }
 
+    // Omitting `variant` returns the magic host-default `build` addr (bare, no
+    // `@v`) — the provider serves it as a `group` to the host-matching variant.
     #[tokio::test]
-    async fn test_build_addr_missing_variant_errors() {
+    async fn test_build_addr_without_variant_returns_magic_addr() {
         let args = FnArgs {
             positional: vec![Value::String("mylib".into())],
             named: HashMap::new(),
         };
-        let err = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap_err();
-        assert!(err.to_string().contains("missing `v`"), "{err}");
+        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        assert_eq!(v, Value::String("//mylib:build".into()));
+    }
+
+    // An explicit empty variant is treated the same as omitting it.
+    #[tokio::test]
+    async fn test_build_addr_empty_variant_returns_magic_addr() {
+        let args = FnArgs {
+            positional: vec![Value::String("mylib".into()), Value::String("".into())],
+            named: HashMap::new(),
+        };
+        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        assert_eq!(v, Value::String("//mylib:build".into()));
     }
 
     fn go_available() -> bool {
@@ -5575,6 +5689,171 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // Non-test targets still emitted.
         assert!(names.iter().any(|n| n == "build_lib"));
         assert!(names.iter().any(|n| n == "_golist"));
+    }
+
+    /// Runnable `test`/`xtest` targets execute the built binary, so `list` emits
+    /// them only for ancestry variants matching the host `goos`/`goarch`. The
+    /// cross-compilable `build_test`/`build_xtest` list for *every* variant.
+    #[tokio::test]
+    async fn list_runnable_test_targets_only_for_host_variant() {
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        // Module root declares two variants: `host` (this machine) and `cross`
+        // (host goos, a non-host goarch).
+        let host = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String(current_goarch())),
+        ]));
+        let cross = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String("otherarch".into())),
+        ]));
+        let two = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([
+                    ("host".to_string(), host),
+                    ("cross".to_string(), cross),
+                ])),
+            )]),
+        };
+
+        struct TwoVariantUniverse(State);
+        impl ProviderExecutor for TwoVariantUniverse {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                unimplemented!("list must not resolve results")
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                unimplemented!("list must not query")
+            }
+            fn states_under<'a>(
+                &'a self,
+                prefix: &'a PkgBuf,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+                let states = if prefix.as_str().is_empty() {
+                    vec![self.0.clone()]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move { Ok(states) })
+            }
+        }
+
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from("pkg"),
+            states: vec![two.clone()],
+            executor: Arc::new(TwoVariantUniverse(two)),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        let variants_of = |name: &str| -> Vec<String> {
+            let mut v: Vec<String> = addrs
+                .iter()
+                .filter(|a| a.name == name)
+                .filter_map(|a| a.args.get("v").cloned())
+                .collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            variants_of("test"),
+            vec!["host".to_string()],
+            "runnable test must list only the host variant: {addrs:?}"
+        );
+        assert_eq!(
+            variants_of("xtest"),
+            vec!["host".to_string()],
+            "runnable xtest must list only the host variant: {addrs:?}"
+        );
+        assert_eq!(
+            variants_of("build_test"),
+            vec!["cross".to_string(), "host".to_string()],
+            "build_test must list every variant: {addrs:?}"
+        );
+        assert_eq!(
+            variants_of("build_xtest"),
+            vec!["cross".to_string(), "host".to_string()],
+            "build_xtest must list every variant: {addrs:?}"
+        );
+        // The magic host-default `build` (bare, no `@v`) is listed once alongside
+        // the per-variant `build@v=…`.
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.name == "build" && !a.args.contains_key("v")),
+            "magic bare build must be listed when a host variant exists: {addrs:?}"
+        );
+    }
+
+    /// The magic host-default `build`: a bare `//pkg:build` resolves to a `group`
+    /// target forwarding to `build@v=<host-matching variant>`.
+    #[tokio::test]
+    async fn magic_build_returns_group_forwarding_to_host_variant() {
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(PkgBuf::from("pkg"), "build".to_string(), Default::default());
+        let resp = provider_get(&p, addr).await.expect("magic build resolves");
+        let spec = resp.target_spec;
+        assert_eq!(spec.driver, "group");
+        let deps = match spec.config.get("deps") {
+            Some(Value::List(v)) => v,
+            other => panic!("group deps must be a list, got: {other:?}"),
+        };
+        assert_eq!(
+            deps,
+            &vec![Value::String("//pkg:build@v=host".into())],
+            "magic build must forward to the host variant"
+        );
+    }
+
+    /// No ancestry variant matches the host os/arch → the magic bare `build` does
+    /// not resolve (there is nothing to forward to).
+    #[tokio::test]
+    async fn magic_build_not_found_without_host_variant() {
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let cross = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([(
+                    "cross".to_string(),
+                    Value::Map(HashMap::from([
+                        ("goos".to_string(), Value::String(current_goos())),
+                        ("goarch".to_string(), Value::String("otherarch".into())),
+                    ])),
+                )])),
+            )]),
+        };
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr: Addr::new(PkgBuf::from("pkg"), "build".to_string(), Default::default()),
+            states: vec![cross],
+            executor: test_executor(sandbox.path()),
+        };
+        let res = p.get(req, &StdCancellationToken::new()).await;
+        assert!(
+            matches!(res, Err(GetError::NotFound)),
+            "magic build must NotFound when no host variant exists"
+        );
     }
 
     #[tokio::test]
