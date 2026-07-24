@@ -24,7 +24,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{ImageFormat, dep_single_file, run_cmd_cancellable};
+use super::{ImageFormat, Tool, dep_single_file, ensure_tool_supports_format, run_cmd_cancellable};
 
 pub const DRIVER_NAME: &str = "oci_load";
 
@@ -37,21 +37,28 @@ struct OciLoadSpec {
     /// archive output (group `""`) is consumed.
     #[spec(required)]
     image: String,
-    /// Local tag to give the loaded image, e.g. `app:dev`. Required for the
-    /// `oci` format (skopeo must name the daemon image); optional for the
-    /// `docker` format (tags come from the archive).
+    /// Local tag to give the loaded image, e.g. `app:dev`. Required when loading
+    /// with `skopeo` (it must name the daemon image) — i.e. for the `oci` format
+    /// or an explicit `tool = "skopeo"`. Optional for `docker load` (tags come
+    /// from the archive).
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     tag: Option<String>,
     /// Source archive format: `oci` (default) or `docker`. Must match how the
     /// `oci_image` target was built.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     format: Option<String>,
+    /// Tool to load with: `skopeo` (default for an `oci` archive) or `docker`
+    /// (default for a `docker` archive — `docker load`, no skopeo needed).
+    /// `docker` cannot load an `oci` archive.
+    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    tool: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciLoadDef {
     format: ImageFormat,
     tag: Option<String>,
+    tool: Tool,
 }
 
 const OCI_LOAD_FORMAT_VERSION: u32 = 1;
@@ -61,33 +68,34 @@ impl Hash for OciLoadDef {
         OCI_LOAD_FORMAT_VERSION.hash(state);
         self.format.transport().hash(state);
         self.tag.hash(state);
+        self.tool.label().hash(state);
     }
 }
 
 /// Assemble the load argv. Pure so it can be unit-tested without a daemon.
-/// `argv[0]` is the binary (docker or skopeo, per format).
+/// `argv[0]` is the binary (docker or skopeo, per `tool`).
 fn load_argv(
     docker_bin: &str,
     skopeo_bin: &str,
     def: &OciLoadDef,
     tar: &std::path::Path,
 ) -> anyhow::Result<Vec<String>> {
-    match def.format {
-        ImageFormat::Docker => Ok(vec![
+    match def.tool {
+        Tool::Docker => Ok(vec![
             docker_bin.to_string(),
             "load".to_string(),
             "-i".to_string(),
             tar.to_string_lossy().into_owned(),
         ]),
-        ImageFormat::Oci => {
+        Tool::Skopeo => {
             let tag = def.tag.as_deref().context(
-                "oci_load of an `oci` archive requires `tag` (skopeo must name the daemon image)",
+                "oci_load with skopeo requires `tag` (skopeo must name the daemon image)",
             )?;
             Ok(vec![
                 skopeo_bin.to_string(),
                 "copy".to_string(),
                 "--insecure-policy".to_string(),
-                format!("oci-archive:{}", tar.to_string_lossy()),
+                format!("{}:{}", def.format.transport(), tar.to_string_lossy()),
                 format!("docker-daemon:{tag}"),
             ])
         }
@@ -143,10 +151,12 @@ impl ManagedDriver for Driver {
         let spec =
             OciLoadSpec::from(req.target_spec.config.clone()).context("parse oci_load config")?;
         let format = ImageFormat::parse(spec.format.as_deref().unwrap_or("oci"))?;
+        let tool = Tool::parse_opt(spec.tool.as_deref(), format)?;
+        ensure_tool_supports_format(tool, format)?;
 
-        // Fail closed at parse time: an `oci` load with no tag can never run.
-        if format == ImageFormat::Oci && spec.tag.is_none() {
-            anyhow::bail!("oci_load of an `oci` archive requires `tag`");
+        // Fail closed at parse time: a skopeo load with no tag can never run.
+        if tool == Tool::Skopeo && spec.tag.is_none() {
+            anyhow::bail!("oci_load with skopeo requires `tag`");
         }
 
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
@@ -158,6 +168,7 @@ impl ManagedDriver for Driver {
         let def = OciLoadDef {
             format,
             tag: spec.tag,
+            tool,
         };
         let hash = {
             let mut h =
@@ -247,6 +258,7 @@ mod tests {
         let def = OciLoadDef {
             format: ImageFormat::Docker,
             tag: None,
+            tool: Tool::Docker,
         };
         let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
         assert_eq!(argv, ["docker", "load", "-i", "/t/i.tar"]);
@@ -257,6 +269,7 @@ mod tests {
         let def = OciLoadDef {
             format: ImageFormat::Oci,
             tag: Some("app:dev".to_string()),
+            tool: Tool::Skopeo,
         };
         let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
         let joined = argv.join(" ");
@@ -268,15 +281,51 @@ mod tests {
         assert!(joined.contains("docker-daemon:app:dev"), "{joined}");
     }
 
+    /// Explicit skopeo on a docker-format archive loads via docker-archive
+    /// transport — still no docker CLI.
     #[test]
-    fn load_argv_oci_without_tag_errors() {
+    fn load_argv_skopeo_docker_format_uses_docker_archive() {
+        let def = OciLoadDef {
+            format: ImageFormat::Docker,
+            tag: Some("app:dev".to_string()),
+            tool: Tool::Skopeo,
+        };
+        let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
+        let joined = argv.join(" ");
+        assert!(joined.contains("docker-archive:/t/i.tar"), "{joined}");
+        assert!(joined.contains("docker-daemon:app:dev"), "{joined}");
+    }
+
+    #[test]
+    fn load_argv_skopeo_without_tag_errors() {
         let def = OciLoadDef {
             format: ImageFormat::Oci,
             tag: None,
+            tool: Tool::Skopeo,
         };
         let err = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar"))
-            .expect_err("oci without tag must fail");
+            .expect_err("skopeo without tag must fail");
         assert!(format!("{err:#}").contains("tag"), "got: {err:#}");
+    }
+
+    /// docker cannot load an oci archive — rejected at parse.
+    #[tokio::test]
+    async fn parse_docker_tool_with_oci_format_fails() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//app:load",
+                    cfg(&[
+                        ("image", Value::String(":img".to_string())),
+                        ("tool", Value::String("docker".to_string())),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("docker+oci must fail");
+        assert!(format!("{err:#}").contains("oci"), "got: {err:#}");
     }
 
     #[tokio::test]

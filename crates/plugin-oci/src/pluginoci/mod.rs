@@ -82,6 +82,58 @@ impl ImageFormat {
     }
 }
 
+/// The CLI used to move an image between an archive, a registry, and the local
+/// daemon (for `oci_push` / `oci_pull` / `oci_load`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Tool {
+    /// `skopeo` — daemonless, reads/writes both OCI and docker archives.
+    Skopeo,
+    /// The `docker` CLI — needs the daemon and only handles docker-format
+    /// archives (`docker load`/`save`/`push`), but keeps `skopeo` off the
+    /// dependency list.
+    Docker,
+}
+
+impl Tool {
+    /// Resolve the `tool` config value. Absent picks per format so `skopeo` is
+    /// only required for OCI archives: a docker-format image uses the `docker`
+    /// CLI, an OCI-format image uses `skopeo`.
+    pub(crate) fn parse_opt(s: Option<&str>, format: ImageFormat) -> anyhow::Result<Self> {
+        match s {
+            None => Ok(match format {
+                ImageFormat::Docker => Tool::Docker,
+                ImageFormat::Oci => Tool::Skopeo,
+            }),
+            Some("skopeo") => Ok(Tool::Skopeo),
+            Some("docker") => Ok(Tool::Docker),
+            Some(other) => {
+                anyhow::bail!("`tool` must be \"skopeo\" or \"docker\", got {other:?}")
+            }
+        }
+    }
+
+    /// Stable label for hashing.
+    fn label(self) -> &'static str {
+        match self {
+            Tool::Skopeo => "skopeo",
+            Tool::Docker => "docker",
+        }
+    }
+}
+
+/// The `docker` CLI cannot read an OCI archive (`docker load`/`save`/`push` are
+/// docker-format only). Reject that combination at parse time with a clear
+/// message rather than a cryptic runtime failure.
+pub(crate) fn ensure_tool_supports_format(tool: Tool, format: ImageFormat) -> anyhow::Result<()> {
+    if tool == Tool::Docker && format == ImageFormat::Oci {
+        anyhow::bail!(
+            "tool=\"docker\" cannot handle an `oci` archive; build with format=\"docker\" or use \
+             tool=\"skopeo\""
+        );
+    }
+    Ok(())
+}
+
 /// Config for an `oci_image` target.
 #[derive(Spec)]
 struct OciImageSpec {
@@ -440,8 +492,8 @@ impl ManagedDriver for Driver {
 
 /// Run a subprocess to completion, failing with the captured stderr on a
 /// non-zero exit. `argv[0]` is the binary. `what` names the operation for error
-/// context. Pure blocking work.
-fn run_cmd(argv: &[String], what: &str) -> anyhow::Result<()> {
+/// context. Returns captured stdout. Pure blocking work.
+fn run_cmd(argv: &[String], what: &str) -> anyhow::Result<String> {
     let (bin, args) = argv.split_first().context("empty argv (internal bug)")?;
     let output = std::process::Command::new(bin)
         .args(args)
@@ -454,17 +506,17 @@ fn run_cmd(argv: &[String], what: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Run `argv` off the async runtime, racing it against cancellation. The child
 /// is not killed mid-syscall (same tradeoff as http_fetch) — cancellation stops
-/// awaiting it.
+/// awaiting it. Returns captured stdout.
 pub(crate) async fn run_cmd_cancellable(
     argv: Vec<String>,
     ctoken: &(dyn Cancellable + Send + Sync),
     what: &'static str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let work = tokio::task::spawn_blocking(move || run_cmd(&argv, what));
     let run = async {
         work.await
