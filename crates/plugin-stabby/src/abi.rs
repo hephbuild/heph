@@ -138,7 +138,9 @@ pub type DynExecutor = stabby::dynptr!(stabby::boxed::Box<dyn StableExecutor + S
 /// aggregate registry (via `set_function_registry`) and wants to invoke one of
 /// the functions in it. Mirrors a lookup + [`hplugin::provider::ProviderFn::call`]
 /// on the host side. `req` is raw `pb::CallRegisteredRequest` bytes; the reply is
-/// a `pb::Frame` carrying `CallFunctionResp` (the returned value) or `Error`.
+/// a `pb::Frame` carrying `CallFunctionResp` — the returned value, plus any
+/// targets / provider-state the host function declared, when the calling plugin
+/// set `accepts_declarations` — or `Error`.
 #[stabby::stabby]
 pub trait StableFunctionRegistry {
     extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>>;

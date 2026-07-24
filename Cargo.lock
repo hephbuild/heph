@@ -1501,12 +1501,16 @@ name = "e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "core",
  "engine",
  "futures",
  "heph",
+ "plugin",
  "plugin-devenv",
  "plugin-oci",
+ "plugin-sdk",
+ "plugin-stabby",
  "serde_json",
  "sha2 0.10.9",
  "tar",
