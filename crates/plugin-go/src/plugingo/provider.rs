@@ -1502,15 +1502,22 @@ impl ProviderInner {
             GoPackageKind::Stdlib { .. } => String::new(),
         };
 
-        // Magic host-default `build`: a bare `//pkg:build` (no `@v`) is served as a
-        // `group` target forwarding to `build@v=<variant>` for the first ancestry
-        // variant matching this machine's goos/goarch. It gives `//pkg:build` an
-        // ergonomic host default without an implicit variant on the real per-variant
-        // build. Intercept before `variant::resolve`, which requires an explicit `v`.
-        // First-party only — `build` (and thus its host-default) exists solely for
-        // first-party packages, matching what `list` emits.
+        // Magic host-default `build`: a *truly bare* `//pkg:build` (no addr args at
+        // all) is served as a `group` target forwarding to `build@v=<variant>` for
+        // the first ancestry variant matching this machine's goos/goarch. It gives
+        // `//pkg:build` an ergonomic host default without an implicit variant on the
+        // real per-variant build. First-party only — `build` (and thus its
+        // host-default) exists solely for first-party packages, matching what `list`
+        // emits.
+        //
+        // Gate on `args.is_empty()`, NOT merely "no `v`": a `build` carrying stray
+        // args — e.g. a legacy `build@goos=linux,goarch=amd64` from a pre-variant
+        // BUILD file — must fall through to `variant::resolve`, which reports a clear
+        // "requires `@v=NAME`" migration error, rather than being silently treated as
+        // the host-default (which would forward to the host variant and confusingly
+        // NotFound for a target-platform-only package).
         if addr.name == "build"
-            && !addr.args.contains_key("v")
+            && addr.args.is_empty()
             && matches!(&*kind, GoPackageKind::FirstParty { .. })
         {
             let (host_goos, host_goarch) = (current_goos(), current_goarch());
@@ -1548,6 +1555,21 @@ impl ProviderInner {
             return Ok(GetResponse {
                 target_spec: magic_build_group_spec(addr.clone(), &target),
             });
+        }
+
+        // Strict addr args: every variant-parameterized go target accepts only `v`
+        // (entry) and `vp` (library/dep pin). Reject anything else rather than
+        // silently ignoring it — notably a legacy `goos`/`goarch` from a pre-variant
+        // BUILD file, which must surface as an actionable error, not resolve to the
+        // wrong thing. (The host-keyed toolchain/govet targets, which do carry
+        // `goos`/`goarch`, are handled earlier and never reach here.)
+        if let Some(bad) = addr.args.keys().find(|k| !matches!(k.as_str(), "v" | "vp")) {
+            return Err(GetError::Other(anyhow::anyhow!(
+                "unknown addr arg `{bad}` on go target `:{}` (allowed: v, vp); \
+                 select a build variant with `@v=NAME` — `goos`/`goarch` are no \
+                 longer addr args, declare a variant instead",
+                addr.name,
+            )));
         }
 
         let (factors, vref) =
@@ -5893,6 +5915,61 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             matches!(res, Err(GetError::NotFound)),
             "magic build on a non-main package must NotFound"
+        );
+    }
+
+    /// Unknown addr args are rejected. A legacy `build@goos=…,goarch=…` (a
+    /// pre-variant BUILD dep) must NOT be hijacked by the magic host-default nor
+    /// silently ignored — it errors naming the offending arg, pointing at `@v=`.
+    #[tokio::test]
+    async fn unknown_build_addr_arg_is_rejected() {
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(
+            PkgBuf::from("cmd"),
+            "build".to_string(),
+            std::collections::BTreeMap::from([
+                ("goos".to_string(), "linux".to_string()),
+                ("goarch".to_string(), "amd64".to_string()),
+            ]),
+        );
+        let err = match provider_get(&p, addr).await {
+            Err(GetError::Other(e)) => e,
+            Err(GetError::NotFound) => panic!("expected an unknown-arg error, got NotFound"),
+            Ok(_) => panic!("expected an error, got Ok"),
+        };
+        let msg = format!("{err:#}");
+        // Args iterate sorted, so `goarch` (the first offending key) is named.
+        assert!(
+            msg.contains("unknown addr arg `goarch`") && msg.contains("@v="),
+            "error must name the bad arg and point at @v=: {msg}"
+        );
+    }
+
+    /// Unknown args are rejected on non-`build` targets too (the check is general,
+    /// not build-specific).
+    #[tokio::test]
+    async fn unknown_addr_arg_rejected_on_build_lib() {
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(
+            PkgBuf::from("lib"),
+            "build_lib".to_string(),
+            std::collections::BTreeMap::from([
+                ("v".to_string(), "host".to_string()),
+                ("bogus".to_string(), "x".to_string()),
+            ]),
+        );
+        let err = match provider_get(&p, addr).await {
+            Err(GetError::Other(e)) => e,
+            other => {
+                let _ = other;
+                panic!("expected an unknown-arg error")
+            }
+        };
+        assert!(
+            format!("{err:#}").contains("unknown addr arg `bogus`"),
+            "{err:#}"
         );
     }
 
