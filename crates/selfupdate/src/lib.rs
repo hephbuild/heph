@@ -209,10 +209,15 @@ fn download_url(tag: &str, os: &str, arch: &str) -> String {
 mod imp {
     use super::{UPGRADED_ENV, binary_name, download_url, host_os_arch};
     use anyhow::{Context, anyhow};
+    use std::io::{IsTerminal, Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
 
     /// `~/.heph/versions/<tag>/` — where downloaded release binaries are cached,
     /// shared across workspaces (a pinned version is workspace-independent).
@@ -242,23 +247,132 @@ mod imp {
         }
 
         let url = download_url(tag, os, arch);
-        tracing::info!("downloading heph {tag}");
-        let bytes = download(&url)?;
+        let bytes = download_with_ui(&url, tag)?;
         install_atomic(&dir, &dest, &bytes)?;
         Ok(dest)
     }
 
-    /// Fetch `url` fully into memory. `reqwest::blocking` spins up its own runtime,
-    /// so run it on a dedicated thread to stay safe if ever called from within an
-    /// async runtime (matches the engine's plugin downloader).
-    fn download(url: &str) -> anyhow::Result<Vec<u8>> {
+    /// Download `tag`'s binary, surfacing progress in the mode that fits the caller.
+    ///
+    /// - **Interactive** (stderr is a tty): a live spinner + byte progress on a
+    ///   single stderr line, cleared completely on completion so no trace of the
+    ///   upgrade is left behind.
+    /// - **Non-interactive** (piped/CI logs): a single `tracing::info!` line, as
+    ///   before — no cursor tricks that would garble a log file.
+    fn download_with_ui(url: &str, tag: &str) -> anyhow::Result<Vec<u8>> {
+        if !std::io::stderr().is_terminal() {
+            tracing::info!("downloading heph {tag}");
+            return download(url, None);
+        }
+        let progress = Arc::new(Progress::default());
+        let spinner = spawn_spinner(tag.to_string(), Arc::clone(&progress));
+        let result = download(url, Some(Arc::clone(&progress)));
+        // Stop the spinner and let it wipe its line before we hand control back.
+        progress.done.store(true, Ordering::SeqCst);
+        drop(spinner.join());
+        result
+    }
+
+    /// Live download progress shared between the fetch thread (writer) and the
+    /// spinner thread (reader). `total` is 0 until the response headers arrive.
+    #[derive(Default)]
+    struct Progress {
+        downloaded: AtomicU64,
+        total: AtomicU64,
+        done: AtomicBool,
+    }
+
+    const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    /// Redraw the spinner line on stderr until `progress.done`, then clear it
+    /// entirely (leaving no "upgraded" residue). Runs on its own thread so the
+    /// blocking download can stream on another.
+    fn spawn_spinner(tag: String, progress: Arc<Progress>) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut err = std::io::stderr();
+            let mut frame = 0usize;
+            while !progress.done.load(Ordering::SeqCst) {
+                let glyph = SPINNER_FRAMES
+                    .get(frame % SPINNER_FRAMES.len())
+                    .unwrap_or(&"");
+                frame = frame.wrapping_add(1);
+                let line = progress_line(
+                    glyph,
+                    &tag,
+                    progress.downloaded.load(Ordering::Relaxed),
+                    progress.total.load(Ordering::Relaxed),
+                );
+                // `\r` + `\x1b[K` overwrites the current line each tick.
+                drop(write!(err, "\r{line}\x1b[K"));
+                drop(err.flush());
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            // Wipe the line so nothing about the upgrade remains on screen.
+            drop(write!(err, "\r\x1b[K"));
+            drop(err.flush());
+        })
+    }
+
+    /// The spinner's text (no cursor codes): `⠹ downloading heph v1.2.3 3.1/8.0 MiB`,
+    /// dropping the total while it is still unknown.
+    fn progress_line(glyph: &str, tag: &str, downloaded: u64, total: u64) -> String {
+        if total > 0 {
+            format!(
+                "{glyph} downloading heph {tag} {}/{}",
+                fmt_bytes(downloaded),
+                fmt_bytes(total)
+            )
+        } else {
+            format!("{glyph} downloading heph {tag} {}", fmt_bytes(downloaded))
+        }
+    }
+
+    /// Human-readable byte count for the progress line.
+    fn fmt_bytes(n: u64) -> String {
+        const KIB: f64 = 1024.0;
+        const MIB: f64 = 1024.0 * 1024.0;
+        let bytes = n as f64;
+        if bytes >= MIB {
+            format!("{:.1} MiB", bytes / MIB)
+        } else if bytes >= KIB {
+            format!("{:.0} KiB", bytes / KIB)
+        } else {
+            format!("{n} B")
+        }
+    }
+
+    /// Fetch `url` fully into memory, streaming so `progress` (when present) tracks
+    /// bytes as they arrive. `reqwest::blocking` spins up its own runtime, so run it
+    /// on a dedicated thread to stay safe if ever called from within an async
+    /// runtime (matches the engine's plugin downloader).
+    fn download(url: &str, progress: Option<Arc<Progress>>) -> anyhow::Result<Vec<u8>> {
         let url = url.to_string();
         std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
-            let resp = reqwest::blocking::get(&url)
+            let mut resp = reqwest::blocking::get(&url)
                 .with_context(|| format!("GET {url}"))?
                 .error_for_status()
                 .with_context(|| format!("GET {url}"))?;
-            Ok(resp.bytes()?.to_vec())
+            if let Some(p) = &progress
+                && let Some(len) = resp.content_length()
+            {
+                p.total.store(len, Ordering::Relaxed);
+            }
+            let mut buf = Vec::with_capacity(resp.content_length().unwrap_or(0) as usize);
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let n = resp
+                    .read(&mut chunk)
+                    .with_context(|| format!("reading response body from {url}"))?;
+                if n == 0 {
+                    break;
+                }
+                let Some(part) = chunk.get(..n) else { break };
+                buf.extend_from_slice(part);
+                if let Some(p) = &progress {
+                    p.downloaded.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+            Ok(buf)
         })
         .join()
         .map_err(|_e| anyhow!("self-upgrade download thread panicked"))?
@@ -324,6 +438,35 @@ mod imp {
                 .with_context(|| format!("flock LOCK_EX on {}", path.display()));
         }
         Ok(FileLock { file })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{fmt_bytes, progress_line};
+
+        #[test]
+        fn fmt_bytes_scales_by_unit() {
+            assert_eq!(fmt_bytes(512), "512 B");
+            assert_eq!(fmt_bytes(2048), "2 KiB");
+            assert_eq!(fmt_bytes(3 * 1024 * 1024 + 100 * 1024), "3.1 MiB");
+        }
+
+        #[test]
+        fn progress_line_includes_total_when_known() {
+            assert_eq!(
+                progress_line("⠹", "v1.2.3", 1024 * 1024, 8 * 1024 * 1024),
+                "⠹ downloading heph v1.2.3 1.0 MiB/8.0 MiB"
+            );
+        }
+
+        #[test]
+        fn progress_line_drops_total_while_unknown() {
+            // total == 0 means Content-Length was absent; show only what arrived.
+            assert_eq!(
+                progress_line("⠋", "v2.0.0", 4096, 0),
+                "⠋ downloading heph v2.0.0 4 KiB"
+            );
+        }
     }
 }
 
