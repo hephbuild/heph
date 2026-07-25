@@ -114,7 +114,7 @@ runs:
           exit 0
         fi
         {
-          echo "SCCACHE_BUCKET=heph-sccache"
+          echo "SCCACHE_BUCKET=heph-sscache"
           echo "SCCACHE_REGION=auto"
           echo "SCCACHE_ENDPOINT=https://b9d7099532d2613531d6f54b60211d0c.r2.cloudflarestorage.com"
           # Bump to invalidate every cached object at once.
