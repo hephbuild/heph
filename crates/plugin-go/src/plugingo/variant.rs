@@ -328,11 +328,18 @@ pub fn resolve_in_universe(
 /// - no `v`: hard error — there is no implicit default variant.
 ///
 /// `module_root` is the target's `go.mod` package (workspace-relative).
+/// `vp_same_module` says whether the addr's `vp` (if any) names a package in the
+/// target's *own* go module — a real nearest-`go.mod` check the caller performs
+/// (a plain path-prefix test is insufficient: a `vp` can prefix-match while
+/// living inside a *nested* submodule). Only an in-module `vp` is honored; a
+/// foreign one (a cross-module dependency's pin) is ignored so its module's
+/// variant declaration can't leak in.
 pub async fn resolve(
     addr: &Addr,
     req_states: &[State],
     module_root: &str,
     executor: &dyn ProviderExecutor,
+    vp_same_module: bool,
 ) -> anyhow::Result<(Factors, VariantRef)> {
     let Some(name) = addr.args.get("v") else {
         bail!(
@@ -348,7 +355,7 @@ pub async fn resolve(
         // drag that foreign module's variant declaration in. Re-resolve the name
         // by ancestry within this module instead — the dep provides its own
         // same-named variant, or it is genuinely undeclared here.
-        Some(vp) if under_module_root(vp, module_root) => {
+        Some(vp) if vp_same_module => {
             let vref = VariantRef::new(name.clone(), vp.clone());
             // Fast path: a `vp` already in the target's ancestry (`req_states` —
             // common for a module-root-declared variant) needs no fetch.
@@ -603,7 +610,7 @@ mod tests {
             "build_lib".to_string(),
             VariantRef::new("release", "app/cmd").to_args(),
         );
-        let (f, vref) = resolve(&addr, &lib_ancestry, "app", &exec)
+        let (f, vref) = resolve(&addr, &lib_ancestry, "app", &exec, true)
             .await
             .expect("sibling variant resolves via the module universe");
         assert_eq!((f.goos.as_str(), f.goarch.as_str()), ("linux", "amd64"));
@@ -612,9 +619,10 @@ mod tests {
 
     // A `vp` from a consumer in a DIFFERENT go module (a cross-module dependency)
     // must NOT be honored: the universe is bounded to the target's own module.
-    // Here `dev/app/graphql`'s dep addr carries `vp=mgmt/go` (a foreign module);
-    // resolution ignores it and resolves `release` by ancestry within `dev/app`,
-    // rebasing `vp` to the target's own module. `states_under` is never consulted.
+    // Here `dev/app/graphql`'s dep addr carries `vp=mgmt/go` (a foreign module),
+    // so the caller passes `vp_same_module = false`; resolution ignores the `vp`
+    // and resolves `release` by ancestry within `dev/app`, rebasing `vp` to the
+    // target's own module. `states_under` is never consulted.
     #[tokio::test]
     async fn foreign_vp_outside_module_resolves_by_ancestry() {
         let ancestry = vec![go_state("dev/app", &[("release", linux_amd64())])];
@@ -628,7 +636,7 @@ mod tests {
             "build_lib".to_string(),
             VariantRef::new("release", "mgmt/go").to_args(),
         );
-        let (f, vref) = resolve(&addr, &ancestry, "dev/app", &exec)
+        let (f, vref) = resolve(&addr, &ancestry, "dev/app", &exec, false)
             .await
             .expect("foreign vp falls back to module-bounded ancestry");
         assert_eq!((f.goos.as_str(), f.goarch.as_str()), ("linux", "amd64"));

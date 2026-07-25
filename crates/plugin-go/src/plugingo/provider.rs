@@ -630,15 +630,7 @@ impl ProviderInner {
             //     forms a cross-subtree consumer pins with `vp`.
             // A package with no variants in scope lists no build targets — there is
             // no implicit default variant.
-            let module_root = match &*kind {
-                GoPackageKind::FirstParty { module_root, .. }
-                | GoPackageKind::ThirdParty { module_root, .. } => module_root
-                    .strip_prefix(&self.workspace_root)
-                    .unwrap_or(module_root)
-                    .to_string_lossy()
-                    .into_owned(),
-                GoPackageKind::Stdlib { .. } => String::new(),
-            };
+            let module_root = module_root_rel(&kind, &self.workspace_root);
             let ancestry_pairs = variant::ancestry_variants_with_factors(&req.states, &module_root);
             let ancestry: Vec<VariantRef> = ancestry_pairs.iter().map(|(v, _)| v.clone()).collect();
             // Runnable `test`/`xtest` targets execute the built binary, so they
@@ -656,10 +648,20 @@ impl ProviderInner {
             // (rarely listed directly, and always consumed with a `vp` pin) fall
             // back to ancestry.
             let universe = if matches!(&*kind, GoPackageKind::FirstParty { .. }) {
-                let module_states = req
+                // `states_under` walks the whole subtree by path prefix, so it
+                // also returns states from *nested* submodules under this
+                // package. Keep only states in this target's own module — a
+                // nested submodule's variants are a different module's targets
+                // and must not be enumerated here.
+                let module_states: Vec<State> = req
                     .executor
                     .states_under(&hmodel::htpkg::PkgBuf::from(module_root.as_str()))
-                    .await?;
+                    .await?
+                    .into_iter()
+                    .filter(|s| {
+                        pkg_in_module(s.package.as_str(), &module_root, &self.workspace_root)
+                    })
+                    .collect();
                 variant::universe_variants(&module_states)?
             } else {
                 ancestry.clone()
@@ -861,6 +863,34 @@ fn is_entry_target_name(name: &str) -> bool {
 /// built for another platform can't run here.
 fn is_run_test_target_name(name: &str) -> bool {
     matches!(name, "test" | "xtest")
+}
+
+/// Workspace-relative go.mod directory of a decoded package (`""` for a root
+/// module, `"go"` for `go/go.mod`, etc.). Two packages belong to the *same* Go
+/// module iff this matches — the real module-membership test (a plain path
+/// prefix is wrong: a package can prefix-match a module root while living inside
+/// a *nested* submodule with its own `go.mod`).
+fn module_root_rel(kind: &GoPackageKind, workspace_root: &Path) -> String {
+    match kind {
+        GoPackageKind::FirstParty { module_root, .. }
+        | GoPackageKind::ThirdParty { module_root, .. } => module_root
+            .strip_prefix(workspace_root)
+            .unwrap_or(module_root)
+            .to_string_lossy()
+            .into_owned(),
+        GoPackageKind::Stdlib { .. } => String::new(),
+    }
+}
+
+/// Whether `pkg` (a Go import package) belongs to the module rooted at
+/// `target_module_root` (workspace-relative). The real nearest-`go.mod` check —
+/// used to bound `vp` honoring and library-variant enumeration to the target's
+/// own module, so a nested submodule's variants never leak across the boundary.
+fn pkg_in_module(pkg: &str, target_module_root: &str, workspace_root: &Path) -> bool {
+    match decode_package(&hmodel::htpkg::PkgBuf::from(pkg), workspace_root) {
+        Some(kind) => module_root_rel(&kind, workspace_root) == target_module_root,
+        None => false,
+    }
 }
 
 /// Spec for the magic host-default `build` (bare `//pkg:build`): a `group` target
@@ -1394,10 +1424,13 @@ impl ProviderInner {
         // resolve the variant here.
         if addr.package.as_str() == target_std::STD_PKG && addr.name == "install" {
             // std:install is always internal (carries `vp`), so it takes the
-            // library/universe branch — `module_root` is unused.
-            let (factors, _vref) = variant::resolve(addr, &req.states, "", req.executor.as_ref())
-                .await
-                .map_err(GetError::Other)?;
+            // library/universe branch — `module_root` is unused. std belongs to
+            // no user module; its `vp` (the consumer's declaring package) is
+            // always honored so std builds with the consumer's variant factors.
+            let (factors, _vref) =
+                variant::resolve(addr, &req.states, "", req.executor.as_ref(), true)
+                    .await
+                    .map_err(GetError::Other)?;
             let spec = target_std::install_spec(addr.clone(), &factors, &self.go_version);
             return Ok(GetResponse { target_spec: spec });
         }
@@ -1492,15 +1525,7 @@ impl ProviderInner {
         //
         // `module_root` bounds ancestry resolution at the go.mod dir (not repo
         // root); it is unused for the `vp` (library) branch.
-        let module_root = match &*kind {
-            GoPackageKind::FirstParty { module_root, .. }
-            | GoPackageKind::ThirdParty { module_root, .. } => module_root
-                .strip_prefix(&self.workspace_root)
-                .unwrap_or(module_root)
-                .to_string_lossy()
-                .into_owned(),
-            GoPackageKind::Stdlib { .. } => String::new(),
-        };
+        let module_root = module_root_rel(&kind, &self.workspace_root);
 
         // Magic host-default `build`: a *truly bare* `//pkg:build` (no addr args at
         // all) is served as a `group` target forwarding to `build@v=<variant>` for
@@ -1572,10 +1597,23 @@ impl ProviderInner {
             )));
         }
 
-        let (factors, vref) =
-            variant::resolve(addr, &req.states, &module_root, req.executor.as_ref())
-                .await
-                .map_err(GetError::Other)?;
+        // Honor `vp` only when it names a package in *this* target's own go
+        // module (a real nearest-`go.mod` check, not a path prefix). A `vp`
+        // threaded from a consumer in a different module is a cross-module dep
+        // pin and must be ignored so the foreign module's variant can't leak in.
+        let vp_same_module = addr
+            .args
+            .get("vp")
+            .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.workspace_root));
+        let (factors, vref) = variant::resolve(
+            addr,
+            &req.states,
+            &module_root,
+            req.executor.as_ref(),
+            vp_same_module,
+        )
+        .await
+        .map_err(GetError::Other)?;
 
         // _golist — generate spec without executing go list (before stdlib check so
         // stdlib packages can also expose a _golist target for cached dep resolution)
@@ -4842,6 +4880,99 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             !addrs.iter().any(|a| a.name == "build"),
             "entry target must not list a variant absent from ancestry: {addrs:?}"
+        );
+    }
+
+    /// Module-bounding: `states_under` walks by path prefix, so a variant
+    /// declared inside a **nested submodule** (its own `go.mod`) is returned too.
+    /// The root module's `list` must NOT enumerate it — that variant is a
+    /// different module's target. Only the same-module (root) variant is listed.
+    #[tokio::test]
+    async fn list_library_excludes_nested_submodule_variant() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("go.mod"),
+            "module example.com/root\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::create_dir(ws.path().join("nested")).unwrap();
+        std::fs::write(
+            ws.path().join("nested/go.mod"),
+            "module example.com/nested\ngo 1.22\n",
+        )
+        .unwrap();
+        let p = Provider::new(ws.path().to_path_buf()).unwrap();
+
+        // `release` declared at the root module ("") AND at the nested submodule
+        // ("nested"). `states_under("")` returns both by prefix.
+        struct NestedUniverse;
+        impl ProviderExecutor for NestedUniverse {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                unimplemented!("list must not resolve results")
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                unimplemented!("list must not query")
+            }
+            fn states_under<'a>(
+                &'a self,
+                prefix: &'a PkgBuf,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+                let variant = || {
+                    Value::Map(HashMap::from([
+                        ("goos".to_string(), Value::String("linux".into())),
+                        ("goarch".to_string(), Value::String("amd64".into())),
+                    ]))
+                };
+                let go_state = |pkg: &str| State {
+                    package: PkgBuf::from(pkg),
+                    provider: "go".to_string(),
+                    state: HashMap::from([(
+                        "variants".to_string(),
+                        Value::Map(HashMap::from([("release".to_string(), variant())])),
+                    )]),
+                };
+                let states = if prefix.as_str().is_empty() {
+                    vec![go_state(""), go_state("nested")]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move { Ok(states) })
+            }
+        }
+
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from(""),
+            states: vec![],
+            executor: Arc::new(NestedUniverse),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        // The root-module variant is listed (vp="").
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.name == "build_lib" && a.args.get("vp").map(String::as_str) == Some("")),
+            "root-module variant must be listed: {addrs:?}"
+        );
+        // The nested submodule's variant must NOT be — it's a different module.
+        assert!(
+            !addrs
+                .iter()
+                .any(|a| a.args.get("vp").map(String::as_str) == Some("nested")),
+            "nested submodule variant must not cross the module boundary: {addrs:?}"
         );
     }
 
