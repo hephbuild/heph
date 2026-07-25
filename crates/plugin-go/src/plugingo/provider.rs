@@ -1597,14 +1597,24 @@ impl ProviderInner {
             )));
         }
 
-        // Honor `vp` only when it names a package in *this* target's own go
-        // module (a real nearest-`go.mod` check, not a path prefix). A `vp`
-        // threaded from a consumer in a different module is a cross-module dep
-        // pin and must be ignored so the foreign module's variant can't leak in.
-        let vp_same_module = addr
-            .args
-            .get("vp")
-            .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.workspace_root));
+        // Decide whether to honor the addr's `vp`:
+        //   - std / thirdparty belong to *no* user module — they carry no
+        //     variant declarations of their own and are only ever reached as a
+        //     dependency. Their factors ARE the consumer's, threaded via `vp`, so
+        //     always honor it (module-bounding them would strand them with an
+        //     empty ancestry and fail).
+        //   - first-party: honor `vp` only when it names a package in *this*
+        //     target's own go module (a real nearest-`go.mod` check, not a path
+        //     prefix). A `vp` threaded from a consumer in a different module is a
+        //     cross-module dep pin; ignoring it keeps the foreign module's
+        //     variant declaration from leaking across the boundary.
+        let vp_same_module = match &*kind {
+            GoPackageKind::Stdlib { .. } | GoPackageKind::ThirdParty { .. } => true,
+            GoPackageKind::FirstParty { .. } => addr
+                .args
+                .get("vp")
+                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.workspace_root)),
+        };
         let (factors, vref) = variant::resolve(
             addr,
             &req.states,
