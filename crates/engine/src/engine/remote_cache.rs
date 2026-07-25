@@ -326,11 +326,26 @@ impl RemoteCacheSet {
         self.caches.iter().any(|c| c.def.read)
     }
 
-    /// Object key for a cached blob, namespaced by a stable hash of the target
-    /// address so distinct targets that happen to share a `hashin` never alias.
+    /// Object key for a cached blob: the target address rendered as a path, so a
+    /// bucket browses like the source tree — `//pkg/path:name@v=x` with `hashin`
+    /// `abc` and artifact `out.tar` becomes `pkg/path/name@v=x/abc/out.tar`.
+    ///
+    /// Readability never costs uniqueness: [`key_segment`] keeps a segment
+    /// verbatim only when it is unambiguously safe, otherwise it appends a hash
+    /// of the original (see there). Two distinct addresses therefore always
+    /// produce distinct key prefixes, so targets sharing a `hashin` never alias.
     fn key(addr: &Addr, hashin: &str, name: &str) -> String {
-        let addr_hash = xxhash_rust::xxh3::xxh3_64(addr.format().as_bytes());
-        format!("{addr_hash:016x}/{hashin}/{name}")
+        let mut key = String::new();
+        for c in addr.package.components() {
+            key.push_str(&key_segment(c));
+            key.push('/');
+        }
+        key.push_str(&key_segment(&addr_name_segment(addr)));
+        key.push('/');
+        key.push_str(&key_segment(hashin));
+        key.push('/');
+        key.push_str(&key_segment(name));
+        key
     }
 
     /// Probe every cache's round-trip latency once, concurrently, and report it.
@@ -700,6 +715,73 @@ fn config_hash(defs: &[RemoteCacheDef]) -> String {
     format!("{:016x}", h.digest())
 }
 
+/// Longest a readable key segment may be before it is truncated and hashed.
+/// Object stores cap the whole key (GCS at 1024 bytes), and a segment past this
+/// has stopped being readable anyway.
+const KEY_SEGMENT_MAX: usize = 96;
+
+/// Marker separating the readable part of a rewritten segment from its hash.
+/// A segment containing it is never kept verbatim, so the *last* occurrence in
+/// an emitted segment is always the marker — that keeps the mapping injective.
+const KEY_HASH_MARKER: &str = "--";
+
+/// The address's target name plus its args, as one segment: `name@k=v,k=v`.
+fn addr_name_segment(addr: &Addr) -> String {
+    if addr.args.is_empty() {
+        return addr.name.clone();
+    }
+    let mut s = addr.name.clone();
+    s.push('@');
+    for (i, (k, v)) in addr.args.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(k);
+        s.push('=');
+        s.push_str(v);
+    }
+    s
+}
+
+/// Whether a segment can be used verbatim in an object key.
+fn key_segment_is_plain(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= KEY_SEGMENT_MAX
+        && raw != "."
+        && raw != ".."
+        && !raw.contains(KEY_HASH_MARKER)
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '=' | ','))
+}
+
+/// Render one path component readable but unambiguous. A plain segment passes
+/// through untouched; anything else has its unsafe characters replaced, is
+/// truncated, and carries a hash of the *original* so two distinct inputs can
+/// never collapse onto the same segment.
+fn key_segment(raw: &str) -> String {
+    if key_segment_is_plain(raw) {
+        return raw.to_string();
+    }
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '=' | ',') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(KEY_SEGMENT_MAX)
+        .collect();
+    out.push_str(KEY_HASH_MARKER);
+    out.push_str(&format!(
+        "{:016x}",
+        xxhash_rust::xxh3::xxh3_64(raw.as_bytes())
+    ));
+    out
+}
+
 impl Engine {
     pub fn remote_caches(&self) -> &Arc<RemoteCacheSet> {
         &self.remote_caches
@@ -964,6 +1046,74 @@ mod tests {
             "t".to_string(),
             Default::default(),
         )
+    }
+
+    fn mk_addr(pkg: &str, name: &str, args: &[(&str, &str)]) -> Addr {
+        Addr::new(
+            hmodel::htpkg::PkgBuf::from(pkg),
+            name.to_string(),
+            args.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn key_mirrors_the_target_address() {
+        assert_eq!(
+            RemoteCacheSet::key(&mk_addr("some/pkg", "tgt", &[]), "h1", "out.tar"),
+            "some/pkg/tgt/h1/out.tar"
+        );
+        assert_eq!(
+            RemoteCacheSet::key(&mk_addr("", "root_tgt", &[]), "h1", "out.tar"),
+            "root_tgt/h1/out.tar",
+            "root package contributes no segments"
+        );
+        assert_eq!(
+            RemoteCacheSet::key(
+                &mk_addr("some/pkg", "tgt", &[("v", "linux"), ("vp", "arm64")]),
+                "h1",
+                "out.tar"
+            ),
+            "some/pkg/tgt@v=linux,vp=arm64/h1/out.tar",
+            "args stay readable on the name segment"
+        );
+    }
+
+    #[test]
+    fn key_distinguishes_addrs_that_would_alias_after_sanitizing() {
+        // `:` and ` ` are both rewritten to `_`, so the readable part collides —
+        // the appended hash is what keeps the two keys apart.
+        let a = RemoteCacheSet::key(&mk_addr("p", "a:b", &[]), "h", "o");
+        let b = RemoteCacheSet::key(&mk_addr("p", "a b", &[]), "h", "o");
+        assert_ne!(a, b);
+        assert!(a.starts_with("p/a_b--"), "unexpected key {a}");
+
+        // A package boundary shift must not alias with a deeper package.
+        assert_ne!(
+            RemoteCacheSet::key(&mk_addr("a", "b", &[]), "h", "o"),
+            RemoteCacheSet::key(&mk_addr("a/b", "h", &[]), "o", "o"),
+        );
+    }
+
+    #[test]
+    fn key_segment_never_confuses_a_plain_name_with_a_rewritten_one() {
+        // A raw segment that already looks like `<text>--<hash>` must not be kept
+        // verbatim, or it could collide with the rewrite of some other segment.
+        let forged = format!(
+            "a_b{KEY_HASH_MARKER}{:016x}",
+            xxhash_rust::xxh3::xxh3_64(b"a b")
+        );
+        assert_ne!(key_segment(&forged), key_segment("a b"));
+    }
+
+    #[test]
+    fn key_segment_truncates_and_hashes_long_segments() {
+        let long = "x".repeat(KEY_SEGMENT_MAX + 50);
+        let seg = key_segment(&long);
+        assert!(seg.len() < long.len(), "long segment must shrink");
+        assert!(seg.starts_with(&"x".repeat(KEY_SEGMENT_MAX)));
+        assert_ne!(seg, key_segment(&"x".repeat(KEY_SEGMENT_MAX + 51)));
     }
 
     #[test]
