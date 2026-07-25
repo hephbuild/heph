@@ -578,7 +578,7 @@ async fn pull_one_remote_blob(
     addr: Addr,
     hashin: String,
     name: String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let ctoken = rs.ctoken().clone_arc();
     engine
         .pull_remote_blobs(ctoken.as_ref(), &addr, &hashin, &rev, &[name])
@@ -1172,25 +1172,37 @@ impl Engine {
                         // reads, and only those it doesn't already have locally.
                         // `locked.remote` is `Some` exactly when the revision has
                         // remote-only blobs, so a fully-local hit does no I/O here.
-                        if let Some(rev) = &locked.remote {
-                            self.materialize_from_remote(
-                                &rs,
+                        //
+                        // An unservable blob answers `false` instead of failing —
+                        // the entry was confirmed, then the bytes went away. Both
+                        // that and a local blob that vanished fall through to
+                        // `unavailable` below.
+                        let served = match &locked.remote {
+                            Some(rev) => {
+                                self.materialize_from_remote(
+                                    &rs,
+                                    &def.target.addr,
+                                    opts.hashin.as_str(),
+                                    manifest,
+                                    &outputs,
+                                    rev,
+                                )
+                                .await?
+                            }
+                            None => true,
+                        };
+                        if served {
+                            self.artifacts_from_manifest(
+                                rs.ctoken(),
                                 &def.target.addr,
                                 opts.hashin.as_str(),
                                 manifest,
                                 &outputs,
-                                rev,
                             )
-                            .await?;
+                            .await?
+                        } else {
+                            None
                         }
-                        self.artifacts_from_manifest(
-                            rs.ctoken(),
-                            &def.target.addr,
-                            opts.hashin.as_str(),
-                            manifest,
-                            &outputs,
-                        )
-                        .await?
                     }
                     None => {
                         self.clone()
@@ -1203,19 +1215,40 @@ impl Engine {
                             .await?
                     }
                 };
-                let (cache_arts, meta) = res.with_context(|| {
-                    format!(
-                        "result lock confirmed a cache entry for {} but it vanished before read",
-                        def.target.addr
-                    )
-                })?;
-                (
-                    cache_arts
-                        .into_iter()
-                        .map(ResultArtifact::from_cache)
-                        .collect(),
-                    meta,
-                )
+                match res {
+                    Some((cache_arts, meta)) => (
+                        cache_arts
+                            .into_iter()
+                            .map(ResultArtifact::from_cache)
+                            .collect(),
+                        meta,
+                    ),
+                    // The entry was confirmed but its bytes are unavailable: a
+                    // remote object expired between the presence check and the
+                    // read, a transfer failed, or a local blob went missing. Build
+                    // the target instead of failing the run — the same outcome a
+                    // plain cache miss would have had, just decided later. Debug,
+                    // not warn: a shared cache reclaiming an old revision mid-build
+                    // is ordinary, and the rebuild is the correct response.
+                    //
+                    // This executes under the riding *read* lock rather than the
+                    // write lock the miss path holds. In-process the execute
+                    // memoizer still collapses concurrent callers to one run; a
+                    // second *process* racing the same rebuild is possible but
+                    // needs both an eviction and a concurrent build of the same
+                    // target, and the blobs it writes are content-addressed by
+                    // `hashin` and land atomically, so the cache stays consistent.
+                    None => {
+                        tracing::debug!(
+                            addr = %def.target.addr,
+                            hashin = opts.hashin.as_str(),
+                            "cache entry confirmed but its artifacts are unavailable; rebuilding",
+                        );
+                        self.clone()
+                            .execute_and_cache_inner(rs.clone(), opts)
+                            .await?
+                    }
+                }
             }
         };
 
@@ -1249,6 +1282,9 @@ impl Engine {
     /// so two output groups needing the same support file download it once. The
     /// `RemoteCacheRead` span is emitted only when something actually transfers, so
     /// a `↓` op in the timeline always means real bytes.
+    ///
+    /// `false` when the remote could not serve a blob it had advertised — the
+    /// caller rebuilds the target rather than failing.
     async fn materialize_from_remote(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
@@ -1257,12 +1293,12 @@ impl Engine {
         manifest: &Manifest,
         outputs: &[String],
         rev: &Arc<RemoteRevision>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let missing = self
             .missing_local_blobs(rs.ctoken(), addr, hashin, manifest, outputs)
             .await?;
         if missing.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         let addr_s = addr.format();
@@ -1292,12 +1328,12 @@ impl Engine {
                 }
                 // Bounded: one in-flight pull holds a temp file plus a live
                 // response stream, and a caller may have asked for many groups.
-                futures::stream::iter(pulls)
+                let served: Vec<bool> = futures::stream::iter(pulls)
                     .buffered(crate::engine::remote_cache::REVISION_BLOB_CONCURRENCY)
-                    .try_collect::<Vec<()>>()
+                    .try_collect()
                     .await
                     .map_err(unwrap_arc_err)?;
-                anyhow::Ok(())
+                anyhow::Ok(served.into_iter().all(|ok| ok))
             },
         )
         .await
@@ -3438,6 +3474,141 @@ mod tests {
                 |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
             ),
             "remote-on target must use the remote hit, not execute: {events:?}"
+        );
+        Ok(())
+    }
+
+    /// Bash target that actually writes an output, so a cache hit has a blob to
+    /// materialize — a no-output target has nothing to pull and would never reach
+    /// the lazy path.
+    fn out_target(addr: &str) -> pluginstatictarget::Target {
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "bash".to_string(),
+            run: Some("echo hi > $OUT".to_string()),
+            out: HashMap::from([(String::new(), vec!["out.txt".to_string()])]),
+            codegen: None,
+            deps: HashMap::new(),
+            labels: vec![],
+            ..Default::default()
+        }
+    }
+
+    /// [`engine_with_remote`] wired to the bash driver, for targets that need a
+    /// shell to produce an output.
+    fn engine_with_remote_bash(
+        targets: Vec<pluginstatictarget::Target>,
+        remote_uri: &str,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            remote_caches: vec![crate::engine::RemoteCacheDef {
+                name: "shared".to_string(),
+                uri: remote_uri.to_string(),
+                read: true,
+                write: true,
+                concurrency: 10,
+            }],
+            ..Default::default()
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_bash()))?;
+        let provider = pluginstatictarget::Provider::new(targets)?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
+    }
+
+    /// Object store that still advertises every object but can only serve
+    /// manifests — a revision whose blobs were reclaimed after their manifest was
+    /// written, or a backend erroring on blob reads only.
+    struct EvictedBlobBackend {
+        /// Directory of a `file://` remote seeded by a real engine, so the
+        /// manifest it serves is the genuine one for the target's `hashin`.
+        root: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::remote_cache::RemoteCacheBackend for EvictedBlobBackend {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
+            if !key.ends_with(crate::engine::local_cache::MANIFEST_V1) {
+                // The blob is gone, even though `exists` still claims otherwise.
+                return Ok(None);
+            }
+            match std::fs::read(self.root.join(key)) {
+                Ok(bytes) => Ok(Some(Box::pin(std::io::Cursor::new(bytes)))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        }
+        async fn open_write(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Pin<Box<dyn tokio::io::AsyncWrite + Send>>> {
+            anyhow::bail!("read-only stub backend")
+        }
+        /// Still advertised: this is what makes the pull, not the probe, discover
+        /// that the bytes are gone.
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// A revision the remote advertised but cannot actually serve must rebuild the
+    /// target, not fail the run.
+    ///
+    /// The hit is decided from the manifest plus a presence check, so the bytes can
+    /// still disappear before the read: an object expired in that window, or the
+    /// blob GET failed. That leaves the engine holding a confirmed "already built"
+    /// entry with nothing behind it — which must degrade to executing the target,
+    /// exactly as a plain cache miss would have.
+    #[tokio::test]
+    async fn unservable_remote_blob_rebuilds_instead_of_failing() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+
+        // Seed the remote for real, so the stub serves a genuine manifest.
+        let (seeder, _seeder_home) =
+            engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        seeder
+            .clone()
+            .result_addr(
+                seed_rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drain_bg(&seed_rs).await;
+
+        // Cold engine whose remote serves the manifest, claims the blobs exist,
+        // and then cannot produce them.
+        let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
+        let mut engine = engine;
+        let home = engine.home.clone();
+        Arc::get_mut(&mut engine)
+            .expect("engine must not be shared yet")
+            .remote_caches = crate::engine::RemoteCacheSet::with_backend(
+            Arc::new(EvictedBlobBackend {
+                root: remote.path().to_path_buf(),
+            }),
+            home,
+        );
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("an unservable remote revision must rebuild, not fail the run");
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
+            ),
+            "the target must be rebuilt when its advertised blobs cannot be served: {events:?}"
         );
         Ok(())
     }

@@ -184,7 +184,7 @@ pub struct RequestStateData {
     /// its support files, so without this they would download and write the same
     /// blob concurrently — duplicate transfer, and two writers racing on one cache
     /// key.
-    pub(crate) mem_remote_blob: Memoizer<(Addr, String, String), Result<(), ArcErr>>,
+    pub(crate) mem_remote_blob: Memoizer<(Addr, String, String), Result<bool, ArcErr>>,
     pub mem_meta: Memoizer<Addr, Result<ResultMeta, ArcErr>>,
     pub mem_spec: Memoizer<Addr, Result<Arc<EngineTargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<Addr, Result<Arc<ExtendedTargetDef>, ArcErr>>,

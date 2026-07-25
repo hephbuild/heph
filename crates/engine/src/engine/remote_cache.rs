@@ -72,7 +72,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OnceCell, Semaphore};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Max blobs of a *single* revision transferred concurrently, on both the pull
 /// and the push side.
@@ -449,6 +449,28 @@ impl RemoteCacheSet {
             config_hash,
             read_order: OnceCell::new(),
         }))
+    }
+
+    /// Test-only: a set of exactly one readable+writable cache over `backend`, so
+    /// a test can drive the read path against a stub object store.
+    #[cfg(test)]
+    pub(crate) fn with_backend(backend: Arc<dyn RemoteCacheBackend>, home: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            caches: vec![ConfiguredCache {
+                def: RemoteCacheDef {
+                    name: "stub".to_string(),
+                    uri: "memory:///stub".to_string(),
+                    read: true,
+                    write: true,
+                    concurrency: 4,
+                },
+                backend,
+                health: CacheHealth::default(),
+            }],
+            home,
+            config_hash: String::new(),
+            read_order: OnceCell::new(),
+        })
     }
 
     /// An empty set — used by tests and the no-config path.
@@ -1292,9 +1314,11 @@ impl Engine {
     /// single-flighted per blob by the caller, so two output groups needing the
     /// same support file transfer it once.
     ///
-    /// A blob the remote no longer serves is an error, not a miss: presence was
-    /// already checked when the hit was accepted, so losing it here means the
-    /// revision was evicted mid-build.
+    /// `Ok(false)` when the remote could not serve one of them — the object was
+    /// evicted between the presence check and the read, or its transfer failed.
+    /// That is **not** an error: the caller falls back to executing the target,
+    /// exactly as it would have on a plain cache miss. Only genuinely fatal
+    /// failures (local temp/codec I/O) and cancellation propagate as `Err`.
     pub(crate) async fn pull_remote_blobs(
         &self,
         ctoken: &dyn Cancellable,
@@ -1302,9 +1326,9 @@ impl Engine {
         hashin: &str,
         rev: &RemoteRevision,
         names: &[String],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if names.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let tmp_dir = self.remote_tmp_dir();
         std::fs::create_dir_all(&tmp_dir)
@@ -1317,15 +1341,16 @@ impl Engine {
             .iter()
             .map(|name| self.pull_remote_blob(ctoken, addr, hashin, rev, name, &tmp_dir))
             .collect();
-        stream::iter(pulls)
+        let served: Vec<bool> = stream::iter(pulls)
             .buffered(REVISION_BLOB_CONCURRENCY)
-            .try_collect::<Vec<()>>()
+            .try_collect()
             .await?;
-        Ok(())
+        Ok(served.into_iter().all(|ok| ok))
     }
 
-    /// Stream one blob into a temp file, then decode it into the local cache.
-    /// The temp file is dropped on both paths.
+    /// Stream one blob into a temp file, then decode it into the local cache. The
+    /// temp file is dropped on both paths. `Ok(false)` if the remote could not
+    /// serve it — see [`Self::pull_remote_blobs`].
     async fn pull_remote_blob(
         &self,
         ctoken: &dyn Cancellable,
@@ -1334,7 +1359,7 @@ impl Engine {
         rev: &RemoteRevision,
         name: &str,
         tmp_dir: &Path,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let encoding = rev.artifact(name)?.encoding.clone();
         let Some(temp) = self
             .remote_caches
@@ -1344,10 +1369,15 @@ impl Engine {
             if ctoken.is_cancelled() {
                 return Err(crate::engine::error::CancelledError.into());
             }
-            anyhow::bail!(
-                "remote cache no longer serves blob {name} of {addr} {hashin}: the revision was \
-                 evicted after its manifest was read — re-run to rebuild it",
+            // Evicted between the presence check and the read, or the transfer
+            // failed (already noted on the cache). Degrade to a miss.
+            debug!(
+                %addr,
+                hashin,
+                blob = name,
+                "remote cache could not serve blob; rebuilding target",
             );
+            return Ok(false);
         };
 
         let local_cache = self.local_cache.clone();
@@ -1370,7 +1400,7 @@ impl Engine {
         .await;
 
         drop(std::fs::remove_file(&temp));
-        res
+        res.map(|()| true)
     }
 }
 
