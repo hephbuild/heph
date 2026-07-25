@@ -3,19 +3,30 @@ description: >-
   Install Nix, restore the persisted Nix store, repair/re-substitute any
   invalid paths, install devenv, and warm the devenv shell with self-healing
   retries so a partial or poisoned cache restore recovers instead of failing
-  the job. Optionally restores the cargo registry + sccache caches.
+  the job. Optionally restores the cargo registry cache and points sccache at
+  the shared R2 bucket.
 
 inputs:
   cargo-target:
     description: >-
-      Rust target triple used to key the cargo registry + sccache caches. Leave
-      empty to skip those caches (e.g. the codegen job, which does not compile).
+      Rust target triple used to key the cargo registry cache. Leave empty to
+      skip it (e.g. the codegen job, which does not compile).
     required: false
     default: ""
   cache-suffix:
     description: >-
-      Extra suffix appended to the cargo/sccache cache keys so jobs that compile
-      different artifact sets (e.g. test vs build) do not clobber each other.
+      Extra suffix appended to the cargo registry cache key so jobs that pull
+      different crate sets (e.g. test vs build vs lint) do not clobber each
+      other. actions/cache skips the save when the exact key already exists, so
+      two jobs sharing a key means whichever saves first freezes the entry and
+      the other never contributes.
+    required: false
+    default: ""
+  r2-secret:
+    description: >-
+      Cloudflare R2 secret access key (`secrets.CF_SSCACHE`) for the shared
+      sccache bucket. Empty — as on fork PRs, where secrets are not exposed —
+      falls back to an ephemeral local-disk sccache.
     required: false
     default: ""
 
@@ -45,6 +56,11 @@ runs:
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
+        # PRs are restore-only. Every PR ref used to save its own ~1.5 GB copy
+        # per OS; with the repo's 10 GB Actions cache quota that LRU-evicted
+        # master's copies before the next PR could read them, so jobs kept
+        # starting cold. Only master writes the store now; PRs read it.
+        save: ${{ github.ref == 'refs/heads/master' }}
         gc-max-store-size-linux: 5368709120
         gc-max-store-size-macos: 5368709120
 
@@ -77,8 +93,39 @@ runs:
         # Surface the real error if the store is still broken after retries.
         devenv shell true
 
+    # sccache stores objects in Cloudflare R2 rather than an actions/cache
+    # tarball. Object storage is shared across every branch, PR and runner, is
+    # not subject to the repo's Actions cache quota, and needs no cache key at
+    # all: sccache's own hash of (source, args, compiler) already separates
+    # lint's check units from the release builds. The tarball scheme could not —
+    # jobs sharing a key clobbered each other, and a job that restored a foreign
+    # tarball compiled the whole workspace at a 0% hit rate, then dropped its
+    # own results because actions/cache does not re-save an existing key.
+    - name: Configure sccache backend
+      if: inputs.cargo-target != ''
+      shell: bash
+      env:
+        R2_SECRET: ${{ inputs.r2-secret }}
+      run: |
+        if [ -z "$R2_SECRET" ]; then
+          # Fork PRs are not given secrets. Fall back to a local-disk cache so
+          # rustc still has a working wrapper (cold, and discarded with the job).
+          echo "SCCACHE_DIR=$GITHUB_WORKSPACE/.sccache" >> "$GITHUB_ENV"
+          echo "::notice title=sccache::no R2 credentials — using local disk (cold cache)"
+          exit 0
+        fi
+        {
+          echo "SCCACHE_BUCKET=heph-sscache"
+          echo "SCCACHE_REGION=auto"
+          echo "SCCACHE_ENDPOINT=https://b9d7099532d2613531d6f54b60211d0c.r2.cloudflarestorage.com"
+          # Bump to invalidate every cached object at once.
+          echo "SCCACHE_S3_KEY_PREFIX=v1"
+          echo "AWS_ACCESS_KEY_ID=47bb1ffef0f93339c11fa28d7540fc3c"
+          echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET"
+        } >> "$GITHUB_ENV"
+
     # Cargo registry/git only — crate downloads + index. Compiled artifacts are
-    # handled by sccache (below), so target/ is intentionally not cached here.
+    # handled by sccache (above), so target/ is intentionally not cached here.
     - name: Cargo registry cache
       if: inputs.cargo-target != ''
       uses: actions/cache@v5
@@ -90,12 +137,3 @@ runs:
         key: cargo-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           cargo-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-
-
-    - name: sccache cache
-      if: inputs.cargo-target != ''
-      uses: actions/cache@v5
-      with:
-        path: ${{ github.workspace }}/.sccache
-        key: sccache-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          sccache-${{ inputs.cargo-target }}${{ inputs.cache-suffix }}-
