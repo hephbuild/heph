@@ -342,7 +342,13 @@ pub async fn resolve(
         );
     };
     match addr.args.get("vp") {
-        Some(vp) => {
+        // Only honor `vp` when it lies within the target's OWN go module. The
+        // variant universe is bounded to the module: a `vp` threaded from a
+        // consumer in a *different* module (a cross-module dependency) must not
+        // drag that foreign module's variant declaration in. Re-resolve the name
+        // by ancestry within this module instead — the dep provides its own
+        // same-named variant, or it is genuinely undeclared here.
+        Some(vp) if under_module_root(vp, module_root) => {
             let vref = VariantRef::new(name.clone(), vp.clone());
             // Fast path: a `vp` already in the target's ancestry (`req_states` —
             // common for a module-root-declared variant) needs no fetch.
@@ -365,7 +371,8 @@ pub async fn resolve(
             let f = resolve_in_universe(&vref, &universe)?;
             Ok((f, vref))
         }
-        None => resolve_ancestry(name, req_states, module_root),
+        // No `vp`, or a `vp` outside this module: resolve by module-bounded ancestry.
+        _ => resolve_ancestry(name, req_states, module_root),
     }
 }
 
@@ -601,5 +608,33 @@ mod tests {
             .expect("sibling variant resolves via the module universe");
         assert_eq!((f.goos.as_str(), f.goarch.as_str()), ("linux", "amd64"));
         assert_eq!(vref.pkg, "app/cmd");
+    }
+
+    // A `vp` from a consumer in a DIFFERENT go module (a cross-module dependency)
+    // must NOT be honored: the universe is bounded to the target's own module.
+    // Here `dev/app/graphql`'s dep addr carries `vp=mgmt/go` (a foreign module);
+    // resolution ignores it and resolves `release` by ancestry within `dev/app`,
+    // rebasing `vp` to the target's own module. `states_under` is never consulted.
+    #[tokio::test]
+    async fn foreign_vp_outside_module_resolves_by_ancestry() {
+        let ancestry = vec![go_state("dev/app", &[("release", linux_amd64())])];
+        // Empty universe: if resolution wrongly consulted `states_under(mgmt/go)`
+        // it would find nothing and fail, proving the ancestry path is taken.
+        let exec = UniverseExec {
+            under: HashMap::new(),
+        };
+        let addr = Addr::new(
+            PkgBuf::from("dev/app/graphql"),
+            "build_lib".to_string(),
+            VariantRef::new("release", "mgmt/go").to_args(),
+        );
+        let (f, vref) = resolve(&addr, &ancestry, "dev/app", &exec)
+            .await
+            .expect("foreign vp falls back to module-bounded ancestry");
+        assert_eq!((f.goos.as_str(), f.goarch.as_str()), ("linux", "amd64"));
+        assert_eq!(
+            vref.pkg, "dev/app",
+            "vp rebased to the target's own module, not the foreign `mgmt/go`"
+        );
     }
 }
