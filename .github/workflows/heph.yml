@@ -14,11 +14,11 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 # sccache config shared by every compiling job. RUSTC_WRAPPER=sccache is set by
-# the devenv shell; here we pin the cache dir to a workspace path so actions/cache
-# can persist it, and disable incremental compilation (sccache cannot cache
-# incremental units, and fresh runners have no warm incremental dir to reuse).
+# the devenv shell; the storage backend (R2, or local disk on fork PRs) is wired
+# up by the setup-nix action. Incremental compilation is off because sccache
+# cannot cache incremental units, and fresh runners have no warm incremental dir
+# to reuse. SCCACHE_CACHE_SIZE bounds only the local-disk fallback.
 env:
-  SCCACHE_DIR: ${{ github.workspace }}/.sccache
   SCCACHE_CACHE_SIZE: "2G"
   CARGO_INCREMENTAL: "0"
 
@@ -223,6 +223,7 @@ jobs:
         uses: ./.github/actions/setup-nix
         with:
           cargo-target: ${{ matrix.target }}
+          r2-secret: ${{ secrets.CF_SSCACHE }}
 
       - name: Build
         id: build
@@ -420,6 +421,11 @@ jobs:
         uses: ./.github/actions/setup-nix
         with:
           cargo-target: x86_64-unknown-linux-gnu
+          # Distinct from the linux/amd64 build job, which uses the same target
+          # triple: sharing a cargo cache key means whichever job saves first
+          # freezes the entry and the other's crate downloads never persist.
+          cache-suffix: "-lint"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
 
       - name: Lint
         shell: devenv shell bash -- -e {0}
@@ -462,6 +468,7 @@ jobs:
         with:
           cargo-target: ${{ matrix.target }}
           cache-suffix: "-test"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
 
       # No macFUSE on the runner: the macOS binaries weak-link libfuse, so they
       # launch with the dylib absent. `support_check` finds no macfuse.fs and
