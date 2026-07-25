@@ -179,6 +179,12 @@ pub struct RequestStateData {
     /// addr can never both hold the non-reentrant per-addr lock — the
     /// self-deadlock this prevents.
     pub(crate) mem_locked_result: Memoizer<Addr, Result<Arc<LockedResolution>, ArcErr>>,
+    /// Single-flights the lazy pull of one remote blob, keyed by
+    /// `(addr, hashin, blob name)`. Two `outputs` cells of the same addr both need
+    /// its support files, so without this they would download and write the same
+    /// blob concurrently — duplicate transfer, and two writers racing on one cache
+    /// key.
+    pub(crate) mem_remote_blob: Memoizer<(Addr, String, String), Result<(), ArcErr>>,
     pub mem_meta: Memoizer<Addr, Result<ResultMeta, ArcErr>>,
     pub mem_spec: Memoizer<Addr, Result<Arc<EngineTargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<Addr, Result<Arc<ExtendedTargetDef>, ArcErr>>,
@@ -548,6 +554,7 @@ impl Engine {
             dep_dag: Mutex::new(DepDag::new()),
             mem_execute_cache: Memoizer::with_tag("execute_cache"),
             mem_locked_result: Memoizer::with_tag("locked_result"),
+            mem_remote_blob: Memoizer::with_tag("remote_blob"),
             mem_result: Memoizer::with_tag("result"),
             mem_meta: Memoizer::with_tag("meta"),
             mem_spec: Memoizer::with_tag("spec"),

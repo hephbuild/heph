@@ -135,6 +135,106 @@ async fn remote_cache_cold_warm_hot() {
     );
 }
 
+/// Total bytes of every file under `dir`.
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut bytes = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            bytes += dir_bytes(&path);
+        } else if let Ok(meta) = entry.metadata() {
+            bytes += meta.len();
+        }
+    }
+    bytes
+}
+
+/// A remote hit must not drag down output blobs nobody reads.
+///
+/// `top` depends on `dep`, and `dep`'s output is several MiB. On a run where
+/// `top` is itself a cache hit, `dep` is resolved only to feed `top`'s `hashin`
+/// — its `hashout` comes from the manifest — so none of its output bytes are
+/// needed. The local cache must therefore stay tiny: only manifests (and the
+/// blob `top` itself hands back) come down.
+///
+/// Then asking for `dep`'s output directly pulls that blob, on demand, and it
+/// comes back byte-identical — proving the deferral is a deferral, not a loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_pull_is_lazy_per_output() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let remote = tempfile::tempdir().expect("remote tempdir");
+    let remote_uri = format!("file://{}", remote.path().display());
+
+    // `dep`'s output is large AND random: large so downloading it is impossible to
+    // miss in the local-cache byte count, random so serving it later proves it came
+    // from the cache rather than a re-execution.
+    std::fs::create_dir_all(root.path().join("pkg")).expect("mkdir pkg");
+    std::fs::write(
+        root.path().join("pkg").join("BUILD"),
+        r#"
+dep = target(
+    name = "dep",
+    driver = "bash",
+    run = "head -c 3000000 /dev/urandom | base64 > $OUT",
+    out = "dep.txt",
+)
+
+target(
+    name = "top",
+    driver = "bash",
+    run = "echo $RANDOM$RANDOM$RANDOM$(wc -c < $SRC_DEP) > $OUT",
+    deps = {"dep": dep},
+    out = "top.txt",
+)
+"#,
+    )
+    .expect("write BUILD");
+
+    // ---- COLD: build both, push both to the remote. ----
+    let cold = build_engine(root.path(), &remote_uri);
+    let top_cold = run_drain(&cold, "//pkg:top").await;
+    let dep_cold = run_drain(&cold, "//pkg:dep").await;
+    let dep_bytes = dep_cold.len() as u64;
+    assert!(
+        dep_bytes > 3_000_000,
+        "dep output should be multi-MiB, got {dep_bytes} bytes"
+    );
+    drop(cold);
+
+    let local_cache = root.path().join(".heph3").join("cache");
+    std::fs::remove_dir_all(&local_cache).expect("rm local cache");
+
+    // ---- WARM: `top` is a remote hit; `dep` is only needed for its hashout. ----
+    let warm = build_engine(root.path(), &remote_uri);
+    let top_warm = run_drain(&warm, "//pkg:top").await;
+    assert_eq!(
+        top_warm, top_cold,
+        "warm run must serve the remote-cached output, not re-execute"
+    );
+
+    let after_top = dir_bytes(&local_cache);
+    assert!(
+        after_top < dep_bytes / 2,
+        "resolving //pkg:top pulled {after_top} bytes into the local cache — \
+         //pkg:dep's {dep_bytes}-byte output was downloaded despite only its \
+         hashout being needed"
+    );
+
+    // ---- Asking for dep's output pulls exactly that blob, on demand. ----
+    let dep_warm = run_drain(&warm, "//pkg:dep").await;
+    assert_eq!(
+        dep_warm, dep_cold,
+        "the deferred blob must still be pullable, byte-identical"
+    );
+    assert!(
+        dir_bytes(&local_cache) > dep_bytes / 2,
+        "asking for dep's output must actually download it"
+    );
+}
+
 /// Companion check: with **no** remote configured, deleting the local cache and
 /// re-running *does* re-execute (different output). This guards against the
 /// cold→warh→hot test passing for the wrong reason (e.g. a stray reproducible

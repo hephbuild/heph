@@ -3,12 +3,21 @@
 //!
 //! Semantics (see [`RemoteCacheSet`]):
 //! - **write** — push to every writable cache in parallel; within each cache the
-//!   manifest is written *last*, so a reader that sees a manifest is guaranteed
-//!   every blob it names is already present (same invariant the local cache
-//!   relies on).
+//!   manifest is written *last*, so a manifest that appears was complete at
+//!   upload time. Blobs are independent objects, though, and a bucket lifecycle
+//!   rule can expire them out from under a surviving manifest — hence the
+//!   presence check in [`RemoteCacheSet::blobs_exist`].
 //! - **read** — try caches one-by-one in ascending-latency order. The first
-//!   cache whose manifest is present serves the *whole* revision: every blob is
-//!   pulled from that same cache, never spliced across caches.
+//!   cache whose manifest is present serves the revision: every blob comes from
+//!   that same cache, never spliced across caches.
+//!
+//! **Reads are lazy.** A remote hit is decided from the *manifest alone* — it
+//! carries every artifact's `hashout`, which is all a dependent needs to compute
+//! its own `hashin`. Output blobs transfer only when a caller actually reads
+//! them, and only the groups it asked for (see [`Engine::pull_remote_blobs`]).
+//! A target resolved purely to feed a dependent's hash — the common case in a
+//! fully-cached build — therefore moves a few hundred manifest bytes, not its
+//! outputs.
 //!
 //! **Separate manifest.** The remote uses its own [`RemoteManifest`], distinct
 //! from the local [`Manifest`], so the two layers can store artifacts
@@ -74,7 +83,7 @@ use tracing::warn;
 /// buffer (10 MiB). A target with thousands of artifacts, multiplied by the
 /// engine's own target-level parallelism, would otherwise run the process out of
 /// file descriptors or memory. Requests past this bound simply queue.
-const REVISION_BLOB_CONCURRENCY: usize = 32;
+pub(crate) const REVISION_BLOB_CONCURRENCY: usize = 32;
 
 /// Max background upload *tasks* in flight process-wide.
 ///
@@ -374,13 +383,35 @@ fn compression_for(size: u64) -> ManifestArtifactEncoding {
     }
 }
 
-/// A revision fetched from one remote cache: the remote manifest plus the local
-/// temp files each blob was streamed into (still in their on-remote encoding —
-/// the engine decodes them per [`RemoteManifestArtifact::encoding`]).
-pub(crate) struct FetchedRevision {
+/// A revision *located* on one remote cache — the decision half of a remote hit.
+///
+/// Holds no blob bytes. The manifest names the revision's artifacts, records
+/// each one's `hashout` (enough to answer "already built" and to feed a
+/// dependent's `hashin`) and its on-remote [`encoding`](RemoteManifestArtifact::encoding),
+/// so individual blobs can be pulled later, on demand, from the same cache the
+/// manifest came from (manifest affinity).
+pub(crate) struct RemoteRevision {
+    /// The cache that served the manifest. Every blob of this revision is pulled
+    /// from it, so a revision is never spliced across caches.
+    cache_idx: usize,
     pub manifest: RemoteManifest,
-    /// `(artifact name, temp file holding its on-remote bytes)`.
-    pub blobs: Vec<(String, PathBuf)>,
+}
+
+impl RemoteRevision {
+    /// The artifact entry for `name`, or an error if the manifest never named it
+    /// — a caller asking for a blob outside the revision is a bug, not a miss.
+    fn artifact(&self, name: &str) -> anyhow::Result<&RemoteManifestArtifact> {
+        self.manifest
+            .artifacts
+            .iter()
+            .find(|a| a.name == name)
+            .with_context(|| {
+                format!(
+                    "remote manifest for {} does not name blob {name}",
+                    self.manifest.target
+                )
+            })
+    }
 }
 
 /// The ordered set of remote caches. Empty when no `caches:` are configured, in
@@ -645,17 +676,21 @@ impl RemoteCacheSet {
         join_all(per_cache).await;
     }
 
-    /// Find the first readable cache (latency order) holding the manifest for
-    /// `(addr, hashin)`, then stream every blob it names from that same cache
-    /// into temp files under `dest_dir`. Returns `None` on a miss, or if any
-    /// named blob is absent (an incomplete revision is treated as a miss).
-    pub(crate) async fn fetch_revision(
+    /// Locate `(addr, hashin)` on the first readable cache (latency order) that
+    /// holds its manifest — **manifest only, no blob transfer**.
+    ///
+    /// This is the whole remote hit/miss decision: the manifest carries every
+    /// artifact's `hashout`, so "already built" is answerable, and a dependent's
+    /// `hashin` computable, without moving a single output byte. Blobs follow
+    /// later, per caller, via [`Self::fetch_blob`].
+    ///
+    /// `None` on a miss (no readable cache has it) or on an unparseable manifest.
+    pub(crate) async fn fetch_manifest(
         &self,
         ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
-        dest_dir: &Path,
-    ) -> anyhow::Result<Option<FetchedRevision>> {
+    ) -> anyhow::Result<Option<RemoteRevision>> {
         if !self.has_readable() {
             return Ok(None);
         }
@@ -700,91 +735,126 @@ impl RemoteCacheSet {
                 return Ok(None);
             }
         };
+        Ok(Some(RemoteRevision {
+            cache_idx,
+            manifest,
+        }))
+    }
 
-        let cache = self
-            .caches
-            .get(cache_idx)
-            .context("remote cache index out of range")?;
-        // Fetch the revision's blobs concurrently — a multi-output target no
-        // longer downloads them one at a time. The shared `LimitStore` still caps
-        // total in-flight ops per cache, so this only parallelizes within that
-        // ceiling. Each future yields `Some((name, temp))` on success or `None`
-        // on a miss (blob absent, or a best-effort backend/stream error already
-        // noted on the cache); a fatal local temp-IO failure is `Err`.
+    /// Whether `rev`'s cache still holds every one of `names` — presence only, no
+    /// bytes transferred.
+    ///
+    /// This is what keeps a lazy pull fail-*soft*. The hit is decided from the
+    /// manifest, but the blobs it names are separate objects that a bucket
+    /// lifecycle rule can expire independently, so "manifest present" alone does
+    /// not prove the revision is still servable. Checking presence up front, at
+    /// decision time, turns an evicted revision back into an ordinary cache miss
+    /// (the target executes) instead of a failure discovered later, mid-read,
+    /// after the engine already committed to "already built".
+    ///
+    /// Any error (or cancellation) answers `false`: unproven presence must never
+    /// be reported as a hit.
+    pub(crate) async fn blobs_exist(
+        &self,
+        ctoken: &dyn Cancellable,
+        rev: &RemoteRevision,
+        addr: &Addr,
+        hashin: &str,
+        names: &[String],
+    ) -> bool {
+        let Some(cache) = self.caches.get(rev.cache_idx) else {
+            return false;
+        };
         // Collected eagerly — see the note in `put_revision`.
-        let fetches: Vec<_> = manifest
-            .artifacts
+        let checks: Vec<_> = names
             .iter()
-            .map(|artifact| {
-                let key = Self::key(addr, hashin, &artifact.name);
+            .map(|name| {
+                let key = Self::key(addr, hashin, name);
                 async move {
-                    let reader = match cache.backend.open_read(&key).await {
-                        Ok(Some(reader)) => reader,
-                        // Manifest names a blob the cache no longer has → incomplete.
-                        Ok(None) => return Ok(None),
-                        Err(e) => {
-                            cache.note_err("blob download", &e);
-                            return Ok(None);
-                        }
-                    };
-                    let temp = dest_dir.join(format!("{}.gz", uuid::Uuid::new_v4()));
-                    // Temp-file I/O is local and genuinely fatal — propagate.
-                    let mut file = tokio::fs::File::create(&temp).await.with_context(|| {
-                        format!("create temp for remote blob {}", artifact.name)
-                    })?;
-                    let mut reader = reader;
-                    // Race the transfer against cancellation. Without this a
-                    // Ctrl-C during a large pull is ignored until the copy ends —
-                    // and the copy is exactly where a wedged connection sits, so
-                    // the run the user just cancelled keeps hanging. A cancelled
-                    // blob makes the revision incomplete, which the caller already
-                    // treats as a miss.
-                    let copied = tokio::select! {
-                        biased;
-                        () = ctoken.cancelled() => {
-                            drop(file);
-                            drop(std::fs::remove_file(&temp));
-                            return Ok(None);
-                        }
-                        r = tokio::io::copy(&mut reader, &mut file) => r,
-                    };
-                    if let Err(e) = copied {
-                        // Mid-stream network error from the cache → best-effort miss.
-                        cache.note_err(
-                            "blob download",
-                            &anyhow::Error::new(e)
-                                .context(format!("stream remote blob {}", artifact.name)),
-                        );
-                        drop(file);
-                        drop(std::fs::remove_file(&temp));
-                        return Ok(None);
+                    if ctoken.is_cancelled() {
+                        return false;
                     }
-                    file.shutdown()
-                        .await
-                        .with_context(|| format!("flush temp for remote blob {}", artifact.name))?;
-                    Ok::<_, anyhow::Error>(Some((artifact.name.clone(), temp)))
+                    match cache.backend.exists(&key).await {
+                        Ok(present) => present,
+                        Err(e) => {
+                            cache.note_err("blob presence check", &e);
+                            false
+                        }
+                    }
                 }
             })
             .collect();
-        // Bounded fan-out — see `REVISION_BLOB_CONCURRENCY`. `buffered` (not
-        // `buffer_unordered`) yields in input order, so the results line up with
-        // `manifest.artifacts` (the local-decode step zips them by position).
-        let slots: Vec<Option<(String, PathBuf)>> = stream::iter(fetches)
+        stream::iter(checks)
             .buffered(REVISION_BLOB_CONCURRENCY)
-            .try_collect()
-            .await?;
+            .all(|present| async move { present })
+            .await
+    }
 
-        // A single missing blob makes the whole revision incomplete: drop every
-        // temp we did download and treat it as a miss so the build executes.
-        if slots.iter().any(Option::is_none) {
-            let downloaded: Vec<(String, PathBuf)> = slots.into_iter().flatten().collect();
-            cleanup_temps(&downloaded);
+    /// Stream one blob of `rev` from the cache that served its manifest into a
+    /// temp file under `dest_dir`, still in its on-remote encoding (the engine
+    /// decodes it into the local cache — see [`Engine::pull_remote_blobs`]).
+    ///
+    /// `Ok(None)` when the cache no longer has the object, the transfer failed
+    /// (already noted on the cache), or the request was cancelled — all of which
+    /// mean "this cache cannot serve the blob". Local temp-file I/O failures are
+    /// genuinely fatal and propagate.
+    pub(crate) async fn fetch_blob(
+        &self,
+        ctoken: &dyn Cancellable,
+        rev: &RemoteRevision,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+        dest_dir: &Path,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let cache = self
+            .caches
+            .get(rev.cache_idx)
+            .context("remote cache index out of range")?;
+        let key = Self::key(addr, hashin, name);
+        let reader = match cache.backend.open_read(&key).await {
+            Ok(Some(reader)) => reader,
+            // Manifest names a blob the cache no longer has → incomplete.
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                cache.note_err("blob download", &e);
+                return Ok(None);
+            }
+        };
+        let temp = dest_dir.join(format!("{}.blob", uuid::Uuid::new_v4()));
+        // Temp-file I/O is local and genuinely fatal — propagate.
+        let mut file = tokio::fs::File::create(&temp)
+            .await
+            .with_context(|| format!("create temp for remote blob {name}"))?;
+        let mut reader = reader;
+        // Race the transfer against cancellation. Without this a Ctrl-C during a
+        // large pull is ignored until the copy ends — and the copy is exactly
+        // where a wedged connection sits, so the run the user just cancelled
+        // keeps hanging.
+        let copied = tokio::select! {
+            biased;
+            () = ctoken.cancelled() => {
+                drop(file);
+                drop(std::fs::remove_file(&temp));
+                return Ok(None);
+            }
+            r = tokio::io::copy(&mut reader, &mut file) => r,
+        };
+        if let Err(e) = copied {
+            // Mid-stream network error from the cache → best-effort miss.
+            cache.note_err(
+                "blob download",
+                &anyhow::Error::new(e).context(format!("stream remote blob {name}")),
+            );
+            drop(file);
+            drop(std::fs::remove_file(&temp));
             return Ok(None);
         }
-        let blobs: Vec<(String, PathBuf)> = slots.into_iter().flatten().collect();
-
+        file.shutdown()
+            .await
+            .with_context(|| format!("flush temp for remote blob {name}"))?;
         cache.note_ok();
-        Ok(Some(FetchedRevision { manifest, blobs }))
+        Ok(Some(temp))
     }
 }
 
@@ -801,14 +871,6 @@ async fn read_small_inner(cache: &ConfiguredCache, key: &str) -> anyhow::Result<
             Ok(Some(buf))
         }
         None => Ok(None),
-    }
-}
-
-/// Best-effort removal of temp files collected during a fetch that ended up a
-/// miss, so a remote failure mid-download doesn't leak.
-fn cleanup_temps(temps: &[(String, PathBuf)]) {
-    for (_, path) in temps {
-        drop(std::fs::remove_file(path));
     }
 }
 
@@ -1152,97 +1214,187 @@ impl Engine {
         Ok(())
     }
 
-    /// On a local cache miss, pull a complete revision from the remote caches
-    /// into the local cache. Returns the manifest on success (the entry is now
-    /// fully present locally), or `None` to fall through to execution.
+    /// Locate a revision on the remote and, if every blob a caller could ask for
+    /// is still there, mirror its manifest into the local cache — **without
+    /// downloading a single output blob**.
     ///
-    /// Must be called under the per-addr **write** lock: it writes blobs into
-    /// the local cache, and the write lock excludes GC and other writers. The
-    /// whole revision comes from a single cache (manifest affinity); blobs land
-    /// first and the manifest is written *last*.
-    pub(crate) async fn download_from_remote(
+    /// This is the remote half of the hit/miss decision. `output_groups` are the
+    /// groups the target's callers may ask for; the blobs backing them (plus
+    /// support files, never logs — see [`Engine::needed_artifacts`]) are
+    /// presence-checked before the hit is accepted, so a revision whose blobs the
+    /// remote has expired degrades to a miss (execute) instead of failing later,
+    /// mid-read. Returns the mirrored local manifest plus the located
+    /// [`RemoteRevision`], which callers keep to pull their own outputs on demand
+    /// via [`Self::pull_remote_blobs`].
+    ///
+    /// Must be called under the per-addr **write** lock: it writes the manifest
+    /// into the local cache, and the write lock excludes GC and other writers.
+    ///
+    /// The mirrored manifest deliberately names blobs that are not local yet — it
+    /// records the revision's identity and hashouts, not its residency. Every
+    /// read path materializes what it needs first (see
+    /// [`Engine::missing_local_blobs`]).
+    pub(crate) async fn probe_remote_revision(
         &self,
         ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
-    ) -> anyhow::Result<Option<Manifest>> {
-        if !self.remote_caches.has_readable() {
-            return Ok(None);
-        }
-
-        let tmp_dir = self.remote_tmp_dir();
-        std::fs::create_dir_all(&tmp_dir)
-            .with_context(|| format!("create remote temp dir {}", tmp_dir.display()))?;
-
-        let Some(fetched) = self
+        output_groups: &[String],
+    ) -> anyhow::Result<Option<(Manifest, RemoteRevision)>> {
+        let Some(rev) = self
             .remote_caches
-            .fetch_revision(ctoken, addr, hashin, &tmp_dir)
+            .fetch_manifest(ctoken, addr, hashin)
             .await?
         else {
             return Ok(None);
         };
 
-        // Decode each temp file into the local cache per its on-remote encoding
-        // (synchronous, on the blocking pool; the non-`Send` local writer stays
-        // on that thread). Then build the *local* manifest — which always
-        // describes decoded bytes (`encoding = None`) — and write it last,
-        // mirroring `cache_locally`.
+        let local_manifest = local_manifest_from_remote(&rev.manifest, hashin);
+        // Resolve groups to blob names through the same "needed" rule the read
+        // path uses, so presence is checked against exactly what will be read.
+        let needed: Vec<String> = Self::needed_artifacts(&local_manifest, output_groups)
+            .map(|a| a.name.clone())
+            .collect();
+        if !self
+            .remote_caches
+            .blobs_exist(ctoken, &rev, addr, hashin, &needed)
+            .await
+        {
+            return Ok(None);
+        }
+
+        let bytes = borsh::to_vec(&local_manifest).context("serialize local manifest")?;
         let local_cache = self.local_cache.clone();
         let addr_owned = addr.clone();
         let hashin_owned = hashin.to_string();
-        let temp_paths: Vec<PathBuf> = fetched.blobs.iter().map(|(_, p)| p.clone()).collect();
-        let RemoteManifest {
-            target, artifacts, ..
-        } = fetched.manifest;
-        let blobs = fetched.blobs;
-        let res = run_codec("download decode", move || -> anyhow::Result<Manifest> {
+        // Same reasoning as `cache_artifact_locally`: the local-cache writer is
+        // synchronous (and not `Send`), so it must not run on a runtime worker.
+        hproc::process_supervisor::block_or_inline(move || {
             use std::io::Write;
-            for (artifact, (name, path)) in artifacts.iter().zip(blobs.iter()) {
-                let mut w = local_cache
-                    .writer(&addr_owned, &hashin_owned, name)
-                    .with_context(|| format!("open local writer for downloaded blob {name}"))?;
-                match artifact.encoding {
-                    ManifestArtifactEncoding::Gzip => gunzip_from_file(path, &mut w)
-                        .with_context(|| format!("decompress downloaded blob {name}"))?,
-                    _ => copy_file_to(path, &mut w)
-                        .with_context(|| format!("write downloaded blob {name}"))?,
-                }
-            }
-
-            let local_manifest = Manifest {
-                version: "1.0.0".to_string(),
-                target,
-                created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                hashin: hashin_owned.clone(),
-                artifacts: artifacts
-                    .iter()
-                    .map(|a| ManifestArtifact {
-                        hashout: a.hashout.clone(),
-                        group: a.group.clone(),
-                        name: a.name.clone(),
-                        size: a.size,
-                        r#type: a.r#type.clone(),
-                        content_type: a.content_type.clone(),
-                        // Local cache stores decoded bytes.
-                        encoding: ManifestArtifactEncoding::None,
-                    })
-                    .collect(),
-            };
-            let bytes = borsh::to_vec(&local_manifest).context("serialize local manifest")?;
-            let mut mw = local_cache
+            let mut w = local_cache
                 .writer(&addr_owned, &hashin_owned, MANIFEST_V1)
-                .context("open local writer for downloaded manifest")?;
-            mw.write_all(&bytes).context("write downloaded manifest")?;
-            Ok(local_manifest)
+                .context("open local writer for remote manifest")?;
+            w.write_all(&bytes).context("write remote manifest")?;
+            anyhow::Ok(())
+        })
+        .with_context(|| format!("mirror remote manifest for {addr} {hashin}"))?;
+
+        Ok(Some((local_manifest, rev)))
+    }
+
+    /// Pull exactly `names` from `rev` into the local cache, decoding each blob
+    /// per its on-remote encoding. Nothing else transfers — this is where a lazy
+    /// read materializes, so it must stay scoped to the blobs the caller asked
+    /// for.
+    ///
+    /// Runs under the per-addr riding **read** lock (which excludes GC's
+    /// `try_write`, so the revision cannot be reclaimed underneath). Pulls are
+    /// single-flighted per blob by the caller, so two output groups needing the
+    /// same support file transfer it once.
+    ///
+    /// A blob the remote no longer serves is an error, not a miss: presence was
+    /// already checked when the hit was accepted, so losing it here means the
+    /// revision was evicted mid-build.
+    pub(crate) async fn pull_remote_blobs(
+        &self,
+        ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        rev: &RemoteRevision,
+        names: &[String],
+    ) -> anyhow::Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let tmp_dir = self.remote_tmp_dir();
+        std::fs::create_dir_all(&tmp_dir)
+            .with_context(|| format!("create remote temp dir {}", tmp_dir.display()))?;
+
+        // Bounded fan-out — see `REVISION_BLOB_CONCURRENCY`. A target whose caller
+        // asks for many output groups must not open every stream at once.
+        // Collected eagerly — see the note in `put_revision`.
+        let pulls: Vec<_> = names
+            .iter()
+            .map(|name| self.pull_remote_blob(ctoken, addr, hashin, rev, name, &tmp_dir))
+            .collect();
+        stream::iter(pulls)
+            .buffered(REVISION_BLOB_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(())
+    }
+
+    /// Stream one blob into a temp file, then decode it into the local cache.
+    /// The temp file is dropped on both paths.
+    async fn pull_remote_blob(
+        &self,
+        ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        rev: &RemoteRevision,
+        name: &str,
+        tmp_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let encoding = rev.artifact(name)?.encoding.clone();
+        let Some(temp) = self
+            .remote_caches
+            .fetch_blob(ctoken, rev, addr, hashin, name, tmp_dir)
+            .await?
+        else {
+            if ctoken.is_cancelled() {
+                return Err(crate::engine::error::CancelledError.into());
+            }
+            anyhow::bail!(
+                "remote cache no longer serves blob {name} of {addr} {hashin}: the revision was \
+                 evicted after its manifest was read — re-run to rebuild it",
+            );
+        };
+
+        let local_cache = self.local_cache.clone();
+        let addr_owned = addr.clone();
+        let hashin_owned = hashin.to_string();
+        let name_owned = name.to_string();
+        let temp_for_codec = temp.clone();
+        let res = run_codec("download decode", move || -> anyhow::Result<()> {
+            let mut w = local_cache
+                .writer(&addr_owned, &hashin_owned, &name_owned)
+                .with_context(|| format!("open local writer for downloaded blob {name_owned}"))?;
+            match encoding {
+                ManifestArtifactEncoding::Gzip => gunzip_from_file(&temp_for_codec, &mut w)
+                    .with_context(|| format!("decompress downloaded blob {name_owned}"))?,
+                _ => copy_file_to(&temp_for_codec, &mut w)
+                    .with_context(|| format!("write downloaded blob {name_owned}"))?,
+            }
+            Ok(())
         })
         .await;
 
-        // Always drop the temp files, success or failure.
-        for path in &temp_paths {
-            drop(std::fs::remove_file(path));
-        }
+        drop(std::fs::remove_file(&temp));
+        res
+    }
+}
 
-        Ok(Some(res?))
+/// The local view of a remote manifest: same artifacts, but `encoding = None`
+/// because the local cache always stores decoded bytes.
+fn local_manifest_from_remote(remote: &RemoteManifest, hashin: &str) -> Manifest {
+    Manifest {
+        version: "1.0.0".to_string(),
+        target: remote.target.clone(),
+        created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        hashin: hashin.to_string(),
+        artifacts: remote
+            .artifacts
+            .iter()
+            .map(|a| ManifestArtifact {
+                hashout: a.hashout.clone(),
+                group: a.group.clone(),
+                name: a.name.clone(),
+                size: a.size,
+                r#type: a.r#type.clone(),
+                content_type: a.content_type.clone(),
+                encoding: ManifestArtifactEncoding::None,
+            })
+            .collect(),
     }
 }
 
@@ -1423,7 +1575,7 @@ mod tests {
                 "should not break before the threshold"
             );
             let res = set
-                .fetch_revision(&never(), &addr, "h", dir.path())
+                .fetch_manifest(&never(), &addr, "h")
                 .await
                 .expect("fetch must be best-effort (Ok), never a hard error");
             assert!(res.is_none(), "a failing remote read is a miss");
@@ -1673,12 +1825,12 @@ mod tests {
         }
     }
 
-    /// A revision's blobs download in parallel, but never more than
+    /// Blobs download in parallel, but never more than
     /// [`REVISION_BLOB_CONCURRENCY`] at a time: sequential pulls made a wide
     /// fan-out crawl, while an unbounded one would hold an open temp file and a
     /// live response stream per artifact.
     #[tokio::test]
-    async fn fetch_revision_fans_out_within_the_blob_bound() {
+    async fn blob_pulls_fan_out_within_the_blob_bound() {
         let dir = tempfile::tempdir().expect("tempdir");
         let addr = addr();
         let artifacts: Vec<RemoteManifestArtifact> =
@@ -1706,13 +1858,24 @@ mod tests {
         });
         let set = set_with(backend.clone(), dir.path().to_path_buf());
 
-        let fetched = set
-            .fetch_revision(&never(), &addr, "h", dir.path())
+        let rev = set
+            .fetch_manifest(&never(), &addr, "h")
             .await
-            .expect("fetch")
+            .expect("fetch manifest")
             .expect("hit");
+        // Collected eagerly — see the note in `put_revision`.
+        let ctoken = never();
+        let fetches: Vec<_> = artifacts
+            .iter()
+            .map(|a| set.fetch_blob(&ctoken, &rev, &addr, "h", &a.name, dir.path()))
+            .collect();
+        let temps: Vec<Option<PathBuf>> = stream::iter(fetches)
+            .buffered(REVISION_BLOB_CONCURRENCY)
+            .try_collect()
+            .await
+            .expect("fetch blobs");
         assert_eq!(
-            fetched.blobs.len(),
+            temps.iter().filter(|t| t.is_some()).count(),
             FANOUT_ARTIFACTS,
             "every blob must be fetched"
         );
@@ -1769,7 +1932,7 @@ mod tests {
     /// target's per-addr write lock — so an uninterruptible copy means Ctrl-C
     /// leaves the build hanging on the very transfer the user gave up on.
     #[tokio::test]
-    async fn fetch_revision_aborts_on_cancellation() {
+    async fn blob_fetch_aborts_on_cancellation() {
         /// Serves a manifest, then never delivers a single blob byte.
         struct StalledBlobBackend {
             manifest_key: String,
@@ -1825,7 +1988,12 @@ mod tests {
         let set = set_with(backend, dir.path().to_path_buf());
 
         let ctoken = never();
-        let fetch = set.fetch_revision(&ctoken, &addr, "h", dir.path());
+        let rev = set
+            .fetch_manifest(&ctoken, &addr, "h")
+            .await
+            .expect("fetch manifest")
+            .expect("hit");
+        let fetch = set.fetch_blob(&ctoken, &rev, &addr, "h", "blob-0", dir.path());
         // Cancel once the copy is underway; without the wiring this never
         // resolves and the test times out.
         let cancel = async {
@@ -1843,7 +2011,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read temp dir")
             .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "gz"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -1887,7 +2055,7 @@ mod tests {
         let set = RemoteCacheSet::empty();
         assert!(set.is_empty());
         assert!(
-            set.fetch_revision(&never(), &addr(), "h", Path::new("/tmp"))
+            set.fetch_manifest(&never(), &addr(), "h")
                 .await
                 .expect("fetch")
                 .is_none()
@@ -1962,26 +2130,37 @@ mod tests {
         // decodes per its recorded encoding.
         let fetch_dir = dir.path().join("fetched");
         std::fs::create_dir_all(&fetch_dir).expect("mkdir");
-        let fetched = set
-            .fetch_revision(&never(), &addr, "h1", &fetch_dir)
+        let rev = set
+            .fetch_manifest(&never(), &addr, "h1")
             .await
             .expect("fetch")
             .expect("present");
-        assert_eq!(fetched.manifest.artifacts.len(), 2);
+        assert_eq!(rev.manifest.artifacts.len(), 2);
         assert_eq!(
-            fetched.manifest.artifacts[0].encoding,
+            rev.manifest.artifacts[0].encoding,
             ManifestArtifactEncoding::Gzip
         );
         assert_eq!(
-            fetched.manifest.artifacts[1].encoding,
+            rev.manifest.artifacts[1].encoding,
             ManifestArtifactEncoding::None
         );
 
+        let gz_temp = set
+            .fetch_blob(&never(), &rev, &addr, "h1", "gz.tar", &fetch_dir)
+            .await
+            .expect("fetch gz")
+            .expect("gz present");
+        let plain_temp = set
+            .fetch_blob(&never(), &rev, &addr, "h1", "plain.tar", &fetch_dir)
+            .await
+            .expect("fetch plain")
+            .expect("plain present");
+
         let mut restored_gz = Vec::new();
-        gunzip_from_file(&fetched.blobs[0].1, &mut restored_gz).expect("gunzip");
+        gunzip_from_file(&gz_temp, &mut restored_gz).expect("gunzip");
         assert_eq!(restored_gz, raw_gz);
 
-        let restored_plain = std::fs::read(&fetched.blobs[1].1).expect("read plain");
+        let restored_plain = std::fs::read(&plain_temp).expect("read plain");
         assert_eq!(
             restored_plain, raw_plain,
             "None-encoded artifact is stored verbatim"
@@ -2084,7 +2263,7 @@ mod tests {
         set.put_revision(&addr, "h1", b"m", &[("o.tar".to_string(), blob_tmp)])
             .await;
         assert!(
-            set.fetch_revision(&never(), &addr, "h1", dir.path())
+            set.fetch_manifest(&never(), &addr, "h1")
                 .await
                 .expect("fetch")
                 .is_none()

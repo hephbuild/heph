@@ -78,10 +78,19 @@ impl Engine {
         let mut bytes = 0u64;
         if let Some(manifest) = self.read_manifest(addr, hashin)? {
             for a in &manifest.artifacts {
+                // A manifest can name blobs that were never downloaded (a
+                // revision mirrored from a remote materializes lazily), so only
+                // count bytes actually reclaimed.
+                let present = self
+                    .local_cache
+                    .exists(addr, hashin, &a.name)
+                    .with_context(|| format!("probe cached artifact {} for {addr}", a.name))?;
                 self.local_cache
                     .delete(addr, hashin, &a.name)
                     .with_context(|| format!("delete cached artifact {} for {addr}", a.name))?;
-                bytes = bytes.saturating_add(a.size);
+                if present {
+                    bytes = bytes.saturating_add(a.size);
+                }
             }
         }
         self.local_cache
