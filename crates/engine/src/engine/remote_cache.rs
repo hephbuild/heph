@@ -19,16 +19,27 @@
 //!
 //! **Streaming.** No blob is ever held whole in memory. Each blob moves through a
 //! temp file: on upload the engine encodes the local blob into a temp file
-//! (synchronous, on the cache thread) and the set streams that file to the
-//! backend via object_store multipart; on download the set streams the backend
-//! object into a temp file and the engine decodes it into the local cache. The
-//! async path only ever touches `Send` temp files and backend streams, so the
-//! synchronous (and partly non-`Send`) local-cache I/O never crosses an `await`.
+//! (synchronous, on the blocking pool — see [`run_codec`]) and the set streams
+//! that file to the backend via object_store multipart; on download the set
+//! streams the backend object into a temp file and the engine decodes it into the
+//! local cache. The async path only ever touches `Send` temp files and backend
+//! streams, so the synchronous (and partly non-`Send`) local-cache I/O never
+//! crosses an `await`.
 //!
 //! **Background upload.** The engine pushes to the remote on a detached task,
 //! tracked by the request's `bg_pending` counter (the same one sandbox cleanup
 //! uses), so the CLI/TUI stays open until every upload drains — but the build's
 //! critical path doesn't wait on the network.
+//!
+//! **Scale.** Everything here is sized for a wide fan-out — hundreds of targets
+//! pulling and pushing at once — and every unbounded queue in that path is an
+//! opportunity to look hung. Three bounds keep it honest:
+//! [`REVISION_BLOB_CONCURRENCY`] (blobs in flight per revision),
+//! [`MAX_CONCURRENT_UPLOADS`] (background push tasks process-wide), and
+//! [`CODEC_SLOTS`] (concurrent compress/decompress, off the runtime workers).
+//! Above them sits the per-cache request ceiling
+//! ([`RemoteCacheDef::concurrency`]), whose semaphore is FIFO-fair, so a queued
+//! transfer always makes progress rather than starving.
 
 use crate::engine::Engine;
 use crate::engine::local_cache::{
@@ -42,16 +53,94 @@ use async_trait::async_trait;
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use futures::future::join_all;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::warn;
+
+/// Max blobs of a *single* revision transferred concurrently, on both the pull
+/// and the push side.
+///
+/// Fanning a revision out is what makes a multi-output target fast, but it must
+/// stay bounded: each in-flight download holds an open temp file plus a live
+/// response stream, and each in-flight upload holds an `object_store` multipart
+/// buffer (10 MiB). A target with thousands of artifacts, multiplied by the
+/// engine's own target-level parallelism, would otherwise run the process out of
+/// file descriptors or memory. Requests past this bound simply queue.
+const REVISION_BLOB_CONCURRENCY: usize = 32;
+
+/// Max background upload *tasks* in flight process-wide.
+///
+/// [`Engine::spawn_remote_upload`] detaches one task per newly-cached target, so
+/// without a bound a wide build spawns hundreds at once. Each holds every one of
+/// its gzipped blobs as a temp file for its whole lifetime, and competes with the
+/// critical-path *pulls* for the same per-cache request budget
+/// ([`RemoteCacheDef::concurrency`]). Capping the task count bounds temp-disk use
+/// and keeps pushes — which are pure background work — from crowding out the
+/// pulls a blocked target is actually waiting on. Uploads are network-bound and
+/// each fans out to [`REVISION_BLOB_CONCURRENCY`] blobs, so a modest cap still
+/// saturates the link.
+const MAX_CONCURRENT_UPLOADS: usize = 16;
+
+static UPLOAD_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_UPLOADS));
+
+/// Backstop on one background push, queue wait included.
+///
+/// Generous — a legitimately large revision over a slow link should finish, not
+/// get cut off. It exists only so a wedged push can't hold the process open
+/// forever (see [`Engine::spawn_remote_upload`]); abandoning one costs nothing
+/// but a remote cache miss next time, since the revision is already local.
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Permits for the synchronous compress/decompress + local-cache I/O that
+/// brackets every transfer.
+///
+/// That work is CPU-bound and runs on the blocking pool (see
+/// [`run_codec`]), so it is capped at the core count: enough to keep every core
+/// busy, few enough that it can't drain the blocking pool that `tokio::fs` also
+/// draws from.
+static CODEC_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| {
+    Semaphore::new(
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(8),
+    )
+});
+
+/// Run the synchronous codec step (gzip/gunzip plus local-cache reads/writes) on
+/// the blocking pool, bounded by [`CODEC_SLOTS`].
+///
+/// It must **not** run on a runtime worker. Compressing or decompressing a
+/// revision takes hundreds of milliseconds to seconds of straight CPU; with
+/// hundreds of targets pulling and pushing at once, doing it inline occupies
+/// every worker thread and the runtime stops polling *everything* — in-flight
+/// transfers, their inactivity deadlines, the TUI. The build looks hung even
+/// though no lock is actually deadlocked. (The previous `block_or_inline` did
+/// exactly that: inline on Linux, `block_in_place` on macOS.)
+///
+/// The closure is `Send`, but the values it builds are not required to be — the
+/// non-`Send` local-cache reader/writer is created and dropped entirely inside
+/// it and never crosses an `await`.
+async fn run_codec<F, R>(what: &'static str, f: F) -> anyhow::Result<R>
+where
+    F: FnOnce() -> anyhow::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    let _permit = CODEC_SLOTS
+        .acquire()
+        .await
+        .with_context(|| format!("acquire remote cache codec slot for {what}"))?;
+    tokio::task::spawn_blocking(f)
+        .await
+        .with_context(|| format!("join remote cache {what} task"))?
+}
 
 /// A streaming object store. The set layers cache semantics (manifest affinity,
 /// ordering, parallel fan-out) on top; a backend only moves bytes.
@@ -168,17 +257,11 @@ impl ConfiguredCache {
     /// median (resists a one-off spike). Any probe failing aborts the whole
     /// measurement with that error.
     async fn probe_latency(&self) -> anyhow::Result<Duration> {
-        self.backend
-            .exists(LATENCY_PROBE_KEY)
-            .await
-            .context("remote cache latency warmup probe")?;
+        self.probe_once().await.context("latency warmup probe")?;
         let mut samples = Vec::with_capacity(LATENCY_SAMPLES);
         for _ in 0..LATENCY_SAMPLES {
             let started = Instant::now();
-            self.backend
-                .exists(LATENCY_PROBE_KEY)
-                .await
-                .context("remote cache latency probe")?;
+            self.probe_once().await.context("latency probe")?;
             samples.push(started.elapsed());
         }
         samples.sort_unstable();
@@ -186,6 +269,26 @@ impl ConfiguredCache {
             .into_iter()
             .nth(LATENCY_SAMPLES / 2)
             .context("latency probe collected no samples")
+    }
+
+    /// One probe request, hard-bounded by [`LATENCY_PROBE_TIMEOUT`].
+    ///
+    /// The bound is the point: `read_order` is a one-shot init that *every*
+    /// target's first remote read waits on, each already holding its per-addr
+    /// write lock. Left to the backend's own budget a probe against a hung
+    /// endpoint rides 20 retries over 30 minutes, and the whole build sits behind
+    /// it. Timing out just sorts that cache last (or, from `measure_latency`,
+    /// reports it unreachable).
+    async fn probe_once(&self) -> anyhow::Result<()> {
+        tokio::time::timeout(
+            LATENCY_PROBE_TIMEOUT,
+            self.backend.exists(LATENCY_PROBE_KEY),
+        )
+        .await
+        .with_context(|| {
+            format!("remote cache probe timed out after {LATENCY_PROBE_TIMEOUT:?}")
+        })??;
+        Ok(())
     }
 }
 
@@ -196,6 +299,20 @@ const LATENCY_PROBE_KEY: &str = "__heph_latency_probe__";
 /// Measured (non-warmup) latency calls per cache. Odd so the median is a single
 /// sample, not an average of two.
 const LATENCY_SAMPLES: usize = 3;
+
+/// Hard cap on one latency probe. A probe is a `HEAD` of a key that never
+/// exists — sub-second on any healthy cache, so a generous bound still fires
+/// only on a genuinely stuck endpoint.
+const LATENCY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap on reading one manifest.
+///
+/// Manifests are tiny by design, so one that hasn't arrived in a minute is stuck
+/// rather than slow. The bound matters because the read happens under the
+/// target's per-addr **write** lock: left to the backend's own budget (up to 20
+/// retries across 30 minutes, sized for multi-GiB blobs) a single wedged manifest
+/// GET parks that target — and everything waiting on it — for half an hour.
+const MANIFEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-cache latency probe result, surfaced by `heph tool cache measure-latency`.
 #[derive(Debug, Clone)]
@@ -444,22 +561,21 @@ impl RemoteCacheSet {
 
     /// Drain a small object (the manifest) fully into memory. Manifests are tiny
     /// by design, so buffering one is fine; blobs never take this path.
+    ///
+    /// Bounded by [`MANIFEST_READ_TIMEOUT`] — a timeout surfaces as an ordinary
+    /// error, which the caller already treats as "this cache didn't serve it",
+    /// so a wedged cache falls through to the next one instead of parking the
+    /// target.
     async fn read_small(&self, cache_idx: usize, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        use tokio::io::AsyncReadExt;
         let cache = self
             .caches
             .get(cache_idx)
             .context("remote cache index out of range")?;
-        match cache.backend.open_read(key).await? {
-            Some(mut r) => {
-                let mut buf = Vec::new();
-                r.read_to_end(&mut buf)
-                    .await
-                    .with_context(|| format!("read remote object {key}"))?;
-                Ok(Some(buf))
-            }
-            None => Ok(None),
-        }
+        tokio::time::timeout(MANIFEST_READ_TIMEOUT, read_small_inner(cache, key))
+            .await
+            .with_context(|| {
+                format!("read remote object {key} timed out after {MANIFEST_READ_TIMEOUT:?}")
+            })?
     }
 
     /// Stream a full revision to every writable cache. `blobs` gives each
@@ -478,11 +594,25 @@ impl RemoteCacheSet {
         // re-logging) a cache that's down.
         let writers = self.caches.iter().filter(|c| c.def.write && !c.broken());
         let per_cache = writers.map(|cache| async move {
-            let blob_puts = blobs.iter().map(|(name, path)| {
-                let key = Self::key(addr, hashin, name);
-                async move { stream_file_to_backend(cache.backend.as_ref(), &key, path).await }
-            });
-            for res in join_all(blob_puts).await {
+            // Collected eagerly rather than left as a lazy `Map`: feeding a
+            // closure-returning-async-block straight into `stream::iter` makes
+            // rustc demand a higher-ranked `FnOnce` impl it can't prove.
+            let blob_puts: Vec<_> = blobs
+                .iter()
+                .map(|(name, path)| {
+                    let key = Self::key(addr, hashin, name);
+                    async move { stream_file_to_backend(cache.backend.as_ref(), &key, path).await }
+                })
+                .collect();
+            // Bounded fan-out: each in-flight put holds a multipart buffer, so a
+            // revision with thousands of artifacts must not open them all at
+            // once. Returning on the first error drops the stream, abandoning the
+            // rest — a cache that just failed isn't worth finishing.
+            let results = stream::iter(blob_puts)
+                .buffered(REVISION_BLOB_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            for res in results {
                 if let Err(e) = res {
                     cache.note_err("blob upload", &e);
                     return;
@@ -506,6 +636,7 @@ impl RemoteCacheSet {
     /// named blob is absent (an incomplete revision is treated as a miss).
     pub(crate) async fn fetch_revision(
         &self,
+        ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
         dest_dir: &Path,
@@ -519,6 +650,9 @@ impl RemoteCacheSet {
         // breaker has tripped; record success/failure so a flaky cache trips.
         let mut found: Option<(usize, Vec<u8>)> = None;
         for &i in self.read_order().await {
+            if ctoken.is_cancelled() {
+                return Ok(None);
+            }
             let Some(cache) = self.caches.get(i) else {
                 continue;
             };
@@ -559,52 +693,71 @@ impl RemoteCacheSet {
         // Fetch the revision's blobs concurrently — a multi-output target no
         // longer downloads them one at a time. The shared `LimitStore` still caps
         // total in-flight ops per cache, so this only parallelizes within that
-        // ceiling. Each future carries its manifest index so the results can be
-        // reassembled in manifest order (the local-decode step zips blobs against
-        // `manifest.artifacts` by position). It yields `Some((name, temp))` on
-        // success or `None` on a miss (blob absent, or a best-effort backend/stream
-        // error already noted on the cache); a fatal local temp-IO failure is `Err`.
-        let fetches = manifest.artifacts.iter().map(|artifact| {
-            let key = Self::key(addr, hashin, &artifact.name);
-            async move {
-                let reader = match cache.backend.open_read(&key).await {
-                    Ok(Some(reader)) => reader,
-                    // Manifest names a blob the cache no longer has → incomplete.
-                    Ok(None) => return Ok(None),
-                    Err(e) => {
-                        cache.note_err("blob download", &e);
+        // ceiling. Each future yields `Some((name, temp))` on success or `None`
+        // on a miss (blob absent, or a best-effort backend/stream error already
+        // noted on the cache); a fatal local temp-IO failure is `Err`.
+        // Collected eagerly — see the note in `put_revision`.
+        let fetches: Vec<_> = manifest
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                let key = Self::key(addr, hashin, &artifact.name);
+                async move {
+                    let reader = match cache.backend.open_read(&key).await {
+                        Ok(Some(reader)) => reader,
+                        // Manifest names a blob the cache no longer has → incomplete.
+                        Ok(None) => return Ok(None),
+                        Err(e) => {
+                            cache.note_err("blob download", &e);
+                            return Ok(None);
+                        }
+                    };
+                    let temp = dest_dir.join(format!("{}.gz", uuid::Uuid::new_v4()));
+                    // Temp-file I/O is local and genuinely fatal — propagate.
+                    let mut file = tokio::fs::File::create(&temp).await.with_context(|| {
+                        format!("create temp for remote blob {}", artifact.name)
+                    })?;
+                    let mut reader = reader;
+                    // Race the transfer against cancellation. Without this a
+                    // Ctrl-C during a large pull is ignored until the copy ends —
+                    // and the copy is exactly where a wedged connection sits, so
+                    // the run the user just cancelled keeps hanging. A cancelled
+                    // blob makes the revision incomplete, which the caller already
+                    // treats as a miss.
+                    let copied = tokio::select! {
+                        biased;
+                        () = ctoken.cancelled() => {
+                            drop(file);
+                            drop(std::fs::remove_file(&temp));
+                            return Ok(None);
+                        }
+                        r = tokio::io::copy(&mut reader, &mut file) => r,
+                    };
+                    if let Err(e) = copied {
+                        // Mid-stream network error from the cache → best-effort miss.
+                        cache.note_err(
+                            "blob download",
+                            &anyhow::Error::new(e)
+                                .context(format!("stream remote blob {}", artifact.name)),
+                        );
+                        drop(file);
+                        drop(std::fs::remove_file(&temp));
                         return Ok(None);
                     }
-                };
-                let temp = dest_dir.join(format!("{}.gz", uuid::Uuid::new_v4()));
-                // Temp-file I/O is local and genuinely fatal — propagate.
-                let mut file = tokio::fs::File::create(&temp)
-                    .await
-                    .with_context(|| format!("create temp for remote blob {}", artifact.name))?;
-                let mut reader = reader;
-                if let Err(e) = tokio::io::copy(&mut reader, &mut file).await {
-                    // Mid-stream network error from the cache → best-effort miss.
-                    cache.note_err(
-                        "blob download",
-                        &anyhow::Error::new(e)
-                            .context(format!("stream remote blob {}", artifact.name)),
-                    );
-                    drop(file);
-                    drop(std::fs::remove_file(&temp));
-                    return Ok(None);
+                    file.shutdown()
+                        .await
+                        .with_context(|| format!("flush temp for remote blob {}", artifact.name))?;
+                    Ok::<_, anyhow::Error>(Some((artifact.name.clone(), temp)))
                 }
-                file.shutdown()
-                    .await
-                    .with_context(|| format!("flush temp for remote blob {}", artifact.name))?;
-                Ok::<_, anyhow::Error>(Some((artifact.name.clone(), temp)))
-            }
-        });
-        // `join_all` preserves input order, so the results line up with
+            })
+            .collect();
+        // Bounded fan-out — see `REVISION_BLOB_CONCURRENCY`. `buffered` (not
+        // `buffer_unordered`) yields in input order, so the results line up with
         // `manifest.artifacts` (the local-decode step zips them by position).
-        let slots: Vec<Option<(String, PathBuf)>> = join_all(fetches)
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let slots: Vec<Option<(String, PathBuf)>> = stream::iter(fetches)
+            .buffered(REVISION_BLOB_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         // A single missing blob makes the whole revision incomplete: drop every
         // temp we did download and treat it as a miss so the build executes.
@@ -617,6 +770,22 @@ impl RemoteCacheSet {
 
         cache.note_ok();
         Ok(Some(FetchedRevision { manifest, blobs }))
+    }
+}
+
+/// The unbounded body of [`RemoteCacheSet::read_small`], split out so the
+/// timeout can wrap it as a single future.
+async fn read_small_inner(cache: &ConfiguredCache, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    match cache.backend.open_read(key).await? {
+        Some(mut r) => {
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf)
+                .await
+                .with_context(|| format!("read remote object {key}"))?;
+            Ok(Some(buf))
+        }
+        None => Ok(None),
     }
 }
 
@@ -728,6 +897,12 @@ impl Engine {
     /// on the network. The upload is bracketed by `RemoteCacheWrite{Start,End}`
     /// events so a long push surfaces in the TUI's slow-target breakdown.
     ///
+    /// **The task must always finish.** Both exit paths spin until `bg_pending`
+    /// hits zero (`tui/backend/ci.rs`, `tui/backend/interactive.rs`) with no
+    /// timeout of their own, and the CI backend has no `q` escape — so a push
+    /// that never returns means `heph` never exits. Hence the two escapes below:
+    /// the request's cancellation token, and [`UPLOAD_DEADLINE`] as a backstop.
+    ///
     /// No-op when no caches are configured or none are writable.
     pub(crate) fn spawn_remote_upload(
         self: &Arc<Self>,
@@ -760,7 +935,35 @@ impl Engine {
                     addr: addr.format(),
                 },
             );
-            engine.upload_to_remote(&addr, &hashin).await;
+            // Queue for one of the `MAX_CONCURRENT_UPLOADS` slots. Taken *after*
+            // the start event so a push waiting its turn still shows as an
+            // in-flight `↑` op — the wait is real time the upload is pending.
+            // A closed semaphore is impossible (it is a process-lifetime static),
+            // but treat it as "skip the push" rather than unwrapping: an upload is
+            // best-effort and must never fail the build.
+            //
+            // The whole thing — queueing included — races cancellation and a
+            // deadline, so this task can never be what keeps the process alive.
+            let ctoken = rs.ctoken().clone_arc();
+            let push = async {
+                match UPLOAD_SLOTS.acquire().await {
+                    Ok(_permit) => engine.upload_to_remote(&addr, &hashin).await,
+                    Err(e) => warn!(error = ?e, %addr, "remote cache upload slot unavailable"),
+                }
+            };
+            tokio::select! {
+                biased;
+                () = ctoken.cancelled() => {}
+                r = tokio::time::timeout(UPLOAD_DEADLINE, push) => {
+                    if r.is_err() {
+                        warn!(
+                            %addr,
+                            "remote cache upload abandoned after {UPLOAD_DEADLINE:?}; \
+                             the revision stays in the local cache",
+                        );
+                    }
+                }
+            }
             rs.emit(crate::engine::event::BuildEventKind::RemoteCacheWriteEnd {
                 addr: addr.format(),
                 error: None,
@@ -795,9 +998,9 @@ impl Engine {
         std::fs::create_dir_all(&tmp_dir)
             .with_context(|| format!("create remote temp dir {}", tmp_dir.display()))?;
 
-        // Encode every blob to a temp file (synchronous local I/O, off the
-        // runtime worker via block_or_inline; the non-`Send` local reader stays
-        // on this thread and never crosses an await). Each artifact is gzipped or
+        // Encode every blob to a temp file (synchronous local I/O, on the
+        // blocking pool via `run_codec`; the non-`Send` local reader stays on
+        // that thread and never crosses an await). Each artifact is gzipped or
         // copied verbatim per `compression_for`, and the chosen encoding is
         // recorded so the remote manifest is self-describing.
         let local_cache = self.local_cache.clone();
@@ -806,7 +1009,7 @@ impl Engine {
             let addr = addr.clone();
             let hashin = hashin.to_string();
             let tmp_dir = tmp_dir.clone();
-            hproc::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
+            run_codec("upload encode", move || {
                 use std::io::Read;
                 let mut out = Vec::with_capacity(artifacts.len());
                 for a in &artifacts {
@@ -825,7 +1028,8 @@ impl Engine {
                     out.push((a.name.clone(), temp, encoding));
                 }
                 Ok(out)
-            })?
+            })
+            .await?
         };
 
         // Build the remote manifest from the local one plus the per-artifact
@@ -876,7 +1080,7 @@ impl Engine {
     /// first and the manifest is written *last*.
     pub(crate) async fn download_from_remote(
         &self,
-        _ctoken: &dyn Cancellable,
+        ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
     ) -> anyhow::Result<Option<Manifest>> {
@@ -890,16 +1094,17 @@ impl Engine {
 
         let Some(fetched) = self
             .remote_caches
-            .fetch_revision(addr, hashin, &tmp_dir)
+            .fetch_revision(ctoken, addr, hashin, &tmp_dir)
             .await?
         else {
             return Ok(None);
         };
 
         // Decode each temp file into the local cache per its on-remote encoding
-        // (synchronous; the non-`Send` local writer stays on this thread). Then
-        // build the *local* manifest — which always describes decoded bytes
-        // (`encoding = None`) — and write it last, mirroring `cache_locally`.
+        // (synchronous, on the blocking pool; the non-`Send` local writer stays
+        // on that thread). Then build the *local* manifest — which always
+        // describes decoded bytes (`encoding = None`) — and write it last,
+        // mirroring `cache_locally`.
         let local_cache = self.local_cache.clone();
         let addr_owned = addr.clone();
         let hashin_owned = hashin.to_string();
@@ -908,47 +1113,47 @@ impl Engine {
             target, artifacts, ..
         } = fetched.manifest;
         let blobs = fetched.blobs;
-        let res =
-            hproc::process_supervisor::block_or_inline(move || -> anyhow::Result<Manifest> {
-                use std::io::Write;
-                for (artifact, (name, path)) in artifacts.iter().zip(blobs.iter()) {
-                    let mut w = local_cache
-                        .writer(&addr_owned, &hashin_owned, name)
-                        .with_context(|| format!("open local writer for downloaded blob {name}"))?;
-                    match artifact.encoding {
-                        ManifestArtifactEncoding::Gzip => gunzip_from_file(path, &mut w)
-                            .with_context(|| format!("decompress downloaded blob {name}"))?,
-                        _ => copy_file_to(path, &mut w)
-                            .with_context(|| format!("write downloaded blob {name}"))?,
-                    }
+        let res = run_codec("download decode", move || -> anyhow::Result<Manifest> {
+            use std::io::Write;
+            for (artifact, (name, path)) in artifacts.iter().zip(blobs.iter()) {
+                let mut w = local_cache
+                    .writer(&addr_owned, &hashin_owned, name)
+                    .with_context(|| format!("open local writer for downloaded blob {name}"))?;
+                match artifact.encoding {
+                    ManifestArtifactEncoding::Gzip => gunzip_from_file(path, &mut w)
+                        .with_context(|| format!("decompress downloaded blob {name}"))?,
+                    _ => copy_file_to(path, &mut w)
+                        .with_context(|| format!("write downloaded blob {name}"))?,
                 }
+            }
 
-                let local_manifest = Manifest {
-                    version: "1.0.0".to_string(),
-                    target,
-                    created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                    hashin: hashin_owned.clone(),
-                    artifacts: artifacts
-                        .iter()
-                        .map(|a| ManifestArtifact {
-                            hashout: a.hashout.clone(),
-                            group: a.group.clone(),
-                            name: a.name.clone(),
-                            size: a.size,
-                            r#type: a.r#type.clone(),
-                            content_type: a.content_type.clone(),
-                            // Local cache stores decoded bytes.
-                            encoding: ManifestArtifactEncoding::None,
-                        })
-                        .collect(),
-                };
-                let bytes = borsh::to_vec(&local_manifest).context("serialize local manifest")?;
-                let mut mw = local_cache
-                    .writer(&addr_owned, &hashin_owned, MANIFEST_V1)
-                    .context("open local writer for downloaded manifest")?;
-                mw.write_all(&bytes).context("write downloaded manifest")?;
-                Ok(local_manifest)
-            });
+            let local_manifest = Manifest {
+                version: "1.0.0".to_string(),
+                target,
+                created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                hashin: hashin_owned.clone(),
+                artifacts: artifacts
+                    .iter()
+                    .map(|a| ManifestArtifact {
+                        hashout: a.hashout.clone(),
+                        group: a.group.clone(),
+                        name: a.name.clone(),
+                        size: a.size,
+                        r#type: a.r#type.clone(),
+                        content_type: a.content_type.clone(),
+                        // Local cache stores decoded bytes.
+                        encoding: ManifestArtifactEncoding::None,
+                    })
+                    .collect(),
+            };
+            let bytes = borsh::to_vec(&local_manifest).context("serialize local manifest")?;
+            let mut mw = local_cache
+                .writer(&addr_owned, &hashin_owned, MANIFEST_V1)
+                .context("open local writer for downloaded manifest")?;
+            mw.write_all(&bytes).context("write downloaded manifest")?;
+            Ok(local_manifest)
+        })
+        .await;
 
         // Always drop the temp files, success or failure.
         for path in &temp_paths {
@@ -972,6 +1177,12 @@ mod tests {
             write,
             concurrency: DEFAULT_CACHE_CONCURRENCY,
         }
+    }
+
+    /// A token that is never cancelled — the default for tests that aren't
+    /// exercising cancellation.
+    fn never() -> hcore::hasync::StdCancellationToken {
+        hcore::hasync::StdCancellationToken::new()
     }
 
     fn addr() -> Addr {
@@ -1062,7 +1273,7 @@ mod tests {
                 "should not break before the threshold"
             );
             let res = set
-                .fetch_revision(&addr, "h", dir.path())
+                .fetch_revision(&never(), &addr, "h", dir.path())
                 .await
                 .expect("fetch must be best-effort (Ok), never a hard error");
             assert!(res.is_none(), "a failing remote read is a miss");
@@ -1176,12 +1387,357 @@ mod tests {
         assert!(cache.probe_latency().await.is_err());
     }
 
+    /// A probe against a cache that accepts the connection and then never
+    /// answers must not hang. `read_order` is a one-shot init every target's
+    /// first remote read waits on — each already holding its per-addr write lock
+    /// — so an unbounded probe stalls the whole build.
+    #[tokio::test(start_paused = true)]
+    async fn probe_latency_times_out_on_a_hung_cache() {
+        struct HungBackend;
+
+        #[async_trait]
+        impl RemoteCacheBackend for HungBackend {
+            async fn open_read(
+                &self,
+                _key: &str,
+            ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+                anyhow::bail!("unused")
+            }
+            async fn open_write(
+                &self,
+                _key: &str,
+            ) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+                anyhow::bail!("unused")
+            }
+            async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+                std::future::pending().await
+            }
+        }
+
+        let cache = ConfiguredCache {
+            def: def("hung", "memory:///hung", true, true),
+            backend: Arc::new(HungBackend),
+            health: CacheHealth::default(),
+        };
+
+        // Paused time auto-advances only when every task is idle, so this
+        // resolves as soon as the timeout is the sole pending thing — it cannot
+        // pass by simply waiting the probe out.
+        let err = cache
+            .probe_latency()
+            .await
+            .expect_err("a hung probe must time out, not hang");
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "error should name the timeout, got: {err:#}"
+        );
+    }
+
+    /// Backend serving a fixed key→bytes map that records the peak number of
+    /// simultaneously-open reads. Each `open_read` holds its slot across a sleep
+    /// so overlapping calls are observable.
+    struct ReadProbeBackend {
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    /// Backend that accepts (and discards) every write, recording the peak number
+    /// of simultaneously-open writes.
+    struct WriteProbeBackend {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    /// Bump `in_flight`, record it against `peak`, sleep so concurrent callers
+    /// overlap, then release. Returns the peak-recording that `assert`s read.
+    async fn hold_slot(in_flight: &AtomicUsize, peak: &AtomicUsize) {
+        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for ReadProbeBackend {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            hold_slot(&self.in_flight, &self.peak).await;
+            Ok(self.objects.get(key).map(|b| {
+                Box::pin(std::io::Cursor::new(b.clone())) as Pin<Box<dyn AsyncRead + Send>>
+            }))
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("read-only probe backend")
+        }
+        async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+            Ok(self.objects.contains_key(key))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for WriteProbeBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            Ok(None)
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            hold_slot(&self.in_flight, &self.peak).await;
+            Ok(Box::pin(tokio::io::sink()))
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    fn set_with(backend: Arc<dyn RemoteCacheBackend>, home: PathBuf) -> Arc<RemoteCacheSet> {
+        Arc::new(RemoteCacheSet {
+            caches: vec![ConfiguredCache {
+                def: def("probe", "memory:///probe", true, true),
+                backend,
+                health: CacheHealth::default(),
+            }],
+            home,
+            config_hash: String::new(),
+            read_order: OnceCell::new(),
+        })
+    }
+
+    /// Artifact count used by the fan-out tests — comfortably above the bound so
+    /// an unbounded implementation would show it.
+    const FANOUT_ARTIFACTS: usize = REVISION_BLOB_CONCURRENCY * 3;
+
+    fn probe_artifact(i: usize) -> RemoteManifestArtifact {
+        RemoteManifestArtifact {
+            hashout: format!("ho-{i}"),
+            group: "out".to_string(),
+            name: format!("blob-{i}"),
+            size: 4,
+            r#type: ManifestArtifactType::Output,
+            content_type: ManifestArtifactContentType::Tar,
+            encoding: ManifestArtifactEncoding::None,
+        }
+    }
+
+    /// A revision's blobs download in parallel, but never more than
+    /// [`REVISION_BLOB_CONCURRENCY`] at a time: sequential pulls made a wide
+    /// fan-out crawl, while an unbounded one would hold an open temp file and a
+    /// live response stream per artifact.
+    #[tokio::test]
+    async fn fetch_revision_fans_out_within_the_blob_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let artifacts: Vec<RemoteManifestArtifact> =
+            (0..FANOUT_ARTIFACTS).map(probe_artifact).collect();
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr.format(),
+            hashin: "h".to_string(),
+            artifacts: artifacts.clone(),
+        };
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(
+            RemoteCacheSet::key(&addr, "h", MANIFEST_V1),
+            borsh::to_vec(&manifest).expect("serialize manifest"),
+        );
+        for a in &artifacts {
+            objects.insert(RemoteCacheSet::key(&addr, "h", &a.name), b"data".to_vec());
+        }
+
+        let backend = Arc::new(ReadProbeBackend {
+            objects,
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let set = set_with(backend.clone(), dir.path().to_path_buf());
+
+        let fetched = set
+            .fetch_revision(&never(), &addr, "h", dir.path())
+            .await
+            .expect("fetch")
+            .expect("hit");
+        assert_eq!(
+            fetched.blobs.len(),
+            FANOUT_ARTIFACTS,
+            "every blob must be fetched"
+        );
+
+        // The manifest read is serial and precedes the blobs, so the peak is
+        // attributable to the blob fan-out alone.
+        let peak = backend.peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "blobs must download in parallel, saw peak concurrency {peak}"
+        );
+        assert!(
+            peak <= REVISION_BLOB_CONCURRENCY,
+            "blob fan-out must stay bounded, saw peak concurrency {peak}"
+        );
+    }
+
+    /// The same bound applies on the push side, where each in-flight put also
+    /// holds an `object_store` multipart buffer.
+    #[tokio::test]
+    async fn put_revision_fans_out_within_the_blob_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+
+        // One shared temp file is enough — the bound is on how many puts are open
+        // at once, not on their contents.
+        let blob_src = dir.path().join("src.blob");
+        std::fs::write(&blob_src, b"data").expect("write blob");
+        let blobs: Vec<(String, PathBuf)> = (0..FANOUT_ARTIFACTS)
+            .map(|i| (format!("blob-{i}"), blob_src.clone()))
+            .collect();
+
+        let backend = Arc::new(WriteProbeBackend {
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let set = set_with(backend.clone(), dir.path().to_path_buf());
+
+        set.put_revision(&addr, "h", b"manifest", &blobs).await;
+
+        let peak = backend.peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "blobs must upload in parallel, saw peak concurrency {peak}"
+        );
+        assert!(
+            peak <= REVISION_BLOB_CONCURRENCY,
+            "blob fan-out must stay bounded, saw peak concurrency {peak}"
+        );
+    }
+
+    /// A pull in progress must abort when the run is cancelled. The blob copy is
+    /// exactly where a wedged connection parks, and it happens under the
+    /// target's per-addr write lock — so an uninterruptible copy means Ctrl-C
+    /// leaves the build hanging on the very transfer the user gave up on.
+    #[tokio::test]
+    async fn fetch_revision_aborts_on_cancellation() {
+        /// Serves a manifest, then never delivers a single blob byte.
+        struct StalledBlobBackend {
+            manifest_key: String,
+            manifest: Vec<u8>,
+        }
+
+        #[async_trait]
+        impl RemoteCacheBackend for StalledBlobBackend {
+            async fn open_read(
+                &self,
+                key: &str,
+            ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+                if key == self.manifest_key {
+                    return Ok(Some(Box::pin(std::io::Cursor::new(self.manifest.clone()))));
+                }
+                // A reader that is forever pending: the copy can only end via
+                // cancellation.
+                struct Never;
+                impl AsyncRead for Never {
+                    fn poll_read(
+                        self: Pin<&mut Self>,
+                        _cx: &mut std::task::Context<'_>,
+                        _buf: &mut tokio::io::ReadBuf<'_>,
+                    ) -> std::task::Poll<std::io::Result<()>> {
+                        std::task::Poll::Pending
+                    }
+                }
+                Ok(Some(Box::pin(Never)))
+            }
+            async fn open_write(
+                &self,
+                _key: &str,
+            ) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+                anyhow::bail!("read-only")
+            }
+            async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr.format(),
+            hashin: "h".to_string(),
+            artifacts: vec![probe_artifact(0)],
+        };
+        let backend = Arc::new(StalledBlobBackend {
+            manifest_key: RemoteCacheSet::key(&addr, "h", MANIFEST_V1),
+            manifest: borsh::to_vec(&manifest).expect("serialize manifest"),
+        });
+        let set = set_with(backend, dir.path().to_path_buf());
+
+        let ctoken = never();
+        let fetch = set.fetch_revision(&ctoken, &addr, "h", dir.path());
+        // Cancel once the copy is underway; without the wiring this never
+        // resolves and the test times out.
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ctoken.cancel();
+        };
+        let (res, ()) = tokio::join!(fetch, cancel);
+
+        assert!(
+            res.expect("cancellation is a miss, not a hard error")
+                .is_none(),
+            "a cancelled pull must report a miss"
+        );
+        // The abandoned temp must not be left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "gz"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "cancelling must not leak partial temp files, found {leftovers:?}"
+        );
+    }
+
+    /// The codec step must not run on a runtime worker. On a single-worker
+    /// runtime an inline (or `block_in_place`-free) implementation would freeze
+    /// every other task for the whole compress/decompress; `run_codec` hands it
+    /// to the blocking pool, so unrelated tasks keep being polled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn run_codec_does_not_block_the_runtime() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn(enclose::enclose!((ticks) async move {
+            loop {
+                ticks.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }));
+
+        let before = ticks.load(Ordering::SeqCst);
+        run_codec("test", || {
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(())
+        })
+        .await
+        .expect("codec");
+        let after = ticks.load(Ordering::SeqCst);
+
+        ticker.abort();
+        assert!(
+            after > before,
+            "the runtime must keep polling other tasks while the codec runs \
+             (ticks {before} -> {after})"
+        );
+    }
+
     #[tokio::test]
     async fn empty_set_is_noop() {
         let set = RemoteCacheSet::empty();
         assert!(set.is_empty());
         assert!(
-            set.fetch_revision(&addr(), "h", Path::new("/tmp"))
+            set.fetch_revision(&never(), &addr(), "h", Path::new("/tmp"))
                 .await
                 .expect("fetch")
                 .is_none()
@@ -1257,7 +1813,7 @@ mod tests {
         let fetch_dir = dir.path().join("fetched");
         std::fs::create_dir_all(&fetch_dir).expect("mkdir");
         let fetched = set
-            .fetch_revision(&addr, "h1", &fetch_dir)
+            .fetch_revision(&never(), &addr, "h1", &fetch_dir)
             .await
             .expect("fetch")
             .expect("present");
@@ -1378,7 +1934,7 @@ mod tests {
         set.put_revision(&addr, "h1", b"m", &[("o.tar".to_string(), blob_tmp)])
             .await;
         assert!(
-            set.fetch_revision(&addr, "h1", dir.path())
+            set.fetch_revision(&never(), &addr, "h1", dir.path())
                 .await
                 .expect("fetch")
                 .is_none()
