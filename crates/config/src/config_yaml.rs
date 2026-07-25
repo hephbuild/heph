@@ -9,7 +9,16 @@ use crate::options::Options;
 /// Default cap on in-flight requests to one remote cache (object_store
 /// `LimitStore`). Lives here because the YAML layer applies it as the default for
 /// an omitted `concurrency`; the engine re-exports it for its own callers.
-pub const DEFAULT_CACHE_CONCURRENCY: usize = 10;
+///
+/// This is an aggregate ceiling shared across *every* target's pull/push, not a
+/// per-target limit — the engine's own parallelism already bounds how many
+/// targets pull at once. The old value of 10 throttled a wide fan-out of small
+/// blobs to a crawl (and a few stalled reads could pin all 10 permits and starve
+/// the rest). It only exists to stop a runaway from opening unbounded
+/// connections; since GCS goes through the HTTP/2 `NegotiatingConnector` (many
+/// streams over few connections), a high ceiling is safe. The Go (v0) cache had
+/// no such store-level cap at all.
+pub const DEFAULT_CACHE_CONCURRENCY: usize = 256;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -665,7 +674,7 @@ caches:
         let local = caches.get("local").expect("local present");
         assert!(local.read);
         assert!(local.write);
-        assert_eq!(local.concurrency, 10);
+        assert_eq!(local.concurrency, DEFAULT_CACHE_CONCURRENCY);
     }
 
     #[test]

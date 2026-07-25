@@ -556,48 +556,64 @@ impl RemoteCacheSet {
             .caches
             .get(cache_idx)
             .context("remote cache index out of range")?;
-        let mut blobs: Vec<(String, PathBuf)> = Vec::with_capacity(manifest.artifacts.len());
-        for artifact in &manifest.artifacts {
+        // Fetch the revision's blobs concurrently — a multi-output target no
+        // longer downloads them one at a time. The shared `LimitStore` still caps
+        // total in-flight ops per cache, so this only parallelizes within that
+        // ceiling. Each future carries its manifest index so the results can be
+        // reassembled in manifest order (the local-decode step zips blobs against
+        // `manifest.artifacts` by position). It yields `Some((name, temp))` on
+        // success or `None` on a miss (blob absent, or a best-effort backend/stream
+        // error already noted on the cache); a fatal local temp-IO failure is `Err`.
+        let fetches = manifest.artifacts.iter().map(|artifact| {
             let key = Self::key(addr, hashin, &artifact.name);
-            // A backend error here is best-effort: log once (per cache), drop any
-            // partial temps, and treat the whole revision as a miss so the build
-            // executes — never propagate it up as a hard failure.
-            let reader = match cache.backend.open_read(&key).await {
-                Ok(Some(reader)) => reader,
-                Ok(None) => {
+            async move {
+                let reader = match cache.backend.open_read(&key).await {
+                    Ok(Some(reader)) => reader,
                     // Manifest names a blob the cache no longer has → incomplete.
-                    cleanup_temps(&blobs);
+                    Ok(None) => return Ok(None),
+                    Err(e) => {
+                        cache.note_err("blob download", &e);
+                        return Ok(None);
+                    }
+                };
+                let temp = dest_dir.join(format!("{}.gz", uuid::Uuid::new_v4()));
+                // Temp-file I/O is local and genuinely fatal — propagate.
+                let mut file = tokio::fs::File::create(&temp)
+                    .await
+                    .with_context(|| format!("create temp for remote blob {}", artifact.name))?;
+                let mut reader = reader;
+                if let Err(e) = tokio::io::copy(&mut reader, &mut file).await {
+                    // Mid-stream network error from the cache → best-effort miss.
+                    cache.note_err(
+                        "blob download",
+                        &anyhow::Error::new(e)
+                            .context(format!("stream remote blob {}", artifact.name)),
+                    );
+                    drop(file);
+                    drop(std::fs::remove_file(&temp));
                     return Ok(None);
                 }
-                Err(e) => {
-                    cache.note_err("blob download", &e);
-                    cleanup_temps(&blobs);
-                    return Ok(None);
-                }
-            };
-
-            let temp = dest_dir.join(format!("{}.gz", uuid::Uuid::new_v4()));
-            // Temp-file I/O is local and genuinely fatal — propagate.
-            let mut file = tokio::fs::File::create(&temp)
-                .await
-                .with_context(|| format!("create temp for remote blob {}", artifact.name))?;
-            let mut reader = reader;
-            if let Err(e) = tokio::io::copy(&mut reader, &mut file).await {
-                // Mid-stream network error from the cache → best-effort miss.
-                cache.note_err(
-                    "blob download",
-                    &anyhow::Error::new(e).context(format!("stream remote blob {}", artifact.name)),
-                );
-                drop(file);
-                drop(std::fs::remove_file(&temp));
-                cleanup_temps(&blobs);
-                return Ok(None);
+                file.shutdown()
+                    .await
+                    .with_context(|| format!("flush temp for remote blob {}", artifact.name))?;
+                Ok::<_, anyhow::Error>(Some((artifact.name.clone(), temp)))
             }
-            file.shutdown()
-                .await
-                .with_context(|| format!("flush temp for remote blob {}", artifact.name))?;
-            blobs.push((artifact.name.clone(), temp));
+        });
+        // `join_all` preserves input order, so the results line up with
+        // `manifest.artifacts` (the local-decode step zips them by position).
+        let slots: Vec<Option<(String, PathBuf)>> = join_all(fetches)
+            .await
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // A single missing blob makes the whole revision incomplete: drop every
+        // temp we did download and treat it as a miss so the build executes.
+        if slots.iter().any(Option::is_none) {
+            let downloaded: Vec<(String, PathBuf)> = slots.into_iter().flatten().collect();
+            cleanup_temps(&downloaded);
+            return Ok(None);
         }
+        let blobs: Vec<(String, PathBuf)> = slots.into_iter().flatten().collect();
 
         cache.note_ok();
         Ok(Some(FetchedRevision { manifest, blobs }))
