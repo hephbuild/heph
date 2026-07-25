@@ -102,6 +102,7 @@ runs:
     # tarball compiled the whole workspace at a 0% hit rate, then dropped its
     # own results because actions/cache does not re-save an existing key.
     - name: Configure sccache backend
+      if: inputs.cargo-target != ''
       shell: bash
       env:
         R2_SECRET: ${{ inputs.r2-secret }}
