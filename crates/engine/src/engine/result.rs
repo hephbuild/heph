@@ -13,6 +13,7 @@ use crate::engine::request_state::RequestState;
 use crate::engine::spec::EngineTargetSpec;
 use async_recursion::async_recursion;
 use enclose::enclose;
+use hcore::hasync::Cancellable;
 use hcore::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::MatchResult;
@@ -22,9 +23,10 @@ use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::grow_stack::{GrowStack, grow_stack};
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::{CacheArtifact, Manifest, ManifestArtifactType};
+use crate::engine::remote_cache::RemoteRevision;
 use crate::engine::result_lock::ResultReadGuard;
 use anyhow::Context;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use hcore::defer;
 use hcore::hartifactcontent::{Content, ReadSeek, WalkEntry, WalkEntryKind};
 use hmodel::htmatcher::Matcher;
@@ -555,6 +557,39 @@ pub(crate) struct LockedResolution {
     /// backend. `Some` exactly when `executed` is `None` (a pre-existing hit);
     /// `None` on the execute / force / shell paths (no pre-existing manifest).
     manifest: Option<Arc<Manifest>>,
+    /// The remote revision backing this hit, when some of the blobs it names are
+    /// still remote-only. Carries the remote manifest (per-blob encodings) and the
+    /// cache that served it, so each caller pulls just its own output groups on
+    /// demand in [`execute_and_cache`](Engine::execute_and_cache).
+    ///
+    /// `None` whenever the revision is fully resident locally — the pure local-hit
+    /// fast path, which touches the network not at all.
+    remote: Option<Arc<RemoteRevision>>,
+}
+
+/// Pull one blob of `rev` into the local cache. A free function taking every
+/// capture by value so the memoizer cell it feeds
+/// ([`RequestStateData::mem_remote_blob`](crate::engine::request_state::RequestStateData))
+/// gets a plain `'static` future.
+async fn pull_one_remote_blob(
+    engine: Arc<Engine>,
+    rs: Arc<RequestState>,
+    rev: Arc<RemoteRevision>,
+    addr: Addr,
+    hashin: String,
+    name: String,
+) -> anyhow::Result<()> {
+    let ctoken = rs.ctoken().clone_arc();
+    engine
+        .pull_remote_blobs(ctoken.as_ref(), &addr, &hashin, &rev, &[name])
+        .await
+}
+
+/// A confirmed pre-existing cache entry: the revision's manifest plus, when some
+/// of its blobs are not local yet, the remote revision they can be pulled from.
+struct CacheHit {
+    manifest: Arc<Manifest>,
+    remote: Option<Arc<RemoteRevision>>,
 }
 
 /// The full freshly-produced artifact set of an executing [`LockedResolution`]
@@ -1133,6 +1168,21 @@ impl Engine {
             None => {
                 let res = match &locked.manifest {
                     Some(manifest) => {
+                        // Lazy materialization: pull just the blobs THIS caller
+                        // reads, and only those it doesn't already have locally.
+                        // `locked.remote` is `Some` exactly when the revision has
+                        // remote-only blobs, so a fully-local hit does no I/O here.
+                        if let Some(rev) = &locked.remote {
+                            self.materialize_from_remote(
+                                &rs,
+                                &def.target.addr,
+                                opts.hashin.as_str(),
+                                manifest,
+                                &outputs,
+                                rev,
+                            )
+                            .await?;
+                        }
                         self.artifacts_from_manifest(
                             rs.ctoken(),
                             &def.target.addr,
@@ -1184,6 +1234,73 @@ impl Engine {
         }
 
         Ok(build_eresult(cached, meta, &outputs, locked.guard.clone()))
+    }
+
+    /// Download the blobs this caller needs and doesn't have, and nothing else.
+    ///
+    /// See [`pull_one_remote_blob`] for the per-blob body.
+    ///
+    /// The lazy half of a remote hit: the decision was made from the manifest
+    /// alone, so the bytes arrive here — scoped to `outputs` (plus support files),
+    /// which is why resolving a target purely for its `hashout` transfers none of
+    /// its outputs. Runs under the riding read lock.
+    ///
+    /// Each blob is single-flighted per `(addr, hashin, name)` through the request,
+    /// so two output groups needing the same support file download it once. The
+    /// `RemoteCacheRead` span is emitted only when something actually transfers, so
+    /// a `↓` op in the timeline always means real bytes.
+    async fn materialize_from_remote(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        addr: &Addr,
+        hashin: &str,
+        manifest: &Manifest,
+        outputs: &[String],
+        rev: &Arc<RemoteRevision>,
+    ) -> anyhow::Result<()> {
+        let missing = self
+            .missing_local_blobs(rs.ctoken(), addr, hashin, manifest, outputs)
+            .await?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let addr_s = addr.format();
+        let hashin = hashin.to_string();
+        crate::engine::event::emit_scope(
+            rs,
+            crate::engine::event::BuildEventKind::RemoteCacheReadStart {
+                addr: addr_s.clone(),
+            },
+            move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
+                addr: addr_s,
+                error,
+            },
+            async {
+                let mut pulls = Vec::with_capacity(missing.len());
+                for name in &missing {
+                    let key = (addr.clone(), hashin.clone(), name.clone());
+                    let engine = Arc::clone(self);
+                    let rs_owned = Arc::clone(rs);
+                    let rev = Arc::clone(rev);
+                    let addr = addr.clone();
+                    let hashin = hashin.clone();
+                    let name = name.clone();
+                    pulls.push(rs.data.mem_remote_blob.once(key, move || {
+                        pull_one_remote_blob(engine, rs_owned, rev, addr, hashin, name)
+                    }));
+                }
+                // Bounded: one in-flight pull holds a temp file plus a live
+                // response stream, and a caller may have asked for many groups.
+                futures::stream::iter(pulls)
+                    .buffered(crate::engine::remote_cache::REVISION_BLOB_CONCURRENCY)
+                    .try_collect::<Vec<()>>()
+                    .await
+                    .map_err(unwrap_arc_err)?;
+                anyhow::Ok(())
+            },
+        )
+        .await
     }
 
     /// Single-flight the per-addr result-lock + cache-fetch/execute, keyed by
@@ -1250,32 +1367,26 @@ impl Engine {
     /// non-cacheable force/shell branch). Runs once per addr per request via
     /// [`resolve_locked`].
     ///
-    /// Cache presence is decided at the **manifest** level, not per output:
-    /// `cache_locally` writes the manifest last and GC deletes whole revisions
-    /// under this very lock, so a present manifest guarantees every output blob
-    /// for this `hashin` is already on disk. Probing with an empty output set
-    /// therefore answers "has this addr been built?" without forcing any output
-    /// blob to be fetched — each caller pulls only its own outputs afterwards in
-    /// [`execute_and_cache`], keeping partial/remote pulls lazy.
+    /// Cache presence is decided at the **manifest** level, never by downloading
+    /// outputs, and the split must stay intact:
     ///
-    /// **Remote-cache contract (TODO(remote-cache)) — keep this split intact:**
-    /// - *Presence (here):* must stay manifest-only. When remote lands, this
-    ///   becomes a manifest-exists check that consults **local OR remote** and
-    ///   downloads NO output blobs — a remote manifest still means "already
-    ///   built, do not execute". Note the empty-output probe below is not a true
-    ///   manifest-only check: it still `exists`-checks SupportFile blobs, so once
-    ///   support files can live remote-only it must be replaced by an explicit
-    ///   `manifest_exists(addr, hashin)` (local-or-remote, no blob I/O).
-    /// - *Materialization (per caller, in [`execute_and_cache`]):* this is where
-    ///   lazy download belongs. The local read there becomes local→remote: use
-    ///   the blob if local, else download just the requested output group(s);
-    ///   only a genuine local+remote miss returns `None` (→ execute). Each caller
-    ///   pulls only the groups it asked for — never the full output set.
-    /// - *Hazard:* that per-caller download writes blobs into the local cache
-    ///   while holding only the riding **read** lock. It is content-addressed by
-    ///   `hashin` (idempotent), but a concurrent GC `try_write` could race a
-    ///   half-written blob — the download path will need atomic
-    ///   rename-into-place or a per-blob write guard.
+    /// - *Presence (here):* a manifest — local, or fetched from a remote — plus a
+    ///   guarantee that the blobs it names are obtainable. A manifest carries
+    ///   every artifact's `hashout`, which is all a dependent needs to compute its
+    ///   own `hashin`, so this answers "has this addr been built?" while moving no
+    ///   output bytes. See [`probe_cache_manifest`](Self::probe_cache_manifest)
+    ///   for how a partially-resident revision is classified.
+    /// - *Materialization (per caller, in [`execute_and_cache`]):* where bytes
+    ///   actually move. Each caller pulls only the output groups it asked for
+    ///   (plus support files), so a target resolved just to feed a dependent's
+    ///   hash — the common case in a fully-cached build — transfers nothing but
+    ///   its manifest.
+    /// - *Hazard:* that per-caller pull writes blobs into the local cache while
+    ///   holding only the riding **read** lock. The read excludes GC (whose
+    ///   `try_write` fails while it is alive) and the blobs are content-addressed
+    ///   by `hashin`, so a concurrent writer can only write identical bytes; the
+    ///   FS backend renames into place and the SQLite backend writes in one
+    ///   transaction, so no reader ever observes a half-written blob.
     async fn resolve_locked_inner(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -1312,16 +1423,17 @@ impl Engine {
                 guard: None,
                 executed: Some(Arc::new(ExecutedArtifacts { cached, meta })),
                 manifest: None,
+                remote: None,
             }));
         }
 
         // 1. Optimistically take a plain shared read lock and probe the cache at
-        //    the manifest level (empty output set — see the doc comment). The read
-        //    rides with every caller's artifacts, protecting the entry while in use.
+        //    the manifest level (see the doc comment). The read rides with every
+        //    caller's artifacts, protecting the entry while in use.
         let read = self
             .acquire_with_notice(&rs, addr, self.result_lock().read(addr, ctoken))
             .await?;
-        if let Some(manifest) = self.probe_cache_manifest(&rs, def, opts).await? {
+        if let Some(hit) = self.probe_cache_manifest(&rs, def, opts).await? {
             // A. Hit — share this read; each caller reads its own outputs under
             // it and runs its own codegen write-back / fixpoint in
             // `execute_and_cache` (is_top-gated, under this riding read). The
@@ -1329,7 +1441,8 @@ impl Engine {
             return Ok(Arc::new(LockedResolution {
                 guard: Some(Arc::new(read)),
                 executed: None,
-                manifest: Some(manifest),
+                manifest: Some(hit.manifest),
+                remote: hit.remote,
             }));
         }
 
@@ -1347,14 +1460,16 @@ impl Engine {
         // write lock excludes all others, so one re-check suffices. On the rare
         // race-win we share without executing; otherwise we execute + cache the
         // full set, which `build_eresult` filters per caller.
-        let (executed, manifest) = match self.probe_cache_manifest(&rs, def, opts).await? {
-            Some(manifest) => (None, Some(manifest)),
+        let (executed, manifest, remote) = match self.probe_cache_manifest(&rs, def, opts).await? {
+            Some(hit) => (None, Some(hit.manifest), hit.remote),
             None => {
-                // Local miss under the write lock: try to pull a complete
-                // revision from the remote caches into the local cache before
-                // executing. Safe to write local blobs here — the write lock
-                // excludes GC and other writers. A remote hit means "already
-                // built": skip execution and share the now-local entry.
+                // Local miss under the write lock: ask the remote caches whether
+                // this revision exists. Manifest only — no output blob is
+                // downloaded here, and none may be: a dependent that just needs
+                // this target's `hashout` must not pay for its outputs. The
+                // manifest is mirrored into the local cache (safe under the write
+                // lock, which excludes GC and other writers) and each caller pulls
+                // the groups it reads in `execute_and_cache`.
                 //
                 // Bracket the pull with one `RemoteCacheRead` span per target
                 // (only when a readable cache exists) so a slow download shows as
@@ -1367,8 +1482,12 @@ impl Engine {
                 // store path — which would `exec` a missing path (status 127).
                 let remote_attempted =
                     def.target.cache.remote_enabled && self.remote_caches.has_readable();
-                let downloaded = if remote_attempted {
+                let located = if remote_attempted {
                     let addr_s = addr.format();
+                    // Every blob a caller of this addr could read must still be on
+                    // the remote for the hit to stand — checked by presence, not by
+                    // transfer (see `RemoteCacheSet::blobs_exist`).
+                    let needed: Vec<String> = def.target.output_names();
                     crate::engine::event::emit_scope(
                         &rs,
                         crate::engine::event::BuildEventKind::RemoteCacheReadStart {
@@ -1378,22 +1497,22 @@ impl Engine {
                             addr: addr_s,
                             error,
                         },
-                        self.download_from_remote(ctoken, addr, opts.hashin.as_str()),
+                        self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
                     )
                     .await?
                 } else {
                     None
                 };
-                match downloaded {
-                    Some(manifest) => {
-                        // A remote pull that landed a revision is a cache hit —
+                match located {
+                    Some((manifest, rev)) => {
+                        // A revision located on the remote is a cache hit —
                         // "already built elsewhere", execution skipped. Emit it so
                         // the cached count (TUI, GHA, telemetry) reflects remote
                         // hits, not just local ones.
                         rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
                             addr: addr.format(),
                         });
-                        (None, Some(Arc::new(manifest)))
+                        (None, Some(Arc::new(manifest)), Some(Arc::new(rev)))
                     }
                     None => {
                         // Only a real remote lookup that came back empty is a
@@ -1408,7 +1527,11 @@ impl Engine {
                             .clone()
                             .execute_and_cache_inner(rs.clone(), opts)
                             .await?;
-                        (Some(Arc::new(ExecutedArtifacts { cached, meta })), None)
+                        (
+                            Some(Arc::new(ExecutedArtifacts { cached, meta })),
+                            None,
+                            None,
+                        )
                     }
                 }
             }
@@ -1428,6 +1551,7 @@ impl Engine {
             guard: Some(Arc::new(read)),
             executed,
             manifest,
+            remote,
         }))
     }
 
@@ -1947,39 +2071,78 @@ impl Engine {
         Ok(())
     }
 
-    /// Presence-probe the local cache at the manifest level (empty output set —
-    /// see the [`resolve_locked_inner`](Self::resolve_locked_inner) doc), emitting
-    /// the hit/miss event. On a hit, returns the parsed manifest so the per-caller
-    /// output read in [`execute_and_cache`](Self::execute_and_cache) reuses it
-    /// instead of re-reading + re-deserializing the manifest from the cache backend.
+    /// Probe the **local** manifest for `(addr, hashin)` and decide whether it is
+    /// a usable hit, emitting the hit/miss event. Returns the parsed manifest so
+    /// the per-caller output read in
+    /// [`execute_and_cache`](Self::execute_and_cache) reuses it instead of
+    /// re-reading + re-deserializing it from the cache backend.
     ///
-    /// Confirming SupportFile blobs exist (via `artifacts_from_manifest` with no
-    /// requested outputs) preserves the exact hit/miss semantics of the former
-    /// empty-output `artifacts_from_local_cache` probe — a present manifest whose
-    /// support blob has been GC'd is still a miss.
+    /// A local manifest is not proof of residency: a revision whose manifest was
+    /// mirrored from a remote (see
+    /// [`probe_remote_revision`](Self::probe_remote_revision)) names blobs that
+    /// were never downloaded, because nothing has needed them yet. So the probe
+    /// classifies:
+    ///
+    /// - **fully resident** → local hit, no remote I/O at all.
+    /// - **some needed blob absent, remote can still serve the revision** → hit
+    ///   backed by that [`RemoteRevision`]; each caller pulls only its own
+    ///   outputs.
+    /// - **some needed blob absent and unobtainable** (no readable remote, remote
+    ///   opted out for this target, or the remote no longer has the revision) →
+    ///   **miss**, so the target executes. Deciding this here, before the engine
+    ///   commits to "already built", is what keeps an evicted or half-written
+    ///   revision fail-soft instead of erroring later, mid-read.
+    ///
+    /// Residency is judged against *every* output group (any caller may ask for
+    /// any of them) plus support files — never logs, which no read path surfaces.
     async fn probe_cache_manifest(
         &self,
         rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<Option<Arc<Manifest>>> {
+    ) -> anyhow::Result<Option<CacheHit>> {
         let addr = &def.target.addr;
         let hashin = opts.hashin.as_str();
-        // TODO(remote-cache): when remote lands, this becomes a manifest-exists
-        // check consulting local OR remote and downloading NO output blobs.
         let hit = match self
             .read_manifest_blocking(rs.ctoken(), addr, hashin)
             .await?
         {
-            Some(manifest)
-                if self
-                    .artifacts_from_manifest(rs.ctoken(), addr, hashin, &manifest, &[])
-                    .await?
-                    .is_some() =>
-            {
-                Some(Arc::new(manifest))
+            Some(manifest) => {
+                let all_groups = def.target.output_names();
+                let missing = self
+                    .missing_local_blobs(rs.ctoken(), addr, hashin, &manifest, &all_groups)
+                    .await?;
+                if missing.is_empty() {
+                    Some(CacheHit {
+                        manifest: Arc::new(manifest),
+                        remote: None,
+                    })
+                } else if !def.target.cache.remote_enabled || !self.remote_caches.has_readable() {
+                    None
+                } else {
+                    // The manifest is local but (some of) the bytes are not. Only a
+                    // remote that still holds every missing blob makes this a hit —
+                    // presence is checked here, not discovered during the read.
+                    match self
+                        .remote_caches
+                        .fetch_manifest(rs.ctoken(), addr, hashin)
+                        .await?
+                    {
+                        Some(rev) => {
+                            let servable = self
+                                .remote_caches
+                                .blobs_exist(rs.ctoken(), &rev, addr, hashin, &missing)
+                                .await;
+                            servable.then(|| CacheHit {
+                                manifest: Arc::new(manifest),
+                                remote: Some(Arc::new(rev)),
+                            })
+                        }
+                        None => None,
+                    }
+                }
             }
-            _ => None,
+            None => None,
         };
         rs.emit(if hit.is_some() {
             crate::engine::event::BuildEventKind::LocalCacheHit {

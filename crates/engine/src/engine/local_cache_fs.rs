@@ -4,6 +4,7 @@ use crate::engine::local_cache::{
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -37,6 +38,54 @@ impl LocalCacheFS {
     }
 }
 
+/// Staging writer behind [`LocalCacheFS::writer`]: bytes land in a temp file that
+/// is renamed over the final path when the writer is dropped, so the blob appears
+/// atomically. A write error (or a failed final flush) drops the temp instead,
+/// leaving whatever was already at the destination untouched rather than
+/// replacing it with a truncated blob.
+struct AtomicFileWriter {
+    file: Option<fs::File>,
+    temp: PathBuf,
+    dest: PathBuf,
+    failed: bool,
+}
+
+impl io::Write for AtomicFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(io::Error::other("cache writer already finalized"));
+        };
+        let res = file.write(buf);
+        if res.is_err() {
+            self.failed = true;
+        }
+        res
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        let res = file.flush();
+        if res.is_err() {
+            self.failed = true;
+        }
+        res
+    }
+}
+
+impl Drop for AtomicFileWriter {
+    fn drop(&mut self) {
+        let flushed = match self.file.take() {
+            Some(mut file) => file.flush().is_ok(),
+            None => false,
+        };
+        if self.failed || !flushed || fs::rename(&self.temp, &self.dest).is_err() {
+            drop(fs::remove_file(&self.temp));
+        }
+    }
+}
+
 impl LocalCache for LocalCacheFS {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<SizedReader> {
         let path = self.get_path(addr, hashin, name);
@@ -59,15 +108,35 @@ impl LocalCache for LocalCacheFS {
         })
     }
 
+    /// Write to a sibling temp file and rename it into place once the writer is
+    /// dropped.
+    ///
+    /// The rename makes a blob appear atomically: a concurrent reader either sees
+    /// the previous complete file or the new one, never a truncated write in
+    /// progress. That matters because a blob can be (re)written while another
+    /// request holds only a *read* lock on the revision — a lazy remote pull
+    /// materializes into an entry other callers are already reading. Both writers
+    /// store the same content-addressed bytes, so whichever rename lands last is
+    /// equally correct.
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
         let path = self.get_path(addr, hashin, name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create parent directories for: {:?}", path))?;
         }
-        let file = fs::File::create(&path)
-            .with_context(|| format!("Failed to create writer for cache path: {:?}", path))?;
-        Ok(Box::new(file))
+        let temp = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            name,
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        let file = fs::File::create(&temp)
+            .with_context(|| format!("Failed to create writer for cache path: {:?}", temp))?;
+        Ok(Box::new(AtomicFileWriter {
+            file: Some(file),
+            temp,
+            dest: path,
+            failed: false,
+        }))
     }
 
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {

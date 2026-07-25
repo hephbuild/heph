@@ -137,6 +137,15 @@ pub trait LocalCache: Send + Sync {
 #[error("not found")]
 pub struct NotFoundError;
 
+/// Name of a revision's manifest blob.
+///
+/// The manifest records a revision's *identity* — its target, `hashin`, and every
+/// artifact's `hashout`/size/type — not which of its blobs are resident. A
+/// revision written by [`cache_locally`](Engine::cache_locally) does have all of
+/// them (blobs first, manifest last); one mirrored from a remote
+/// ([`probe_remote_revision`](Engine::probe_remote_revision)) starts with none of
+/// them, and materializes per caller. Read paths therefore check residency
+/// explicitly — see [`missing_local_blobs`](Engine::missing_local_blobs).
 pub(crate) const MANIFEST_V1: &str = "manifest-v1.borsh";
 
 #[derive(Clone)]
@@ -511,6 +520,60 @@ impl Engine {
         hproc::process_supervisor::block_or_inline(move || self.read_manifest(addr, hashin))
     }
 
+    /// The blobs a caller asking for `outputs` will actually read: its Output
+    /// groups plus every SupportFile (which travels with the target wherever it is
+    /// referenced), and never a Log — logs are written to the cache but no read
+    /// path surfaces them.
+    ///
+    /// The single definition of "needed", shared by the read path
+    /// ([`artifacts_from_manifest`](Self::artifacts_from_manifest)), the residency
+    /// check ([`missing_local_blobs`](Self::missing_local_blobs)) and the remote
+    /// presence check — so a lazy pull can never be decided against a different
+    /// set than the one that will be read.
+    pub(crate) fn needed_artifacts<'a>(
+        manifest: &'a Manifest,
+        outputs: &'a [String],
+    ) -> impl Iterator<Item = &'a ManifestArtifact> {
+        manifest.artifacts.iter().filter(|a| match a.r#type {
+            ManifestArtifactType::Output => outputs.contains(&a.group),
+            ManifestArtifactType::SupportFile => true,
+            ManifestArtifactType::Log => false,
+        })
+    }
+
+    /// Names of the blobs a caller asking for `outputs` needs that are not in the
+    /// local cache yet — exactly what has to be pulled from a remote before
+    /// [`artifacts_from_manifest`](Self::artifacts_from_manifest) can serve the
+    /// read.
+    ///
+    /// A non-empty result is the normal state of a revision whose manifest came
+    /// from a remote: the manifest records the revision's identity and hashouts,
+    /// not which of its blobs happen to be resident.
+    pub(crate) async fn missing_local_blobs(
+        &self,
+        _ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        manifest: &Manifest,
+        outputs: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let local_cache = &self.local_cache;
+        hproc::process_supervisor::block_or_inline(move || {
+            let mut missing = Vec::new();
+            for artifact in Self::needed_artifacts(manifest, outputs) {
+                if !local_cache
+                    .exists(addr, hashin, &artifact.name)
+                    .with_context(|| {
+                        format!("probe local blob {} for {addr} {hashin}", artifact.name)
+                    })?
+                {
+                    missing.push(artifact.name.clone());
+                }
+            }
+            anyhow::Ok(missing)
+        })
+    }
+
     /// Build this caller's artifact set from an already-parsed `manifest`, gating
     /// Output groups to `outputs` (SupportFiles always travel). Returns `None`
     /// when a required blob is missing — treat as a miss. Splitting this from
@@ -676,13 +739,28 @@ mod tests {
             "engine B local cache must start cold"
         );
 
-        // Pulling from the remote populates B's local cache and returns the manifest.
-        let manifest = engine_b
-            .download_from_remote(&ctoken, &addr, "HASHIN1")
+        // Probing the remote mirrors the manifest — and only the manifest.
+        let needed = vec!["out".to_string()];
+        let (manifest, rev) = engine_b
+            .probe_remote_revision(&ctoken, &addr, "HASHIN1", &needed)
             .await
-            .expect("download")
+            .expect("probe")
             .expect("remote hit");
         assert_eq!(manifest.artifacts.len(), 1);
+        let blob_name = manifest.artifacts[0].name.clone();
+        assert!(
+            !engine_b
+                .local_cache
+                .exists(&addr, "HASHIN1", &blob_name)
+                .expect("exists"),
+            "probing the remote must not download any output blob"
+        );
+
+        // Pulling that one blob is what puts bytes in B's local cache.
+        engine_b
+            .pull_remote_blobs(&ctoken, &addr, "HASHIN1", &rev, &[blob_name])
+            .await
+            .expect("pull");
 
         // The blob is now served from B's *local* cache, byte-identical.
         let (arts, _) = engine_b
@@ -741,13 +819,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        // The revision is now on the remote: a cold engine pulls it.
+        // The revision is now on the remote: a cold engine locates it.
         let (engine2, _e2) = engine_with_remote(&remote_uri);
         assert!(
             engine2
-                .download_from_remote(&ctoken, &addr, "HASHBG")
+                .probe_remote_revision(&ctoken, &addr, "HASHBG", &["out".to_string()])
                 .await
-                .expect("download")
+                .expect("probe")
                 .is_some(),
             "background upload must land on the remote"
         );
@@ -763,11 +841,80 @@ mod tests {
         let addr = test_addr();
         assert!(
             engine
-                .download_from_remote(&ctoken, &addr, "NOPE")
+                .probe_remote_revision(&ctoken, &addr, "NOPE", &["out".to_string()])
                 .await
-                .expect("download")
+                .expect("probe")
                 .is_none()
         );
+    }
+
+    /// A revision whose manifest is on the remote but whose blob has been expired
+    /// (an independent object-store lifecycle rule can do exactly that) must read
+    /// as a **miss**, so the target executes. Accepting the hit on the manifest
+    /// alone would strand the build: the pull would fail after the engine already
+    /// decided "already built".
+    #[tokio::test]
+    async fn remote_probe_rejects_a_revision_whose_blob_is_gone() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let (engine_a, _a) = engine_with_remote(&remote_uri);
+        engine_a
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHEVICT",
+                vec![raw_artifact("a", b"payload")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        engine_a.upload_to_remote(&addr, "HASHEVICT").await;
+
+        // Expire every blob object, leaving the manifest behind.
+        let needed = vec!["out".to_string()];
+        let (manifest, _) = engine_a
+            .probe_remote_revision(&ctoken, &addr, "HASHEVICT", &needed)
+            .await
+            .expect("probe")
+            .expect("remote hit while intact");
+        let blob_names: Vec<String> = manifest.artifacts.iter().map(|a| a.name.clone()).collect();
+        let removed = evict_objects(remote.path(), &blob_names);
+        assert!(removed > 0, "test must actually evict a blob");
+
+        let (engine_b, _b) = engine_with_remote(&remote_uri);
+        assert!(
+            engine_b
+                .probe_remote_revision(&ctoken, &addr, "HASHEVICT", &needed)
+                .await
+                .expect("probe")
+                .is_none(),
+            "a revision the remote can no longer serve must read as a miss"
+        );
+    }
+
+    /// Delete every file under `dir` (recursively) whose file name is in `names`.
+    /// Mimics an object-store lifecycle rule expiring blobs while leaving the
+    /// revision's manifest object in place. Returns how many were removed.
+    fn evict_objects(dir: &std::path::Path, names: &[String]) -> usize {
+        let mut removed = 0;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                removed += evict_objects(&path, names);
+            } else if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                && names.iter().any(|n| n == file_name)
+            {
+                std::fs::remove_file(&path).expect("evict blob");
+                removed += 1;
+            }
+        }
+        removed
     }
 
     fn test_addr() -> Addr {
