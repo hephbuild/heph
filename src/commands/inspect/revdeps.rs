@@ -109,7 +109,7 @@ fn resolve_addr_in(input: &str, cwp: &PkgBuf, root: &Path) -> anyhow::Result<Add
 }
 
 /// `resolve_addr_in` against the current working package and workspace root.
-fn resolve_addr(input: &str) -> anyhow::Result<Addr> {
+pub(super) fn resolve_addr(input: &str) -> anyhow::Result<Addr> {
     resolve_addr_in(
         input,
         &crate::engine::get_cwp()?,

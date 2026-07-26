@@ -6,6 +6,7 @@ mod hashin;
 mod hashout;
 mod labels;
 mod packages;
+mod path;
 mod revdeps;
 mod spec;
 
@@ -106,6 +107,19 @@ pub enum InspectCommands {
     ///
     /// `heph inspect revdeps //lib:core --scope //cmd/...`
     Revdeps(revdeps::Args),
+    /// Print the chain of targets leading from one target to another
+    ///
+    /// Walks the dependency graph from FROM and prints the shortest chain of
+    /// hops that reaches TO — FROM first, TO last, one target per line. Hops are
+    /// direct (declared) dependency edges. When TO is not reachable from FROM,
+    /// nothing is printed.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect path //cmd/server:bin //lib:core`
+    ///
+    /// `heph inspect path //cmd/server:bin main.go`
+    Path(path::Args),
     /// List provider-exposed functions (`heph.<provider>.<fn>`)
     ///
     /// Prints every function registered by a provider for use in BUILD files,
@@ -136,6 +150,7 @@ impl InspectCommands {
             InspectCommands::Def(args) => def::execute(args, sink, global),
             InspectCommands::Deps(args) => deps::execute(args, sink, global),
             InspectCommands::Revdeps(args) => revdeps::execute(args, sink, global),
+            InspectCommands::Path(args) => path::execute(args, sink, global),
             InspectCommands::Functions(args) => functions::execute(args, sink, global),
         }
     }
