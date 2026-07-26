@@ -1110,9 +1110,14 @@ fn pkg_prefix_pattern(pkg: &str) -> String {
 }
 
 /// The `@heph/query` addr selecting `go_test_data`-labelled targets in `pkg`.
+///
+/// Excludes the `go` provider: these labels are carried by buildfile-emitted
+/// codegen targets, never by go targets. Skipping the go provider avoids
+/// resolving (and cascade-building) the go provider's own targets, whose spec
+/// resolution pulls in the whole golist/std graph.
 fn go_test_data_query_addr(pkg: &str) -> Addr {
     let expr = format!("{} && label(go_test_data)", pkg_pattern(pkg));
-    hplugin_query::pluginquery::query_addr(&expr, "", &[])
+    hplugin_query::pluginquery::query_addr(&expr, "", &["go"])
 }
 
 fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
@@ -1155,8 +1160,11 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
     // def tier (`get_def`, the most expensive). Order terms by that cost so the
     // engine's left-to-right `&&` bails at the cheapest possible tier.
+    // Exclude the `go` provider: `go_src` labels only buildfile codegen targets,
+    // never go targets — skipping go avoids spec-resolving (and cascade-building)
+    // the go provider's own targets just to reject them on the label.
     let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
-    let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &[]);
+    let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &["go"]);
     addrs.push(go_src_query_addr.format());
 
     if let Some(deps_state) = pick_codegen_deps(states)
@@ -1201,8 +1209,10 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
     };
     // Cheapest-first by resolution tier (see `compute_pkg_src_addrs`): `scope`
     // (addr) < `label` (spec/`get_spec`) < `tree_output` (def/`get_def`).
+    // Exclude the `go` provider (see `compute_pkg_src_addrs`): `go_embed_src`
+    // only labels buildfile codegen targets.
     let expr = format!("{scope} && label(go_embed_src) && tree_output({pkg_str})");
-    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &[]);
+    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &["go"]);
     let mut addrs = vec![query_addr.format()];
 
     if let Some(deps_state) = pick_embed_deps(states)
@@ -5648,6 +5658,43 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             !addrs.iter().any(|s| s.contains("go_embed_src")),
             "golist srcfiles must NOT reference the go_embed_src lane: {addrs:?}"
+        );
+    }
+
+    // The `go_src`/`go_embed_src`/`go_test_data` labels are only ever carried by
+    // buildfile-emitted codegen targets. Every one of these label queries must
+    // exclude the `go` provider, so resolving them never spec-resolves the go
+    // provider's own targets (which drags in the golist/std graph) just to reject
+    // them on the label — and never re-enters `get_spec` for the very addr being
+    // resolved.
+    #[test]
+    fn label_queries_exclude_the_go_provider() {
+        let exclude = format!("{}=go", hplugin_query::pluginquery::EXCLUDE_PROVIDER_ARG);
+
+        let src = compute_pkg_src_addrs("pkg", &[]).unwrap();
+        let go_src = src
+            .iter()
+            .find(|s| s.contains("label(go_src)"))
+            .expect("go_src query present");
+        assert!(
+            go_src.contains(&exclude),
+            "go_src query must exclude the go provider: {go_src}"
+        );
+
+        let embed = compute_embed_src_addrs("pkg", &[]).unwrap();
+        let go_embed = embed
+            .iter()
+            .find(|s| s.contains("label(go_embed_src)"))
+            .expect("go_embed_src query present");
+        assert!(
+            go_embed.contains(&exclude),
+            "go_embed_src query must exclude the go provider: {go_embed}"
+        );
+
+        let data = go_test_data_query_addr("pkg").format();
+        assert!(
+            data.contains(&exclude),
+            "go_test_data query must exclude the go provider: {data}"
         );
     }
 
