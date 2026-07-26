@@ -113,16 +113,22 @@ impl HttpConnector for NegotiatingConnector {
 }
 
 /// Retry budget for the explicit store builders. The default (10 retries /
-/// 180s elapsed) is sized for small objects; a genuine reset an hour into a
+/// 180s elapsed) is sized for small objects; a genuine reset deep into a
 /// multi-GiB transfer would hit the 180s elapsed cap and fail despite using a
-/// single retry. Widen it so resume-via-`Range` has room. Kept under the ~1h
-/// GCS bearer lifetime, and safe past object_store's "<5min" guidance because
-/// our credential provider refreshes the token on every re-signed request and a
-/// GET/GCS transfer carries no signed payload to go stale.
+/// single retry. Widen it so resume-via-`Range` has room.
+///
+/// `retry_timeout` is per *request*, and every request heph makes now carries its
+/// own bound — [`METADATA_TIMEOUT`](super::remote_cache::METADATA_TIMEOUT) for
+/// metadata, `BLOB_WRITE_STALL_TIMEOUT` per upload write, `InactivityReader` on a
+/// download body. So this only has to cover one request's retry chain, not a whole
+/// transfer: 5 minutes is ample, and keeping it *tight* matters because a request
+/// retrying inside this budget is holding one of the cache's request slots the
+/// whole time. The previous 30 minutes let a single unlucky request squat a slot
+/// for half an hour.
 fn retry_config() -> RetryConfig {
     RetryConfig {
         max_retries: 20,
-        retry_timeout: Duration::from_secs(30 * 60),
+        retry_timeout: Duration::from_secs(5 * 60),
         ..Default::default()
     }
 }
@@ -298,6 +304,24 @@ impl RemoteCacheBackend for ObjStoreBackend {
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(e).with_context(|| format!("head remote object {path}")),
         }
+    }
+
+    async fn list_names(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let path = self.object_path(prefix);
+        let mut names = Vec::new();
+        let mut objects = self.store.list(Some(&path));
+        while let Some(meta) = objects
+            .try_next()
+            .await
+            .with_context(|| format!("list remote objects under {path}"))?
+        {
+            // Keys never nest below a revision, so the filename is the artifact
+            // name as written by `RemoteCacheSet::key`.
+            if let Some(name) = meta.location.filename() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
     }
 }
 
