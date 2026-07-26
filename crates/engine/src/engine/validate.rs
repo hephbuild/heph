@@ -5,9 +5,10 @@
 //! each other when materialized, so they must be rejected.
 //!
 //! Outputs are normalized to root-anchored paths via
-//! [`crate::engine::gitignore::content_to_pattern`] (directories carry a trailing
-//! `/`). Two outputs overlap when they are the *same* path, or when one is a
-//! directory that *contains* the other (e.g. `/gen/` vs `/gen/a.go`). Glob
+//! [`crate::engine::gitignore::content_to_pattern`]. Two outputs overlap when
+//! they are the *same* path, or when one is a directory that *contains* the other
+//! (e.g. `/gen` vs `/gen/a.go`); overlap tests trim any trailing slash first, so
+//! this holds regardless of how directories are spelled. Glob
 //! patterns are compared as their literal strings, so a glob lying inside a
 //! declared directory is caught, but glob-vs-concrete-file fuzzy matching is not
 //! resolved.
@@ -267,7 +268,7 @@ mod tests {
         assert!(
             has_pair(
                 &overlaps,
-                "/a/gen/",
+                "/a/gen",
                 "//a:dir",
                 "/a/gen/sub/x.go",
                 "//a:file"

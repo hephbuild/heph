@@ -227,12 +227,19 @@ pub fn merge_section(
 /// paths are already workspace-root-relative (package-rooted), so a leading
 /// `/` anchors them precisely.
 ///
+/// A `DirPath` is emitted *without* a trailing slash. In gitignore syntax a
+/// trailing `/` restricts the pattern to directories, and a `codegen = copy`
+/// directory output is materialized as a **symlink** into the cache — which git
+/// treats as a file, not a directory — so `/gen/` would fail to ignore it and the
+/// link would show up untracked. `/gen` matches both spellings.
+///
 /// Reused by `validate` as the canonical, normalized output-path key for
-/// detecting overlapping `codegen = copy` outputs across targets.
+/// detecting overlapping `codegen = copy` outputs across targets; its overlap
+/// tests trim trailing slashes anyway, so they are unaffected.
 pub(crate) fn content_to_pattern(content: &Content) -> String {
     match content {
         Content::FilePath(p) => format!("/{}", p.trim_start_matches('/')),
-        Content::DirPath(p) => format!("/{}/", p.trim_start_matches('/').trim_end_matches('/')),
+        Content::DirPath(p) => format!("/{}", p.trim_start_matches('/').trim_end_matches('/')),
         Content::Glob(g) => format!("/{}", g.trim_start_matches('/')),
     }
 }
@@ -310,9 +317,11 @@ mod tests {
             content_to_pattern(&Content::FilePath("foo/bar.go".into())),
             "/foo/bar.go"
         );
+        // No trailing slash: a gitignore `dir/` pattern only matches real
+        // directories, and a codegen dir output is materialized as a symlink.
         assert_eq!(
             content_to_pattern(&Content::DirPath("foo/gen".into())),
-            "/foo/gen/"
+            "/foo/gen"
         );
         assert_eq!(
             content_to_pattern(&Content::Glob("foo/gen/**/*.go".into())),
