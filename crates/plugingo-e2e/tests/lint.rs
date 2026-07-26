@@ -38,8 +38,9 @@ async fn test_format_check_execs_the_downloaded_govet() -> anyhow::Result<()> {
     let ws = common::make_workspace_host(common::fixture("with_dep")?)?;
 
     // The fixture is gofmt-clean, so the check gate passes — the point is that it
-    // gets far enough to actually run the tool.
-    ws.run("//lib:format-check@v=host").await?;
+    // gets far enough to actually run the tool. Bare addr: formatting is syntactic,
+    // so `format`/`format-check` carry no variant.
+    ws.run("//lib:format-check").await?;
     Ok(())
 }
 
