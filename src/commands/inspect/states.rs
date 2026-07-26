@@ -17,8 +17,6 @@ pub struct Args {
     pub matcher: Option<String>,
 
     /// Also show the states a package inherits from its ancestors
-    // No short form on purpose: `-i` is `--interactive` on the sibling `deps`
-    // command, and quietly meaning something else here would bite.
     #[arg(long)]
     pub inherited: bool,
 
