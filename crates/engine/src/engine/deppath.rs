@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use enclose::enclose;
+use futures::future::Either;
 use futures::{StreamExt, TryStreamExt, stream};
 use hmodel::htaddr::Addr;
 
@@ -9,6 +10,51 @@ use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
 
 impl Engine {
+    /// The shortest chain of targets linking `a` and `b`, whichever way round
+    /// the edges run — `a → … → b` if `b` is a dependency of `a`, else
+    /// `b → … → a`, else `None`. The returned chain always reads from the
+    /// dependent to the dependency, so the caller need not know which of the two
+    /// is upstream.
+    ///
+    /// Both directions are searched concurrently and share the request's def
+    /// memoizer, so a target resolved by one walk is free for the other. The
+    /// first walk to find a chain wins and the other is dropped — a DAG cannot
+    /// link the pair both ways, so there is nothing to arbitrate. A direction
+    /// that fails to resolve some target does not sink the other's answer, but
+    /// it does outrank a bare "not connected": a walk that broke never proved
+    /// the pair unconnected.
+    pub async fn dep_path_between(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        a: Addr,
+        b: Addr,
+        no_transitive: bool,
+    ) -> anyhow::Result<Option<Vec<Addr>>> {
+        let forward = Arc::clone(&self).dep_path(rs.clone(), a.clone(), b.clone(), no_transitive);
+        let backward = self.dep_path(rs, b, a, no_transitive);
+        futures::pin_mut!(forward, backward);
+
+        let (first, rest) = match futures::future::select(forward, backward).await {
+            Either::Left((first, rest)) => (first, Either::Right(rest)),
+            Either::Right((first, rest)) => (first, Either::Left(rest)),
+        };
+        // The chain answers the question; the other direction is dropped
+        // wherever its walk had got to.
+        if let Ok(Some(chain)) = first {
+            return Ok(Some(chain));
+        }
+
+        let second = match rest {
+            Either::Left(f) => f.await,
+            Either::Right(f) => f.await,
+        };
+        match (first, second) {
+            (Ok(Some(chain)), _) | (_, Ok(Some(chain))) => Ok(Some(chain)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+            _ => Ok(None),
+        }
+    }
+
     /// The shortest chain of targets leading from `from` to `to` — `from` first,
     /// `to` last, one hop per element. Returns `None` when `to` is not reachable
     /// from `from`.
@@ -256,6 +302,84 @@ mod tests {
         ])?;
 
         assert_eq!(path(engine, "//lib:leaf", "//app:bin").await?, None);
+        Ok(())
+    }
+
+    /// `dep_path_between` over two addr strings, formatted for comparison.
+    async fn between(engine: Arc<Engine>, a: &str, b: &str) -> anyhow::Result<Option<Vec<String>>> {
+        let rs = engine.new_state();
+        let chain = engine
+            .dep_path_between(rs, parse_addr(a)?, parse_addr(b)?, false)
+            .await?;
+        Ok(chain.map(|c| c.iter().map(|a| a.format()).collect()))
+    }
+
+    #[tokio::test]
+    async fn argument_order_does_not_matter() -> anyhow::Result<()> {
+        // The chain always reads dependent → dependency, whichever way the pair
+        // is given, so the caller need not know which end is upstream.
+        let (engine, _root) = make_engine(vec![
+            target("//app:bin", &["//lib:mid"]),
+            target("//lib:mid", &["//lib:leaf"]),
+            target("//lib:leaf", &[]),
+        ])?;
+        let expected = Some(vec![
+            "//app:bin".to_string(),
+            "//lib:mid".to_string(),
+            "//lib:leaf".to_string(),
+        ]);
+
+        assert_eq!(
+            between(Arc::clone(&engine), "//app:bin", "//lib:leaf").await?,
+            expected
+        );
+        assert_eq!(between(engine, "//lib:leaf", "//app:bin").await?, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_broken_walk_does_not_sink_the_other_direction() -> anyhow::Result<()> {
+        // Walking up from //lib:leaf breaks on its missing dep, but the walk down
+        // from //app:bin reaches leaf without ever resolving it — the chain stands.
+        let (engine, _root) = make_engine(vec![
+            target("//app:bin", &["//lib:leaf"]),
+            target("//lib:leaf", &["//nope:missing"]),
+        ])?;
+
+        assert_eq!(
+            between(engine, "//lib:leaf", "//app:bin").await?,
+            Some(vec!["//app:bin".to_string(), "//lib:leaf".to_string()])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_broken_walk_outranks_not_connected() -> anyhow::Result<()> {
+        // Neither direction finds a chain, but one of them broke on the way — that
+        // is not proof the pair is unconnected, so the error surfaces.
+        let (engine, _root) = make_engine(vec![
+            target("//lib:leaf", &["//nope:missing"]),
+            target("//other:c", &[]),
+        ])?;
+
+        let err = between(engine, "//lib:leaf", "//other:c")
+            .await
+            .expect_err("expected the broken walk to surface");
+        assert!(format!("{err:#}").contains("//nope:missing"), "{err:#}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unconnected_targets_have_no_path_either_way() -> anyhow::Result<()> {
+        // Both walks must exhaust before `None` is the answer.
+        let (engine, _root) = make_engine(vec![
+            target("//app:bin", &["//lib:leaf"]),
+            target("//lib:leaf", &[]),
+            target("//other:c", &["//other:d"]),
+            target("//other:d", &[]),
+        ])?;
+
+        assert_eq!(between(engine, "//app:bin", "//other:c").await?, None);
         Ok(())
     }
 

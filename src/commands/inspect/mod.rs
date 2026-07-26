@@ -107,18 +107,21 @@ pub enum InspectCommands {
     ///
     /// `heph inspect revdeps //lib:core --scope //cmd/...`
     Revdeps(revdeps::Args),
-    /// Print the chain of targets leading from one target to another
+    /// Print the chain of targets linking two targets
     ///
-    /// Walks the dependency graph from FROM and prints the shortest chain of
-    /// hops that reaches TO — FROM first, TO last, one target per line. Hops
-    /// follow each target's resolved deps, so a dep pulled in by another dep's
-    /// transitives counts; pass --no-transitive to follow only the directly
-    /// declared ones. When TO is not reachable from FROM, nothing is printed on
-    /// stdout — the reason is logged instead.
+    /// Prints the shortest chain of hops linking A and B, one target per line.
+    /// Argument order does not matter: both directions are searched, and the
+    /// chain is printed from the dependent to the dependency. Hops follow each
+    /// target's resolved deps, so a dep pulled in by another dep's transitives
+    /// counts; pass --no-transitive to follow only the directly declared ones.
+    /// When the two are unconnected, nothing is printed on stdout — the reason
+    /// is logged instead.
     ///
     /// Examples:
     ///
     /// `heph inspect path //cmd/server:bin //lib:core`
+    ///
+    /// `heph inspect path //lib:core //cmd/server:bin` — same chain
     ///
     /// `heph inspect path //cmd/server:bin main.go`
     ///

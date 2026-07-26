@@ -12,12 +12,12 @@ use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
-    /// Target the chain starts at (e.g. //cmd/server:bin)
+    /// One end of the chain (e.g. //cmd/server:bin)
     #[arg(add = ArgValueCompleter::new(complete_target_addr))]
-    pub from: String,
-    /// Target the chain must reach (e.g. //lib:core)
+    pub a: String,
+    /// The other end of the chain (e.g. //lib:core) — order does not matter
     #[arg(add = ArgValueCompleter::new(complete_target_addr))]
-    pub to: String,
+    pub b: String,
     /// Follow only directly declared deps, without applying transitive deps
     #[arg(long)]
     pub no_transitive: bool,
@@ -25,8 +25,8 @@ pub struct Args {
 
 struct PathApp {
     engine: Arc<Engine>,
-    from: Addr,
-    to: Addr,
+    a: Addr,
+    b: Addr,
     no_transitive: bool,
     fail_fast: bool,
 }
@@ -48,21 +48,23 @@ impl App for PathApp {
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let PathApp {
             engine,
-            from,
-            to,
+            a,
+            b,
             no_transitive,
             fail_fast,
         } = self;
         let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
         // Kept for the "no path" log line — the addrs themselves move into the walk.
-        let (from_label, to_label) = (from.format(), to.format());
+        let (a_label, b_label) = (a.format(), b.format());
         // Resolving defs may run provider targets, recording rich failures in
         // `rs`; `finalize` prefers those over the returned error.
         let res = Arc::clone(&engine)
-            .dep_path(rs.clone(), from, to, no_transitive)
+            .dep_path_between(rs.clone(), a, b, no_transitive)
             .await;
         crate::commands::errors::finalize!(ctx, rs, res, chain => {
             match chain {
+                // The chain reads dependent → dependency whichever way the
+                // arguments were given, so the direction is visible in the output.
                 Some(chain) => {
                     for addr in chain {
                         println!("{}", addr.format());
@@ -70,7 +72,7 @@ impl App for PathApp {
                 }
                 // Unconnected targets leave stdout empty, so callers can test the
                 // output for emptiness; the reason goes to the log (stderr) instead.
-                None => tracing::info!("no path from {from_label} to {to_label}"),
+                None => tracing::info!("no path between {a_label} and {b_label}"),
             }
             Ok(())
         })
@@ -79,7 +81,7 @@ impl App for PathApp {
 
 impl PathApp {
     fn title(&self) -> String {
-        format!("Path {} → {}", self.from.format(), self.to.format())
+        format!("Path {} ↔ {}", self.a.format(), self.b.format())
     }
 }
 
@@ -88,13 +90,13 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 }
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let from = super::revdeps::resolve_addr(args.from.as_ref())?;
-    let to = super::revdeps::resolve_addr(args.to.as_ref())?;
+    let a = super::revdeps::resolve_addr(args.a.as_ref())?;
+    let b = super::revdeps::resolve_addr(args.b.as_ref())?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = PathApp {
         engine,
-        from,
-        to,
+        a,
+        b,
         no_transitive: args.no_transitive,
         fail_fast: global.fail_fast,
     };
