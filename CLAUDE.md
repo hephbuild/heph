@@ -36,6 +36,37 @@ The same applies to subsequent pushes on an open PR: push the fix and let CI run
 
 Run the full `tst` suite locally only for a large blast radius change — one touching the engine core, provider/driver traits, or caching, where a break is likely to be wide rather than local. Run it before opening the PR: the cost of a broken PR there is higher than the wait.
 
+## Review Board
+
+Standing agents (`.claude/agents/`) own quality for this project. They are advisory — they return verdicts, you implement.
+
+### Always consult
+
+For any non-trivial feature or change. Skip for typo fixes, comment edits, and mechanical renames.
+
+| Agent | Owns | Consult at |
+|---|---|---|
+| `product-vision` | Is it the right thing; fast/easy/useful for humans *and* agents; CLI surface, naming, **diagnosability** ("why did it do that?" is a design-time requirement) | **Design** (before writing code), and again on the finished UX |
+| `feature-quality` | Test coverage, corner cases, and the low-overhead promise (memory, disk, CPU, allocations, per-target cost) | **Design** (what will this cost?) and **review** (is it tested, is it cheap?) |
+| `code-quality` | Correctness, soundness, Rust idiom, code smells, wheel-reinvention | **Review**, before commit |
+
+### Consult when triggered
+
+Mechanical triggers — if the change touches it, consult. Not a judgment call.
+
+| Agent | Trigger | Consult at |
+|---|---|---|
+| `hermeticity` | New/changed `Driver` or `Provider`; anything feeding the input hash, def hash, or cache key; sandbox input/output declaration | **Design** and **review** |
+| `compatibility` | `proto/`; `crates/plugin-abi` or `ABI_SEMVER`; cache serialization / on-disk or remote-cache format; Starlark builtins or rule signatures; CLI command/flag/exit-code/`--json` shape | **Design** (before the format is fixed) and **review** |
+| `perf-measurement` | Change lands on a hot path (result/spec resolution, hashing, cache read, provider walk); a perf claim needs proof; something feels slower | **After** implementation, before commit |
+
+### Rules
+
+- Consults at the same stage run in parallel — one message, multiple agents.
+- A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
+- **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
+- A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
+
 @.claude/rust.md
 @.claude/testing.md
 @.claude/architecture.md
