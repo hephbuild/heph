@@ -9,14 +9,16 @@ use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
 
 impl Engine {
-    /// The shortest chain of targets leading from `from` to `to`, following
-    /// declared direct dependency edges — `from` first, `to` last, one hop per
-    /// element. Returns `None` when `to` is not reachable from `from`.
+    /// The shortest chain of targets leading from `from` to `to` — `from` first,
+    /// `to` last, one hop per element. Returns `None` when `to` is not reachable
+    /// from `from`.
     ///
-    /// Edges are the *direct* inputs of each target (`get_direct_def`), so the
-    /// hops are the ones actually written in the build files; transitive
-    /// resolution would collapse intermediate targets into a single edge and
-    /// hide them.
+    /// Edges are a target's resolved inputs (`get_def`), so a dep pulled in by
+    /// another dep's transitive sandbox is a hop like any other — the graph the
+    /// engine actually builds, not just what the build files spell out. With
+    /// `no_transitive`, only the directly declared inputs are followed
+    /// (`get_direct_def`), which can leave targets that are linked only through
+    /// a transitive contribution looking unconnected.
     ///
     /// The walk is breadth-first: a whole level is resolved before the next one
     /// starts, so the first chain reaching `to` has the fewest hops. Within a
@@ -28,6 +30,7 @@ impl Engine {
         rs: Arc<RequestState>,
         from: Addr,
         to: Addr,
+        no_transitive: bool,
     ) -> anyhow::Result<Option<Vec<Addr>>> {
         if from == to {
             return Ok(Some(vec![from]));
@@ -51,7 +54,7 @@ impl Engine {
             // with the addr it was resolved from without re-cloning the frontier.
             let level: Vec<(Addr, Vec<Addr>)> = stream::iter(frontier.into_iter().map(|node| {
                 enclose!((self => engine, rs) async move {
-                    let deps = direct_deps(engine, rs, &node).await?;
+                    let deps = deps_of(engine, rs, &node, no_transitive).await?;
                     anyhow::Ok((node, deps))
                 })
             }))
@@ -81,15 +84,21 @@ impl Engine {
     }
 }
 
-/// A target's direct dependency addrs, deduplicated, in declared order. Several
-/// inputs may reference the same target through different outputs; as a graph
-/// edge that is one dep.
-async fn direct_deps(
+/// A target's dependency addrs, deduplicated, in declared order. Several inputs
+/// may reference the same target through different outputs; as a graph edge that
+/// is one dep. `no_transitive` drops the inputs contributed by the deps'
+/// transitive sandboxes, leaving only what the target declares itself.
+async fn deps_of(
     engine: Arc<Engine>,
     rs: Arc<RequestState>,
     addr: &Addr,
+    no_transitive: bool,
 ) -> anyhow::Result<Vec<Addr>> {
-    let def = engine.get_direct_def(rs, addr).await?;
+    let def = if no_transitive {
+        engine.get_direct_def(rs, addr).await?
+    } else {
+        engine.get_def(rs, addr).await?
+    };
     let inputs = &def.target_def.inputs;
 
     let mut seen = HashSet::with_capacity(inputs.len());
@@ -122,6 +131,8 @@ fn chain_to(parents: &HashMap<Addr, Addr>, from: &Addr, to: &Addr) -> Vec<Addr> 
 mod tests {
     use super::*;
     use crate::engine::Config;
+    use crate::engine::driver::TargetAddr;
+    use crate::engine::driver::sandbox::{Dep, Sandbox};
     use hbuiltins::pluginstatictarget;
     use hmodel::htaddr::parse_addr;
     use std::collections::HashMap;
@@ -161,15 +172,45 @@ mod tests {
         Ok((Arc::new(engine), root))
     }
 
+    /// A target contributing `dep` to its dependents' defs through transitives —
+    /// an edge that only exists once transitives are applied.
+    fn target_with_transitive(addr: &str, dep: &str) -> anyhow::Result<pluginstatictarget::Target> {
+        let mut transitive = Sandbox::default();
+        transitive.push_dep(Dep {
+            r#ref: TargetAddr {
+                r#ref: parse_addr(dep)?,
+                ..Default::default()
+            },
+            group: String::new(),
+            runtime: true,
+            hash: true,
+            id: "t".to_string(),
+            ..Default::default()
+        });
+        Ok(pluginstatictarget::Target {
+            transitive,
+            ..target(addr, &[])
+        })
+    }
+
     /// `dep_path` between two addr strings, formatted for comparison.
     async fn path(
         engine: Arc<Engine>,
         from: &str,
         to: &str,
     ) -> anyhow::Result<Option<Vec<String>>> {
+        path_opts(engine, from, to, false).await
+    }
+
+    async fn path_opts(
+        engine: Arc<Engine>,
+        from: &str,
+        to: &str,
+        no_transitive: bool,
+    ) -> anyhow::Result<Option<Vec<String>>> {
         let rs = engine.new_state();
         let chain = engine
-            .dep_path(rs, parse_addr(from)?, parse_addr(to)?)
+            .dep_path(rs, parse_addr(from)?, parse_addr(to)?, no_transitive)
             .await?;
         Ok(chain.map(|c| c.iter().map(|a| a.format()).collect()))
     }
@@ -232,6 +273,30 @@ mod tests {
         assert_eq!(
             path(engine, "//app:bin", "//lib:leaf").await?,
             Some(vec!["//app:bin".to_string(), "//lib:leaf".to_string()])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn follows_transitively_contributed_edges() -> anyhow::Result<()> {
+        // Nothing declares a dep on //lib:extra: //lib:mid only *contributes* it,
+        // and applying transitives lands it directly in //app:bin's inputs — so
+        // the edge the engine actually builds is bin → extra.
+        let (engine, _root) = make_engine(vec![
+            target("//app:bin", &["//lib:mid"]),
+            target_with_transitive("//lib:mid", "//lib:extra")?,
+            target("//lib:extra", &[]),
+        ])?;
+
+        assert_eq!(
+            path(Arc::clone(&engine), "//app:bin", "//lib:extra").await?,
+            Some(vec!["//app:bin".to_string(), "//lib:extra".to_string()])
+        );
+        // --no-transitive follows only what the build files declare, so the same
+        // pair looks unconnected.
+        assert_eq!(
+            path_opts(engine, "//app:bin", "//lib:extra", true).await?,
+            None
         );
         Ok(())
     }

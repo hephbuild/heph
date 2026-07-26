@@ -18,12 +18,16 @@ pub struct Args {
     /// Target the chain must reach (e.g. //lib:core)
     #[arg(add = ArgValueCompleter::new(complete_target_addr))]
     pub to: String,
+    /// Follow only directly declared deps, without applying transitive deps
+    #[arg(long)]
+    pub no_transitive: bool,
 }
 
 struct PathApp {
     engine: Arc<Engine>,
     from: Addr,
     to: Addr,
+    no_transitive: bool,
     fail_fast: bool,
 }
 
@@ -46,6 +50,7 @@ impl App for PathApp {
             engine,
             from,
             to,
+            no_transitive,
             fail_fast,
         } = self;
         let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
@@ -53,7 +58,9 @@ impl App for PathApp {
         let (from_label, to_label) = (from.format(), to.format());
         // Resolving defs may run provider targets, recording rich failures in
         // `rs`; `finalize` prefers those over the returned error.
-        let res = Arc::clone(&engine).dep_path(rs.clone(), from, to).await;
+        let res = Arc::clone(&engine)
+            .dep_path(rs.clone(), from, to, no_transitive)
+            .await;
         crate::commands::errors::finalize!(ctx, rs, res, chain => {
             match chain {
                 Some(chain) => {
@@ -88,6 +95,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         engine,
         from,
         to,
+        no_transitive: args.no_transitive,
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);

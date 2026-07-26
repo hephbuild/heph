@@ -110,15 +110,19 @@ pub enum InspectCommands {
     /// Print the chain of targets leading from one target to another
     ///
     /// Walks the dependency graph from FROM and prints the shortest chain of
-    /// hops that reaches TO — FROM first, TO last, one target per line. Hops are
-    /// direct (declared) dependency edges. When TO is not reachable from FROM,
-    /// nothing is printed on stdout — the reason is logged instead.
+    /// hops that reaches TO — FROM first, TO last, one target per line. Hops
+    /// follow each target's resolved deps, so a dep pulled in by another dep's
+    /// transitives counts; pass --no-transitive to follow only the directly
+    /// declared ones. When TO is not reachable from FROM, nothing is printed on
+    /// stdout — the reason is logged instead.
     ///
     /// Examples:
     ///
     /// `heph inspect path //cmd/server:bin //lib:core`
     ///
     /// `heph inspect path //cmd/server:bin main.go`
+    ///
+    /// `heph inspect path //cmd/server:bin //lib:core --no-transitive`
     Path(path::Args),
     /// List provider-exposed functions (`heph.<provider>.<fn>`)
     ///

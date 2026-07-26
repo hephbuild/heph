@@ -3,6 +3,7 @@ use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
 use hmodel::htaddr::parse_addr;
 use hmodel::htpkg::PkgBuf;
+use hplugin::driver::sandbox::Sandbox;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
@@ -26,6 +27,9 @@ pub struct Target {
     /// shorthand or `{enabled, remote, history}` dict). `None` lets the driver
     /// default it (exec: local+remote on).
     pub cache: Option<Value>,
+    /// Sandbox this target contributes to whoever depends on it — the deps/tools
+    /// the engine folds into a dependent's def when transitives are applied.
+    pub transitive: Sandbox,
 }
 
 pub struct Provider {
@@ -75,6 +79,7 @@ impl Provider {
                     driver: t.driver,
                     config,
                     labels: t.labels,
+                    transitive: t.transitive,
                     ..Default::default()
                 })
             })
