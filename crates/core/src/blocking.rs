@@ -25,11 +25,19 @@
 //! process, so a job costs a channel send rather than a thread spawn.
 //!
 //! **Dropped-wake-up backstop.** The result still crosses threads, so [`run`]
-//! does not simply `await` the `oneshot` — it re-polls on a timer
+//! does not simply `await` the `oneshot` — a pending waiter is re-woken on a timer
 //! ([`WAKE_BACKSTOP`]). A lost wake-up then costs latency instead of stranding
 //! the caller forever. This is the same defence the macOS child watcher uses for
-//! its own dropped kernel events (`kqueue_macos.rs`), and it is cheap: the timer
-//! only fires for jobs that outlive it.
+//! its own dropped kernel events (`kqueue_macos.rs`).
+//!
+//! The backstop is a plain thread, *not* `tokio::time::timeout`, because [`run`]
+//! is also awaited inside a loaded cdylib plugin: the plugin's statically-linked
+//! tokio is a separate instance from the host's, and the future is polled by a
+//! host worker, so the plugin's tokio sees no runtime context at all. A tokio
+//! timer there panics with "there is no reactor running", and that panic crosses
+//! the plugin's `extern "C"` ABI seam, where it aborts the process. Nothing in
+//! this module may touch the reactor; a `oneshot` is plain waker traffic and is
+//! fine.
 //!
 //! Jobs must be `'static`: a caller's future can be dropped (cancellation) while
 //! its job is still running, so the job cannot borrow from the caller's frame.
@@ -37,8 +45,11 @@
 
 use crossbeam_channel::{Sender, unbounded};
 use std::any::Any;
+use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::OnceLock;
+use std::pin::Pin;
+use std::sync::{Mutex, Once, OnceLock};
+use std::task::{Poll, Waker};
 use std::thread;
 use std::time::Duration;
 
@@ -50,13 +61,47 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// rather than silently killing a pool thread.
 type Panic = Box<dyn Any + Send + 'static>;
 
-/// How often [`run`] re-polls a pending result.
+/// How often a pending [`run`] waiter is re-woken.
 ///
 /// Purely a backstop against a dropped cross-thread wake-up: on a healthy wake-up
-/// the result arrives immediately and the timer is never reached. Short enough
+/// the result arrives immediately and the tick is never reached. Short enough
 /// that a lost wake-up is a hiccup, long enough that a pool of thousands of
 /// queued jobs isn't paying for a busy poll.
 const WAKE_BACKSTOP: Duration = Duration::from_millis(250);
+
+/// Waiters to re-wake on the next tick. Drained by the backstop thread, so a
+/// registration is consumed by one tick and a still-pending waiter re-registers
+/// from the poll that tick provokes.
+static PENDING: Mutex<Vec<Waker>> = Mutex::new(Vec::new());
+
+static BACKSTOP_THREAD: Once = Once::new();
+
+/// Re-wake `waker` within [`WAKE_BACKSTOP`], starting the backstop thread on the
+/// first pending waiter (a process that never blocks never pays for it).
+fn backstop(waker: Waker) {
+    BACKSTOP_THREAD.call_once(|| {
+        thread::Builder::new()
+            .name("heph-blocking-wake".to_string())
+            .spawn(|| {
+                loop {
+                    thread::sleep(WAKE_BACKSTOP);
+                    let due = std::mem::take(&mut *lock_pending());
+                    for waker in due {
+                        waker.wake();
+                    }
+                }
+            })
+            // Same stance as the pool itself: no fallback worth having.
+            .expect("spawn heph blocking-wake thread");
+    });
+    lock_pending().push(waker);
+}
+
+/// A waker panicking mid-`wake` would poison the list and strand every later
+/// waiter, so poisoning is ignored — the `Vec` is still consistent.
+fn lock_pending() -> std::sync::MutexGuard<'static, Vec<Waker>> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Pool size.
 ///
@@ -127,15 +172,21 @@ where
         pool_broken("queue closed");
     }
 
-    // Re-poll rather than awaiting once: see the dropped-wake-up backstop note
-    // in the module docs.
-    loop {
-        match tokio::time::timeout(WAKE_BACKSTOP, &mut rx).await {
-            Ok(Ok(Ok(value))) => return value,
-            Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
-            Ok(Err(_closed)) => pool_broken("dropped a job unanswered"),
-            Err(_elapsed) => continue,
+    // Arm the backstop on every pending poll rather than trusting a single
+    // wake-up: see the dropped-wake-up note in the module docs.
+    let received = poll_fn(|cx| match Pin::new(&mut rx).poll(cx) {
+        Poll::Ready(out) => Poll::Ready(out),
+        Poll::Pending => {
+            backstop(cx.waker().clone());
+            Poll::Pending
         }
+    })
+    .await;
+
+    match received {
+        Ok(Ok(value)) => value,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_closed) => pool_broken("dropped a job unanswered"),
     }
 }
 
@@ -185,6 +236,66 @@ mod tests {
         let panicked = tokio::spawn(run(|| panic!("boom"))).await;
         assert!(panicked.is_err(), "panic must propagate to the caller");
         assert_eq!(run(|| 7).await, 7, "the pool must still serve jobs");
+    }
+
+    /// Inside a loaded cdylib plugin the plugin's own tokio has no runtime
+    /// context — the host worker polls the plugin's future through the stable ABI
+    /// seam. Anything here that touched the reactor panicked there, and that panic
+    /// aborts the process on its way back across the `extern "C"` boundary.
+    /// `block_on` with no runtime installed reproduces exactly that context.
+    #[test]
+    fn works_with_no_tokio_runtime_installed() {
+        assert_eq!(futures::executor::block_on(run(|| 7)), 7);
+    }
+
+    /// Same, for a job slow enough that the waiter actually parks and arms the
+    /// backstop — the reactor-free path has to carry the pending case too.
+    #[test]
+    fn pending_job_completes_with_no_tokio_runtime_installed() {
+        let out = futures::executor::block_on(run(|| {
+            thread::sleep(WAKE_BACKSTOP * 2);
+            "done"
+        }));
+        assert_eq!(out, "done");
+    }
+
+    /// A waiter must be re-woken while its job is still running — that spare
+    /// wake-up is the whole defence against a dropped one. Counted with a waker
+    /// nothing else can wake: the job is still asleep, so any wake seen here came
+    /// from the backstop and not from the job answering.
+    #[test]
+    fn backstop_re_wakes_a_waiter_while_its_job_is_still_running() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+        static WAKES: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        unsafe fn wake(_: *const ()) {
+            WAKES.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, noop);
+        let counting = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+
+        let mut fut = Box::pin(run(|| {
+            thread::sleep(WAKE_BACKSTOP * 4);
+            11
+        }));
+        assert!(
+            fut.as_mut()
+                .poll(&mut Context::from_waker(&counting))
+                .is_pending(),
+            "a job that sleeps cannot answer before its first poll returns",
+        );
+
+        thread::sleep(WAKE_BACKSTOP * 2);
+        assert!(
+            WAKES.load(Ordering::SeqCst) > 0,
+            "the backstop must re-wake a waiter whose job is still running",
+        );
+
+        assert_eq!(futures::executor::block_on(fut), 11);
     }
 
     /// Many jobs at once all complete, exercising the queue past the pool size.
