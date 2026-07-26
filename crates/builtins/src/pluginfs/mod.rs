@@ -47,22 +47,24 @@ pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
     matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
 }
 
-/// True if `path` is a symlink whose target resolves inside a `.heph*` directory
-/// (e.g. `.heph3/cache/...`). Such links point at engine-internal artifacts —
-/// materialized cache outputs, not raw workspace source — so they must be
-/// skipped by source reads exactly like a stamped codegen file.
+/// True if `path` resolves inside a `.heph*` directory (e.g. `.heph3/cache/...`),
+/// pointing at an engine-internal artifact — a materialized cache output, not raw
+/// workspace source — so it must be skipped by source reads like a stamped
+/// codegen file.
 ///
-/// A non-symlink, a dangling link, or any IO error is treated as "not a heph
-/// link" so source reads never break on such trees.
-pub fn is_heph_symlink(path: &std::path::Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {}
-        _ => return false,
-    }
-    let Ok(target) = std::fs::canonicalize(path) else {
+/// This holds whether `path` is *itself* a symlink into the cache (`gen ->
+/// .heph3/…`) **or** lies *under* such a symlinked directory (`gen/some/file.txt`,
+/// a real file reached through the `gen` link). [`std::fs::canonicalize`] resolves
+/// every symlink along the path — ancestors included — so a file transitively
+/// inside the cache is detected, not just a leaf symlink.
+///
+/// A dangling link, a nonexistent path, or any IO error is treated as "not a heph
+/// path" so source reads never break on such trees.
+pub fn resolves_into_heph_dir(path: &std::path::Path) -> bool {
+    let Ok(resolved) = std::fs::canonicalize(path) else {
         return false;
     };
-    target.components().any(|c| {
+    resolved.components().any(|c| {
         matches!(c, std::path::Component::Normal(name)
             if name.to_str().is_some_and(|n| n.starts_with(".heph")))
     })
@@ -764,9 +766,9 @@ fn emit_glob_file(
         return Ok(());
     }
     // Skip net-new codegen outputs stamped back into the tree — sourcing them
-    // here would double-source the generated content. Same for symlinks into a
-    // `.heph*` dir: they point at engine-internal artifacts, not raw source.
-    if has_codegen_xattr(abs) || is_heph_symlink(abs) {
+    // here would double-source the generated content. Same for paths resolving
+    // into a `.heph*` dir: they are engine-internal artifacts, not raw source.
+    if has_codegen_xattr(abs) || resolves_into_heph_dir(abs) {
         return Ok(());
     }
     let Some(rel_str) = rel.to_str() else {
@@ -1004,10 +1006,10 @@ impl hplugin::driver::Driver for Driver {
 
                 // A file() over a net-new codegen output (stamped back into the
                 // tree) resolves to nothing — the generated content must only be
-                // sourced from its generator, never re-read as raw source. A
-                // symlink into a `.heph*` dir (engine-internal artifact) is
+                // sourced from its generator, never re-read as raw source. A path
+                // resolving into a `.heph*` dir (engine-internal artifact) is
                 // skipped the same way.
-                if has_codegen_xattr(&abs) || is_heph_symlink(&abs) {
+                if has_codegen_xattr(&abs) || resolves_into_heph_dir(&abs) {
                     return Ok(RunResponse {
                         artifacts: vec![],
                         ..Default::default()
@@ -2855,30 +2857,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_is_heph_symlink_only_targets_heph_dirs() {
+    fn test_resolves_into_heph_dir() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempdir().unwrap();
 
-        // Plain file: not a symlink.
+        // Plain file, not under any cache: not a heph path.
         let plain = tmp.path().join("plain.rs");
         fs::write(&plain, b"x").unwrap();
-        assert!(!is_heph_symlink(&plain));
+        assert!(!resolves_into_heph_dir(&plain));
 
         // Symlink to a normal (non-.heph) file.
         let normal = tmp.path().join("normal.rs");
         fs::write(&normal, b"x").unwrap();
         let link_normal = tmp.path().join("link_normal.rs");
         symlink(&normal, &link_normal).unwrap();
-        assert!(!is_heph_symlink(&link_normal));
+        assert!(!resolves_into_heph_dir(&link_normal));
 
-        // Symlink into a `.heph*` dir.
+        // Symlink directly into a `.heph*` dir.
         let cache = tmp.path().join(".heph3").join("cache");
         fs::create_dir_all(&cache).unwrap();
         let blob = cache.join("blob.rs");
         fs::write(&blob, b"x").unwrap();
         let link_heph = tmp.path().join("link_heph.rs");
         symlink(&blob, &link_heph).unwrap();
-        assert!(is_heph_symlink(&link_heph));
+        assert!(resolves_into_heph_dir(&link_heph));
+
+        // The load-bearing case: a real file reached *through* a symlinked
+        // directory (`gen -> .heph3/cache/gen`). The leaf is not itself a
+        // symlink, but it transitively resolves inside the cache.
+        let cache_gen = cache.join("gen");
+        fs::create_dir_all(cache_gen.join("some")).unwrap();
+        let deep = cache_gen.join("some").join("file.txt");
+        fs::write(&deep, b"x").unwrap();
+        let gen_link = tmp.path().join("gen");
+        symlink(&cache_gen, &gen_link).unwrap();
+        // The symlinked dir itself…
+        assert!(resolves_into_heph_dir(&gen_link));
+        // …and a plain file underneath it, via the link.
+        assert!(resolves_into_heph_dir(
+            &gen_link.join("some").join("file.txt")
+        ));
     }
 }
