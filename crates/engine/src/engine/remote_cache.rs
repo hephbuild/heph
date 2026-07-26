@@ -131,7 +131,7 @@ static CODEC_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| {
 });
 
 /// Run the synchronous codec step (gzip/gunzip plus local-cache reads/writes) on
-/// the blocking pool, bounded by [`CODEC_SLOTS`].
+/// the dedicated blocking pool, bounded by [`CODEC_SLOTS`].
 ///
 /// It must **not** run on a runtime worker. Compressing or decompressing a
 /// revision takes hundreds of milliseconds to seconds of straight CPU; with
@@ -140,6 +140,10 @@ static CODEC_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| {
 /// transfers, their inactivity deadlines, the TUI. The build looks hung even
 /// though no lock is actually deadlocked. (The previous `block_or_inline` did
 /// exactly that: inline on Linux, `block_in_place` on macOS.)
+///
+/// `hcore::blocking` rather than `spawn_blocking`: the latter's `JoinHandle`
+/// wake-up rides tokio's cross-thread waker, observed to drop wake-ups on macOS
+/// under load (`RCA_MACOS_WAKER.md`) — the same load this path generates.
 ///
 /// The closure is `Send`, but the values it builds are not required to be — the
 /// non-`Send` local-cache reader/writer is created and dropped entirely inside
@@ -153,9 +157,9 @@ where
         .acquire()
         .await
         .with_context(|| format!("acquire remote cache codec slot for {what}"))?;
-    tokio::task::spawn_blocking(f)
+    hcore::blocking::run(f)
         .await
-        .with_context(|| format!("join remote cache {what} task"))?
+        .with_context(|| format!("remote cache {what}"))
 }
 
 /// A streaming object store. The set layers cache semantics (manifest affinity,
@@ -1538,7 +1542,7 @@ impl Engine {
         let hashin_owned = hashin.to_string();
         // Same reasoning as `cache_artifact_locally`: the local-cache writer is
         // synchronous (and not `Send`), so it must not run on a runtime worker.
-        hproc::process_supervisor::block_or_inline(move || {
+        hcore::blocking::run(move || {
             use std::io::Write;
             let mut w = local_cache
                 .writer(&addr_owned, &hashin_owned, MANIFEST_V1)
@@ -1546,6 +1550,7 @@ impl Engine {
             w.write_all(&bytes).context("write remote manifest")?;
             anyhow::Ok(())
         })
+        .await
         .with_context(|| format!("mirror remote manifest for {addr} {hashin}"))?;
 
         Ok(Some((local_manifest, rev)))

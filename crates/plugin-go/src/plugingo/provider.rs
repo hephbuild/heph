@@ -726,13 +726,14 @@ impl ProviderInner {
                     >);
             }
 
-            let packages = hproc::process_supervisor::block_or_inline(
+            let packages = hcore::blocking::run(
                 enclose!((self.workspace_root => workspace_root, self.skip => skip, self.walker => walker) move || {
                     let mut packages = Vec::new();
                     collect_go_packages(&walker, &search_dir, &workspace_root, false, &skip, &mut packages);
                     packages
                 }),
-            );
+            )
+            .await;
 
             Ok(Box::new(packages.into_iter())
                 as Box<
@@ -2320,7 +2321,7 @@ impl ProviderInner {
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
-                    let pkg = hproc::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
+                    let pkg = hcore::blocking::run(move || -> anyhow::Result<_> {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
                                 let entry = entry_result?;
@@ -2337,7 +2338,8 @@ impl ProviderInner {
                             }
                         }
                         anyhow::bail!("_golist produced no package.bin")
-                    })?;
+                    })
+                    .await?;
                     // `go list -e` reports no-buildable-files cases as a JSON
                     // entry with the Error field populated and empty GoFiles.
                     // Surface that as a typed sentinel so consumers can map it
@@ -2377,7 +2379,7 @@ impl ProviderInner {
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
-                    let addrs = hproc::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
+                    let addrs = hcore::blocking::run(move || -> anyhow::Result<_> {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
                                 let entry = entry_result?;
@@ -2394,7 +2396,8 @@ impl ProviderInner {
                             }
                         }
                         anyhow::bail!("_golist produced no package_addrs.bin")
-                    })?;
+                    })
+                    .await?;
                     Ok(Arc::new(addrs))
                 }),
             )
@@ -2585,6 +2588,8 @@ impl ProviderInner {
             return Ok(Arc::clone(hit));
         }
         let data = if go_mod_path.exists() {
+            // Stays inline: one small `read_to_string`, from a sync fn, memoized
+            // per module. Not worth an async hop onto the blocking pool.
             let content = hproc::process_supervisor::block_or_inline(
                 enclose!((go_mod_path) move || std::fs::read_to_string(&go_mod_path)),
             )

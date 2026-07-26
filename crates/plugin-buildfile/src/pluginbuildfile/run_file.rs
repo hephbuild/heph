@@ -1036,13 +1036,18 @@ impl Provider {
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
-                    hproc::process_supervisor::block_or_inline(move || -> anyhow::Result<Arc<RunResult>> {
+                    // Starlark evaluation of a whole package: the single heaviest
+                    // synchronous unit in a build, and one per package. On a runtime
+                    // worker it stops that worker polling anything at all — see
+                    // `hcore::blocking`.
+                    hcore::blocking::run(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
                             BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, skip);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
                     })
+                    .await
                 }),
             )
             .await
