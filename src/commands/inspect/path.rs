@@ -49,14 +49,21 @@ impl App for PathApp {
             fail_fast,
         } = self;
         let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
+        // Kept for the "no path" log line — the addrs themselves move into the walk.
+        let (from_label, to_label) = (from.format(), to.format());
         // Resolving defs may run provider targets, recording rich failures in
         // `rs`; `finalize` prefers those over the returned error.
         let res = Arc::clone(&engine).dep_path(rs.clone(), from, to).await;
         crate::commands::errors::finalize!(ctx, rs, res, chain => {
-            // No chain at all means the two targets are unconnected: print
-            // nothing, so callers can test the output for emptiness.
-            for addr in chain.into_iter().flatten() {
-                println!("{}", addr.format());
+            match chain {
+                Some(chain) => {
+                    for addr in chain {
+                        println!("{}", addr.format());
+                    }
+                }
+                // Unconnected targets leave stdout empty, so callers can test the
+                // output for emptiness; the reason goes to the log (stderr) instead.
+                None => tracing::info!("no path from {from_label} to {to_label}"),
             }
             Ok(())
         })

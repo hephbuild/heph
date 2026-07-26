@@ -112,7 +112,7 @@ pub enum InspectCommands {
     /// Walks the dependency graph from FROM and prints the shortest chain of
     /// hops that reaches TO — FROM first, TO last, one target per line. Hops are
     /// direct (declared) dependency edges. When TO is not reachable from FROM,
-    /// nothing is printed.
+    /// nothing is printed on stdout — the reason is logged instead.
     ///
     /// Examples:
     ///
