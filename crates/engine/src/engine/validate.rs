@@ -22,6 +22,7 @@ use crate::engine::driver::targetdef::path::CodegenMode;
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::gitignore::content_to_pattern;
 use crate::engine::request_state::RequestState;
+use hbuiltins::pluginfs;
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
@@ -63,6 +64,15 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     let a = a.trim_end_matches('/');
     let b = b.trim_end_matches('/');
     a == b || is_ancestor(a, b) || is_ancestor(b, a)
+}
+
+/// An overlap between two outputs that is *not* a codegen clobber, so it must not
+/// be flagged. Two fs-provider inputs (e.g. a broad `glob` and a specific `file`,
+/// or two globs) may legitimately cover the same path — the fs provider only
+/// exposes existing source, it never materializes or overwrites — so their
+/// overlap is a normal dependency pattern, allowed by exception.
+fn overlap_exempt(a: &Addr, b: &Addr) -> bool {
+    pluginfs::is_fs_addr(a) && pluginfs::is_fs_addr(b)
 }
 
 impl Engine {
@@ -156,7 +166,7 @@ impl Engine {
                 if !paths_overlap(&a.path, &b.path) {
                     break;
                 }
-                if a.addr != b.addr {
+                if a.addr != b.addr && !overlap_exempt(&a.addr, &b.addr) {
                     overlaps.push(CodegenOverlap {
                         a: a.clone(),
                         b: b.clone(),
@@ -248,6 +258,24 @@ mod tests {
             "{overlaps:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn fs_provider_overlaps_are_exempt() {
+        let file = pluginfs::file_addr("a/gen.go");
+        let glob = pluginfs::glob_addr("a/*.go", &[]);
+        let other = hmodel::htaddr::parse_addr("//a:t").expect("valid addr");
+        // Two fs-provider inputs overlapping is allowed.
+        assert!(overlap_exempt(&file, &glob), "two fs deps must be exempt");
+        // An fs input overlapping a real (non-fs) codegen output is NOT exempt.
+        assert!(
+            !overlap_exempt(&file, &other),
+            "fs vs non-fs must still be flagged"
+        );
+        assert!(
+            !overlap_exempt(&other, &other),
+            "two non-fs outputs must still be flagged"
+        );
     }
 
     #[tokio::test]
