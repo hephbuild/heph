@@ -2540,7 +2540,11 @@ impl Engine {
                         pending_cycle = Some(e);
                         continue;
                     }
-                    return Err(e);
+                    // Attach the target so the failure is traceable even in
+                    // non-tui output, where the addr isn't otherwise shown. The
+                    // context wraps but preserves the chain, so downstream typed
+                    // downcasts still work.
+                    return Err(e.context(format!("resolving target `{addr}`")));
                 }
             };
 
@@ -3741,15 +3745,37 @@ mod tests {
         Ok(())
     }
 
-    /// Provider whose `get` fails with a typed `CycleError` for one addr (and
-    /// `NotFound` otherwise) — models a provider that over-claims a name and
-    /// induces a cycle deep in resolution (like the go provider over-claiming a
-    /// buildfile codegen target). Used to verify the engine *contains* the
-    /// cycle: it falls through to the next provider rather than aborting.
+    /// Provider whose `get` fails for one addr (and `NotFound` otherwise).
+    ///
+    /// With `fail_kind = Cycle` it raises a typed `CycleError` — modeling a
+    /// provider that over-claims a name and induces a cycle deep in resolution
+    /// (like the go provider over-claiming a buildfile codegen target), used to
+    /// verify the engine *contains* the cycle by falling through to the next
+    /// provider. With `fail_kind = Typed` it raises a plain typed error, the
+    /// ordinary "this provider blew up" path that must surface with the addr
+    /// attached.
     struct CyclingProvider {
         name: String,
         cycles_for: String,
+        fail_kind: FailKind,
     }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailKind {
+        Cycle,
+        Typed,
+    }
+
+    /// A typed error carried out of a provider's `get`, so a test can assert the
+    /// chain still downcasts after the engine attaches addr context.
+    #[derive(Debug)]
+    struct ProviderBlewUp;
+    impl std::fmt::Display for ProviderBlewUp {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "provider blew up")
+        }
+    }
+    impl std::error::Error for ProviderBlewUp {}
     impl crate::engine::provider::Provider for CyclingProvider {
         fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
             Ok(ConfigResponse {
@@ -3785,19 +3811,20 @@ mod tests {
             req: GetRequest,
             _ctoken: &'a (dyn Cancellable + Send + Sync),
         ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-            let cycles = req.addr.format() == self.cycles_for;
+            let fails = req.addr.format() == self.cycles_for;
+            let kind = self.fail_kind;
             let addr = req.addr.clone();
             Box::pin(async move {
-                if cycles {
-                    Err(GetError::Other(
+                match (fails, kind) {
+                    (false, _) => Err(GetError::NotFound),
+                    (true, FailKind::Cycle) => Err(GetError::Other(
                         CycleError {
                             from: addr.clone(),
                             to: addr,
                         }
                         .into(),
-                    ))
-                } else {
-                    Err(GetError::NotFound)
+                    )),
+                    (true, FailKind::Typed) => Err(GetError::Other(ProviderBlewUp.into())),
                 }
             })
         }
@@ -3812,6 +3839,14 @@ mod tests {
 
     fn engine_with_cycling(
         cycles_for: &str,
+        statics: Vec<pluginstatictarget::Target>,
+    ) -> anyhow::Result<Arc<Engine>> {
+        engine_with_failing(cycles_for, FailKind::Cycle, statics)
+    }
+
+    fn engine_with_failing(
+        cycles_for: &str,
+        fail_kind: FailKind,
         statics: Vec<pluginstatictarget::Target>,
     ) -> anyhow::Result<Arc<Engine>> {
         let root = tempdir()?;
@@ -3829,6 +3864,7 @@ mod tests {
             Box::new(CyclingProvider {
                 name: "cyc".to_string(),
                 cycles_for: cycles_for.clone(),
+                fail_kind,
             })
         })?;
         if !statics.is_empty() {
@@ -3870,6 +3906,38 @@ mod tests {
         assert!(
             hcore::hmemoizer::downcast_chain_ref::<CycleError>(&err).is_some(),
             "expected CycleError, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    // A provider `get` failure must name the target it was resolving — without
+    // it, non-tui output shows only the provider's own message with no clue
+    // which addr triggered it. The context must wrap, not replace: the typed
+    // error still has to downcast out of the chain.
+    #[tokio::test]
+    async fn get_spec_error_names_the_target_and_keeps_the_chain() -> anyhow::Result<()> {
+        let engine = engine_with_failing("//pkg:t", FailKind::Typed, vec![])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+
+        let err = engine
+            .clone()
+            .get_spec(engine.new_state(), &addr)
+            .await
+            .err()
+            .expect("provider failure must propagate");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("resolving target `//pkg:t`"),
+            "must name the addr: {msg}"
+        );
+        assert!(
+            msg.contains("provider blew up"),
+            "must keep the provider's message: {msg}"
+        );
+        assert!(
+            hcore::hmemoizer::downcast_chain_ref::<ProviderBlewUp>(&err).is_some(),
+            "typed downcast must survive the context wrap: {msg}"
         );
         Ok(())
     }
