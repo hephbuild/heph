@@ -41,6 +41,8 @@ mod local_cache_sqlite;
 mod local_cache_tmp;
 mod packages;
 mod remote_cache;
+mod states;
+pub use states::{PackageStates, StatesOptions};
 mod remote_cache_latency;
 mod remote_cache_objstore;
 pub use hplugin::provider;
