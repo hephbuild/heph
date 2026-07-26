@@ -49,6 +49,15 @@ struct TargetDef {
     /// not invalidate the cache — that's the whole point of `runtime_deps`.
     pub runtime_dep_group_inputs: BTreeMap<String, Vec<Input>>,
     pub tool_group_inputs: BTreeMap<String, Vec<Input>>,
+    /// Declared outputs (`out`), normalized and keyed by group. Folded into
+    /// the def hash: the paths are wired into `$OUT`/`$OUT_<group>` and decide
+    /// what the sandbox captures, so changing them is a semantic change to the
+    /// target. Kept as a BTreeMap so the hash does not depend on `spec.outputs`
+    /// HashMap iteration order.
+    pub outputs: BTreeMap<String, Vec<Path>>,
+    /// Declared `support_files`, normalized. Hashed for the same reason as
+    /// `outputs` — they are packed into the target's artifact set.
+    pub support_files: Vec<Path>,
     pub env: BTreeMap<String, String>,
     pub pass_env: BTreeMap<String, String>,
     pub runtime_pass_env: Vec<String>,
@@ -63,6 +72,8 @@ impl Hash for TargetDef {
         // runtime_dep_group_inputs intentionally excluded — runtime_deps
         // (and runtime-only transitives) must not affect the cache key.
         self.tool_group_inputs.hash(state);
+        self.outputs.hash(state);
+        self.support_files.hash(state);
         self.env.hash(state);
         self.pass_env.hash(state);
         // runtime_pass_env and runtime_env intentionally excluded
@@ -602,11 +613,34 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 .collect()
         };
 
+        // Built before the def hash — `outputs` and `support_files` are part of
+        // the hashed def, so they have to exist by the time we hash it.
+        let output_groups = spec
+            .outputs
+            .iter()
+            .map(|(k, v)| {
+                Ok((
+                    k.clone(),
+                    v.iter()
+                        .map(|p| spec_path_to_target_path(p, &pkg, &spec.codegen))
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                ))
+            })
+            .collect::<anyhow::Result<BTreeMap<String, Vec<Path>>>>()?;
+
+        let support_files = spec
+            .support_files
+            .iter()
+            .map(|p| spec_path_to_target_path(p, &pkg, &CodegenMode::None))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         let def = TargetDef {
             run: spec.run,
             dep_group_inputs,
             runtime_dep_group_inputs,
             tool_group_inputs,
+            outputs: output_groups,
+            support_files: support_files.clone(),
             env: spec.env.into_iter().collect(),
             pass_env,
             runtime_pass_env: spec.runtime_pass_env,
@@ -622,25 +656,14 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             format!("{:x}", h.finish()).into_bytes()
         };
 
-        let outputs = spec
+        let outputs = def
             .outputs
             .iter()
-            .map(|(k, v)| {
-                Ok(Output {
-                    group: k.clone(),
-                    paths: v
-                        .iter()
-                        .map(|p| spec_path_to_target_path(p, &pkg, &spec.codegen))
-                        .collect::<anyhow::Result<Vec<_>>>()?,
-                })
+            .map(|(group, paths)| Output {
+                group: group.clone(),
+                paths: paths.clone(),
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let support_files = spec
-            .support_files
-            .iter()
-            .map(|p| spec_path_to_target_path(p, &pkg, &CodegenMode::None))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
         Ok(ParseResponse {
             target_def: EngineTargetDef {
@@ -1701,6 +1724,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -1752,6 +1777,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -1809,6 +1836,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -1877,6 +1906,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -1940,6 +1971,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -2002,6 +2035,8 @@ mod tests {
                 pass_env,
                 runtime_pass_env,
                 runtime_env,
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -2429,6 +2464,159 @@ mod tests {
         Ok(())
     }
 
+    /// Builds an `out` config value: `{group: [paths...]}`.
+    fn out_value(groups: &[(&str, &[&str])]) -> hcore::htvalue::Value {
+        hcore::htvalue::Value::Map(
+            groups
+                .iter()
+                .map(|(g, paths)| {
+                    (
+                        g.to_string(),
+                        hcore::htvalue::Value::List(
+                            paths
+                                .iter()
+                                .map(|p| hcore::htvalue::Value::String(p.to_string()))
+                                .collect(),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_parse_out_path_change_def_hash() -> anyhow::Result<()> {
+        // Renaming a declared output inside an existing group must invalidate
+        // the def hash. The group name is unchanged, so the cache manifest
+        // still has a blob for it — without the outputs in the hash this is a
+        // stale hit that serves the previously captured artifact and never
+        // reruns the target.
+        let with_a = parse_with(HashMap::from([(
+            "out".to_string(),
+            out_value(&[("", &["a.txt"])]),
+        )]))
+        .await?;
+        let with_b = parse_with(HashMap::from([(
+            "out".to_string(),
+            out_value(&[("", &["b.txt"])]),
+        )]))
+        .await?;
+        assert_ne!(with_a.hash, with_b.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_out_added_changes_def_hash() -> anyhow::Result<()> {
+        // Declaring an output where there was none must change the def hash.
+        let base = parse_with(HashMap::new()).await?;
+        let with_out = parse_with(HashMap::from([(
+            "out".to_string(),
+            out_value(&[("", &["a.txt"])]),
+        )]))
+        .await?;
+        assert_ne!(base.hash, with_out.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_out_group_rename_changes_def_hash() -> anyhow::Result<()> {
+        // Same paths under a different group name — the group is what `$OUT_*`
+        // and the cache manifest are keyed on, so it must be hashed too.
+        let g1 = parse_with(HashMap::from([(
+            "out".to_string(),
+            out_value(&[("g1", &["a.txt"])]),
+        )]))
+        .await?;
+        let g2 = parse_with(HashMap::from([(
+            "out".to_string(),
+            out_value(&[("g2", &["a.txt"])]),
+        )]))
+        .await?;
+        assert_ne!(g1.hash, g2.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_out_hash_stable_across_group_order() -> anyhow::Result<()> {
+        // `spec.outputs` is a HashMap: two parses of the same spec can iterate
+        // its groups in different orders. The def hash must not depend on that,
+        // or identical targets thrash the cache between runs.
+        let groups: &[(&str, &[&str])] = &[
+            ("a", &["a.txt"]),
+            ("b", &["b.txt"]),
+            ("c", &["c.txt"]),
+            ("d", &["d.txt"]),
+            ("e", &["e.txt"]),
+            ("f", &["f.txt"]),
+            ("g", &["g.txt"]),
+            ("h", &["h.txt"]),
+        ];
+        let first = parse_with(HashMap::from([("out".to_string(), out_value(groups))])).await?;
+        for _ in 0..8 {
+            let again = parse_with(HashMap::from([("out".to_string(), out_value(groups))])).await?;
+            assert_eq!(first.hash, again.hash);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_codegen_change_def_hash() -> anyhow::Result<()> {
+        // `codegen` is baked into every output path's `codegen_tree`, and it
+        // decides whether the outputs land back in the tree. Changing it is a
+        // semantic change to the target.
+        let copy = parse_with(HashMap::from([
+            ("out".to_string(), out_value(&[("", &["a.txt"])])),
+            (
+                "codegen".to_string(),
+                hcore::htvalue::Value::String("copy".to_string()),
+            ),
+        ]))
+        .await?;
+        let in_place = parse_with(HashMap::from([
+            ("out".to_string(), out_value(&[("", &["a.txt"])])),
+            (
+                "codegen".to_string(),
+                hcore::htvalue::Value::String("in_place".to_string()),
+            ),
+        ]))
+        .await?;
+        assert_ne!(copy.hash, in_place.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_support_files_change_def_hash() -> anyhow::Result<()> {
+        // support_files are packed into the target's artifact set, so changing
+        // them changes what a cache hit would serve.
+        let with_a = parse_with(HashMap::from([(
+            "support_files".to_string(),
+            hcore::htvalue::Value::List(vec![hcore::htvalue::Value::String("a.txt".to_string())]),
+        )]))
+        .await?;
+        let with_b = parse_with(HashMap::from([(
+            "support_files".to_string(),
+            hcore::htvalue::Value::List(vec![hcore::htvalue::Value::String("b.txt".to_string())]),
+        )]))
+        .await?;
+        assert_ne!(with_a.hash, with_b.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_outputs_reach_engine_target_def() -> anyhow::Result<()> {
+        // The EngineTargetDef outputs are now derived from the hashed def map —
+        // make sure every declared group still reaches the engine.
+        let td = parse_with(HashMap::from([(
+            "out".to_string(),
+            out_value(&[("bin", &["a.txt"]), ("lib", &["b.txt", "c.txt"])]),
+        )]))
+        .await?;
+        let groups: Vec<&str> = td.outputs.iter().map(|o| o.group.as_str()).collect();
+        assert_eq!(groups, vec!["bin", "lib"]);
+        assert_eq!(td.outputs[1].paths.len(), 2);
+        Ok(())
+    }
+
     fn make_tool_binary(
         dir: &std::path::Path,
         name: &str,
@@ -2529,6 +2717,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -2663,6 +2853,8 @@ mod tests {
                 pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -2807,6 +2999,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -2982,6 +3176,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -3065,6 +3261,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -3164,6 +3362,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![],
@@ -3223,6 +3423,8 @@ mod tests {
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
             }),
             inputs: vec![],
             outputs: vec![

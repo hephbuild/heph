@@ -695,14 +695,14 @@ pub mod targetdef {
         use serde::Serialize;
         use std::fmt::Display;
 
-        #[derive(Clone, Debug, Serialize)]
+        #[derive(Clone, Debug, Hash, Serialize)]
         pub struct Path {
             pub content: Content,
             pub codegen_tree: CodegenMode,
             pub collect: bool,
         }
 
-        #[derive(Clone, Debug, Serialize)]
+        #[derive(Clone, Debug, Hash, Serialize)]
         pub enum Content {
             FilePath(String),
             DirPath(String),
@@ -725,7 +725,9 @@ pub mod targetdef {
         /// `#[spec(skip)]` so it is only the absent/null default, never a string.
         ///
         /// [`FromSpecValue`]: crate::htspec::FromSpecValue
-        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, crate::htspec::SpecEnum)]
+        #[derive(
+            Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, crate::htspec::SpecEnum,
+        )]
         pub enum CodegenMode {
             #[default]
             #[spec(skip)]
