@@ -724,10 +724,17 @@ impl ProviderInner {
                         ));
                     }
                     if lint_enabled {
-                        push_names(
-                            &mut addrs,
-                            &["lint-check", "lint", "format-check", "format"],
-                        );
+                        push_names(&mut addrs, &["lint-check", "lint"]);
+                        // Formatting is syntactic, so `format`/`format-check` are
+                        // variant-free (see `VARIANT_FREE_TARGET_NAMES`): one bare
+                        // addr per package, never multiplied across variants.
+                        for name in VARIANT_FREE_TARGET_NAMES {
+                            addrs.push(Addr::new(
+                                req.package.clone(),
+                                (*name).to_string(),
+                                Default::default(),
+                            ));
+                        }
                     }
                     if !skip_tests {
                         push_names(
@@ -850,11 +857,11 @@ fn is_test_target_name(name: &str) -> bool {
 /// other target is a **library / intermediate** (carries `vp`, resolved against
 /// the module universe). Used by `list` to choose the enumeration scope
 /// (ancestry vs universe) per target name.
+///
+/// `format`/`format-check` are deliberately absent: formatting is syntactic, so
+/// they are variant-independent (see [`VARIANT_FREE_TARGET_NAMES`]).
 fn is_entry_target_name(name: &str) -> bool {
-    matches!(
-        name,
-        "build" | "test" | "xtest" | "lint-check" | "lint" | "format-check" | "format"
-    )
+    matches!(name, "build" | "test" | "xtest" | "lint-check" | "lint")
 }
 
 /// **Runnable** test target names — the ones that execute the built test binary
@@ -921,9 +928,24 @@ const GOLIST_TARGET_NAMES: &[&str] = &[
     "lint-check",
     "lint",
     "_lint-analyze",
-    "format-check",
-    "format",
 ];
+
+/// Target names this provider owns that are **variant-free**: they carry no `@v`
+/// / `@vp` and are handled before variant resolution.
+///
+/// Formatting is purely syntactic — gofmt/gofumpt/goimports never look at
+/// `GOOS`/`GOARCH`/build tags — so a per-variant `format` would be three kinds of
+/// wrong: it would silently skip files excluded by the variant's build
+/// constraints (`foo_windows.go` never formatted unless a windows variant is
+/// declared), run N near-identical jobs for N variants, and have several variants
+/// claim the same `codegen = in_place` source paths. So they source their file
+/// list straight off disk (every `*.go` in the package dir) instead of from the
+/// variant-scoped `_golist`.
+///
+/// Linting is *not* in here on purpose: `_lint-analyze` type-checks against
+/// variant-scoped dependency facts, so its results legitimately differ per
+/// variant.
+const VARIANT_FREE_TARGET_NAMES: &[&str] = &["format", "format-check"];
 
 /// Workspace-relative package of heph's own go/analysis unitchecker binary
 /// (`heph-govet`), built as an ordinary `build` (package main) target like any
@@ -954,6 +976,7 @@ fn is_firstparty_pkg(pkg: &str) -> bool {
 fn is_known_go_target_name(name: &str) -> bool {
     SPECIAL_TARGET_NAMES.contains(&name)
         || GOLIST_TARGET_NAMES.contains(&name)
+        || VARIANT_FREE_TARGET_NAMES.contains(&name)
         || TEST_TARGET_NAMES.contains(&name)
 }
 
@@ -1527,6 +1550,16 @@ impl ProviderInner {
         // root); it is unused for the `vp` (library) branch.
         let module_root = module_root_rel(&kind, &self.workspace_root);
 
+        // format / format-check — variant-free (see `VARIANT_FREE_TARGET_NAMES`),
+        // so handle them before variant resolution and source the file list from
+        // disk rather than the variant-scoped `_golist`.
+        if VARIANT_FREE_TARGET_NAMES.contains(&addr.name.as_str()) {
+            return match self.get_format(addr, &kind).map_err(GetError::Other)? {
+                Some(resp) => Ok(resp),
+                None => Err(GetError::NotFound),
+            };
+        }
+
         // Magic host-default `build`: a *truly bare* `//pkg:build` (no addr args at
         // all) is served as a `group` target forwarding to `build@v=<variant>` for
         // the first ancestry variant matching this machine's goos/goarch. It gives
@@ -1807,40 +1840,6 @@ impl ProviderInner {
                     &pkg.go_files,
                     Some(&config_addr),
                 );
-                Ok(GetResponse { target_spec: spec })
-            }
-            // Formatting: `format-check` is the gate (fails on unformatted files),
-            // `format` rewrites the sources in place (codegen). Both run the
-            // heph-govet `-format` mode; neither needs facts or dep archives.
-            "format-check" | "format" => {
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                // Format only where the module opts in with a golangci config
-                // (the same gate as lint); the config also carries formatter
-                // settings (gofumpt/goimports).
-                let config_addr = match self.golangci_config_addr(&module_root) {
-                    Some(a) => a,
-                    None => return Err(GetError::NotFound),
-                };
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
-                let config_addr = Some(config_addr);
-                let params = crate::plugingo::driver_format::FormatParams {
-                    addr: addr.clone(),
-                    govet_addr: &govet_addr,
-                    src_addrs: &pkg_addrs.go_files,
-                    go_files: &pkg.go_files,
-                    config_addr: config_addr.as_ref(),
-                };
-                let spec = if addr.name == "format" {
-                    crate::plugingo::driver_format::build_format_spec(params)
-                } else {
-                    crate::plugingo::driver_format::build_format_check_spec(params)
-                };
                 Ok(GetResponse { target_spec: spec })
             }
             // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
@@ -2696,6 +2695,117 @@ impl ProviderInner {
         Addr::new(package.clone(), name.to_string(), vref.to_args())
     }
 
+    /// Spec for the variant-free `format` / `format-check` targets. `Ok(None)`
+    /// means "no such target here" (the caller maps it to `NotFound`).
+    ///
+    /// Formatting is syntactic, so this deliberately does **not** go through
+    /// `_golist`: `go list` reports only the `GoFiles` the current
+    /// `GOOS`/`GOARCH`/`-tags` select, which would leave every
+    /// constraint-excluded file (`foo_windows.go` on a linux-only workspace) and
+    /// every `_test.go` file permanently unformatted. Reading the package
+    /// directory instead formats exactly what a developer sees in it.
+    fn get_format(&self, addr: &Addr, kind: &GoPackageKind) -> anyhow::Result<Option<GetResponse>> {
+        // `format` is listed for first-party packages only — stdlib/thirdparty
+        // sources are vendored, not ours to rewrite.
+        let GoPackageKind::FirstParty { module_root, .. } = kind else {
+            return Ok(None);
+        };
+
+        // No variant to select. Reject args rather than ignore them, so a stale
+        // `format@v=NAME` is an actionable error instead of silently doing
+        // something else.
+        if let Some(bad) = addr.args.keys().next() {
+            anyhow::bail!(
+                "unknown addr arg `{bad}` on go target `:{}` — formatting is \
+                 syntactic and therefore variant-free; use a bare `:{}`",
+                addr.name,
+                addr.name,
+            );
+        }
+
+        // Format only where the module opts in with a golangci config (the same
+        // gate as lint); the config also carries formatter settings
+        // (gofumpt/goimports).
+        let Some(config_addr) = self.golangci_config_addr(module_root) else {
+            return Ok(None);
+        };
+
+        let go_files = self.package_go_files_on_disk(addr.package.as_str())?;
+        if go_files.is_empty() {
+            return Ok(None);
+        }
+        let src_addrs: Vec<String> = go_files
+            .iter()
+            .map(|f| {
+                let rel = if addr.package.as_str().is_empty() {
+                    f.clone()
+                } else {
+                    format!("{}/{}", addr.package.as_str(), f)
+                };
+                pluginfs::file_addr(&rel).format()
+            })
+            .collect();
+
+        let govet_addr = self.govet_tool_addr()?;
+        let params = crate::plugingo::driver_format::FormatParams {
+            addr: addr.clone(),
+            govet_addr: &govet_addr,
+            src_addrs: &src_addrs,
+            go_files: &go_files,
+            config_addr: Some(&config_addr),
+        };
+        let target_spec = if addr.name == "format" {
+            crate::plugingo::driver_format::build_format_spec(params)
+        } else {
+            crate::plugingo::driver_format::build_format_check_spec(params)
+        };
+        Ok(Some(GetResponse { target_spec }))
+    }
+
+    /// Every `.go` file directly in `pkg`'s directory, sorted, as basenames.
+    ///
+    /// Build constraints are deliberately not applied — see [`Self::get_format`].
+    /// Codegen-stamped files are skipped: they are owned by their generator (an
+    /// `fs:file` over one resolves to nothing anyway), and declaring one as a
+    /// `codegen = in_place` output of `format` would collide with the generator's
+    /// own output. Files reached through a `.heph*` cache dir are skipped for the
+    /// same reason they are in the fs provider — they are engine artifacts, not
+    /// source.
+    fn package_go_files_on_disk(&self, pkg: &str) -> anyhow::Result<Vec<String>> {
+        let dir = if pkg.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(pkg)
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("read go pkg dir {dir:?}"))),
+        };
+        let mut files: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read go pkg dir entry in {dir:?}"))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".go") {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            if pluginfs::has_codegen_xattr(&path) || pluginfs::resolves_into_heph_dir(&path) {
+                continue;
+            }
+            files.push(name.to_string());
+        }
+        // `read_dir` order is filesystem-defined; sort so the spec (and therefore
+        // the target's input hash) is reproducible.
+        files.sort();
+        Ok(files)
+    }
+
     /// The addr of the module's golangci-lint config, if the module root (the
     /// `go.mod` directory) holds one. Lint/format targets exist ONLY for modules
     /// that have such a config — the presence of a `.golangci.yml`/`.golangci.yaml`
@@ -3520,6 +3630,12 @@ mod tests {
         )
     }
 
+    /// Addr with no variant args — for the variant-free targets
+    /// (`format`/`format-check`, `download`, `_go_mod`).
+    fn make_bare_addr(package: &str, name: &str) -> Addr {
+        Addr::new(PkgBuf::from(package), name.to_string(), Default::default())
+    }
+
     /// A root `provider_state(provider="go", variants={"host": {goos, goarch}})`
     /// defining the default `host` variant every test target resolves against.
     fn host_variant_state() -> State {
@@ -3630,14 +3746,13 @@ mod tests {
         enable_golangci(sandbox.path());
         // Default `govet` — i.e. the dev build's (nonexistent) release target.
         let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
-        for name in [
-            "_lint-analyze",
-            "lint-check",
-            "lint",
-            "format-check",
-            "format",
-        ] {
+        for name in ["_lint-analyze", "lint-check", "lint"] {
             provider_get(&p, make_addr("cmd", name))
+                .await
+                .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
+        }
+        for name in ["format-check", "format"] {
+            provider_get(&p, make_bare_addr("cmd", name))
                 .await
                 .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
         }
@@ -4178,7 +4293,13 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
 
         for name in ["_lint-analyze", "format-check", "format"] {
-            let resp = provider_get(&p, make_addr("cmd", name)).await.unwrap();
+            // Formatting is variant-free; lint is not.
+            let addr = if name.starts_with("format") {
+                make_bare_addr("cmd", name)
+            } else {
+                make_addr("cmd", name)
+            };
+            let resp = provider_get(&p, addr).await.unwrap();
             let deps = match resp.target_spec.config.get("deps").unwrap() {
                 Value::Map(m) => m,
                 other => panic!("{name}: expected deps map, got {other:?}"),
@@ -4276,7 +4397,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         enable_golangci(sandbox.path());
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
-        let check = provider_get(&p, make_addr("cmd", "format-check"))
+        let check = provider_get(&p, make_bare_addr("cmd", "format-check"))
             .await
             .unwrap();
         assert_eq!(check.target_spec.driver, "go_format_check");
@@ -4285,7 +4406,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "check gate declares no outputs"
         );
 
-        let fix = provider_get(&p, make_addr("cmd", "format")).await.unwrap();
+        let fix = provider_get(&p, make_bare_addr("cmd", "format"))
+            .await
+            .unwrap();
         assert_eq!(fix.target_spec.driver, "go_format");
         // Stages the heph-govet tool + the package's own sources.
         let deps = match fix.target_spec.config.get("deps").unwrap() {
@@ -4300,6 +4423,140 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             fix.target_spec.config.get("out").is_some(),
             "fix declares in_place outputs"
+        );
+    }
+
+    /// Formatting is syntactic: it must cover every `.go` file in the package,
+    /// including the ones the current variant's build constraints exclude.
+    /// Sourcing the list from `_golist` (i.e. `go list`'s `GoFiles`) left
+    /// `foo_windows.go` unformatted forever on a workspace with no windows
+    /// variant — and `_test.go` files unformatted everywhere.
+    #[tokio::test]
+    async fn test_format_covers_constraint_excluded_and_test_files() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        // Neither of these is in `go list`'s GoFiles for the host variant: the
+        // first is excluded by its filename build constraint (no test host is
+        // both windows and plan9), the second is a test file.
+        let pkg_dir = sandbox.path().join("cmd");
+        std::fs::write(
+            pkg_dir.join("only_windows.go"),
+            "//go:build windows && plan9\n\npackage main\n",
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("main_test.go"), "package main\n").unwrap();
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let fix = provider_get(&p, make_bare_addr("cmd", "format"))
+            .await
+            .unwrap();
+        let out = match fix.target_spec.config.get("out").expect("out") {
+            Value::Map(m) => match m.iter().find(|(k, _)| *k == "src").map(|(_, v)| v) {
+                Some(Value::List(l)) => l
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => panic!("out entry not a string: {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                other => panic!("src group missing: {other:?}"),
+            },
+            other => panic!("out not a map: {other:?}"),
+        };
+        for expected in ["only_windows.go", "main_test.go", "main.go"] {
+            assert!(
+                out.iter().any(|f| f == expected),
+                "{expected} must be formatted: {out:?}"
+            );
+        }
+    }
+
+    /// `format`/`format-check` carry no variant, so `list` emits exactly one bare
+    /// addr each no matter how many variants a module declares — while `lint`
+    /// (whose analysis genuinely depends on the variant) is still emitted per
+    /// variant.
+    #[tokio::test]
+    async fn list_emits_format_once_and_variant_free() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        // Two variants in ancestry: `host` (so runnable targets list) and a
+        // second, cross-compiled one.
+        let cross = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String("linux".into())),
+            ("goarch".to_string(), Value::String("arm64".into())),
+        ]));
+        let host = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String(current_goarch())),
+        ]));
+        let states = vec![State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([
+                    ("host".to_string(), host),
+                    ("cross".to_string(), cross),
+                ])),
+            )]),
+        }];
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from("cmd"),
+            states,
+            executor: test_executor(&p.inner.workspace_root),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        for name in ["format", "format-check"] {
+            let listed: Vec<&Addr> = addrs.iter().filter(|a| a.name == name).collect();
+            assert_eq!(
+                listed.len(),
+                1,
+                "{name} must be listed once, not per variant: {listed:?}"
+            );
+            assert!(
+                listed[0].args.is_empty(),
+                "{name} must carry no variant args: {:?}",
+                listed[0]
+            );
+        }
+        // Lint is the contrast: its analysis is variant-scoped, so it stays
+        // multiplied across the declared variants.
+        assert_eq!(
+            addrs.iter().filter(|a| a.name == "lint-check").count(),
+            2,
+            "lint-check must still be listed per variant: {addrs:?}"
+        );
+    }
+
+    /// A stale `format@v=NAME` (e.g. carried over from when formatting was
+    /// variant-parameterized) must fail loudly, not silently format something
+    /// else.
+    #[tokio::test]
+    async fn test_format_rejects_a_variant_arg() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let msg = match provider_get(&p, make_addr("cmd", "format")).await {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(other) => panic!("expected a typed error, got {other:?}"),
+            Ok(_) => panic!("a variant arg on format must be rejected"),
+        };
+        assert!(
+            msg.contains("variant-free") && msg.contains("`v`"),
+            "error must explain formatting is variant-free: {msg}"
         );
     }
 
@@ -4320,11 +4577,14 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "format-check",
             "format",
         ] {
+            // Formatting is variant-free; lint is not.
+            let addr = if name.starts_with("format") {
+                make_bare_addr("cmd", name)
+            } else {
+                make_addr("cmd", name)
+            };
             assert!(
-                matches!(
-                    provider_get(&p, make_addr("cmd", name)).await,
-                    Err(GetError::NotFound)
-                ),
+                matches!(provider_get(&p, addr).await, Err(GetError::NotFound)),
                 "{name} must be NotFound without a golangci config"
             );
         }
