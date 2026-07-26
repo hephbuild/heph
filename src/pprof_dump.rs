@@ -55,23 +55,32 @@ const SAMPLE_HZ: libc::c_int = 199;
 /// `libsystem` does not match. Both spellings are listed for that reason, and
 /// [`tests::blocklist_covers_the_c_library_but_not_the_main_binary`] fails if any
 /// platform's C library stops being covered.
+///
+/// Entries are anchored (`libc.so`, not `libc`) because the match is a bare
+/// substring and over-blocking is the quieter failure of the two: an unanchored
+/// `libc` also swallows `libc++abi`, `libcharset`, `libcorecrypto` — and
+/// `libcrypto`/`libcurl` the day a dependency links them. Those samples would
+/// then vanish from every profile with nothing to indicate it, which for a
+/// profiler pointed at a network stall drops exactly the frames worth having.
 const UNWIND_BLOCKLIST: &[&str] = &[
-    "libc",
-    "libgcc",
+    // Linux/glibc.
+    "libc.so",
+    "libgcc_s",
     "libunwind",
-    "pthread",
+    "libpthread",
     "ld-linux",
-    "ld.so",
     "vdso",
     // macOS. Both cases: `libSystem.B.dylib` and `libsystem_c.dylib` both exist.
     "libsystem",
     "libSystem",
+    "libc.dylib",
     "libdyld",
     // GCD frames are their own unwind hazard on Darwin.
     "libdispatch",
 ];
 
 /// Handle to the running pprof watcher thread.
+#[derive(Debug)]
 pub struct Watcher {
     handle: JoinHandle<()>,
 }
@@ -107,8 +116,10 @@ pub fn start(path: PathBuf) -> anyhow::Result<Watcher> {
     let guard = pprof::ProfilerGuardBuilder::default()
         .frequency(SAMPLE_HZ)
         .blocklist(UNWIND_BLOCKLIST)
+        // `pprof::Error` wraps `nix`/`io` errors, so keep it as a source rather
+        // than stringifying it away.
         .build()
-        .map_err(|e| anyhow::anyhow!("start CPU profiler: {e}"))?;
+        .context("start CPU profiler")?;
     install_signal();
     Ok(Watcher {
         handle: spawn_watcher(guard, path),
@@ -275,7 +286,7 @@ mod tests {
             })
             .collect();
         for h in handles {
-            drop(h.join());
+            h.join().expect("burn thread must not panic");
         }
     }
 
@@ -409,6 +420,12 @@ mod tests {
     /// than the bug: an over-broad [`UNWIND_BLOCKLIST`] (one matching the main
     /// binary) would drop every sample and leave `--pprof-cpu` writing empty
     /// profiles forever, crashing nothing and telling no one.
+    ///
+    /// **Only one test in this binary may call [`start`].** pprof's `PROFILER` is
+    /// a process singleton: a concurrent second `start` fails with
+    /// `Error::Running`, and a sequential one would silently profile under the
+    /// previous run's state. The deterministic properties are asserted by the
+    /// sampler-free tests below precisely so this stays the only one.
     #[test]
     fn sampling_a_busy_process_yields_a_profile_without_crashing() {
         let dir = tempfile::tempdir().expect("tempdir");
