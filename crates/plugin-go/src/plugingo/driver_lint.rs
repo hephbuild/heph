@@ -52,6 +52,22 @@ use xxhash_rust::xxh3::Xxh3Default;
 const LINT_FACTS: &str = "lint.facts";
 const LINT_REPORT: &str = "lint-report.json";
 
+/// Per-input `unpack_root` for the `report` dep group.
+///
+/// The gate and the fixer consume one `_lint-analyze` report **per variant**, and
+/// every one of those targets lives in the *same package* and names its output
+/// `lint-report.json` — so they all resolve to the same sandbox path and
+/// `detect_output_collisions` (correctly) rejects the target. Give each report
+/// its own unpack root so they land side by side instead. Both drivers read the
+/// staged paths out of the per-input list file, so where they land is immaterial
+/// to them.
+///
+/// (The `facts_*` groups don't need this: those reports come from *different*
+/// packages, so their paths already differ.)
+fn report_unpack_root(i: usize) -> String {
+    format!("lint_report_{i}")
+}
+
 /// Dep group carrying the `heph-govet` unitchecker binary.
 const GOVET_TOOL_GROUP: &str = "govet_tool";
 
@@ -708,7 +724,15 @@ impl ManagedDriver for GoLintGateDriver {
                         .with_context(|| format!("parse dep addr {addr_str}"))?,
                     mode: InputMode::Standard,
                     origin_id: format!("dep|{group}|{i}"),
-                    annotations: BTreeMap::new(),
+                    // One unpack root per report: every variant's analyze target
+                    // is in this same package and emits `lint-report.json`, so
+                    // they would otherwise all claim one sandbox path (see
+                    // `report_unpack_root`).
+                    annotations: if group.as_str() == "report" {
+                        BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
+                    } else {
+                        BTreeMap::new()
+                    },
                     hashed: true,
                     // The golangci config is a hash-only input: it re-keys the
                     // target on any `.golangci.yml` change without staging the
@@ -1049,7 +1073,15 @@ impl ManagedDriver for GoLintFixDriver {
                         .with_context(|| format!("parse dep addr {addr_str}"))?,
                     mode: InputMode::Standard,
                     origin_id: format!("dep|{group}|{i}"),
-                    annotations: BTreeMap::new(),
+                    // One unpack root per report: every variant's analyze target
+                    // is in this same package and emits `lint-report.json`, so
+                    // they would otherwise all claim one sandbox path (see
+                    // `report_unpack_root`).
+                    annotations: if group.as_str() == "report" {
+                        BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
+                    } else {
+                        BTreeMap::new()
+                    },
                     hashed: true,
                     // The golangci config is a hash-only input: it re-keys the
                     // target on any `.golangci.yml` change without staging the
@@ -1868,6 +1900,85 @@ mod tests {
         let a = edits.get("a.go").unwrap();
         assert_eq!(a.len(), 1, "only the first fix's edits are taken");
         assert_eq!(a[0].new, "A");
+    }
+
+    /// Every variant's `_lint-analyze` sits in the *same package* and names its
+    /// output `lint-report.json`. Staged into one root they would all claim the
+    /// same sandbox path and `detect_output_collisions` would reject the target
+    /// ("lint-report.json is produced by two different targets"), so each report
+    /// input must carry its own `unpack_root`.
+    #[tokio::test]
+    async fn per_variant_reports_get_distinct_unpack_roots() {
+        let analyze: Vec<Addr> = ["host", "win"]
+            .iter()
+            .map(|v| {
+                Addr::new(
+                    PkgBuf::from("mylib"),
+                    "_lint-analyze".to_string(),
+                    std::collections::BTreeMap::from([
+                        ("v".to_string(), (*v).to_string()),
+                        ("vp".to_string(), String::new()),
+                    ]),
+                )
+            })
+            .collect();
+        let token = hcore::hasync::StdCancellationToken::new();
+
+        let gate = GoLintGateDriver
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: Arc::new(build_lint_gate_spec(addr("lint-check"), &analyze, None)),
+                },
+                &token,
+            )
+            .await
+            .unwrap();
+        let fix = GoLintFixDriver::new()
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: Arc::new(build_lint_fix_spec(
+                        addr("lint"),
+                        &analyze,
+                        &["//mylib:a.go".to_string()],
+                        &["a.go".to_string()],
+                        None,
+                    )),
+                },
+                &token,
+            )
+            .await
+            .unwrap();
+
+        for (what, def) in [("gate", &gate.target_def), ("fix", &fix.target_def)] {
+            let roots: Vec<&String> = def
+                .inputs
+                .iter()
+                .filter(|i| i.origin_id.starts_with("dep|report|"))
+                .map(|i| {
+                    i.annotations
+                        .get("unpack_root")
+                        .unwrap_or_else(|| panic!("{what}: report input has no unpack_root"))
+                })
+                .collect();
+            assert_eq!(roots.len(), 2, "{what}: one input per variant report");
+            assert_ne!(
+                roots[0], roots[1],
+                "{what}: two same-package reports must not share an unpack root"
+            );
+        }
+
+        // The fixer's sources stay at the workspace root — they are its
+        // `codegen = in_place` outputs and must land where the tree expects them.
+        assert!(
+            fix.target_def
+                .inputs
+                .iter()
+                .filter(|i| i.origin_id.starts_with("dep||"))
+                .all(|i| !i.annotations.contains_key("unpack_root")),
+            "fixer sources must not be relocated"
+        );
     }
 
     // The gate is the union across variants: a finding only one variant's build
