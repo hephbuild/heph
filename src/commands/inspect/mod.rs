@@ -6,6 +6,7 @@ mod hashin;
 mod hashout;
 mod labels;
 mod packages;
+mod path;
 mod revdeps;
 mod spec;
 
@@ -106,6 +107,26 @@ pub enum InspectCommands {
     ///
     /// `heph inspect revdeps //lib:core --scope //cmd/...`
     Revdeps(revdeps::Args),
+    /// Print the chain of targets linking two targets
+    ///
+    /// Prints the shortest chain of hops linking A and B, one target per line.
+    /// Argument order does not matter: both directions are searched, and the
+    /// chain is printed from the dependent to the dependency. Hops follow each
+    /// target's resolved deps, so a dep pulled in by another dep's transitives
+    /// counts; pass --no-transitive to follow only the directly declared ones.
+    /// When the two are unconnected, nothing is printed on stdout — the reason
+    /// is logged instead.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect path //cmd/server:bin //lib:core`
+    ///
+    /// `heph inspect path //lib:core //cmd/server:bin` — same chain
+    ///
+    /// `heph inspect path //cmd/server:bin main.go`
+    ///
+    /// `heph inspect path //cmd/server:bin //lib:core --no-transitive`
+    Path(path::Args),
     /// List provider-exposed functions (`heph.<provider>.<fn>`)
     ///
     /// Prints every function registered by a provider for use in BUILD files,
@@ -136,6 +157,7 @@ impl InspectCommands {
             InspectCommands::Def(args) => def::execute(args, sink, global),
             InspectCommands::Deps(args) => deps::execute(args, sink, global),
             InspectCommands::Revdeps(args) => revdeps::execute(args, sink, global),
+            InspectCommands::Path(args) => path::execute(args, sink, global),
             InspectCommands::Functions(args) => functions::execute(args, sink, global),
         }
     }
