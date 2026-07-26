@@ -1327,17 +1327,26 @@ impl Engine {
             }
         };
 
+        // Guard the write-back against a tree that moved under us — an in_place
+        // target is about to overwrite the very files it hashed as inputs.
+        self.clone().check_in_place_inputs_unchanged(opts).await?;
         // Codegen tree write-back: is_top-gated, idempotent, runs on every path
         // (a cache hit on an in_place fmt must still materialize). Uses this
         // caller's `cached`, so the is_top requester must have asked for the
         // codegen output groups — exactly as before the single-flight split.
-        self.materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
+        let wrote = self
+            .materialize_codegen(opts.is_top, opts.def, &cached, opts.frozen)
             .await?;
         // Fixpoint registration only on the cacheable path (force/shell never
         // cache a fixpoint). Idempotent across hit/miss; a no-op unless this is a
-        // top-level in_place codegen target whose tree just moved.
+        // top-level in_place codegen target whose tree just moved — and when the
+        // write-back moved nothing, the guard above already established that the
+        // tree hashes to `opts.hashin`, so the fixpoint would recompute that same
+        // key and early-return. Skip it and save a full input re-hash on the
+        // steady-state path (an already-formatted tree), where it is the common
+        // case.
         let can_cache = !opts.force && opts.def.target.cache.enabled && !opts.shell;
-        if can_cache {
+        if can_cache && wrote {
             self.clone().maybe_store_fixpoint(&rs, opts).await?;
         }
 
@@ -1683,13 +1692,13 @@ impl Engine {
         def: &LinkedTargetDef,
         cached: &[ResultArtifact],
         frozen: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
         // Gate: only the top-level requested target writes its tree back, and
         // only when it actually declares a codegen output path.
         if !is_top {
-            return Ok(());
+            return Ok(false);
         }
         let has_codegen = def.target.outputs.iter().any(|o| {
             o.paths
@@ -1697,9 +1706,15 @@ impl Engine {
                 .any(|p| !matches!(p.codegen_tree, CodegenMode::None))
         });
         if !has_codegen {
-            return Ok(());
+            return Ok(false);
         }
 
+        // Whether anything about the tree actually moved. Content writes, exec-bit
+        // reconciles and symlink recreates all count; the codegen xattr does not
+        // (it is metadata, outside the `@heph/fs` content+exec-bit hash). `false`
+        // therefore means the tree still hashes exactly as it did before this
+        // call — which is what lets the caller skip the fixpoint recompute.
+        let mut wrote = false;
         let root = &self.cfg.root;
         let mut frozen_diff = String::new();
 
@@ -1854,6 +1869,7 @@ impl Engine {
                                 }
                                 std::fs::write(&dest, &new_bytes)
                                     .with_context(|| format!("write codegen file {:?}", dest))?;
+                                wrote = true;
                             }
                             // The exec bit is part of the `@heph/fs` (content,
                             // exec-bit) input hash, so reconcile it to the
@@ -1878,6 +1894,7 @@ impl Engine {
                                         .with_context(
                                             || format!("reconcile exec bit on {:?}", dest),
                                         )?;
+                                        wrote = true;
                                     }
                                 }
                             }
@@ -1917,6 +1934,7 @@ impl Engine {
                                     std::os::unix::fs::symlink(&target, &dest).with_context(
                                         || format!("symlink {:?} -> {:?}", dest, target),
                                     )?;
+                                    wrote = true;
                                 }
                                 // Stamp Copy symlink outputs too, so a later fs
                                 // glob excludes them like regular Copy files.
@@ -1937,7 +1955,7 @@ impl Engine {
             }));
         }
 
-        Ok(())
+        Ok(wrote)
     }
 
     // Memoized by addr:hashin — at most one execute+cache cycle runs per target per request,
@@ -2100,6 +2118,72 @@ impl Engine {
             )
             .await
             .map_err(unwrap_arc_err)
+    }
+
+    /// Refuse to write an in_place target's tree back when the sources moved
+    /// under it.
+    ///
+    /// An in_place target (a formatter, a lint fixer) rewrites the very files it
+    /// took as inputs, and the rewrite is derived from the bytes those inputs
+    /// held when the run hashed them. Everything between that hash and this
+    /// write-back — resolving deps, staging, executing, reading the cache — is a
+    /// window in which the tree can move: an editor save, a `git checkout`, a
+    /// concurrent run. `materialize_codegen` writes unconditionally, so without
+    /// this check the newer bytes are silently replaced by (stale bytes +
+    /// transform), with no error and no diff.
+    ///
+    /// Recomputing the target's `hashin` against the *current* tree on a fresh
+    /// request re-reads the `@heph/fs` inputs (cache-off, memoized per request),
+    /// so an unchanged tree reproduces this run's `hashin` exactly — the same
+    /// property [`Self::maybe_store_fixpoint`] relies on after the write. Any
+    /// difference means an input this target is about to overwrite is no longer
+    /// what it transformed.
+    ///
+    /// Gated exactly like the write-back it guards: top-level only (nothing else
+    /// writes), in_place only (nothing else overwrites its own inputs), and never
+    /// on a frozen run (which writes nothing at all).
+    ///
+    /// A failure to recompute is *not* waved through: not being able to confirm
+    /// the tree is precisely the case where overwriting it is unsafe.
+    async fn check_in_place_inputs_unchanged(
+        self: Arc<Self>,
+        opts: &ExecuteOptions<'_>,
+    ) -> anyhow::Result<()> {
+        use crate::engine::driver::targetdef::path::CodegenMode;
+
+        if opts.frozen || !opts.is_top {
+            return Ok(());
+        }
+        let is_in_place = opts.def.target.outputs.iter().any(|o| {
+            o.paths
+                .iter()
+                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
+        });
+        if !is_in_place {
+            return Ok(());
+        }
+
+        let addr = &opts.def.target.addr;
+        let current = Arc::clone(&self)
+            .meta(self.new_state(), addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "re-reading the sources of {addr} to confirm they still match what it \
+                     transformed, before writing its in-place output back over them"
+                )
+            })?
+            .hashin;
+        if current != *opts.hashin {
+            anyhow::bail!(
+                "{addr} rewrites its own sources in place, and they changed while it ran \
+                 (input hash {} → {current}). Its output was computed from the older bytes, \
+                 so writing it back would discard the newer ones — nothing was written. \
+                 Re-run once the tree is settled.",
+                opts.hashin,
+            );
+        }
+        Ok(())
     }
 
     /// Register the just-executed in_place target's cache entry under the key a
