@@ -3557,6 +3557,19 @@ mod tests {
         async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
+        /// Also still advertised — the presence check lists the revision, and the
+        /// seeded `file://` tree really does hold every object. Only `open_read`
+        /// lies, which is the point: the loss is discovered mid-read.
+        async fn list_names(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            let dir = self.root.join(prefix);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                return Ok(Vec::new());
+            };
+            Ok(entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect())
+        }
     }
 
     /// A revision the remote advertised but cannot actually serve must rebuild the

@@ -57,12 +57,47 @@ pub async fn run<A: App>(
 
     view.finish();
 
-    // Block return until background sandbox cleanups have drained. No TUI to
-    // keep alive here, but the process must not exit out from under the cleaner
-    // thread mid-rmdir. Poll cheaply — cleanups are short rmdirs.
+    // Block return until background work has drained: sandbox cleanups (the
+    // process must not exit out from under the cleaner thread mid-rmdir) and
+    // remote-cache uploads (a cold run's whole point is to populate the cache, so
+    // we never abandon a push that is still making progress — each one carries its
+    // own deadline).
+    //
+    // Report while waiting. There is no TUI here, so a silent poll makes a long
+    // drain indistinguishable from a hang: the run prints its summary and then the
+    // process just sits there. Saying what is outstanding, and that the count is
+    // going down, is the difference between "uploading 400 revisions" and "heph is
+    // wedged".
+    let started = std::time::Instant::now();
+    let mut next_report = started + DRAIN_REPORT_EVERY;
+    let mut announced = false;
     while bg_pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(DRAIN_POLL).await;
+        if std::time::Instant::now() >= next_report {
+            next_report += DRAIN_REPORT_EVERY;
+            tracing::info!(
+                pending = bg_pending.load(std::sync::atomic::Ordering::Acquire),
+                elapsed_secs = started.elapsed().as_secs(),
+                "waiting for background cache uploads and sandbox cleanup to finish",
+            );
+            announced = true;
+        }
+    }
+    if announced {
+        tracing::info!(
+            elapsed_secs = started.elapsed().as_secs(),
+            "background work drained",
+        );
     }
 
     result
 }
+
+/// Poll interval for the background-work drain. Short because most runs drain
+/// almost immediately — cleanups are brief rmdirs.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How often the drain reports what it is still waiting on. Long enough that a
+/// normal run says nothing at all, short enough that a slow drain never looks like
+/// a hang.
+const DRAIN_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
