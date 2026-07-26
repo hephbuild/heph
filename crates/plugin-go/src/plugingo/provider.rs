@@ -724,11 +724,18 @@ impl ProviderInner {
                         ));
                     }
                     if lint_enabled {
-                        push_names(&mut addrs, &["lint-check", "lint"]);
-                        // Formatting is syntactic, so `format`/`format-check` are
-                        // variant-free (see `VARIANT_FREE_TARGET_NAMES`): one bare
-                        // addr per package, never multiplied across variants.
-                        for name in VARIANT_FREE_TARGET_NAMES {
+                        // One bare addr per package for both families, never
+                        // multiplied across variants: formatting is syntactic and
+                        // so variant-free outright (`VARIANT_FREE_TARGET_NAMES`),
+                        // while the lint gate/fixer aggregate every ancestry
+                        // variant's analysis (`VARIANT_AGGREGATE_TARGET_NAMES`).
+                        // The per-variant `_lint-analyze` stays unlisted (as
+                        // before): it is internal, and the aggregators pull it in
+                        // as a dep.
+                        for name in VARIANT_AGGREGATE_TARGET_NAMES
+                            .iter()
+                            .chain(VARIANT_FREE_TARGET_NAMES)
+                        {
                             addrs.push(Addr::new(
                                 req.package.clone(),
                                 (*name).to_string(),
@@ -859,9 +866,11 @@ fn is_test_target_name(name: &str) -> bool {
 /// (ancestry vs universe) per target name.
 ///
 /// `format`/`format-check` are deliberately absent: formatting is syntactic, so
-/// they are variant-independent (see [`VARIANT_FREE_TARGET_NAMES`]).
+/// they are variant-independent (see [`VARIANT_FREE_TARGET_NAMES`]). So are
+/// `lint-check`/`lint`, which aggregate over every ancestry variant instead of
+/// being selected with one (see [`VARIANT_AGGREGATE_TARGET_NAMES`]).
 fn is_entry_target_name(name: &str) -> bool {
-    matches!(name, "build" | "test" | "xtest" | "lint-check" | "lint")
+    matches!(name, "build" | "test" | "xtest")
 }
 
 /// **Runnable** test target names — the ones that execute the built test binary
@@ -921,14 +930,7 @@ const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &[
-    "build_lib",
-    "build",
-    "embed",
-    "lint-check",
-    "lint",
-    "_lint-analyze",
-];
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "_lint-analyze"];
 
 /// Target names this provider owns that are **variant-free**: they carry no `@v`
 /// / `@vp` and are handled before variant resolution.
@@ -942,10 +944,29 @@ const GOLIST_TARGET_NAMES: &[&str] = &[
 /// list straight off disk (every `*.go` in the package dir) instead of from the
 /// variant-scoped `_golist`.
 ///
-/// Linting is *not* in here on purpose: `_lint-analyze` type-checks against
-/// variant-scoped dependency facts, so its results legitimately differ per
-/// variant.
+/// The lint targets are *not* in here: they carry no variant either, but they
+/// reach the per-variant analysis units underneath, so they need their own
+/// handling (see [`VARIANT_AGGREGATE_TARGET_NAMES`]).
 const VARIANT_FREE_TARGET_NAMES: &[&str] = &["format", "format-check"];
+
+/// Target names that carry no `@v`/`@vp` themselves but **fan out over every
+/// declared variant** underneath — one bare addr per package aggregating N
+/// per-variant analysis units.
+///
+/// Lint *rules* are variant-independent, but the object they analyze is not:
+/// `_lint-analyze` type-checks the package, and a typed package only exists per
+/// `(GOOS, GOARCH, tags)` — `foo_linux.go` and `foo_windows.go` redeclare each
+/// other's symbols, and their imports differ. Facts are variant-scoped for the
+/// same reason. So the analysis unit stays per-variant while the user-facing
+/// gate (`lint-check`) and fixer (`lint`) aggregate the module-bounded ancestry
+/// variants.
+///
+/// That fixes two things a variant-selected `lint` got wrong: a file excluded by
+/// the selected variant's build constraints was silently never linted
+/// (`foo_windows.go` on a host-variant run), and N per-variant fixers each
+/// declared the same `codegen = in_place` source paths — N targets racing to
+/// rewrite one file. One aggregating fixer claims each path once.
+const VARIANT_AGGREGATE_TARGET_NAMES: &[&str] = &["lint-check", "lint"];
 
 /// Workspace-relative package of heph's own go/analysis unitchecker binary
 /// (`heph-govet`), built as an ordinary `build` (package main) target like any
@@ -977,6 +998,7 @@ fn is_known_go_target_name(name: &str) -> bool {
     SPECIAL_TARGET_NAMES.contains(&name)
         || GOLIST_TARGET_NAMES.contains(&name)
         || VARIANT_FREE_TARGET_NAMES.contains(&name)
+        || VARIANT_AGGREGATE_TARGET_NAMES.contains(&name)
         || TEST_TARGET_NAMES.contains(&name)
 }
 
@@ -1560,6 +1582,16 @@ impl ProviderInner {
             };
         }
 
+        // lint-check / lint — one bare addr per package aggregating the
+        // per-variant `_lint-analyze` units (see `VARIANT_AGGREGATE_TARGET_NAMES`).
+        // They carry no variant of their own, so they also resolve before variant
+        // resolution; they enumerate the ancestry variants themselves.
+        if VARIANT_AGGREGATE_TARGET_NAMES.contains(&addr.name.as_str()) {
+            return Arc::clone(&self)
+                .get_lint_aggregate(&req, &kind, &module_root)
+                .await;
+        }
+
         // Magic host-default `build`: a *truly bare* `//pkg:build` (no addr args at
         // all) is served as a `group` target forwarding to `build@v=<variant>` for
         // the first ancestry variant matching this machine's goos/goarch. It gives
@@ -1793,53 +1825,6 @@ impl ProviderInner {
                         )
                     }
                 };
-                Ok(GetResponse { target_spec: spec })
-            }
-            // User-facing check gate: depends on `_lint-analyze`'s report and fails on
-            // findings. `_lint-analyze` always exits 0 so facts cache regardless; the gate
-            // is the thing that fails.
-            "lint-check" => {
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                // Lint only where the module opts in with a golangci config;
-                // attach it as a hash-only dep so a config change re-keys the gate.
-                let config_addr = match self.golangci_config_addr(&module_root) {
-                    Some(a) => a,
-                    None => return Err(GetError::NotFound),
-                };
-                let analyze_addr = self.make_addr_with_name(&addr.package, "_lint-analyze", &vref);
-                let spec = crate::plugingo::driver_lint::build_lint_gate_spec(
-                    addr.clone(),
-                    &analyze_addr,
-                    Some(&config_addr),
-                );
-                Ok(GetResponse { target_spec: spec })
-            }
-            // The plain `lint` target FIXES: it consumes `_lint-analyze`'s report (suggested
-            // fixes) + the package sources, applies the edits, and rewrites the
-            // sources in place (codegen). Runs no analysis itself — reuses `_lint-analyze`'s
-            // cache. Use `lint-check` to only report.
-            "lint" => {
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                let config_addr = match self.golangci_config_addr(&module_root) {
-                    Some(a) => a,
-                    None => return Err(GetError::NotFound),
-                };
-                let analyze_addr = self.make_addr_with_name(&addr.package, "_lint-analyze", &vref);
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                let spec = crate::plugingo::driver_lint::build_lint_fix_spec(
-                    addr.clone(),
-                    &analyze_addr,
-                    &pkg_addrs.go_files,
-                    &pkg.go_files,
-                    Some(&config_addr),
-                );
                 Ok(GetResponse { target_spec: spec })
             }
             // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
@@ -2806,6 +2791,146 @@ impl ProviderInner {
         Ok(files)
     }
 
+    /// Spec for the user-facing `lint-check` (gate) and `lint` (fixer) targets:
+    /// one bare addr per package that aggregates the per-variant `_lint-analyze`
+    /// units of every module-bounded ancestry variant.
+    ///
+    /// Why aggregate rather than let the user select a variant (see
+    /// [`VARIANT_AGGREGATE_TARGET_NAMES`]): lint rules don't depend on the
+    /// variant, only the typed package they run against does. Selecting one
+    /// variant therefore reported on an arbitrary subset of the package's files
+    /// — `foo_windows.go` was silently unlinted on a host-variant run — and gave
+    /// every variant its own fixer, each declaring the same source files as
+    /// `codegen = in_place` outputs.
+    ///
+    /// A variant whose build constraints leave the package with no Go files is
+    /// skipped: it has no `_lint-analyze` target, so wiring one would be a dep
+    /// that resolves to `NotFound`. All variants skipped (or none declared) →
+    /// `NotFound`, matching what the per-variant targets did.
+    async fn get_lint_aggregate(
+        self: Arc<Self>,
+        req: &GetRequest,
+        kind: &GoPackageKind,
+        module_root: &str,
+    ) -> Result<GetResponse, GetError> {
+        let addr = &req.addr;
+
+        // Linting is first-party only: std/thirdparty sources are vendored, and
+        // their modules carry no golangci config to opt in with.
+        let GoPackageKind::FirstParty {
+            module_root: module_root_path,
+            ..
+        } = kind
+        else {
+            return Err(GetError::NotFound);
+        };
+
+        // No variant to select any more. Reject a stale `@v=`/`@vp=` rather than
+        // ignore it, so a pinned addr surfaces the migration instead of quietly
+        // linting a different (now wider) set of files.
+        if let Some(bad) = addr.args.keys().next() {
+            return Err(GetError::Other(anyhow::anyhow!(
+                "unknown addr arg `{bad}` on go target `:{}` — lint rules are \
+                 variant-independent, so `:{}` now aggregates every declared \
+                 variant's analysis; use a bare `:{}` (the per-variant unit is \
+                 `:_lint-analyze@v=NAME,vp=PKG`)",
+                addr.name,
+                addr.name,
+                addr.name,
+            )));
+        }
+
+        // Lint only where the module opts in with a golangci config; attach it as
+        // a hash-only dep so a config change re-keys the gate/fixer directly.
+        let Some(config_addr) = self.golangci_config_addr(module_root_path) else {
+            return Err(GetError::NotFound);
+        };
+
+        // The ancestry variants — the same set `list` used to multiply these
+        // targets across, now folded into one target's deps.
+        let vrefs: Vec<VariantRef> =
+            variant::ancestry_variants_with_factors(&req.states, module_root)
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect();
+
+        // One `_golist` read per variant, fanned out: they are independent and
+        // engine-cached (the `_lint-analyze` targets read the very same ones).
+        let per_variant = futures::future::try_join_all(vrefs.iter().map(|vref| {
+            let this = Arc::clone(&self);
+            let executor = Arc::clone(&req.executor);
+            let golist_addr = self.make_addr_with_name(&addr.package, "_golist", vref);
+            async move {
+                match this.read_golist_package(executor, &golist_addr).await {
+                    // No buildable Go files under this variant's constraints →
+                    // no analysis unit to aggregate.
+                    Ok(pkg) if pkg.go_files.is_empty() => anyhow::Ok(None),
+                    Ok(pkg) => anyhow::Ok(Some((vref.clone(), pkg, golist_addr))),
+                    Err(e) if downcast_chain_ref::<NoGoFilesError>(&e).is_some() => {
+                        anyhow::Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }))
+        .await
+        .map_err(GetError::Other)?;
+
+        let analyzed: Vec<(VariantRef, Arc<GoPackage>, Addr)> =
+            per_variant.into_iter().flatten().collect();
+        if analyzed.is_empty() {
+            return Err(GetError::NotFound);
+        }
+
+        let analyze_addrs: Vec<Addr> = analyzed
+            .iter()
+            .map(|(vref, _, _)| self.make_addr_with_name(&addr.package, "_lint-analyze", vref))
+            .collect();
+
+        if addr.name == "lint-check" {
+            let spec = crate::plugingo::driver_lint::build_lint_gate_spec(
+                addr.clone(),
+                &analyze_addrs,
+                Some(&config_addr),
+            );
+            return Ok(GetResponse { target_spec: spec });
+        }
+
+        // The fixer additionally stages the sources it rewrites. Union them
+        // across variants: a file the selected variant's constraints excluded is
+        // still linted (and so still fixable) under another one, and it must be a
+        // declared output or the engine has nowhere to write the fix back.
+        let addrs_per_variant =
+            futures::future::try_join_all(analyzed.iter().map(|(_, _, golist_addr)| {
+                self.read_golist_package_addrs(Arc::clone(&req.executor), golist_addr)
+            }))
+            .await
+            .map_err(GetError::Other)?;
+
+        // Keyed by basename (a Go package's files are flat, so basenames are
+        // unique in it) → source addr. `resolve_package_addrs` maps files 1:1 in
+        // order, so `go_files[i]` is the addr of `pkg.go_files[i]`. `BTreeMap`
+        // keeps the two emitted lists aligned, deduped and in a stable order, so
+        // the spec — and the target's input hash — is reproducible.
+        let mut by_file: BTreeMap<String, String> = BTreeMap::new();
+        for ((_, pkg, _), pkg_addrs) in analyzed.iter().zip(addrs_per_variant.iter()) {
+            for (file, src) in pkg.go_files.iter().zip(pkg_addrs.go_files.iter()) {
+                by_file.entry(file.clone()).or_insert_with(|| src.clone());
+            }
+        }
+        let go_files: Vec<String> = by_file.keys().cloned().collect();
+        let src_addrs: Vec<String> = by_file.into_values().collect();
+
+        let spec = crate::plugingo::driver_lint::build_lint_fix_spec(
+            addr.clone(),
+            &analyze_addrs,
+            &src_addrs,
+            &go_files,
+            Some(&config_addr),
+        );
+        Ok(GetResponse { target_spec: spec })
+    }
+
     /// The addr of the module's golangci-lint config, if the module root (the
     /// `go.mod` directory) holds one. Lint/format targets exist ONLY for modules
     /// that have such a config — the presence of a `.golangci.yml`/`.golangci.yaml`
@@ -3444,6 +3569,11 @@ mod tests {
         workspace_root: PathBuf,
         /// Source map applied when generating `package_addrs.bin`.
         source_map: HashMap<String, String>,
+        /// The variant declarations this workspace has. Served from
+        /// `states_under`, and used to turn an addr's `v` into the `GOOS`/`GOARCH`
+        /// the mocked `go list` runs under — so a `_golist` really does see a
+        /// different file set per variant, as it does in production.
+        states: Vec<State>,
     }
 
     struct BinaryArtifact {
@@ -3475,14 +3605,14 @@ mod tests {
 
     impl ProviderExecutor for GoListTestExecutor {
         // The test fixtures are single-module workspaces (go.mod at root), so the
-        // module universe = the root `host` variant. Serve it for `states_under`
-        // of the root prefix; deeper prefixes have no declarations.
+        // module universe = the variants declared at the root. Serve them for
+        // `states_under` of the root prefix; deeper prefixes have no declarations.
         fn states_under<'a>(
             &'a self,
             prefix: &'a hmodel::htpkg::PkgBuf,
         ) -> BoxFuture<'a, anyhow::Result<Vec<hplugin::provider::State>>> {
             let states = if prefix.as_str().is_empty() {
-                vec![host_variant_state()]
+                self.states.clone()
             } else {
                 vec![]
             };
@@ -3498,13 +3628,24 @@ mod tests {
                     );
                 }
 
-                // This mock runs a real host `go list`, so use host factors
-                // regardless of the addr's variant coordinate.
-                let factors = Factors {
-                    goos: current_goos(),
-                    goarch: current_goarch(),
-                    ..Default::default()
-                };
+                // Resolve the addr's variant against the declared states so the
+                // mocked `go list` runs with that variant's `GOOS`/`GOARCH` —
+                // build constraints must select a different file set per variant
+                // here just as they do in production. Falls back to host factors
+                // for an addr with no `v` (or a name this workspace never
+                // declared).
+                let factors = addr
+                    .args
+                    .get("v")
+                    .and_then(|name| variant::resolve_ancestry(name, &self.states, "").ok())
+                    .map_or_else(
+                        || Factors {
+                            goos: current_goos(),
+                            goarch: current_goarch(),
+                            ..Default::default()
+                        },
+                        |(f, _)| f,
+                    );
                 let kind = decode_package(&addr.package, &self.workspace_root)
                     .ok_or_else(|| anyhow::anyhow!("unknown package: {}", addr.package))?;
 
@@ -3593,6 +3734,7 @@ mod tests {
         Arc::new(GoListTestExecutor {
             workspace_root: workspace_root.to_path_buf(),
             source_map: HashMap::new(),
+            states: vec![host_variant_state()],
         })
     }
 
@@ -3746,12 +3888,12 @@ mod tests {
         enable_golangci(sandbox.path());
         // Default `govet` — i.e. the dev build's (nonexistent) release target.
         let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
-        for name in ["_lint-analyze", "lint-check", "lint"] {
-            provider_get(&p, make_addr("cmd", name))
-                .await
-                .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
-        }
-        for name in ["format-check", "format"] {
+        // `_lint-analyze` is the per-variant unit; the gate/fixer and the
+        // formatters are bare.
+        provider_get(&p, make_addr("cmd", "_lint-analyze"))
+            .await
+            .unwrap_or_else(|e| panic!("_lint-analyze spec must resolve on a dev build: {e:?}"));
+        for name in ["lint-check", "lint", "format-check", "format"] {
             provider_get(&p, make_bare_addr("cmd", name))
                 .await
                 .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
@@ -4050,6 +4192,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &ctoken).await.unwrap();
@@ -4094,6 +4237,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let inner: Arc<dyn ProviderExecutor> = Arc::new(GoListTestExecutor {
             workspace_root: sandbox.path().to_path_buf(),
             source_map: HashMap::new(),
+            states: vec![host_variant_state()],
         });
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let executor: Arc<dyn ProviderExecutor> = Arc::new(CountingExecutor {
@@ -4327,7 +4471,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("cmd", "lint-check"))
+        let resp = provider_get(&p, make_bare_addr("cmd", "lint-check"))
             .await
             .unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint_gate");
@@ -4358,7 +4502,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("cmd", "lint")).await.unwrap();
+        let resp = provider_get(&p, make_bare_addr("cmd", "lint"))
+            .await
+            .unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint_fix");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
@@ -4472,12 +4618,203 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         }
     }
 
-    /// `format`/`format-check` carry no variant, so `list` emits exactly one bare
-    /// addr each no matter how many variants a module declares — while `lint`
-    /// (whose analysis genuinely depends on the variant) is still emitted per
-    /// variant.
+    /// A state declaring `host` plus a second, cross-compiled variant — the
+    /// two-variant ancestry the aggregation tests need.
+    fn two_variant_state() -> State {
+        let cross = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String("windows".into())),
+            ("goarch".to_string(), Value::String("amd64".into())),
+        ]));
+        let host = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String(current_goarch())),
+        ]));
+        State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([
+                    ("host".to_string(), host),
+                    ("win".to_string(), cross),
+                ])),
+            )]),
+        }
+    }
+
+    /// `provider_get` with a custom variant declaration — threaded into both the
+    /// request's ancestry states and the executor, so the mocked `_golist` runs
+    /// under each variant's own factors.
+    async fn provider_get_with_states(
+        p: &Provider,
+        addr: Addr,
+        states: Vec<State>,
+    ) -> Result<GetResponse, GetError> {
+        let ctoken = StdCancellationToken::new();
+        let workspace = p.inner.workspace_root.clone();
+        p.get(
+            GetRequest {
+                request_id: "test".to_string(),
+                addr,
+                states: states.clone(),
+                executor: Arc::new(GoListTestExecutor {
+                    workspace_root: workspace,
+                    source_map: HashMap::new(),
+                    states,
+                }),
+            },
+            &ctoken,
+        )
+        .await
+    }
+
+    /// The string entries of a spec's dep group.
+    fn dep_group(spec: &hplugin::provider::TargetSpec, group: &str) -> Vec<String> {
+        let deps = match spec.config.get("deps").expect("deps") {
+            Value::Map(m) => m,
+            other => panic!("deps not a map: {other:?}"),
+        };
+        match deps.get(group) {
+            Some(Value::List(l)) => l
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("dep entry not a string: {other:?}"),
+                })
+                .collect(),
+            other => panic!("dep group `{group}` missing: {other:?}"),
+        }
+    }
+
+    /// The gate aggregates: one `_lint-analyze` report dep per declared variant,
+    /// off a single bare addr. Selecting one variant instead would report on
+    /// whichever subset of the package's files that variant's build constraints
+    /// happen to admit.
     #[tokio::test]
-    async fn list_emits_format_once_and_variant_free() {
+    async fn test_lint_check_aggregates_every_variants_report() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let resp = provider_get_with_states(
+            &p,
+            make_bare_addr("cmd", "lint-check"),
+            vec![two_variant_state()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_gate");
+
+        let reports = dep_group(&resp.target_spec, "report");
+        assert_eq!(
+            reports.len(),
+            2,
+            "one analyze report per declared variant: {reports:?}"
+        );
+        for v in ["v=host", "v=win"] {
+            assert!(
+                reports.iter().any(|r| r.contains(":_lint-analyze")
+                    && r.contains(v)
+                    && r.ends_with("|report")),
+                "gate must consume {v}'s analyze report: {reports:?}"
+            );
+        }
+    }
+
+    /// The fixer unions its sources across variants: a file only one variant's
+    /// build constraints admit is still analyzed under that variant, so its fix
+    /// must have somewhere to land. Under the old per-variant fixer it was both
+    /// unfixable from the other variant AND claimed as a `codegen = in_place`
+    /// output by two targets at once.
+    #[tokio::test]
+    async fn test_lint_fix_unions_sources_across_variants() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        // One file per variant, each invisible to the other's `go list`. Note the
+        // filenames: `_windows.go` is itself a build constraint, so the
+        // non-windows file must not be named `not_windows.go`.
+        let pkg_dir = sandbox.path().join("cmd");
+        std::fs::write(
+            pkg_dir.join("only_windows.go"),
+            "//go:build windows\n\npackage main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("elsewhere.go"),
+            "//go:build !windows\n\npackage main\n",
+        )
+        .unwrap();
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let resp =
+            provider_get_with_states(&p, make_bare_addr("cmd", "lint"), vec![two_variant_state()])
+                .await
+                .unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_fix");
+
+        let out = match resp.target_spec.config.get("out").expect("out") {
+            Value::Map(m) => match m.iter().find(|(k, _)| *k == "src").map(|(_, v)| v) {
+                Some(Value::List(l)) => l
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => panic!("out entry not a string: {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                other => panic!("src group missing: {other:?}"),
+            },
+            other => panic!("out not a map: {other:?}"),
+        };
+        for expected in ["only_windows.go", "elsewhere.go", "main.go"] {
+            assert!(
+                out.iter().any(|f| f == expected),
+                "{expected} must be a fixable output: {out:?}"
+            );
+        }
+        // Each path claimed exactly once — the whole point of one fixer instead
+        // of one per variant.
+        let mut sorted = out.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            out.len(),
+            "duplicate in_place claims: {out:?}"
+        );
+        // Sources and outputs stay index-aligned and deduped the same way.
+        assert_eq!(dep_group(&resp.target_spec, "").len(), out.len());
+    }
+
+    /// A stale `lint@v=NAME` (from when the gate/fixer were variant-selected)
+    /// must fail loudly rather than silently linting a now-wider set of files.
+    #[tokio::test]
+    async fn test_lint_rejects_a_variant_arg() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        for name in ["lint", "lint-check"] {
+            let msg = match provider_get(&p, make_addr("cmd", name)).await {
+                Err(GetError::Other(e)) => format!("{e:#}"),
+                Err(other) => panic!("expected a typed error for {name}, got {other:?}"),
+                Ok(_) => panic!("a variant arg on {name} must be rejected"),
+            };
+            assert!(
+                msg.contains("variant-independent") && msg.contains("_lint-analyze"),
+                "error must explain the aggregation and name the per-variant unit: {msg}"
+            );
+        }
+    }
+
+    /// None of the user-facing lint/format targets carry a variant, so `list`
+    /// emits exactly one bare addr each no matter how many variants a module
+    /// declares. `format` is variant-free outright; `lint-check`/`lint` aggregate
+    /// the per-variant `_lint-analyze` units, which stay internal (unlisted).
+    #[tokio::test]
+    async fn list_emits_lint_and_format_once_and_variant_free() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
@@ -4517,7 +4854,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .map(|r| r.unwrap().addr)
             .collect();
 
-        for name in ["format", "format-check"] {
+        for name in ["format", "format-check", "lint", "lint-check"] {
             let listed: Vec<&Addr> = addrs.iter().filter(|a| a.name == name).collect();
             assert_eq!(
                 listed.len(),
@@ -4530,12 +4867,22 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 listed[0]
             );
         }
-        // Lint is the contrast: its analysis is variant-scoped, so it stays
-        // multiplied across the declared variants.
+        // The variant-scoped analysis unit stays internal: the aggregators pull
+        // it in as a dep, so listing it too would run every variant's analysis
+        // twice over in a `//...` sweep.
+        assert!(
+            !addrs.iter().any(|a| a.name == "_lint-analyze"),
+            "_lint-analyze must stay unlisted: {addrs:?}"
+        );
+        // The contrast: `build` genuinely is variant-selected, so it stays
+        // multiplied across the two declared variants (plus the bare host-default).
         assert_eq!(
-            addrs.iter().filter(|a| a.name == "lint-check").count(),
+            addrs
+                .iter()
+                .filter(|a| a.name == "build" && !a.args.is_empty())
+                .count(),
             2,
-            "lint-check must still be listed per variant: {addrs:?}"
+            "build must still be listed per variant: {addrs:?}"
         );
     }
 
@@ -4577,11 +4924,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "format-check",
             "format",
         ] {
-            // Formatting is variant-free; lint is not.
-            let addr = if name.starts_with("format") {
-                make_bare_addr("cmd", name)
-            } else {
+            // Only the internal `_lint-analyze` unit carries a variant; the
+            // user-facing gate/fixer and the formatters are bare.
+            let addr = if name == "_lint-analyze" {
                 make_addr("cmd", name)
+            } else {
+                make_bare_addr("cmd", name)
             };
             assert!(
                 matches!(provider_get(&p, addr).await, Err(GetError::NotFound)),
@@ -4615,7 +4963,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )
         .unwrap();
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
-        provider_get(&p, make_addr("cmd", "lint-check"))
+        provider_get(&p, make_bare_addr("cmd", "lint-check"))
             .await
             .expect("lint-check resolves with a .golangci.yaml");
         let names = provider_list(&p, "cmd").await;
@@ -6447,6 +6795,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
@@ -6494,6 +6843,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
@@ -6680,6 +7030,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();

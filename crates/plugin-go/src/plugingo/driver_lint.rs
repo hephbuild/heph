@@ -663,6 +663,20 @@ fn report_findings(json: &[u8]) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Union the per-variant reports' findings: a finding in *any* variant fails the
+/// gate. A file every variant compiles yields the same finding in each, so
+/// identical findings collapse; sorting keeps the failure message independent of
+/// the order the reports happened to be staged in.
+fn merge_report_findings(reports: &[Vec<u8>]) -> anyhow::Result<Vec<String>> {
+    let mut findings: Vec<String> = Vec::new();
+    for report in reports {
+        findings.extend(report_findings(report)?);
+    }
+    findings.sort();
+    findings.dedup();
+    Ok(findings)
+}
+
 #[async_trait]
 impl ManagedDriver for GoLintGateDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -744,28 +758,19 @@ impl ManagedDriver for GoLintGateDriver {
         req: ManagedRunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        // Single staged report file (origin `dep|report|*`).
-        let mut report_path: Option<String> = None;
-        for m in &req.inputs {
-            if !m.input.origin_id.starts_with("dep|report|") {
-                continue;
-            }
-            if let Ok(list_path) = m.require_list_path()
-                && let Ok(f) = std::fs::File::open(list_path)
-            {
-                for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-                    if !line.is_empty() {
-                        report_path = Some(line);
-                        break;
-                    }
-                }
-            }
+        // One staged report per variant (origin `dep|report|*`). The gate is the
+        // union: a finding in any variant fails. A file both variants compile
+        // yields the same finding in each, so dedupe — and sort, so the message
+        // doesn't depend on staging order.
+        let report_paths = staged_paths_in_group(&req, "report");
+        if report_paths.is_empty() {
+            anyhow::bail!("go_lint_gate: no lint report staged");
         }
-        let report_path =
-            report_path.ok_or_else(|| anyhow::anyhow!("go_lint_gate: no lint report staged"))?;
-        let bytes = std::fs::read(&report_path)
-            .with_context(|| format!("read lint report {report_path}"))?;
-        let findings = report_findings(&bytes)?;
+        let reports = report_paths
+            .iter()
+            .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let findings = merge_report_findings(&reports)?;
         if !findings.is_empty() {
             anyhow::bail!(
                 "lint found {} issue(s):\n{}",
@@ -792,6 +797,7 @@ impl ManagedDriver for GoLintGateDriver {
 /// (basename) with `new`. `start`/`end` are 0-based byte offsets into the file
 /// as the analyzer parsed it; `_lint-analyze` and `lint` stage byte-identical
 /// sources, so the offsets line up.
+#[derive(Debug)]
 struct FixEdit {
     start: usize,
     end: usize,
@@ -861,6 +867,60 @@ fn report_edits(json: &[u8]) -> anyhow::Result<HashMap<String, Vec<FixEdit>>> {
                         new: new.to_string(),
                     });
                 }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Merge the per-variant reports into one edit set per source file.
+///
+/// Within a single report, overlapping edits are left alone — [`apply_edits`]
+/// resolves those with go/analysis' own earliest-wins rule. *Across* reports the
+/// situation is different: a file every variant compiles produces the same
+/// diagnostic in each, so byte-identical edits are deduped; but two variants
+/// proposing *different* rewrites of the same bytes is a genuine ambiguity with
+/// no basis to prefer either, so it fails rather than silently applying whichever
+/// report happened to be staged first.
+fn merge_report_edits(reports: &[Vec<u8>]) -> anyhow::Result<HashMap<String, Vec<FixEdit>>> {
+    /// Same span, same replacement — the same diagnostic seen by another variant.
+    fn is_same(a: &FixEdit, b: &FixEdit) -> bool {
+        a.start == b.start && a.end == b.end && a.new == b.new
+    }
+    /// Spans that can't both be applied: they overlap, or they are the same span
+    /// (which covers two insertions at one offset, where `start == end` makes the
+    /// overlap test vacuous).
+    fn collides(a: &FixEdit, b: &FixEdit) -> bool {
+        (a.start < b.end && b.start < a.end) || (a.start == b.start && a.end == b.end)
+    }
+
+    let mut out: HashMap<String, Vec<FixEdit>> = HashMap::new();
+    for report in reports {
+        for (file, edits) in report_edits(report)? {
+            let merged = out.entry(file.clone()).or_default();
+            // Only edits contributed by *earlier* reports are compared against;
+            // this report's own overlaps stay for `apply_edits` to arbitrate.
+            let prior = merged.len();
+            for e in edits {
+                if merged[..prior].iter().any(|x| is_same(x, &e)) {
+                    continue;
+                }
+                if let Some((start, end, new)) = merged[..prior]
+                    .iter()
+                    .find(|x| collides(x, &e))
+                    .map(|x| (x.start, x.end, x.new.clone()))
+                {
+                    anyhow::bail!(
+                        "go_lint_fix: build variants disagree on how to fix {file}: \
+                         bytes [{start}, {end}) → {new:?} vs bytes [{}, {}) → {:?}. \
+                         Nothing can pick a winner — fix the diagnostic by hand, or \
+                         narrow the variant set the package is linted under.",
+                        e.start,
+                        e.end,
+                        e.new,
+                    );
+                }
+                merged.push(e);
             }
         }
     }
@@ -1064,14 +1124,17 @@ impl ManagedDriver for GoLintFixDriver {
         req: ManagedRunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        // The analyze target's `-json` report (single staged file, dep|report|*).
-        let report_path = staged_paths_in_group(&req, "report")
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("go_lint_fix: no lint report staged"))?;
-        let report = std::fs::read(&report_path)
-            .with_context(|| format!("read lint report {report_path}"))?;
-        let mut edits_by_file = report_edits(&report)?;
+        // One `-json` report per variant (dep|report|*), merged into a single
+        // edit set per file — see `merge_report_edits`.
+        let report_paths = staged_paths_in_group(&req, "report");
+        if report_paths.is_empty() {
+            anyhow::bail!("go_lint_fix: no lint report staged");
+        }
+        let reports = report_paths
+            .iter()
+            .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut edits_by_file = merge_report_edits(&reports)?;
 
         // Apply the edits to each staged source, rewriting it in place. The
         // default (`""`) group is staged as a plain writable copy (not read-only,
@@ -1240,15 +1303,17 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
 /// through `_lint-analyze`'s report.
 pub fn build_lint_gate_spec(
     addr: Addr,
-    analyze_addr: &Addr,
+    analyze_addrs: &[Addr],
     config_addr: Option<&Addr>,
 ) -> TargetSpec {
     let mut deps = BTreeMap::from([(
         "report".to_string(),
-        Value::List(vec![Value::String(format!(
-            "{}|report",
-            analyze_addr.format()
-        ))]),
+        Value::List(
+            analyze_addrs
+                .iter()
+                .map(|a| Value::String(format!("{}|report", a.format())))
+                .collect(),
+        ),
     )]);
     if let Some(cfg) = config_addr {
         deps.insert(
@@ -1272,16 +1337,19 @@ pub fn build_lint_gate_spec(
     }
 }
 
-/// Build the user-facing `lint` (fixer) spec. Depends on the `report` output of the
-/// analyze target (`_lint-analyze`) plus the package's own `.go` sources, applies each
-/// diagnostic's suggested fix, and rewrites the sources in place (codegen).
+/// Build the user-facing `lint` (fixer) spec. Depends on the `report` output of
+/// every per-variant analyze target (`_lint-analyze`) plus the package's own
+/// `.go` sources, applies each diagnostic's suggested fix, and rewrites the
+/// sources in place (codegen).
 ///
 /// `src_addrs` are the source file target addresses (the `""` dep group, staged
 /// writable and rewritten); `go_files` are their basenames (the declared
 /// `in_place` outputs). The two are the same files viewed as addr vs. filename.
+/// Both are the *union* across variants, so a file only one variant's build
+/// constraints admit is still fixable.
 pub fn build_lint_fix_spec(
     addr: Addr,
-    analyze_addr: &Addr,
+    analyze_addrs: &[Addr],
     src_addrs: &[String],
     go_files: &[String],
     config_addr: Option<&Addr>,
@@ -1289,10 +1357,12 @@ pub fn build_lint_fix_spec(
     let mut deps = BTreeMap::from([
         (
             "report".to_string(),
-            Value::List(vec![Value::String(format!(
-                "{}|report",
-                analyze_addr.format()
-            ))]),
+            Value::List(
+                analyze_addrs
+                    .iter()
+                    .map(|a| Value::String(format!("{}|report", a.format())))
+                    .collect(),
+            ),
         ),
         (
             String::new(),
@@ -1515,12 +1585,12 @@ mod tests {
             "_lint-analyze".to_string(),
             Default::default(),
         );
-        let check = build_lint_gate_spec(addr("lint-check"), &analyze, None);
+        let check = build_lint_gate_spec(addr("lint-check"), std::slice::from_ref(&analyze), None);
         assert_eq!(check.labels, vec!["go-lint-check", "lint-check"]);
 
         let fix = build_lint_fix_spec(
             addr("lint"),
-            &analyze,
+            std::slice::from_ref(&analyze),
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
             None,
@@ -1679,7 +1749,7 @@ mod tests {
             "_lint-analyze".to_string(),
             Default::default(),
         );
-        let s = build_lint_gate_spec(addr("lint-check"), &analyze, None);
+        let s = build_lint_gate_spec(addr("lint-check"), std::slice::from_ref(&analyze), None);
         assert_eq!(s.driver, "go_lint_gate");
         let deps = match s.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -1707,18 +1777,23 @@ mod tests {
         );
         let cfg = Addr::new(PkgBuf::from(""), "file".to_string(), Default::default());
 
-        let gate = build_lint_gate_spec(addr("lint-check"), &analyze, Some(&cfg));
+        let gate = build_lint_gate_spec(
+            addr("lint-check"),
+            std::slice::from_ref(&analyze),
+            Some(&cfg),
+        );
         assert!(
             deps_map(&gate).contains_key("config"),
             "gate must depend on the golangci config so a config change re-keys it"
         );
         // Without a config addr, no config dep (keeps the no-config path clean).
-        let gate_none = build_lint_gate_spec(addr("lint-check"), &analyze, None);
+        let gate_none =
+            build_lint_gate_spec(addr("lint-check"), std::slice::from_ref(&analyze), None);
         assert!(!deps_map(&gate_none).contains_key("config"));
 
         let fix = build_lint_fix_spec(
             addr("lint"),
-            &analyze,
+            std::slice::from_ref(&analyze),
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
             Some(&cfg),
@@ -1795,6 +1870,107 @@ mod tests {
         assert_eq!(a[0].new, "A");
     }
 
+    // The gate is the union across variants: a finding only one variant's build
+    // constraints expose still fails, and a finding every variant reports is
+    // listed once, not N times.
+    #[test]
+    fn gate_unions_and_dedupes_findings_across_variants() {
+        let shared = br#"{"m": {"printf": [{"posn": "a.go:1:1", "message": "shared"}]}}"#;
+        let win_only = br#"{"m": {"printf": [
+            {"posn": "a.go:1:1", "message": "shared"},
+            {"posn": "only_windows.go:2:2", "message": "windows only"}
+        ]}}"#;
+        let findings = merge_report_findings(&[shared.to_vec(), win_only.to_vec()]).unwrap();
+        assert_eq!(findings.len(), 2, "shared finding deduped: {findings:?}");
+        assert!(
+            findings.iter().any(|f| f.contains("only_windows.go")),
+            "a finding from one variant alone must still fail the gate: {findings:?}"
+        );
+    }
+
+    /// A `-json` report with one suggested fix over `[start, end)` of `a.go`.
+    fn one_fix_report(start: usize, end: usize, new: &str) -> Vec<u8> {
+        format!(
+            r#"{{"m": {{"l": [{{"posn": "a.go:1:1", "message": "x",
+              "suggested_fixes": [{{"message": "f", "edits": [
+                {{"filename": "a.go", "start": {start}, "end": {end}, "new": "{new}"}}
+              ]}}]}}]}}}}"#
+        )
+        .into_bytes()
+    }
+
+    // Every variant that compiles a file reports the same diagnostic on it, so
+    // merging N reports must not apply the same rewrite N times.
+    #[test]
+    fn merge_dedupes_the_same_edit_seen_by_several_variants() {
+        let reports = vec![
+            one_fix_report(0, 5, "A"),
+            one_fix_report(0, 5, "A"),
+            one_fix_report(0, 5, "A"),
+        ];
+        let merged = merge_report_edits(&reports).unwrap();
+        let a = merged.get("a.go").expect("keyed by basename");
+        assert_eq!(
+            a.len(),
+            1,
+            "identical cross-variant edits collapse: {}",
+            a.len()
+        );
+        assert_eq!(a[0].new, "A");
+    }
+
+    // Edits from different variants that don't touch each other all apply.
+    #[test]
+    fn merge_keeps_disjoint_edits_from_different_variants() {
+        let merged =
+            merge_report_edits(&[one_fix_report(0, 2, "A"), one_fix_report(4, 6, "B")]).unwrap();
+        assert_eq!(merged.get("a.go").unwrap().len(), 2);
+    }
+
+    // Two variants proposing different rewrites of the same bytes is a real
+    // ambiguity — nothing here can pick a winner, so it must fail rather than
+    // apply whichever report was staged first.
+    #[test]
+    fn merge_fails_when_variants_disagree_on_a_rewrite() {
+        let err = merge_report_edits(&[one_fix_report(0, 5, "A"), one_fix_report(3, 8, "B")])
+            .expect_err("overlapping, differing edits must not silently resolve");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("disagree") && msg.contains("a.go"),
+            "error must name the file and the disagreement: {msg}"
+        );
+    }
+
+    // Same span, different replacement — the overlap test alone misses this for
+    // zero-length insertions, so it is checked explicitly.
+    #[test]
+    fn merge_fails_on_conflicting_insertions_at_one_offset() {
+        let err = merge_report_edits(&[one_fix_report(3, 3, "A"), one_fix_report(3, 3, "B")])
+            .expect_err("two different insertions at one offset must not silently resolve");
+        assert!(format!("{err:#}").contains("disagree"));
+    }
+
+    // Within ONE report, overlapping edits stay go/analysis' problem:
+    // `apply_edits` drops the later one (earliest wins). Merging must not turn
+    // that long-standing behavior into a hard failure.
+    #[test]
+    fn merge_leaves_intra_report_overlaps_to_apply_edits() {
+        let json = br#"{"m": {"l": [
+            {"posn": "a.go:1:1", "message": "x", "suggested_fixes": [{"message": "f", "edits": [
+              {"filename": "a.go", "start": 0, "end": 5, "new": "A"}]}]},
+            {"posn": "a.go:2:1", "message": "y", "suggested_fixes": [{"message": "f", "edits": [
+              {"filename": "a.go", "start": 3, "end": 8, "new": "B"}]}]}
+        ]}}"#;
+        let merged = merge_report_edits(std::slice::from_ref(&json.to_vec())).unwrap();
+        let mut a = merged.into_values().next().unwrap();
+        assert_eq!(a.len(), 2, "both kept; apply_edits arbitrates");
+        assert_eq!(
+            apply_edits(b"0123456789", &mut a).unwrap(),
+            b"A56789",
+            "earliest edit wins, the overlapping one is dropped"
+        );
+    }
+
     #[test]
     fn apply_edits_splices_in_offset_order() {
         let src = b"hello world";
@@ -1869,7 +2045,7 @@ mod tests {
         );
         let s = build_lint_fix_spec(
             addr("lint"),
-            &analyze,
+            std::slice::from_ref(&analyze),
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
             None,
@@ -1920,7 +2096,7 @@ mod tests {
         );
         let spec = build_lint_fix_spec(
             addr("lint"),
-            &analyze,
+            std::slice::from_ref(&analyze),
             &["//mylib:a.go".to_string()],
             &["a.go".to_string()],
             None,
