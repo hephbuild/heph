@@ -229,119 +229,120 @@ impl Engine {
         artifact: &outputartifact::OutputArtifact,
     ) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
         let hashin = hashin.to_string();
-        // `block_or_inline` runs on the current worker via `block_in_place`
-        // (multi-thread) or inline (current-thread). Avoids `spawn_blocking`
-        // whose JoinHandle wake-up uses tokio's cross-thread waker, which
-        // is observed to drop wakeups on macOS under heavy load — see
-        // `RCA_MACOS_WAKER.md`.
-        hproc::process_supervisor::block_or_inline(
-            enclose!((cache => local_cache, addr, artifact) move || {
-                let open_writer =
-                    |name: &str| -> anyhow::Result<Box<dyn io::Write>> {
-                        local_cache.writer(&addr, &hashin, name)
-                    };
-                let type_prefix = match artifact.r#type {
-                    outputartifact::Type::Output => "out",
-                    outputartifact::Type::Log => "log",
-                    outputartifact::Type::SupportFile => "support",
+        // Writing a revision tars and copies every output — the heaviest
+        // synchronous work in a build, once per target. It runs on the dedicated
+        // blocking pool: not inline (that parks a runtime worker with the runtime
+        // unaware, and enough concurrent writes stop the reactor entirely) and not
+        // `spawn_blocking` (whose JoinHandle wake-up rides tokio's cross-thread
+        // waker, observed to drop wakeups on macOS under load — see
+        // `RCA_MACOS_WAKER.md`). See `hcore::blocking`.
+        hcore::blocking::run(enclose!((cache => local_cache, addr, artifact) move || {
+            let open_writer =
+                |name: &str| -> anyhow::Result<Box<dyn io::Write>> {
+                    local_cache.writer(&addr, &hashin, name)
                 };
+            let type_prefix = match artifact.r#type {
+                outputartifact::Type::Output => "out",
+                outputartifact::Type::Log => "log",
+                outputartifact::Type::SupportFile => "support",
+            };
 
-                let (size, content_type, name) = match &artifact.content {
-                    outputartifact::Content::Raw(raw) => {
-                        let name = format!("{}_{}.tar", type_prefix, artifact.name);
-                        let mut cw = CountingWriter::new(
-                            open_writer(&name).with_context(|| {
-                                format!("open cache writer for {addr} {name}")
-                            })?,
-                        );
-                        let mut p = hartifactcontent::tar::TarPacker::new();
-                        p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
-                        p.pack(&mut cw)
-                            .with_context(|| format!("pack raw artifact into {addr} {name}"))?;
-                        (cw.bytes_written(), hartifactcontent::Type::Tar, name)
-                    }
-                    outputartifact::Content::File(file) => {
-                        let name = format!("{}_{}.tar", type_prefix, artifact.name);
-                        let mut cw = CountingWriter::new(
-                            open_writer(&name).with_context(|| {
-                                format!("open cache writer for {addr} {name}")
-                            })?,
-                        );
-                        let mut p = hartifactcontent::tar::TarPacker::new();
-                        p.create_file(file.source_path.clone(), file.out_path.clone());
-                        p.pack(&mut cw).with_context(|| {
-                            format!(
-                                "pack file artifact {} into {addr} {name}",
-                                file.source_path
-                            )
-                        })?;
-                        (cw.bytes_written(), hartifactcontent::Type::Tar, name)
-                    }
-                    outputartifact::Content::TarPath(path) => {
-                        let name = format!("{}_{}", type_prefix, artifact.name);
-                        let mut f = File::open(path)
-                            .with_context(|| format!("open tar artifact {path}"))?;
-                        let size = f
-                            .metadata()
-                            .with_context(|| format!("stat tar artifact {path}"))?
-                            .size();
-                        let mut w = open_writer(&name)
-                            .with_context(|| format!("open cache writer for {addr} {name}"))?;
-                        io::copy(&mut f, &mut w).with_context(|| {
-                            format!("copy tar artifact {path} into {addr} {name}")
-                        })?;
-                        (size, hartifactcontent::Type::Tar, name)
-                    }
-                    outputartifact::Content::CpioPath(path) => {
-                        let name = format!("{}_{}", type_prefix, artifact.name);
-                        let mut f = File::open(path)
-                            .with_context(|| format!("open cpio artifact {path}"))?;
-                        let size = f
-                            .metadata()
-                            .with_context(|| format!("stat cpio artifact {path}"))?
-                            .size();
-                        let mut w = open_writer(&name)
-                            .with_context(|| format!("open cache writer for {addr} {name}"))?;
-                        io::copy(&mut f, &mut w).with_context(|| {
-                            format!("copy cpio artifact {path} into {addr} {name}")
-                        })?;
-                        (size, hartifactcontent::Type::Cpio, name)
-                    }
-                };
+            let (size, content_type, name) = match &artifact.content {
+                outputartifact::Content::Raw(raw) => {
+                    let name = format!("{}_{}.tar", type_prefix, artifact.name);
+                    let mut cw = CountingWriter::new(
+                        open_writer(&name).with_context(|| {
+                            format!("open cache writer for {addr} {name}")
+                        })?,
+                    );
+                    let mut p = hartifactcontent::tar::TarPacker::new();
+                    p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
+                    p.pack(&mut cw)
+                        .with_context(|| format!("pack raw artifact into {addr} {name}"))?;
+                    (cw.bytes_written(), hartifactcontent::Type::Tar, name)
+                }
+                outputartifact::Content::File(file) => {
+                    let name = format!("{}_{}.tar", type_prefix, artifact.name);
+                    let mut cw = CountingWriter::new(
+                        open_writer(&name).with_context(|| {
+                            format!("open cache writer for {addr} {name}")
+                        })?,
+                    );
+                    let mut p = hartifactcontent::tar::TarPacker::new();
+                    p.create_file(file.source_path.clone(), file.out_path.clone());
+                    p.pack(&mut cw).with_context(|| {
+                        format!(
+                            "pack file artifact {} into {addr} {name}",
+                            file.source_path
+                        )
+                    })?;
+                    (cw.bytes_written(), hartifactcontent::Type::Tar, name)
+                }
+                outputartifact::Content::TarPath(path) => {
+                    let name = format!("{}_{}", type_prefix, artifact.name);
+                    let mut f = File::open(path)
+                        .with_context(|| format!("open tar artifact {path}"))?;
+                    let size = f
+                        .metadata()
+                        .with_context(|| format!("stat tar artifact {path}"))?
+                        .size();
+                    let mut w = open_writer(&name)
+                        .with_context(|| format!("open cache writer for {addr} {name}"))?;
+                    io::copy(&mut f, &mut w).with_context(|| {
+                        format!("copy tar artifact {path} into {addr} {name}")
+                    })?;
+                    (size, hartifactcontent::Type::Tar, name)
+                }
+                outputartifact::Content::CpioPath(path) => {
+                    let name = format!("{}_{}", type_prefix, artifact.name);
+                    let mut f = File::open(path)
+                        .with_context(|| format!("open cpio artifact {path}"))?;
+                    let size = f
+                        .metadata()
+                        .with_context(|| format!("stat cpio artifact {path}"))?
+                        .size();
+                    let mut w = open_writer(&name)
+                        .with_context(|| format!("open cache writer for {addr} {name}"))?;
+                    io::copy(&mut f, &mut w).with_context(|| {
+                        format!("copy cpio artifact {path} into {addr} {name}")
+                    })?;
+                    (size, hartifactcontent::Type::Cpio, name)
+                }
+            };
 
-                let artifact_type = match artifact.r#type {
-                    outputartifact::Type::Output => ManifestArtifactType::Output,
-                    outputartifact::Type::Log => ManifestArtifactType::Log,
-                    outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
-                };
+            let artifact_type = match artifact.r#type {
+                outputartifact::Type::Output => ManifestArtifactType::Output,
+                outputartifact::Type::Log => ManifestArtifactType::Log,
+                outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+            };
 
-                anyhow::Ok((
-                    CacheArtifact {
-                        addr: addr.clone(),
-                        hashin: hashin.clone(),
-                        name: name.clone(),
-                        cache: local_cache.clone(),
-                        hashout: artifact.hashout.clone(),
-                        content_type,
-                        group: artifact.group.clone(),
-                        r#type: artifact_type.clone(),
-                        size,
+            anyhow::Ok((
+                CacheArtifact {
+                    addr: addr.clone(),
+                    hashin: hashin.clone(),
+                    name: name.clone(),
+                    cache: local_cache.clone(),
+                    hashout: artifact.hashout.clone(),
+                    content_type,
+                    group: artifact.group.clone(),
+                    r#type: artifact_type.clone(),
+                    size,
+                },
+                ManifestArtifact {
+                    hashout: artifact.hashout.clone(),
+                    group: artifact.group.clone(),
+                    name: name.clone(),
+                    size,
+                    r#type: artifact_type,
+                    content_type: match content_type {
+                        hartifactcontent::Type::Tar => ManifestArtifactContentType::Tar,
+                        hartifactcontent::Type::Cpio => ManifestArtifactContentType::Cpio,
                     },
-                    ManifestArtifact {
-                        hashout: artifact.hashout.clone(),
-                        group: artifact.group.clone(),
-                        name: name.clone(),
-                        size,
-                        r#type: artifact_type,
-                        content_type: match content_type {
-                            hartifactcontent::Type::Tar => ManifestArtifactContentType::Tar,
-                            hartifactcontent::Type::Cpio => ManifestArtifactContentType::Cpio,
-                        },
-                        encoding: ManifestArtifactEncoding::None,
-                    },
-                ))
-            }),
-        )
+                    encoding: ManifestArtifactEncoding::None,
+                },
+            ))
+        }))
+        .await
     }
 
     /// Persist `artifacts` for `addr` under the input hash `hashin`.
@@ -413,7 +414,18 @@ impl Engine {
         addr: &Addr,
         hashin: &str,
     ) -> anyhow::Result<Option<Manifest>> {
-        let sized = match self.local_cache.reader(addr, hashin, MANIFEST_V1) {
+        Self::read_manifest_from(&self.local_cache, addr, hashin)
+    }
+
+    /// [`read_manifest`](Self::read_manifest) against a cache handle rather than
+    /// `&self`, so it can be moved onto the blocking pool (which needs a `'static`
+    /// job — see [`read_manifest_blocking`](Self::read_manifest_blocking)).
+    pub(crate) fn read_manifest_from(
+        cache: &Arc<dyn LocalCache>,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<Manifest>> {
+        let sized = match cache.reader(addr, hashin, MANIFEST_V1) {
             Ok(s) => s,
             Err(e) if e.is::<NotFoundError>() => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("read manifest for {addr} {hashin}")),
@@ -510,14 +522,23 @@ impl Engine {
     /// result hot path. The backend `reader` + `borsh::from_slice` is the expensive
     /// half of a cache lookup, so its result is stashed and reused across the
     /// presence-probe and the per-caller output read (see `LockedResolution::manifest`).
-    /// See `cache_artifact_locally` for why this is `block_or_inline`, not `spawn_blocking`.
+    ///
+    /// On the dedicated blocking pool (see `hcore::blocking`, and
+    /// `cache_artifact_locally` for why neither inline nor `spawn_blocking` works):
+    /// this runs once per target on the hot path, and a backend read plus a borsh
+    /// parse is more than a runtime worker should disappear into.
     pub(crate) async fn read_manifest_blocking(
         &self,
         _ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
     ) -> anyhow::Result<Option<Manifest>> {
-        hproc::process_supervisor::block_or_inline(move || self.read_manifest(addr, hashin))
+        // Cloned rather than borrowed: a pool job outlives a dropped caller future
+        // (cancellation), so it cannot borrow the caller's frame. An `Addr` plus a
+        // hash is a handful of small strings — cheap next to the read itself.
+        let (local_cache, addr, hashin) =
+            (self.local_cache.clone(), addr.clone(), hashin.to_string());
+        hcore::blocking::run(move || Self::read_manifest_from(&local_cache, &addr, &hashin)).await
     }
 
     /// The blobs a caller asking for `outputs` will actually read: its Output
@@ -558,6 +579,12 @@ impl Engine {
         outputs: &[String],
     ) -> anyhow::Result<Vec<String>> {
         let local_cache = &self.local_cache;
+        // Deliberately still inline, unlike the write path: this is a walk of an
+        // already-parsed manifest plus one `exists` stat per needed artifact — no
+        // bytes read, no compression. Moving it to the blocking pool would mean a
+        // `'static` job, so `manifest` and `outputs` would have to be cloned or
+        // re-plumbed as `Arc`s through the whole read path, to take work off the
+        // worker that barely occupies it.
         hproc::process_supervisor::block_or_inline(move || {
             let mut missing = Vec::new();
             for artifact in Self::needed_artifacts(manifest, outputs) {
@@ -588,6 +615,8 @@ impl Engine {
         outputs: &[String],
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
         let local_cache = &self.local_cache;
+        // Inline for the same reason as `missing_local_blobs`: stats and struct
+        // building over a manifest already in memory.
         hproc::process_supervisor::block_or_inline(move || {
             let mut results: Vec<CacheArtifact> = Vec::with_capacity(manifest.artifacts.len());
             let mut result_meta: Vec<ArtifactMeta> = Vec::with_capacity(manifest.artifacts.len());

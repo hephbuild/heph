@@ -17,8 +17,12 @@ use crate::{
 /// execute permits, since every `block_in_place` site parks a runtime worker and
 /// spawns a replacement from the blocking pool. Default `512` is enough today but
 /// silently degrades to inline execution if saturated; the explicit `8 × N + 64`
-/// gives clear headroom for nested `block_or_inline` chains (execute → cache →
-/// plugingo) without ever hitting the cliff.
+/// gives clear headroom without ever hitting the cliff.
+///
+/// The heavy synchronous work — cache writes, gzip, starlark evaluation, the Go
+/// package walks — does *not* draw on this pool: it runs on `hcore::blocking`'s own
+/// dedicated threads, which is what keeps these `n` workers free to poll the
+/// reactor and the timer wheel.
 pub fn build_runtime() -> std::io::Result<Runtime> {
     let n = available_parallelism().map(|p| p.get()).unwrap_or(8);
     Builder::new_multi_thread()

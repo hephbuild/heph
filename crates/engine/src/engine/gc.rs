@@ -253,9 +253,9 @@ impl Engine {
         // TTL and rows whose path no longer exists. Best-effort — a prune failure
         // never fails the artifact GC.
         let walker = self.walker.clone();
-        match hproc::process_supervisor::block_or_inline(move || {
-            walker.prune(hwalk::cached_walker::DEFAULT_TTL, true)
-        }) {
+        match hcore::blocking::run(move || walker.prune(hwalk::cached_walker::DEFAULT_TTL, true))
+            .await
+        {
             Ok(n) => stats.fswalk_rows_removed = n,
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "fswalk prune failed"),
         }
@@ -263,8 +263,7 @@ impl Engine {
         // Clear staged read-only inputs — a pure cache, re-materialized on
         // demand — respecting each entry's advisory lock.
         let engine = Arc::clone(&self);
-        let (stage_removed, stage_bytes) =
-            hproc::process_supervisor::block_or_inline(move || engine.gc_stage());
+        let (stage_removed, stage_bytes) = hcore::blocking::run(move || engine.gc_stage()).await;
         stats.stage_entries_removed = stage_removed;
         stats.bytes_removed = stats.bytes_removed.saturating_add(stage_bytes);
 

@@ -33,12 +33,13 @@ impl PipeSemaphore {
 
     /// Blocks the calling thread until a permit is available.
     ///
-    /// **Contract:** callers must be on a thread that may block — either a
-    /// dedicated OS thread (e.g. the sqlite writer thread, rayon pool) or a
-    /// tokio worker that has handed off its core via
-    /// `hproc::process_supervisor::block_or_inline` /
+    /// **Contract:** callers must be on a thread that may block — a dedicated OS
+    /// thread (the sqlite writer thread, the `hcore::blocking` pool, a rayon
+    /// worker) or a tokio worker that has handed off its core via
     /// `tokio::task::block_in_place`. Calling this directly from a tokio task
-    /// parks the worker and can starve the runtime.
+    /// parks the worker and can starve the runtime; so does
+    /// `hproc::process_supervisor::block_or_inline`, which on Linux *is* inline on
+    /// the worker — the cache write path goes through `hcore::blocking` instead.
     fn acquire(self: &Arc<Self>) -> PipePermit {
         let mut count = self.count.lock().expect("pipe semaphore mutex poisoned");
         while *count == 0 {

@@ -2093,11 +2093,12 @@ impl Engine {
         // Blob copy is synchronous IO — run it off the async poll like every
         // other cache write (see `cache_artifact_locally`).
         let primary = opts.hashin.clone();
-        let dup = hproc::process_supervisor::block_or_inline(enclose!(
+        let dup = hcore::blocking::run(enclose!(
             (self => engine, addr, fixpoint, primary) move || {
                 engine.duplicate_cache_revision(&addr, &primary, &fixpoint)
             }
-        ));
+        ))
+        .await;
         if let Err(e) = dup {
             // Best-effort: the primary cache entry is already written, so a
             // failure here just means the next run re-executes instead of

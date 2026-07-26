@@ -338,13 +338,14 @@ impl EProvider for Provider {
                 .once(
                     (),
                     enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip, self.walker => walker) move || async move {
-                        let packages = hproc::process_supervisor::block_or_inline(move || {
+                        let packages = hcore::blocking::run(move || {
                             // Recursion reads dirs through the shared walker, so an
                             // unchanged tree is served from the cross-run fswalk cache.
                             let mut packages = std::collections::HashSet::new();
                             find_packages_sync(&walker, &root, &root, &patterns, &skip, &mut packages)?;
                             Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
-                        })?;
+                        })
+                        .await?;
                         Ok(Arc::new(packages))
                     }),
                 )

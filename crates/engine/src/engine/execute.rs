@@ -200,15 +200,14 @@ impl Engine {
     }
 }
 
-/// Run a synchronous `std::fs` operation on the current tokio worker
-/// thread via `block_in_place` (on multi-thread runtime) or directly (on
-/// current-thread, e.g. tests). `tokio::fs::*` routes through
-/// `spawn_blocking` and has been observed to lose wake-ups on macOS
-/// under heavy load; doing the fs op on the worker is the path that
-/// surely makes progress.
+/// Run a synchronous `std::fs` operation on the dedicated blocking pool.
+///
+/// Not `tokio::fs::*` (which routes through `spawn_blocking`, observed to lose
+/// wake-ups on macOS under heavy load) and not inline on the worker (which parks
+/// it without telling the runtime). See `hcore::blocking`.
 async fn sync_fs_op_on_thread<F>(f: F) -> std::io::Result<()>
 where
     F: FnOnce() -> std::io::Result<()> + Send + 'static,
 {
-    hproc::process_supervisor::block_or_inline(f)
+    hcore::blocking::run(f).await
 }
