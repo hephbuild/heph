@@ -2,6 +2,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hartifactcontent;
 use hcore::hasync::{self, Cancellable};
+use hmodel::htaddr::Addr;
 use hplugin::driver::inputartifact;
 use hplugin::driver::outputartifact::Content::TarPath;
 use hplugin::driver::targetdef::path::{self, Content};
@@ -392,16 +393,17 @@ pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {
 /// last-write-wins in the sandbox (regular deps `File::create`-truncate; FUSE
 /// layers shadow by registration order — neither surfaces the conflict).
 pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> anyhow::Result<()> {
-    // Absolute sandbox path -> the source_addr of the target that claimed it.
-    let mut owners: HashMap<PathBuf, String> = HashMap::new();
+    // Absolute sandbox path -> the target that claimed it.
+    let mut owners: HashMap<PathBuf, Addr> = HashMap::new();
     for (unpack_root, inputs) in groups {
         for input in inputs {
-            let producer = input.source_addr.format();
+            let producer = &input.source_addr;
             let paths = input.artifact.content.entry_paths().with_context(|| {
                 format!(
                     "enumerate paths for output-collision check \
-                     (origin_id={}, source_addr={producer})",
+                     (origin_id={}, source_addr={})",
                     input.origin_id,
+                    producer.format(),
                 )
             })?;
             for rel in paths {
@@ -412,12 +414,26 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
                 }
                 let abs = unpack_root.join(&rel);
                 match owners.get(&abs) {
-                    Some(existing) if *existing != producer => anyhow::bail!(
-                        "output collision: {} is produced by two different targets \
-                         ({existing} and {producer}); a sandbox file may be provided by \
-                         only one target",
-                        abs.display(),
-                    ),
+                    Some(existing) if existing != producer => {
+                        // Two fs-provider inputs (e.g. a `glob` and a specific
+                        // `file`) claiming the same path expose the *same*
+                        // workspace source bytes — the fs provider only surfaces
+                        // existing files, it never materializes — so this overlap
+                        // is benign (last-writer-wins is safe when the bytes
+                        // match). Allow it, keeping the first owner. Mirrors the
+                        // `validate` codegen-overlap exemption. Any collision
+                        // involving a non-fs producer is still a hard error.
+                        if is_fs_source(existing) && is_fs_source(producer) {
+                            continue;
+                        }
+                        anyhow::bail!(
+                            "output collision: {} is produced by two different targets \
+                             ({} and {}); a sandbox file may be provided by only one target",
+                            abs.display(),
+                            existing.format(),
+                            producer.format(),
+                        )
+                    }
                     // Same producer (diamond / depended twice) — one owner, allowed.
                     Some(_) => {}
                     None => {
@@ -428,6 +444,17 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
         }
     }
     Ok(())
+}
+
+/// The fs provider's package. Its `file`/`glob` targets only expose existing
+/// workspace source (never materialize), so two of them claiming the same
+/// sandbox path provide identical bytes — a benign overlap. Kept as a literal to
+/// avoid a `driver-support` → `builtins` dependency (would cycle); mirrors
+/// `hbuiltins::pluginfs::is_fs_addr`.
+const FS_PROVIDER_PKG: &str = "@heph/fs";
+
+fn is_fs_source(addr: &Addr) -> bool {
+    addr.package.as_str() == FS_PROVIDER_PKG
 }
 
 // ---------------------------------------------------------------------
@@ -776,6 +803,44 @@ mod source_map_tests {
             "must name both producers: {msg}"
         );
         assert!(msg.contains("pkg/x.txt"), "must name the path: {msg}");
+    }
+
+    // Two fs-provider inputs (a glob and a specific file) claiming the same path
+    // expose the same workspace source, so the overlap is allowed.
+    #[test]
+    fn two_fs_provider_inputs_same_path_allowed() {
+        let groups = group(vec![
+            make_input(
+                "dep|glob|0",
+                "//@heph/fs:glob@p=mgmt/tsconfig*.json",
+                &[("mgmt/tsconfig.lib.json", "{}")],
+            ),
+            make_input(
+                "dep|file|0",
+                "//@heph/fs:file@f=mgmt/tsconfig.lib.json",
+                &[("mgmt/tsconfig.lib.json", "{}")],
+            ),
+        ]);
+        detect_output_collisions(&groups).expect("two fs deps overlapping must be allowed");
+    }
+
+    // The exemption is fs-only: an fs input colliding with a real (non-fs)
+    // producer is still a hard error.
+    #[test]
+    fn fs_vs_non_fs_collision_still_errors() {
+        let groups = group(vec![
+            make_input(
+                "dep|glob|0",
+                "//@heph/fs:glob@p=mgmt/*.json",
+                &[("mgmt/x.json", "1")],
+            ),
+            make_input("dep|gen|0", "//mgmt:gen", &[("mgmt/x.json", "2")]),
+        ]);
+        let err = detect_output_collisions(&groups).expect_err("fs vs non-fs must collide");
+        assert!(
+            format!("{err:#}").contains("two different targets"),
+            "{err:#}"
+        );
     }
 
     // The same target contributing a path twice (diamond dep / depended twice)

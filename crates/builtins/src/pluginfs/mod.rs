@@ -100,6 +100,12 @@ pub fn is_glob_addr(addr: &Addr) -> bool {
     addr.package.as_str() == PKG && addr.name == "glob"
 }
 
+/// Returns `true` if `addr` is any fs-provider target (e.g. `file`/`glob`), i.e.
+/// it lives in the fs provider's package.
+pub fn is_fs_addr(addr: &Addr) -> bool {
+    addr.package.as_str() == PKG
+}
+
 // ─── Provider ────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
