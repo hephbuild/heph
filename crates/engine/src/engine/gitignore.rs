@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use enclose::enclose;
 use futures::TryStreamExt;
 
 use crate::engine::Engine;
@@ -99,36 +100,54 @@ impl Engine {
         rs: Arc<RequestState>,
         matcher: &Matcher,
     ) -> anyhow::Result<Vec<GitignoreEntry>> {
-        let mut entries: Vec<GitignoreEntry> = Vec::new();
-        let stream = Arc::clone(&self).query(rs.clone(), matcher);
-        tokio::pin!(stream);
-        while let Some(addr) = stream.try_next().await? {
-            // A provider may `list` an addr it cannot `get` standalone (e.g. go's
-            // `//pkg:build` for a non-main package, resolved only as an in-context
-            // dep). Such a target emits no codegen-copy output here, so skip it on
-            // a self-addr NotFound — matching the query resolver and `validate`.
-            // Any other failure propagates.
-            let def = match Arc::clone(&self).get_def(rs.clone(), &addr).await {
-                Ok(def) => def,
-                Err(e)
-                    if downcast_chain_ref::<TargetNotFoundError>(&e)
-                        .is_some_and(|nf| nf.addr == addr) =>
-                {
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            for output in &def.target_def.outputs {
-                for path in &output.paths {
-                    if path.codegen_tree == CodegenMode::Copy {
-                        entries.push(GitignoreEntry {
-                            pattern: content_to_pattern(&path.content),
-                            addr: Some(addr.clone()),
-                        });
-                    }
-                }
+        // Drain the addr stream first, then fan the def fetches out in parallel
+        // (each shares parse work through the per-request memoizer, like
+        // `codegen_copy_overlaps`). The sequential await-per-addr loop this
+        // replaced serialized every `get_def`.
+        let addrs: Vec<Addr> = {
+            let stream = Arc::clone(&self).query(rs.clone(), matcher);
+            tokio::pin!(stream);
+            let mut v = Vec::new();
+            while let Some(addr) = stream.try_next().await? {
+                v.push(addr);
             }
-        }
+            v
+        };
+
+        let fail_fast = rs.fail_fast();
+        let futs = addrs.iter().map(|addr| {
+            enclose!((self => engine, rs, addr) async move {
+                // A provider may `list` an addr it cannot `get` standalone (e.g.
+                // go's `//pkg:build` for a non-main package, resolved only as an
+                // in-context dep). Such a target emits no codegen-copy output here,
+                // so skip it on a self-addr NotFound — matching the query resolver
+                // and `validate`. Any other failure propagates.
+                let def = match engine.get_def(rs, &addr).await {
+                    Ok(def) => def,
+                    Err(e)
+                        if downcast_chain_ref::<TargetNotFoundError>(&e)
+                            .is_some_and(|nf| nf.addr == addr) =>
+                    {
+                        return Ok(Vec::new());
+                    }
+                    Err(e) => return Err(e),
+                };
+                let entries: Vec<GitignoreEntry> = def
+                    .target_def
+                    .outputs
+                    .iter()
+                    .flat_map(|output| output.paths.iter())
+                    .filter(|path| path.codegen_tree == CodegenMode::Copy)
+                    .map(|path| GitignoreEntry {
+                        pattern: content_to_pattern(&path.content),
+                        addr: Some(addr.clone()),
+                    })
+                    .collect();
+                Ok::<Vec<GitignoreEntry>, anyhow::Error>(entries)
+            })
+        });
+        let per_target = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
+        let entries: Vec<GitignoreEntry> = per_target.into_iter().flatten().collect();
         Ok(normalize(entries))
     }
 }
@@ -586,6 +605,72 @@ mod tests {
         {
             Box::pin(async { Ok(crate::engine::provider::ProbeResponse { states: vec![] }) })
         }
+    }
+
+    // Several targets are enumerated concurrently, so completion order is
+    // nondeterministic. The result must not be: every entry is present exactly
+    // once, sorted by pattern, and attributed to its emitting target.
+    #[tokio::test]
+    async fn entries_from_many_targets_are_complete_and_sorted() -> anyhow::Result<()> {
+        use hmodel::htaddr::Addr;
+        use std::collections::HashMap;
+
+        fn codegen_target(addr: &str, out: &str) -> hbuiltins::pluginstatictarget::Target {
+            let mut outs = HashMap::new();
+            outs.insert(String::new(), vec![out.to_string()]);
+            hbuiltins::pluginstatictarget::Target {
+                addr: addr.to_string(),
+                driver: "exec".to_string(),
+                run: Some("true".to_string()),
+                out: outs,
+                codegen: Some("copy".to_string()),
+                ..Default::default()
+            }
+        }
+
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        // Declared in an order that does not match the sorted pattern order, so a
+        // stable result cannot come from insertion order alone.
+        let provider = hbuiltins::pluginstatictarget::Provider::new(vec![
+            codegen_target("//z:t", "z_gen.go"),
+            codegen_target("//a:t", "a_gen.go"),
+            codegen_target("//m:t", "m_gen.go"),
+        ])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let entries = Arc::clone(&engine)
+            .codegen_copy_gitignore_patterns(rs, &Matcher::TreeOutputTo(PkgBuf::from("")))
+            .await?;
+
+        let got: Vec<(&str, String)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.pattern.as_str(),
+                    e.addr.as_ref().map(Addr::format).unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/a/a_gen.go", "//a:t".to_string()),
+                ("/m/m_gen.go", "//m:t".to_string()),
+                ("/z/z_gen.go", "//z:t".to_string()),
+            ],
+            "entries must be complete, attributed, and pattern-sorted: {entries:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
