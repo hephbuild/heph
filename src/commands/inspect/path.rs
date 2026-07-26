@@ -6,6 +6,7 @@ use clap_complete::engine::ArgValueCompleter;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::utils::resolve_addr;
 use crate::engine::Engine;
 use crate::htaddr::Addr;
 use crate::tui::{self, App, AppContext, LogSink};
@@ -90,8 +91,8 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 }
 
 async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let a = super::revdeps::resolve_addr(args.a.as_ref())?;
-    let b = super::revdeps::resolve_addr(args.b.as_ref())?;
+    let a = resolve_addr(args.a.as_ref())?;
+    let b = resolve_addr(args.b.as_ref())?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = PathApp {
         engine,
