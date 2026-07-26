@@ -9,6 +9,7 @@ mod packages;
 mod path;
 mod revdeps;
 mod spec;
+mod states;
 
 use clap::{Args, Subcommand};
 
@@ -127,6 +128,31 @@ pub enum InspectCommands {
     ///
     /// `heph inspect path //cmd/server:bin //lib:core --no-transitive`
     Path(path::Args),
+    /// Show the `provider_state(...)` declared across the package tree
+    ///
+    /// A `provider_state(provider="X", …)` call in a BUILD file configures
+    /// provider `X` for that package and — depending on the provider — its
+    /// descendants. This prints where those declarations live and what they
+    /// carry: a `//pkg` header per package, then one line per state as
+    /// `<provider>  <field>=<json> …`. Packages declaring nothing are omitted,
+    /// so empty output means "no state here".
+    ///
+    /// Pass --inherited to see the whole chain a provider is handed for a
+    /// package — its own declarations plus every ancestor's — each line
+    /// prefixed with the package that declared it, root first. Which of two
+    /// declarations wins is the provider's own policy; this only reports what
+    /// applies.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect states` — every declaration in the workspace
+    ///
+    /// `heph inspect states //cmd/...`
+    ///
+    /// `heph inspect states //cmd/server --inherited` — what applies there
+    ///
+    /// `heph inspect states -p go --json`
+    States(states::Args),
     /// List provider-exposed functions (`heph.<provider>.<fn>`)
     ///
     /// Prints every function registered by a provider for use in BUILD files,
@@ -158,6 +184,7 @@ impl InspectCommands {
             InspectCommands::Deps(args) => deps::execute(args, sink, global),
             InspectCommands::Revdeps(args) => revdeps::execute(args, sink, global),
             InspectCommands::Path(args) => path::execute(args, sink, global),
+            InspectCommands::States(args) => states::execute(args, sink, global),
             InspectCommands::Functions(args) => functions::execute(args, sink, global),
         }
     }
