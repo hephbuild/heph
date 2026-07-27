@@ -22,7 +22,7 @@ use hmodel::htpkg::PkgBuf;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::grow_stack::{GrowStack, grow_stack};
 use crate::engine::link::LinkedTargetDef;
-use crate::engine::local_cache::{CacheArtifact, Manifest, ManifestArtifactType};
+use crate::engine::local_cache::{BlobResidency, CacheArtifact, Manifest, ManifestArtifactType};
 use crate::engine::remote_cache::RemoteRevision;
 use crate::engine::result_lock::ResultReadGuard;
 use anyhow::Context;
@@ -1270,8 +1270,13 @@ impl Engine {
                         // the entry was confirmed, then the bytes went away. Both
                         // that and a local blob that vanished fall through to
                         // `unavailable` below.
-                        let served = match &locked.remote {
-                            Some(rev) => {
+                        // A remote materialization has already probed every needed
+                        // blob and pulled the rest, so the read below must not
+                        // probe them again — those keys are freshly *queued* to
+                        // the sqlite writer, and re-probing parks a tokio worker
+                        // on the batch commit. See `BlobResidency`.
+                        let (served, residency) = match &locked.remote {
+                            Some(rev) => (
                                 self.materialize_from_remote(
                                     &rs,
                                     &def.target.addr,
@@ -1280,9 +1285,10 @@ impl Engine {
                                     &outputs,
                                     rev,
                                 )
-                                .await?
-                            }
-                            None => true,
+                                .await?,
+                                BlobResidency::Established,
+                            ),
+                            None => (true, BlobResidency::Unknown),
                         };
                         if served {
                             self.artifacts_from_manifest(
@@ -1291,6 +1297,7 @@ impl Engine {
                                 opts.hashin.as_str(),
                                 manifest,
                                 &outputs,
+                                residency,
                             )
                             .await?
                         } else {

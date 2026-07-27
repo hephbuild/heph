@@ -62,6 +62,31 @@ pub enum ManifestArtifactType {
     SupportFile,
 }
 
+/// Whether the caller already knows every needed blob is in the local cache.
+///
+/// The per-blob `exists` in [`Engine::artifacts_from_manifest`] is not free. It
+/// takes a pooled sqlite connection, and — because a write is only *queued* to
+/// the single writer thread, not committed — a key written moments ago is still
+/// pending, so the probe parks on an untimed condvar until the writer's next
+/// batch drains. On the remote-hit path that probe runs inline on a tokio
+/// worker, so `n` concurrent hits park `n` workers on a batch commit, and the
+/// reactor, the timer wheel, the in-flight transfers and the TUI stop with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobResidency {
+    /// Nothing has looked yet — probe each needed blob, and degrade the hit to a
+    /// miss if one is gone. The state of a plain local hit, where the manifest
+    /// may well outlive the blobs a GC reclaimed.
+    Unknown,
+    /// Every needed blob was just confirmed present or pulled, by
+    /// `Engine::materialize_from_remote` over exactly this artifact set
+    /// ([`Engine::needed_artifacts`] is shared by both paths). Re-probing has
+    /// nothing left to learn, and skipping it does not skip the wait so much as
+    /// move it to whoever actually reads the bytes — `reader` does its own
+    /// `wait_if_pending`. A caller that only needed the hashouts, the common case
+    /// in a fully-cached build, then never waits at all.
+    Established,
+}
+
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ManifestArtifact {
     pub hashout: String,
@@ -606,6 +631,9 @@ impl Engine {
     /// when a required blob is missing — treat as a miss. Splitting this from
     /// [`read_manifest`](Self::read_manifest) lets a confirmed hit reuse the parsed
     /// manifest instead of re-reading + re-deserializing it for each caller.
+    ///
+    /// `residency` says whether the per-blob probe is still needed — see
+    /// [`BlobResidency`].
     pub(crate) async fn artifacts_from_manifest(
         &self,
         _ctoken: &dyn Cancellable,
@@ -613,6 +641,7 @@ impl Engine {
         hashin: &str,
         manifest: &Manifest,
         outputs: &[String],
+        residency: BlobResidency,
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
         let local_cache = &self.local_cache;
         // Inline for the same reason as `missing_local_blobs`: stats and struct
@@ -643,7 +672,9 @@ impl Engine {
                     continue;
                 }
 
-                if !local_cache.exists(addr, hashin, artifact.name.as_ref())? {
+                if residency == BlobResidency::Unknown
+                    && !local_cache.exists(addr, hashin, artifact.name.as_ref())?
+                {
                     return Ok(None);
                 }
 
@@ -680,8 +711,17 @@ impl Engine {
         else {
             return Ok(None);
         };
-        self.artifacts_from_manifest(ctoken, &def.target.addr, hashin, &manifest, &outputs)
-            .await
+        self.artifacts_from_manifest(
+            ctoken,
+            &def.target.addr,
+            hashin,
+            &manifest,
+            &outputs,
+            // Nothing has established residency for this manifest: it may name
+            // blobs a GC has since reclaimed.
+            BlobResidency::Unknown,
+        )
+        .await
     }
 }
 
@@ -806,6 +846,73 @@ mod tests {
                 .reader,
         );
         assert!(!bytes.is_empty());
+    }
+
+    /// After a remote materialization, the per-blob `exists` in
+    /// `artifacts_from_manifest` has nothing left to learn — the same artifact
+    /// set was just probed and pulled. It is not merely redundant: those keys are
+    /// freshly *queued* to the single sqlite writer, so re-probing parks on the
+    /// pending slot's untimed condvar until the batch drains, on a path that runs
+    /// inline on a tokio worker.
+    ///
+    /// Asserted by the shape that separates the two answers: a manifest whose
+    /// blob is *not* in the local cache. `Unknown` has to probe and therefore
+    /// reports a miss; `Established` cannot be probing, because it serves the
+    /// read.
+    #[tokio::test]
+    async fn established_residency_does_not_re_probe_the_local_cache() {
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let (engine, _dir) = engine_with_remote("file:///dev/null/unused");
+
+        // A manifest that names a blob nobody ever wrote.
+        let manifest = Manifest {
+            version: "1.0.0".to_string(),
+            target: addr.format(),
+            created_at_nanos: 0,
+            hashin: "HASHRES".to_string(),
+            artifacts: vec![ManifestArtifact {
+                hashout: "HO".to_string(),
+                group: "out".to_string(),
+                name: "absent.tar".to_string(),
+                size: 1,
+                r#type: ManifestArtifactType::Output,
+                content_type: ManifestArtifactContentType::Tar,
+                encoding: ManifestArtifactEncoding::None,
+            }],
+        };
+        let outputs = vec!["out".to_string()];
+
+        assert!(
+            engine
+                .artifacts_from_manifest(
+                    &ctoken,
+                    &addr,
+                    "HASHRES",
+                    &manifest,
+                    &outputs,
+                    BlobResidency::Unknown,
+                )
+                .await
+                .expect("read")
+                .is_none(),
+            "an unprobed manifest whose blob is gone must degrade to a miss"
+        );
+
+        let (arts, meta) = engine
+            .artifacts_from_manifest(
+                &ctoken,
+                &addr,
+                "HASHRES",
+                &manifest,
+                &outputs,
+                BlobResidency::Established,
+            )
+            .await
+            .expect("read")
+            .expect("established residency must serve without probing");
+        assert_eq!(arts.len(), 1, "the artifact set is still built in full");
+        assert_eq!(meta.len(), 1);
     }
 
     /// The background upload bumps the request's `bg_pending` counter and drops
