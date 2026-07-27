@@ -27,7 +27,7 @@ A per-platform difference is sometimes the right answer, but it is **the user's 
 
 - **OS axis** (Linux vs macOS): a `#[cfg(target_os = …)]` semantics split, a Linux-only mechanism, a macOS path that degrades, a one-OS-only dependency.
 - **Arch axis** (x86_64 vs aarch64): a `#[cfg(target_arch = …)]` split, intrinsics/SIMD/inline asm with no counterpart, an arch-gated dependency. Memory ordering is the sharp edge — aarch64 is weakly ordered where x86_64 is TSO, so a `Relaxed`/`Acquire` mistake that is benign on x86_64 is a live race on ARM. Reason about orderings from the model, not from "it passed on my machine".
-- **Test coverage is narrower than the build matrix.** CI tests only `linux/amd64` and `darwin/arm64`; `linux/arm64` is cross-compiled and shipped without ever running a test, and `darwin/amd64` is not built at all. Anything whose behavior is arch- or OS-conditional has an uncovered combination by construction — say so rather than assuming CI caught it.
+- **CI runs the suite natively on all three supported targets** — `linux/amd64` (`ubuntu-latest`), `linux/arm64` (`ubuntu-24.04-arm`), `darwin/arm64` (`macos-latest`). Both axes are covered on both OSes, so a green CI does exercise an arch-conditional change. Two gaps remain: the shipped `linux/arm64` binary is cross-compiled (`cargo zigbuild` on an amd64 runner) while its test job builds natively, so a toolchain-specific break in the release artifact is untested; and `darwin/amd64` is neither built nor tested (it is not a supported target). Ordering bugs are still worth reasoning about from the memory model — aarch64 CI catches the ones that happen to manifest, not the ones that are merely possible.
 
 ## Error Handling
 
