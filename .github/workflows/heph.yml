@@ -451,6 +451,16 @@ jobs:
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
 
+          # Linux ARM64 (Native). ubuntu-24.04-arm is free for public repos and
+          # is the only place aarch64-linux is exercised at all — the build job
+          # cross-compiles it, so without this job the target shipped with no
+          # test ever run against it. Pairs with darwin/arm64 to give the arch
+          # axis coverage on both OSes rather than only on macOS.
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+
           # macOS ARM64 (Apple Silicon natively runs on macos-latest)
           - os: darwin
             arch: arm64
