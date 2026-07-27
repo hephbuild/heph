@@ -29,10 +29,8 @@ pub fn rows_for_height(term_height: u16) -> u16 {
 }
 
 /// Slice `lines` to a `rows`-tall window starting at `scroll`, returning the
-/// window and the clamped scroll offset. When content extends past the window
-/// bottom, the last visible row is replaced by a combined `+N more` collapse
-/// that counts *every* hidden line below (slow targets and lock waits alike).
-/// Scroll is clamped so the window never runs off the end.
+/// window and the clamped scroll offset. Scroll is clamped so the window never
+/// runs off the end. The scroll indicator in the bottom border conveys overflow.
 fn windowed(
     mut lines: Vec<Line<'static>>,
     rows: usize,
@@ -47,15 +45,7 @@ fn windowed(
     }
     let max_scroll = total - rows;
     let scroll = scroll.min(max_scroll);
-    let mut window: Vec<Line<'static>> = lines.drain(scroll..scroll + rows).collect();
-    // Rows still hidden below the window. The collapse line itself displaces one
-    // shown row, so the reported count is the hidden rows plus that displaced one.
-    let hidden_below = max_scroll - scroll;
-    if hidden_below > 0
-        && let Some(last) = window.last_mut()
-    {
-        *last = Line::from(format!("  +{} more", hidden_below + 1));
-    }
+    let window: Vec<Line<'static>> = lines.drain(scroll..scroll + rows).collect();
     (window, scroll)
 }
 
@@ -924,9 +914,7 @@ impl BuildState {
 
     /// The long-running ("slow") target rows, one per slow target and uncollapsed:
     /// `addr (icon Ns)…` — one `(icon Ns)` group per op the target passed through
-    /// or is in. The collapse into a "+N more" line is applied later, over the
-    /// *combined* slow + lock-wait body (see [`BuildState::body_lines`]), so the
-    /// overflow count covers both kinds of rows together.
+    /// or is in.
     fn slow_rows(&self, now_ms: u64) -> Vec<Line<'static>> {
         self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS)
             .into_iter()
@@ -941,8 +929,7 @@ impl BuildState {
     }
 
     /// The full body: lock-wait notices first (they take priority), then every
-    /// slow-target row. Uncollapsed — the caller windows/collapses it to the
-    /// available rows, so a "+N more" count spans locks and slow rows alike.
+    /// slow-target row. Uncollapsed — the caller windows it to the available rows.
     pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
         let mut body = self.lock_wait_lines();
         body.extend(self.slow_rows(now_ms));
@@ -1639,7 +1626,7 @@ impl TUIAppView for TuiProgressView {
     /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
     /// ```text
     /// ╭─ heph · N built · N cached · N running · N failed ──── <workers> ─╮
-    ///   <slow rows + lock waits, scrollable, collapsed to "+N more">
+    ///   <slow rows + lock waits, scrollable>
     /// ╰─── <label> ───────────────────────────────────────────────────────╯
     ///   ↑/↓ scroll
     /// ```
@@ -2441,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn render_fits_within_progress_rows_and_collapses_slow_block() {
+    fn render_fits_within_progress_rows_and_shows_scroll_indicator() {
         let mut v = TuiProgressView::new("Running //x:y");
         // 20 long-running targets, all started at 0.
         for i in 0..20 {
@@ -2451,15 +2438,13 @@ mod tests {
         let lines = v.render("⠋", 10_000, 100, height);
         // The box fills exactly the rows it was given.
         assert_eq!(lines.len(), usize::from(height));
-        // The bottom border (second-to-last row) carries the label.
+        // The bottom border (second-to-last row) carries the label and scroll indicator.
         let footer = format!("{}", lines[lines.len() - 2]);
         assert!(footer.contains("Running //x:y"), "{footer}");
-        // 20 slow rows can't fit the small body, so a "+N more" collapse appears.
+        // 20 slow rows can't fit the small body, so the scroll indicator appears.
         assert!(
-            lines[1..lines.len() - 2]
-                .iter()
-                .any(|l| format!("{l}").contains("more")),
-            "expected collapse line in body, got {lines:?}"
+            footer.contains("↑ 1–5 of 20 ↓"),
+            "expected scroll indicator in footer, got {footer}"
         );
     }
 
@@ -2661,24 +2646,22 @@ mod tests {
     }
 
     #[test]
-    fn body_collapse_counts_locks_and_slow_together() {
-        // 2 lock waits + 4 slow targets = 6 body rows. Regression: the old
-        // collapse counted only the slow overflow and ignored hidden lock rows.
+    fn scroll_indicator_covers_locks_and_slow_together() {
+        // 2 lock waits + 4 slow targets = 6 body rows. The scroll indicator
+        // must reflect the combined total, not just slow overflow.
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, lock_wait_start("//l:1", 1)));
         v.apply(&ev(0, lock_wait_start("//l:2", 2)));
         for i in 0..4 {
             v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
         }
-        // height 7 → body_rows = 4. 6 items > 4 ⇒ window shows 3 + a collapse.
-        // total=6, body_rows=4, max_scroll=2, scroll=0 ⇒ hidden_below=2 ⇒ +3 more.
+        // height 7 → body_rows = 4. 6 items > 4 ⇒ scroll indicator shows 1–4 of 6.
         let lines = v.render("⠋", 10_000, 80, 7);
-        let collapse = lines
-            .iter()
-            .map(|l| format!("{l}"))
-            .find(|t| t.contains("more"))
-            .expect("collapse line");
-        assert!(collapse.contains("+3 more"), "{collapse}");
+        let footer = format!("{}", lines[lines.len() - 2]);
+        assert!(
+            footer.contains("↑ 1–4 of 6 ↓"),
+            "expected scroll indicator, got {footer}"
+        );
     }
 
     #[test]
@@ -3094,22 +3077,22 @@ mod tests {
             v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
         }
         // body_rows = 4, 6 slow rows, max_scroll = 2.
-        // Scroll past the end; render clamps to the bottom ⇒ no collapse there.
+        // Scroll past the end; render clamps to the bottom ⇒ indicator shows 3–6.
         v.scroll(10);
-        let body: String = v
-            .render("⠋", 10_000, 80, 7)
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(!body.contains("more"), "no collapse at bottom: {body}");
-        // Back to the top: the collapse returns.
+        let lines = v.render("⠋", 10_000, 80, 7);
+        let bottom = format!("{}", lines[lines.len() - 2]);
+        assert!(
+            bottom.contains("↑ 3–6 of 6 ↓"),
+            "indicator at bottom: {bottom}"
+        );
+        // Back to the top: indicator shows 1–4.
         v.scroll(-10);
-        let body: String = v
-            .render("⠋", 10_000, 80, 7)
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(body.contains("more"), "collapse at top: {body}");
+        let lines = v.render("⠋", 10_000, 80, 7);
+        let bottom = format!("{}", lines[lines.len() - 2]);
+        assert!(
+            bottom.contains("↑ 1–4 of 6 ↓"),
+            "indicator at top: {bottom}"
+        );
     }
 
     #[test]
