@@ -14,13 +14,17 @@ mod common;
 
 use common::Dist;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// CSI ?1049h / ?1049l — enter and leave the alternate screen.
 const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
+
+/// CSI 6n — Device Status Report, "where is the cursor?". The child blocks on
+/// the reply, so the harness must answer it the way a real terminal would.
+const DSR_CURSOR: &[u8] = b"\x1b[6n";
 
 /// Generous: this spawns a release binary that builds a target, on a shared CI
 /// runner. Long enough never to be the flake, short enough to fail the job
@@ -142,17 +146,46 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let mut writer = pair.master.take_writer().expect("take pty writer");
     let captured = Arc::new(Mutex::new((Vec::<u8>::new(), String::new())));
     let sink = Arc::clone(&captured);
     let pump = std::thread::spawn(move || {
         let mut parser = vt100::Parser::new(ROWS, COLS, 0);
         let mut buf = [0u8; 8192];
+        // A pty is a pipe, not a terminal: nothing on this end answers queries.
+        // The TUI asks where the cursor is (DSR) while setting up its inline
+        // viewport and blocks until the terminal replies, so a harness that only
+        // reads deadlocks the child. `tail` carries the last few bytes across
+        // reads in case a request straddles a chunk boundary.
+        let mut tail = Vec::<u8>::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let Some(chunk) = buf.get(..n) else { break };
                     parser.process(chunk);
+
+                    tail.extend_from_slice(chunk);
+                    let replies = tail
+                        .windows(DSR_CURSOR.len())
+                        .filter(|w| *w == DSR_CURSOR)
+                        .count();
+                    for _ in 0..replies {
+                        // Cursor at row 1, column 1 — the state a fresh terminal
+                        // is in. The value only positions the inline viewport.
+                        if writer.write_all(b"\x1b[1;1R").is_err() || writer.flush().is_err() {
+                            break;
+                        }
+                    }
+                    // Keep only enough tail to catch a split request, and drop
+                    // anything already answered.
+                    if replies > 0 {
+                        tail.clear();
+                    } else if tail.len() > DSR_CURSOR.len() {
+                        let keep = tail.len() - (DSR_CURSOR.len() - 1);
+                        tail.drain(..keep);
+                    }
+
                     let screen = parser.screen().contents();
                     let mut guard = sink.lock().expect("capture lock");
                     guard.0.extend_from_slice(chunk);
