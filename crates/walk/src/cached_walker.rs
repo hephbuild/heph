@@ -487,11 +487,19 @@ impl FsWalkStore {
 
     fn put_dir(&self, path: &Path, mtime_ns: i64, entries: &[u8], now: i64) {
         let conn = self.write.lock();
-        drop(conn.execute(
+        // `prepare_cached`, not `execute`: this runs once per walked directory
+        // under the single write mutex, and `execute` re-parses and re-plans the
+        // statement every time — with concurrent discovery, every cache miss
+        // queues behind that parse. The connection is WAL with
+        // `synchronous = OFF`, so the implicit commit is a WAL append and it is
+        // the parse, not the transaction, that is worth removing.
+        let Ok(mut stmt) = conn.prepare_cached(
             "INSERT OR REPLACE INTO dirs (path, mtime_ns, entries, accessed_ns) \
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![path_key(path), mtime_ns, entries, now],
-        ));
+        ) else {
+            return;
+        };
+        drop(stmt.execute(rusqlite::params![path_key(path), mtime_ns, entries, now]));
     }
 
     fn get_file(&self, path: &Path) -> Option<FileHash> {
@@ -512,18 +520,22 @@ impl FsWalkStore {
 
     fn put_file(&self, path: &Path, fh: &FileHash, now: i64) {
         let conn = self.write.lock();
-        drop(conn.execute(
+        // Prepared for the same reason as `put_dir`, and more so: this runs once
+        // per hashed file, not per directory.
+        let Ok(mut stmt) = conn.prepare_cached(
             "INSERT OR REPLACE INTO files (path, size, mtime_ns, exec, hashout, accessed_ns) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                path_key(path),
-                i64::try_from(fh.size).unwrap_or(i64::MAX),
-                fh.mtime_ns,
-                fh.exec as i64,
-                fh.hashout,
-                now
-            ],
-        ));
+        ) else {
+            return;
+        };
+        drop(stmt.execute(rusqlite::params![
+            path_key(path),
+            i64::try_from(fh.size).unwrap_or(i64::MAX),
+            fh.mtime_ns,
+            fh.exec as i64,
+            fh.hashout,
+            now
+        ]));
     }
 
     /// Refresh last-access for a batch of paths in `table` (chunked under the
@@ -722,5 +734,56 @@ mod tests {
             w.prune(std::time::Duration::from_secs(0), false).unwrap(),
             0
         );
+    }
+
+    /// The walker must stay correct with many threads writing at once.
+    ///
+    /// Every miss goes through one write mutex, so concurrent discovery — the
+    /// point of the phase this precedes — turns this into the contended path for
+    /// the whole build. `execute` re-parsed and re-planned the statement on every
+    /// call while holding that mutex; `prepare_cached` reuses it.
+    ///
+    /// Asserted on behaviour rather than on statement reuse, which has no
+    /// observable seam: every thread must get the right listing and the right
+    /// hash whichever order they interleave in, and a second pass must agree with
+    /// the first now that it is reading back what the concurrent writes stored.
+    #[test]
+    fn concurrent_walks_agree_with_the_uncached_primitives() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..8 {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir(&d).unwrap();
+            for j in 0..8 {
+                std::fs::write(d.join(format!("f{j}")), format!("body {i} {j}")).unwrap();
+            }
+        }
+
+        let w = Arc::new(CachedWalker::open(&root.join("fswalk.db")));
+        // Overlapping, not disjoint: threads contend on the same rows.
+        let pass = |w: &CachedWalker| {
+            for i in 0..8 {
+                let d = root.join(format!("d{i}"));
+                let listing = w.read_dir(&d).expect("read_dir");
+                assert_eq!(listing.entries.len(), 8, "d{i} must list every file");
+                for j in 0..8 {
+                    let f = d.join(format!("f{j}"));
+                    let h = w.file_hash(&f).expect("file_hash");
+                    assert_eq!(
+                        h.hashout,
+                        file_hashout(&f, h.exec).unwrap(),
+                        "cached hash must match the uncached primitive",
+                    );
+                }
+            }
+        };
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| pass(&w));
+            }
+        });
+        // Second pass now reads back what the concurrent writes stored.
+        pass(&w);
     }
 }
