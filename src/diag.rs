@@ -31,6 +31,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use tracing::{info, warn};
 
 /// File descriptor the handler appends dumps to; `-1` until [`install`] opens it.
 static DIAG_FD: AtomicI32 = AtomicI32::new(-1);
@@ -97,8 +98,10 @@ fn spawn_sweeper() {
 /// Max threads dumped in one sweep. A cap is not arbitrary caution: each dump is
 /// an unwind, and a process with hundreds of threads would otherwise spend a long
 /// time with the unwinder lock changing hands.
-#[cfg(target_os = "linux")]
 const MAX_THREADS: usize = 256;
+
+/// Pause between signalling successive threads.
+const THREAD_GAP: std::time::Duration = std::time::Duration::from_millis(2);
 
 fn sweep() {
     let path = dump_path();
@@ -117,10 +120,10 @@ fn sweep() {
         )
     };
     if fd < 0 {
-        eprintln!(
-            "heph: cannot write {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
+        warn!(
+            path = %path.display(),
+            error = %std::io::Error::last_os_error(),
+            "Cannot write thread dump"
         );
         return;
     }
@@ -133,7 +136,7 @@ fn sweep() {
     }
 
     let n = sweep_threads();
-    eprintln!("heph: wrote {} thread backtraces to {}", n, path.display());
+    info!(threads = n, path = %path.display(), "Wrote thread backtraces");
 }
 
 /// Signal used to make each thread dump itself. `SIGUSR1` is free here —
@@ -161,17 +164,79 @@ fn sweep_threads() -> usize {
             libc::syscall(libc::SYS_tgkill, pid as i32, tid, DUMP_SIGNAL);
         }
         n += 1;
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(THREAD_GAP);
     }
     n
 }
 
-/// macOS has no `tgkill`, and no portable way to signal a specific thread by id.
-/// Dump the calling thread only, and be explicit rather than silently producing
-/// one backtrace where the reader expects all of them.
-#[cfg(not(target_os = "linux"))]
+/// Our own Mach task port.
+///
+/// `libc::mach_task_self()` is deprecated in favour of the `mach2` crate; this
+/// reads the same underlying static rather than pulling in a dependency for one
+/// port lookup.
+/// macOS has no `tgkill`; the Mach layer is the way in.
+///
+/// `task_threads` hands back a port for every thread in the task,
+/// `pthread_from_mach_thread_np` converts each to the `pthread_t` that
+/// `pthread_kill` wants, and the port array is Mach-allocated memory the caller
+/// must hand back with `vm_deallocate`. Same serial pacing and cap as the Linux
+/// path, for the same reason: no two threads inside the unwinder at once.
+#[cfg(target_os = "macos")]
 fn sweep_threads() -> usize {
-    eprintln!("heph: per-thread sweep is Linux-only; dumping this thread only");
+    let mut ports: mach2::mach_types::thread_act_array_t = std::ptr::null_mut();
+    let mut count: mach2::message::mach_msg_type_number_t = 0;
+
+    // SAFETY: `task_threads` fills `ports`/`count` on success; both are valid
+    // out-params, and `mach_task_self()` names our own task.
+    // SAFETY: names our own task.
+    let task = unsafe { mach2::traps::mach_task_self() };
+    // SAFETY: `ports`/`count` are valid out-params; `task_threads` fills them.
+    let kr = unsafe { mach2::task::task_threads(task, &mut ports, &mut count) };
+    if kr != 0 || ports.is_null() {
+        warn!(kern_return = kr, "Cannot enumerate threads for the dump");
+        return 0;
+    }
+
+    // SAFETY: `ports` points to `count` thread ports owned by us until the
+    // `vm_deallocate` below.
+    let list = unsafe { std::slice::from_raw_parts(ports, count as usize) };
+    let mut n = 0;
+    for &port in list.iter().take(MAX_THREADS) {
+        // SAFETY: `port` came from `task_threads`; a port that no longer names a
+        // live thread yields a null `pthread_t`, which we skip rather than
+        // signal.
+        let pt = unsafe { libc::pthread_from_mach_thread_np(port) };
+        // `pthread_t` is an opaque integer here; 0 means the port no longer
+        // names a live thread.
+        if pt == 0 {
+            continue;
+        }
+        // SAFETY: `pt` is a live pthread of this process and the handler for
+        // `DUMP_SIGNAL` is installed before this runs.
+        unsafe {
+            libc::pthread_kill(pt, DUMP_SIGNAL);
+        }
+        n += 1;
+        std::thread::sleep(THREAD_GAP);
+    }
+
+    // Mach-allocated; leaking it on every dump would grow the task's address
+    // space each time someone asks for one.
+    let bytes = (count as usize * std::mem::size_of::<mach2::mach_types::thread_act_t>())
+        as mach2::vm_types::mach_vm_size_t;
+    // SAFETY: returning the exact region `task_threads` allocated.
+    let _kr = unsafe {
+        mach2::vm::mach_vm_deallocate(task, ports as mach2::vm_types::mach_vm_address_t, bytes)
+    };
+    n
+}
+
+/// Neither Linux nor macOS: no portable way to signal a specific thread, so dump
+/// the caller and say so rather than silently producing one backtrace where the
+/// reader expects all of them.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sweep_threads() -> usize {
+    warn!("Per-thread sweep is unsupported on this platform; dumping the calling thread only");
     on_dump_signal(DUMP_SIGNAL);
     1
 }

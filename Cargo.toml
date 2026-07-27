@@ -179,6 +179,12 @@ flate2 = "1.1.9"
 default = ["fuse-sandbox"]
 fuse-sandbox = ["hsandboxfuse/fuse-sandbox"]
 
+# macOS-only: enumerating the task's threads for `SIGQUIT` dumps goes through
+# Mach (`task_threads`), and libc has deprecated its re-exports in favour of this
+# crate. Linux uses `tgkill` from libc and needs nothing extra.
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+
 [dev-dependencies]
 serde-jsonlines = "0.7.0"
 tempfile = "3"
