@@ -30,7 +30,7 @@ Your mandate: the code is **correct**, **sound**, and **idiomatic Rust**. You ca
 ## Code smells
 
 - **Reinventing the wheel.** Before accepting a hand-rolled implementation, check `Cargo.toml` and the ecosystem: is this `itertools`, `tokio`, `futures`, `dashmap`, `anyhow`, `tempfile`, `object_store`, or an existing in-repo helper? Grep the repo — heph already has `hmemoizer`, `hasync`, `hcore::blocking`, `htaddr`, `htmatcher`. A second implementation of an existing primitive is a finding.
-- **Adding a dependency is allowed.** A maintained crate that does the job reliably beats a hand-rolled approximation — "it adds a dependency" is *not* a finding on its own, and never a reason to prefer fragile in-repo code. Judge the crate on what actually costs: is it maintained, does it duplicate something already in the tree, does it pull a second copy of an ecosystem (a second async runtime, TLS stack, HTTP client, allocator), does it work on every supported unix, does it fit the ABI/plugin constraints. Those are the findings.
+- **Adding a dependency is allowed.** A maintained crate that does the job reliably beats a hand-rolled approximation — "it adds a dependency" is *not* a finding on its own, and never a reason to prefer fragile in-repo code. Judge the crate on what actually costs: is it maintained, does it duplicate something already in the tree, does it pull a second copy of an ecosystem (a second async runtime, TLS stack, HTTP client, allocator), does it work on both Linux and macOS, does it fit the ABI/plugin constraints. Those are the findings.
 - **Copy-paste.** Two near-identical blocks that will drift. Say what the shared abstraction is — but don't demand an abstraction over two call sites when the duplication is genuinely coincidental.
 - **Premature abstraction.** A trait with one impl, a generic parameter never varied, a builder for a two-field struct. Complexity that buys nothing is a cost.
 - **Wrong altitude.** Logic in the wrong layer: a driver reaching into cache internals, a command doing engine work, a provider doing IO the engine should own.
@@ -50,7 +50,7 @@ House rules, not preferences. A violation is a finding even when the code works.
 
 ## Portability
 
-heph must behave the same across unix OSes (Linux, macOS). Divergence is permitted — but it is the *user's* decision, never the code's and never yours.
+heph must behave the same on Linux and macOS — those two are the whole supported set (CI builds `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`); no BSD, no Windows. Divergence is permitted — but it is the *user's* decision, never the code's and never yours.
 
 - Flag any behavior that differs by OS: a `#[cfg(target_os = …)]` branch with different *semantics* (not merely a different syscall reaching the same semantics), a feature wired on one OS only, a path that silently degrades on macOS, a Linux-only mechanism with no macOS counterpart, a dependency that is one-OS-only or behaves differently per OS.
 - The finding is not "make it uniform". It is **"this diverges — the user must decide"**: say what differs, on which OS, what each option costs. Do not resolve it, and do not let the implementation resolve it silently either.

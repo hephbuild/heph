@@ -29,7 +29,7 @@ When you claim a cost, ground it: point at the line, name the multiplier, or say
 
 ## Portability
 
-heph must behave the same across unix OSes (Linux and macOS). A per-OS difference is allowed **only as an explicit decision by the caller's user** — never as a quiet consequence of the implementation.
+heph must behave the same on Linux and macOS — those two are the whole supported set (CI builds `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`); no BSD, no Windows. A per-OS difference is allowed **only as an explicit decision by the caller's user** — never as a quiet consequence of the implementation.
 
 - At design time, ask outright: does this work identically on Linux and macOS? If the honest answer is "not quite", that is a finding *now*, phrased as a decision to be made — what differs, on which OS, what each option costs — not a resolution you pick.
 - At review time, look for `#[cfg(target_os = …)]` semantics splits, Linux-only mechanisms, macOS paths that silently degrade, and dependencies that only work on one OS.

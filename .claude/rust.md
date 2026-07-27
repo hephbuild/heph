@@ -21,7 +21,7 @@
 
 ## Portability
 
-Features work the same across unix OSes (Linux, macOS). A per-OS difference is sometimes the right answer, but it is **the user's decision** — never the implementation's and never an agent's. When a design would diverge (`#[cfg(target_os = …)]` semantics split, a Linux-only mechanism, a macOS path that degrades, a one-OS-only dependency), stop and put the choice to the user: what differs, on which OS, what each option costs. Uniform semantics reached by different implementations is fine. Silent divergence is a bug.
+Features work the same on Linux and macOS — those two are the whole supported set (CI builds `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`); no BSD, no Windows. A per-OS difference is sometimes the right answer, but it is **the user's decision** — never the implementation's and never an agent's. When a design would diverge (`#[cfg(target_os = …)]` semantics split, a Linux-only mechanism, a macOS path that degrades, a one-OS-only dependency), stop and put the choice to the user: what differs, on which OS, what each option costs. Uniform semantics reached by different implementations is fine. Silent divergence is a bug.
 
 ## Error Handling
 

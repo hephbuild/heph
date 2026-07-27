@@ -45,7 +45,7 @@ For every change touching a boundary:
 
 ## Cross-OS surface
 
-The unix OSes are a compatibility axis like any other: the same command, flag, `--json` shape, exit code, and BUILD-file API must exist and mean the same thing on Linux and macOS.
+Linux and macOS — the whole supported set — are a compatibility axis like any other: the same command, flag, `--json` shape, exit code, and BUILD-file API must exist and mean the same thing on Linux and macOS.
 
 - A flag or builtin present on one OS only, an argument whose default differs by OS, a `--json` field emitted on one OS only, or an exit code that differs — each is a boundary difference. Report it like any other break: what differs, on which OS, and how it fails for a script or agent that learned the other shape.
 - Mixed-OS fleets are the normal case here (macOS laptops, Linux CI, one shared remote cache). Ask whether an OS-conditional change makes the shared cache, the shared plugin, or the shared BUILD file behave differently depending on who ran it.
@@ -69,6 +69,6 @@ Then: **COMPATIBLE**, **COMPATIBLE AFTER BUMP** (name the bump), or **BREAKING**
 - "Nobody is on the old version yet" is a valid reason to break — but it must be *stated as a decision*, not assumed. Say it out loud so it's on the record.
 - Check the actual on-disk/wire representation and the actual version constant, not the intent. Grep for the version markers and read what guards them.
 - A change that forces a full cache invalidation for every user is not automatically wrong, but it must be flagged — that's a real cost the caller should choose knowingly.
-- A new dependency is fine. What you check is whether it reaches a boundary: does it change a serialized/wire representation, a proto-generated type, an ABI struct, or a CLI/JSON shape — and is it available and identical on every supported unix.
+- A new dependency is fine. What you check is whether it reaches a boundary: does it change a serialized/wire representation, a proto-generated type, an ABI struct, or a CLI/JSON shape — and is it available and identical on both Linux and macOS.
 - An OS-conditional boundary is a decision for the user, not a footnote. Name it; don't resolve it.
 - You do not write code or perform the bump. Name the boundary, the direction that breaks, and the required action.
