@@ -1043,6 +1043,7 @@ impl RemoteCacheSet {
                     async move {
                         // Uploads are bulk too, and background: they must never
                         // hold a slot a critical-path metadata read needs.
+                        observe_transfer_slots(cache);
                         let _slot =
                             cache.shared_slots.acquire().await.with_context(|| {
                                 format!("acquire remote cache blob slot for {key}")
@@ -1233,6 +1234,7 @@ impl RemoteCacheSet {
         // reserve is what stops a wide pull from starving the manifest reads and
         // presence checks that decide every other target's hit
         // (see `META_SLOT_RESERVE`).
+        observe_transfer_slots(cache);
         let _slot = cache
             .shared_slots
             .acquire()
@@ -1288,6 +1290,22 @@ impl RemoteCacheSet {
         cache.note_ok();
         Ok(Some(temp))
     }
+}
+
+/// Report the bulk transfer budget's free slots to the saturation watchdog,
+/// immediately before queueing on it.
+///
+/// `remote-cache-transfer` was registered with the [`Limiter`] set and never
+/// observed, so the one diagnostic that would have named a saturated blob budget
+/// reported nothing — the metadata half was wired, the bulk half was not. Read
+/// *before* the `acquire`, so a full budget shows as zero rather than as the one
+/// slot this caller is about to take.
+///
+/// [`Limiter`]: crate::engine::diag::Limiter
+fn observe_transfer_slots(cache: &ConfiguredCache) {
+    let d = crate::engine::diag::global();
+    d.limiter("remote-cache-transfer")
+        .observe(cache.shared_slots.available_permits(), d.now_ms());
 }
 
 /// The unbounded body of [`RemoteCacheSet::read_small`], split out so the
@@ -1961,6 +1979,49 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         )
+    }
+
+    /// `remote-cache-transfer` was registered with the saturation watchdog and
+    /// never observed, so the diagnostic that would name a saturated blob budget
+    /// reported nothing — the metadata half was wired, the bulk half was not.
+    /// Which meant the one failure this tooling exists to explain, a wide pull or
+    /// push eating the whole request budget, showed up as a build that had simply
+    /// gone quiet.
+    #[tokio::test]
+    async fn a_saturated_transfer_budget_is_reported_to_the_watchdog() {
+        let cache = ConfiguredCache::new(
+            def("probe", "memory:///probe", true, true),
+            Arc::new(FailBackend) as Arc<dyn RemoteCacheBackend>,
+        );
+        let bulk = cache.shared_slots.available_permits();
+        assert!(bulk > 0, "the cache must start with a bulk budget");
+
+        let d = crate::engine::diag::global();
+        // Not saturated while slots are free — an observation must clear, too.
+        observe_transfer_slots(&cache);
+        assert!(
+            !d.saturated(d.now_ms())
+                .iter()
+                .any(|(name, _)| *name == "remote-cache-transfer"),
+            "an available budget must not read as saturated",
+        );
+
+        let _held = cache
+            .shared_slots
+            .acquire_many(u32::try_from(bulk).expect("budget fits"))
+            .await
+            .expect("take the whole bulk budget");
+        observe_transfer_slots(&cache);
+        assert!(
+            d.saturated(d.now_ms() + 1_000)
+                .iter()
+                .any(|(name, _)| *name == "remote-cache-transfer"),
+            "an exhausted bulk budget must be visible to the watchdog",
+        );
+
+        // Leave the global as we found it: it is process-wide.
+        drop(_held);
+        observe_transfer_slots(&cache);
     }
 
     #[test]
