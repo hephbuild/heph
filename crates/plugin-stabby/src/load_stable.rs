@@ -761,6 +761,13 @@ pub struct StableRemoteHook {
     inner: Arc<DynHook>,
     name: String,
     state: std::sync::Mutex<HookStreamState>,
+    /// Set once the stream has been ended by `on_close` / `drain`.
+    ///
+    /// Read before encoding so a closed hook costs an atomic load per event
+    /// instead of a serialization. The hook is engine-level while `on_close`
+    /// fires per *request*, so in a long-lived host (the LSP) every event after
+    /// the first request ends would otherwise be encoded only to be dropped.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl StableRemoteHook {
@@ -769,6 +776,7 @@ impl StableRemoteHook {
             inner: Arc::new(inner),
             name: name.into(),
             state: std::sync::Mutex::new(HookStreamState::default()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -779,6 +787,19 @@ impl Hook for StableRemoteHook {
     }
 
     fn on_event(&self, ev: &hcore::events::BuildEvent) {
+        // The stream is one-shot: once ended, nothing reopens it, so there is
+        // nothing to encode for.
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // Encode BEFORE taking the lock. This is the engine's emit chokepoint —
+        // every event of every target passes through it — and `event_frame` is a
+        // serde-JSON render plus a prost encode. Holding the state mutex across
+        // that serializes all emitters behind the slowest one, which is exactly
+        // what `hplugin::hook`'s contract says a hook must not do. The lock only
+        // guards the lazily-opened stream handle; it does not order frames (the
+        // channel does), so encoding outside it changes nothing observable.
+        let frame = event_frame(ev);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !st.started {
             st.started = true;
@@ -800,12 +821,14 @@ impl Hook for StableRemoteHook {
         }
         if let Some(tx) = &st.tx {
             // Plugin gone / stream closed => receiver dropped; best-effort.
-            drop(tx.send(event_frame(ev)));
+            drop(tx.send(frame));
         }
     }
 
     fn on_close(&self) {
         // Drop the sender so the plugin's pull sees end-of-stream and flushes.
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.tx = None;
     }
@@ -814,6 +837,8 @@ impl Hook for StableRemoteHook {
         Box::pin(async move {
             // Ensure the stream is closed, then await the plugin's ack so its final
             // write lands before the host exits.
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Release);
             let join = {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.tx = None;
