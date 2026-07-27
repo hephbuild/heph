@@ -118,21 +118,27 @@ const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// Age past which a file under `remote-tmp` cannot belong to a live transfer,
 /// used by [`sweep_abandoned_temps`].
 ///
-/// [`UPLOAD_DEADLINE`] bounds the push end to end, queue wait included, and the
-/// temp is created inside that bound. The pull side has no deadline of its own:
-/// it stays fresh because a progressing transfer keeps advancing the temp's
-/// mtime, and a *stalled* one is killed by the backend's inactivity bound (see
-/// [`RemoteCacheBackend`]). The margin on top covers the gap between the last
-/// byte and the decode. Past all that, a file can only be residue from a run
+/// The floor is derived: [`UPLOAD_DEADLINE`] bounds the push end to end, queue
+/// wait included, and the temp is created inside that bound; the pull side has no
+/// deadline of its own but stays fresh because a progressing transfer keeps
+/// advancing the temp's mtime, and a *stalled* one is killed by the backend's
+/// inactivity bound (see [`RemoteCacheBackend`]). Past that, plus the gap between
+/// the last byte and the decode, a file can only be residue from a run
 /// hard-killed before its [`TempBlob`] could be dropped.
 ///
-/// Sizing it this way is what makes the sweep safe to run while *another* heph
-/// process is mid-transfer: its live temps are younger than this, so they are
-/// never touched. It also makes the disk cost **time**-bounded rather than
-/// size-bounded — a crash loop retains at most this much residue no matter how
-/// many times it crashes — and, because the `.blob` naming is unchanged, the
-/// first run of this binary reclaims what every pre-fix run left behind.
-const TEMP_SWEEP_AGE: Duration = UPLOAD_DEADLINE.saturating_add(Duration::from_secs(10 * 60));
+/// The value sits far above that floor on purpose, because the two directions are
+/// not symmetric. Too *large* only delays reclaiming residue — disk, bounded by
+/// time rather than by crash count, so a crash loop retains at most this much no
+/// matter how often it crashes. Too *small* unlinks a live temp out from under a
+/// concurrent heph against the same home, which on the pull side is a hard error
+/// rather than a miss. The mtime-freshness premise also assumes the peer is
+/// *running*: a suspended laptop or a `SIGSTOP`ed process stops advancing mtime
+/// while its transfer is still perfectly live, and only a margin this wide keeps
+/// that from looking abandoned.
+///
+/// Because the `.blob` naming is unchanged, the first run of this binary reclaims
+/// what every pre-fix run left behind.
+const TEMP_SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Permits for the synchronous compress/decompress + local-cache I/O that
 /// brackets every transfer.
@@ -3141,8 +3147,8 @@ mod tests {
         };
 
         let stale = plant("stale.blob", Some(TEMP_SWEEP_AGE + Duration::from_secs(60)));
-        // Old enough to be an abandoned *download*, young enough to still be a
-        // live upload from another process — the case the margin exists for.
+        // Well past any transfer's own bound, but still inside the sweep window —
+        // it could belong to a suspended peer, so the margin says keep it.
         let borderline = plant("borderline.blob", Some(TEMP_SWEEP_AGE / 2));
         let fresh = plant("fresh.blob", None);
         let foreign = plant("notours.txt", Some(TEMP_SWEEP_AGE * 10));
