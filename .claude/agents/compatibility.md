@@ -49,7 +49,7 @@ Linux and macOS — the whole supported set — are a compatibility axis like an
 
 - A flag or builtin present on one OS only, an argument whose default differs by OS, a `--json` field emitted on one OS only, or an exit code that differs — each is a boundary difference. Report it like any other break: what differs, on which OS, and how it fails for a script or agent that learned the other shape.
 - Mixed-OS fleets are the normal case here (macOS laptops, Linux CI, one shared remote cache). Ask whether an OS-conditional change makes the shared cache, the shared plugin, or the shared BUILD file behave differently depending on who ran it.
-- **Cross-OS ABI.** A plugin cdylib is built per-platform; anything platform-conditional in an ABI struct's layout, size, or callback set is a silent mismatch, not a version error. `ABI_SEMVER` must not be `cfg`-dependent.
+- **Cross-platform ABI.** A plugin cdylib is built per target; anything platform-conditional in an ABI struct's layout, size, alignment, or callback set is a silent mismatch, not a version error. This bites on the arch axis as hard as the OS axis — alignment and padding differ between x86_64 and aarch64. `ABI_SEMVER` must not be `cfg`-dependent.
 - Divergence is allowed when the user decides it. Your job is to state it as a decision on the record — never accept an OS split that arrived implicitly.
 
 ## Output format
@@ -69,6 +69,6 @@ Then: **COMPATIBLE**, **COMPATIBLE AFTER BUMP** (name the bump), or **BREAKING**
 - "Nobody is on the old version yet" is a valid reason to break — but it must be *stated as a decision*, not assumed. Say it out loud so it's on the record.
 - Check the actual on-disk/wire representation and the actual version constant, not the intent. Grep for the version markers and read what guards them.
 - A change that forces a full cache invalidation for every user is not automatically wrong, but it must be flagged — that's a real cost the caller should choose knowingly.
-- A new dependency is fine. What you check is whether it reaches a boundary: does it change a serialized/wire representation, a proto-generated type, an ABI struct, or a CLI/JSON shape — and is it available and identical on both Linux and macOS.
-- An OS-conditional boundary is a decision for the user, not a footnote. Name it; don't resolve it.
+- A new dependency is fine. What you check is whether it reaches a boundary: does it change a serialized/wire representation, a proto-generated type, an ABI struct, or a CLI/JSON shape — and is it available and identical on all three supported targets, arch axis included.
+- An OS- or arch-conditional boundary is a decision for the user, not a footnote. Name it; don't resolve it.
 - You do not write code or perform the bump. Name the boundary, the direction that breaks, and the required action.

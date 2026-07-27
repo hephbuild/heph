@@ -21,7 +21,13 @@
 
 ## Portability
 
-Features work the same on Linux and macOS — those two are the whole supported set (CI builds `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`); no BSD, no Windows. A per-OS difference is sometimes the right answer, but it is **the user's decision** — never the implementation's and never an agent's. When a design would diverge (`#[cfg(target_os = …)]` semantics split, a Linux-only mechanism, a macOS path that degrades, a one-OS-only dependency), stop and put the choice to the user: what differs, on which OS, what each option costs. Uniform semantics reached by different implementations is fine. Silent divergence is a bug.
+The supported set is three targets — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`. No BSD, no Windows, no 32-bit. Features work the same on all three.
+
+A per-platform difference is sometimes the right answer, but it is **the user's decision** — never the implementation's and never an agent's. When a design would diverge, stop and put the choice to the user: what differs, on which target, what each option costs. Uniform semantics reached by different implementations is fine; silent divergence is a bug.
+
+- **OS axis** (Linux vs macOS): a `#[cfg(target_os = …)]` semantics split, a Linux-only mechanism, a macOS path that degrades, a one-OS-only dependency.
+- **Arch axis** (x86_64 vs aarch64): a `#[cfg(target_arch = …)]` split, intrinsics/SIMD/inline asm with no counterpart, an arch-gated dependency. Memory ordering is the sharp edge — aarch64 is weakly ordered where x86_64 is TSO, so a `Relaxed`/`Acquire` mistake that is benign on x86_64 is a live race on ARM. Reason about orderings from the model, not from "it passed on my machine".
+- **Test coverage is narrower than the build matrix.** CI tests only `linux/amd64` and `darwin/arm64`; `linux/arm64` is cross-compiled and shipped without ever running a test, and `darwin/amd64` is not built at all. Anything whose behavior is arch- or OS-conditional has an uncovered combination by construction — say so rather than assuming CI caught it.
 
 ## Error Handling
 

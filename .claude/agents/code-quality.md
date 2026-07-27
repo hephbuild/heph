@@ -50,10 +50,12 @@ House rules, not preferences. A violation is a finding even when the code works.
 
 ## Portability
 
-heph must behave the same on Linux and macOS — those two are the whole supported set (CI builds `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`); no BSD, no Windows. Divergence is permitted — but it is the *user's* decision, never the code's and never yours.
+The supported set is three targets — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`. No BSD, no Windows, no 32-bit. heph must behave the same on all three. Divergence is permitted — but it is the *user's* decision, never the code's and never yours.
 
-- Flag any behavior that differs by OS: a `#[cfg(target_os = …)]` branch with different *semantics* (not merely a different syscall reaching the same semantics), a feature wired on one OS only, a path that silently degrades on macOS, a Linux-only mechanism with no macOS counterpart, a dependency that is one-OS-only or behaves differently per OS.
-- The finding is not "make it uniform". It is **"this diverges — the user must decide"**: say what differs, on which OS, what each option costs. Do not resolve it, and do not let the implementation resolve it silently either.
+- **OS axis.** Flag behavior that differs between Linux and macOS: a `#[cfg(target_os = …)]` branch with different *semantics* (not merely a different syscall reaching the same semantics), a feature wired on one OS only, a path that silently degrades on macOS, a Linux-only mechanism with no macOS counterpart, a dependency that is one-OS-only or behaves differently per OS.
+- **Arch axis.** Same standard for x86_64 vs aarch64: a `#[cfg(target_arch = …)]` split, intrinsics/SIMD/inline asm with no counterpart on the other arch, an arch-gated dependency, an assumption about pointer width or alignment. Do not assume the arch axis is covered because the OS axis is.
+- **Memory ordering is the arch bug that actually happens.** aarch64 is weakly ordered; x86_64 is TSO. A `Relaxed` or `Acquire` that should be `SeqCst`, or a missing fence, is invisible on x86_64 and a live race on ARM. Judge every `Ordering` from the model, not from "the test passed" — and note that CI runs tests on `linux/amd64` and `darwin/arm64` only, so `linux/arm64` ships with no test run at all and `darwin/amd64` is never built.
+- The finding is not "make it uniform". It is **"this diverges — the user must decide"**: say what differs, on which target, what each option costs. Do not resolve it, and do not let the implementation resolve it silently either.
 - Uniform semantics reached by different implementations is fine and unflagged.
 - Silent divergence — the same command quietly doing something else on macOS with no error and no note — is a BLOCKER regardless of how small the difference is.
 
@@ -80,6 +82,6 @@ Then: **PASS**, **PASS WITH NITS**, or **BLOCKED** (blocking items named).
 - Ranked by severity, always. Don't bury a soundness bug under formatting nits.
 - Distinguish "this is wrong" from "I'd write it differently". Only the first blocks.
 - A new dependency is not a defect. Say what the crate actually costs, or say nothing.
-- OS divergence is not yours to settle — flag it and hand the decision to the caller.
+- OS *and* arch divergence is not yours to settle — flag it and hand the decision to the caller.
 - Read the surrounding code before judging style — match the file's existing idiom, naming, and comment density rather than imposing a different one.
 - You do not rewrite the code. You name the defect precisely enough to be fixed in one pass.

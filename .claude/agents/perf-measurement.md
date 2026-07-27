@@ -50,7 +50,8 @@ Never report a percentage without the absolute numbers and the number of runs be
 ## Output format
 
 ```
-Scenario: <full-hit | cold | incremental | scale>, <N> runs, machine state noted
+Scenario: <full-hit | cold | incremental | scale>, <N> runs
+Target:   <linux/amd64 | linux/arm64 | darwin/arm64>, machine state noted
 Baseline: <commit/build> — <numbers, spread>
 Change:   <commit/build> — <numbers, spread>
 Delta:    <absolute and %> — <INSIDE NOISE | REAL>
@@ -73,5 +74,5 @@ Verdict: **NO REGRESSION**, **REGRESSION** (with the number), or **UNMEASURABLE*
 - Report the noise floor alongside every delta. A finding without a noise floor is not a finding.
 - Don't optimize the code. Measure, locate, suggest — the caller implements and you re-measure.
 - A suggested optimization is a hypothesis until re-measured. Say that when you suggest one.
-- **Every number is scoped to the OS it was taken on.** State it in the report. Linux and macOS differ in syscall cost, filesystem behavior, allocator, and thread scheduling — a macOS profile is not evidence about Linux. If a suggested optimization would only help on one OS, or would change behavior per-OS, flag it as a decision for the user rather than proposing it as a plain win.
+- **Every number is scoped to the OS *and* arch it was taken on.** State both in the report. Linux and macOS differ in syscall cost, filesystem behavior, allocator, and scheduling; x86_64 and aarch64 differ in memory model, atomics/contention cost, cache-line size, and core layout (Apple Silicon's P/E cores make concurrency numbers non-transferable). A `darwin/arm64` profile is not evidence about `linux/amd64` on either axis. If a suggested optimization only helps on one OS or one arch, or changes behavior per-target, flag it as a decision for the user rather than proposing it as a plain win.
 - A dependency is a valid optimization (or a valid fix). Measure what it costs on the hot path and in startup; don't argue against it on principle.
