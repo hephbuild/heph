@@ -515,10 +515,10 @@ pub struct BuildState {
 /// The header's count fields for one frame, as rendered strings.
 ///
 /// Every consumer — the split header, the plain-text summary — goes through
-/// [`BuildState::counts`], which walks the matched set exactly once per
-/// intersection it needs. That is the point of the type: two callers each
-/// asking for "their" subset of the fields is how the same `matched ∩ finished`
-/// scan ended up running twice on every frame of every view.
+/// [`BuildState::counts`]. The done count is kept split from its denominator
+/// because the header binds each half to a different view tab, while the
+/// plain-text summary wants them joined; carrying both shapes in one value is
+/// what lets the two renderings share a single computation and stay in step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Counts {
     /// The finished count, bound to the [`ViewMode::Done`] tab.
@@ -748,10 +748,9 @@ impl BuildState {
         ))
     }
 
-    /// The count fields for one frame — see [`Counts`]. Runs one
-    /// `matched ∩ finished` pass (via [`BuildState::matched_progress`]) and one
-    /// `matched ∩ cache_hit` pass (via [`BuildState::cached_count`]), never two
-    /// of either.
+    /// The count fields for one frame — see [`Counts`]. `O(1)`: every field is
+    /// either a `len()` or a counter folded in [`BuildState::apply`], so this is
+    /// four reads and the `format!`s, with no walk of any target set.
     pub fn counts(&self, scope: CountScope) -> Counts {
         let (done, total) = match scope {
             // All-targets scope: every observed target (`finished ∪ in_flight`),
@@ -1111,10 +1110,10 @@ impl BuildHeader {
 
 impl ProgressHeader for BuildHeader {
     fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
-        // One `counts` call per frame: it is the only place the matched set is
-        // walked, and it walks it once per intersection. Asking for the done
-        // segment and the other fields separately is what made the
-        // `matched ∩ finished` scan run twice on every frame of every view.
+        // One `counts` call per frame, and it is `O(1)` — the matched
+        // intersections behind `done` and `cached` are counters folded in
+        // `BuildState::apply`, not scans. Keep the whole header on this one call
+        // so the fields cannot disagree about the frame they describe.
         let Counts {
             done,
             total,
