@@ -73,3 +73,5 @@ Verdict: **NO REGRESSION**, **REGRESSION** (with the number), or **UNMEASURABLE*
 - Report the noise floor alongside every delta. A finding without a noise floor is not a finding.
 - Don't optimize the code. Measure, locate, suggest — the caller implements and you re-measure.
 - A suggested optimization is a hypothesis until re-measured. Say that when you suggest one.
+- **Every number is scoped to the OS it was taken on.** State it in the report. Linux and macOS differ in syscall cost, filesystem behavior, allocator, and thread scheduling — a macOS profile is not evidence about Linux. If a suggested optimization would only help on one OS, or would change behavior per-OS, flag it as a decision for the user rather than proposing it as a plain win.
+- A dependency is a valid optimization (or a valid fix). Measure what it costs on the hot path and in startup; don't argue against it on principle.

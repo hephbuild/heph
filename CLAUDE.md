@@ -66,6 +66,8 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 - A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
 - **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
 - A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
+- **Per-OS behavior is the user's decision.** Features work uniformly across unix OSes by default. A divergence between Linux and macOS may be the right answer — but it is never settled by an agent or by the implementation. Flag it (what differs, on which OS, what each option costs) and put the call to the user before writing the code.
+- **Adding a dependency is allowed** when it gets the job done reliably. A maintained crate beats a fragile hand-rolled version. What still gets flagged: duplicating a crate already in the tree, a second copy of an ecosystem (async runtime, TLS, HTTP client, allocator), hot-path or startup cost, and one-OS-only support.
 
 @.claude/rust.md
 @.claude/testing.md
