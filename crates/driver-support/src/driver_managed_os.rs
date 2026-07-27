@@ -1,6 +1,6 @@
 use crate::driver_managed::{
     ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, detect_output_collisions,
-    invoke_inner, list_path_for, resolve_unpack_root, write_source_map,
+    invoke_inner, list_path_for, resolve_unpack_root, write_source_map_blocking,
 };
 use anyhow::Context;
 use hcore::hartifactcontent;
@@ -98,18 +98,30 @@ impl ManagedDriverOs {
                         })?;
                     }
                     _ => {
+                        // Writes the input's entire tree to disk. Inline in this
+                        // `async fn` that is a tokio worker held for the whole
+                        // materialization, and with `2 * ncpu` execute permits
+                        // against `ncpu` workers, enough targets in this window
+                        // park every one of them. The captures are an `Arc`
+                        // bump and the (usually empty) filter list.
+                        let content = Arc::clone(&input.artifact.content);
                         let filters = input.filters.clone();
-                        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
-                            None
-                        } else {
-                            Some(&|rel: &Path| filters.iter().any(|f| Path::new(f) == rel))
-                        };
-                        hartifactcontent::unpack::unpack(
-                            input.artifact.content.as_ref(),
-                            unpack_root.as_path(),
-                            list_path.as_deref(),
-                            predicate,
-                        )
+                        let (root, lp) = (unpack_root.clone(), list_path.clone());
+                        hcore::blocking::run(move || {
+                            let pred = |rel: &Path| filters.iter().any(|f| Path::new(f) == rel);
+                            let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
+                                None
+                            } else {
+                                Some(&pred)
+                            };
+                            hartifactcontent::unpack::unpack(
+                                content.as_ref(),
+                                root.as_path(),
+                                lp.as_deref(),
+                                predicate,
+                            )
+                        })
+                        .await
                         .with_context(|| {
                             format!(
                                 "unpack input origin_id={} source_addr={} into {:?}",
@@ -132,7 +144,7 @@ impl ManagedDriverOs {
         fs::create_dir_all(&sandbox_pkg_dir)
             .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
-        write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir)?;
+        let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir).await?;
 
         let target = req.target;
         let hashin = req.hashin;
@@ -158,7 +170,8 @@ impl ManagedDriverOs {
             });
         }
 
-        collect_outputs(&mut res, target, hashin, &ws_dir, &sandbox_dir)?;
+        res.artifacts
+            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir).await?);
 
         Ok(RunResponse {
             artifacts: res.artifacts,

@@ -166,7 +166,8 @@ impl ManagedDriverFuse {
             });
         }
 
-        collect_outputs(&mut res, target, hashin, &ws_dir, &sandbox_dir)?;
+        res.artifacts
+            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir).await?);
 
         Ok(RunResponse {
             artifacts: res.artifacts,
