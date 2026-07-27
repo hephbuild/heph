@@ -1021,6 +1021,35 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
     }
 }
 
+/// Concurrent whole-package Starlark evaluations.
+///
+/// [`hcore::blocking`] is `2 * cores` threads behind one unbounded FIFO, shared
+/// by four classes of work with no reserve between them: sub-millisecond
+/// manifest reads, tar-and-copy into the cache, gzip (already self-capped at the
+/// core count by the remote cache's `CODEC_SLOTS`) — and this, the single
+/// heaviest synchronous unit in a build, at hundreds of milliseconds per
+/// package.
+///
+/// The pool is arrival-fair and work-conserving, so an unbounded fan-out of
+/// package evaluations does not *starve* the short jobs, it puts them behind a
+/// queue of long ones. `run_pkg` is the only class that can occupy every thread
+/// for that long, and it was the only one not bounded.
+///
+/// The core count, for the same reason `CODEC_SLOTS` uses it: the work is
+/// CPU-bound, so more concurrent evaluations than cores buys nothing, and half
+/// the pool stays free for the short jobs that were queueing behind them. It is
+/// a cap on this class, not a reserve for the others — with gzip also at its own
+/// core-count cap, a build that peaks on both at once can still fill the pool.
+/// Guaranteeing a reserve is a change to the pool itself.
+static PKG_EVAL_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(pkg_eval_slots()));
+
+fn pkg_eval_slots() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(8)
+}
+
 impl Provider {
     pub(crate) async fn run_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
         let key = pkg.to_string();
@@ -1036,6 +1065,14 @@ impl Provider {
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
+                    // Bound the fan-out before queueing: see `PKG_EVAL_SLOTS`.
+                    // Taken here rather than inside the closure so the wait
+                    // happens in async-land, not on a pool thread — parking a
+                    // pool thread to wait for a pool thread is the deadlock.
+                    let _slot = PKG_EVAL_SLOTS
+                        .acquire()
+                        .await
+                        .context("acquiring a package-evaluation slot")?;
                     // Starlark evaluation of a whole package: the single heaviest
                     // synchronous unit in a build, and one per package. On a runtime
                     // worker it stops that worker polling anything at all — see
@@ -1961,6 +1998,58 @@ target(
 )
 "#;
         assert!(run_transitive(content).is_err());
+    }
+
+    /// Whole-package Starlark evaluation is the heaviest synchronous unit in a
+    /// build and it shares one unbounded FIFO with sub-millisecond manifest
+    /// reads. Fanned out without a cap it fills every thread of
+    /// `hcore::blocking` with hundreds-of-milliseconds jobs, and the short work
+    /// queued behind them — the pool is arrival-fair, so this is head-of-line
+    /// latency rather than starvation.
+    ///
+    /// Asserted by holding every slot: an evaluation must wait for one, so it
+    /// cannot be reaching the pool while the cap is exhausted.
+    ///
+    /// Note it borrows a process-wide semaphore, so it briefly delays any other
+    /// test in this binary that evaluates a package.
+    #[tokio::test]
+    async fn package_evaluation_waits_for_a_slot() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "mypkg".to_string();
+        let pkg_path = tmp_dir.path().join(&pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(
+            pkg_path.join("BUILD"),
+            r#"target(name = "t", driver = "d")"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            build_file_patterns: vec![glob::Pattern::new("BUILD").unwrap()],
+            ..Provider::default()
+        };
+
+        let held = PKG_EVAL_SLOTS
+            .acquire_many(u32::try_from(pkg_eval_slots()).unwrap())
+            .await
+            .expect("hold every evaluation slot");
+
+        let eval = provider.run_pkg(&pkg_name);
+        tokio::pin!(eval);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut eval)
+                .await
+                .is_err(),
+            "an evaluation must not reach the blocking pool while every slot is held",
+        );
+
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), eval)
+            .await
+            .expect("releasing the slots must let the evaluation through")
+            .unwrap();
+        assert_eq!(result.targets.len(), 1);
     }
 
     #[tokio::test]
