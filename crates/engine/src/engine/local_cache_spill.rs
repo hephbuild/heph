@@ -43,7 +43,7 @@
 //! ephemeral tmp store, not this one.
 
 use crate::engine::local_cache::{
-    LocalCache, MANIFEST_V1, NotFoundError, SizedReader, TargetStream,
+    Existence, LocalCache, MANIFEST_V1, NotFoundError, SizedReader, TargetStream,
 };
 use crate::engine::local_cache_fs::LocalCacheFS;
 use anyhow::{Context, Result};
@@ -116,6 +116,18 @@ impl LocalCache for LocalCacheSpill {
 
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
         Ok(self.primary.exists(addr, hashin, name)? || self.blobs.exists(addr, hashin, name)?)
+    }
+
+    fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
+        // A queue reported by the primary settles it: the blob is on its way in
+        // and neither backend has a committed answer yet. Otherwise fall back to
+        // the two-sided probe — `blobs` is an FS cache and commits inline, so it
+        // never queues.
+        match self.primary.existence(addr, hashin, name)? {
+            queued @ Existence::Queued(_) => Ok(queued),
+            Existence::Committed(true) => Ok(Existence::Committed(true)),
+            Existence::Committed(false) => self.blobs.existence(addr, hashin, name),
+        }
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {

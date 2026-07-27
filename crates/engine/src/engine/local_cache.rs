@@ -10,10 +10,13 @@ use hcore::hartifactcontent;
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
 use std::fs::File;
+use std::future::Future;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::{io, time};
+use std::task::{Context as TaskContext, Poll};
+use std::{fmt, io, time};
 
 struct CountingWriter<W: io::Write> {
     inner: W,
@@ -64,13 +67,15 @@ pub enum ManifestArtifactType {
 
 /// Whether the caller already knows every needed blob is in the local cache.
 ///
-/// The per-blob `exists` in [`Engine::artifacts_from_manifest`] is not free. It
-/// takes a pooled sqlite connection, and — because a write is only *queued* to
-/// the single writer thread, not committed — a key written moments ago is still
-/// pending, so the probe parks on an untimed condvar until the writer's next
-/// batch drains. On the remote-hit path that probe runs inline on a tokio
-/// worker, so `n` concurrent hits park `n` workers on a batch commit, and the
-/// reactor, the timer wheel, the in-flight transfers and the TUI stop with them.
+/// The per-blob probe in [`Engine::artifacts_from_manifest`] is not free: a pooled
+/// sqlite connection and one point lookup per needed artifact, on the hot path of
+/// every cache hit. On the remote path it also has nothing to learn — the pull
+/// just walked the same set.
+///
+/// Note this is a cost, not a hazard. Probing a key with a write still queued used
+/// to park the calling thread on the writer thread's next batch commit, and that
+/// probe runs on a tokio worker; [`Engine::exists_local`] now awaits the queue
+/// instead, so skipping the probe saves lookups rather than rescuing the runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlobResidency {
     /// Nothing has looked yet — probe each needed blob, and degrade the hit to a
@@ -120,10 +125,80 @@ pub struct SizedReader {
 /// connection/snapshot, not a borrow of the cache.
 pub type TargetStream = Box<dyn Iterator<Item = anyhow::Result<String>> + Send>;
 
+/// Resolves once a queued-but-uncommitted cache write has landed.
+///
+/// Only a backend with a write-behind queue produces one. The sqlite backend's
+/// `writer` *queues* onto a single writer thread rather than committing, so a key
+/// written moments ago is not yet readable, and `exists`/`reader` cover the gap by
+/// parking the calling thread on an untimed condvar. That is the right thing on an
+/// OS thread and ruinous on a tokio worker: `n` concurrent readers park `n`
+/// workers on one batch commit, and the reactor, the timer wheel, every in-flight
+/// remote transfer and the TUI stop with them — nothing deadlocked, the build
+/// merely looks hung. Awaiting this suspends the *task* and leaves the worker
+/// polling.
+pub struct PendingWrite(Pin<Box<dyn Future<Output = ()> + Send>>);
+
+impl PendingWrite {
+    /// Wrap a backend's completion future. Boxed because the trait is used as
+    /// `dyn LocalCache`; the allocation is only paid on the rare path where a
+    /// write to the probed key is actually in flight.
+    pub fn new(fut: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(Box::pin(fut))
+    }
+}
+
+impl Future for PendingWrite {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+impl fmt::Debug for PendingWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PendingWrite(..)")
+    }
+}
+
+/// How many times [`Engine::exists_local`] will wait out a queued write for one
+/// key before answering from committed state.
+///
+/// Enough for a key genuinely rewritten while it is being probed; far below what a
+/// misbehaving backend would need to burn a worker on a ready-`Queued` spin.
+const MAX_QUEUE_WAITS: usize = 8;
+
+/// The answer to a presence check that refuses to wait for anything.
+#[derive(Debug)]
+pub enum Existence {
+    /// Answered from the committed state of the cache.
+    Committed(bool),
+    /// A write to this key is queued but not committed, so there is no settled
+    /// answer yet. Wait on the handle — `.await` from a task, and see
+    /// [`PendingWrite`] for why that matters — then ask again.
+    Queued(PendingWrite),
+}
+
 pub trait LocalCache: Send + Sync {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader>;
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Write>>;
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool>;
+    /// [`exists`](Self::exists), minus the wait on the backend's write-behind
+    /// queue — it reports the queue instead of blocking on it, so it is safe to
+    /// call from a tokio worker. [`Engine::exists_local`] is the async wrapper
+    /// that drives it to an answer.
+    ///
+    /// **Required, deliberately.** A default of
+    /// `Ok(Existence::Committed(self.exists(..)?))` is correct only for a backend
+    /// that commits inline, and wrong in the worst way for one that queues: it
+    /// silently reinstates the worker-parking this method exists to remove, with
+    /// nothing to see. A decorator that forwards `exists` and forgets this would
+    /// inherit that default and re-park the runtime. Making it required means the
+    /// compiler asks every impl — including test doubles — which one it is.
+    ///
+    /// An inline backend answers `Ok(Existence::Committed(self.exists(..)?))`
+    /// explicitly; a decorator forwards to the layer that owns the queue.
+    fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Existence>;
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
     /// Stream the distinct target address keys (`Addr::format()`, parseable via
     /// `htaddr::parse_addr`) present in the cache. Streamed rather than collected
@@ -603,27 +678,69 @@ impl Engine {
         manifest: &Manifest,
         outputs: &[String],
     ) -> anyhow::Result<Vec<String>> {
-        let local_cache = &self.local_cache;
-        // Deliberately still inline, unlike the write path: this is a walk of an
-        // already-parsed manifest plus one `exists` stat per needed artifact — no
-        // bytes read, no compression. Moving it to the blocking pool would mean a
-        // `'static` job, so `manifest` and `outputs` would have to be cloned or
-        // re-plumbed as `Arc`s through the whole read path, to take work off the
-        // worker that barely occupies it.
-        hproc::process_supervisor::block_or_inline(move || {
-            let mut missing = Vec::new();
-            for artifact in Self::needed_artifacts(manifest, outputs) {
-                if !local_cache
-                    .exists(addr, hashin, &artifact.name)
-                    .with_context(|| {
-                        format!("probe local blob {} for {addr} {hashin}", artifact.name)
-                    })?
-                {
-                    missing.push(artifact.name.clone());
-                }
+        // Stays on the calling worker rather than going to `hcore::blocking`: this
+        // is a walk of an already-parsed manifest plus one indexed point lookup per
+        // needed artifact — no bytes read, no compression — and a `'static` job
+        // would force `manifest` and `outputs` to be cloned or re-plumbed as `Arc`s
+        // through the whole read path to offload work that barely occupies the
+        // worker. That is only defensible because `exists_local` never blocks; the
+        // plain `exists` it replaced could park here for a whole batch commit.
+        let mut missing = Vec::new();
+        for artifact in Self::needed_artifacts(manifest, outputs) {
+            if !self
+                .exists_local(addr, hashin, &artifact.name)
+                .await
+                .with_context(|| {
+                    format!("probe local blob {} for {addr} {hashin}", artifact.name)
+                })?
+            {
+                missing.push(artifact.name.clone());
             }
-            anyhow::Ok(missing)
-        })
+        }
+        Ok(missing)
+    }
+
+    /// [`LocalCache::exists`] for an async caller: the same answer, without ever
+    /// waiting on the backend's write-behind queue.
+    ///
+    /// `exists` covers a queued-but-uncommitted write by blocking until the batch
+    /// commits, which is right on an OS thread and wrong on every caller in this
+    /// module — see [`PendingWrite`]. Awaiting the slot suspends the task instead.
+    ///
+    /// "Never waits on the queue" is the exact claim, not "never blocks": the
+    /// probe underneath still checks a connection out of the sqlite read pool, and
+    /// `r2d2::Pool::get` waits on a condvar when the pool is exhausted. That is
+    /// reachable — the pipe-read path and every open `OwnedBlob` (FUSE) hold a
+    /// connection — and it is the remaining bound on this call.
+    ///
+    /// It re-probes rather than answering after one wait because a *new* write to
+    /// the key can be queued between the await and the next check. The retries are
+    /// capped: an unbounded loop here would spin a worker at full tilt against a
+    /// backend that kept handing back a ready [`Existence::Queued`], which is a
+    /// worse failure than the park it replaced because nothing would show it. On
+    /// exhaustion the committed answer is the right one to return — a reader has no
+    /// happens-before against a write still in flight, so "absent" was always a
+    /// legitimate answer, and the `warn!` says the backend is behaving oddly.
+    pub(crate) async fn exists_local(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+    ) -> anyhow::Result<bool> {
+        for _ in 0..MAX_QUEUE_WAITS {
+            match self.local_cache.existence(addr, hashin, name)? {
+                Existence::Committed(found) => return Ok(found),
+                Existence::Queued(pending) => pending.await,
+            }
+        }
+        tracing::warn!(
+            %addr,
+            hashin,
+            name,
+            waits = MAX_QUEUE_WAITS,
+            "local cache kept reporting a queued write for one key; answering from committed state"
+        );
+        self.local_cache.exists(addr, hashin, name)
     }
 
     /// Build this caller's artifact set from an already-parsed `manifest`, gating
@@ -644,58 +761,61 @@ impl Engine {
         residency: BlobResidency,
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
         let local_cache = &self.local_cache;
-        // Inline for the same reason as `missing_local_blobs`: stats and struct
-        // building over a manifest already in memory.
-        hproc::process_supervisor::block_or_inline(move || {
-            let mut results: Vec<CacheArtifact> = Vec::with_capacity(manifest.artifacts.len());
-            let mut result_meta: Vec<ArtifactMeta> = Vec::with_capacity(manifest.artifacts.len());
+        // Stays on the calling worker for the same reason as `missing_local_blobs`:
+        // point lookups and struct building over a manifest already in memory, with
+        // `exists_local` keeping the probe non-blocking.
+        let mut results: Vec<CacheArtifact> = Vec::with_capacity(manifest.artifacts.len());
+        let mut result_meta: Vec<ArtifactMeta> = Vec::with_capacity(manifest.artifacts.len());
 
-            for artifact in &manifest.artifacts {
-                // Outputs and SupportFiles both flow back to dependents — Output
-                // populates SRC/list, SupportFile only materializes into the
-                // sandbox. Logs and other types are kept in the cache but not
-                // surfaced to callers here.
-                match artifact.r#type {
-                    ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
-                    ManifestArtifactType::Log => continue,
-                }
-
-                result_meta.push(ArtifactMeta {
-                    hashout: artifact.hashout.clone(),
-                });
-
-                // Outputs are gated on the caller's requested output groups.
-                // SupportFiles travel with the target wherever it's referenced.
-                if artifact.r#type == ManifestArtifactType::Output
-                    && !outputs.contains(&artifact.group)
-                {
-                    continue;
-                }
-
-                if residency == BlobResidency::Unknown
-                    && !local_cache.exists(addr, hashin, artifact.name.as_ref())?
-                {
-                    return Ok(None);
-                }
-
-                results.push(CacheArtifact {
-                    addr: addr.clone(),
-                    hashin: hashin.to_string(),
-                    name: artifact.name.clone(),
-                    cache: local_cache.clone(),
-                    content_type: match artifact.content_type {
-                        ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
-                        ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
-                    },
-                    r#type: artifact.r#type.clone(),
-                    hashout: artifact.hashout.clone(),
-                    group: artifact.group.clone(),
-                    size: artifact.size,
-                });
+        for artifact in &manifest.artifacts {
+            // Outputs and SupportFiles both flow back to dependents — Output
+            // populates SRC/list, SupportFile only materializes into the
+            // sandbox. Logs and other types are kept in the cache but not
+            // surfaced to callers here.
+            match artifact.r#type {
+                ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
+                ManifestArtifactType::Log => continue,
             }
 
-            anyhow::Ok(Some((results, result_meta)))
-        })
+            result_meta.push(ArtifactMeta {
+                hashout: artifact.hashout.clone(),
+            });
+
+            // Outputs are gated on the caller's requested output groups.
+            // SupportFiles travel with the target wherever it's referenced.
+            if artifact.r#type == ManifestArtifactType::Output && !outputs.contains(&artifact.group)
+            {
+                continue;
+            }
+
+            if residency == BlobResidency::Unknown
+                && !self
+                    .exists_local(addr, hashin, artifact.name.as_ref())
+                    .await
+                    .with_context(|| {
+                        format!("probe local blob {} for {addr} {hashin}", artifact.name)
+                    })?
+            {
+                return Ok(None);
+            }
+
+            results.push(CacheArtifact {
+                addr: addr.clone(),
+                hashin: hashin.to_string(),
+                name: artifact.name.clone(),
+                cache: local_cache.clone(),
+                content_type: match artifact.content_type {
+                    ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                    ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+                },
+                r#type: artifact.r#type.clone(),
+                hashout: artifact.hashout.clone(),
+                group: artifact.group.clone(),
+                size: artifact.size,
+            });
+        }
+
+        Ok(Some((results, result_meta)))
     }
 
     pub async fn artifacts_from_local_cache(
@@ -1169,5 +1289,114 @@ mod tests {
         let mut out = Vec::new();
         io::Read::read_to_end(&mut r, &mut out).expect("read");
         out
+    }
+
+    /// A backend that reports the write queue a fixed number of times before
+    /// settling — a key rewritten while it is being probed, or a backend that has
+    /// gone wrong and keeps claiming a queue forever.
+    struct QueuedTimes {
+        queued_answers: std::sync::Mutex<usize>,
+        committed: bool,
+        existence_calls: Arc<std::sync::atomic::AtomicUsize>,
+        exists_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LocalCache for QueuedTimes {
+        fn reader(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<SizedReader> {
+            Err(anyhow::anyhow!(NotFoundError))
+        }
+        fn writer(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<Box<dyn io::Write>> {
+            unreachable!("the probe path never writes")
+        }
+        fn exists(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<bool> {
+            self.exists_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.committed)
+        }
+        fn existence(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<Existence> {
+            self.existence_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut left = self.queued_answers.lock().expect("queued answers");
+            if *left > 0 {
+                *left -= 1;
+                // Ready on the first poll: the point is the loop's control flow,
+                // not the waiting, and a ready future is also the shape that would
+                // spin a worker without the cap.
+                return Ok(Existence::Queued(PendingWrite::new(std::future::ready(()))));
+            }
+            Ok(Existence::Committed(self.committed))
+        }
+        fn delete(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn engine_with_cache(cache: Arc<dyn LocalCache>) -> (Engine, tempfile::TempDir) {
+        let (mut engine, dir) = test_engine();
+        engine.local_cache = cache;
+        (engine, dir)
+    }
+
+    /// The invariant the whole probe path rests on: a write that is queued but not
+    /// yet committed must be reported *present*. If `exists_local` answered from
+    /// committed state while a write was in flight, every freshly-written blob
+    /// would look absent and a cache hit would silently become a rebuild.
+    #[tokio::test]
+    async fn exists_local_reports_a_queued_write_as_present() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (engine, _dir) = engine_with_cache(Arc::new(QueuedTimes {
+            queued_answers: std::sync::Mutex::new(2),
+            committed: true,
+            existence_calls: calls.clone(),
+            exists_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+
+        assert!(
+            engine
+                .exists_local(&test_addr(), "h", "blob")
+                .await
+                .expect("probe"),
+            "a queued write must resolve to present, not to the committed miss"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two queued answers must be waited out, then the settled one taken"
+        );
+    }
+
+    /// A backend that never settles must not spin a worker. The loop gives up
+    /// after a bounded number of waits and answers from committed state, which is
+    /// a legitimate answer for a reader with no happens-before against the write.
+    #[tokio::test]
+    async fn exists_local_gives_up_after_a_bounded_number_of_waits() {
+        let existence_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exists_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (engine, _dir) = engine_with_cache(Arc::new(QueuedTimes {
+            queued_answers: std::sync::Mutex::new(usize::MAX),
+            committed: false,
+            existence_calls: existence_calls.clone(),
+            exists_calls: exists_calls.clone(),
+        }));
+
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.exists_local(&test_addr(), "h", "blob"),
+        )
+        .await
+        .expect("a never-settling backend must not hang the probe")
+        .expect("probe");
+
+        assert!(!found);
+        assert_eq!(
+            existence_calls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_QUEUE_WAITS,
+            "the retries must be capped"
+        );
+        assert_eq!(
+            exists_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the capped-out answer comes from one committed-state probe"
+        );
     }
 }

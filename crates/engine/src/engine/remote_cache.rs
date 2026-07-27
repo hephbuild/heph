@@ -1426,7 +1426,18 @@ impl Engine {
     }
 
     async fn upload_to_remote_inner(&self, addr: &Addr, hashin: &str) -> anyhow::Result<()> {
-        let Some(manifest) = self.read_manifest(addr, hashin)? else {
+        // Off the worker, not the synchronous `read_manifest`: this task is spawned
+        // the moment `cache_locally` returns, so the manifest key it reads is the
+        // one just *queued* to the sqlite writer, and `reader` parks on that
+        // commit. Up to `MAX_CONCURRENT_UPLOADS` of these run at once on plain
+        // runtime workers — the exact shape that stalls the reactor.
+        let manifest = {
+            let (local_cache, addr, hashin) =
+                (self.local_cache.clone(), addr.clone(), hashin.to_string());
+            hcore::blocking::run(move || Self::read_manifest_from(&local_cache, &addr, &hashin))
+                .await?
+        };
+        let Some(manifest) = manifest else {
             return Ok(());
         };
 

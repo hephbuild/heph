@@ -20,7 +20,7 @@
 //! run, so it grows by at most one entry per uncacheable target (within the
 //! capacity budget) and is reclaimed when the process exits.
 
-use crate::engine::local_cache::{LocalCache, SizedReader, TargetStream};
+use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
 use anyhow::Result;
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
@@ -132,6 +132,17 @@ impl LocalCache for LocalCacheTmp {
             return Ok(true);
         }
         self.durable.exists(addr, hashin, name)
+    }
+
+    fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
+        let key = Self::key(addr, hashin, name);
+        // An admitted tmp entry is committed the moment `TmpWriter` inserts it —
+        // no queue behind it, so answer straight away.
+        if self.store.map.read().contains_key(&key) {
+            return Ok(Existence::Committed(true));
+        }
+        // Spilled entries live in the durable cache and inherit its write queue.
+        self.durable.existence(addr, hashin, name)
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
@@ -293,6 +304,10 @@ mod tests {
         fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
             let key = (addr.format(), hashin.to_string(), name.to_string());
             Ok(self.store.read().contains_key(&key))
+        }
+        // In-memory map, committed the instant the writer drops.
+        fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
+            Ok(Existence::Committed(self.exists(addr, hashin, name)?))
         }
         fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
             let key = (addr.format(), hashin.to_string(), name.to_string());

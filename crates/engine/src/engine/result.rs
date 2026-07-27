@@ -5766,7 +5766,9 @@ mod tests {
         // presence-probe and the per-caller read each parsed the manifest (two
         // backend reads per hit); now the probe stashes the parsed manifest on
         // `LockedResolution` and the caller filters its outputs from it.
-        use crate::engine::local_cache::{LocalCache, MANIFEST_V1, SizedReader, TargetStream};
+        use crate::engine::local_cache::{
+            Existence, LocalCache, MANIFEST_V1, SizedReader, TargetStream,
+        };
 
         struct CountingCache {
             inner: SArc<dyn LocalCache>,
@@ -5789,6 +5791,16 @@ mod tests {
             }
             fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
                 self.inner.exists(addr, hashin, name)
+            }
+            // Forwarded, not defaulted: defaulting would route the probe through
+            // the blocking  and park the worker this test runs on.
+            fn existence(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<Existence> {
+                self.inner.existence(addr, hashin, name)
             }
             fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
                 self.inner.delete(addr, hashin, name)
