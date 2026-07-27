@@ -69,8 +69,9 @@ fn shipped_gha_cdylib_loads() {
     .expect("write BUILD");
 
     // A query still resolving the workspace graph means the hook registered and
-    // the engine came up with it attached.
-    let out = ws.run(&dist, &["query", "//pkg/..."]).expect("run");
+    // the engine came up with it attached. Subtree selection needs `-e`: a bare
+    // positional argument is parsed strictly as an address.
+    let out = ws.run(&dist, &["query", "-e", "//pkg/..."]).expect("run");
     assert!(out.status.success(), "{}", describe(&out));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("//pkg:ok"),

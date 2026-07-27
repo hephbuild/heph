@@ -170,7 +170,10 @@ in
     chmod +x "$dist/heph"
 
     export HEPH_E2E_DIST="$dist"
-    cargo test --locked -p bin-e2e "''${@}"
+    # --no-fail-fast: each test file is a separate binary, and cargo stops at the
+    # first one that fails. A CI run that spends 20 minutes building artifacts
+    # should report every broken seam it found, not just the first.
+    cargo test --locked -p bin-e2e --no-fail-fast "''${@}"
   '';
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
