@@ -127,7 +127,7 @@ pub struct HostSupervisor;
 impl HostSupervisor {
     /// Wrap as an ABI-stable [`DynSupervisor`] to pass over the seam.
     pub fn wrap() -> DynSupervisor {
-        stabby::boxed::Box::new(HostSupervisor).into()
+        dynify(stabby::boxed::Box::new(HostSupervisor))
     }
 }
 
@@ -365,5 +365,64 @@ impl StableExecutor for HostExecutor {
                 },
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostLogSink, HostSupervisor};
+    use crate::abi::{DynRead, StableRead, StableReadDyn};
+    use stabby::vec::Vec as SVec;
+
+    /// A distinct `StableRead` implementor per `N`: each monomorphization is its
+    /// own source type, so each construction is a FIRST-USE insert into stabby's
+    /// process-global vtable registry. This is the mutation side of the race.
+    struct Churn<const N: usize>;
+
+    impl<const N: usize> StableRead for Churn<N> {
+        extern "C" fn read_chunk(&self) -> SVec<u8> {
+            SVec::from([N as u8].as_slice())
+        }
+    }
+
+    /// Keep the registry mutating while other threads read it.
+    macro_rules! churn {
+        ($($n:literal),* $(,)?) => {
+            $({
+                let handle: DynRead = crate::vtable::dynify(stabby::boxed::Box::new(Churn::<$n>));
+                let got = handle.read_chunk();
+                assert_eq!(got.as_slice(), [$n as u8], "vtable dispatched to the wrong impl");
+            })*
+        };
+    }
+
+    /// The host's `wrap` constructors run on the plugin-load path, which is driven
+    /// under `rayon::into_par_iter` — so they race sibling first-use vtable inserts
+    /// coming from other plugins loading concurrently. Built with a bare `.into()`
+    /// a `wrap` reads the registry root without the guard and can clone a node
+    /// another thread just freed, coming back with a null vtable slice and
+    /// aborting the process (non-unwinding, so it is not catchable). Every one of
+    /// them must go through `dynify`.
+    #[test]
+    fn host_wrap_constructors_are_registry_safe_under_concurrent_first_use() {
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                scope.spawn(move || {
+                    if i % 2 == 0 {
+                        // Reader side: repeated lookups of an already-registered
+                        // vtable, which is what a freed root corrupts.
+                        for _ in 0..256 {
+                            let _sup = HostSupervisor::wrap();
+                            let _sink = HostLogSink::wrap();
+                        }
+                    } else {
+                        churn!(
+                            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                            20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                        );
+                    }
+                });
+            }
+        });
     }
 }
