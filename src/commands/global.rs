@@ -7,7 +7,10 @@ use clap::Args;
 /// subcommand, then plumbed to each command's `execute`.
 #[derive(Args, Clone, Debug, Default)]
 pub struct GlobalOptions {
-    /// Write CPU pprof on exit
+    /// Sample CPU and write a pprof profile to PATH. `kill -USR2 <pid>`
+    /// snapshots the profile so far without stopping the run — this is the point
+    /// of the flag, since a hung build never reaches exit. A filtered final
+    /// report is also written at exit.
     #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
     pub pprof_cpu: Option<PathBuf>,
     /// Install a SIGUSR1 handler that appends the signalled thread's backtrace to
@@ -20,8 +23,7 @@ pub struct GlobalOptions {
         value_name = "FILE",
         num_args = 0..=1,
         default_missing_value = "/tmp/heph-backtrace.log",
-        global = true,
-        hide = true
+        global = true
     )]
     pub diag_backtrace: Option<PathBuf>,
     /// Disable the interactive TUI (force CI/log-only output)

@@ -233,21 +233,29 @@ impl RemoteCacheDef {
 /// the breaker below and a perfectly healthy cache drops out of the run — the
 /// build then rebuilds everything from scratch and looks hung.
 ///
-/// So the budget is split: metadata draws from its own reserve and can never
-/// queue behind a blob stream.
+/// So metadata gets a reserve of its own that a blob stream can never occupy.
+///
+/// This is a **floor, not a ceiling**. An earlier version partitioned the budget
+/// outright — metadata could use only these slots even while every bulk slot sat
+/// idle. That inverts on a metadata-heavy run: resolving a fully-cached graph is
+/// almost entirely manifest reads and presence checks (a target whose manifest is
+/// local but whose blobs are not still has to ask the remote), so a build would
+/// serialize thousands of targets through 32 slots while 224 went unused. See
+/// [`ConfiguredCache::meta_op`] for how the floor is preserved without the cap.
 const META_SLOT_RESERVE: usize = 32;
 
-/// Split a cache's request budget into `(metadata, blob)` slot counts.
+/// Split a cache's request budget into `(metadata reserve, shared pool)` slot
+/// counts.
 ///
-/// Metadata takes [`META_SLOT_RESERVE`], or half the budget when that is
-/// smaller, so a deliberately tiny `concurrency` still leaves room for both
-/// classes. The two halves sum to the budget, so the store's own request cap
-/// (`LimitStore`) is never the binding constraint and therefore never a place
-/// where the two classes contend again.
+/// The reserve is [`META_SLOT_RESERVE`], or half the budget when that is smaller,
+/// so a deliberately tiny `concurrency` still leaves room for both classes. The
+/// two sum to the budget, so the store's own request cap (`LimitStore`) is never
+/// the binding constraint and therefore never a place where the two classes
+/// contend again.
 fn split_request_budget(concurrency: usize) -> (usize, usize) {
     let total = concurrency.max(2);
-    let meta = META_SLOT_RESERVE.min(total / 2).max(1);
-    (meta, (total - meta).max(1))
+    let reserve = META_SLOT_RESERVE.min(total / 2).max(1);
+    (reserve, (total - reserve).max(1))
 }
 
 /// After this many consecutive failures a cache is circuit-broken: skipped
@@ -294,26 +302,28 @@ struct CacheHealth {
 }
 
 /// A configured cache: its definition, the constructed backend, its health, and
-/// the two halves of its request budget (see [`META_SLOT_RESERVE`]).
+/// its request budget (see [`META_SLOT_RESERVE`]).
 struct ConfiguredCache {
     def: RemoteCacheDef,
     backend: Arc<dyn RemoteCacheBackend>,
     health: CacheHealth,
-    /// Concurrent metadata requests (manifest reads, presence checks).
-    meta_slots: Semaphore,
-    /// Concurrent bulk blob transfers, in either direction.
-    blob_slots: Semaphore,
+    /// Metadata-only permits. Nothing bulk may take one, so a manifest read can
+    /// always find a slot that no blob stream is sitting on.
+    meta_reserve: Semaphore,
+    /// The rest of the budget. Blob transfers draw only from here; metadata
+    /// borrows from here first, so idle bulk capacity is usable.
+    shared_slots: Semaphore,
 }
 
 impl ConfiguredCache {
     fn new(def: RemoteCacheDef, backend: Arc<dyn RemoteCacheBackend>) -> Self {
-        let (meta, blob) = split_request_budget(def.concurrency);
+        let (reserve, shared) = split_request_budget(def.concurrency);
         Self {
             def,
             backend,
             health: CacheHealth::default(),
-            meta_slots: Semaphore::new(meta),
-            blob_slots: Semaphore::new(blob),
+            meta_reserve: Semaphore::new(reserve),
+            shared_slots: Semaphore::new(shared),
         }
     }
 
@@ -324,9 +334,22 @@ impl ConfiguredCache {
     /// The slot is taken **before** the clock starts. The timeout is a liveness
     /// bound on the request; charging it for time spent queued turns ordinary
     /// backpressure into a fake failure, and three of those trip the breaker and
-    /// cost the whole run its cache. Queue time is bounded instead by the reserve
-    /// being metadata-only — nothing ahead of us in it is a long blob stream
-    /// (see [`META_SLOT_RESERVE`]).
+    /// cost the whole run its cache. Queue time is bounded instead by *where* we
+    /// queue, below.
+    ///
+    /// Slot order — the shared pool first, the reserve only as a fallback:
+    ///
+    /// - `try_acquire` on the shared pool, never `acquire`. A success means bulk
+    ///   capacity was idle and we borrow it, which is what lets a metadata-heavy
+    ///   run use the whole budget instead of [`META_SLOT_RESERVE`] of it. It is a
+    ///   non-blocking barge, so we never *wait* behind a blob stream.
+    /// - On failure — bulk is saturated — fall back to the metadata reserve and
+    ///   wait there. Nothing bulk can hold one of those, so anything ahead of us
+    ///   is another short metadata request. That is the [`META_SLOT_RESERVE`]
+    ///   guarantee, and it is the reason the fallback order is not the other way
+    ///   round: draining the reserve first would leave later metadata queued on
+    ///   the shared pool, behind exactly the multi-GiB transfers this reserve
+    ///   exists to avoid.
     ///
     /// The timeout also has to be *ours*: object_store's own budget
     /// (`retry_config`) is sized for resuming multi-GiB blobs, so left to it a
@@ -336,11 +359,14 @@ impl ConfiguredCache {
     where
         F: Future<Output = anyhow::Result<T>>,
     {
-        let _slot = self
-            .meta_slots
-            .acquire()
-            .await
-            .with_context(|| format!("acquire remote cache metadata slot for {what}"))?;
+        let _slot = match self.shared_slots.try_acquire() {
+            Ok(slot) => slot,
+            Err(_) => self
+                .meta_reserve
+                .acquire()
+                .await
+                .with_context(|| format!("acquire remote cache metadata slot for {what}"))?,
+        };
         tokio::time::timeout(METADATA_TIMEOUT, fut)
             .await
             .with_context(|| format!("{what} timed out after {METADATA_TIMEOUT:?}"))?
@@ -836,7 +862,7 @@ impl RemoteCacheSet {
                         // Uploads are bulk too, and background: they must never
                         // hold a slot a critical-path metadata read needs.
                         let _slot =
-                            cache.blob_slots.acquire().await.with_context(|| {
+                            cache.shared_slots.acquire().await.with_context(|| {
                                 format!("acquire remote cache blob slot for {key}")
                             })?;
                         stream_file_to_backend(cache.backend.as_ref(), &key, path).await
@@ -1026,7 +1052,7 @@ impl RemoteCacheSet {
         // presence checks that decide every other target's hit
         // (see `META_SLOT_RESERVE`).
         let _slot = cache
-            .blob_slots
+            .shared_slots
             .acquire()
             .await
             .with_context(|| format!("acquire remote cache blob slot for {name}"))?;
@@ -2154,7 +2180,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn saturated_blob_transfers_do_not_starve_a_manifest_read() {
         const CONCURRENCY: usize = 8;
-        let (meta_slots, blob_slots) = split_request_budget(CONCURRENCY);
+        let (meta_reserve, shared_slots) = split_request_budget(CONCURRENCY);
 
         let addr = addr();
         let manifest = RemoteManifest {
@@ -2194,7 +2220,7 @@ mod tests {
             manifest,
         });
         let tmp = tempfile::tempdir().expect("tempdir");
-        for i in 0..blob_slots + 4 {
+        for i in 0..shared_slots + 4 {
             let (set, rev, addr, tmp) = (
                 Arc::clone(&set),
                 Arc::clone(&rev),
@@ -2212,13 +2238,13 @@ mod tests {
         // Wait for the bulk half to actually fill before reading the manifest —
         // otherwise the test could pass without ever reproducing contention.
         for _ in 0..10_000 {
-            if budget.available_permits() <= meta_slots {
+            if budget.available_permits() <= meta_reserve {
                 break;
             }
             tokio::task::yield_now().await;
         }
         assert!(
-            budget.available_permits() <= meta_slots,
+            budget.available_permits() <= meta_reserve,
             "blob transfers never saturated their half of the budget"
         );
 
@@ -2228,6 +2254,120 @@ mod tests {
             .expect("a manifest read must not be starved by in-flight blob transfers")
             .is_some();
         assert!(found, "manifest read must resolve to a hit");
+    }
+
+    /// Backend that parks every read on `gate` and records how many were in
+    /// flight at once, so a test can observe the real metadata concurrency
+    /// rather than infer it from timing.
+    struct ConcurrencyProbeBackend {
+        gate: Arc<Semaphore>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        manifest: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for ConcurrencyProbeBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let _open = self.gate.acquire().await.context("gate closed")?;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(Some(Box::pin(std::io::Cursor::new(self.manifest.clone()))))
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("unused")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Metadata must be able to use idle bulk capacity, not just its reserve.
+    ///
+    /// The regression this guards: the reserve was implemented as a partition, so
+    /// metadata could never exceed [`META_SLOT_RESERVE`] slots even with every
+    /// bulk slot idle. Resolving a fully-cached graph is almost entirely metadata
+    /// — a target whose manifest is local but whose blobs are not still has to ask
+    /// the remote — so a wide build serialized thousands of targets through 32
+    /// slots while the other 224 went unused, and the run looked hung.
+    ///
+    /// With no blob transfer in flight, `CONCURRENCY` concurrent manifest reads
+    /// must all be in flight together. Under the old split the peak would pin to
+    /// the reserve.
+    #[tokio::test]
+    async fn metadata_uses_idle_bulk_capacity() {
+        const CONCURRENCY: usize = 8;
+        let (meta_reserve, _shared) = split_request_budget(CONCURRENCY);
+
+        let addr = addr();
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr.format(),
+            hashin: "h".to_string(),
+            artifacts: Vec::new(),
+        };
+
+        // No permits: every read parks inside the backend until released, so all
+        // of them pile up and the peak is observable.
+        let gate = Arc::new(Semaphore::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = Arc::new(ConcurrencyProbeBackend {
+            gate: Arc::clone(&gate),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+            manifest: borsh::to_vec(&manifest).expect("serialize"),
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cache_def = def("probe", "memory:///probe", true, true);
+        cache_def.concurrency = CONCURRENCY;
+        let set = Arc::new(RemoteCacheSet {
+            caches: vec![ConfiguredCache::new(cache_def, backend)],
+            home: dir.path().to_path_buf(),
+            config_hash: String::new(),
+            read_order: OnceCell::new(),
+        });
+
+        let reads: Vec<_> = (0..CONCURRENCY)
+            .map(|i| {
+                let (set, addr) = (Arc::clone(&set), addr.clone());
+                tokio::spawn(async move {
+                    drop(set.fetch_manifest(&never(), &addr, &format!("h{i}")).await);
+                })
+            })
+            .collect();
+
+        for _ in 0..10_000 {
+            if peak.load(Ordering::SeqCst) >= CONCURRENCY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let observed = peak.load(Ordering::SeqCst);
+
+        // Release before asserting so a failure doesn't leave the reads parked.
+        gate.add_permits(CONCURRENCY);
+        for r in reads {
+            drop(r.await);
+        }
+
+        assert!(
+            observed > meta_reserve,
+            "metadata peaked at {observed} concurrent reads, capped by the {meta_reserve}-slot \
+             reserve — idle bulk capacity is not being borrowed"
+        );
+        assert_eq!(
+            observed, CONCURRENCY,
+            "metadata should reach the cache's full request budget when no blob transfer is \
+             holding slots"
+        );
     }
 
     /// Backend that records how many times `exists` was called and sleeps a
