@@ -1,0 +1,24 @@
+[package]
+name = "bin-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+# Deliberately NO dependency on `heph` or any workspace crate: this suite drives
+# the shipped artifacts as a child process. Linking them would defeat the point
+# (and would test *this* build rather than the one CI publishes). Anything that
+# can be proven in-process belongs in `crates/e2e`.
+[dev-dependencies]
+anyhow = "1"
+tempfile = "3"
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+# Real PTY + terminal emulator: the interactive TUI only engages when stderr is
+# a terminal, and its output is escape sequences — asserting on cells of a
+# parsed screen is the only way to test it that isn't asserting on raw bytes.
+portable-pty = "0.9"
+vt100 = "0.16"

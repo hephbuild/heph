@@ -325,10 +325,28 @@ impl RemoteCacheBackend for ObjStoreBackend {
 
     async fn open_write(&self, key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
         let path = self.object_path(key);
-        // `BufWriter` performs a multipart upload under the hood, buffering at
-        // most one part (default 10 MiB) before flushing — bounded memory.
-        // Finalized on `poll_shutdown`.
-        Ok(Box::pin(BufWriter::new(self.store.clone(), path)))
+        // `BufWriter` performs a multipart upload under the hood, finalized on
+        // `poll_shutdown`.
+        //
+        // `with_max_concurrency(1)` is load-bearing, not tuning. At its default
+        // of 8 the writer spawns up to eight `put_part` tasks, and **each one
+        // takes its own permit from the store-wide `LimitStore`** — so one heph
+        // blob slot expands to eight store requests. That breaks the 1:1
+        // slot-to-request invariant `split_request_budget` is built on: the
+        // metadata reserve's real store headroom is only the metadata share, so
+        // a few dozen concurrent uploads exhaust the whole store budget, a
+        // manifest read then starts its `METADATA_TIMEOUT` clock while queued
+        // behind blob parts whose own stall bound is ten minutes, and three such
+        // timeouts trip the breaker — dropping a *healthy* cache for the rest of
+        // the run. That is the failure PR #178 fixed one layer out.
+        //
+        // Raising the `LimitStore` ceiling instead would defeat the connection
+        // bound it exists to impose. The cost is losing part pipelining on a
+        // high-latency link for multi-GiB blobs; `REVISION_BLOB_CONCURRENCY`
+        // still fans out across blobs, and can be raised if throughput regresses.
+        Ok(Box::pin(
+            BufWriter::new(self.store.clone(), path).with_max_concurrency(1),
+        ))
     }
 
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
@@ -480,6 +498,159 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).await.expect("read");
         Some(buf)
+    }
+
+    /// One heph blob slot must mean one store request.
+    ///
+    /// `split_request_budget` divides a cache's `concurrency` into a metadata
+    /// reserve and a bulk pool on exactly that basis, so the store's own
+    /// `LimitStore` is never the binding constraint. `BufWriter` at its default
+    /// concurrency breaks it: it spawns up to eight `put_part` tasks per writer,
+    /// each taking its own store permit, and the metadata reserve's real store
+    /// headroom collapses. A manifest read then starts its `METADATA_TIMEOUT`
+    /// clock while queued behind blob parts bounded at ten minutes, and three of
+    /// those trip the breaker on a cache that is perfectly healthy.
+    #[tokio::test]
+    async fn a_multipart_upload_takes_one_store_request_at_a_time() {
+        use object_store::{
+            GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+            PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Delegates to an in-memory store, recording peak concurrent parts.
+        #[derive(Debug)]
+        struct PartCountingStore {
+            inner: Arc<dyn ObjectStore>,
+            inflight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        impl std::fmt::Display for PartCountingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("PartCountingStore")
+            }
+        }
+
+        struct CountingUpload {
+            inner: Box<dyn MultipartUpload>,
+            inflight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        impl std::fmt::Debug for CountingUpload {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("CountingUpload")
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl MultipartUpload for CountingUpload {
+            fn put_part(&mut self, data: PutPayload) -> UploadPart {
+                let n = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(n, Ordering::SeqCst);
+                let part = self.inner.put_part(data);
+                let inflight = Arc::clone(&self.inflight);
+                Box::pin(async move {
+                    // Slow enough that overlapping parts overlap observably.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let r = part.await;
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    r
+                })
+            }
+            async fn complete(&mut self) -> OsResult<PutResult> {
+                self.inner.complete().await
+            }
+            async fn abort(&mut self) -> OsResult<()> {
+                self.inner.abort().await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for PartCountingStore {
+            async fn put_opts(
+                &self,
+                location: &ObjPath,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> OsResult<PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjPath,
+                opts: PutMultipartOptions,
+            ) -> OsResult<Box<dyn MultipartUpload>> {
+                let inner = self.inner.put_multipart_opts(location, opts).await?;
+                Ok(Box::new(CountingUpload {
+                    inner,
+                    inflight: Arc::clone(&self.inflight),
+                    peak: Arc::clone(&self.peak),
+                }))
+            }
+            async fn get_opts(&self, location: &ObjPath, opts: GetOptions) -> OsResult<GetResult> {
+                self.inner.get_opts(location, opts).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, OsResult<ObjPath>>,
+            ) -> futures::stream::BoxStream<'static, OsResult<ObjPath>> {
+                self.inner.delete_stream(locations)
+            }
+            fn list(
+                &self,
+                prefix: Option<&ObjPath>,
+            ) -> futures::stream::BoxStream<'static, OsResult<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> OsResult<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &ObjPath,
+                to: &ObjPath,
+                opts: object_store::CopyOptions,
+            ) -> OsResult<()> {
+                self.inner.copy_opts(from, to, opts).await
+            }
+        }
+
+        let (inflight, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let backend = ObjStoreBackend {
+            store: Arc::new(PartCountingStore {
+                inner: Arc::new(object_store::memory::InMemory::new()),
+                inflight: Arc::clone(&inflight),
+                peak: Arc::clone(&peak),
+            }),
+            prefix: ObjPath::from("repo"),
+        };
+
+        // Several parts' worth: `BufWriter`'s default part size is 10 MiB, and
+        // at its default concurrency of 8 these would overlap.
+        //
+        // Written in chunks rather than one 45 MiB call, because that is what
+        // the upload path does (`stream_file_to_backend` copies chunk by chunk)
+        // and because the bound applies *between* writes: a single `write` of
+        // several parts' worth splits them internally with no capacity check.
+        let blob = vec![0u8; 45 * 1024 * 1024];
+        let mut w = backend.open_write("big.blob").await.expect("open_write");
+        for chunk in blob.chunks(256 * 1024) {
+            w.write_all(chunk).await.expect("write");
+        }
+        w.shutdown().await.expect("shutdown");
+        assert_eq!(get(&backend, "big.blob").await.expect("present"), blob);
+
+        assert!(
+            peak.load(Ordering::SeqCst) > 0,
+            "the upload must actually have gone multipart"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "one blob slot must never expand into several store requests",
+        );
     }
 
     #[tokio::test]
