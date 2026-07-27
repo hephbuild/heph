@@ -116,7 +116,7 @@ mod tests {
     }
 
     fn wrap(sup: RecordingSupervisor) -> DynSupervisor {
-        stabby::boxed::Box::new(sup).into()
+        hplugin_stabby::vtable::dynify(stabby::boxed::Box::new(sup))
     }
 
     #[test]

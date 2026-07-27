@@ -996,9 +996,32 @@ impl Engine {
             });
         }
 
+        // First genuine (non-cancellation) failure — from the matcher walk below
+        // or from a target. We never leave either loop by `?`: returning drops
+        // the `JoinSet`, and the futures the spawned tasks were driving live in
+        // this request's memoizers, which the tasks hold an `Arc` back into. The
+        // un-polled future keeps that cycle alive, so `RequestStateData::drop`
+        // never runs: children are never signalled, and their sandboxes are never
+        // enqueued for cleanup. Instead the first failure *signals* every other
+        // target to stop (cancelling the request token broadcasts SIGINT to
+        // running children) and we keep draining until they have all stopped by
+        // themselves, then return this error.
+        let mut fatal: Option<anyhow::Error> = None;
+
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
-        while let Some(addr) = stream.try_next().await? {
+        loop {
+            let next = match stream.try_next().await {
+                Ok(next) => next,
+                // The matcher walk itself failed. Stop enqueuing, signal the
+                // already-spawned targets, and fall through to the drain.
+                Err(e) => {
+                    fatal = Some(e);
+                    rs.ctoken().cancel();
+                    break;
+                }
+            };
+            let Some(addr) = next else { break };
             // Stop enqueuing new targets once cancelled — don't keep draining
             // the matcher and spawning work that would immediately bail.
             if rs.ctoken().is_cancelled() {
@@ -1021,7 +1044,9 @@ impl Engine {
             );
         }
         // Matcher fully resolved: mark the matched set final (drops the `~`).
-        if owns_matched {
+        // Not on a failed walk — the set never became final, so claiming it did
+        // would paint a wrong denominator over an aborting run.
+        if owns_matched && fatal.is_none() {
             rs.emit(crate::engine::event::BuildEventKind::Matched {
                 addrs: Vec::new(),
                 complete: true,
@@ -1030,13 +1055,6 @@ impl Engine {
 
         let mut ok: Vec<Arc<EResult>> = vec![];
         let mut errors: Vec<(Addr, anyhow::Error)> = vec![];
-        // First genuine (non-cancellation) failure under fail_fast. We never
-        // break out of the JoinSet — doing so would drop it and tear down
-        // in-flight tasks mid-execution. Instead, the first failure *signals*
-        // every other target to stop (cancelling the request token broadcasts
-        // SIGINT to running children) and we keep draining until they have all
-        // stopped by themselves, then return this error.
-        let mut fatal: Option<anyhow::Error> = None;
         while let Some(joined) = set.join_next().await {
             let (addr, res) = match joined {
                 Ok(pair) => pair,
@@ -4430,6 +4448,164 @@ mod tests {
         assert!(
             downcast_chain_ref::<CancelledError>(&err).is_some(),
             "expected CancelledError, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    const WALK_BLEW_UP: &str = "matcher walk blew up";
+    /// Package listed after the real one, whose `list` is the failing step.
+    const LATE_PKG: &str = "zzz";
+
+    /// Reproduces "a provider dies mid-walk, after `Engine::result` already
+    /// spawned tasks for the addrs it did yield" — deterministically.
+    ///
+    /// `get` parks every spawned task inside its `mem_spec` cell (waking only on
+    /// cancellation) and counts it in; the `list` of the trailing [`LATE_PKG`]
+    /// waits for that count before failing. So by the time the query stream
+    /// errors, every spawned task is guaranteed to be parked in a memoizer cell —
+    /// which is the state the `JoinSet` must not be dropped in.
+    struct GateProvider {
+        inner: pluginstatictarget::Provider,
+        parked: SArc<AtomicUsize>,
+        expect_parked: usize,
+    }
+
+    impl crate::engine::provider::Provider for GateProvider {
+        fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            self.inner.config(req)
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            if req.package.as_str() != LATE_PKG {
+                return self.inner.list(req, ctoken);
+            }
+            Box::pin(async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while self.parked.load(Ordering::SeqCst) < self.expect_parked {
+                    if std::time::Instant::now() >= deadline {
+                        // Distinct message: the test asserts on WALK_BLEW_UP, so a
+                        // gate that never opened fails loudly instead of passing
+                        // for the wrong reason.
+                        anyhow::bail!("gate timed out before every target parked");
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(anyhow::anyhow!(WALK_BLEW_UP))
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            req: ListPackagesRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            Box::pin(async move {
+                let it = self.inner.list_packages(req, ctoken).await?;
+                let late = std::iter::once(Ok(ListPackageResponse {
+                    pkg: PkgBuf::from(LATE_PKG),
+                }));
+                Ok(Box::new(it.chain(late)) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async move {
+                self.parked.fetch_add(1, Ordering::SeqCst);
+                // Park until the request is cancelled. Pre-fix nothing ever
+                // cancels it, because the early return skips `ctoken().cancel()`
+                // and `RequestStateData::drop` can't run either.
+                ctoken.cancelled().await;
+                Err(GetError::NotFound)
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            self.inner.probe(req, ctoken)
+        }
+    }
+
+    /// A failing matcher walk must surface its error *through the drain*, not by
+    /// returning early. Returning drops the `JoinSet`, which leaves each spawned
+    /// task's future un-polled inside this request's `mem_result` — and those
+    /// futures hold an `Arc<RequestState>` back into the very memoizer that owns
+    /// them. That cycle pins `RequestStateData` forever, so its `Drop` never runs:
+    /// the token is never cancelled, running children are never signalled, and
+    /// their sandboxes are never enqueued for cleanup. Releasing the last external
+    /// `Arc` and finding the request actually gone is the observable proof the
+    /// cycle was not formed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_matcher_walk_drains_instead_of_dropping_the_joinset() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        let targets = vec![
+            static_target("//pkg:a", &[], &[]),
+            static_target("//pkg:b", &[], &[]),
+            static_target("//pkg:c", &[], &[]),
+        ];
+        let expect_parked = targets.len();
+        let parked = SArc::new(AtomicUsize::new(0));
+        let inner = pluginstatictarget::Provider::new(targets)?;
+        engine.register_provider(enclose!((parked) move |_| Box::new(GateProvider {
+            inner,
+            parked,
+            expect_parked,
+        })))?;
+        let engine = Arc::new(engine);
+
+        let rs = engine.new_state();
+
+        let err = engine
+            .clone()
+            .result(
+                rs.clone(),
+                &Matcher::PackagePrefix(PkgBuf::from("")),
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .err()
+            .expect("a failed matcher walk must return Err");
+        assert!(
+            format!("{err:#}").contains(WALK_BLEW_UP),
+            "the walk failure must be what surfaces, got: {err:#}"
+        );
+
+        assert_eq!(
+            parked.load(Ordering::SeqCst),
+            expect_parked,
+            "the gate must have opened because every target parked, not by timing out"
+        );
+
+        drain_bg(&rs).await;
+        drop(rs);
+
+        assert!(
+            engine.requests.lock().expect("requests lock").is_empty(),
+            "the request outlived its own `result` call: dropping the JoinSet left \
+             un-polled futures in this request's memoizers, and those futures hold an \
+             Arc back into the RequestStateData that owns them, so its Drop — which \
+             cancels the token and deregisters the request — can never run"
         );
         Ok(())
     }
