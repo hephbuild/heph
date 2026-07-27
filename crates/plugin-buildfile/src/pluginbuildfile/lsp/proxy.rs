@@ -1176,15 +1176,22 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let tmp = tempfile::tempdir().unwrap();
         let registry = Arc::new(hplugin::provider::ProviderFunctionRegistry::default());
+        let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
+        let walker = Arc::new(hwalk::CachedWalker::disabled());
         let loader = BuildFileLoader::new(
             tmp.path().to_path_buf(),
-            vec![glob::Pattern::new("BUILD").unwrap()],
+            patterns.clone(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::clone(&registry),
             Arc::new(std::sync::OnceLock::new()),
-            Arc::new(hwalk::CachedWalker::disabled()),
-            Arc::new(hwalk::Ignore::default()),
+            Arc::clone(&walker),
+            Arc::new(crate::pluginbuildfile::provider::PackageList::new(
+                tmp.path().to_path_buf(),
+                patterns,
+                Arc::new(hwalk::Ignore::default()),
+                walker,
+            )),
         );
         // Mirror context.rs: a buffer that fails to eval falls back to a
         // source-only index (the realistic mid-edit case).

@@ -3792,6 +3792,7 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "model",
+ "once_cell",
  "plugin",
  "plugin-query",
  "proc",

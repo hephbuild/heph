@@ -353,6 +353,15 @@ pub trait Provider: Send + Sync {
         req: ListRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>;
+    /// The packages this provider knows about, in a **deterministic order**.
+    ///
+    /// The order is part of the contract, not a detail: the engine preserves it
+    /// through `Engine::packages` into `query`, which feeds `pluginquery`'s
+    /// `deps`, which `plugingroup` folds into its def hash *in order*. Returning
+    /// `HashSet` iteration order — the natural shape when the packages come from
+    /// a filesystem walk — therefore gives the same tree a different build
+    /// definition on every run, and a different `LIST_*` line order inside the
+    /// sandbox. Sort, or preserve a stable walk order.
     fn list_packages<'a>(
         &'a self,
         req: ListPackagesRequest,
