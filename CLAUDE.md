@@ -16,13 +16,31 @@ devenv shell        # enter the dev shell (provides Rust toolchain, buf, protoc 
 cargo build                          # build
 cargo test <test_name>               # run a single test by name
 
-tst                                  # run all tests
+tst                                  # run all tests (excludes bin-e2e)
+e2e                                  # binary end-to-end suite (see below)
 lint                                 # lint
 fix                                  # format & apply lint fixes
 gen                                  # regenerate protobuf bindings (runs buf generate)
 ```
 
 The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building.
+
+### `e2e` — testing the shipped binary
+
+`e2e` runs `crates/bin-e2e`: black-box tests that spawn the **release binary and plugin cdylibs** as a child process, rather than linking the crates. It is the only way to cover things that have no in-process form — `dlopen` of a real cdylib, the TUI under a PTY, process exit codes, whether the binary launches at all on this host.
+
+```bash
+e2e                          # build the artifacts from this tree, then test them
+e2e tui_pty                  # one test file
+e2e -- --nocapture           # args after `--` reach cargo test
+HEPH_E2E_FROM=dist e2e       # test an already-downloaded artifact set (what CI does)
+```
+
+One script, one code path — CI runs the same `e2e`, differing only in where the artifacts come from. Do not add a parallel script or inline the steps into the workflow.
+
+It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run it reflexively: the `bin_e2e` CI job runs it on all three platforms on every push, and it gates `release`. Run it locally only when changing something it covers (the loader, the TUI, CLI exit codes, the `e2e` script itself) — and expect a full release build the first time.
+
+`tst` excludes `bin-e2e` deliberately: those tests need staged artifacts and hard-fail without `HEPH_E2E_DIST`, so a suite that never ran can't read as a suite that passed. See `.claude/testing.md` for what belongs there versus `crates/e2e`.
 
 ## Workflow
 
