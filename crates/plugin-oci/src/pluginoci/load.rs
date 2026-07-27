@@ -24,7 +24,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{ImageFormat, Tool, dep_single_file, ensure_tool_supports_format, run_cmd_cancellable};
+use super::{
+    ImageFormat, Tool, ToolIo, dep_single_file, ensure_tool_supports_format, parse_docker_load_ref,
+    run_tool,
+};
 
 pub const DRIVER_NAME: &str = "oci_load";
 
@@ -102,31 +105,20 @@ fn load_argv(
     }
 }
 
+#[derive(Default)]
 pub struct Driver {
-    docker_bin: String,
-    skopeo_bin: String,
-}
-
-impl Default for Driver {
-    fn default() -> Self {
-        Driver::new()
-    }
+    tools: super::Tools,
 }
 
 impl Driver {
     pub fn new() -> Self {
-        Driver {
-            docker_bin: "docker".to_string(),
-            skopeo_bin: "skopeo".to_string(),
-        }
+        Driver::default()
     }
 
-    #[cfg(test)]
-    fn with_binaries(docker: impl Into<String>, skopeo: impl Into<String>) -> Self {
-        Driver {
-            docker_bin: docker.into(),
-            skopeo_bin: skopeo.into(),
-        }
+    /// Point the driver at specific binaries. Public so tests — including
+    /// out-of-crate e2e — can substitute fakes.
+    pub fn with_tools(tools: super::Tools) -> Self {
+        Driver { tools }
     }
 }
 
@@ -161,9 +153,7 @@ impl ManagedDriver for Driver {
 
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
-        if image_ref.output.is_none() {
-            image_ref.output = Some(String::new());
-        }
+        super::pin_archive_group(&mut image_ref, &spec.image)?;
 
         let def = OciLoadDef {
             format,
@@ -212,15 +202,46 @@ impl ManagedDriver for Driver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let def = req.request.target.def_de::<OciLoadDef>();
+        let def = req.request.target.def_de::<OciLoadDef>().clone();
         let tar = dep_single_file(&req, IMAGE_ORIGIN)?;
-        let argv = load_argv(&self.docker_bin, &self.skopeo_bin, def, &tar)?;
-        run_cmd_cancellable(argv, ctoken, "oci_load")
+        let cwd = req.sandbox_ws_dir.clone();
+        let addr = req.request.target.addr.format();
+        let argv = load_argv(&self.tools.docker, &self.tools.skopeo, &def, &tar)?;
+        let mut io = ToolIo::from_request(&mut req.request);
+        let stdout = run_tool(argv, &cwd, "oci_load", &mut io, ctoken)
             .await
             .context("load image into docker daemon")?;
+
+        // `docker load` takes tags from the archive and has no `--tag`, so an
+        // explicit `tag` has to be applied afterwards. Doing nothing with it
+        // would leave the user with a dangling `<none>:<none>` image and no way
+        // to run what they just asked to load.
+        let tagged = match (def.tool, def.tag.as_deref()) {
+            (Tool::Docker, Some(tag)) => {
+                let loaded = parse_docker_load_ref(&stdout)?;
+                run_tool(
+                    vec![
+                        self.tools.docker.clone(),
+                        "tag".to_string(),
+                        loaded,
+                        tag.to_string(),
+                    ],
+                    &cwd,
+                    "docker tag (oci_load)",
+                    &mut io,
+                    ctoken,
+                )
+                .await?;
+                Some(tag)
+            }
+            // skopeo named the daemon image via `docker-daemon:<tag>` already.
+            (Tool::Skopeo, tag) => tag,
+            (Tool::Docker, None) => None,
+        };
+        tracing::info!(addr, tag = tagged, "oci_load: loaded into the local daemon");
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -251,6 +272,13 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect()
+    }
+
+    async fn parse(addr: &str, config: HashMap<String, Value>) -> ParseResponse {
+        Driver::new()
+            .parse(parse_req(addr, config), &StdCancellationToken::new())
+            .await
+            .expect("parse")
     }
 
     #[test]
@@ -365,10 +393,70 @@ mod tests {
         assert!(!resp.target_def.cache.enabled);
     }
 
-    #[test]
-    fn with_binaries_overrides() {
-        let d = Driver::with_binaries("/d", "/s");
-        assert_eq!(d.docker_bin, "/d");
-        assert_eq!(d.skopeo_bin, "/s");
+    /// `docker load` has no `--tag` and takes tags from the archive, so an
+    /// explicit `tag` has to be applied afterwards. Accepting it and dropping it
+    /// would leave a dangling `<none>:<none>` image the user cannot run.
+    #[tokio::test]
+    async fn run_docker_applies_an_explicit_tag() {
+        let sbx = super::super::testfake::Sandbox::new("app");
+        let tar = sbx.pkg.join("img.tar");
+        std::fs::write(&tar, "tar").expect("tar");
+
+        let resp = parse(
+            "//app:load",
+            cfg(&[
+                ("image", Value::String(":img".to_string())),
+                ("format", Value::String("docker".to_string())),
+                ("tag", Value::String("app:dev".to_string())),
+            ]),
+        )
+        .await;
+
+        let docker = sbx.fake(
+            "docker",
+            "case \"$1\" in load) echo 'Loaded image ID: sha256:abc';; esac\nexit 0",
+        );
+        let rid = "req".to_string();
+        let req = super::super::testfake::run_request(
+            &rid,
+            "hashin",
+            &resp.target_def,
+            &sbx,
+            &[(IMAGE_ORIGIN, vec![tar])],
+        );
+        Driver::with_tools(super::super::Tools {
+            docker,
+            skopeo: "skopeo".to_string(),
+        })
+        .run(req, &StdCancellationToken::new())
+        .await
+        .expect("run");
+
+        let calls = sbx.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("tag sha256:abc app:dev")),
+            "the explicit tag must be applied: {calls:?}"
+        );
+    }
+
+    /// Handing skopeo the `digest` group would give it a text file where it
+    /// expects an archive.
+    #[tokio::test]
+    async fn parse_rejects_an_explicit_output_group() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//app:load",
+                    cfg(&[
+                        ("image", Value::String(":img|digest".to_string())),
+                        ("tag", Value::String("t".to_string())),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("an explicit group must fail");
+        assert!(format!("{err:#}").contains("digest"), "got: {err:#}");
     }
 }

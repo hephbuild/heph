@@ -25,7 +25,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{ImageFormat, Tool, dep_single_file, ensure_tool_supports_format, run_cmd_cancellable};
+use super::{
+    ImageFormat, Tool, ToolIo, dep_single_file, ensure_tool_supports_format, parse_docker_load_ref,
+    run_tool,
+};
 
 pub const DRIVER_NAME: &str = "oci_push";
 
@@ -77,60 +80,79 @@ impl Hash for OciPushDef {
     }
 }
 
-/// Parse the image ref/id `docker load` printed to stdout, e.g.
-/// `Loaded image: alpine:latest` or `Loaded image ID: sha256:abc…`. Takes the
-/// last such line (a docker archive may load several).
-fn parse_docker_load_ref(stdout: &str) -> anyhow::Result<String> {
-    for line in stdout.lines().rev() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Loaded image ID:") {
-            return Ok(rest.trim().to_string());
-        }
-        if let Some(rest) = line.strip_prefix("Loaded image:") {
-            return Ok(rest.trim().to_string());
-        }
-    }
-    anyhow::bail!("no `Loaded image` line in docker load output: {stdout:?}")
-}
-
 /// Push a docker-format archive with the docker CLI: load it into the daemon,
-/// tag the loaded image as `dest`, push. No skopeo.
+/// tag the loaded image as `dest`, push, then drop the tag again.
+///
+/// The load is an unavoidable side effect of the docker path (the CLI can only
+/// push from the daemon's store), but the *tag* is not: leaving it behind would
+/// silently do `oci_load`'s job on an `oci_push` target, so it is removed once
+/// the push has succeeded.
 async fn docker_push(
     docker_bin: &str,
     tar: &std::path::Path,
     dest: &str,
+    cwd: &std::path::Path,
+    io: &mut ToolIo<'_>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<()> {
-    let tar = tar.to_string_lossy().into_owned();
-    let stdout = run_cmd_cancellable(
+    let stdout = run_tool(
         vec![
             docker_bin.to_string(),
             "load".to_string(),
             "-i".to_string(),
-            tar,
+            tar.to_string_lossy().into_owned(),
         ],
-        ctoken,
+        cwd,
         "docker load (oci_push)",
+        io,
+        ctoken,
     )
     .await?;
     let loaded = parse_docker_load_ref(&stdout)?;
-    run_cmd_cancellable(
+    run_tool(
         vec![
             docker_bin.to_string(),
             "tag".to_string(),
             loaded,
             dest.to_string(),
         ],
-        ctoken,
+        cwd,
         "docker tag (oci_push)",
-    )
-    .await?;
-    run_cmd_cancellable(
-        vec![docker_bin.to_string(), "push".to_string(), dest.to_string()],
+        io,
         ctoken,
-        "docker push (oci_push)",
     )
     .await?;
+    let pushed = run_tool(
+        vec![docker_bin.to_string(), "push".to_string(), dest.to_string()],
+        cwd,
+        "docker push (oci_push)",
+        io,
+        ctoken,
+    )
+    .await;
+    // Remove the tag whether or not the push succeeded, so a failed push does
+    // not leave the daemon holding an image the user never asked to load.
+    let untag = run_tool(
+        vec![
+            docker_bin.to_string(),
+            "rmi".to_string(),
+            "--no-prune".to_string(),
+            dest.to_string(),
+        ],
+        cwd,
+        "docker rmi (oci_push)",
+        io,
+        ctoken,
+    )
+    .await;
+    pushed?;
+    if let Err(e) = untag {
+        tracing::warn!(
+            dest,
+            error = %e,
+            "oci_push: pushed, but could not drop the temporary local tag"
+        );
+    }
     Ok(())
 }
 
@@ -148,6 +170,12 @@ fn push_argv(
         "copy".to_string(),
         // Avoid needing a host /etc/containers/policy.json.
         "--insecure-policy".to_string(),
+        // Copy every instance in the archive, not just the one matching the
+        // host. skopeo's default (`system`) would silently push a
+        // single-architecture image from a multi-platform archive on Linux, and
+        // fail outright on macOS, where no instance matches `darwin`.
+        "--multi-arch".to_string(),
+        "all".to_string(),
     ];
     if insecure {
         argv.push("--dest-tls-verify=false".to_string());
@@ -157,31 +185,20 @@ fn push_argv(
     argv
 }
 
+#[derive(Default)]
 pub struct Driver {
-    skopeo_bin: String,
-    docker_bin: String,
-}
-
-impl Default for Driver {
-    fn default() -> Self {
-        Driver::new()
-    }
+    tools: super::Tools,
 }
 
 impl Driver {
     pub fn new() -> Self {
-        Driver {
-            skopeo_bin: "skopeo".to_string(),
-            docker_bin: "docker".to_string(),
-        }
+        Driver::default()
     }
 
-    #[cfg(test)]
-    fn with_binaries(skopeo: impl Into<String>, docker: impl Into<String>) -> Self {
-        Driver {
-            skopeo_bin: skopeo.into(),
-            docker_bin: docker.into(),
-        }
+    /// Point the driver at specific binaries. Public so tests — including
+    /// out-of-crate e2e — can substitute fakes.
+    pub fn with_tools(tools: super::Tools) -> Self {
+        Driver { tools }
     }
 }
 
@@ -209,12 +226,22 @@ impl ManagedDriver for Driver {
         let tool = Tool::parse_opt(spec.tool.as_deref(), format)?;
         ensure_tool_supports_format(tool, format)?;
 
+        // `insecure` is a skopeo flag. The docker CLI takes insecure registries
+        // from the daemon config instead, so accepting the attribute here and
+        // dropping it would leave the user believing TLS verification is off
+        // when it is not.
+        if spec.insecure && tool == Tool::Docker {
+            anyhow::bail!(
+                "`insecure = True` is not supported with tool = \"docker\": the daemon decides \
+                 which registries are insecure. Add the registry to the daemon's \
+                 `insecure-registries`, or use tool = \"skopeo\"."
+            );
+        }
+
         // Consume only the image archive (group ""), never the digest group.
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
-        if image_ref.output.is_none() {
-            image_ref.output = Some(String::new());
-        }
+        super::pin_archive_group(&mut image_ref, &spec.image)?;
 
         let def = OciPushDef {
             dest: spec.dest,
@@ -265,20 +292,33 @@ impl ManagedDriver for Driver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let def = req.request.target.def_de::<OciPushDef>();
+        let def = req.request.target.def_de::<OciPushDef>().clone();
         let tar = dep_single_file(&req, IMAGE_ORIGIN)?;
+        let cwd = req.sandbox_ws_dir.clone();
+        let addr = req.request.target.addr.format();
+        let mut io = ToolIo::from_request(&mut req.request);
         match def.tool {
             Tool::Skopeo => {
-                let argv = push_argv(&self.skopeo_bin, def.format, &tar, &def.dest, def.insecure);
-                run_cmd_cancellable(argv, ctoken, "skopeo copy (oci_push)").await?;
+                let argv = push_argv(
+                    &self.tools.skopeo,
+                    def.format,
+                    &tar,
+                    &def.dest,
+                    def.insecure,
+                );
+                run_tool(argv, &cwd, "skopeo copy (oci_push)", &mut io, ctoken).await?;
             }
             Tool::Docker => {
-                docker_push(&self.docker_bin, &tar, &def.dest, ctoken).await?;
+                docker_push(&self.tools.docker, &tar, &def.dest, &cwd, &mut io, ctoken).await?;
             }
         }
+        // A push is the one place the build graph meets the outside world, so
+        // say what left the machine: without this line neither a human nor an
+        // agent can learn what `heph run //app:push` actually shipped.
+        tracing::info!(addr, r#ref = def.dest, "oci_push: pushed");
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -476,10 +516,145 @@ mod tests {
         assert!(format!("{err:#}").contains("oci"), "got: {err:#}");
     }
 
-    #[test]
-    fn with_binaries_overrides() {
-        let d = Driver::with_binaries("/fake/skopeo", "/fake/docker");
-        assert_eq!(d.skopeo_bin, "/fake/skopeo");
-        assert_eq!(d.docker_bin, "/fake/docker");
+    /// The docker path is load → tag → push → rmi, in that order. The final
+    /// `rmi` is what keeps `oci_push` from also doing `oci_load`'s job: without
+    /// it the daemon keeps an image the user never asked to load.
+    #[tokio::test]
+    async fn run_docker_push_loads_tags_pushes_then_drops_the_tag() {
+        let sbx = super::super::testfake::Sandbox::new("app");
+        let tar = sbx.pkg.join("img.tar");
+        std::fs::write(&tar, "tar").expect("tar");
+
+        let resp = parse(
+            "//app:push",
+            cfg(&[
+                ("image", Value::String(":img".to_string())),
+                ("ref", Value::String("reg.io/app:1".to_string())),
+                ("format", Value::String("docker".to_string())),
+            ]),
+        )
+        .await;
+
+        let docker = sbx.fake(
+            "docker",
+            "case \"$1\" in load) echo 'Loaded image: sha256:abc';; esac\nexit 0",
+        );
+        let rid = "req".to_string();
+        let req = super::super::testfake::run_request(
+            &rid,
+            "hashin",
+            &resp.target_def,
+            &sbx,
+            &[(IMAGE_ORIGIN, vec![tar])],
+        );
+        Driver::with_tools(super::super::Tools {
+            docker,
+            skopeo: "skopeo".to_string(),
+        })
+        .run(req, &StdCancellationToken::new())
+        .await
+        .expect("run");
+
+        let verbs: Vec<String> = sbx
+            .calls()
+            .iter()
+            .filter_map(|c| c.split_whitespace().nth(1).map(str::to_string))
+            .collect();
+        assert_eq!(
+            verbs,
+            ["load", "tag", "push", "rmi"],
+            "calls: {:?}",
+            sbx.calls()
+        );
+        let tag = sbx
+            .calls()
+            .into_iter()
+            .find(|c| c.contains(" tag "))
+            .expect("tag call");
+        assert!(tag.contains("sha256:abc reg.io/app:1"), "{tag}");
+    }
+
+    /// skopeo copies every instance in the archive. The default (`system`) would
+    /// push one architecture out of a multi-platform archive on Linux and fail
+    /// outright on macOS, where nothing matches `darwin`.
+    #[tokio::test]
+    async fn run_skopeo_push_copies_all_architectures() {
+        let sbx = super::super::testfake::Sandbox::new("app");
+        let tar = sbx.pkg.join("img.tar");
+        std::fs::write(&tar, "tar").expect("tar");
+
+        let resp = parse(
+            "//app:push",
+            cfg(&[
+                ("image", Value::String(":img".to_string())),
+                ("ref", Value::String("reg.io/app:1".to_string())),
+            ]),
+        )
+        .await;
+
+        let skopeo = sbx.fake("skopeo", "exit 0");
+        let rid = "req".to_string();
+        let req = super::super::testfake::run_request(
+            &rid,
+            "hashin",
+            &resp.target_def,
+            &sbx,
+            &[(IMAGE_ORIGIN, vec![tar])],
+        );
+        Driver::with_tools(super::super::Tools {
+            docker: "docker".to_string(),
+            skopeo,
+        })
+        .run(req, &StdCancellationToken::new())
+        .await
+        .expect("run");
+
+        let call = sbx.calls().into_iter().next().expect("a skopeo call");
+        assert!(call.contains("--multi-arch all"), "{call}");
+        assert!(call.contains("docker://reg.io/app:1"), "{call}");
+    }
+
+    /// `insecure` is a skopeo flag; silently dropping it for the docker tool
+    /// would leave the user believing TLS verification is off when it is not.
+    #[tokio::test]
+    async fn parse_insecure_with_docker_tool_fails() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//app:push",
+                    cfg(&[
+                        ("image", Value::String(":img".to_string())),
+                        ("ref", Value::String("r".to_string())),
+                        ("format", Value::String("docker".to_string())),
+                        ("insecure", Value::Bool(true)),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("insecure + docker must fail");
+        assert!(format!("{err:#}").contains("insecure"), "got: {err:#}");
+    }
+
+    /// Handing skopeo the `digest` group would give it a text file where it
+    /// expects an archive, failing deep inside its layout parser.
+    #[tokio::test]
+    async fn parse_rejects_an_explicit_output_group() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//app:push",
+                    cfg(&[
+                        ("image", Value::String(":img|digest".to_string())),
+                        ("ref", Value::String("r".to_string())),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("an explicit group must fail");
+        assert!(format!("{err:#}").contains("digest"), "got: {err:#}");
     }
 }

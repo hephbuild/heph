@@ -4020,6 +4020,7 @@ dependencies = [
  "driver-support",
  "model",
  "plugin",
+ "proc",
  "serde",
  "serde_json",
  "tempfile",
