@@ -10,11 +10,50 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT_PIPES: usize = 64;
 const WRITE_BATCH_MAX: usize = 64;
+
+/// How long `read_pool.get()` waits before giving up.
+///
+/// With the pool sized above the pipe budget (see [`read_pool_headroom`]) nothing
+/// should ever queue here, so reaching this is a bug — a leaked connection or a scheduling cycle —
+/// and the point of the bound is to say so instead of stalling. It stays
+/// generous because the alternative failure is worse: a pool shortage that would
+/// have cleared turns into a failed build.
+const READ_POOL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read connections to keep beyond the pipe budget, for the callers that take one
+/// with **no** pipe permit.
+///
+/// Sizing the pool at exactly the pipe budget leaves zero headroom, and the pipe
+/// path holds its connection for the *consumer's* whole drain — so a burst of
+/// streaming reads can own every connection for an unbounded time while `exists`,
+/// `list_targets`, `list_target_entries`, `seekable_reader` and the SELECT phase
+/// of `reader` are still trying to acquire one. Those then block for
+/// [`READ_POOL_TIMEOUT`] on paths that are supposed to be a single indexed
+/// lookup.
+///
+/// It also breaks a scheduling cycle: a queued `rayon::spawn` pipe-copy owns a
+/// connection it cannot release until rayon runs it, while a rayon worker sits in
+/// `read_pool.get()`. With headroom the unpermitted caller is served from spare
+/// capacity and the copy gets to run.
+///
+/// Scaled by core count because the unpermitted callers are bounded by the
+/// threads that can be inside one at once (tokio workers, the `hcore::blocking`
+/// pool, rayon), and clamped so neither a 2-core machine nor a 128-core one picks
+/// an absurd number. Two of these callers hold their connection for a long time —
+/// `list_targets`' producer thread for a whole GC stream, `seekable_reader`'s
+/// `OwnedBlob` for the reader's lifetime — so this is not purely burst capacity.
+fn read_pool_headroom() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    (4 * cores).clamp(16, 64)
+}
 
 type Key = (String, String, String);
 
@@ -187,8 +226,22 @@ impl LocalCacheSQLite {
         inline_threshold: usize,
         pipe_limit: usize,
     ) -> Result<Self> {
-        let pipe_limit = pipe_limit.max(DEFAULT_MAX_CONCURRENT_PIPES);
-        let read_pool_size = u32::try_from(pipe_limit).unwrap_or(u32::MAX);
+        Self::with_exact_pipe_limit(
+            db_path,
+            inline_threshold,
+            pipe_limit.max(DEFAULT_MAX_CONCURRENT_PIPES),
+        )
+    }
+
+    /// [`Self::with_pipe_limit`] without the [`DEFAULT_MAX_CONCURRENT_PIPES`]
+    /// floor, so a test can saturate the pipe budget without writing 64 blobs.
+    fn with_exact_pipe_limit(
+        db_path: PathBuf,
+        inline_threshold: usize,
+        pipe_limit: usize,
+    ) -> Result<Self> {
+        let read_pool_size =
+            u32::try_from(pipe_limit.saturating_add(read_pool_headroom())).unwrap_or(u32::MAX);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating sqlite cache dir {parent:?}"))?;
@@ -234,6 +287,10 @@ impl LocalCacheSQLite {
         let read_pool = r2d2::Pool::builder()
             .max_size(read_pool_size)
             .min_idle(Some(1))
+            // Explicit rather than inherited: this bound is load-bearing for the
+            // stall it converts into an error, and it should not move because
+            // r2d2 changed a default.
+            .connection_timeout(READ_POOL_TIMEOUT)
             .build(manager)
             .context("building sqlite read connection pool")?;
 
@@ -257,6 +314,20 @@ impl LocalCacheSQLite {
 
     fn key(addr: &Addr) -> String {
         addr.format()
+    }
+
+    /// A pooled read connection.
+    ///
+    /// Failure here is [`READ_POOL_TIMEOUT`] elapsing far more often than sqlite
+    /// being broken, and the two have nothing in common to investigate — so the
+    /// message names the pool rather than the query.
+    fn read_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.read_pool.get().with_context(|| {
+            format!(
+                "acquiring a sqlite read connection: pool of {} exhausted for {READ_POOL_TIMEOUT:?}",
+                self.read_pool.max_size(),
+            )
+        })
     }
 
     fn writer_tx(&self) -> Result<&mpsc::Sender<WriterCmd>> {
@@ -366,10 +437,7 @@ impl LocalCache for LocalCacheSQLite {
         let addr_key = Self::key(addr);
         self.pending.wait_if_pending(&addr_key, hashin, name);
 
-        let conn = self
-            .read_pool
-            .get()
-            .context("acquiring read connection from pool")?;
+        let conn = self.read_conn()?;
 
         let mut stmt = conn
             .prepare_cached(
@@ -416,10 +484,7 @@ impl LocalCache for LocalCacheSQLite {
 
         // Semaphore acquired before pool to bound concurrent open pipes (= open FDs).
         let permit = self.pipe_sem.acquire();
-        let conn = self
-            .read_pool
-            .get()
-            .context("acquiring read connection from pool")?;
+        let conn = self.read_conn()?;
 
         let (pipe_reader, mut pipe_writer) =
             io::pipe().with_context(|| format!("creating pipe for sqlite blob read of {name}"))?;
@@ -461,10 +526,7 @@ impl LocalCache for LocalCacheSQLite {
         let addr_key = Self::key(addr);
         self.pending.wait_if_pending(&addr_key, hashin, name);
 
-        let conn = self
-            .read_pool
-            .get()
-            .context("acquiring read connection from pool")?;
+        let conn = self.read_conn()?;
 
         let mut stmt = conn
             .prepare_cached(
@@ -488,10 +550,7 @@ impl LocalCache for LocalCacheSQLite {
         // thread, the consumer pulls one addr at a time. Bounded so a slow
         // consumer (GC locking/resolving each target) applies backpressure
         // instead of buffering every target in memory.
-        let conn = self
-            .read_pool
-            .get()
-            .context("acquiring read connection from pool")?;
+        let conn = self.read_conn()?;
         let (tx, rx) = mpsc::sync_channel::<Result<String>>(256);
         // Dedicated thread (not rayon) so a saturated rayon pool can't starve
         // this long-lived producer and deadlock the consumer on `recv`.
@@ -525,10 +584,7 @@ impl LocalCache for LocalCacheSQLite {
 
     fn list_target_entries(&self, addr: &Addr) -> Result<Vec<String>> {
         let key = Self::key(addr);
-        let conn = self
-            .read_pool
-            .get()
-            .context("acquiring read connection from pool")?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached("SELECT DISTINCT hashin FROM artifacts WHERE addr=?1")
             .context("preparing list_target_entries query")?;
@@ -561,10 +617,7 @@ impl LocalCache for LocalCacheSQLite {
         let addr_key = Self::key(addr);
         self.pending.wait_if_pending(&addr_key, hashin, name);
 
-        let conn = self
-            .read_pool
-            .get()
-            .context("acquiring read connection from pool")?;
+        let conn = self.read_conn()?;
 
         let mut stmt = conn
             .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
@@ -699,6 +752,55 @@ mod tests {
             name.to_string(),
             Default::default(),
         )
+    }
+
+    /// Streaming reads hold a pooled connection for the *consumer's* whole drain.
+    /// Sized at exactly the pipe budget, a handful of undrained readers therefore
+    /// owned every connection in the pool, and the callers that take one with no
+    /// pipe permit at all — `exists` here, but equally `list_targets`,
+    /// `list_target_entries` and `seekable_reader` — blocked behind them for
+    /// `READ_POOL_TIMEOUT` on what is a single indexed lookup.
+    #[test]
+    fn undrained_streaming_reads_do_not_starve_an_indexed_lookup() -> Result<()> {
+        const PIPES: usize = 4;
+        // Over the pipe buffer, so the copy blocks with the connection held
+        // rather than finishing and handing it straight back.
+        let payload = vec![7u8; 4 * 1024 * 1024];
+
+        let dir = tempdir()?;
+        let cache = Arc::new(LocalCacheSQLite::with_exact_pipe_limit(
+            dir.path().join("cache.db"),
+            // Everything takes the pipe path, nothing is served inline.
+            0,
+            PIPES,
+        )?);
+
+        let addr = make_addr("pkg", "t");
+        for i in 0..PIPES {
+            let mut w = cache.writer(&addr, "h", &format!("blob{i}"))?;
+            w.write_all(&payload)?;
+            drop(w);
+        }
+
+        // Take every pipe permit and hold the readers undrained.
+        let _held: Vec<SizedReader> = (0..PIPES)
+            .map(|i| cache.reader(&addr, "h", &format!("blob{i}")))
+            .collect::<Result<_>>()?;
+
+        // Racing the lookup against a deadline rather than measuring it: on a
+        // loaded CI box a wall-clock assertion on an unblocked `exists` is
+        // flaky, but "did it beat 5s" separates it cleanly from a pool that is
+        // parked for the full 30s timeout.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(enclose::enclose!((cache, addr) move || {
+            drop(tx.send(cache.exists(&addr, "h", "blob0")));
+        }));
+        let found = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exists must not queue behind undrained streaming reads")?;
+        assert!(found, "the blob was written, so exists must report it");
+
+        Ok(())
     }
 
     #[test]
