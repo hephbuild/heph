@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt";
 in
 {
   # https://devenv.sh/basics/
@@ -79,7 +79,66 @@ in
   # targeted passes exercise the feature-gated transport code, off by default:
   # the stabby host loader/adapters (plugin-stabby `host`) and the stabby guest
   # serving (plugin-sdk `stabby` — the SDK is transport-agnostic by default).
-  scripts.tst.exec = "cargo test --locked --all && cargo test --locked -p plugin-stabby --features host && cargo test --locked -p plugin-sdk --features stabby";
+  # `bin-e2e` is excluded on purpose: it drives *shipped artifacts*, not this
+  # source tree, and has no meaning without a staged dist. Run it with `e2e`.
+  scripts.tst.exec = "cargo test --locked --workspace --exclude bin-e2e && cargo test --locked -p plugin-stabby --features host && cargo test --locked -p plugin-sdk --features stabby";
+
+  # Binary end-to-end suite: black-box tests against the artifacts CI publishes
+  # (the `heph` binary + the go/gha plugin cdylibs). ONE entrypoint, identical
+  # locally and in CI — the only difference is where the artifacts come from:
+  #
+  #   e2e                      # build them from this tree (local default)
+  #   HEPH_E2E_FROM=dist e2e   # use an already-downloaded set (CI)
+  #
+  # Both branches converge on the same normalized layout under
+  # $CARGO_TARGET_DIR/e2e-dist, so the tests never learn which one ran. Extra
+  # args pass through to cargo test (e.g. `e2e tui_pty -- --nocapture`).
+  scripts.e2e.exec = ''
+    set -euo pipefail
+
+    case "$(uname -s)" in
+      Darwin) os=darwin; ext=dylib ;;
+      *)      os=linux;  ext=so ;;
+    esac
+    case "$(uname -m)" in
+      arm64|aarch64) arch=arm64 ;;
+      *)             arch=amd64 ;;
+    esac
+
+    dist="$CARGO_TARGET_DIR/e2e-dist"
+    rm -rf "$dist"
+    mkdir -p "$dist"
+
+    if [ -n "''${HEPH_E2E_FROM:-}" ]; then
+      # CI: artifacts downloaded from the `build` job, still carrying their
+      # per-platform names. Strip the suffix so the tests see one layout.
+      src="$HEPH_E2E_FROM"
+      cp "$src/heph_''${os}_''${arch}"                 "$dist/heph"
+      cp "$src/heph-go-plugin_''${os}_''${arch}.$ext"  "$dist/heph-go-plugin.$ext"
+      cp "$src/heph-gha-plugin_''${os}_''${arch}.$ext" "$dist/heph-gha-plugin.$ext"
+    else
+      # Local: build the same three artifacts the build job builds, the same way
+      # (one invocation so cargo overlaps the three LTO tails — see heph.yml).
+      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib
+      out="$CARGO_TARGET_DIR/release"
+      cp "$out/heph"                       "$dist/heph"
+      cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
+      cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
+      if [ "$os" = "darwin" ]; then
+        # Same post-processing the shipped macOS artifacts get, so a local run
+        # tests the same bytes CI would publish.
+        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext"; do
+          bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
+        done
+      fi
+    fi
+
+    # download-artifact does not preserve the executable bit.
+    chmod +x "$dist/heph"
+
+    export HEPH_E2E_DIST="$dist"
+    cargo test --locked -p bin-e2e "''${@}"
+  '';
 
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$CARGO_TARGET_DIR/profiling/heph "''${@}"'';

@@ -504,9 +504,74 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
 
+  # Black-box tests against the artifacts the `build` job just produced — the
+  # exact bytes that get published. Covers only what `test` structurally cannot:
+  # dlopen of the shipped plugin cdylibs, the TUI under a real PTY, and process
+  # exit status. Runs `e2e`, the same script used locally; the only CI-specific
+  # part is HEPH_E2E_FROM pointing at the downloaded artifacts.
+  #
+  # linux/arm64 matters most here: the build job cross-compiles it, so this is
+  # the only place the shipped aarch64-linux binary is ever executed.
+  bin_e2e:
+    name: Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    needs: [gen, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: darwin
+            arch: arm64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v7
+        with:
+          name: repo
+          path: .
+
+      # Only this platform's three artifacts: `heph_<os>_<arch>` plus the two
+      # `heph-*-plugin_<os>_<arch>.{so,dylib}`. `heph-govet` carries no
+      # os/arch suffix, so the pattern leaves it out.
+      - name: Download artifacts under test
+        uses: actions/download-artifact@v7
+        with:
+          pattern: heph*_${{ matrix.os }}_${{ matrix.arch }}*
+          path: dist
+          merge-multiple: true
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: ${{ matrix.target }}
+          cache-suffix: "-bin-e2e"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
+
+      - name: E2E
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+          HEPH_E2E_FROM: dist
+        run: e2e
+
+      - name: sccache stats
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: sccache --show-stats
+
   release:
     name: Release
-    needs: [gen, upload_artifacts, lint, test]
+    needs: [gen, upload_artifacts, lint, test, bin_e2e]
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -558,7 +623,7 @@ jobs:
 
   cleanup:
     name: Cleanup
-    needs: [gen, build, lint, test, upload_artifacts]
+    needs: [gen, build, lint, test, bin_e2e, upload_artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
