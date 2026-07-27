@@ -25,12 +25,13 @@ pub struct GlobalOptions {
     /// report is also written at exit.
     #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
     pub pprof_cpu: Option<PathBuf>,
-    /// Print a diagnostic when a run makes no progress for this long
+    /// Write a diagnostic when a run makes no progress for this long
     ///
     /// heph watches its own event stream and, if nothing at all advances for the
-    /// given duration while work is outstanding, prints one paragraph to stderr
-    /// naming what is open, for how long, and whether any bytes are moving. Off
-    /// with `--stall-notice=off`. Default: 60s.
+    /// given duration while work is outstanding, appends one paragraph naming
+    /// what is open, for how long, and whether any bytes are moving to
+    /// `<home>/diag/stall-<pid>.log`, and logs the path at `warn`. Off with
+    /// `--stall-notice=off`. Default: 60s.
     ///
     /// The text is a diagnostic, not a stable interface — parse the JSON surface
     /// instead.
