@@ -684,7 +684,7 @@ jobs:
 
   cleanup:
     name: Cleanup
-    needs: [gen, build, lint, test, bin_e2e_warm, bin_e2e, upload_artifacts]
+    needs: [gen, build, lint, test, bin_e2e, upload_artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
