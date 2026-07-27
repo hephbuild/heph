@@ -41,6 +41,17 @@ impl LogSink {
         *guard = Inner::Direct;
     }
 
+    /// Write a diagnostic straight to the sink.
+    ///
+    /// The sink owns the stderr destination and, while the TUI holds the
+    /// terminal, buffers into the renderer — so an out-of-band notice from a
+    /// plain OS thread lands as a proper line instead of interleaving mid-frame
+    /// and corrupting the display. Best-effort: a diagnostic must never take the
+    /// run down over a broken pipe.
+    pub fn write_diagnostic(&self, text: &str) {
+        drop(self.write_bytes(text.as_bytes()));
+    }
+
     fn write_bytes(&self, buf: &[u8]) -> io::Result<()> {
         let guard = self
             .inner

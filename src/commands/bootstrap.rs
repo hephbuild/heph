@@ -111,6 +111,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
 
     let mut e = engine::Engine::new(config)?;
 
+    // Always on, never gated. The diagnostic that needs a flag is the one you did
+    // not pass on the run that hung — the whole reason this exists. Its `on_event`
+    // is relaxed atomics only, so a build that never stalls pays a handful of
+    // instructions per event and nothing else.
+    e.register_hook(Arc::new(engine::diag::DiagHook::new(Arc::clone(
+        engine::diag::global(),
+    ))))?;
+
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
     // engine's own skip dirs. The remaining built-ins have no config.
     e.register_provider(|_| Box::new(pluginhostbin::Provider))?;

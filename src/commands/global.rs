@@ -2,6 +2,18 @@ use std::path::PathBuf;
 
 use clap::Args;
 
+/// Parse `--stall-notice`: a duration, or `off` to disable.
+///
+/// Zero is the "off" sentinel rather than `Option`, because clap reads a field of
+/// type `Option<T>` as "this flag is optional" and expects the parser to yield
+/// `T` — returning an `Option` from the parser panics at access time.
+fn parse_stall_notice(s: &str) -> Result<std::time::Duration, String> {
+    if matches!(s.trim(), "off" | "none") {
+        return Ok(std::time::Duration::ZERO);
+    }
+    humantime::parse_duration(s).map_err(|e| format!("invalid duration {s:?}: {e}"))
+}
+
 /// Global options shared by every subcommand. Flattened into the top-level CLI
 /// with `global = true` so the flags are accepted before or after the
 /// subcommand, then plumbed to each command's `execute`.
@@ -13,19 +25,23 @@ pub struct GlobalOptions {
     /// report is also written at exit.
     #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
     pub pprof_cpu: Option<PathBuf>,
-    /// Install a SIGUSR1 handler that appends the signalled thread's backtrace to
-    /// FILE — for diagnosing hangs where ptrace/perf/core dumps are blocked
-    /// (locked-down CI containers). Off unless passed; bare `--diag-backtrace`
-    /// writes to /tmp/heph-backtrace.log. See the `diag` module for the
-    /// sweep-all-threads recipe.
+    /// Print a diagnostic when a run makes no progress for this long
+    ///
+    /// heph watches its own event stream and, if nothing at all advances for the
+    /// given duration while work is outstanding, prints one paragraph to stderr
+    /// naming what is open, for how long, and whether any bytes are moving. Off
+    /// with `--stall-notice=off`. Default: 60s.
+    ///
+    /// The text is a diagnostic, not a stable interface — parse the JSON surface
+    /// instead.
     #[arg(
-        long = "diag-backtrace",
-        value_name = "FILE",
-        num_args = 0..=1,
-        default_missing_value = "/tmp/heph-backtrace.log",
+        long = "stall-notice",
+        value_name = "DURATION",
+        default_value = "60s",
+        value_parser = parse_stall_notice,
         global = true
     )]
-    pub diag_backtrace: Option<PathBuf>,
+    pub stall_notice: std::time::Duration,
     /// Disable the interactive TUI (force CI/log-only output)
     #[arg(long = "no-tui", global = true)]
     pub no_tui: bool,
@@ -73,26 +89,5 @@ mod tests {
     fn auto_approve_is_opt_in() {
         assert!(!parse(&["heph"]).auto_approve);
         assert!(parse(&["heph", "--auto-approve"]).auto_approve);
-    }
-
-    #[test]
-    fn diag_backtrace_is_opt_in() {
-        use std::path::Path;
-        // Absent → off.
-        assert!(parse(&["heph"]).diag_backtrace.is_none());
-        // Bare flag → default file.
-        assert_eq!(
-            parse(&["heph", "--diag-backtrace"])
-                .diag_backtrace
-                .as_deref(),
-            Some(Path::new("/tmp/heph-backtrace.log"))
-        );
-        // Explicit path honored.
-        assert_eq!(
-            parse(&["heph", "--diag-backtrace", "/tmp/x.log"])
-                .diag_backtrace
-                .as_deref(),
-            Some(Path::new("/tmp/x.log"))
-        );
     }
 }
