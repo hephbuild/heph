@@ -62,6 +62,11 @@ fn windowed(
 /// Columns shifted per Left/Right key press when panning a wide body.
 pub const HSCROLL_STEP: usize = 4;
 
+/// Minimum columns the bottom border must reserve when the scroll indicator is
+/// active. The shortest possible indicator `↑ 1–1 of 1 ↓` is 14 columns; this
+/// leaves room for the label to remain visible on narrow-but-not-tiny terminals.
+const SCROLL_INDICATOR_MIN_WIDTH: usize = 20;
+
 /// Drop the first `offset` visible columns from a line, preserving each span's
 /// styling. Every glyph this module emits is single-width, so a char count is an
 /// exact column count. `offset == 0` returns the line untouched.
@@ -1441,13 +1446,37 @@ impl TuiProgressView {
 
     /// The rounded bottom border: `╰─── <label> ────…────╯`. The label is left
     /// after a `─── ` lead-in; if it overruns the available span it scrolls like
-    /// a banner. Total visible width always equals `width`.
-    fn bottom_line(&self, now_ms: u64, width: u16) -> Line<'static> {
+    /// a banner. Total visible width always equals `width`. When the body has
+    /// more lines than the viewport, a scroll indicator like
+    /// `↑ 3–43 of 75 ↓` replaces the trailing dash fill.
+    fn bottom_line(
+        &self,
+        now_ms: u64,
+        width: u16,
+        scroll: usize,
+        total: usize,
+        body_rows: usize,
+    ) -> Line<'static> {
         let width = usize::from(width).max(MIN_BOX_WIDTH);
         // "╰─── " (5) + window + "─╯" (2) == width  ⇒  window = width - 7.
-        let window = width.saturating_sub(7);
+        let mut window = width.saturating_sub(7);
         let label = self.model.label();
         let label_len = label.chars().count();
+
+        // When the body overflows the viewport, show a scroll position indicator
+        // in the bottom-right: `↑ 1–20 of 75 ↓`. The label shrinks to make room.
+        let scrollable = total > body_rows && body_rows > 0;
+        let show_indicator = scrollable && window > SCROLL_INDICATOR_MIN_WIDTH;
+        let indicator = if show_indicator {
+            let vis_start = scroll + 1;
+            let vis_end = (scroll + body_rows).min(total);
+            format!(" ↑ {vis_start}–{vis_end} of {total} ↓")
+        } else {
+            String::new()
+        };
+        if show_indicator {
+            window = window.saturating_sub(indicator.chars().count());
+        }
 
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
         spans.push(Span::raw("╰─── "));
@@ -1460,6 +1489,9 @@ impl TuiProgressView {
             }
         } else if window > 0 {
             spans.push(Span::raw(banner_slice(&label, window, now_ms)));
+        }
+        if show_indicator {
+            spans.push(Span::raw(indicator));
         }
         spans.push(Span::raw("─╯"));
         Line::from(spans)
@@ -1639,6 +1671,7 @@ impl TUIAppView for TuiProgressView {
             ViewMode::Cached => self.state.cached_lines(self.scope.get(), filter),
             ViewMode::Failed => self.state.failed_lines(filter),
         };
+        let total = body.len();
         let filtering = !filter.is_empty();
         if body.is_empty() {
             self.scroll.set(0);
@@ -1704,7 +1737,7 @@ impl TUIAppView for TuiProgressView {
         while lines.len() < body_rows + 1 {
             lines.push(Line::from(""));
         }
-        lines.push(self.bottom_line(now_ms, width));
+        lines.push(self.bottom_line(now_ms, width, self.scroll.get(), total, body_rows));
         lines.push(self.help_line());
         lines
     }
@@ -2552,10 +2585,19 @@ mod tests {
         let long =
             TuiProgressView::new("a-really-long-label-that-overflows-the-available-window-area");
         for w in [40u16, 80, 120] {
-            let s = format!("{}", short.bottom_line(0, w));
-            let l = format!("{}", long.bottom_line(0, w));
+            // No scroll: total=0, body_rows=0 → indicator never triggers.
+            let s = format!("{}", short.bottom_line(0, w, 0, 0, 0));
+            let l = format!("{}", long.bottom_line(0, w, 0, 0, 0));
             assert_eq!(s.chars().count(), usize::from(w), "short @ {w}: {s}");
             assert_eq!(l.chars().count(), usize::from(w), "long @ {w}: {l}");
+        }
+        // With scroll active: the indicator replaces trailing dashes and the
+        // total width still matches.
+        for w in [40u16, 80, 120] {
+            let s = format!("{}", short.bottom_line(0, w, 0, 75, 20));
+            let l = format!("{}", long.bottom_line(0, w, 55, 100, 20));
+            assert_eq!(s.chars().count(), usize::from(w), "short scroll @ {w}: {s}");
+            assert_eq!(l.chars().count(), usize::from(w), "long scroll @ {w}: {l}");
         }
     }
 
