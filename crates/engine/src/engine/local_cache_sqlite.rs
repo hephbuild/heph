@@ -62,6 +62,20 @@ fn read_pool_headroom(pipe_limit: usize) -> usize {
     pipe_limit.clamp(16, 64)
 }
 
+/// Cap on the bytes one write transaction moves.
+///
+/// Batching amortizes the commit, but the blob `io::copy` happens *inside* the
+/// transaction, so the batch's byte total is how long the single writer thread is
+/// unavailable — and every reader of a key in it, plus every reader of a key
+/// merely queued behind it, waits on `PendingSlot`'s untimed condvar for that
+/// whole time. Counted alone, 64 jobs is anywhere from a few KiB to the spill
+/// threshold times 64.
+///
+/// Whichever limit is reached first ends the batch. A single job larger than this
+/// still goes on its own — one blob cannot be split across transactions — so this
+/// bounds the batching, not the blob.
+const WRITE_BATCH_MAX_BYTES: i64 = 32 * 1024 * 1024;
+
 type Key = (String, String, String);
 
 struct PipeSemaphore {
@@ -585,6 +599,35 @@ impl Drop for DrainOnExit<'_> {
     }
 }
 
+/// Bytes a command will move inside the transaction. A delete moves none — it is
+/// one indexed `DELETE`, and batching those freely is the point.
+fn write_bytes(cmd: &WriterCmd) -> i64 {
+    match cmd {
+        WriterCmd::Write(job) => job.size,
+        WriterCmd::Delete(_) => 0,
+    }
+}
+
+/// Take `first` plus whatever is already queued, up to [`WRITE_BATCH_MAX`] jobs
+/// or [`WRITE_BATCH_MAX_BYTES`] of blob data — whichever comes first.
+fn collect_batch(first: WriterCmd, rx: &mpsc::Receiver<WriterCmd>) -> Vec<WriterCmd> {
+    let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
+    let mut batch_bytes = write_bytes(&first);
+    batch.push(first);
+    // The byte check is *before* the `try_recv`, so a first job that is already
+    // over the cap goes alone rather than dragging a second one in with it.
+    while batch.len() < WRITE_BATCH_MAX && batch_bytes < WRITE_BATCH_MAX_BYTES {
+        match rx.try_recv() {
+            Ok(cmd) => {
+                batch_bytes = batch_bytes.saturating_add(write_bytes(&cmd));
+                batch.push(cmd);
+            }
+            Err(_) => break,
+        }
+    }
+    batch
+}
+
 fn writer_loop(
     conn: &mut Connection,
     rx: &mpsc::Receiver<WriterCmd>,
@@ -601,14 +644,7 @@ fn writer_loop(
         #[cfg(test)]
         gate.wait_while_closed();
 
-        let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
-        batch.push(first);
-        while batch.len() < WRITE_BATCH_MAX {
-            match rx.try_recv() {
-                Ok(cmd) => batch.push(cmd),
-                Err(_) => break,
-            }
-        }
+        let mut batch = collect_batch(first, rx);
 
         if let Err(e) = process_batch(conn, &mut batch) {
             tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
@@ -1006,6 +1042,90 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use tempfile::tempdir;
+
+    /// A write command of a declared size. The spool is empty — `collect_batch`
+    /// only reads `size`, which is what the real writer records too.
+    fn write_cmd(name: &str, size: i64) -> WriterCmd {
+        WriterCmd::Write(WriteJob {
+            key: ("//pkg:t".to_string(), "h".to_string(), name.to_string()),
+            buf: SpooledTempFile::new(SPOOL_MEM_THRESHOLD),
+            size,
+            slot: PendingSlot::new(),
+        })
+    }
+
+    /// The blob `io::copy` runs *inside* the write transaction, so the batch's
+    /// byte total is how long the single writer thread is unavailable — and every
+    /// reader of a key in that batch, or merely queued behind it, waits on an
+    /// untimed condvar for exactly that long. Counting to 64 says nothing about
+    /// it: 64 jobs is anywhere from a few KiB to 64× the spill threshold.
+    #[test]
+    fn a_write_batch_is_bounded_by_bytes_as_well_as_count() {
+        let (tx, rx) = mpsc::channel();
+        // Twenty jobs at a tenth of the cap each — well under the count bound of
+        // `WRITE_BATCH_MAX`, so only the byte cap can stop this batch.
+        const JOBS: usize = 20;
+        let each = WRITE_BATCH_MAX_BYTES / 10;
+        for i in 0..JOBS {
+            tx.send(write_cmd(&format!("blob{i}"), each)).expect("send");
+        }
+
+        let first = rx.recv().expect("first");
+        let batch = collect_batch(first, &rx);
+
+        assert!(
+            batch.len() < JOBS,
+            "the byte cap must end the batch early, took all {} jobs",
+            batch.len()
+        );
+        let bytes: i64 = batch.iter().map(write_bytes).sum();
+        assert!(
+            bytes <= WRITE_BATCH_MAX_BYTES + each,
+            "a batch may only overshoot by its last job, took {bytes} bytes"
+        );
+    }
+
+    /// One blob cannot be split across transactions, so an over-cap job goes
+    /// alone rather than being joined by another.
+    #[test]
+    fn an_oversized_write_is_batched_alone() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(write_cmd("huge", WRITE_BATCH_MAX_BYTES * 4))
+            .expect("send");
+        tx.send(write_cmd("small", 1)).expect("send");
+
+        let first = rx.recv().expect("first");
+        let batch = collect_batch(first, &rx);
+
+        assert_eq!(
+            batch.len(),
+            1,
+            "an already-over-cap job must not drag another into its transaction"
+        );
+    }
+
+    /// Deletes move no bytes — one indexed `DELETE` each — so batching them
+    /// freely is the whole point and the byte cap must not throttle them.
+    #[test]
+    fn deletes_do_not_count_against_the_byte_cap() {
+        let (tx, rx) = mpsc::channel();
+        for i in 0..WRITE_BATCH_MAX {
+            tx.send(WriterCmd::Delete(DeleteJob {
+                key: ("//pkg:t".to_string(), "h".to_string(), format!("blob{i}")),
+                slot: PendingSlot::new(),
+            }))
+            .expect("send");
+        }
+
+        let first = rx.recv().expect("first");
+        let batch = collect_batch(first, &rx);
+
+        assert_eq!(
+            batch.len(),
+            WRITE_BATCH_MAX,
+            "deletes should still batch up to the count bound"
+        );
+    }
 
     fn make_addr(pkg: &str, name: &str) -> hmodel::htaddr::Addr {
         hmodel::htaddr::Addr::new(
