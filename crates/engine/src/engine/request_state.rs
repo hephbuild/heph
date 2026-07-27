@@ -247,6 +247,23 @@ pub struct RequestStateData {
     /// fails with a clear error. Shared via `Arc<RequestStateData>`, so child
     /// states inherit it.
     pub approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
+    /// This request may hash, probe and read, but must never take the exclusive
+    /// per-addr result lock.
+    ///
+    /// Set only by [`Engine::new_hash_only_state`], which is used to re-read the
+    /// tree from *inside* an in-flight resolution — the in_place write-back guard
+    /// and the fixpoint recompute. Those nested requests share the engine's one
+    /// `ResultLock` with the request they are nested inside, but not its
+    /// `mem_locked_result` — which is the memoizer that makes per-addr
+    /// acquisition idempotent within a request. So a nested write acquire
+    /// contends its own outer request's riding read guard, which is held until
+    /// the nested call returns: a self-deadlock, not contention.
+    ///
+    /// A cacheable miss therefore answers [`HashUnknownError`] instead of
+    /// building. Targets that take no lock at all (`@heph/fs`, see
+    /// `resolve_locked_inner`'s `skip_lock`) still execute normally — re-reading
+    /// the tree is the entire point of these requests.
+    pub hash_only: bool,
 }
 
 /// One frame of the live resolution path (the breadcrumb chain). Built as an
@@ -305,6 +322,12 @@ impl RequestState {
     /// `sandbox_cleaner::enqueue`, or to the renderer so it can poll for drain.
     pub fn bg_pending(&self) -> crate::engine::sandbox_cleaner::PendingCounter {
         Arc::clone(&self.data.bg_pending)
+    }
+
+    /// True when this request may hash, probe and read but must never take the
+    /// exclusive per-addr result lock. See [`RequestStateData::hash_only`].
+    pub fn hash_only(&self) -> bool {
+        self.data.hash_only
     }
 
     /// Records a genuinely-failing target's rich diagnostic. First-writer-wins:
@@ -546,6 +569,48 @@ impl Engine {
         log_tail_lines: usize,
         approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
     ) -> Arc<RequestState> {
+        self.new_state_inner(
+            fail_fast,
+            events,
+            bg_pending,
+            log_tail_lines,
+            approval,
+            false,
+        )
+    }
+
+    /// A request that re-reads the tree from *inside* an in-flight resolution.
+    ///
+    /// `parent` is the addr being resolved, and is not optional: `meta`'s dep walk
+    /// derives `is_top` from `RequestState::parent`, so a parent-less nested
+    /// request would promote every direct dep to a top-level frame — running each
+    /// one's own in_place write-back guard, which spins yet another nested
+    /// request per level.
+    ///
+    /// The returned request is [`hash_only`](RequestStateData::hash_only): it may
+    /// not build, so it can never contend the per-addr result lock its own caller
+    /// is holding.
+    pub fn new_hash_only_state(self: &Arc<Self>, parent: Addr) -> Arc<RequestState> {
+        self.new_state_inner(
+            true,
+            None,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Self::DEFAULT_LOG_TAIL_LINES,
+            None,
+            true,
+        )
+        .with_parent(parent)
+    }
+
+    fn new_state_inner(
+        self: &Arc<Self>,
+        fail_fast: bool,
+        events: Option<crate::engine::event::EventSender>,
+        bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+        log_tail_lines: usize,
+        approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
+        hash_only: bool,
+    ) -> Arc<RequestState> {
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
         // subtree keys into one bucket of any per-request cache (e.g. pluginfs's
@@ -579,6 +644,7 @@ impl Engine {
             bg_pending,
             failures: Mutex::new(indexmap::IndexMap::new()),
             approval,
+            hash_only,
         });
 
         let state = Arc::new(RequestState {
