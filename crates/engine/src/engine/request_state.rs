@@ -35,6 +35,12 @@ fn ptr_key(addr: &Addr) -> AddrPtrKey {
     AddrPtrKey(inner as *const AddrInner as usize)
 }
 
+/// Pack a directed edge into one key for [`DepDag::edges`]. Node indices are
+/// `u32`, so the two halves never collide.
+const fn edge_key(from: u32, to: u32) -> u64 {
+    ((from as u64) << 32) | to as u64
+}
+
 /// Online cycle-detecting DAG built with Pearce & Kelly's incremental topological
 /// ordering (2006). Per-edge work is amortized O(δ), where δ is the size of the
 /// "affected region" between the endpoints — typically 0 for forward edges (the
@@ -49,6 +55,36 @@ pub struct DepDag {
     pred: Vec<Vec<u32>>,
     ord: Vec<u32>,
     index_of: FxHashMap<AddrPtrKey, u32>,
+    /// Membership index over the same edges held in `succ`/`pred`, used *only*
+    /// for the already-present short-circuit in [`DepDag::add_dep`].
+    ///
+    /// `succ`/`pred` stay dense `Vec`s because the Pearce-Kelly reorder scans
+    /// whole adjacency lists — a hash set there would trade a sequential read
+    /// for pointer chasing. What the `Vec`s are bad at is the membership test:
+    /// `succ[f].contains(&t)` is a linear scan under the `DepDag` mutex, and it
+    /// scans the *whole* list on a miss, so filling a node to out-degree D cost
+    /// Θ(D²/2) even with no repeats. Repeats then pay D per offer, and they are
+    /// the common case rather than an oddity: a transparent group's re-inline
+    /// (`result.rs`, before `mem_result.once`) re-walks all D of the group's
+    /// deps once per parent that reaches it, so K parents made the old check
+    /// Θ(K·D²) — 250 ms at D=100k.
+    ///
+    /// Two invariants, both load-bearing:
+    ///
+    /// - An edge is inserted here only *after* `add_dep` has committed it,
+    ///   never before. Recording an edge that the cycle check then rejects
+    ///   would make the next identical `add_dep` short-circuit to `Ok`,
+    ///   silently accepting the cycle.
+    /// - The index and the adjacency lists are written together, by
+    ///   [`DepDag::commit_edge`] alone. There is no retraction path today
+    ///   (`RequestState::speculative` exists precisely so a rejected candidate
+    ///   never records an edge that would have to be taken back); if one is
+    ///   ever added it must remove from both sides, or a live edge becomes
+    ///   invisible to the cycle check.
+    ///
+    /// Keys are packed `(from, to)` rather than a tuple so the hash is one
+    /// `FxHasher` round instead of two, at identical size.
+    edges: FxHashSet<u64>,
 }
 
 impl DepDag {
@@ -71,7 +107,7 @@ impl DepDag {
             });
         }
 
-        if self.succ[f as usize].contains(&t) {
+        if self.edges.contains(&edge_key(f, t)) {
             return Ok(());
         }
 
@@ -79,8 +115,7 @@ impl DepDag {
         let to_ord = self.ord[t as usize];
 
         if from_ord < to_ord {
-            self.succ[f as usize].push(t);
-            self.pred[t as usize].push(f);
+            self.commit_edge(f, t);
             return Ok(());
         }
 
@@ -140,9 +175,22 @@ impl DepDag {
             self.ord[n as usize] = positions[delta_minus.len() + i];
         }
 
+        self.commit_edge(f, t);
+        Ok(())
+    }
+
+    /// Append `f → t` to the adjacency lists and record it in the membership
+    /// index. The single writer of [`DepDag::edges`], so the index cannot drift
+    /// from `succ`/`pred`. Both call sites are in `add_dep`, after every
+    /// rejection path — see the note on [`DepDag::edges`].
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "callers pass node indices already bound to the vectors' lengths by get_or_insert"
+    )]
+    fn commit_edge(&mut self, f: u32, t: u32) {
         self.succ[f as usize].push(t);
         self.pred[t as usize].push(f);
-        Ok(())
+        self.edges.insert(edge_key(f, t));
     }
 
     fn get_or_insert(&mut self, addr: &Addr) -> u32 {
@@ -674,6 +722,11 @@ mod tests {
         Addr::new(PkgBuf::from("pkg"), name.to_string(), Default::default())
     }
 
+    /// A node's index in the DAG's parallel vectors, for white-box assertions.
+    fn idx(dag: &DepDag, a: &Addr) -> usize {
+        *dag.index_of.get(&ptr_key(a)).expect("addr not in dag") as usize
+    }
+
     /// Build an `Engine` rooted at a unique temp dir so the sqlite cache db
     /// never collides across parallel tests (a shared path locks the db).
     /// The returned `TempDir` must be held alive for the test's duration.
@@ -727,6 +780,100 @@ mod tests {
     }
 
     #[test]
+    fn test_dep_dag_rejected_edge_is_not_recorded() {
+        // The membership index must only ever learn about edges `add_dep`
+        // actually committed. If a cycle-rejected edge were recorded, the
+        // second attempt would short-circuit to Ok and the cycle would be
+        // silently accepted.
+        let mut dag = DepDag::new();
+        let a = addr("a");
+        let b = addr("b");
+        let c = addr("c");
+        assert!(dag.add_dep(&a, &b).is_ok());
+        assert!(dag.add_dep(&b, &c).is_ok());
+
+        for _ in 0..3 {
+            assert!(
+                dag.add_dep(&c, &a).is_err(),
+                "a rejected edge must stay rejected on every retry"
+            );
+        }
+        // Self-loops take the earlier `f == t` bail; they must not be recorded
+        // either.
+        for _ in 0..3 {
+            assert!(dag.add_dep(&a, &a).is_err());
+        }
+
+        // A rejection must also leave the ordering usable: the cycle bail
+        // returns from inside the δ⁺ walk, before any `ord` is rewritten, so a
+        // later legitimate reorder must still produce a valid topological
+        // order. If a rejection ever corrupted `ord`, the only symptom would be
+        // a wrong verdict on some unrelated later edge.
+        let d = addr("d");
+        assert!(dag.add_dep(&d, &a).is_ok());
+        let (ai, bi, ci, di) = (idx(&dag, &a), idx(&dag, &b), idx(&dag, &c), idx(&dag, &d));
+        assert!(dag.ord[di] < dag.ord[ai]);
+        assert!(dag.ord[ai] < dag.ord[bi]);
+        assert!(dag.ord[bi] < dag.ord[ci]);
+    }
+
+    #[test]
+    fn test_dep_dag_duplicate_check_does_not_scan_adjacency_lists() {
+        // White-box: the already-present short-circuit must consult the
+        // membership index, not the adjacency lists. Emptying them behind the
+        // DAG's back must not make a known edge look new — the old
+        // `succ[f].contains(&t)` scan would miss, take the forward branch, and
+        // re-push into both lists.
+        let mut dag = DepDag::new();
+        let hub = addr("hub");
+        let leaf = addr("leaf");
+        assert!(dag.add_dep(&hub, &leaf).is_ok());
+
+        let (hi, li) = (idx(&dag, &hub), idx(&dag, &leaf));
+        dag.succ[hi].clear();
+        dag.pred[li].clear();
+        assert!(dag.add_dep(&hub, &leaf).is_ok());
+        assert!(
+            dag.succ[hi].is_empty() && dag.pred[li].is_empty(),
+            "duplicate add must neither scan nor re-push the adjacency lists"
+        );
+    }
+
+    #[test]
+    fn test_dep_dag_wide_node_repeat_edges_never_rescan() {
+        // The transparent-group re-inline (`result.rs`, before
+        // `mem_result.once`) re-walks a group's whole dep list once per parent
+        // that reaches it, so the same D edges are offered over and over. Each
+        // repeat offer must be answered from the membership index alone.
+        //
+        // Deterministic rather than timed: `succ[hub]` is emptied between the
+        // passes, so an implementation that rescans the adjacency list misses,
+        // takes the forward branch, and rebuilds the list to D entries. D is
+        // wide enough to be the shape this guards without making the test
+        // expensive — the assertion is structural, not statistical.
+        const D: usize = 2_000;
+
+        let hub = addr("hub");
+        let leaves: Vec<Addr> = (0..D).map(|i| addr(&format!("wide_leaf{i}"))).collect();
+
+        let mut dag = DepDag::new();
+        for leaf in &leaves {
+            dag.add_dep(&hub, leaf).unwrap();
+        }
+        let hi = idx(&dag, &hub);
+        assert_eq!(dag.succ[hi].len(), D);
+
+        dag.succ[hi].clear();
+        for leaf in &leaves {
+            dag.add_dep(&hub, leaf).unwrap();
+        }
+        assert!(
+            dag.succ[hi].is_empty(),
+            "re-offering {D} known edges rescanned (and rebuilt) the adjacency list"
+        );
+    }
+
+    #[test]
     fn test_dep_dag_pk_reorder() {
         // Insert a→c, b→c first (so c gets a low ord relative to a/b in insertion
         // order: a=0, c=1, b=2). Then a→b is a back-edge in initial ord (ord[a]=0,
@@ -742,19 +889,44 @@ mod tests {
         assert!(dag.add_dep(&b, &c).is_ok());
         assert!(dag.add_dep(&b, &a).is_ok());
 
-        let ai = *dag.index_of.get(&ptr_key(&a)).unwrap();
-        let bi = *dag.index_of.get(&ptr_key(&b)).unwrap();
-        let ci = *dag.index_of.get(&ptr_key(&c)).unwrap();
-        assert!(dag.ord[bi as usize] < dag.ord[ai as usize]);
-        assert!(dag.ord[ai as usize] < dag.ord[ci as usize]);
-        assert!(dag.ord[bi as usize] < dag.ord[ci as usize]);
+        let (ai, bi, ci) = (idx(&dag, &a), idx(&dag, &b), idx(&dag, &c));
+        assert!(dag.ord[bi] < dag.ord[ai]);
+        assert!(dag.ord[ai] < dag.ord[ci]);
+        assert!(dag.ord[bi] < dag.ord[ci]);
+
+        // b→a was committed through the reorder branch, the second of
+        // `add_dep`'s two commit sites. Re-offering it must short-circuit on the
+        // membership index exactly like a forward-path edge. It is the reorder
+        // site that makes this worth pinning: the reorder *fixed* the ordering,
+        // so ord[b] < ord[a] now holds and a re-offer that missed the index
+        // would sail through the forward branch and push a duplicate into both
+        // adjacency lists — silently, since a duplicate only costs an extra
+        // visit in the δ walks.
+        let (succ_b, pred_a) = (dag.succ[bi].len(), dag.pred[ai].len());
+        for _ in 0..3 {
+            assert!(dag.add_dep(&b, &a).is_ok());
+        }
+        assert_eq!(dag.succ[bi].len(), succ_b);
+        assert_eq!(dag.pred[ai].len(), pred_a);
+
+        // Same white-box check as the forward path: with the lists emptied, a
+        // known reorder-committed edge must still be answered from the index.
+        dag.succ[bi].clear();
+        dag.pred[ai].clear();
+        assert!(dag.add_dep(&b, &a).is_ok());
+        assert!(dag.succ[bi].is_empty() && dag.pred[ai].is_empty());
     }
 
     #[test]
     fn test_dep_dag_concurrent_stress() {
-        // 64 threads each adding 100 acyclic edges, plus one closing edge from
-        // a designated thread. Assert that the closing edge surfaces exactly one
-        // CycleError and all other inserts succeed.
+        // 64 threads each adding 100 acyclic edges, and every one of them also
+        // attempting the same chain-closing edge. Assert that all the acyclic
+        // inserts succeed and that the closing edge is rejected on *every*
+        // attempt — a rejected edge must never be recorded in the membership
+        // index, or a later attempt would short-circuit to Ok and the cycle
+        // would be silently accepted. Interleaving the attempts with 6400
+        // concurrent inserts (which force reorders) is the point: the verdict
+        // must not depend on what else landed in between.
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let dag = Arc::new(Mutex::new(DepDag::new()));
@@ -766,8 +938,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let closing_attempts = AtomicUsize::new(0);
-        let closing_attempts = Arc::new(closing_attempts);
+        let closing_attempts = Arc::new(AtomicUsize::new(0));
         let ok_count = Arc::new(AtomicUsize::new(0));
         let err_count = Arc::new(AtomicUsize::new(0));
 
@@ -784,15 +955,13 @@ mod tests {
                         let res = dag.lock().add_dep(&from, &to);
                         assert!(res.is_ok());
                     }
-                    // One thread tries to close the seed chain into a cycle.
-                    if tid == 0 {
-                        closing_attempts.fetch_add(1, Ordering::SeqCst);
-                        let res = dag.lock().add_dep(&addr("a9"), &addr("a0"));
-                        match res {
-                            Ok(_) => ok_count.fetch_add(1, Ordering::SeqCst),
-                            Err(_) => err_count.fetch_add(1, Ordering::SeqCst),
-                        };
-                    }
+                    // Every thread tries to close the seed chain into a cycle.
+                    closing_attempts.fetch_add(1, Ordering::SeqCst);
+                    let res = dag.lock().add_dep(&addr("a9"), &addr("a0"));
+                    match res {
+                        Ok(()) => ok_count.fetch_add(1, Ordering::SeqCst),
+                        Err(_) => err_count.fetch_add(1, Ordering::SeqCst),
+                    };
                 })
             })
             .collect();
@@ -800,9 +969,9 @@ mod tests {
             t.join().unwrap();
         }
 
-        assert_eq!(closing_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(closing_attempts.load(Ordering::SeqCst), 64);
         assert_eq!(ok_count.load(Ordering::SeqCst), 0);
-        assert_eq!(err_count.load(Ordering::SeqCst), 1);
+        assert_eq!(err_count.load(Ordering::SeqCst), 64);
     }
 
     #[tokio::test]
