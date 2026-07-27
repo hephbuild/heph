@@ -56,7 +56,7 @@ use futures::future::BoxFuture;
 use futures::task::{ArcWake, waker_ref};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -149,6 +149,16 @@ pub(crate) struct Cell<V> {
     /// Slab key of the awaiter that last polled the inner future, or
     /// [`NO_DRIVER`]. An inner wake is routed here and nowhere else.
     driver: AtomicUsize,
+    /// Set when the driver has been woken and has not yet re-polled.
+    ///
+    /// Without it, a burst of inner wakes is indistinguishable from a dead
+    /// driver: the first wake consumes the driver's waker slot, and every wake
+    /// after it sees an empty slot. Treating that as "unreachable" and waking
+    /// everyone would reintroduce the storm on exactly the bursty workload this
+    /// module exists to fix; treating it as "already scheduled" and doing nothing
+    /// would drop a real wake when the driver is genuinely gone. This latch
+    /// distinguishes the two.
+    driver_awake: AtomicBool,
 }
 
 impl<V> Cell<V> {
@@ -158,6 +168,7 @@ impl<V> Cell<V> {
             slot: Mutex::new(Some(fut)),
             wakers: Mutex::new(Wakers::default()),
             driver: AtomicUsize::new(NO_DRIVER),
+            driver_awake: AtomicBool::new(false),
         })
     }
 
@@ -189,25 +200,44 @@ impl<V> Cell<V> {
 /// the cell rather than on whichever task happened to be driving.
 impl<V: Send + Sync + 'static> ArcWake for Cell<V> {
     fn wake_by_ref(cell: &Arc<Self>) {
+        // Everything below runs under the waker lock, `driver` included.
+        // `Await::drop` clears `driver` and then edits the set while holding this
+        // lock, so a load taken outside it can name a driver that is already gone.
+        let mut wakers = cell.wakers();
         let driver = cell.driver.load(Ordering::Acquire);
-        let waker = {
-            let mut wakers = cell.wakers();
-            if driver == NO_DRIVER {
-                // Nobody is on the hook — the driver abdicated between our load
-                // and here. Wake everyone so one of them re-elects itself;
-                // waking a single awaiter risks picking one that is mid-drop.
-                let all = wakers.take_all();
-                drop(wakers);
-                for waker in all {
-                    waker.wake();
-                }
-                return;
-            }
+        let targeted = if driver == NO_DRIVER {
+            None
+        } else {
             wakers.take(driver)
         };
-        // This is the whole point of the module: an inner wake reaches exactly
-        // one task, not all W of them.
-        if let Some(waker) = waker {
+
+        // The optimization: an inner wake normally reaches exactly one task, not
+        // all W of them. That is the whole point of the module.
+        if let Some(waker) = targeted {
+            // The driver now owes us a re-poll; further wakes until then are
+            // redundant.
+            cell.driver_awake.store(true, Ordering::Release);
+            drop(wakers);
+            waker.wake();
+            return;
+        }
+
+        // The slot is empty. If the driver already owes us a re-poll, it will
+        // observe this progress when it runs — polling the inner future re-reads
+        // its state, so nothing is lost by staying quiet. This is the common case
+        // during a burst, and waking everyone here would be the storm again.
+        if driver != NO_DRIVER && cell.driver_awake.load(Ordering::Acquire) {
+            return;
+        }
+
+        // No driver, or a driver that owes us nothing and has no waker — nobody
+        // is going to poll this cell. Wake everyone and let one re-elect itself.
+        // An extra wake costs one spurious poll; a missing one hangs the cell
+        // forever, and at the tail of a build there is no ambient re-polling left
+        // to rescue it.
+        let all = wakers.take_all();
+        drop(wakers);
+        for waker in all {
             waker.wake();
         }
     }
@@ -274,6 +304,9 @@ impl<V: Clone + Send + Sync + 'static> Future for Await<V> {
         if let Some(key) = this.key {
             cell.driver.store(key, Ordering::Release);
         }
+        // Clear before polling, so a wake raised *during* the poll re-arms the
+        // latch rather than being swallowed as "already notified".
+        cell.driver_awake.store(false, Ordering::Release);
 
         let waker = waker_ref(cell);
         let mut cx = Context::from_waker(&waker);
@@ -422,6 +455,60 @@ mod tests {
                 "parked awaiter {i} must be woken on completion"
             );
         }
+    }
+
+    /// An inner wake with no reachable driver must wake everyone.
+    ///
+    /// A recorded driver whose waker slot is empty is ambiguous — it either
+    /// already got woken and has not re-registered yet, or it is gone. Targeting
+    /// it and finding nothing used to drop the wake on the floor, which strands
+    /// every remaining awaiter: with completion-only wakes there is no ambient
+    /// re-polling left to rescue them, and at the tail of a build that is a hang.
+    #[test]
+    fn inner_wake_falls_back_to_everyone_when_the_driver_slot_is_empty() {
+        let (cell, stashed, _ready) = stash_cell(9);
+
+        let (w1c, w1w) = counting();
+        let mut w1 = Await::new(Arc::clone(&cell));
+        assert!(poll_with(&mut w1, &w1w).is_pending());
+        let (w2c, w2w) = counting();
+        let mut w2 = Await::new(Arc::clone(&cell));
+        assert!(poll_with(&mut w2, &w2w).is_pending());
+
+        let (dc, dw) = counting();
+        let mut driver = Await::new(Arc::clone(&cell));
+        assert!(poll_with(&mut driver, &dw).is_pending());
+
+        let inner = stashed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("inner future must have stashed the cell's waker");
+
+        // First wake consumes the driver's slot and arms the latch.
+        inner.wake_by_ref();
+        assert_eq!(count(&dc), 1);
+        assert_eq!((count(&w1c), count(&w2c)), (0, 0));
+
+        // Still latched: the driver owes a re-poll, so further wakes stay quiet
+        // rather than fanning out. This is the burst case, and waking everyone
+        // here would be the storm again.
+        inner.wake_by_ref();
+        assert_eq!(
+            (count(&w1c), count(&w2c)),
+            (0, 0),
+            "a wake fanned out while the driver was already scheduled"
+        );
+
+        // Now simulate the driver being unreachable: it owes nothing and has no
+        // waker registered. The wake must reach the others rather than vanish.
+        cell.driver_awake.store(false, Ordering::SeqCst);
+        inner.wake_by_ref();
+        assert_eq!(
+            (count(&w1c), count(&w2c)),
+            (1, 1),
+            "a wake with an unreachable driver was dropped; every awaiter is stranded"
+        );
     }
 
     /// A dropped driver must hand the cell back, not strand it.
@@ -679,6 +766,10 @@ impl<V> Drop for Await<V> {
             .driver
             .compare_exchange(key, NO_DRIVER, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
+        if was_driver {
+            // We owed the cell a re-poll and will never make it.
+            self.cell.driver_awake.store(false, Ordering::Release);
+        }
 
         let mut wakers = self.cell.wakers();
         wakers.remove(key);
