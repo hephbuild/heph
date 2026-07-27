@@ -174,6 +174,12 @@ impl ProviderExecutor for EngineProviderExecutor {
             for pkg_str in pkgs {
                 let pkg = PkgBuf::from(pkg_str.as_str());
 
+                // Same pruning as `Engine::query`: skip packages the matcher
+                // cannot select before paying for probe + list.
+                if m.matches_pkg(&pkg) == hmodel::htmatcher::MatchResult::MatchNo {
+                    continue;
+                }
+
                 let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
 
                 for provider in &engine.providers {

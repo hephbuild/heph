@@ -4,10 +4,8 @@ use crate::engine::request_state::RequestState;
 use enclose::enclose;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use hmodel::htaddr::Addr;
 use hmodel::htmatcher::{MatchResult, Matcher};
 use hmodel::htpkg::PkgBuf;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// What [`Engine::states`] should collect.
@@ -38,8 +36,7 @@ pub struct PackageStates {
 /// can only shrug — those are treated as selecting the package, keeping the
 /// scan inclusive rather than silently dropping declarations.
 fn matches_package(m: &Matcher, pkg: &PkgBuf) -> bool {
-    let probe = Addr::new(pkg.clone(), String::new(), BTreeMap::new());
-    m.matches_addr(&probe) != MatchResult::MatchNo
+    m.matches_pkg(pkg) != MatchResult::MatchNo
 }
 
 impl Engine {
