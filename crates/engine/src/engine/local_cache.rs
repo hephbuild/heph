@@ -808,6 +808,47 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
+    /// Every blob of a pushed revision is gzipped into its own temp file first.
+    /// A real upload therefore creates N of them, and the only thing that
+    /// reclaims them is the `TempBlob` guards travelling in `prepared` — there is
+    /// no explicit cleanup left to notice if one of them stops being a guard.
+    #[tokio::test]
+    async fn a_completed_upload_leaves_no_temp_blobs_behind() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let (engine, _dir) = engine_with_remote(&remote_uri);
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHTMP",
+                vec![
+                    raw_artifact("a", b"first payload"),
+                    raw_artifact("b", b"second payload"),
+                    raw_artifact("c", b"third payload"),
+                ],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        engine.upload_to_remote(&addr, "HASHTMP").await;
+
+        let tmp_dir = engine.home.join("cache").join("remote-tmp");
+        let leftovers: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .expect("the upload must have created the temp dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "blob"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a completed upload must reclaim every encode temp, found {leftovers:?}"
+        );
+    }
+
     /// The background upload bumps the request's `bg_pending` counter and drops
     /// it back to zero once the push finishes — the signal the CLI/TUI shutdown
     /// path waits on so it never exits with an upload in flight. The pushed

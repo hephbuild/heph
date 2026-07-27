@@ -118,12 +118,20 @@ const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// Age past which a file under `remote-tmp` cannot belong to a live transfer,
 /// used by [`sweep_abandoned_temps`].
 ///
-/// [`UPLOAD_DEADLINE`] is the only deadline over a temp's lifetime — the pull
-/// side has none of its own — so the margin on top is what actually covers a
-/// slow download. Past it, a file can only be residue from a run hard-killed
-/// before its [`TempBlob`] could be dropped. Sizing it this way is what makes the
-/// sweep safe to run while *another* heph process is mid-transfer: its live temps
-/// are younger than this, so they are never touched.
+/// [`UPLOAD_DEADLINE`] bounds the push end to end, queue wait included, and the
+/// temp is created inside that bound. The pull side has no deadline of its own:
+/// it stays fresh because a progressing transfer keeps advancing the temp's
+/// mtime, and a *stalled* one is killed by the backend's inactivity bound (see
+/// [`RemoteCacheBackend`]). The margin on top covers the gap between the last
+/// byte and the decode. Past all that, a file can only be residue from a run
+/// hard-killed before its [`TempBlob`] could be dropped.
+///
+/// Sizing it this way is what makes the sweep safe to run while *another* heph
+/// process is mid-transfer: its live temps are younger than this, so they are
+/// never touched. It also makes the disk cost **time**-bounded rather than
+/// size-bounded — a crash loop retains at most this much residue no matter how
+/// many times it crashes — and, because the `.blob` naming is unchanged, the
+/// first run of this binary reclaims what every pre-fix run left behind.
 const TEMP_SWEEP_AGE: Duration = UPLOAD_DEADLINE.saturating_add(Duration::from_secs(10 * 60));
 
 /// Permits for the synchronous compress/decompress + local-cache I/O that
@@ -236,15 +244,26 @@ fn sweep_abandoned_temps(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let now = std::time::SystemTime::now();
-    let (mut swept, mut kept) = (0usize, 0usize);
+    // "Now" comes from the directory's own filesystem, not the process clock.
+    // The two can disagree — an NFS server running behind, a laptop resumed from
+    // sleep — and comparing across them can read a *live* temp as provably old.
+    // Deleting one out from under a transfer is not a miss on that pull, it is a
+    // hard error. Same clock on both sides, and any skew cancels.
+    let now = match sweep_clock(dir) {
+        Some(now) => now,
+        None => {
+            debug!(dir = %dir.display(), "no usable mtime clock; skipping temp sweep");
+            return;
+        }
+    };
+    let (mut swept, mut kept, mut failed) = (0usize, 0usize, 0usize);
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != TEMP_BLOB_EXT) {
             continue;
         }
-        // Unreadable metadata or an mtime in the future (clock skew, a foreign
-        // filesystem) both read as "not provably old" — keep it.
+        // Unreadable metadata or an mtime in the future both read as "not
+        // provably old" — keep it.
         let abandoned = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -255,22 +274,58 @@ fn sweep_abandoned_temps(dir: &Path) {
             kept += 1;
             continue;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            swept += 1;
+        match std::fs::remove_file(&path) {
+            Ok(()) => swept += 1,
+            // A `.blob` directory, EPERM, an immutable flag: nothing will ever
+            // reclaim it and the sweep is the only thing that looks, so it has to
+            // be said out loud rather than counted as kept.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                failed += 1;
+                debug!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not reclaim an abandoned remote cache temp blob",
+                );
+            }
         }
     }
-    if swept > 0 {
+    if swept > 0 || failed > 0 {
         debug!(
             swept,
             kept,
+            failed,
             dir = %dir.display(),
             "reclaimed abandoned remote cache temp blobs",
         );
     }
 }
 
+/// The current time as `dir`'s own filesystem records it, by writing a file there
+/// and reading back its mtime.
+///
+/// Deliberately not [`std::time::SystemTime::now`] — see [`sweep_abandoned_temps`].
+/// The name is outside [`TEMP_BLOB_EXT`], so a concurrent sweep never treats it as
+/// residue; two processes racing on it only overwrite each other's timestamp,
+/// which is all either one wanted.
+fn sweep_clock(dir: &Path) -> Option<std::time::SystemTime> {
+    let probe = dir.join(".sweep-clock");
+    let now = std::fs::File::create(&probe)
+        .and_then(|f| f.metadata()?.modified())
+        .ok();
+    drop(std::fs::remove_file(&probe));
+    now
+}
+
 /// A streaming object store. The set layers cache semantics (manifest affinity,
 /// ordering, parallel fan-out) on top; a backend only moves bytes.
+///
+/// **A reader must bound its own inactivity.** `fetch_blob` puts a
+/// [`METADATA_TIMEOUT`] on opening the stream, but the body copy that follows is
+/// raced only against cancellation — an implementation that can sit forever
+/// mid-response holds a bulk request slot indefinitely, and leaves a temp file
+/// whose mtime stops advancing, which is the premise [`TEMP_SWEEP_AGE`] rests on.
+/// [`ObjStoreBackend`] does this with its `InactivityReader`.
 #[async_trait]
 pub trait RemoteCacheBackend: Send + Sync {
     /// Open a streaming reader for an object, or `None` if it does not exist.
@@ -1515,25 +1570,33 @@ impl Engine {
     /// of anything a previous run abandoned.
     ///
     /// The path is only reachable through here, so it cannot be named without
-    /// having been created. The sweep is once, not per transfer: it is a
+    /// having been created. The sweep runs once, not per transfer: it is a
     /// `read_dir` plus a `stat` per entry, and this sits on the path of every
     /// upload and every pull — at a hundred thousand targets, re-walking the
-    /// directory each time would cost more than the leak it reclaims. On the
-    /// blocking pool because a directory holding a large backlog is exactly the
-    /// case where it is slow.
+    /// directory each time would cost far more than the residue it reclaims.
+    ///
+    /// It is also *detached*, so the first transfer of the run does not wait on
+    /// it. Nothing depends on the sweep having finished — its whole job is
+    /// deleting files this process will never look at — and a directory holding a
+    /// large backlog is precisely the case where it is slow and the case where
+    /// waiting would be most visible. Both it and the `create_dir_all` go to the
+    /// blocking pool.
     async fn remote_tmp_dir(&self) -> anyhow::Result<&Path> {
         let dir = self
             .remote_tmp_ready
             .get_or_try_init(|| {
                 let dir = self.home.join("cache").join("remote-tmp");
                 async move {
-                    hcore::blocking::run(move || {
+                    let dir = hcore::blocking::run(move || {
                         std::fs::create_dir_all(&dir)
                             .with_context(|| format!("create remote temp dir {}", dir.display()))?;
-                        sweep_abandoned_temps(&dir);
                         anyhow::Ok(dir)
                     })
-                    .await
+                    .await?;
+                    tokio::spawn(enclose::enclose!((dir) async move {
+                        hcore::blocking::run(move || sweep_abandoned_temps(&dir)).await;
+                    }));
+                    anyhow::Ok(dir)
                 }
             })
             .await?;
@@ -2969,19 +3032,24 @@ mod tests {
         let mut fetch = Box::pin(set.fetch_blob(&ctoken, &rev, &addr, "h", "blob-0", dir.path()));
 
         // Poll it far enough to have created the temp and parked on the copy.
-        for _ in 0..200 {
+        // The budget is generous rather than tight: this is waiting on a
+        // `tokio::fs::File::create` to land, and on a loaded 2-core runner a
+        // one-second deadline is a coin flip, not a signal.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while temp_blobs(dir.path()).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fetch never created its temp file",
+            );
             tokio::select! {
                 _ = &mut fetch => panic!("a stalled backend must never complete the copy"),
                 () = tokio::time::sleep(Duration::from_millis(5)) => {}
-            }
-            if !temp_blobs(dir.path()).is_empty() {
-                break;
             }
         }
         assert_eq!(
             temp_blobs(dir.path()).len(),
             1,
-            "the fetch should have a temp file open by now"
+            "the fetch should have exactly one temp file open"
         );
 
         drop(fetch);
@@ -3078,10 +3146,26 @@ mod tests {
         let borderline = plant("borderline.blob", Some(TEMP_SWEEP_AGE / 2));
         let fresh = plant("fresh.blob", None);
         let foreign = plant("notours.txt", Some(TEMP_SWEEP_AGE * 10));
+        // Clock skew the other way. `duration_since` fails rather than going
+        // negative, and that has to read as "keep" — a refactor to
+        // `elapsed().unwrap_or(MAX)` would silently invert it into "delete
+        // everything".
+        let future = {
+            let path = dir.path().join("future.blob");
+            let f = std::fs::File::create(&path).expect("create planted file");
+            let when = std::time::SystemTime::now() + Duration::from_secs(60 * 60);
+            f.set_times(std::fs::FileTimes::new().set_modified(when))
+                .expect("post-date planted file");
+            path
+        };
 
         sweep_abandoned_temps(dir.path());
 
         assert!(!stale.exists(), "an abandoned temp must be reclaimed");
+        assert!(
+            future.exists(),
+            "an mtime in the future is not evidence of abandonment"
+        );
         assert!(
             borderline.exists(),
             "a temp that could still belong to a live transfer must be left alone"
