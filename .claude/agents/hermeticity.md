@@ -50,6 +50,8 @@ Cache keys that are too specific are also a bug — they present as "heph is slo
 - **Declared outputs are in the def hash.** A change to the declared output set must change the key — otherwise a cache entry from a different output set is served.
 - **Cache-key stability across versions.** Does this change alter the key for unchanged targets? If yes, that's a full-rebuild for every user — call it out. If the key stays the same but the *meaning* changed, that's cache poisoning — BLOCKER.
 - **Sandbox actually enforces it.** Declaration without enforcement rots. If the sandbox can't detect an undeclared read, say so — the design leans on discipline, and discipline decays.
+- **Platform uniformity.** The supported set is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — no BSD, no Windows, no 32-bit — and heph must behave the same on all three. Everything below applies to the arch axis (x86_64 vs aarch64) exactly as it does to the OS axis; an artifact built on one arch and served to the other is the same class of failure. Ask both directions: (a) does the *behavior* differ between Linux and macOS — a `#[cfg(target_os = …)]` semantics split, a Linux-only sandbox/syscall path, a mechanism that degrades on macOS; (b) does the *key* differ — is the OS in the hash when it doesn't change the output (kills cross-machine and remote-cache sharing in a mixed fleet), or absent from the hash when it does change the output (a macOS artifact served to a Linux machine, the worst case). A per-OS difference is allowed, but only as a decision the user makes: report what differs and what each option costs; never resolve it yourself and never let the implementation resolve it silently.
+- **Environment assumptions, especially in plugins.** A plugin must be *handed* what it needs, not discover it. Anything read from the ambient process — env vars, cwd, `$PATH` lookups, `$HOME`/`$TMPDIR`, locale, host statics — is both an undeclared input and a portability hazard. Flag the read, then say whether it should be declared, injected, or removed.
 
 ## Output format
 
@@ -69,4 +71,6 @@ Then: **HERMETIC**, **HERMETIC WITH EXEMPTIONS** (list them), or **NOT HERMETIC*
 - Ground every finding in a concrete divergence — two environments, or a before/after change that produces the same hash. A hermeticity claim you can't make diverge is a smell, not a finding; say which it is.
 - An exemption is fine when it is deliberate, justified, and written down at the site. An undocumented exclusion is a finding even if it happens to be correct today.
 - Read the driver's actual input/output declaration and the actual hash computation. Don't infer from names.
+- Pinning a dependency (a crate, a staged toolchain, a content-addressed download) is the *right* fix for a host-tool input — prefer it over trusting the host. The dependency is not the problem; the unpinned host is.
+- Per-OS and per-arch behavior is the user's decision, not yours. Flag the divergence and its cache consequence; hand the call back.
 - You do not write code. Name the undeclared input precisely enough to declare it in one pass.

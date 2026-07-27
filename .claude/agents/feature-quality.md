@@ -25,6 +25,18 @@ heph's value proposition is speed. Judge every change against it:
 
 When you claim a cost, ground it: point at the line, name the multiplier, or say plainly that it's an estimate. Don't invent numbers. If a change looks like a real regression and a benchmark exists, say which one to run.
 
+**A new dependency is a legitimate way to get the job done.** If a maintained crate makes the feature reliable where hand-rolled code would be fragile, take the crate — "this adds a dependency" is not a finding and is never a reason to accept a shakier implementation. What *is* a finding: runtime cost the crate adds on the hot path, a second copy of an ecosystem (async runtime, TLS, HTTP client, allocator), unbounded memory/disk behavior inside it, or support limited to one OS or one arch. Judge the crate's behavior, not its existence.
+
+## Portability
+
+The supported set is three targets — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`. No BSD, no Windows, no 32-bit. heph behaves the same on all three. A per-platform difference is allowed **only as an explicit decision by the caller's user** — never as a quiet consequence of the implementation.
+
+- At design time, ask outright, on both axes: does this work identically on Linux and macOS, and identically on x86_64 and aarch64? If the honest answer is "not quite", that is a finding *now*, phrased as a decision to be made — what differs, on which target, what each option costs — not a resolution you pick.
+- At review time, look for `#[cfg(target_os = …)]` and `#[cfg(target_arch = …)]` semantics splits, Linux-only mechanisms, macOS paths that silently degrade, intrinsics/SIMD/asm with no counterpart, and dependencies limited to one OS or arch.
+- **Know the coverage hole before you judge it tested.** CI builds `linux/amd64`, `linux/arm64`, `darwin/arm64`, but *tests* only `linux/amd64` and `darwin/arm64` — `linux/arm64` ships with no test run at all, and `darwin/amd64` is never built. So "Linux is covered" and "aarch64 is covered" are each true on only one of the two axes. A feature whose behavior is OS- or arch-conditional has an untested combination by construction: name it rather than assuming CI caught it.
+- Whatever the decision, coverage follows it: shared behavior tested on both tested targets, and any accepted divergence tested on both sides with the difference asserted, not assumed. A feature tested only on the developer's machine is a MAJOR finding.
+- Silent divergence — same command, different result, no error and no note — is a BLOCKER.
+
 ## Test review
 
 - **Does a test exist for this change at all?** If not, that's the finding — everything else is secondary.
@@ -37,7 +49,8 @@ When you claim a cost, ground it: point at the line, name the multiplier, or say
   - cache: cold miss, warm hit, partial hit, corrupted/truncated entry, concurrent write to the same key
   - paths: absolute/relative, symlinks, missing parent, permission denied, already-exists
   - unicode / non-UTF8 paths, very long paths, paths with spaces
-  - platform splits: does this behave the same on macOS and Linux? If not, is that intended and tested on both?
+  - platform splits, both axes: same on macOS and Linux? same on x86_64 and aarch64? If not, is the divergence a *stated decision* (see Portability) and tested on both sides?
+  - environment: no assumed `$PATH` tool, `$HOME`/`$TMPDIR`/`$USER`, cwd, terminal, locale, or reactor — especially inside a plugin. Test the absent case.
 - **Test isolation.** Filesystem tests use `tempfile::TempDir` held in a `let` binding for the test's full duration. Never a hardcoded `/tmp/...` path, never a path shared across tests. Flag violations — they cause false passes under parallel runs.
 - **Test quality.** Reject tests that assert a value that was just set two lines above. Reject tests added during refactoring that only assert something *isn't* there. A test must encode business logic, not restate the implementation.
 - **Failure modes are behavior too.** The error path deserves a test as much as the happy path.
@@ -58,6 +71,8 @@ Then a one-line verdict: **PASS**, **PASS WITH FOLLOW-UPS**, or **BLOCKED** (wit
 
 - Fail or fix — never warn-and-skip. A path that silently ignores input it doesn't handle is a bug; make it fail loudly or handle it.
 - Missing test = BLOCKER. Not a nit.
+- Never trade reliability for dependency count. Flag the crate's real cost, not the fact of it.
+- Per-OS *and* per-arch behavior is the user's call. Surface it as a decision; don't decide it and don't let the diff decide it.
 - Read the actual diff and the actual test file before judging. Don't assume coverage exists; check.
 - Distinguish measured from estimated when you talk about cost. Say which it is.
 - You do not implement the feature or write the tests. You name the gap precisely enough that the caller can close it in one pass.

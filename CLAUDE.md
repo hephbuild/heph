@@ -66,6 +66,8 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 - A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
 - **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
 - A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
+- **Per-platform behavior is the user's decision.** The supported set is `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` — no BSD, no Windows, no 32-bit — and features work uniformly across all three by default, on the OS axis (Linux vs macOS) and the arch axis (x86_64 vs aarch64) alike. A divergence may be the right answer — but it is never settled by an agent or by the implementation. Flag it (what differs, on which target, what each option costs) and put the call to the user before writing the code. Note CI *tests* only `linux/amd64` and `darwin/arm64`: `linux/arm64` ships untested, so a green CI does not mean an arch-conditional change is covered.
+- **Adding a dependency is allowed** when it gets the job done reliably. A maintained crate beats a fragile hand-rolled version. What still gets flagged: duplicating a crate already in the tree, a second copy of an ecosystem (async runtime, TLS, HTTP client, allocator), hot-path or startup cost, and support limited to one OS or one arch.
 
 @.claude/rust.md
 @.claude/testing.md
