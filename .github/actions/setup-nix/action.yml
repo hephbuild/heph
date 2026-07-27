@@ -54,8 +54,12 @@ runs:
     - name: Cache Nix store
       uses: nix-community/cache-nix-action@v7
       with:
-        primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
-        restore-prefixes-first-match: nix-${{ runner.os }}-
+        # Keyed on arch as well as OS: the store holds realized derivations for
+        # the runner's own system, so an arm64 runner restoring an x86_64 store
+        # registers paths it cannot execute — which surfaces as the "path is not
+        # valid" eval failure the repair step below exists to fight.
+        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('devenv.lock', 'devenv.nix', 'devenv.yaml') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
         # PRs are restore-only. Every PR ref used to save its own ~1.5 GB copy
         # per OS; with the repo's 10 GB Actions cache quota that LRU-evicted
         # master's copies before the next PR could read them, so jobs kept
