@@ -962,6 +962,91 @@ impl Engine {
         }
     }
 
+    /// How many matched addrs may have a live top-level task at once.
+    ///
+    /// `Engine::result` used to spawn one task per matched addr as fast as the
+    /// matcher yielded them, with only a cancellation check as a brake, and
+    /// `result_semaphore` is acquired *inside* `execute` — downstream of spec,
+    /// def, link, hashin and probe, and only on a miss. So nothing bounded the
+    /// resolve pipeline itself: a hundred thousand targets meant a hundred
+    /// thousand live boxed `#[async_recursion]` state machines, a hundred
+    /// thousand jobs queued against the blocking pool's `2 * cores` threads, and
+    /// a hundred thousand wakers in one global mutex — all before a single target
+    /// was known to need building.
+    ///
+    /// **Sized against what is downstream, not against the target count.** The
+    /// work a resolution actually does is bounded elsewhere and none of those
+    /// bounds scale past a few dozen: the sqlite read pool and pipe budget are
+    /// `max(2 * parallelism, 64)`, the blocking pool is `2 * cores` threads, and
+    /// the remote cache has its own per-cache request split. Admitting far past
+    /// them does not buy concurrency, it buys queue — which is the thing being
+    /// fixed. Eight times the execute width leaves ample margin for slow
+    /// resolutions not to idle the execute permits (`Engine::labels`, the
+    /// adjacent stream-consuming walk, bounds at `2 * cores`), while staying in
+    /// the neighbourhood of the machinery underneath.
+    ///
+    /// Clamped at both ends: the floor keeps a small `--jobs` from serialising
+    /// resolution, and the ceiling keeps a large one from handing
+    /// `Semaphore::new` an absurd number.
+    ///
+    /// This does **not** make request memory `O(limit)`. `query`'s `seen` set,
+    /// the `ok` batch, the `mem_result` cells and the recursive dep fan-out are
+    /// all structurally `O(matched)` — and so is the peak flock-fd count, since
+    /// a read guard rides on the artifact and lives as long as the request holds
+    /// it, so this bounds the rate of acquisition and not the count. What it
+    /// bounds is live *task* state, blocking-queue depth, and waker churn.
+    fn top_level_spawn_limit(max_workers: usize) -> usize {
+        max_workers.saturating_mul(8).clamp(16, 2048)
+    }
+
+    /// Fold one finished top-level task into the batch's outcome.
+    ///
+    /// Shared by the reap inside the admission loop and the final drain, because
+    /// the two must not diverge: fail-fast semantics, the treatment of
+    /// cancellation as stop-fallout rather than a failure, and "the first
+    /// failure wins" are all decided here, and a second copy would be a second
+    /// place for them to drift.
+    fn classify_joined(
+        joined: Result<(Addr, anyhow::Result<Arc<EResult>>), tokio::task::JoinError>,
+        fail_fast: bool,
+        rs: &Arc<RequestState>,
+        ok: &mut Vec<Arc<EResult>>,
+        errors: &mut Vec<(Addr, anyhow::Error)>,
+        fatal: &mut Option<anyhow::Error>,
+    ) {
+        let (addr, res) = match joined {
+            Ok(pair) => pair,
+            // A task panicked (we never abort them). Capture it, signal stop, and
+            // let the caller keep draining the rest — never propagate via `?`,
+            // which would drop the JoinSet.
+            Err(join_err) => {
+                if fatal.is_none() {
+                    *fatal = Some(anyhow::Error::new(join_err).context("result task panicked"));
+                    rs.ctoken().cancel();
+                }
+                return;
+            }
+        };
+        match res {
+            Ok(v) => ok.push(v),
+            Err(e) if downcast_chain_ref::<CancelledError>(&e).is_some() => {
+                // Cancellation is stop-fallout, not a genuine failure: the token
+                // is cancelled, so we surface a single `CancelledError` after
+                // draining rather than recording it per-addr.
+            }
+            Err(e) => {
+                if !fail_fast {
+                    errors.push((addr, e));
+                } else if fatal.is_none() {
+                    // Fail-fast: tell everything to stop, then wait for it.
+                    // Failures landing after we signalled don't override it.
+                    *fatal = Some(e);
+                    rs.ctoken().cancel();
+                }
+            }
+        }
+    }
+
     pub async fn result(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -1007,12 +1092,87 @@ impl Engine {
         // running children) and we keep draining until they have all stopped by
         // themselves, then return this error.
         let mut fatal: Option<anyhow::Error> = None;
+        let mut ok: Vec<Arc<EResult>> = vec![];
+        let mut errors: Vec<(Addr, anyhow::Error)> = vec![];
 
-        let stream = Arc::clone(&self).query(rs.clone(), matcher);
-        tokio::pin!(stream);
+        // See `top_level_spawn_limit`. A finished task's result stays in the
+        // `JoinSet` until the drain below, but its future — the expensive part —
+        // is dropped on completion, so the permit and the state machine are
+        // released together.
+        let spawn_limit = Arc::new(tokio::sync::Semaphore::new(Self::top_level_spawn_limit(
+            self.max_workers,
+        )));
+
+        // The walk runs in its own task feeding a bounded channel, rather than
+        // being driven inline by the admission loop below.
+        //
+        // `query` is a lazy stream with no producer of its own: polled from the
+        // same loop that parks on `spawn_limit`, the whole walk — package
+        // enumeration, `provider.list` (whole-package Starlark evaluation),
+        // `probe_segments` — stops dead every time admission is full. That
+        // silently re-couples two things that used to overlap, and it can stop
+        // the walk *indefinitely*: a permit holder sitting in `gate_approval` is
+        // waiting on a human. The `Matched` stream is emitted from the walk, so
+        // the client's "done X / ~N" denominator would freeze with it, showing a
+        // stalled count and no reason for it.
+        //
+        // The channel is what keeps admission bounded regardless: the walk may
+        // run ahead, but only by its capacity.
+        let (matched_tx, mut matched_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Addr>>(
+            Self::top_level_spawn_limit(self.max_workers),
+        );
+        // `spawn_with_cycle_ctx`, not bare `tokio::spawn`: the walk calls
+        // `Memoizer::once` (packages, `probe_segments`, the `MatchShrug`
+        // spec/def resolutions), and without the parent frame those calls get no
+        // wait-for edge — a cycle running through them would hang instead of
+        // reporting `MemoizerCycleError`.
+        let walk =
+            hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, owns_matched) {
+                let matcher = matcher.clone();
+                async move {
+                    let stream = engine.query(rs.clone(), &matcher);
+                    tokio::pin!(stream);
+                    loop {
+                        match stream.try_next().await {
+                            Ok(Some(addr)) => {
+                                // Announce each match as it resolves so the client can
+                                // render a provisional "done X / ~N" that grows while
+                                // the matcher streams.
+                                if owns_matched {
+                                    rs.emit(crate::engine::event::BuildEventKind::Matched {
+                                        addrs: vec![addr.format()],
+                                        complete: false,
+                                    });
+                                }
+                                // A closed receiver means the consumer stopped
+                                // enqueuing (cancelled, or a fatal landed); stop
+                                // walking rather than keep evaluating packages.
+                                if matched_tx.send(Ok(addr)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => return,
+                            Err(e) => {
+                                drop(matched_tx.send(Err(e)).await);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }));
+
+        // Built once, not per matched addr: `cancelled()` boxes a future and
+        // registers a waker in a shared map, and it resolves at most once.
+        let mut cancelled = rs.ctoken().cancelled();
+        // Whether the loop ended because the walk did, rather than by breaking.
+        let mut walk_finished = false;
         loop {
-            let next = match stream.try_next().await {
-                Ok(next) => next,
+            let Some(next) = matched_rx.recv().await else {
+                walk_finished = true;
+                break;
+            };
+            let addr = match next {
+                Ok(addr) => addr,
                 // The matcher walk itself failed. Stop enqueuing, signal the
                 // already-spawned targets, and fall through to the drain.
                 Err(e) => {
@@ -1021,72 +1181,92 @@ impl Engine {
                     break;
                 }
             };
-            let Some(addr) = next else { break };
             // Stop enqueuing new targets once cancelled — don't keep draining
             // the matcher and spawning work that would immediately bail.
             if rs.ctoken().is_cancelled() {
                 break;
             }
-            // Announce each match as it resolves so the client can render a
-            // provisional "done X / ~N" that grows while the matcher streams.
-            if owns_matched {
-                rs.emit(crate::engine::event::BuildEventKind::Matched {
-                    addrs: vec![addr.format()],
-                    complete: false,
-                });
+            // Admission control. Deadlock-free because a permit is only ever
+            // taken by a *top-level* spawn: dep fan-out is resolved inline
+            // inside the parent's task, and a memoizer cell is driven by
+            // whichever awaiter polls it — so a matched addr that is also some
+            // other target's dep is computed inside that parent and never waits
+            // here. No holder of a permit is waiting for one.
+            //
+            // Raced against cancellation rather than only checked before it: a
+            // permit holder can be parked on something slow (a human at
+            // `gate_approval`, a wedged network pull), and Ctrl-C must not have
+            // to wait for it to finish before this loop stops.
+            let permit = tokio::select! {
+                biased;
+                () = &mut cancelled => break,
+                permit = Arc::clone(&spawn_limit).acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    // Only possible if the semaphore were closed, and nothing
+                    // closes it — but treat it like the matcher failing rather
+                    // than unwrapping: stop enqueuing, drain what is running.
+                    Err(e) => {
+                        fatal = Some(anyhow::Error::new(e).context("acquiring a resolution slot"));
+                        rs.ctoken().cancel();
+                        break;
+                    }
+                },
+            };
+            // Reap whatever finished while we waited for that permit — a permit
+            // only frees when a task ends, so by here at least one is joinable.
+            //
+            // This is what keeps fail-fast working. Admission is now gated on
+            // completions, so the drain below cannot start until the last addr
+            // has been admitted; leaving classification entirely to it would
+            // mean a target that failed at t=0 no longer stops the batch, and
+            // every remaining target gets built before anyone notices. It also
+            // holds the `JoinSet` at roughly the in-flight count instead of one
+            // entry per matched addr.
+            while let Some(joined) = set.try_join_next() {
+                Self::classify_joined(joined, fail_fast, &rs, &mut ok, &mut errors, &mut fatal);
+            }
+            if fatal.is_some() {
+                break;
             }
             hcore::hmemoizer::join_set_spawn(
                 &mut set,
                 enclose!((self => engine, rs, opts, addr, outputs) async move {
+                    // Released when this task ends, however it ends.
+                    let _permit = permit;
                     let r = engine.result_addr(rs, &addr, outputs, &opts).await;
                     (addr, r)
                 }),
             );
         }
+        drop(matched_rx);
+        if walk_finished {
+            // The walk is already over — this only collects a panic, so that one
+            // is not reported as a cleanly-complete empty set.
+            if let Err(join_err) = walk.await
+                && fatal.is_none()
+            {
+                fatal = Some(anyhow::Error::new(join_err).context("matcher walk task panicked"));
+                rs.ctoken().cancel();
+            }
+        } else {
+            // Broke early (cancelled, or a fatal landed): its answer is no longer
+            // wanted, and it may be deep inside a whole-package Starlark
+            // evaluation. Abort rather than wait it out — the previous shape
+            // dropped the stream mid-poll and Ctrl-C must stay that responsive.
+            walk.abort();
+        }
         // Matcher fully resolved: mark the matched set final (drops the `~`).
         // Not on a failed walk — the set never became final, so claiming it did
         // would paint a wrong denominator over an aborting run.
-        if owns_matched && fatal.is_none() {
+        if owns_matched && walk_finished && fatal.is_none() {
             rs.emit(crate::engine::event::BuildEventKind::Matched {
                 addrs: Vec::new(),
                 complete: true,
             });
         }
 
-        let mut ok: Vec<Arc<EResult>> = vec![];
-        let mut errors: Vec<(Addr, anyhow::Error)> = vec![];
         while let Some(joined) = set.join_next().await {
-            let (addr, res) = match joined {
-                Ok(pair) => pair,
-                // A task panicked (we never abort tasks). Capture it, signal
-                // stop, and keep draining the rest — don't propagate via `?`,
-                // which would drop the JoinSet.
-                Err(join_err) => {
-                    if fatal.is_none() {
-                        fatal = Some(anyhow::Error::new(join_err).context("result task panicked"));
-                        rs.ctoken().cancel();
-                    }
-                    continue;
-                }
-            };
-            match res {
-                Ok(v) => ok.push(v),
-                Err(e) if downcast_chain_ref::<CancelledError>(&e).is_some() => {
-                    // Cancellation is stop-fallout, not a genuine failure: the
-                    // token is cancelled, so we surface a single `CancelledError`
-                    // after draining rather than recording it per-addr.
-                }
-                Err(e) => {
-                    if !fail_fast {
-                        errors.push((addr, e));
-                    } else if fatal.is_none() {
-                        // Fail-fast: tell everything to stop, then wait for it.
-                        // Failures that land after we signalled don't override it.
-                        fatal = Some(e);
-                        rs.ctoken().cancel();
-                    }
-                }
-            }
+            Self::classify_joined(joined, fail_fast, &rs, &mut ok, &mut errors, &mut fatal);
         }
 
         if let Some(e) = fatal {
@@ -4423,6 +4603,261 @@ mod tests {
         Ok(())
     }
 
+    /// Counts `get` calls — cumulative and concurrent — and parks each one
+    /// until released.
+    struct AdmissionGate {
+        inner: pluginstatictarget::Provider,
+        entered: SArc<AtomicUsize>,
+        inflight: SArc<AtomicUsize>,
+        peak: SArc<AtomicUsize>,
+        gate: SArc<tokio::sync::Semaphore>,
+    }
+
+    impl crate::engine::provider::Provider for AdmissionGate {
+        fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            self.inner.config(req)
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            self.inner.list(req, ctoken)
+        }
+        fn list_packages<'a>(
+            &'a self,
+            req: ListPackagesRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            self.inner.list_packages(req, ctoken)
+        }
+        fn get<'a>(
+            &'a self,
+            req: GetRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async move {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let n = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(n, Ordering::SeqCst);
+                // Park here until the test lets go, so every admitted task
+                // is simultaneously in flight and the count is the plateau.
+                let permit = self.gate.acquire().await;
+                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                drop(permit);
+                self.inner.get(req, ctoken).await
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            self.inner.probe(req, ctoken)
+        }
+    }
+
+    /// `Engine::result` used to spawn one task per matched addr as fast as the
+    /// matcher yielded them. The execute semaphore is taken *inside* `execute` —
+    /// downstream of spec, def, link, hashin and probe, and only on a miss — so
+    /// nothing bounded the resolve pipeline itself, and a selection of a hundred
+    /// thousand meant a hundred thousand live state machines, queued blocking
+    /// jobs, wakers and flock fds before a single target was known to need
+    /// building.
+    ///
+    /// Gates the provider's `get` so every spawned task parks in the same place,
+    /// then asserts the in-flight count plateaus at the limit rather than at the
+    /// selection size.
+    #[tokio::test]
+    async fn top_level_resolution_is_admission_controlled() -> anyhow::Result<()> {
+        // parallelism 1 keeps the limit small enough to overshoot cheaply.
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: Some(1),
+            ..Default::default()
+        })?;
+        let limit = Engine::top_level_spawn_limit(engine.max_workers);
+        let targets: Vec<_> = (0..limit + 50)
+            .map(|i| static_target(&format!("//pkg:t{i}"), &[], &[]))
+            .collect();
+        let selected = targets.len();
+
+        let (entered, inflight, peak) = (
+            SArc::new(AtomicUsize::new(0)),
+            SArc::new(AtomicUsize::new(0)),
+            SArc::new(AtomicUsize::new(0)),
+        );
+        let gate = SArc::new(tokio::sync::Semaphore::new(0));
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        let provider = AdmissionGate {
+            inner: pluginstatictarget::Provider::new(targets)?,
+            entered: SArc::clone(&entered),
+            inflight: SArc::clone(&inflight),
+            peak: SArc::clone(&peak),
+            gate: SArc::clone(&gate),
+        };
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = SArc::new(engine);
+
+        let rs = engine.new_state();
+        let batch = tokio::spawn(enclose!((engine, rs) async move {
+            engine
+                .result(
+                    rs,
+                    &Matcher::Package(PkgBuf::from("pkg")),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await
+        }));
+
+        // Wait for the plateau: every permit taken, every holder parked in `get`.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while inflight.load(Ordering::SeqCst) < limit {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "resolution never reached the limit; in flight {}",
+                inflight.load(Ordering::SeqCst),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Give an unbounded spawn loop room to overshoot if it is going to.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let observed = peak.load(Ordering::SeqCst);
+        assert_eq!(
+            observed, limit,
+            "top-level resolution must plateau at the limit, not at the {selected} matched",
+        );
+
+        // Admission must be coupled to *completion*, not to elapsed time: an
+        // implementation that merely spawned slowly would have passed the
+        // plateau check above. Releasing exactly one holder must admit exactly
+        // one more.
+        gate.add_permits(1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while entered.load(Ordering::SeqCst) < limit + 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "releasing one holder must admit one more; entered {}",
+                entered.load(Ordering::SeqCst),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Cancelling while the enqueue loop is parked on a permit must return,
+        // not wait out the slowest in-flight target.
+        rs.ctoken().cancel();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(30), batch)
+            .await
+            .expect("a cancelled batch must not hang on the admission permit")
+            .expect("join");
+        // Release the parked holders so the engine's teardown isn't left with
+        // tasks blocked inside the provider.
+        gate.add_permits(selected);
+        drop(res);
+        Ok(())
+    }
+
+    /// The bound must not drop the tail. A selection larger than the limit has to
+    /// resolve *every* matched addr — a `break` on the wrong branch or a leaked
+    /// permit would wedge the loop after exactly `limit` and every other batch
+    /// test in this file uses two or three targets, so none of them would notice.
+    #[tokio::test]
+    async fn a_selection_larger_than_the_limit_resolves_every_target() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with_parallelism(1, |max_workers| {
+            (0..Engine::top_level_spawn_limit(max_workers) + 50)
+                .map(|i| static_target(&format!("//pkg:t{i}"), &[], &[]))
+                .collect()
+        })?;
+        let expected = Engine::top_level_spawn_limit(engine.max_workers) + 50;
+
+        let rs = engine.new_state();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            engine.clone().result(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            ),
+        )
+        .await
+        .expect("the bounded enqueue loop must not wedge")?;
+
+        assert_eq!(
+            res.ok.len(),
+            expected,
+            "every matched target must resolve, not just the first window"
+        );
+        Ok(())
+    }
+
+    /// The deadlock-freedom argument, exercised rather than asserted in a
+    /// comment.
+    ///
+    /// A permit is only ever taken by a *top-level* spawn: dep fan-out resolves
+    /// inline inside the parent's task, and a memoizer cell is driven by
+    /// whichever awaiter polls it, so a dep never needs a task of its own to be
+    /// scheduled. The shape that would break it if that stopped holding is this
+    /// one — the first `limit` matched addrs all depend on an addr the matcher
+    /// yields *last*, so every permit is held by something waiting on a target
+    /// that could never be admitted.
+    #[tokio::test]
+    async fn matched_targets_depending_on_a_late_matched_target_do_not_deadlock()
+    -> anyhow::Result<()> {
+        let (engine, _root) = engine_with_parallelism(1, |max_workers| {
+            // `zzz` sorts last, so the walk yields it after every dependent.
+            let mut targets = vec![static_target("//pkg:zzz", &[], &[])];
+            targets.extend(
+                (0..Engine::top_level_spawn_limit(max_workers) + 50)
+                    .map(|i| static_target(&format!("//pkg:t{i}"), &[], &["//pkg:zzz"])),
+            );
+            targets
+        })?;
+        let expected = Engine::top_level_spawn_limit(engine.max_workers) + 51;
+
+        let rs = engine.new_state();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            engine.clone().result(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            ),
+        )
+        .await
+        .expect("a selection whose admitted targets all await a late match must not deadlock")?;
+
+        assert_eq!(res.ok.len(), expected);
+        Ok(())
+    }
+
+    /// The limit is a sizing decision, so it gets a test rather than living only
+    /// in a doc comment — otherwise the multiplier can be changed to anything and
+    /// every test stays green.
+    #[test]
+    fn the_spawn_limit_is_clamped_at_both_ends() {
+        // Floor: a small `--jobs` must not serialise resolution behind execution.
+        assert_eq!(Engine::top_level_spawn_limit(0), 16);
+        assert_eq!(Engine::top_level_spawn_limit(1), 16);
+        assert_eq!(Engine::top_level_spawn_limit(2), 16);
+        // Eight times the execute width in the ordinary range.
+        assert_eq!(Engine::top_level_spawn_limit(20), 160);
+        // Ceiling: a large `--jobs` must not hand `Semaphore::new` an absurd
+        // number, and `saturating_mul` alone would not stop it.
+        assert_eq!(Engine::top_level_spawn_limit(usize::MAX), 2048);
+    }
+
     #[tokio::test]
     async fn cancelled_batch_returns_cancelled_not_success() -> anyhow::Result<()> {
         // A cancelled fail-fast batch must abort with CancelledError, not
@@ -4986,6 +5421,27 @@ mod tests {
             labels: vec![],
             ..Default::default()
         }
+    }
+
+    /// [`engine_with_home`] with an explicit `parallelism`, and targets built
+    /// from the resulting `max_workers` — so a test can size a selection against
+    /// [`Engine::top_level_spawn_limit`] without hardcoding the machine.
+    fn engine_with_parallelism(
+        parallelism: usize,
+        targets: impl FnOnce(usize) -> Vec<pluginstatictarget::Target>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: Some(parallelism),
+            ..Default::default()
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        let provider = pluginstatictarget::Provider::new(targets(engine.max_workers))?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
     }
 
     /// Engine + the `TempDir` backing its `home`/cache. The caller must hold the
