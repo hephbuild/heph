@@ -504,6 +504,67 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
 
+  # Compile `bin_e2e`'s test binaries ahead of the job that runs them. `tst`
+  # excludes the crate (it needs staged artifacts to run) and nothing else in
+  # the workspace depends on it, so its private dependencies — portable-pty,
+  # vt100 — and the three test binaries are all `bin_e2e` has to compile after
+  # downloading the artifacts, on the critical path to `release`.
+  #
+  # This job needs only `gen`, so it runs concurrently with `build` and `test`
+  # and is long finished before `bin_e2e` starts. sccache is shared across jobs
+  # through R2, and the registry cache key is the same `-bin-e2e` suffix, so
+  # `bin_e2e` restores both and starts running tests instead of compiling.
+  #
+  # Its own job rather than a step in `test`: both compile the test profile, so
+  # sharing a runner would mean sharing `target/debug`'s cargo lock and running
+  # one after the other anyway.
+  #
+  # --no-run because the tests hard-fail without a dist. A compile error here is
+  # a real failure — `bin_e2e` would hit the same one 20 minutes later.
+  bin_e2e_warm:
+    name: Warm Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 20
+    needs: gen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: darwin
+            arch: arm64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v7
+        with:
+          name: repo
+          path: .
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: ${{ matrix.target }}
+          cache-suffix: "-bin-e2e"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
+
+      - name: Compile test binaries
+        shell: devenv shell bash -- -e {0}
+        run: cargo test --locked -p bin-e2e --no-run
+
+      - name: sccache stats
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: sccache --show-stats
+
   # Black-box tests against the artifacts the `build` job just produced — the
   # exact bytes that get published. Covers only what `test` structurally cannot:
   # dlopen of the shipped plugin cdylibs, the TUI under a real PTY, and process
@@ -516,7 +577,14 @@ jobs:
     name: Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
-    needs: [gen, build]
+    # bin_e2e_warm is a hard dependency, not just an optimisation running
+    # nearby: both jobs pay the same nix-store restore before compiling
+    # anything, so on a run where `build` is mostly sccache hits it can finish
+    # first and this job would start while the warm is still going — compiling
+    # the same crates concurrently, with neither seeing the other's objects.
+    # Waiting makes the cache hit deterministic. The warm needs only `gen`, so
+    # it is finished well before `build` on any run where `build` does work.
+    needs: [gen, build, bin_e2e_warm]
     strategy:
       fail-fast: false
       matrix:
