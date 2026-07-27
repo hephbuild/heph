@@ -569,7 +569,14 @@ impl Engine {
         log_tail_lines: usize,
         approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
     ) -> Arc<RequestState> {
-        self.new_state_inner(fail_fast, events, bg_pending, log_tail_lines, approval, false)
+        self.new_state_inner(
+            fail_fast,
+            events,
+            bg_pending,
+            log_tail_lines,
+            approval,
+            false,
+        )
     }
 
     /// A request that re-reads the tree from *inside* an in-flight resolution.

@@ -5837,7 +5837,10 @@ mod tests {
     /// therefore tracks those deps exactly.
     fn bash_target(addr: &str, deps: &[&str]) -> pluginstatictarget::Target {
         let mut deps_map = HashMap::new();
-        deps_map.insert("".to_string(), deps.iter().map(|s| (*s).to_string()).collect());
+        deps_map.insert(
+            "".to_string(),
+            deps.iter().map(|s| (*s).to_string()).collect(),
+        );
         pluginstatictarget::Target {
             addr: addr.to_string(),
             driver: "bash".to_string(),
@@ -5883,7 +5886,12 @@ mod tests {
         // hash-only request answers from the cache under a shared read.
         let rs = engine.new_state();
         Arc::clone(&engine)
-            .result_addr(rs.clone(), &addr, OutputMatcher::All, &ResultOptions::default())
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
             .await
             .expect("real resolve");
         drop(rs);
