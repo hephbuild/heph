@@ -114,10 +114,11 @@ fn main() -> ExitCode {
     }
     let started_at = std::time::Instant::now();
 
-    // Opt-in hang diagnostics: install the SIGUSR1 → thread-backtrace dumper.
-    if let Some(path) = &cli.global.diag_backtrace {
-        diag::install(path);
-    }
+    // Always-on hang diagnostics. An opt-in dumper is useless for the hang you
+    // did not anticipate — you would have to have passed a flag on the run that
+    // is already stuck. Costs one `signal(2)` at startup; the file is opened
+    // lazily inside the handler.
+    diag::install();
 
     // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.
     let pprof_watcher = match cli.global.pprof_cpu.clone() {

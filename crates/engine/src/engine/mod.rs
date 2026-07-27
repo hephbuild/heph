@@ -21,6 +21,7 @@ pub use hconfig::{FuseConfig, FuseMode, get_cwd, get_root};
 mod plugin_load;
 pub use plugin_load::clear_plugin_cache;
 pub mod approval;
+pub mod diag;
 pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
 mod cwd;
 mod result;

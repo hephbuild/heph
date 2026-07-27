@@ -361,11 +361,20 @@ impl ConfiguredCache {
     {
         let _slot = match self.shared_slots.try_acquire() {
             Ok(slot) => slot,
-            Err(_) => self
-                .meta_reserve
-                .acquire()
-                .await
-                .with_context(|| format!("acquire remote cache metadata slot for {what}"))?,
+            Err(_) => {
+                // Bulk is full and we are about to queue on the reserve. This is
+                // the limiter worth reporting: metadata never *waits* on
+                // `shared_slots` (it barges with `try_acquire`), so a gauge there
+                // reads zero during exactly the metadata starvation it would be
+                // meant to catch.
+                let d = crate::engine::diag::global();
+                d.limiter("remote-cache-metadata")
+                    .observe(self.meta_reserve.available_permits(), d.now_ms());
+                self.meta_reserve
+                    .acquire()
+                    .await
+                    .with_context(|| format!("acquire remote cache metadata slot for {what}"))?
+            }
         };
         tokio::time::timeout(METADATA_TIMEOUT, fut)
             .await

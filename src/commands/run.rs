@@ -278,7 +278,31 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         approval: tui::ApprovalCenter::new(),
     };
     let interactive = tui::should_use_tui(global.no_tui);
+
+    // Stall watchdog. Registered before the run so it observes the whole stream,
+    // and it emits through the same `LogSink` the logs use rather than a bare
+    // `eprintln!` — while the TUI owns the terminal a raw stderr write from an
+    // unrelated OS thread interleaves mid-frame and corrupts the display, which
+    // would make the paragraph unreadable in exactly the interactive case.
+    //
+    // It runs in both TUI and `--no-tui` mode: the CI backend creates the same
+    // event channel, so the fold is already paid for, and a hung CI build is
+    // precisely where nobody is watching a progress bar.
+    let watchdog = (!global.stall_notice.is_zero()).then(|| {
+        let threshold = global.stall_notice;
+        let diag_sink = sink.clone();
+        hengine::engine::diag::Watchdog::spawn(
+            std::sync::Arc::clone(hengine::engine::diag::global()),
+            threshold,
+            move |text| diag_sink.write_diagnostic(text),
+        )
+    });
+
     let result = tui::run_app(app, sink, interactive, shutdown).await;
+    // Stop before teardown so no paragraph races the final summary.
+    if let Some(w) = &watchdog {
+        w.stop();
+    }
     // The app's request state has dropped now (firing each hook's `on_close`);
     // await any hook's final out-of-process flush before returning so a process
     // exit never races it.
