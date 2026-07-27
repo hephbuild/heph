@@ -36,6 +36,35 @@ pub fn is_cancelled(e: &anyhow::Error) -> bool {
     hcore::hmemoizer::downcast_chain_ref::<CancelledError>(e).is_some()
 }
 
+/// A hash-only request reached a target it would have had to *build* to answer.
+///
+/// Hash-only requests exist to re-read the tree from inside an in-flight
+/// resolution (the in_place write-back guard and the fixpoint recompute). They
+/// are forbidden from taking the exclusive per-addr result lock, because the
+/// request they are nested inside is already holding riding **read** guards that
+/// it will not release until the nested call returns — so a write acquire is a
+/// self-deadlock, not contention.
+///
+/// So a cache miss under such a request answers "unknown" instead of building.
+/// Callers decide what that means: the fixpoint recompute skips (it is an
+/// optimization), the write-back guard refuses to write (it cannot confirm).
+#[derive(Debug, Clone)]
+pub struct HashUnknownError {
+    pub addr: Addr,
+}
+
+impl fmt::Display for HashUnknownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} is not cached at its current inputs, and this hash-only resolution may not build it",
+            self.addr.format()
+        )
+    }
+}
+
+impl std::error::Error for HashUnknownError {}
+
 #[derive(Debug, Clone)]
 pub struct CycleError {
     pub from: Addr,

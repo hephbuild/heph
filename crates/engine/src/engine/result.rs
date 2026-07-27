@@ -2,8 +2,8 @@ use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
-    CancelledError, CycleError, MultiError, ProcessFailed, TargetFailure, TargetNotFoundError,
-    UpstreamFailed,
+    CancelledError, CycleError, HashUnknownError, MultiError, ProcessFailed, TargetFailure,
+    TargetNotFoundError, UpstreamFailed,
 };
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
@@ -700,6 +700,15 @@ fn classify_failure(
     // so the cycle surfaces directly to the caller (and never gets masked behind
     // an `UpstreamFailed` marker or duplicated into the failure registry).
     if downcast_chain_ref::<CycleError>(&e).is_some() {
+        return e;
+    }
+
+    // "This hash-only request may not build" is a property of the request, not a
+    // failure of the target. Nothing is wrong with the dep; we simply declined to
+    // build it. Propagate unchanged so the caller can recognise it — the fixpoint
+    // recompute treats it as "skip", and the in_place write-back guard needs to
+    // say "could not confirm", not "dependency failed".
+    if downcast_chain_ref::<HashUnknownError>(&e).is_some() {
         return e;
     }
 
@@ -1530,6 +1539,13 @@ impl Engine {
             let _w = if skip_lock {
                 None
             } else {
+                // A hash-only request must not take the write lock — its own
+                // caller is holding guards it will not release until we return.
+                // Reading the tree is what these requests are for, and that is
+                // exactly the `skip_lock` branch above; anything else is a build.
+                if rs.hash_only() {
+                    return Err(HashUnknownError { addr: addr.clone() }.into());
+                }
                 Some(
                     self.acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
                         .await?,
@@ -1570,6 +1586,14 @@ impl Engine {
         //    write lock directly — after a miss we'll almost certainly execute,
         //    so this skips the upgradable→upgrade two-step. It also serializes
         //    the execute phase per addr, replacing the old exclusive result lock.
+        //
+        //    Unless this is a hash-only request. Then the write acquire below
+        //    would contend a riding read held by the very request we are nested
+        //    inside, which cannot release it until we return. Answer "unknown"
+        //    and let the caller decide — that is a deadlock, not contention.
+        if rs.hash_only() {
+            return Err(HashUnknownError { addr: addr.clone() }.into());
+        }
         drop(read);
         let write = self
             .acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
@@ -2165,7 +2189,7 @@ impl Engine {
 
         let addr = &opts.def.target.addr;
         let current = Arc::clone(&self)
-            .meta(self.new_state(), addr)
+            .meta(self.new_hash_only_state(addr.clone()), addr)
             .await
             .with_context(|| {
                 format!(
@@ -2236,11 +2260,18 @@ impl Engine {
         let addr = opts.def.target.addr.clone();
         // Fresh request → fs inputs re-stat the post-write-back tree, yielding the
         // exact hashin the NEXT run will compute.
-        let fresh = self.new_state();
+        let fresh = self.new_hash_only_state(addr.clone());
         let fixpoint = match Arc::clone(&self).meta(fresh, &addr).await {
             Ok(m) => m.hashin,
             Err(e) => {
                 // Optimization only: the primary entry is already cached.
+                //
+                // `HashUnknownError` lands here whenever a cacheable dep is not
+                // cached at its post-write-back inputs — which is exactly the
+                // shape whose fixpoint would be unsound anyway: the recomputed
+                // key folds that dep's NEW hashout, while the artifacts being
+                // filed under it were produced from the old one. Skipping is
+                // both the safe answer and the correct one.
                 tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: meta recompute failed");
                 return Ok(());
             }
@@ -5783,6 +5814,135 @@ mod tests {
             labels: vec![],
             ..Default::default()
         }
+    }
+
+    /// Like [`codegen_run_target`] but with extra deps beyond the introspect
+    /// target — used to put a *cacheable* sibling in an in_place target's dep
+    /// closure.
+    fn codegen_run_target_with_deps(
+        addr: &str,
+        codegen: &str,
+        paths: &[&str],
+        run: &str,
+        extra_deps: &[&str],
+    ) -> pluginstatictarget::Target {
+        let mut t = codegen_run_target(addr, codegen, paths, run);
+        if let Some(d) = t.deps.get_mut("") {
+            d.extend(extra_deps.iter().map(|s| (*s).to_string()));
+        }
+        t
+    }
+
+    /// Cacheable bash target that takes `deps` and does nothing else. Its `hashin`
+    /// therefore tracks those deps exactly.
+    fn bash_target(addr: &str, deps: &[&str]) -> pluginstatictarget::Target {
+        let mut deps_map = HashMap::new();
+        deps_map.insert("".to_string(), deps.iter().map(|s| (*s).to_string()).collect());
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "bash".to_string(),
+            run: Some("true".to_string()),
+            out: HashMap::new(),
+            codegen: None,
+            deps: deps_map,
+            labels: vec![],
+            ..Default::default()
+        }
+    }
+
+    /// The invariant behind the fix, on its own: a hash-only request answers
+    /// `HashUnknownError` for a cacheable target it is not already cached for,
+    /// rather than taking the exclusive per-addr lock to build it.
+    ///
+    /// This is what makes nesting one inside a live resolution safe — the nested
+    /// request shares the engine's single `ResultLock` with its caller but not
+    /// the `mem_locked_result` memoizer that makes per-addr acquisition
+    /// idempotent, so any write acquire is a self-deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hash_only_request_refuses_to_build_instead_of_locking() -> anyhow::Result<()> {
+        // `meta` hashes a target from its INPUTS, so the uncached cacheable
+        // target has to be a dep — that is the one a real recompute would build.
+        let (engine, _root) = engine_with_home(vec![
+            static_target("//pkg:dep", &[], &[]),
+            static_target("//pkg:top", &[], &["//pkg:dep"]),
+        ])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:top")?;
+
+        // Nothing is cached yet, so resolving for real would execute `//pkg:dep`.
+        let err = Arc::clone(&engine)
+            .meta(engine.new_hash_only_state(addr.clone()), &addr)
+            .await
+            .err()
+            .expect("a hash-only request must not build an uncached target");
+        assert!(
+            downcast_chain_ref::<HashUnknownError>(&err).is_some(),
+            "expected HashUnknownError, got: {err:#}"
+        );
+
+        // And it is not a blanket refusal: once the target IS cached, the same
+        // hash-only request answers from the cache under a shared read.
+        let rs = engine.new_state();
+        Arc::clone(&engine)
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &ResultOptions::default())
+            .await
+            .expect("real resolve");
+        drop(rs);
+        Arc::clone(&engine)
+            .meta(engine.new_hash_only_state(addr.clone()), &addr)
+            .await
+            .expect("a cached target is answerable without building");
+        Ok(())
+    }
+
+    /// An in_place target whose dep closure contains a **cacheable** target
+    /// hashing the same file it rewrites must not deadlock against itself.
+    ///
+    /// `maybe_store_fixpoint` recomputes the target's `hashin` on a *fresh*
+    /// `RequestState` — deliberately, so the `@heph/fs` inputs re-read the
+    /// just-written tree. But the outer request is still holding a riding **read**
+    /// guard on every cacheable addr it resolved, including `//pkg:probe`. The
+    /// write-back changed `in.txt`, so on the fresh request `//pkg:probe` hashes
+    /// differently, misses, and asks for the exclusive **write** lock on an addr
+    /// the outer request will not release until this call returns. The fresh
+    /// request also runs on its own uncancelled token, so Ctrl-C cannot break it.
+    ///
+    /// `go_lint_fix` is exactly this shape: an in_place fixer over the same files
+    /// its cacheable analyze dep hashes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_place_fixpoint_does_not_deadlock_on_a_cacheable_dep_it_rewrote()
+    -> anyhow::Result<()> {
+        let src = hbuiltins::pluginfs::file_addr("pkg/in.txt").format();
+        let (engine, root) = engine_with_home_fs(vec![
+            bash_target("//pkg:probe", &[&src]),
+            codegen_run_target_with_deps(
+                "//pkg:fmt",
+                "in_place",
+                &["in.txt"],
+                "printf '%s\\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+                &["//pkg:probe"],
+            ),
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        // Lowercase and newline-less, so run 1 provably changes the bytes — which
+        // is what moves `//pkg:probe`'s hashin on the fixpoint recompute.
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (res, _events) = tokio::time::timeout(
+            Duration::from_secs(60),
+            resolve_collecting_events(&engine, &addr),
+        )
+        .await
+        .expect("in_place fixpoint recompute deadlocked against its own riding read locks");
+        res.expect("fmt resolves");
+
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"HELLO\n",
+            "the in_place write-back must still land",
+        );
+        Ok(())
     }
 
     /// in_place does NOT restrict outputs to pre-existing inputs: a run that
