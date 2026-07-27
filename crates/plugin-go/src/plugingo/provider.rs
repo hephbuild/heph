@@ -1,9 +1,9 @@
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
-    encode_thirdparty_download, factors_to_args,
+    encode_thirdparty_download,
 };
 use crate::plugingo::errors::NoGoFilesError;
-use crate::plugingo::factors::{Factors, current_goarch, current_goos};
+use crate::plugingo::factors::{Factors, VariantRef, current_goarch, current_goos};
 use crate::plugingo::govet;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
@@ -17,6 +17,7 @@ use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
 use crate::plugingo::toolchain;
+use crate::plugingo::variant;
 use anyhow::Context;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -157,7 +158,7 @@ pub(crate) struct GoModData {
 struct LibsKey {
     imports: Vec<String>,
     extra: Vec<String>,
-    factors: Factors,
+    vref: VariantRef,
     module_root: PathBuf,
     transitive: bool,
 }
@@ -165,7 +166,7 @@ struct LibsKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ImportClosureKey {
     import_path: String,
-    factors: Factors,
+    vref: VariantRef,
     module_root: PathBuf,
 }
 
@@ -413,19 +414,19 @@ impl ProviderTrait for Provider {
             signature: FnSignature {
                 positional: vec![
                     Param::required("pkg", ParamType::String),
-                    Param::required("goos", ParamType::String),
-                    Param::required("goarch", ParamType::String),
+                    Param::optional("variant", ParamType::String, Value::String(String::new())),
                 ],
-                named: vec![Param::optional(
-                    "tags",
-                    ParamType::list(ParamType::String),
-                    Value::List(vec![]),
-                )],
+                named: vec![],
                 variadic: None,
                 returns: ParamType::String,
             },
-            doc: "Build the address of a Go package's `_golist` target for a given \
-                  GOOS/GOARCH (and optional build tags), as used in `deps`."
+            doc: "Build the address of a Go package's user-facing `build` target, as \
+                  used in `deps`. With a variant name, returns \
+                  `//<pkg>:build@v=<variant>`. Omit `variant` (or pass \"\") to get \
+                  the magic host-default target `//<pkg>:build` — a `group` that \
+                  forwards to the first variant matching this machine's os/arch. The \
+                  provider resolves the variant (and pins the defining package) when \
+                  built."
                 .to_string(),
             func: Arc::new(BuildAddrFn),
         }]
@@ -439,8 +440,28 @@ impl ProviderTrait for Provider {
             doc: doc.to_string(),
             required: false,
         };
+        let variant_struct = ParamType::strukt(vec![
+            ("goos", ParamType::String),
+            ("goarch", ParamType::String),
+            ("tags", ParamType::list(ParamType::String)),
+            ("goexperiment", ParamType::list(ParamType::String)),
+            ("gcflags", ParamType::list(ParamType::String)),
+            ("ldflags", ParamType::list(ParamType::String)),
+        ]);
         Some(StateSchema {
             fields: vec![
+                field(
+                    "variants",
+                    ParamType::map(variant_struct),
+                    "Named Go build variants for this package (and its descendants, via \
+                     closest-ancestor lookup). Maps a variant name to a static factor set: \
+                     `goos`/`goarch` (required), plus optional `tags` (build tags), \
+                     `goexperiment` (GOEXPERIMENT), `gcflags` (extra `go tool compile` flags) \
+                     and `ldflags` (extra `go tool link` flags). \
+                     A user-facing target selects one with `@v=NAME`, resolving the closest \
+                     ancestor package that defines that name; variants do NOT compound across \
+                     the tree (each definition is self-contained).",
+                ),
                 field(
                     "go_codegen_root",
                     ParamType::Bool,
@@ -504,13 +525,12 @@ impl ProviderTrait for Provider {
     }
 }
 
-/// `heph.go.build_addr(pkg, goos, goarch, tags=[])` — format the heph
-/// address of a Go target without resolving anything. Takes a heph package (the addr's
-/// package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a thirdparty `@heph/go/thirdparty/…@v`
-/// path) and the platform factors, and returns the canonical addr
-/// string `//<pkg>:build@goos=…,goarch=…[,tags=…]`. Pure string transform — same
-/// factor encoding the provider uses internally ([`factors_to_args`]), so the result
-/// matches the addr the provider serves for that package.
+/// `heph.go.build_addr(pkg, v)` — format the heph address of a Go package's
+/// user-facing `build` target for variant `v`, without resolving anything. Takes
+/// a heph package (the addr's package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a
+/// thirdparty `@heph/go/thirdparty/…@v` path) and a variant name, and returns the
+/// canonical addr string `//<pkg>:build@v=<variant>`. Pure string transform — the
+/// provider resolves the variant (and pins its defining package) at get time.
 struct BuildAddrFn;
 
 impl BuildAddrFn {
@@ -525,31 +545,40 @@ impl BuildAddrFn {
             other => anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}"),
         }
     }
+
+    /// Optional string arg: `None` when absent, error when present but non-string.
+    fn opt_arg_str<'a>(
+        args: &'a FnArgs,
+        idx: usize,
+        name: &str,
+    ) -> anyhow::Result<Option<&'a str>> {
+        match args.named.get(name).or_else(|| args.positional.get(idx)) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(other) => {
+                anyhow::bail!("heph.go.build_addr: `{name}` must be a string, got {other:?}")
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl ProviderFn for BuildAddrFn {
     async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
         let pkg = Self::arg_str(&args, 0, "pkg")?;
-        let goos = Self::arg_str(&args, 1, "goos")?;
-        let goarch = Self::arg_str(&args, 2, "goarch")?;
+        let v = Self::opt_arg_str(&args, 1, "variant")?.unwrap_or("");
 
-        let mut build_tags = match args.named.get("tags") {
-            Some(v) => parse_strings(v).context("heph.go.build_addr: parsing `tags`")?,
-            None => Vec::new(),
+        // With a variant name, a user-facing `build` target carries only `v` (the
+        // provider resolves the closest variant and fills in `vp` when built).
+        // Without one, return the magic host-default `//<pkg>:build` — a bare,
+        // variant-less addr the provider serves as a `group` forwarding to the
+        // first variant matching this machine's os/arch.
+        let addr_args = if v.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("v".to_string(), v.to_string())])
         };
-        build_tags.sort();
-
-        let factors = Factors {
-            goos: goos.to_string(),
-            goarch: goarch.to_string(),
-            build_tags,
-        };
-        let addr = Addr::new(
-            PkgBuf::from(pkg),
-            "build".to_string(),
-            factors_to_args(&factors),
-        );
+        let addr = Addr::new(PkgBuf::from(pkg), "build".to_string(), addr_args);
         Ok(Value::String(addr.format()))
     }
 }
@@ -568,18 +597,16 @@ impl ProviderInner {
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
         Box::pin(async move {
-            let factors = Factors {
-                goos: current_goos(),
-                goarch: current_goarch(),
-                build_tags: vec![],
+            let empty = || {
+                Ok(Box::new(std::iter::empty())
+                    as Box<
+                        dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                    >)
             };
 
             let kind = match decode_package(&req.package, &self.workspace_root) {
                 Some(k) => k,
-                None => {
-                    return Ok(Box::new(std::iter::empty())
-                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
-                }
+                None => return empty(),
             };
 
             // A first-party package inside a skipped subtree lists nothing —
@@ -589,108 +616,150 @@ impl ProviderInner {
                     .skip
                     .prunes_package(&self.workspace_root, Path::new(req.package.as_str()))
             {
-                return Ok(Box::new(std::iter::empty())
-                    as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
+                return empty();
             }
 
+            // Every build/list target is variant-parameterized. Two enumeration
+            // scopes:
+            //   - **entry / binary** targets (`build`, `test`, `lint`, …) list the
+            //     module-bounded *ancestry* variants — the ones a user can select
+            //     at this package.
+            //   - **library / intermediate** targets (`build_lib`, `_golist`, …)
+            //     list the whole module *universe* (fetched via `states_under`), so
+            //     a variant declared at a sibling package is still enumerated — the
+            //     forms a cross-subtree consumer pins with `vp`.
+            // A package with no variants in scope lists no build targets — there is
+            // no implicit default variant.
+            let module_root = module_root_rel(&kind, &self.workspace_root);
+            let ancestry_pairs = variant::ancestry_variants_with_factors(&req.states, &module_root);
+            let ancestry: Vec<VariantRef> = ancestry_pairs.iter().map(|(v, _)| v.clone()).collect();
+            // Runnable `test`/`xtest` targets execute the built binary, so they
+            // only make sense for the host platform — enumerate them for the
+            // ancestry variants whose `goos`/`goarch` match this machine. The
+            // corresponding `build_test`/`build_xtest` (cross-compilable) still
+            // list for every variant, below.
+            let (host_goos, host_goarch) = (current_goos(), current_goarch());
+            let ancestry_host: Vec<VariantRef> = ancestry_pairs
+                .iter()
+                .filter(|(_, f)| f.goos == host_goos && f.goarch == host_goarch)
+                .map(|(v, _)| v.clone())
+                .collect();
+            // First-party libs enumerate the module universe; stdlib/thirdparty
+            // (rarely listed directly, and always consumed with a `vp` pin) fall
+            // back to ancestry.
+            let universe = if matches!(&*kind, GoPackageKind::FirstParty { .. }) {
+                // `states_under` walks the whole subtree by path prefix, so it
+                // also returns states from *nested* submodules under this
+                // package. Keep only states in this target's own module — a
+                // nested submodule's variants are a different module's targets
+                // and must not be enumerated here.
+                let module_states: Vec<State> = req
+                    .executor
+                    .states_under(&hmodel::htpkg::PkgBuf::from(module_root.as_str()))
+                    .await?
+                    .into_iter()
+                    .filter(|s| {
+                        pkg_in_module(s.package.as_str(), &module_root, &self.workspace_root)
+                    })
+                    .collect();
+                variant::universe_variants(&module_states)?
+            } else {
+                ancestry.clone()
+            };
+            let vrefs_for = |name: &str| -> &[VariantRef] {
+                if is_run_test_target_name(name) {
+                    &ancestry_host
+                } else if is_entry_target_name(name) {
+                    &ancestry
+                } else {
+                    &universe
+                }
+            };
+
+            let push_names = |addrs: &mut Vec<Addr>, names: &[&str]| {
+                for name in names {
+                    for vref in vrefs_for(name) {
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            (*name).to_string(),
+                            vref.to_args(),
+                        ));
+                    }
+                }
+            };
+
+            let mut addrs: Vec<Addr> = Vec::new();
             match &*kind {
                 GoPackageKind::Stdlib { .. } => {
-                    let addrs = vec![
-                        Addr::new(
-                            req.package.clone(),
-                            "_golist".to_string(),
-                            factors_to_args(&factors),
-                        ),
-                        Addr::new(
-                            req.package,
-                            "build_lib".to_string(),
-                            factors_to_args(&factors),
-                        ),
-                    ];
-                    let responses: Vec<anyhow::Result<ListResponse>> = addrs
-                        .into_iter()
-                        .map(|addr| Ok(ListResponse { addr }))
-                        .collect();
-                    Ok(Box::new(responses.into_iter())
-                        as Box<
-                            dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
-                        >)
+                    push_names(&mut addrs, &["_golist", "build_lib"]);
                 }
                 GoPackageKind::ThirdParty { subpath, .. } => {
-                    let mut addrs = vec![
-                        Addr::new(
-                            req.package.clone(),
-                            "_golist".to_string(),
-                            factors_to_args(&factors),
-                        ),
-                        Addr::new(
-                            req.package.clone(),
-                            "build_lib".to_string(),
-                            factors_to_args(&factors),
-                        ),
-                    ];
-                    // The `download` target lives at the module root only and
-                    // is factor-independent (one per module@version).
+                    push_names(&mut addrs, &["_golist", "build_lib"]);
+                    // The `download` target lives at the module root only and is
+                    // variant-independent (one per module@version).
                     if subpath.is_empty() {
                         addrs.push(Addr::new(
-                            req.package,
+                            req.package.clone(),
                             "download".to_string(),
                             Default::default(),
                         ));
                     }
-                    let responses: Vec<anyhow::Result<ListResponse>> = addrs
-                        .into_iter()
-                        .map(|addr| Ok(ListResponse { addr }))
-                        .collect();
-                    Ok(Box::new(responses.into_iter())
-                        as Box<
-                            dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
-                        >)
                 }
                 GoPackageKind::FirstParty { module_root, .. } => {
-                    // Emit the full candidate set unconditionally for any dir
-                    // under a go.mod (decode_package guarantees that). Each
-                    // variant is filtered at `get` time by inspecting the
-                    // `_golist` result — no filesystem scan needed.
-                    //
-                    // Lint/format variants are the exception: they exist only for
-                    // modules that opt in with a golangci config at the go.mod
-                    // root, so gate them here (matching the `get`-time gate) to
-                    // avoid advertising targets that would resolve to NotFound.
+                    // Lint/format targets exist only for modules that opt in with a
+                    // golangci config at the go.mod root, so gate them here
+                    // (matching the `get`-time gate) to avoid advertising targets
+                    // that would resolve to NotFound.
                     let lint_enabled = self.golangci_config_addr(module_root).is_some();
                     let skip_tests = pick_test_skip(&req.states, req.package.as_str());
-                    let mut names: Vec<&str> = vec!["_golist", "build_lib", "build", "embed"];
+                    push_names(&mut addrs, &["_golist", "build_lib", "build", "embed"]);
+                    // Magic host-default `build` (bare, no `@v`): a `group`
+                    // forwarding to the first host-matching variant. Listed only
+                    // when such a variant exists in ancestry.
+                    if !ancestry_host.is_empty() {
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "build".to_string(),
+                            Default::default(),
+                        ));
+                    }
                     if lint_enabled {
-                        names.extend_from_slice(&["lint-check", "lint", "format-check", "format"]);
+                        // One bare addr per package for both families, never
+                        // multiplied across variants: formatting is syntactic and
+                        // so variant-free outright (`VARIANT_FREE_TARGET_NAMES`),
+                        // while the lint gate/fixer aggregate every ancestry
+                        // variant's analysis (`VARIANT_AGGREGATE_TARGET_NAMES`).
+                        // The per-variant `_lint-analyze` stays unlisted (as
+                        // before): it is internal, and the aggregators pull it in
+                        // as a dep.
+                        for name in VARIANT_AGGREGATE_TARGET_NAMES
+                            .iter()
+                            .chain(VARIANT_FREE_TARGET_NAMES)
+                        {
+                            addrs.push(Addr::new(
+                                req.package.clone(),
+                                (*name).to_string(),
+                                Default::default(),
+                            ));
+                        }
                     }
                     if !skip_tests {
-                        names.extend_from_slice(&[
-                            "embed_xtest",
-                            "build_test",
-                            "test",
-                            "build_xtest",
-                            "xtest",
-                        ]);
+                        push_names(
+                            &mut addrs,
+                            &["embed_xtest", "build_test", "test", "build_xtest", "xtest"],
+                        );
                     }
-                    let responses: Vec<anyhow::Result<ListResponse>> = names
-                        .iter()
-                        .map(|name| {
-                            Ok(ListResponse {
-                                addr: Addr::new(
-                                    req.package.clone(),
-                                    (*name).to_string(),
-                                    factors_to_args(&factors),
-                                ),
-                            })
-                        })
-                        .collect();
-
-                    Ok(Box::new(responses.into_iter())
-                        as Box<
-                            dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
-                        >)
                 }
             }
+
+            let responses: Vec<anyhow::Result<ListResponse>> = addrs
+                .into_iter()
+                .map(|addr| Ok(ListResponse { addr }))
+                .collect();
+            Ok(Box::new(responses.into_iter())
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
 
@@ -790,22 +859,114 @@ fn is_test_target_name(name: &str) -> bool {
     TEST_TARGET_NAMES.contains(&name)
 }
 
+/// User-facing **entry / binary** target names — the ones a user selects a
+/// variant on directly (bare `@v`, resolved by module-bounded ancestry). Every
+/// other target is a **library / intermediate** (carries `vp`, resolved against
+/// the module universe). Used by `list` to choose the enumeration scope
+/// (ancestry vs universe) per target name.
+///
+/// `format`/`format-check` are deliberately absent: formatting is syntactic, so
+/// they are variant-independent (see [`VARIANT_FREE_TARGET_NAMES`]). So are
+/// `lint-check`/`lint`, which aggregate over every ancestry variant instead of
+/// being selected with one (see [`VARIANT_AGGREGATE_TARGET_NAMES`]).
+fn is_entry_target_name(name: &str) -> bool {
+    matches!(name, "build" | "test" | "xtest")
+}
+
+/// **Runnable** test target names — the ones that execute the built test binary
+/// (as opposed to `build_test`/`build_xtest`, which only cross-compile it). Only
+/// these are gated to the host `goos`/`goarch` in `list`, since a test binary
+/// built for another platform can't run here.
+fn is_run_test_target_name(name: &str) -> bool {
+    matches!(name, "test" | "xtest")
+}
+
+/// Workspace-relative go.mod directory of a decoded package (`""` for a root
+/// module, `"go"` for `go/go.mod`, etc.). Two packages belong to the *same* Go
+/// module iff this matches — the real module-membership test (a plain path
+/// prefix is wrong: a package can prefix-match a module root while living inside
+/// a *nested* submodule with its own `go.mod`).
+fn module_root_rel(kind: &GoPackageKind, workspace_root: &Path) -> String {
+    match kind {
+        GoPackageKind::FirstParty { module_root, .. }
+        | GoPackageKind::ThirdParty { module_root, .. } => module_root
+            .strip_prefix(workspace_root)
+            .unwrap_or(module_root)
+            .to_string_lossy()
+            .into_owned(),
+        GoPackageKind::Stdlib { .. } => String::new(),
+    }
+}
+
+/// Whether `pkg` (a Go import package) belongs to the module rooted at
+/// `target_module_root` (workspace-relative). The real nearest-`go.mod` check —
+/// used to bound `vp` honoring and library-variant enumeration to the target's
+/// own module, so a nested submodule's variants never leak across the boundary.
+fn pkg_in_module(pkg: &str, target_module_root: &str, workspace_root: &Path) -> bool {
+    match decode_package(&hmodel::htpkg::PkgBuf::from(pkg), workspace_root) {
+        Some(kind) => module_root_rel(&kind, workspace_root) == target_module_root,
+        None => false,
+    }
+}
+
+/// Spec for the magic host-default `build` (bare `//pkg:build`): a `group` target
+/// that re-exports the outputs of the concrete `build@v=<variant>` it forwards to.
+fn magic_build_group_spec(addr: Addr, target: &Addr) -> hplugin::provider::TargetSpec {
+    let config = HashMap::from([(
+        "deps".to_string(),
+        Value::List(vec![Value::String(target.format())]),
+    )]);
+    hplugin::provider::TargetSpec {
+        addr,
+        driver: hbuiltins::plugingroup::DRIVER_NAME.to_string(),
+        config,
+        ..Default::default()
+    }
+}
+
 /// Targets handled by `handle_get` *before* the `_golist` resolve (no go list
 /// needed): the golist target itself, the go.mod copy, and the module download.
 const SPECIAL_TARGET_NAMES: &[&str] = &["_golist", "_go_mod", "download"];
 
 /// Non-test first-party/thirdparty target names this provider owns and resolves
 /// through `_golist` (see the `match addr.name` arms in `handle_get`).
-const GOLIST_TARGET_NAMES: &[&str] = &[
-    "build_lib",
-    "build",
-    "embed",
-    "lint-check",
-    "lint",
-    "_lint-analyze",
-    "format-check",
-    "format",
-];
+const GOLIST_TARGET_NAMES: &[&str] = &["build_lib", "build", "embed", "_lint-analyze"];
+
+/// Target names this provider owns that are **variant-free**: they carry no `@v`
+/// / `@vp` and are handled before variant resolution.
+///
+/// Formatting is purely syntactic — gofmt/gofumpt/goimports never look at
+/// `GOOS`/`GOARCH`/build tags — so a per-variant `format` would be three kinds of
+/// wrong: it would silently skip files excluded by the variant's build
+/// constraints (`foo_windows.go` never formatted unless a windows variant is
+/// declared), run N near-identical jobs for N variants, and have several variants
+/// claim the same `codegen = in_place` source paths. So they source their file
+/// list straight off disk (every `*.go` in the package dir) instead of from the
+/// variant-scoped `_golist`.
+///
+/// The lint targets are *not* in here: they carry no variant either, but they
+/// reach the per-variant analysis units underneath, so they need their own
+/// handling (see [`VARIANT_AGGREGATE_TARGET_NAMES`]).
+const VARIANT_FREE_TARGET_NAMES: &[&str] = &["format", "format-check"];
+
+/// Target names that carry no `@v`/`@vp` themselves but **fan out over every
+/// declared variant** underneath — one bare addr per package aggregating N
+/// per-variant analysis units.
+///
+/// Lint *rules* are variant-independent, but the object they analyze is not:
+/// `_lint-analyze` type-checks the package, and a typed package only exists per
+/// `(GOOS, GOARCH, tags)` — `foo_linux.go` and `foo_windows.go` redeclare each
+/// other's symbols, and their imports differ. Facts are variant-scoped for the
+/// same reason. So the analysis unit stays per-variant while the user-facing
+/// gate (`lint-check`) and fixer (`lint`) aggregate the module-bounded ancestry
+/// variants.
+///
+/// That fixes two things a variant-selected `lint` got wrong: a file excluded by
+/// the selected variant's build constraints was silently never linted
+/// (`foo_windows.go` on a host-variant run), and N per-variant fixers each
+/// declared the same `codegen = in_place` source paths — N targets racing to
+/// rewrite one file. One aggregating fixer claims each path once.
+const VARIANT_AGGREGATE_TARGET_NAMES: &[&str] = &["lint-check", "lint"];
 
 /// Workspace-relative package of heph's own go/analysis unitchecker binary
 /// (`heph-govet`), built as an ordinary `build` (package main) target like any
@@ -836,6 +997,8 @@ fn is_firstparty_pkg(pkg: &str) -> bool {
 fn is_known_go_target_name(name: &str) -> bool {
     SPECIAL_TARGET_NAMES.contains(&name)
         || GOLIST_TARGET_NAMES.contains(&name)
+        || VARIANT_FREE_TARGET_NAMES.contains(&name)
+        || VARIANT_AGGREGATE_TARGET_NAMES.contains(&name)
         || TEST_TARGET_NAMES.contains(&name)
 }
 
@@ -1114,8 +1277,9 @@ fn pkg_prefix_pattern(pkg: &str) -> String {
 ///
 /// Excludes the `go` provider: these labels are carried by buildfile-emitted
 /// codegen targets, never by go targets. Skipping the go provider avoids
-/// resolving (and cascade-building) the go provider's own targets, whose spec
-/// resolution pulls in the whole golist/std graph.
+/// resolving (and cascade-building) the go provider's own variant-parameterized
+/// targets — which are multiplied per variant and whose spec resolution pulls in
+/// the whole per-variant golist/std graph.
 fn go_test_data_query_addr(pkg: &str) -> Addr {
     let expr = format!("{} && label(go_test_data)", pkg_pattern(pkg));
     hplugin_query::pluginquery::query_addr(&expr, "", &["go"])
@@ -1161,9 +1325,9 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
     // def tier (`get_def`, the most expensive). Order terms by that cost so the
     // engine's left-to-right `&&` bails at the cheapest possible tier.
-    // Exclude the `go` provider: `go_src` labels only buildfile codegen targets,
-    // never go targets — skipping go avoids spec-resolving (and cascade-building)
-    // the go provider's own targets just to reject them on the label.
+    // Exclude the `go` provider: `go_src` labels only its buildfile codegen
+    // targets, never go targets — skipping go avoids resolving (and cascade-
+    // building) the go provider's per-variant targets.
     let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
     let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &["go"]);
     addrs.push(go_src_query_addr.format());
@@ -1247,7 +1411,6 @@ fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
 impl ProviderInner {
     async fn handle_get(self: Arc<Self>, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
-        let factors = Factors::from_addr(addr);
 
         // Hermetic Go toolchain: `//@heph/go/toolchain/<version>:go` downloads
         // the pinned SDK for the host platform. This replaces the former
@@ -1289,17 +1452,30 @@ impl ProviderInner {
                      (\"//@heph/go/govet/<tag>:heph-govet\")"
                 )));
             }
-            let sha256 =
-                govet::expected_sha256(&self.sdk_checksums, tag, &factors.goos, &factors.goarch);
+            // The govet tool is host-native (never cross-compiled), so its asset
+            // is keyed by the host platform — read the host factors directly, not a
+            // build variant.
+            let (goos, goarch) = (current_goos(), current_goarch());
+            let sha256 = govet::expected_sha256(&self.sdk_checksums, tag, &goos, &goarch);
             let spec = govet::build_spec(addr.clone(), tag, &sha256);
             return Ok(GetResponse { target_spec: spec });
         }
 
         // Standard library install: `@heph/go/std:install` builds all of std from
-        // source once (per factor); per-package `build_lib` extracts archives from
+        // source once (per variant); per-package `build_lib` extracts archives from
         // its output. Lives at the bare `@heph/go/std` package, which does not
-        // decode as a Stdlib import path, so handle it before `decode_package`.
+        // decode as a Stdlib import path, so handle it before `decode_package`. It
+        // is variant-parameterized (std is compiled with the variant's factors), so
+        // resolve the variant here.
         if addr.package.as_str() == target_std::STD_PKG && addr.name == "install" {
+            // std:install is always internal (carries `vp`), so it takes the
+            // library/universe branch — `module_root` is unused. std belongs to
+            // no user module; its `vp` (the consumer's declaring package) is
+            // always honored so std builds with the consumer's variant factors.
+            let (factors, _vref) =
+                variant::resolve(addr, &req.states, "", req.executor.as_ref(), true)
+                    .await
+                    .map_err(GetError::Other)?;
             let spec = target_std::install_spec(addr.clone(), &factors, &self.go_version);
             return Ok(GetResponse { target_spec: spec });
         }
@@ -1332,20 +1508,8 @@ impl ProviderInner {
             return Err(GetError::NotFound);
         }
 
-        // _golist — generate spec without executing go list (before stdlib check so
-        // stdlib packages can also expose a _golist target for cached dep resolution)
-        if addr.name == "_golist" {
-            return self
-                .get_golist_spec(addr.clone(), &kind, &factors, &req.states)
-                .map_err(GetError::Other);
-        }
-
-        // Stdlib — no go list needed for other targets
-        if let GoPackageKind::Stdlib { import_path } = &*kind {
-            return self.get_stdlib(addr.clone(), import_path, &factors);
-        }
-
-        // _go_mod — copy go.mod/go.sum; no go list needed
+        // _go_mod — copy go.mod/go.sum; variant-independent, so handle it before
+        // variant resolution (its addr carries no `v`).
         if addr.name == "_go_mod" {
             let module_root = self.workspace_root.join(addr.package.as_str());
             let mod_files: Vec<String> = ["go.mod", "go.sum"]
@@ -1360,9 +1524,11 @@ impl ProviderInner {
             return Ok(GetResponse { target_spec: spec });
         }
 
-        // download — module-root only, factor-independent. Runs `go mod download`
-        // and exposes the module source tree as artifacts so downstream build_lib
-        // / embed targets get fully sandboxed sources instead of host GOMODCACHE.
+        // download — module-root only, variant-independent (module bytes don't
+        // depend on the build variant). Runs `go mod download` and exposes the
+        // module source tree as artifacts so downstream build_lib / embed targets
+        // get fully sandboxed sources instead of host GOMODCACHE. Handle before
+        // variant resolution (its addr carries no `v`).
         if addr.name == "download" {
             if let GoPackageKind::ThirdParty {
                 module,
@@ -1383,6 +1549,158 @@ impl ProviderInner {
                 return Ok(GetResponse { target_spec: spec });
             }
             return Err(GetError::NotFound);
+        }
+
+        // A name this provider doesn't own can't be a variant target — decline so
+        // the engine falls through to the owning provider. `foreign_name_guard`
+        // above is the on-by-default fast path (before `decode_package`); this
+        // unconditional check covers the guard-off case, where a foreign name (e.g.
+        // a buildfile codegen target sharing a Go package dir, spec-resolved via a
+        // go-first registration) must decline rather than error out of variant
+        // resolution below.
+        if !is_known_go_target_name(&addr.name) {
+            return Err(GetError::NotFound);
+        }
+
+        // Everything below is variant-parameterized. Resolve the addr's variant —
+        // a bare `@v` (binary/entry target) resolves by module-bounded ancestry;
+        // `@v,vp` (library / dependency target) resolves `(name, vp)` against the
+        // module universe. Returns the concrete `factors` this target builds with,
+        // plus the `vref` to thread onto every sub-target and dependency address.
+        //
+        // `module_root` bounds ancestry resolution at the go.mod dir (not repo
+        // root); it is unused for the `vp` (library) branch.
+        let module_root = module_root_rel(&kind, &self.workspace_root);
+
+        // format / format-check — variant-free (see `VARIANT_FREE_TARGET_NAMES`),
+        // so handle them before variant resolution and source the file list from
+        // disk rather than the variant-scoped `_golist`.
+        if VARIANT_FREE_TARGET_NAMES.contains(&addr.name.as_str()) {
+            return match self.get_format(addr, &kind).map_err(GetError::Other)? {
+                Some(resp) => Ok(resp),
+                None => Err(GetError::NotFound),
+            };
+        }
+
+        // lint-check / lint — one bare addr per package aggregating the
+        // per-variant `_lint-analyze` units (see `VARIANT_AGGREGATE_TARGET_NAMES`).
+        // They carry no variant of their own, so they also resolve before variant
+        // resolution; they enumerate the ancestry variants themselves.
+        if VARIANT_AGGREGATE_TARGET_NAMES.contains(&addr.name.as_str()) {
+            return Arc::clone(&self)
+                .get_lint_aggregate(&req, &kind, &module_root)
+                .await;
+        }
+
+        // Magic host-default `build`: a *truly bare* `//pkg:build` (no addr args at
+        // all) is served as a `group` target forwarding to `build@v=<variant>` for
+        // the first ancestry variant matching this machine's goos/goarch. It gives
+        // `//pkg:build` an ergonomic host default without an implicit variant on the
+        // real per-variant build. First-party only — `build` (and thus its
+        // host-default) exists solely for first-party packages, matching what `list`
+        // emits.
+        //
+        // Gate on `args.is_empty()`, NOT merely "no `v`": a `build` carrying stray
+        // args — e.g. a legacy `build@goos=linux,goarch=amd64` from a pre-variant
+        // BUILD file — must fall through to `variant::resolve`, which reports a clear
+        // "requires `@v=NAME`" migration error, rather than being silently treated as
+        // the host-default (which would forward to the host variant and confusingly
+        // NotFound for a target-platform-only package).
+        if addr.name == "build"
+            && addr.args.is_empty()
+            && matches!(&*kind, GoPackageKind::FirstParty { .. })
+        {
+            let (host_goos, host_goarch) = (current_goos(), current_goarch());
+            let chosen = variant::ancestry_variants_with_factors(&req.states, &module_root)
+                .into_iter()
+                .find(|(_, f)| f.goos == host_goos && f.goarch == host_goarch);
+            let Some((vref, _)) = chosen else {
+                return Err(GetError::NotFound);
+            };
+            // The magic target must resolve exactly where the real `build` does —
+            // a `main` package. A non-main / library / directory-only package (no
+            // buildable Go files) has no `build`, so decline here on the *magic*
+            // addr rather than emit a `group` whose `build@v=…` dep can't resolve.
+            // Declining on the self addr lets the codegen/query/`validate` walks
+            // skip it (they match a self-addr `TargetNotFound`); a cross-addr dep
+            // NotFound would surface instead. Checked via the chosen variant's
+            // `_golist` (engine-cached; the real `build@v=…` reads the same one).
+            let golist_addr = self.make_addr_with_name(&addr.package, "_golist", &vref);
+            match self
+                .read_golist_package(Arc::clone(&req.executor), &golist_addr)
+                .await
+            {
+                Ok(pkg) if pkg.name.as_deref() == Some("main") => {}
+                Ok(_) => return Err(GetError::NotFound),
+                Err(e) if downcast_chain_ref::<NoGoFilesError>(&e).is_some() => {
+                    return Err(GetError::NotFound);
+                }
+                Err(e) => return Err(GetError::Other(e)),
+            }
+            let target = Addr::new(
+                addr.package.clone(),
+                "build".to_string(),
+                BTreeMap::from([("v".to_string(), vref.name.clone())]),
+            );
+            return Ok(GetResponse {
+                target_spec: magic_build_group_spec(addr.clone(), &target),
+            });
+        }
+
+        // Strict addr args: every variant-parameterized go target accepts only `v`
+        // (entry) and `vp` (library/dep pin). Reject anything else rather than
+        // silently ignoring it — notably a legacy `goos`/`goarch` from a pre-variant
+        // BUILD file, which must surface as an actionable error, not resolve to the
+        // wrong thing. (The host-keyed toolchain/govet targets, which do carry
+        // `goos`/`goarch`, are handled earlier and never reach here.)
+        if let Some(bad) = addr.args.keys().find(|k| !matches!(k.as_str(), "v" | "vp")) {
+            return Err(GetError::Other(anyhow::anyhow!(
+                "unknown addr arg `{bad}` on go target `:{}` (allowed: v, vp); \
+                 select a build variant with `@v=NAME` — `goos`/`goarch` are no \
+                 longer addr args, declare a variant instead",
+                addr.name,
+            )));
+        }
+
+        // Decide whether to honor the addr's `vp`:
+        //   - std / thirdparty belong to *no* user module — they carry no
+        //     variant declarations of their own and are only ever reached as a
+        //     dependency. Their factors ARE the consumer's, threaded via `vp`, so
+        //     always honor it (module-bounding them would strand them with an
+        //     empty ancestry and fail).
+        //   - first-party: honor `vp` only when it names a package in *this*
+        //     target's own go module (a real nearest-`go.mod` check, not a path
+        //     prefix). A `vp` threaded from a consumer in a different module is a
+        //     cross-module dep pin; ignoring it keeps the foreign module's
+        //     variant declaration from leaking across the boundary.
+        let vp_same_module = match &*kind {
+            GoPackageKind::Stdlib { .. } | GoPackageKind::ThirdParty { .. } => true,
+            GoPackageKind::FirstParty { .. } => addr
+                .args
+                .get("vp")
+                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.workspace_root)),
+        };
+        let (factors, vref) = variant::resolve(
+            addr,
+            &req.states,
+            &module_root,
+            req.executor.as_ref(),
+            vp_same_module,
+        )
+        .await
+        .map_err(GetError::Other)?;
+
+        // _golist — generate spec without executing go list (before stdlib check so
+        // stdlib packages can also expose a _golist target for cached dep resolution)
+        if addr.name == "_golist" {
+            return self
+                .get_golist_spec(addr.clone(), &kind, &factors, &req.states)
+                .map_err(GetError::Other);
+        }
+
+        // Stdlib — no go list needed for other targets
+        if let GoPackageKind::Stdlib { import_path } = &*kind {
+            return self.get_stdlib(addr.clone(), import_path, &factors, &vref);
         }
 
         // provider_state(provider="go", test=False) opts the package (and all
@@ -1411,7 +1729,7 @@ impl ProviderInner {
         // `NoGoFilesError` (raised by `read_golist_package` when `go list -e`
         // reports the package has no buildable Go files) maps uniformly to
         // `NotFound` for every variant — no per-arm duck-typed check needed.
-        let golist_addr = self.make_addr_with_name(&addr.package, "_golist", &factors);
+        let golist_addr = self.make_addr_with_name(&addr.package, "_golist", &vref);
         let pkg = match self
             .read_golist_package(Arc::clone(&req.executor), &golist_addr)
             .await
@@ -1448,13 +1766,7 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let transitive = Arc::clone(&self)
-                    .collect_direct_libs(
-                        Arc::clone(&req.executor),
-                        &pkg,
-                        &[],
-                        &factors,
-                        &module_root,
-                    )
+                    .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
                     .await
                     .map_err(GetError::Other)?;
 
@@ -1515,89 +1827,6 @@ impl ProviderInner {
                 };
                 Ok(GetResponse { target_spec: spec })
             }
-            // User-facing check gate: depends on `_lint-analyze`'s report and fails on
-            // findings. `_lint-analyze` always exits 0 so facts cache regardless; the gate
-            // is the thing that fails.
-            "lint-check" => {
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                // Lint only where the module opts in with a golangci config;
-                // attach it as a hash-only dep so a config change re-keys the gate.
-                let config_addr = match self.golangci_config_addr(&module_root) {
-                    Some(a) => a,
-                    None => return Err(GetError::NotFound),
-                };
-                let analyze_addr =
-                    self.make_addr_with_name(&addr.package, "_lint-analyze", &factors);
-                let spec = crate::plugingo::driver_lint::build_lint_gate_spec(
-                    addr.clone(),
-                    &analyze_addr,
-                    Some(&config_addr),
-                );
-                Ok(GetResponse { target_spec: spec })
-            }
-            // The plain `lint` target FIXES: it consumes `_lint-analyze`'s report (suggested
-            // fixes) + the package sources, applies the edits, and rewrites the
-            // sources in place (codegen). Runs no analysis itself — reuses `_lint-analyze`'s
-            // cache. Use `lint-check` to only report.
-            "lint" => {
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                let config_addr = match self.golangci_config_addr(&module_root) {
-                    Some(a) => a,
-                    None => return Err(GetError::NotFound),
-                };
-                let analyze_addr =
-                    self.make_addr_with_name(&addr.package, "_lint-analyze", &factors);
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                let spec = crate::plugingo::driver_lint::build_lint_fix_spec(
-                    addr.clone(),
-                    &analyze_addr,
-                    &pkg_addrs.go_files,
-                    &pkg.go_files,
-                    Some(&config_addr),
-                );
-                Ok(GetResponse { target_spec: spec })
-            }
-            // Formatting: `format-check` is the gate (fails on unformatted files),
-            // `format` rewrites the sources in place (codegen). Both run the
-            // heph-govet `-format` mode; neither needs facts or dep archives.
-            "format-check" | "format" => {
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                // Format only where the module opts in with a golangci config
-                // (the same gate as lint); the config also carries formatter
-                // settings (gofumpt/goimports).
-                let config_addr = match self.golangci_config_addr(&module_root) {
-                    Some(a) => a,
-                    None => return Err(GetError::NotFound),
-                };
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                let govet_addr = self.govet_tool_addr().map_err(GetError::Other)?;
-                let config_addr = Some(config_addr);
-                let params = crate::plugingo::driver_format::FormatParams {
-                    addr: addr.clone(),
-                    govet_addr: &govet_addr,
-                    src_addrs: &pkg_addrs.go_files,
-                    go_files: &pkg.go_files,
-                    config_addr: config_addr.as_ref(),
-                };
-                let spec = if addr.name == "format" {
-                    crate::plugingo::driver_format::build_format_spec(params)
-                } else {
-                    crate::plugingo::driver_format::build_format_check_spec(params)
-                };
-                Ok(GetResponse { target_spec: spec })
-            }
             // Analyze unit: runs heph-govet, produces `lint.facts` (consumed by
             // dependents) + `lint-report.json` (consumed by the gate).
             "_lint-analyze" => {
@@ -1608,13 +1837,7 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let transitive = Arc::clone(&self)
-                    .collect_direct_libs(
-                        Arc::clone(&req.executor),
-                        &pkg,
-                        &[],
-                        &factors,
-                        &module_root,
-                    )
+                    .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
                     .await
                     .map_err(GetError::Other)?;
 
@@ -1689,13 +1912,13 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
 
-                let own_lib_addr = self.build_lib_addr(addr, &factors);
+                let own_lib_addr = self.build_lib_addr(addr, &vref);
                 let mut transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &pkg,
                         &[],
-                        &factors,
+                        &vref,
                         &module_root,
                     )
                     .await
@@ -1770,7 +1993,7 @@ impl ProviderInner {
                         Arc::clone(&req.executor),
                         &pkg,
                         &test_extra,
-                        &factors,
+                        &vref,
                         &module_root,
                     )
                     .await
@@ -1868,7 +2091,7 @@ impl ProviderInner {
                         Arc::clone(&req.executor),
                         &xtest_imports_pkg,
                         &[],
-                        &factors,
+                        &vref,
                         &module_root,
                     )
                     .await
@@ -1882,9 +2105,8 @@ impl ProviderInner {
                         if ip != import_path {
                             return Some((ip, a));
                         }
-                        p_lib_name.map(|name| {
-                            (ip, self.make_addr_with_name(&addr.package, name, &factors))
-                        })
+                        p_lib_name
+                            .map(|name| (ip, self.make_addr_with_name(&addr.package, name, &vref)))
                     })
                     .collect();
 
@@ -1934,21 +2156,18 @@ impl ProviderInner {
                         Arc::clone(&req.executor),
                         &testmain_pkg,
                         &[],
-                        &factors,
+                        &vref,
                         &module_root,
                     )
                     .await
                     .map_err(GetError::Other)?;
                 // testmain imports `_test "P"` → importcfg needs P→test_lib.
                 let test_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_test_lib", &factors);
+                    self.make_addr_with_name(&addr.package, "build_test_lib", &vref);
                 transitive.libs.push((import_path.clone(), test_lib_addr));
 
-                let testmain_src_addr = Addr::new(
-                    addr.package.clone(),
-                    "testmain".to_string(),
-                    factors_to_args(&factors),
-                );
+                let testmain_src_addr =
+                    Addr::new(addr.package.clone(), "testmain".to_string(), vref.to_args());
                 let spec = target_test::build_testmain_lib_spec(
                     addr.clone(),
                     &factors,
@@ -1971,14 +2190,14 @@ impl ProviderInner {
                         Arc::clone(&req.executor),
                         &testmain_pkg,
                         &[],
-                        &factors,
+                        &vref,
                         &module_root,
                     )
                     .await
                     .map_err(GetError::Other)?;
                 // testmain imports `_xtest "P_test"` → importcfg needs P_test→xtest_lib.
                 let xtest_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors);
+                    self.make_addr_with_name(&addr.package, "build_xtest_lib", &vref);
                 transitive
                     .libs
                     .push((format!("{}_test", import_path), xtest_lib_addr));
@@ -1986,7 +2205,7 @@ impl ProviderInner {
                 let testmain_src_addr = Addr::new(
                     addr.package.clone(),
                     "xtestmain".to_string(),
-                    factors_to_args(&factors),
+                    vref.to_args(),
                 );
                 let spec = target_test::build_testmain_lib_spec(
                     addr.clone(),
@@ -2021,7 +2240,7 @@ impl ProviderInner {
                         Arc::clone(&req.executor),
                         &pkg,
                         &test_extra,
-                        &factors,
+                        &vref,
                         &module_root,
                     )
                     .await
@@ -2039,11 +2258,11 @@ impl ProviderInner {
                     }
                 }
                 let test_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_test_lib", &factors);
+                    self.make_addr_with_name(&addr.package, "build_test_lib", &vref);
                 all_libs.push((import_path.clone(), test_lib_addr));
 
                 let testmain_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_testmain_lib", &factors);
+                    self.make_addr_with_name(&addr.package, "build_testmain_lib", &vref);
                 let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
@@ -2108,7 +2327,7 @@ impl ProviderInner {
                         Arc::clone(&req.executor),
                         &xtest_root,
                         &[],
-                        &factors,
+                        &vref,
                         &module_root,
                     )
                     .await
@@ -2121,7 +2340,7 @@ impl ProviderInner {
                 // packages P has no lib at all — skip the slot entirely so we
                 // don't request a non-existent target.
                 if let Some(p_lib_name) = pick_xtest_p_lib_name(&pkg) {
-                    let p_addr = self.make_addr_with_name(&addr.package, p_lib_name, &factors);
+                    let p_addr = self.make_addr_with_name(&addr.package, p_lib_name, &vref);
                     all_libs.push((import_path.clone(), p_addr));
                     seen.insert(import_path.clone());
                 } else {
@@ -2138,11 +2357,11 @@ impl ProviderInner {
                     }
                 }
                 let xtest_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors);
+                    self.make_addr_with_name(&addr.package, "build_xtest_lib", &vref);
                 all_libs.push((p_test, xtest_lib_addr));
 
                 let testmain_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_xtestmain_lib", &factors);
+                    self.make_addr_with_name(&addr.package, "build_xtestmain_lib", &vref);
                 let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
@@ -2157,8 +2376,7 @@ impl ProviderInner {
                 if pkg.test_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let build_test_addr =
-                    self.make_addr_with_name(&addr.package, "build_test", &factors);
+                let build_test_addr = self.make_addr_with_name(&addr.package, "build_test", &vref);
                 let data_query_addr = go_test_data_query_addr(addr.package.as_str());
                 let test_env =
                     pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
@@ -2176,7 +2394,7 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let build_xtest_addr =
-                    self.make_addr_with_name(&addr.package, "build_xtest", &factors);
+                    self.make_addr_with_name(&addr.package, "build_xtest", &vref);
                 let data_query_addr = go_test_data_query_addr(addr.package.as_str());
                 let test_env =
                     pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
@@ -2282,10 +2500,11 @@ impl ProviderInner {
         addr: Addr,
         import_path: &str,
         factors: &Factors,
+        vref: &VariantRef,
     ) -> Result<GetResponse, GetError> {
         match addr.name.as_str() {
             "build_lib" => {
-                let spec = target_std::build_spec(addr, import_path, factors);
+                let spec = target_std::build_spec(addr, import_path, factors, vref);
                 Ok(GetResponse { target_spec: spec })
             }
             _ => Err(GetError::NotFound),
@@ -2405,8 +2624,8 @@ impl ProviderInner {
             .map_err(unwrap_arc_err)
     }
 
-    fn build_lib_addr(&self, addr: &Addr, factors: &Factors) -> Addr {
-        self.make_addr_with_name(&addr.package, "build_lib", factors)
+    fn build_lib_addr(&self, addr: &Addr, vref: &VariantRef) -> Addr {
+        self.make_addr_with_name(&addr.package, "build_lib", vref)
     }
 
     /// Addr of the `heph-govet` binary the lint and format targets exec: the
@@ -2438,14 +2657,17 @@ impl ProviderInner {
         if !addr.args.is_empty() {
             return Ok(addr);
         }
+        // The govet tool is a host-native binary, not variant-parameterized: its
+        // `http_fetch` URL templates over plain `goos`/`goarch` args (like the Go
+        // toolchain download), so it keeps that vocabulary rather than `v`/`vp`.
+        let host_args = BTreeMap::from([
+            ("goos".to_string(), current_goos()),
+            ("goarch".to_string(), current_goarch()),
+        ]);
         Ok(Addr::new(
             addr.package.clone(),
             addr.name.clone(),
-            factors_to_args(&Factors {
-                goos: current_goos(),
-                goarch: current_goarch(),
-                build_tags: vec![],
-            }),
+            host_args,
         ))
     }
 
@@ -2453,9 +2675,260 @@ impl ProviderInner {
         &self,
         package: &hmodel::htpkg::PkgBuf,
         name: &str,
-        factors: &Factors,
+        vref: &VariantRef,
     ) -> Addr {
-        Addr::new(package.clone(), name.to_string(), factors_to_args(factors))
+        Addr::new(package.clone(), name.to_string(), vref.to_args())
+    }
+
+    /// Spec for the variant-free `format` / `format-check` targets. `Ok(None)`
+    /// means "no such target here" (the caller maps it to `NotFound`).
+    ///
+    /// Formatting is syntactic, so this deliberately does **not** go through
+    /// `_golist`: `go list` reports only the `GoFiles` the current
+    /// `GOOS`/`GOARCH`/`-tags` select, which would leave every
+    /// constraint-excluded file (`foo_windows.go` on a linux-only workspace) and
+    /// every `_test.go` file permanently unformatted. Reading the package
+    /// directory instead formats exactly what a developer sees in it.
+    fn get_format(&self, addr: &Addr, kind: &GoPackageKind) -> anyhow::Result<Option<GetResponse>> {
+        // `format` is listed for first-party packages only — stdlib/thirdparty
+        // sources are vendored, not ours to rewrite.
+        let GoPackageKind::FirstParty { module_root, .. } = kind else {
+            return Ok(None);
+        };
+
+        // No variant to select. Reject args rather than ignore them, so a stale
+        // `format@v=NAME` is an actionable error instead of silently doing
+        // something else.
+        if let Some(bad) = addr.args.keys().next() {
+            anyhow::bail!(
+                "unknown addr arg `{bad}` on go target `:{}` — formatting is \
+                 syntactic and therefore variant-free; use a bare `:{}`",
+                addr.name,
+                addr.name,
+            );
+        }
+
+        // Format only where the module opts in with a golangci config (the same
+        // gate as lint); the config also carries formatter settings
+        // (gofumpt/goimports).
+        let Some(config_addr) = self.golangci_config_addr(module_root) else {
+            return Ok(None);
+        };
+
+        let go_files = self.package_go_files_on_disk(addr.package.as_str())?;
+        if go_files.is_empty() {
+            return Ok(None);
+        }
+        let src_addrs: Vec<String> = go_files
+            .iter()
+            .map(|f| {
+                let rel = if addr.package.as_str().is_empty() {
+                    f.clone()
+                } else {
+                    format!("{}/{}", addr.package.as_str(), f)
+                };
+                pluginfs::file_addr(&rel).format()
+            })
+            .collect();
+
+        let govet_addr = self.govet_tool_addr()?;
+        let params = crate::plugingo::driver_format::FormatParams {
+            addr: addr.clone(),
+            govet_addr: &govet_addr,
+            src_addrs: &src_addrs,
+            go_files: &go_files,
+            config_addr: Some(&config_addr),
+        };
+        let target_spec = if addr.name == "format" {
+            crate::plugingo::driver_format::build_format_spec(params)
+        } else {
+            crate::plugingo::driver_format::build_format_check_spec(params)
+        };
+        Ok(Some(GetResponse { target_spec }))
+    }
+
+    /// Every `.go` file directly in `pkg`'s directory, sorted, as basenames.
+    ///
+    /// Build constraints are deliberately not applied — see [`Self::get_format`].
+    /// Codegen-stamped files are skipped: they are owned by their generator (an
+    /// `fs:file` over one resolves to nothing anyway), and declaring one as a
+    /// `codegen = in_place` output of `format` would collide with the generator's
+    /// own output. Files reached through a `.heph*` cache dir are skipped for the
+    /// same reason they are in the fs provider — they are engine artifacts, not
+    /// source.
+    fn package_go_files_on_disk(&self, pkg: &str) -> anyhow::Result<Vec<String>> {
+        let dir = if pkg.is_empty() {
+            self.workspace_root.clone()
+        } else {
+            self.workspace_root.join(pkg)
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("read go pkg dir {dir:?}"))),
+        };
+        let mut files: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read go pkg dir entry in {dir:?}"))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".go") {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            if pluginfs::has_codegen_xattr(&path) || pluginfs::resolves_into_heph_dir(&path) {
+                continue;
+            }
+            files.push(name.to_string());
+        }
+        // `read_dir` order is filesystem-defined; sort so the spec (and therefore
+        // the target's input hash) is reproducible.
+        files.sort();
+        Ok(files)
+    }
+
+    /// Spec for the user-facing `lint-check` (gate) and `lint` (fixer) targets:
+    /// one bare addr per package that aggregates the per-variant `_lint-analyze`
+    /// units of every module-bounded ancestry variant.
+    ///
+    /// Why aggregate rather than let the user select a variant (see
+    /// [`VARIANT_AGGREGATE_TARGET_NAMES`]): lint rules don't depend on the
+    /// variant, only the typed package they run against does. Selecting one
+    /// variant therefore reported on an arbitrary subset of the package's files
+    /// — `foo_windows.go` was silently unlinted on a host-variant run — and gave
+    /// every variant its own fixer, each declaring the same source files as
+    /// `codegen = in_place` outputs.
+    ///
+    /// A variant whose build constraints leave the package with no Go files is
+    /// skipped: it has no `_lint-analyze` target, so wiring one would be a dep
+    /// that resolves to `NotFound`. All variants skipped (or none declared) →
+    /// `NotFound`, matching what the per-variant targets did.
+    async fn get_lint_aggregate(
+        self: Arc<Self>,
+        req: &GetRequest,
+        kind: &GoPackageKind,
+        module_root: &str,
+    ) -> Result<GetResponse, GetError> {
+        let addr = &req.addr;
+
+        // Linting is first-party only: std/thirdparty sources are vendored, and
+        // their modules carry no golangci config to opt in with.
+        let GoPackageKind::FirstParty {
+            module_root: module_root_path,
+            ..
+        } = kind
+        else {
+            return Err(GetError::NotFound);
+        };
+
+        // No variant to select any more. Reject a stale `@v=`/`@vp=` rather than
+        // ignore it, so a pinned addr surfaces the migration instead of quietly
+        // linting a different (now wider) set of files.
+        if let Some(bad) = addr.args.keys().next() {
+            return Err(GetError::Other(anyhow::anyhow!(
+                "unknown addr arg `{bad}` on go target `:{}` — lint rules are \
+                 variant-independent, so `:{}` now aggregates every declared \
+                 variant's analysis; use a bare `:{}` (the per-variant unit is \
+                 `:_lint-analyze@v=NAME,vp=PKG`)",
+                addr.name,
+                addr.name,
+                addr.name,
+            )));
+        }
+
+        // Lint only where the module opts in with a golangci config; attach it as
+        // a hash-only dep so a config change re-keys the gate/fixer directly.
+        let Some(config_addr) = self.golangci_config_addr(module_root_path) else {
+            return Err(GetError::NotFound);
+        };
+
+        // The ancestry variants — the same set `list` used to multiply these
+        // targets across, now folded into one target's deps.
+        let vrefs: Vec<VariantRef> =
+            variant::ancestry_variants_with_factors(&req.states, module_root)
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect();
+
+        // One `_golist` read per variant, fanned out: they are independent and
+        // engine-cached (the `_lint-analyze` targets read the very same ones).
+        let per_variant = futures::future::try_join_all(vrefs.iter().map(|vref| {
+            let this = Arc::clone(&self);
+            let executor = Arc::clone(&req.executor);
+            let golist_addr = self.make_addr_with_name(&addr.package, "_golist", vref);
+            async move {
+                match this.read_golist_package(executor, &golist_addr).await {
+                    // No buildable Go files under this variant's constraints →
+                    // no analysis unit to aggregate.
+                    Ok(pkg) if pkg.go_files.is_empty() => anyhow::Ok(None),
+                    Ok(pkg) => anyhow::Ok(Some((vref.clone(), pkg, golist_addr))),
+                    Err(e) if downcast_chain_ref::<NoGoFilesError>(&e).is_some() => {
+                        anyhow::Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }))
+        .await
+        .map_err(GetError::Other)?;
+
+        let analyzed: Vec<(VariantRef, Arc<GoPackage>, Addr)> =
+            per_variant.into_iter().flatten().collect();
+        if analyzed.is_empty() {
+            return Err(GetError::NotFound);
+        }
+
+        let analyze_addrs: Vec<Addr> = analyzed
+            .iter()
+            .map(|(vref, _, _)| self.make_addr_with_name(&addr.package, "_lint-analyze", vref))
+            .collect();
+
+        if addr.name == "lint-check" {
+            let spec = crate::plugingo::driver_lint::build_lint_gate_spec(
+                addr.clone(),
+                &analyze_addrs,
+                Some(&config_addr),
+            );
+            return Ok(GetResponse { target_spec: spec });
+        }
+
+        // The fixer additionally stages the sources it rewrites. Union them
+        // across variants: a file the selected variant's constraints excluded is
+        // still linted (and so still fixable) under another one, and it must be a
+        // declared output or the engine has nowhere to write the fix back.
+        let addrs_per_variant =
+            futures::future::try_join_all(analyzed.iter().map(|(_, _, golist_addr)| {
+                self.read_golist_package_addrs(Arc::clone(&req.executor), golist_addr)
+            }))
+            .await
+            .map_err(GetError::Other)?;
+
+        // Keyed by basename (a Go package's files are flat, so basenames are
+        // unique in it) → source addr. `resolve_package_addrs` maps files 1:1 in
+        // order, so `go_files[i]` is the addr of `pkg.go_files[i]`. `BTreeMap`
+        // keeps the two emitted lists aligned, deduped and in a stable order, so
+        // the spec — and the target's input hash — is reproducible.
+        let mut by_file: BTreeMap<String, String> = BTreeMap::new();
+        for ((_, pkg, _), pkg_addrs) in analyzed.iter().zip(addrs_per_variant.iter()) {
+            for (file, src) in pkg.go_files.iter().zip(pkg_addrs.go_files.iter()) {
+                by_file.entry(file.clone()).or_insert_with(|| src.clone());
+            }
+        }
+        let go_files: Vec<String> = by_file.keys().cloned().collect();
+        let src_addrs: Vec<String> = by_file.into_values().collect();
+
+        let spec = crate::plugingo::driver_lint::build_lint_fix_spec(
+            addr.clone(),
+            &analyze_addrs,
+            &src_addrs,
+            &go_files,
+            Some(&config_addr),
+        );
+        Ok(GetResponse { target_spec: spec })
     }
 
     /// The addr of the module's golangci-lint config, if the module root (the
@@ -2480,7 +2953,7 @@ impl ProviderInner {
     fn libs_key(
         root_pkg: &GoPackage,
         extra_imports: &[String],
-        factors: &Factors,
+        vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
     ) -> LibsKey {
@@ -2493,7 +2966,7 @@ impl ProviderInner {
         LibsKey {
             imports,
             extra,
-            factors: factors.clone(),
+            vref: vref.clone(),
             module_root: module_root.to_path_buf(),
             transitive,
         }
@@ -2514,18 +2987,11 @@ impl ProviderInner {
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
-        factors: &Factors,
+        vref: &VariantRef,
         module_root: &Path,
     ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(
-            executor,
-            root_pkg,
-            extra_imports,
-            factors,
-            module_root,
-            true,
-        )
-        .await
+        self.collect_libs(executor, root_pkg, extra_imports, vref, module_root, true)
+            .await
     }
 
     /// Resolve direct imports only (no recursion) — correct for compile steps.
@@ -2534,18 +3000,11 @@ impl ProviderInner {
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
-        factors: &Factors,
+        vref: &VariantRef,
         module_root: &Path,
     ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(
-            executor,
-            root_pkg,
-            extra_imports,
-            factors,
-            module_root,
-            false,
-        )
-        .await
+        self.collect_libs(executor, root_pkg, extra_imports, vref, module_root, false)
+            .await
     }
 
     async fn collect_libs(
@@ -2553,23 +3012,23 @@ impl ProviderInner {
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
-        factors: &Factors,
+        vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
     ) -> anyhow::Result<TransitiveDeps> {
-        let key = Self::libs_key(root_pkg, extra_imports, factors, module_root, transitive);
+        let key = Self::libs_key(root_pkg, extra_imports, vref, module_root, transitive);
         let extra = extra_imports.to_vec();
         let module_root = module_root.to_path_buf();
         let arc = self
             .libs_cache
             .once(
                 key,
-                enclose!((self => me, executor, factors, root_pkg.imports => root_imports) move || async move {
+                enclose!((self => me, executor, vref, root_pkg.imports => root_imports) move || async move {
                     me.collect_libs_inner(
                         executor,
                         &root_imports,
                         &extra,
-                        &factors,
+                        &vref,
                         &module_root,
                         transitive,
                     )
@@ -2649,24 +3108,24 @@ impl ProviderInner {
         self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
         import_path: String,
-        factors: Factors,
+        vref: VariantRef,
         go_mod: Arc<GoModData>,
         module_root: PathBuf,
     ) -> anyhow::Result<Arc<ImportClosure>> {
         let key = ImportClosureKey {
             import_path: import_path.clone(),
-            factors: factors.clone(),
+            vref: vref.clone(),
             module_root: module_root.clone(),
         };
         self.import_closure_cache
             .once(
                 key,
-                enclose!((self => me, executor, import_path, factors, go_mod, module_root) move || async move {
+                enclose!((self => me, executor, import_path, vref, go_mod, module_root) move || async move {
                     let (resolved_path, dep_addr_opt, sub_imports) = me
                         .resolve_import(
                             Arc::clone(&executor),
                             &import_path,
-                            &factors,
+                            &vref,
                             &go_mod.requires,
                             &go_mod.module_path,
                             &module_root,
@@ -2681,7 +3140,7 @@ impl ProviderInner {
                                 Arc::clone(&me).import_closure(
                                     Arc::clone(&executor),
                                     sub,
-                                    factors.clone(),
+                                    vref.clone(),
                                     Arc::clone(&go_mod),
                                     module_root.clone(),
                                 )
@@ -2707,7 +3166,7 @@ impl ProviderInner {
         executor: Arc<dyn ProviderExecutor>,
         root_imports: &[String],
         extra_imports: &[String],
-        factors: &Factors,
+        vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
     ) -> anyhow::Result<TransitiveDeps> {
@@ -2734,7 +3193,7 @@ impl ProviderInner {
                 Arc::clone(&self).import_closure(
                     Arc::clone(&executor),
                     ip,
-                    factors.clone(),
+                    vref.clone(),
                     Arc::clone(&go_mod),
                     module_root_buf.clone(),
                 )
@@ -2773,7 +3232,7 @@ impl ProviderInner {
             self.resolve_import(
                 Arc::clone(&executor),
                 ip,
-                factors,
+                vref,
                 go_mod_requires,
                 workspace_module_path,
                 module_root,
@@ -2794,7 +3253,7 @@ impl ProviderInner {
         &self,
         executor: Arc<dyn ProviderExecutor>,
         import_path: &str,
-        factors: &Factors,
+        vref: &VariantRef,
         go_mod_requires: &[(String, String)],
         workspace_module_path: &str,
         module_root: &Path,
@@ -2803,11 +3262,11 @@ impl ProviderInner {
             && (import_path == workspace_module_path
                 || import_path.starts_with(&format!("{}/", workspace_module_path)));
         if !is_workspace_module && is_stdlib_import_path(import_path) {
-            let addr = encode_stdlib(import_path, factors);
+            let addr = encode_stdlib(import_path, vref);
             let golist_addr = Addr::new(
                 hmodel::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),
                 "_golist".to_string(),
-                factors_to_args(factors),
+                vref.to_args(),
             );
             // Propagate golist errors instead of swallowing them: a missing or
             // partial closure here turns into a broken link step downstream
@@ -2823,7 +3282,7 @@ impl ProviderInner {
 
         let dep_addr = match self.resolve_import_to_addr(
             import_path,
-            factors,
+            vref,
             module_root,
             workspace_module_path,
             go_mod_requires,
@@ -2861,7 +3320,7 @@ impl ProviderInner {
     fn resolve_import_to_addr(
         &self,
         import_path: &str,
-        factors: &Factors,
+        vref: &VariantRef,
         module_root: &Path,
         workspace_module_path: &str,
         go_mod_requires: &[(String, String)],
@@ -2886,7 +3345,7 @@ impl ProviderInner {
             } else {
                 self.workspace_root.join(module_rel).join(rel_suffix)
             };
-            return Some(encode_firstparty(&src_dir, &self.workspace_root, factors));
+            return Some(encode_firstparty(&src_dir, &self.workspace_root, vref));
         }
 
         // Third-party: look up in go.mod requires
@@ -2902,7 +3361,7 @@ impl ProviderInner {
                 .to_string_lossy()
                 .to_string();
             return Some(encode_thirdparty(
-                &mod_path, &version, &subpath, &base_pkg, factors,
+                &mod_path, &version, &subpath, &base_pkg, vref,
             ));
         }
 
@@ -3043,86 +3502,48 @@ mod tests {
         let args = FnArgs {
             positional: vec![
                 Value::String("mylib".into()),
-                Value::String("linux".into()),
-                Value::String("amd64".into()),
+                Value::String("release".into()),
             ],
             named: HashMap::new(),
         };
         let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(
-            v,
-            Value::String("//mylib:build@goarch=amd64,goos=linux".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_addr_tags() {
-        let mut named = HashMap::new();
-        // Unsorted on input — must come out sorted (bar,foo) in the addr.
-        named.insert(
-            "tags".to_string(),
-            Value::List(vec![
-                Value::String("foo".into()),
-                Value::String("bar".into()),
-            ]),
-        );
-        let args = FnArgs {
-            positional: vec![
-                Value::String("@heph/go/std/fmt".into()),
-                Value::String("darwin".into()),
-                Value::String("arm64".into()),
-            ],
-            named,
-        };
-        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(
-            v,
-            Value::String(
-                "//@heph/go/std/fmt:build@goarch=arm64,goos=darwin,tags=\"bar,foo\"".into()
-            )
-        );
+        assert_eq!(v, Value::String("//mylib:build@v=release".into()));
     }
 
     #[tokio::test]
     async fn test_build_addr_named_args() {
         let mut named = HashMap::new();
         named.insert("pkg".to_string(), Value::String("mylib".into()));
-        named.insert("goos".to_string(), Value::String("linux".into()));
-        named.insert("goarch".to_string(), Value::String("amd64".into()));
+        named.insert("variant".to_string(), Value::String("release".into()));
         let args = FnArgs {
             positional: vec![],
             named,
         };
         let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
-        assert_eq!(
-            v,
-            Value::String("//mylib:build@goarch=amd64,goos=linux".into())
-        );
+        assert_eq!(v, Value::String("//mylib:build@v=release".into()));
     }
 
+    // Omitting `variant` returns the magic host-default `build` addr (bare, no
+    // `@v`) — the provider serves it as a `group` to the host-matching variant.
     #[tokio::test]
-    async fn test_build_addr_missing_goarch_errors() {
+    async fn test_build_addr_without_variant_returns_magic_addr() {
         let args = FnArgs {
-            positional: vec![Value::String("mylib".into()), Value::String("linux".into())],
+            positional: vec![Value::String("mylib".into())],
             named: HashMap::new(),
         };
-        let err = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap_err();
-        assert!(err.to_string().contains("missing `goarch`"), "{err}");
+        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        assert_eq!(v, Value::String("//mylib:build".into()));
     }
 
-    fn run_str(spec: &hplugin::provider::TargetSpec) -> String {
-        match spec.config.get("run").unwrap() {
-            Value::String(s) => s.clone(),
-            Value::List(v) => v
-                .iter()
-                .map(|x| match x {
-                    Value::String(s) => s.as_str(),
-                    _ => panic!("run entry not a string"),
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => panic!("run not string or list"),
-        }
+    // An explicit empty variant is treated the same as omitting it.
+    #[tokio::test]
+    async fn test_build_addr_empty_variant_returns_magic_addr() {
+        let args = FnArgs {
+            positional: vec![Value::String("mylib".into()), Value::String("".into())],
+            named: HashMap::new(),
+        };
+        let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
+        assert_eq!(v, Value::String("//mylib:build".into()));
     }
 
     fn go_available() -> bool {
@@ -3148,6 +3569,11 @@ mod tests {
         workspace_root: PathBuf,
         /// Source map applied when generating `package_addrs.bin`.
         source_map: HashMap<String, String>,
+        /// The variant declarations this workspace has. Served from
+        /// `states_under`, and used to turn an addr's `v` into the `GOOS`/`GOARCH`
+        /// the mocked `go list` runs under — so a `_golist` really does see a
+        /// different file set per variant, as it does in production.
+        states: Vec<State>,
     }
 
     struct BinaryArtifact {
@@ -3178,6 +3604,21 @@ mod tests {
     }
 
     impl ProviderExecutor for GoListTestExecutor {
+        // The test fixtures are single-module workspaces (go.mod at root), so the
+        // module universe = the variants declared at the root. Serve them for
+        // `states_under` of the root prefix; deeper prefixes have no declarations.
+        fn states_under<'a>(
+            &'a self,
+            prefix: &'a hmodel::htpkg::PkgBuf,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<hplugin::provider::State>>> {
+            let states = if prefix.as_str().is_empty() {
+                self.states.clone()
+            } else {
+                vec![]
+            };
+            Box::pin(async move { Ok(states) })
+        }
+
         fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
             Box::pin(async move {
                 if addr.name != "_golist" {
@@ -3187,7 +3628,24 @@ mod tests {
                     );
                 }
 
-                let factors = Factors::from_addr(addr);
+                // Resolve the addr's variant against the declared states so the
+                // mocked `go list` runs with that variant's `GOOS`/`GOARCH` —
+                // build constraints must select a different file set per variant
+                // here just as they do in production. Falls back to host factors
+                // for an addr with no `v` (or a name this workspace never
+                // declared).
+                let factors = addr
+                    .args
+                    .get("v")
+                    .and_then(|name| variant::resolve_ancestry(name, &self.states, "").ok())
+                    .map_or_else(
+                        || Factors {
+                            goos: current_goos(),
+                            goarch: current_goarch(),
+                            ..Default::default()
+                        },
+                        |(f, _)| f,
+                    );
                 let kind = decode_package(&addr.package, &self.workspace_root)
                     .ok_or_else(|| anyhow::anyhow!("unknown package: {}", addr.package))?;
 
@@ -3276,6 +3734,7 @@ mod tests {
         Arc::new(GoListTestExecutor {
             workspace_root: workspace_root.to_path_buf(),
             source_map: HashMap::new(),
+            states: vec![host_variant_state()],
         })
     }
 
@@ -3303,8 +3762,37 @@ mod tests {
         Ok(())
     }
 
+    /// Build a fully-resolved internal addr carrying the default test variant
+    /// (`host`, defined at the root by [`host_variant_state`]).
     fn make_addr(package: &str, name: &str) -> Addr {
+        Addr::new(
+            PkgBuf::from(package),
+            name.to_string(),
+            VariantRef::new("host", "").to_args(),
+        )
+    }
+
+    /// Addr with no variant args — for the variant-free targets
+    /// (`format`/`format-check`, `download`, `_go_mod`).
+    fn make_bare_addr(package: &str, name: &str) -> Addr {
         Addr::new(PkgBuf::from(package), name.to_string(), Default::default())
+    }
+
+    /// A root `provider_state(provider="go", variants={"host": {goos, goarch}})`
+    /// defining the default `host` variant every test target resolves against.
+    fn host_variant_state() -> State {
+        let variant = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String(current_goarch())),
+        ]));
+        State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([("host".to_string(), variant)])),
+            )]),
+        }
     }
 
     /// Write a minimal `.golangci.yml` at a fixture's module root so its lint and
@@ -3400,14 +3888,13 @@ mod tests {
         enable_golangci(sandbox.path());
         // Default `govet` — i.e. the dev build's (nonexistent) release target.
         let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
-        for name in [
-            "_lint-analyze",
-            "lint-check",
-            "lint",
-            "format-check",
-            "format",
-        ] {
-            provider_get(&p, make_addr("cmd", name))
+        // `_lint-analyze` is the per-variant unit; the gate/fixer and the
+        // formatters are bare.
+        provider_get(&p, make_addr("cmd", "_lint-analyze"))
+            .await
+            .unwrap_or_else(|e| panic!("_lint-analyze spec must resolve on a dev build: {e:?}"));
+        for name in ["lint-check", "lint", "format-check", "format"] {
+            provider_get(&p, make_bare_addr("cmd", name))
                 .await
                 .unwrap_or_else(|e| panic!("{name} spec must resolve on a dev build: {e:?}"));
         }
@@ -3607,7 +4094,7 @@ mod tests {
         GetRequest {
             request_id: "test".to_string(),
             addr,
-            states: vec![],
+            states: vec![host_variant_state()],
             executor: test_executor(workspace_root),
         }
     }
@@ -3701,10 +4188,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = GetRequest {
             request_id: "test".to_string(),
             addr: make_addr("", "_golist"),
-            states: vec![],
+            states: vec![host_variant_state()],
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &ctoken).await.unwrap();
@@ -3749,6 +4237,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let inner: Arc<dyn ProviderExecutor> = Arc::new(GoListTestExecutor {
             workspace_root: sandbox.path().to_path_buf(),
             source_map: HashMap::new(),
+            states: vec![host_variant_state()],
         });
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let executor: Arc<dyn ProviderExecutor> = Arc::new(CountingExecutor {
@@ -3823,7 +4312,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = GetRequest {
             request_id: "test".to_string(),
             addr: make_addr("", "codegen_gen"),
-            states: vec![],
+            states: vec![host_variant_state()],
             executor,
         };
 
@@ -3948,7 +4437,13 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
 
         for name in ["_lint-analyze", "format-check", "format"] {
-            let resp = provider_get(&p, make_addr("cmd", name)).await.unwrap();
+            // Formatting is variant-free; lint is not.
+            let addr = if name.starts_with("format") {
+                make_bare_addr("cmd", name)
+            } else {
+                make_addr("cmd", name)
+            };
+            let resp = provider_get(&p, addr).await.unwrap();
             let deps = match resp.target_spec.config.get("deps").unwrap() {
                 Value::Map(m) => m,
                 other => panic!("{name}: expected deps map, got {other:?}"),
@@ -3976,7 +4471,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("cmd", "lint-check"))
+        let resp = provider_get(&p, make_bare_addr("cmd", "lint-check"))
             .await
             .unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint_gate");
@@ -4007,7 +4502,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("cmd", "lint")).await.unwrap();
+        let resp = provider_get(&p, make_bare_addr("cmd", "lint"))
+            .await
+            .unwrap();
         assert_eq!(resp.target_spec.driver, "go_lint_fix");
 
         let deps = match resp.target_spec.config.get("deps").unwrap() {
@@ -4046,7 +4543,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         enable_golangci(sandbox.path());
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
 
-        let check = provider_get(&p, make_addr("cmd", "format-check"))
+        let check = provider_get(&p, make_bare_addr("cmd", "format-check"))
             .await
             .unwrap();
         assert_eq!(check.target_spec.driver, "go_format_check");
@@ -4055,7 +4552,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "check gate declares no outputs"
         );
 
-        let fix = provider_get(&p, make_addr("cmd", "format")).await.unwrap();
+        let fix = provider_get(&p, make_bare_addr("cmd", "format"))
+            .await
+            .unwrap();
         assert_eq!(fix.target_spec.driver, "go_format");
         // Stages the heph-govet tool + the package's own sources.
         let deps = match fix.target_spec.config.get("deps").unwrap() {
@@ -4070,6 +4569,341 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(
             fix.target_spec.config.get("out").is_some(),
             "fix declares in_place outputs"
+        );
+    }
+
+    /// Formatting is syntactic: it must cover every `.go` file in the package,
+    /// including the ones the current variant's build constraints exclude.
+    /// Sourcing the list from `_golist` (i.e. `go list`'s `GoFiles`) left
+    /// `foo_windows.go` unformatted forever on a workspace with no windows
+    /// variant — and `_test.go` files unformatted everywhere.
+    #[tokio::test]
+    async fn test_format_covers_constraint_excluded_and_test_files() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        // Neither of these is in `go list`'s GoFiles for the host variant: the
+        // first is excluded by its filename build constraint (no test host is
+        // both windows and plan9), the second is a test file.
+        let pkg_dir = sandbox.path().join("cmd");
+        std::fs::write(
+            pkg_dir.join("only_windows.go"),
+            "//go:build windows && plan9\n\npackage main\n",
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("main_test.go"), "package main\n").unwrap();
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let fix = provider_get(&p, make_bare_addr("cmd", "format"))
+            .await
+            .unwrap();
+        let out = match fix.target_spec.config.get("out").expect("out") {
+            Value::Map(m) => match m.iter().find(|(k, _)| *k == "src").map(|(_, v)| v) {
+                Some(Value::List(l)) => l
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => panic!("out entry not a string: {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                other => panic!("src group missing: {other:?}"),
+            },
+            other => panic!("out not a map: {other:?}"),
+        };
+        for expected in ["only_windows.go", "main_test.go", "main.go"] {
+            assert!(
+                out.iter().any(|f| f == expected),
+                "{expected} must be formatted: {out:?}"
+            );
+        }
+    }
+
+    /// A state declaring `host` plus a second, cross-compiled variant — the
+    /// two-variant ancestry the aggregation tests need.
+    fn two_variant_state() -> State {
+        let cross = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String("windows".into())),
+            ("goarch".to_string(), Value::String("amd64".into())),
+        ]));
+        let host = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String(current_goarch())),
+        ]));
+        State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([
+                    ("host".to_string(), host),
+                    ("win".to_string(), cross),
+                ])),
+            )]),
+        }
+    }
+
+    /// `provider_get` with a custom variant declaration — threaded into both the
+    /// request's ancestry states and the executor, so the mocked `_golist` runs
+    /// under each variant's own factors.
+    async fn provider_get_with_states(
+        p: &Provider,
+        addr: Addr,
+        states: Vec<State>,
+    ) -> Result<GetResponse, GetError> {
+        let ctoken = StdCancellationToken::new();
+        let workspace = p.inner.workspace_root.clone();
+        p.get(
+            GetRequest {
+                request_id: "test".to_string(),
+                addr,
+                states: states.clone(),
+                executor: Arc::new(GoListTestExecutor {
+                    workspace_root: workspace,
+                    source_map: HashMap::new(),
+                    states,
+                }),
+            },
+            &ctoken,
+        )
+        .await
+    }
+
+    /// The string entries of a spec's dep group.
+    fn dep_group(spec: &hplugin::provider::TargetSpec, group: &str) -> Vec<String> {
+        let deps = match spec.config.get("deps").expect("deps") {
+            Value::Map(m) => m,
+            other => panic!("deps not a map: {other:?}"),
+        };
+        match deps.get(group) {
+            Some(Value::List(l)) => l
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("dep entry not a string: {other:?}"),
+                })
+                .collect(),
+            other => panic!("dep group `{group}` missing: {other:?}"),
+        }
+    }
+
+    /// The gate aggregates: one `_lint-analyze` report dep per declared variant,
+    /// off a single bare addr. Selecting one variant instead would report on
+    /// whichever subset of the package's files that variant's build constraints
+    /// happen to admit.
+    #[tokio::test]
+    async fn test_lint_check_aggregates_every_variants_report() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let resp = provider_get_with_states(
+            &p,
+            make_bare_addr("cmd", "lint-check"),
+            vec![two_variant_state()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_gate");
+
+        let reports = dep_group(&resp.target_spec, "report");
+        assert_eq!(
+            reports.len(),
+            2,
+            "one analyze report per declared variant: {reports:?}"
+        );
+        for v in ["v=host", "v=win"] {
+            assert!(
+                reports.iter().any(|r| r.contains(":_lint-analyze")
+                    && r.contains(v)
+                    && r.ends_with("|report")),
+                "gate must consume {v}'s analyze report: {reports:?}"
+            );
+        }
+    }
+
+    /// The fixer unions its sources across variants: a file only one variant's
+    /// build constraints admit is still analyzed under that variant, so its fix
+    /// must have somewhere to land. Under the old per-variant fixer it was both
+    /// unfixable from the other variant AND claimed as a `codegen = in_place`
+    /// output by two targets at once.
+    #[tokio::test]
+    async fn test_lint_fix_unions_sources_across_variants() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        // One file per variant, each invisible to the other's `go list`. Note the
+        // filenames: `_windows.go` is itself a build constraint, so the
+        // non-windows file must not be named `not_windows.go`.
+        let pkg_dir = sandbox.path().join("cmd");
+        std::fs::write(
+            pkg_dir.join("only_windows.go"),
+            "//go:build windows\n\npackage main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("elsewhere.go"),
+            "//go:build !windows\n\npackage main\n",
+        )
+        .unwrap();
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let resp =
+            provider_get_with_states(&p, make_bare_addr("cmd", "lint"), vec![two_variant_state()])
+                .await
+                .unwrap();
+        assert_eq!(resp.target_spec.driver, "go_lint_fix");
+
+        let out = match resp.target_spec.config.get("out").expect("out") {
+            Value::Map(m) => match m.iter().find(|(k, _)| *k == "src").map(|(_, v)| v) {
+                Some(Value::List(l)) => l
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => panic!("out entry not a string: {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                other => panic!("src group missing: {other:?}"),
+            },
+            other => panic!("out not a map: {other:?}"),
+        };
+        for expected in ["only_windows.go", "elsewhere.go", "main.go"] {
+            assert!(
+                out.iter().any(|f| f == expected),
+                "{expected} must be a fixable output: {out:?}"
+            );
+        }
+        // Each path claimed exactly once — the whole point of one fixer instead
+        // of one per variant.
+        let mut sorted = out.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            out.len(),
+            "duplicate in_place claims: {out:?}"
+        );
+        // Sources and outputs stay index-aligned and deduped the same way.
+        assert_eq!(dep_group(&resp.target_spec, "").len(), out.len());
+    }
+
+    /// A stale `lint@v=NAME` (from when the gate/fixer were variant-selected)
+    /// must fail loudly rather than silently linting a now-wider set of files.
+    #[tokio::test]
+    async fn test_lint_rejects_a_variant_arg() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        for name in ["lint", "lint-check"] {
+            let msg = match provider_get(&p, make_addr("cmd", name)).await {
+                Err(GetError::Other(e)) => format!("{e:#}"),
+                Err(other) => panic!("expected a typed error for {name}, got {other:?}"),
+                Ok(_) => panic!("a variant arg on {name} must be rejected"),
+            };
+            assert!(
+                msg.contains("variant-independent") && msg.contains("_lint-analyze"),
+                "error must explain the aggregation and name the per-variant unit: {msg}"
+            );
+        }
+    }
+
+    /// None of the user-facing lint/format targets carry a variant, so `list`
+    /// emits exactly one bare addr each no matter how many variants a module
+    /// declares. `format` is variant-free outright; `lint-check`/`lint` aggregate
+    /// the per-variant `_lint-analyze` units, which stay internal (unlisted).
+    #[tokio::test]
+    async fn list_emits_lint_and_format_once_and_variant_free() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        // Two variants in ancestry: `host` (so runnable targets list) and a
+        // second, cross-compiled one.
+        let cross = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String("linux".into())),
+            ("goarch".to_string(), Value::String("arm64".into())),
+        ]));
+        let host = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String(current_goarch())),
+        ]));
+        let states = vec![State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([
+                    ("host".to_string(), host),
+                    ("cross".to_string(), cross),
+                ])),
+            )]),
+        }];
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from("cmd"),
+            states,
+            executor: test_executor(&p.inner.workspace_root),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        for name in ["format", "format-check", "lint", "lint-check"] {
+            let listed: Vec<&Addr> = addrs.iter().filter(|a| a.name == name).collect();
+            assert_eq!(
+                listed.len(),
+                1,
+                "{name} must be listed once, not per variant: {listed:?}"
+            );
+            assert!(
+                listed[0].args.is_empty(),
+                "{name} must carry no variant args: {:?}",
+                listed[0]
+            );
+        }
+        // The variant-scoped analysis unit stays internal: the aggregators pull
+        // it in as a dep, so listing it too would run every variant's analysis
+        // twice over in a `//...` sweep.
+        assert!(
+            !addrs.iter().any(|a| a.name == "_lint-analyze"),
+            "_lint-analyze must stay unlisted: {addrs:?}"
+        );
+        // The contrast: `build` genuinely is variant-selected, so it stays
+        // multiplied across the two declared variants (plus the bare host-default).
+        assert_eq!(
+            addrs
+                .iter()
+                .filter(|a| a.name == "build" && !a.args.is_empty())
+                .count(),
+            2,
+            "build must still be listed per variant: {addrs:?}"
+        );
+    }
+
+    /// A stale `format@v=NAME` (e.g. carried over from when formatting was
+    /// variant-parameterized) must fail loudly, not silently format something
+    /// else.
+    #[tokio::test]
+    async fn test_format_rejects_a_variant_arg() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep");
+        enable_golangci(sandbox.path());
+        let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+
+        let msg = match provider_get(&p, make_addr("cmd", "format")).await {
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(other) => panic!("expected a typed error, got {other:?}"),
+            Ok(_) => panic!("a variant arg on format must be rejected"),
+        };
+        assert!(
+            msg.contains("variant-free") && msg.contains("`v`"),
+            "error must explain formatting is variant-free: {msg}"
         );
     }
 
@@ -4090,11 +4924,15 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "format-check",
             "format",
         ] {
+            // Only the internal `_lint-analyze` unit carries a variant; the
+            // user-facing gate/fixer and the formatters are bare.
+            let addr = if name == "_lint-analyze" {
+                make_addr("cmd", name)
+            } else {
+                make_bare_addr("cmd", name)
+            };
             assert!(
-                matches!(
-                    provider_get(&p, make_addr("cmd", name)).await,
-                    Err(GetError::NotFound)
-                ),
+                matches!(provider_get(&p, addr).await, Err(GetError::NotFound)),
                 "{name} must be NotFound without a golangci config"
             );
         }
@@ -4125,7 +4963,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )
         .unwrap();
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
-        provider_get(&p, make_addr("cmd", "lint-check"))
+        provider_get(&p, make_bare_addr("cmd", "lint-check"))
             .await
             .expect("lint-check resolves with a .golangci.yaml");
         let names = provider_list(&p, "cmd").await;
@@ -4404,17 +5242,36 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     // ---- factors ----
 
     #[tokio::test]
-    async fn test_factors_linux_amd64_in_compile_config() {
+    async fn test_variant_factors_flow_to_compile_config() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let addr = {
-            let mut args = std::collections::BTreeMap::new();
-            args.insert("goos".to_string(), "linux".to_string());
-            args.insert("goarch".to_string(), "amd64".to_string());
-            Addr::new(PkgBuf::from(""), "build_lib".to_string(), args)
+        // A root variant pinning linux/amd64; resolving `build_lib@v=x` must thread
+        // those factors into the go_compile config.
+        let variant = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String("linux".into())),
+            ("goarch".to_string(), Value::String("amd64".into())),
+        ]));
+        let state = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([("x".to_string(), variant)])),
+            )]),
         };
-        let resp = provider_get(&p, addr).await.unwrap();
+        let addr = Addr::new(
+            PkgBuf::from(""),
+            "build_lib".to_string(),
+            VariantRef::new("x", "").to_args(),
+        );
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr,
+            states: vec![state],
+            executor: test_executor(sandbox.path()),
+        };
+        let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let cfg = &resp.target_spec.config;
         assert!(matches!(cfg.get("goos"), Some(Value::String(s)) if s == "linux"));
         assert!(matches!(cfg.get("goarch"), Some(Value::String(s)) if s == "amd64"));
@@ -4557,13 +5414,184 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = ListRequest {
             request_id: "test".to_string(),
             package: PkgBuf::from(package),
-            states: vec![],
+            states: vec![host_variant_state()],
+            executor: test_executor(&p.inner.workspace_root),
         };
         p.list(req, &ctoken)
             .await
             .unwrap()
             .map(|r| r.unwrap().addr.name.clone())
             .collect()
+    }
+
+    /// The completeness fix: a library target must list a variant declared at a
+    /// **sibling** package (reachable only via the module universe / `states_under`),
+    /// not just the package's own ancestry. Entry targets stay ancestry-scoped.
+    #[tokio::test]
+    async fn list_library_enumerates_sibling_variant_from_universe() {
+        let sandbox = copy_fixture("simple_lib"); // a library package at the module root
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        // `release` declared ONLY at sibling package `other` — not in the root
+        // lib's ancestry. `states_under` (the module universe) surfaces it.
+        struct SiblingUniverse;
+        impl ProviderExecutor for SiblingUniverse {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                unimplemented!("list must not resolve results")
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                unimplemented!("list must not query")
+            }
+            fn states_under<'a>(
+                &'a self,
+                prefix: &'a PkgBuf,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+                let release = Value::Map(HashMap::from([
+                    ("goos".to_string(), Value::String("linux".into())),
+                    ("goarch".to_string(), Value::String("amd64".into())),
+                ]));
+                let states = if prefix.as_str().is_empty() {
+                    vec![State {
+                        package: PkgBuf::from("other"),
+                        provider: "go".to_string(),
+                        state: HashMap::from([(
+                            "variants".to_string(),
+                            Value::Map(HashMap::from([("release".to_string(), release)])),
+                        )]),
+                    }]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move { Ok(states) })
+            }
+        }
+
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from(""),
+            states: vec![], // no ancestry variants for this package
+            executor: Arc::new(SiblingUniverse),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        // build_lib (library) lists the sibling's variant, pinned via `vp`.
+        assert!(
+            addrs.iter().any(|a| a.name == "build_lib"
+                && a.args.get("v").map(String::as_str) == Some("release")
+                && a.args.get("vp").map(String::as_str) == Some("other")),
+            "sibling-declared variant must be listed on build_lib: {addrs:?}"
+        );
+        // build (entry) is ancestry-scoped — nothing declared in ancestry, so it
+        // is not listed.
+        assert!(
+            !addrs.iter().any(|a| a.name == "build"),
+            "entry target must not list a variant absent from ancestry: {addrs:?}"
+        );
+    }
+
+    /// Module-bounding: `states_under` walks by path prefix, so a variant
+    /// declared inside a **nested submodule** (its own `go.mod`) is returned too.
+    /// The root module's `list` must NOT enumerate it — that variant is a
+    /// different module's target. Only the same-module (root) variant is listed.
+    #[tokio::test]
+    async fn list_library_excludes_nested_submodule_variant() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("go.mod"),
+            "module example.com/root\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::create_dir(ws.path().join("nested")).unwrap();
+        std::fs::write(
+            ws.path().join("nested/go.mod"),
+            "module example.com/nested\ngo 1.22\n",
+        )
+        .unwrap();
+        let p = Provider::new(ws.path().to_path_buf()).unwrap();
+
+        // `release` declared at the root module ("") AND at the nested submodule
+        // ("nested"). `states_under("")` returns both by prefix.
+        struct NestedUniverse;
+        impl ProviderExecutor for NestedUniverse {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                unimplemented!("list must not resolve results")
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                unimplemented!("list must not query")
+            }
+            fn states_under<'a>(
+                &'a self,
+                prefix: &'a PkgBuf,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+                let variant = || {
+                    Value::Map(HashMap::from([
+                        ("goos".to_string(), Value::String("linux".into())),
+                        ("goarch".to_string(), Value::String("amd64".into())),
+                    ]))
+                };
+                let go_state = |pkg: &str| State {
+                    package: PkgBuf::from(pkg),
+                    provider: "go".to_string(),
+                    state: HashMap::from([(
+                        "variants".to_string(),
+                        Value::Map(HashMap::from([("release".to_string(), variant())])),
+                    )]),
+                };
+                let states = if prefix.as_str().is_empty() {
+                    vec![go_state(""), go_state("nested")]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move { Ok(states) })
+            }
+        }
+
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from(""),
+            states: vec![],
+            executor: Arc::new(NestedUniverse),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        // The root-module variant is listed (vp="").
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.name == "build_lib" && a.args.get("vp").map(String::as_str) == Some("")),
+            "root-module variant must be listed: {addrs:?}"
+        );
+        // The nested submodule's variant must NOT be — it's a different module.
+        assert!(
+            !addrs
+                .iter()
+                .any(|a| a.args.get("vp").map(String::as_str) == Some("nested")),
+            "nested submodule variant must not cross the module boundary: {addrs:?}"
+        );
     }
 
     #[tokio::test]
@@ -5431,7 +6459,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = ListRequest {
             request_id: "test".to_string(),
             package: PkgBuf::from("pkg"),
-            states: vec![with_recursive(state_with_test_skip("", true))],
+            states: vec![
+                with_recursive(state_with_test_skip("", true)),
+                host_variant_state(),
+            ],
+            executor: test_executor(sandbox.path()),
         };
         let names: Vec<String> = p
             .list(req, &ctoken)
@@ -5450,6 +6482,246 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(names.iter().any(|n| n == "_golist"));
     }
 
+    /// Runnable `test`/`xtest` targets execute the built binary, so `list` emits
+    /// them only for ancestry variants matching the host `goos`/`goarch`. The
+    /// cross-compilable `build_test`/`build_xtest` list for *every* variant.
+    #[tokio::test]
+    async fn list_runnable_test_targets_only_for_host_variant() {
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        // Module root declares two variants: `host` (this machine) and `cross`
+        // (host goos, a non-host goarch).
+        let host = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String(current_goarch())),
+        ]));
+        let cross = Value::Map(HashMap::from([
+            ("goos".to_string(), Value::String(current_goos())),
+            ("goarch".to_string(), Value::String("otherarch".into())),
+        ]));
+        let two = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([
+                    ("host".to_string(), host),
+                    ("cross".to_string(), cross),
+                ])),
+            )]),
+        };
+
+        struct TwoVariantUniverse(State);
+        impl ProviderExecutor for TwoVariantUniverse {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                unimplemented!("list must not resolve results")
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                unimplemented!("list must not query")
+            }
+            fn states_under<'a>(
+                &'a self,
+                prefix: &'a PkgBuf,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<State>>> {
+                let states = if prefix.as_str().is_empty() {
+                    vec![self.0.clone()]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move { Ok(states) })
+            }
+        }
+
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from("pkg"),
+            states: vec![two.clone()],
+            executor: Arc::new(TwoVariantUniverse(two)),
+        };
+        let addrs: Vec<Addr> = p
+            .list(req, &StdCancellationToken::new())
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr)
+            .collect();
+
+        let variants_of = |name: &str| -> Vec<String> {
+            let mut v: Vec<String> = addrs
+                .iter()
+                .filter(|a| a.name == name)
+                .filter_map(|a| a.args.get("v").cloned())
+                .collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            variants_of("test"),
+            vec!["host".to_string()],
+            "runnable test must list only the host variant: {addrs:?}"
+        );
+        assert_eq!(
+            variants_of("xtest"),
+            vec!["host".to_string()],
+            "runnable xtest must list only the host variant: {addrs:?}"
+        );
+        assert_eq!(
+            variants_of("build_test"),
+            vec!["cross".to_string(), "host".to_string()],
+            "build_test must list every variant: {addrs:?}"
+        );
+        assert_eq!(
+            variants_of("build_xtest"),
+            vec!["cross".to_string(), "host".to_string()],
+            "build_xtest must list every variant: {addrs:?}"
+        );
+        // The magic host-default `build` (bare, no `@v`) is listed once alongside
+        // the per-variant `build@v=…`.
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.name == "build" && !a.args.contains_key("v")),
+            "magic bare build must be listed when a host variant exists: {addrs:?}"
+        );
+    }
+
+    /// The magic host-default `build`: a bare `//pkg:build` on a `main` package
+    /// resolves to a `group` target forwarding to `build@v=<host-matching variant>`.
+    #[tokio::test]
+    async fn magic_build_returns_group_forwarding_to_host_variant() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep"); // `cmd` is `package main`
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default());
+        let resp = provider_get(&p, addr).await.expect("magic build resolves");
+        let spec = resp.target_spec;
+        assert_eq!(spec.driver, "group");
+        let deps = match spec.config.get("deps") {
+            Some(Value::List(v)) => v,
+            other => panic!("group deps must be a list, got: {other:?}"),
+        };
+        assert_eq!(
+            deps,
+            &vec![Value::String("//cmd:build@v=host".into())],
+            "magic build must forward to the host variant"
+        );
+    }
+
+    /// No ancestry variant matches the host os/arch → the magic bare `build` does
+    /// not resolve (there is nothing to forward to). Checked before `go list`.
+    #[tokio::test]
+    async fn magic_build_not_found_without_host_variant() {
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let cross = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([(
+                "variants".to_string(),
+                Value::Map(HashMap::from([(
+                    "cross".to_string(),
+                    Value::Map(HashMap::from([
+                        ("goos".to_string(), Value::String(current_goos())),
+                        ("goarch".to_string(), Value::String("otherarch".into())),
+                    ])),
+                )])),
+            )]),
+        };
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr: Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default()),
+            states: vec![cross],
+            executor: test_executor(sandbox.path()),
+        };
+        let res = p.get(req, &StdCancellationToken::new()).await;
+        assert!(
+            matches!(res, Err(GetError::NotFound)),
+            "magic build must NotFound when no host variant exists"
+        );
+    }
+
+    /// Regression: the magic bare `build` on a NON-main package (a library or a
+    /// directory that only holds go sub-packages) must resolve to a self-addr
+    /// `NotFound` — exactly like the real `build@v=…` — so the codegen/query
+    /// walks skip it, rather than emitting a `group` whose `build@v=…` dep can't
+    /// resolve (which surfaced as a cross-addr `target not found` in
+    /// `heph tool gen-gitignore`).
+    #[tokio::test]
+    async fn magic_build_not_found_for_non_main_package() {
+        require_go!();
+        let sandbox = copy_fixture("with_dep"); // `lib` is a library (package lib)
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(PkgBuf::from("lib"), "build".to_string(), Default::default());
+        let res = provider_get(&p, addr).await;
+        assert!(
+            matches!(res, Err(GetError::NotFound)),
+            "magic build on a non-main package must NotFound"
+        );
+    }
+
+    /// Unknown addr args are rejected. A legacy `build@goos=…,goarch=…` (a
+    /// pre-variant BUILD dep) must NOT be hijacked by the magic host-default nor
+    /// silently ignored — it errors naming the offending arg, pointing at `@v=`.
+    #[tokio::test]
+    async fn unknown_build_addr_arg_is_rejected() {
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(
+            PkgBuf::from("cmd"),
+            "build".to_string(),
+            std::collections::BTreeMap::from([
+                ("goos".to_string(), "linux".to_string()),
+                ("goarch".to_string(), "amd64".to_string()),
+            ]),
+        );
+        let err = match provider_get(&p, addr).await {
+            Err(GetError::Other(e)) => e,
+            Err(GetError::NotFound) => panic!("expected an unknown-arg error, got NotFound"),
+            Ok(_) => panic!("expected an error, got Ok"),
+        };
+        let msg = format!("{err:#}");
+        // Args iterate sorted, so `goarch` (the first offending key) is named.
+        assert!(
+            msg.contains("unknown addr arg `goarch`") && msg.contains("@v="),
+            "error must name the bad arg and point at @v=: {msg}"
+        );
+    }
+
+    /// Unknown args are rejected on non-`build` targets too (the check is general,
+    /// not build-specific).
+    #[tokio::test]
+    async fn unknown_addr_arg_rejected_on_build_lib() {
+        let sandbox = copy_fixture("with_dep");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let addr = Addr::new(
+            PkgBuf::from("lib"),
+            "build_lib".to_string(),
+            std::collections::BTreeMap::from([
+                ("v".to_string(), "host".to_string()),
+                ("bogus".to_string(), "x".to_string()),
+            ]),
+        );
+        let err = match provider_get(&p, addr).await {
+            Err(GetError::Other(e)) => e,
+            other => {
+                let _ = other;
+                panic!("expected an unknown-arg error")
+            }
+        };
+        assert!(
+            format!("{err:#}").contains("unknown addr arg `bogus`"),
+            "{err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn get_returns_not_found_for_test_targets_when_test_skip_set() {
         require_go!();
@@ -5460,7 +6732,10 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             let req = GetRequest {
                 request_id: "test".to_string(),
                 addr: make_addr("pkg", name),
-                states: vec![with_recursive(state_with_test_skip("", true))],
+                states: vec![
+                    with_recursive(state_with_test_skip("", true)),
+                    host_variant_state(),
+                ],
                 executor: test_executor(sandbox.path()),
             };
             let res = p.get(req, &ctoken).await;
@@ -5483,6 +6758,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             states: vec![
                 with_recursive(state_with_test_skip("", true)),
                 state_with_test_skip("pkg", false),
+                host_variant_state(),
             ],
             executor: test_executor(sandbox.path()),
         };
@@ -5515,10 +6791,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = GetRequest {
             request_id: "test".to_string(),
             addr: make_addr("", "_golist"),
-            states: vec![],
+            states: vec![host_variant_state()],
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
@@ -5562,10 +6839,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = GetRequest {
             request_id: "test".to_string(),
             addr: make_addr("", "_golist"),
-            states: vec![state],
+            states: vec![state, host_variant_state()],
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
@@ -5748,10 +7026,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let req = GetRequest {
             request_id: "test".to_string(),
             addr: make_addr("", "_golist"),
-            states: vec![state],
+            states: vec![state, host_variant_state()],
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
+                states: vec![host_variant_state()],
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();

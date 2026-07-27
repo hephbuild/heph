@@ -43,6 +43,8 @@ struct GoGolistSpec {
     go_version: String,
     /// Go build tags.
     build_tags: Vec<String>,
+    /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
+    goexperiment: Vec<String>,
     /// For thirdparty packages: the `download` target whose filtered outputs are
     /// staged into consumers' sandboxes.
     #[spec(ty = ParamType::String)]
@@ -72,6 +74,7 @@ struct GoGolistDef {
     goarch: String,
     go_version: String,
     build_tags: Vec<String>,
+    goexperiment: Vec<String>,
     dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
     /// will be staged into consumers' sandboxes. Threaded through so
@@ -87,7 +90,7 @@ struct GoGolistDef {
 /// `go_compile`; cached `_golist` artifacts from intermediate builds of that
 /// work could carry empty `EmbedFiles` for a now-resolvable embed, surfacing as
 /// `compute embedcfg: //go:embed pattern(s) matched no files` until evicted.
-const GO_GOLIST_FORMAT_VERSION: u32 = 15;
+const GO_GOLIST_FORMAT_VERSION: u32 = 16;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -97,6 +100,7 @@ impl Hash for GoGolistDef {
         self.goarch.hash(state);
         self.go_version.hash(state);
         self.build_tags.hash(state);
+        self.goexperiment.hash(state);
         self.dep_inputs.hash(state);
         self.thirdparty_download_addr.hash(state);
         // The hermetic SDK arrives via dep_inputs (group `gosdk`); the engine
@@ -171,6 +175,7 @@ impl ManagedDriver for GoGolistDriver {
             goarch: spec.goarch,
             go_version: spec.go_version,
             build_tags: spec.build_tags,
+            goexperiment: spec.goexperiment,
             dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
         };
@@ -273,6 +278,9 @@ impl ManagedDriver for GoGolistDriver {
         // Ubuntu host with gcc on PATH pulls runtime/cgo here but later link
         // steps run without it, breaking importcfg.
         env.insert("CGO_ENABLED".to_string(), "0".to_string());
+        if !def.goexperiment.is_empty() {
+            env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
+        }
         // Thirdparty module *metadata* listing still consults the host module
         // cache / proxy (modules are content-addressed and verified by go.sum),
         // matching the v1 plugin; first-party and stdlib reads stay fully

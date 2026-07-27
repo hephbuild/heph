@@ -1,4 +1,4 @@
-use crate::plugingo::factors::Factors;
+use crate::plugingo::factors::VariantRef;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -198,11 +198,11 @@ fn parse_thirdparty(rest: &str, module_root: PathBuf) -> Option<GoPackageKind> {
 }
 
 /// Encode a stdlib import path as a heph Addr for build_lib.
-pub fn encode_stdlib(import_path: &str, factors: &Factors) -> Addr {
+pub fn encode_stdlib(import_path: &str, vref: &VariantRef) -> Addr {
     Addr::new(
         PkgBuf::from(format!("{}{}", STD_PREFIX, import_path)),
         "build_lib".to_string(),
-        factors_to_args(factors),
+        vref.to_args(),
     )
 }
 
@@ -214,7 +214,7 @@ pub fn encode_thirdparty(
     version: &str,
     subpath: &str,
     base_pkg: &str,
-    factors: &Factors,
+    vref: &VariantRef,
 ) -> Addr {
     let thirdparty_part = if subpath.is_empty() {
         format!("{}{}@{}", THIRD_PREFIX, module, version)
@@ -228,11 +228,7 @@ pub fn encode_thirdparty(
         format!("{}/{}", base_pkg, thirdparty_part)
     };
 
-    Addr::new(
-        PkgBuf::from(pkg),
-        "build_lib".to_string(),
-        factors_to_args(factors),
-    )
+    Addr::new(PkgBuf::from(pkg), "build_lib".to_string(), vref.to_args())
 }
 
 /// Encode the module-root `download` target Addr for a thirdparty module.
@@ -252,23 +248,13 @@ pub fn encode_thirdparty_download(module: &str, version: &str, base_pkg: &str) -
 }
 
 /// Encode a first-party package (relative to workspace root) as a heph Addr for build_lib.
-pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, factors: &Factors) -> Addr {
+pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, vref: &VariantRef) -> Addr {
     let rel = src_dir.strip_prefix(workspace_root).unwrap_or(src_dir);
     Addr::new(
         PkgBuf::from(rel.to_string_lossy().as_ref()),
         "build_lib".to_string(),
-        factors_to_args(factors),
+        vref.to_args(),
     )
-}
-
-pub fn factors_to_args(factors: &Factors) -> BTreeMap<String, String> {
-    let mut args = BTreeMap::new();
-    args.insert("goos".to_string(), factors.goos.clone());
-    args.insert("goarch".to_string(), factors.goarch.clone());
-    if !factors.build_tags.is_empty() {
-        args.insert("tags".to_string(), factors.build_tags.join(","));
-    }
-    args
 }
 
 /// Convert an import path to a dep group name.
@@ -712,24 +698,16 @@ mod tests {
 
     #[test]
     fn test_encode_stdlib() {
-        let factors = Factors {
-            goos: "linux".into(),
-            goarch: "amd64".into(),
-            build_tags: vec![],
-        };
-        let addr = encode_stdlib("fmt", &factors);
+        let vref = VariantRef::new("dev", "");
+        let addr = encode_stdlib("fmt", &vref);
         assert_eq!(addr.package.as_str(), "@heph/go/std/fmt");
         assert_eq!(addr.name, "build_lib");
     }
 
     #[test]
     fn test_encode_thirdparty_with_subpath() {
-        let factors = Factors {
-            goos: "linux".into(),
-            goarch: "amd64".into(),
-            build_tags: vec![],
-        };
-        let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "", &factors);
+        let vref = VariantRef::new("dev", "");
+        let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "", &vref);
         assert_eq!(
             addr.package.as_str(),
             "@heph/go/thirdparty/github.com/foo/bar@v1.2.3/pkg"
@@ -738,12 +716,8 @@ mod tests {
 
     #[test]
     fn test_encode_thirdparty_no_subpath() {
-        let factors = Factors {
-            goos: "linux".into(),
-            goarch: "amd64".into(),
-            build_tags: vec![],
-        };
-        let addr = encode_thirdparty("github.com/foo/bar", "v1.0.0", "", "", &factors);
+        let vref = VariantRef::new("dev", "");
+        let addr = encode_thirdparty("github.com/foo/bar", "v1.0.0", "", "", &vref);
         assert_eq!(
             addr.package.as_str(),
             "@heph/go/thirdparty/github.com/foo/bar@v1.0.0"
@@ -752,12 +726,8 @@ mod tests {
 
     #[test]
     fn test_encode_thirdparty_with_base_pkg() {
-        let factors = Factors {
-            goos: "linux".into(),
-            goarch: "amd64".into(),
-            build_tags: vec![],
-        };
-        let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "go", &factors);
+        let vref = VariantRef::new("dev", "");
+        let addr = encode_thirdparty("github.com/foo/bar", "v1.2.3", "pkg", "go", &vref);
         assert_eq!(
             addr.package.as_str(),
             "go/@heph/go/thirdparty/github.com/foo/bar@v1.2.3/pkg"
@@ -803,17 +773,13 @@ mod tests {
 
     #[test]
     fn test_encode_thirdparty_roundtrip_with_base_pkg() {
-        let factors = Factors {
-            goos: "linux".into(),
-            goarch: "amd64".into(),
-            build_tags: vec![],
-        };
+        let vref = VariantRef::new("dev", "");
         let addr = encode_thirdparty(
             "k8s.io/apimachinery",
             "v0.32.1",
             "pkg/util/sets",
             "go",
-            &factors,
+            &vref,
         );
         let ws = Path::new("/workspace");
         let kind = decode_package(&addr.package, ws).unwrap();
@@ -833,15 +799,12 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let src = ws.path().join("mylib");
         std::fs::create_dir_all(&src).unwrap();
-        let factors = Factors {
-            goos: "linux".into(),
-            goarch: "amd64".into(),
-            build_tags: vec![],
-        };
-        let addr = encode_firstparty(&src, ws.path(), &factors);
+        let vref = VariantRef::new("dev", "");
+        let addr = encode_firstparty(&src, ws.path(), &vref);
         assert_eq!(addr.package.as_str(), "mylib");
         assert_eq!(addr.name, "build_lib");
-        assert_eq!(addr.args.get("goos").map(|s| s.as_str()), Some("linux"));
+        assert_eq!(addr.args.get("v").map(|s| s.as_str()), Some("dev"));
+        assert_eq!(addr.args.get("vp").map(|s| s.as_str()), Some(""));
     }
 
     #[test]

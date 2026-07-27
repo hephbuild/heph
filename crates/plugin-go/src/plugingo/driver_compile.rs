@@ -96,6 +96,10 @@ struct GoCompileSpec {
     /// Go release whose staged hermetic SDK provides GOROOT + the `go` binary.
     #[spec(required)]
     go_version: String,
+    /// `GOEXPERIMENT` values from the variant (sorted). Empty → unset.
+    goexperiment: Vec<String>,
+    /// Extra flags passed verbatim to `go tool compile` (the variant's gcflags).
+    gcflags: Vec<String>,
     /// Import paths of the transitive libs, in deterministic order — each maps to
     /// a `lib_<sanitized>` dep group carrying that archive, used to build
     /// importcfg.
@@ -118,6 +122,8 @@ struct GoCompileDef {
     goos: String,
     goarch: String,
     go_version: String,
+    goexperiment: Vec<String>,
+    gcflags: Vec<String>,
     import_paths: Vec<String>,
     s_files: Vec<String>,
     embed_variant: Option<EmbedVariant>,
@@ -129,7 +135,7 @@ struct GoCompileDef {
 
 /// Bump to invalidate every cached `go_compile` archive whenever the compile
 /// command shape or embed resolution semantics change.
-const GO_COMPILE_FORMAT_VERSION: u32 = 2;
+const GO_COMPILE_FORMAT_VERSION: u32 = 3;
 
 impl Hash for GoCompileDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -139,6 +145,11 @@ impl Hash for GoCompileDef {
         self.goos.hash(state);
         self.goarch.hash(state);
         self.go_version.hash(state);
+        // Variant toolchain knobs — each changes compiler output, so each must
+        // key the cache. `goexperiment` is already sorted at variant-parse time;
+        // `gcflags` order is semantically meaningful, so hash as-is.
+        self.goexperiment.hash(state);
+        self.gcflags.hash(state);
         // `import_paths` order is not semantically meaningful — it comes from a
         // closure walk that dedups through a per-process-randomized `HashSet`,
         // and `run()` re-sorts before writing importcfg, so the archive is
@@ -244,6 +255,8 @@ impl ManagedDriver for GoCompileDriver {
             goos: spec.goos,
             goarch: spec.goarch,
             go_version: spec.go_version,
+            goexperiment: spec.goexperiment,
+            gcflags: spec.gcflags,
             import_paths: spec.import_paths,
             s_files: spec.s_files,
             embed_variant,
@@ -346,6 +359,9 @@ impl ManagedDriver for GoCompileDriver {
         env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
         env.insert("GOWORK".to_string(), "off".to_string());
         env.insert("CGO_ENABLED".to_string(), "0".to_string());
+        if !def.goexperiment.is_empty() {
+            env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
+        }
         // Non-hermetic toolchains (host, or a hostbin/nix target wrapper) may need
         // PATH; hermetic mode omits it to stay PATH-independent.
         if !matches!(
@@ -442,6 +458,9 @@ impl ManagedDriver for GoCompileDriver {
             "-importcfg".to_string(),
             importcfg_path.to_string_lossy().into_owned(),
         ];
+        // Variant gcflags — raw `go tool compile` flags (what `-gcflags` forwards),
+        // in declared order, before the source responses.
+        cargs.extend(def.gcflags.iter().cloned());
         if has_asm {
             cargs.push("-symabis".to_string());
             cargs.push("symabis".to_string());
@@ -797,6 +816,11 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         "go_version".to_string(),
         Value::String(p.go_version.to_string()),
     );
+    config.insert(
+        "goexperiment".to_string(),
+        str_list(&p.factors.goexperiment),
+    );
+    config.insert("gcflags".to_string(), str_list(&p.factors.gcflags));
     config.insert("import_paths".to_string(), Value::List(import_paths));
     config.insert("s_files".to_string(), str_list(p.s_files));
     config.insert(
@@ -862,6 +886,7 @@ mod driver_tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            ..Default::default()
         }
     }
 
@@ -1078,6 +1103,8 @@ mod driver_tests {
             goos: "linux".to_string(),
             goarch: "amd64".to_string(),
             go_version: "1.26.4".to_string(),
+            goexperiment: vec![],
+            gcflags: vec![],
             import_paths: ips.iter().map(|s| s.to_string()).collect(),
             s_files: vec![],
             embed_variant: None,

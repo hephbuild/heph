@@ -307,13 +307,19 @@ fn unimplemented(method: u32) -> SVec<u8> {
 // Server-streaming: the provider's iterator is pulled lazily across the seam (one
 // item per `StableItemStream::next`), never materialized into one blob.
 
-async fn provider_list_stream(provider: Arc<dyn Provider>, req: SVec<u8>) -> DynItemStream {
+async fn provider_list_stream(
+    provider: Arc<dyn Provider>,
+    req: SVec<u8>,
+    exec: DynExecutor,
+) -> DynItemStream {
     let req = pb::ListRequest::decode(&req[..]).unwrap_or_default();
     let tok = StdCancellationToken::new();
+    let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
     let lreq = ListRequest {
         request_id: req.request_id,
         package: PkgBuf::from(req.package),
         states: req.states.into_iter().map(convert::state_from_pb).collect(),
+        executor,
     };
     match provider.list(lreq, &tok).await {
         Ok(iter) => make_item_stream(frame_iter(iter, |lr| {
@@ -542,10 +548,25 @@ impl StableProvider for StableProviderImpl {
         let provider = Arc::clone(&self.provider);
         dynify(stabby::boxed::Box::new(async move {
             match pb::ProviderMethod::try_from(method as i32) {
-                Ok(pb::ProviderMethod::List) => provider_list_stream(provider, req).await,
+                // `List` rides `invoke_exec_server_stream` (it needs an executor).
                 Ok(pb::ProviderMethod::ListPackages) => {
                     provider_list_packages_stream(provider, req).await
                 }
+                _ => unimplemented_item_stream(method),
+            }
+        }))
+    }
+
+    extern "C" fn invoke_exec_server_stream<'a>(
+        &'a self,
+        method: u32,
+        req: SVec<u8>,
+        exec: DynExecutor,
+    ) -> DynFuture<'a, DynItemStream> {
+        let provider = Arc::clone(&self.provider);
+        dynify(stabby::boxed::Box::new(async move {
+            match pb::ProviderMethod::try_from(method as i32) {
+                Ok(pb::ProviderMethod::List) => provider_list_stream(provider, req, exec).await,
                 _ => unimplemented_item_stream(method),
             }
         }))
@@ -1481,6 +1502,7 @@ mod tests {
                 request_id: String::new(),
                 package: PkgBuf::from("p"),
                 states: vec![],
+                executor: Arc::new(hplugin::provider::NoopExecutor),
             },
             &tok,
         ))

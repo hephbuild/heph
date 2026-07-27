@@ -18,6 +18,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// ABI semantic version. Major must match exactly between host and plugin;
 /// minor is negotiated to `min(host, plugin)` at handshake.
 ///
+/// 0.5.0: `StableExecutor` gained a `states` method (fetch a package's provider
+/// states for cross-subtree config resolution — the go variant `vp` lookup). A
+/// new method on a `#[stabby::stabby]` vtable trait changes its type-report, so
+/// this is a hard break: every plugin must be rebuilt against this ABI.
+///
 /// 0.4.0: new optional `heph_plugin_set_supervisor` entry (`StableSupervisor` /
 /// `DynSupervisor`) so a plugin's children register with the host's process
 /// supervisor. Additive: no existing vtable or struct changed, and the host
@@ -27,7 +32,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.4.0";
+pub const ABI_SEMVER: &str = "0.5.0";
 
 #[cfg(feature = "convert")]
 pub mod convert;

@@ -333,11 +333,13 @@ impl Provider for StableRemoteProvider {
                 states: req.states.iter().map(convert::state_to_pb).collect(),
             }
             .encode_to_vec();
-            // Server-streaming: pull items lazily across the seam — the whole list
-            // is never materialized on either side.
+            // Server-streaming **with** the executor, so the plugin's `list` can
+            // call back (e.g. the go module variant universe via `states_under`).
+            // Items still stream lazily across the seam.
+            let exec: DynExecutor = HostExecutor::wrap(Arc::clone(&req.executor));
             let stream = self
                 .inner
-                .invoke_server_stream(pb::ProviderMethod::List as u32, sv(&pb_req))
+                .invoke_exec_server_stream(pb::ProviderMethod::List as u32, sv(&pb_req), exec)
                 .await;
             Ok(Box::new(ItemStreamIter {
                 stream,

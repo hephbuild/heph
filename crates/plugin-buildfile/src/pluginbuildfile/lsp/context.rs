@@ -144,6 +144,7 @@ impl HephLspContext {
                 request_id: "lsp".to_string(),
                 package: PkgBuf::from(package),
                 states: vec![],
+                executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
             },
             &ctoken,
         );

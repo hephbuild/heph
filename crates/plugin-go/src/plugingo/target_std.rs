@@ -1,8 +1,7 @@
 use crate::plugingo::addr_util::{
-    factors_to_args, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
-    to_run_value,
+    go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config, to_run_value,
 };
-use crate::plugingo::factors::Factors;
+use crate::plugingo::factors::{Factors, VariantRef};
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -29,13 +28,9 @@ pub fn archive_filename(import_path: &str) -> String {
     format!("{}.a", sanitized)
 }
 
-/// Address of the `@heph/go/std:install` target for the given factors.
-pub fn install_addr(factors: &Factors) -> Addr {
-    Addr::new(
-        PkgBuf::from(STD_PKG),
-        "install".to_string(),
-        factors_to_args(factors),
-    )
+/// Address of the `@heph/go/std:install` target for the given variant.
+pub fn install_addr(vref: &VariantRef) -> Addr {
+    Addr::new(PkgBuf::from(STD_PKG), "install".to_string(), vref.to_args())
 }
 
 /// Sandbox-relative dir the std archives land in after `go install std`, e.g.
@@ -139,7 +134,12 @@ pub fn install_spec(addr: Addr, factors: &Factors, go_version: &str) -> TargetSp
 /// Build the `@heph/go/std/<import>:build_lib` target: extract a single
 /// precompiled archive from the `install` output. Mirrors `v1`'s `stdLibBuild` —
 /// pure `mv`, no Go invocation, so it carries no SDK dep.
-pub fn build_spec(addr: Addr, import_path: &str, factors: &Factors) -> TargetSpec {
+pub fn build_spec(
+    addr: Addr,
+    import_path: &str,
+    factors: &Factors,
+    vref: &VariantRef,
+) -> TargetSpec {
     let out_file = archive_filename(import_path);
     let subdir = pkg_subdir(factors);
 
@@ -153,7 +153,7 @@ pub fn build_spec(addr: Addr, import_path: &str, factors: &Factors) -> TargetSpe
         "install".to_string(),
         Value::List(vec![Value::String(format!(
             "{}|pkg",
-            install_addr(factors).format()
+            install_addr(vref).format()
         ))]),
     );
 
@@ -213,12 +213,17 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            ..Default::default()
         }
+    }
+
+    fn test_vref() -> VariantRef {
+        VariantRef::new("dev", "")
     }
 
     #[test]
     fn test_install_builds_std_from_source() {
-        let spec = install_spec(install_addr(&test_factors()), &test_factors(), V);
+        let spec = install_spec(install_addr(&test_vref()), &test_factors(), V);
         let run = run_str(&spec);
         assert!(
             run.contains("install --trimpath std"),
@@ -230,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_install_reads_no_host_go() {
-        let spec = install_spec(install_addr(&test_factors()), &test_factors(), V);
+        let spec = install_spec(install_addr(&test_vref()), &test_factors(), V);
         let run = run_str(&spec);
         // GOROOT must come from the staged hermetic SDK, never the host.
         assert!(
@@ -253,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_install_out_has_pkg_dir_and_list() {
-        let spec = install_spec(install_addr(&test_factors()), &test_factors(), V);
+        let spec = install_spec(install_addr(&test_vref()), &test_factors(), V);
         let out = match spec.config.get("out").unwrap() {
             Value::Map(m) => m,
             _ => panic!("out must be map"),
@@ -271,8 +276,9 @@ mod tests {
             goos: "darwin".into(),
             goarch: "arm64".into(),
             build_tags: vec![],
+            ..Default::default()
         };
-        let spec = install_spec(install_addr(&factors), &factors, V);
+        let spec = install_spec(install_addr(&test_vref()), &factors, V);
         let env = match spec.config.get("env").unwrap() {
             Value::Map(m) => m,
             _ => panic!("env must be map"),
@@ -284,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_build_lib_extracts_from_install() {
-        let spec = build_spec(build_lib_addr(), "fmt", &test_factors());
+        let spec = build_spec(build_lib_addr(), "fmt", &test_factors(), &test_vref());
         let run = run_str(&spec);
         assert!(
             run.contains("@heph/go/std/goroot/pkg/linux_amd64/fmt.a"),
@@ -295,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_build_lib_deps_on_install() {
-        let spec = build_spec(build_lib_addr(), "fmt", &test_factors());
+        let spec = build_spec(build_lib_addr(), "fmt", &test_factors(), &test_vref());
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("deps must be map"),
@@ -313,7 +319,7 @@ mod tests {
     #[test]
     fn test_build_lib_carries_no_sdk_dep() {
         // build_lib is a pure mv; pulling the whole SDK in would be wasteful.
-        let spec = build_spec(build_lib_addr(), "fmt", &test_factors());
+        let spec = build_spec(build_lib_addr(), "fmt", &test_factors(), &test_vref());
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("deps must be map"),
@@ -323,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_build_lib_out_group() {
-        let spec = build_spec(build_lib_addr(), "fmt", &test_factors());
+        let spec = build_spec(build_lib_addr(), "fmt", &test_factors(), &test_vref());
         let out = spec.config.get("out").unwrap();
         assert!(matches!(out, Value::Map(m) if m.contains_key("a")));
     }

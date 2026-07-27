@@ -97,14 +97,124 @@ fn sdk_checksums_for(gotool: &str) -> std::collections::HashMap<String, String> 
         .collect()
 }
 
-pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
+/// A minimal provider that injects the Go build *variants* every e2e workspace
+/// needs, without editing each fixture's BUILD file. Its `probe` returns, for the
+/// root package, a `provider="go"` state declaring two variants:
+///   - `host`: the build host's own GOOS/GOARCH (the default the suite uses),
+///   - `linux_amd64`: pinned linux/amd64 (for the build-tag cross-compile tests).
+/// Every other endpoint is empty — targets/packages come from the real providers.
+struct VariantInjector;
+
+impl VariantInjector {
+    fn variants_state() -> hplugin::provider::State {
+        use hcore::htvalue::Value;
+        let variant = |goos: &str, goarch: &str| {
+            Value::Map(std::collections::HashMap::from([
+                ("goos".to_string(), Value::String(goos.to_string())),
+                ("goarch".to_string(), Value::String(goarch.to_string())),
+            ]))
+        };
+        let variants = Value::Map(std::collections::HashMap::from([
+            (
+                "host".to_string(),
+                variant(hcore::htplatform::os(), hcore::htplatform::arch()),
+            ),
+            ("linux_amd64".to_string(), variant("linux", "amd64")),
+        ]));
+        hplugin::provider::State {
+            package: hmodel::htpkg::PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: std::collections::HashMap::from([("variants".to_string(), variants)]),
+        }
+    }
 }
 
-/// Build the workspace using the **host** `go` (gotool = "host") instead of a
-/// hermetic SDK. Requires `go` on PATH (guard call sites with `require_go!`).
-pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
+impl hplugin::provider::Provider for VariantInjector {
+    fn config(
+        &self,
+        _req: hplugin::provider::ConfigRequest,
+    ) -> anyhow::Result<hplugin::provider::ConfigResponse> {
+        Ok(hplugin::provider::ConfigResponse {
+            name: "go-variant-injector".to_string(),
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        _req: hplugin::provider::ListRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<hplugin::provider::ListResponse>> + Send>,
+        >,
+    > {
+        Box::pin(async move { Ok(Box::new(std::iter::empty()) as Box<_>) })
+    }
+
+    fn list_packages<'a>(
+        &'a self,
+        _req: hplugin::provider::ListPackagesRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<hplugin::provider::ListPackageResponse>> + Send>,
+        >,
+    > {
+        Box::pin(async move { Ok(Box::new(std::iter::empty()) as Box<_>) })
+    }
+
+    fn get<'a>(
+        &'a self,
+        _req: hplugin::provider::GetRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<hplugin::provider::GetResponse, hplugin::provider::GetError>,
+    > {
+        Box::pin(async move { Err(hplugin::provider::GetError::NotFound) })
+    }
+
+    fn probe<'a>(
+        &'a self,
+        req: hplugin::provider::ProbeRequest,
+        _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<hplugin::provider::ProbeResponse>> {
+        Box::pin(async move {
+            let states = if req.package.as_str().is_empty() {
+                vec![Self::variants_state()]
+            } else {
+                vec![]
+            };
+            Ok(hplugin::provider::ProbeResponse { states })
+        })
+    }
+}
+
+/// Default workspace: builds with the **host** `go` (gotool = "host"). This is
+/// what almost every e2e test should use — it reuses the host toolchain's
+/// prebuilt std, so it stages no hermetic SDK and builds no std from source,
+/// which is dramatically less disk and time. (Staging a full hermetic SDK + std
+/// tree per isolated test workspace is what exhausted the CI runner disk.) Only
+/// the few tests that specifically exercise the hermetic toolchain use
+/// [`make_workspace_hermetic`]. Requires `go` on PATH (guard with `require_go!`).
+pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, &[], HOST_GO)
+}
+
+/// Alias for [`make_workspace`] kept for call sites that spell the host toolchain
+/// explicitly.
+pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
+    make_workspace(dir)
+}
+
+/// Build the workspace against the pinned **hermetic** Go SDK ([`HERMETIC_GO`]) —
+/// downloaded and staged, with std compiled from source. Expensive (disk + time),
+/// so reserve it for the *select few* tests that must prove the hermetic
+/// toolchain path itself; everything else uses [`make_workspace`] (host `go`).
+pub fn make_workspace_hermetic(dir: TempDir) -> anyhow::Result<Workspace> {
+    make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
 }
 
 /// A published heph release whose `heph-govet_<goos>_<goarch>` assets the lint
@@ -121,7 +231,7 @@ pub fn govet_addr() -> String {
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
 /// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, false, true, skip, HERMETIC_GO)
+    make_workspace_ordered(dir, false, true, skip, HOST_GO)
 }
 
 /// Same as [`make_workspace`] but registers the **go provider before** the
@@ -136,7 +246,7 @@ pub fn make_workspace_go_first(
     dir: TempDir,
     foreign_name_guard: bool,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered(dir, true, foreign_name_guard, &[], HERMETIC_GO)
+    make_workspace_ordered(dir, true, foreign_name_guard, &[], HOST_GO)
 }
 
 fn make_workspace_ordered(
@@ -150,6 +260,10 @@ fn make_workspace_ordered(
     let go_bin = go_bin_path();
     // `fs` is auto-registered by `Engine::new`.
     let mut b = WorkspaceBuilder::from_dir(dir).with_fs_skip(fs_skip.iter().copied());
+
+    // Inject the Go build variants (`host`, `linux_amd64`) every fixture builds
+    // against, so targets resolve `@v=…` without each BUILD declaring them.
+    b = b.with_provider(|_| Box::new(VariantInjector));
 
     if go_first {
         let gotool = gotool.clone();

@@ -118,6 +118,18 @@ fn build_spec_inner(
             ),
         );
     }
+    if !factors.goexperiment.is_empty() {
+        config.insert(
+            "goexperiment".to_string(),
+            Value::List(
+                factors
+                    .goexperiment
+                    .iter()
+                    .map(|t| Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !deps.is_empty() {
         config.insert("deps".to_string(), Value::Map(deps));
     }
@@ -164,6 +176,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec![],
+            ..Default::default()
         }
     }
 
@@ -426,6 +439,7 @@ mod tests {
             goos: "linux".into(),
             goarch: "amd64".into(),
             build_tags: vec!["integration".to_string()],
+            ..Default::default()
         };
         let spec = build_spec_stdlib(test_addr(), "fmt", &factors, V).unwrap();
         assert!(

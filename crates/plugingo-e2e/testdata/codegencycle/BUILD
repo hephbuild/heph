@@ -37,7 +37,7 @@ target(
     name = "a-dist",
     driver = "sh",
     run = "mv ${SRC} ${OUT}",
-    deps = ["//cmd/a:build"],
+    deps = ["//cmd/a:build@v=host"],
     out = "dist/a",
     labels = ["build"],
 )
@@ -46,7 +46,7 @@ target(
     name = "b-dist",
     driver = "sh",
     run = "mv ${SRC} ${OUT}",
-    deps = ["//cmd/b:build"],
+    deps = ["//cmd/b:build@v=host"],
     out = "dist/b",
     labels = ["build"],
 )

@@ -28,6 +28,12 @@ impl Engine {
             // Multiple providers can surface the same addr (or the same package
             // from `packages()`), so dedup before yielding.
             let mut seen: FxHashSet<Addr> = FxHashSet::default();
+            // Callback surface handed to each `list` so a provider can gather
+            // config beyond the package ancestry (e.g. the go module variant
+            // universe via `states_under`).
+            let executor: Arc<dyn hplugin::provider::ProviderExecutor> = Arc::new(
+                crate::engine::result::EngineProviderExecutor::new(Arc::downgrade(&self), rs.clone()),
+            );
             for pkg_result in self.packages(m, &rs).await? {
                 let pkg = PkgBuf::from(pkg_result?);
 
@@ -42,6 +48,7 @@ impl Engine {
                             .filter(|s| s.provider == provider.name)
                             .cloned()
                             .collect(),
+                        executor: Arc::clone(&executor),
                     }, rs.ctoken()).await?;
 
                     for item in it {

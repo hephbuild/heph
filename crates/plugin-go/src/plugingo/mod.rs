@@ -19,6 +19,7 @@ mod target_std;
 mod target_test;
 mod thirdparty;
 mod toolchain;
+mod variant;
 
 pub use driver_compile::GoCompileDriver;
 pub use driver_format::{GoFormatCheckDriver, GoFormatDriver};

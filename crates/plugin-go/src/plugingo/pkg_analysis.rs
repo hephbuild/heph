@@ -478,12 +478,11 @@ pub(crate) async fn run_go_list(
     module_root: &std::path::Path,
 ) -> anyhow::Result<HashMap<String, GoPackage>> {
     let mut cmd = tokio::process::Command::new("go");
-    cmd.arg("list")
-        .arg("-json")
-        .arg("-e")
-        .arg("-test")
-        .args(factors.go_list_flags())
-        .arg(import_path)
+    cmd.arg("list").arg("-json").arg("-e").arg("-test");
+    if !factors.build_tags.is_empty() {
+        cmd.arg("-tags").arg(factors.build_tags.join(","));
+    }
+    cmd.arg(import_path)
         .current_dir(module_root)
         .env("GOOS", &factors.goos)
         .env("GOARCH", &factors.goarch)

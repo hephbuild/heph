@@ -28,7 +28,7 @@ async fn test_codegen_build_lib_compiles_with_generated_source() -> anyhow::Resu
     let ws = make_workspace(dir)?;
     // build_lib depends on _golist (for source_map) which depends on the query for go_src
     // labels, which finds //:gen. The engine must run //:gen first, then build_lib.
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     let paths = artifact_paths(&result);
     assert!(
         !paths.is_empty(),
@@ -43,7 +43,7 @@ async fn test_codegen_build_produces_binary() -> anyhow::Result<()> {
     let dir = fixture("codegen")?;
     let ws = make_workspace(dir)?;
     let _ = fs::remove_file(ws.dir.path().join("gen.go"));
-    let result = ws.run("//:build").await?;
+    let result = ws.run("//:build@v=host").await?;
     let paths = artifact_paths(&result);
     assert!(
         !paths.is_empty(),
@@ -60,7 +60,7 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("codegen")?;
     let ws = make_workspace(dir)?;
-    let result = ws.run("//:build").await?;
+    let result = ws.run("//:build@v=host").await?;
 
     let tmp = tempfile::tempdir().context("create tempdir for binary")?;
     let mut binary_path: Option<std::path::PathBuf> = None;
@@ -112,7 +112,7 @@ async fn test_codegen_root_build_multi_package() -> anyhow::Result<()> {
     let dir = fixture("codegenroot")?;
     let ws = make_workspace(dir)?;
     let result = ws
-        .run("//:build")
+        .run("//:build@v=host")
         .await
         .context("build //:build under a go_codegen_root")?;
     assert!(
@@ -135,7 +135,7 @@ async fn test_codegen_root_build_with_generated_pkg_skipped() -> anyhow::Result<
     let dir = fixture("codegenroot")?;
     let ws = make_workspace_fs_skip(dir, &["genpb/**"])?;
     let result = ws
-        .run("//:build")
+        .run("//:build@v=host")
         .await
         .context("build //:build with the generated sub-package under fs.skip")?;
     assert!(
@@ -193,7 +193,7 @@ async fn test_codegencycle_single_target_builds() -> anyhow::Result<()> {
     let dir = fixture("codegencycle")?;
     let ws = make_workspace(dir)?;
     let result = ws
-        .run("//shared:build_lib")
+        .run("//shared:build_lib@v=host")
         .await
         .context("build //shared:build_lib directly")?;
     assert!(
@@ -249,7 +249,7 @@ async fn test_build_lib_still_builds_go_first() -> anyhow::Result<()> {
     // Guard off: the failed go over-claim of `//:gen` must not leave a stale DAG
     // edge that false-cycles this legit build.
     let ws = make_workspace_go_first(dir, false)?;
-    let result = ws.run("//:build_lib").await?;
+    let result = ws.run("//:build_lib@v=host").await?;
     assert!(
         !artifact_paths(&result).is_empty(),
         "build_lib must produce the .a archive even with go registered first"
