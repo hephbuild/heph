@@ -40,3 +40,6 @@ gen
 example/go/large
 
 ai-docs
+
+# CodeGraph
+.codegraph/
