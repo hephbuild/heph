@@ -90,9 +90,9 @@ in
   #   e2e                      # build them from this tree (local default)
   #   HEPH_E2E_FROM=dist e2e   # use an already-downloaded set (CI)
   #
-  # Both branches converge on the same normalized layout under
-  # $CARGO_TARGET_DIR/e2e-dist, so the tests never learn which one ran. Extra
-  # args pass through to cargo test (e.g. `e2e tui_pty -- --nocapture`).
+  # Both branches converge on the same normalized layout, so the tests never
+  # learn which one ran. Extra args pass through to cargo test (e.g.
+  # `e2e tui_pty -- --nocapture`).
   scripts.e2e.exec = ''
     set -euo pipefail
 
@@ -105,9 +105,22 @@ in
       *)             arch=amd64 ;;
     esac
 
-    dist="$CARGO_TARGET_DIR/e2e-dist"
-    rm -rf "$dist"
-    mkdir -p "$dist"
+    # Stage into a directory unique to THIS run. CARGO_TARGET_DIR is inherited
+    # from the environment (see enterShell) and worktrees routinely share one,
+    # so a fixed path under it is not private to this run: a second `e2e` — in
+    # another worktree, or just another terminal — would `rm -rf` the binaries
+    # the first one is still running tests against, and the failure would
+    # surface as an unrelated test blowing up somewhere else. mktemp costs one
+    # copy of three files and removes the whole class.
+    dist_root="$CARGO_TARGET_DIR/e2e-dist"
+    mkdir -p "$dist_root"
+    dist="$(mktemp -d "$dist_root/run.XXXXXXXX")"
+    # Keep the staged artifacts for inspection with HEPH_E2E_KEEP_DIST=1.
+    if [ -z "''${HEPH_E2E_KEEP_DIST:-}" ]; then
+      trap 'rm -rf "$dist"' EXIT
+    else
+      trap 'echo "staged artifacts kept at $dist"' EXIT
+    fi
 
     if [ -n "''${HEPH_E2E_FROM:-}" ]; then
       # CI: artifacts downloaded from the `build` job, still carrying their
@@ -121,9 +134,29 @@ in
       # (one invocation so cargo overlaps the three LTO tails — see heph.yml).
       cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib
       out="$CARGO_TARGET_DIR/release"
+
+      # `release/` is shared across worktrees too, and cargo's build lock only
+      # covers the build — not the gap between it and the copy below. A build in
+      # another worktree landing in that gap would hand this run some other
+      # branch's binary, and every assertion would still pass. Fingerprint the
+      # artifacts around the copy so that becomes a loud failure instead of a
+      # green run against the wrong bytes.
+      fingerprint() {
+        if [ "$os" = "darwin" ]; then stat -f '%i %z %m' "$@"; else stat -c '%i %s %Y' "$@"; fi
+      }
+      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext")"
+
       cp "$out/heph"                       "$dist/heph"
       cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
       cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
+
+      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext")"
+      if [ "$before" != "$after" ]; then
+        echo "e2e: $out changed while staging — another build (likely another" >&2
+        echo "e2e: worktree sharing CARGO_TARGET_DIR) raced this one. Re-run." >&2
+        exit 1
+      fi
+
       if [ "$os" = "darwin" ]; then
         # Same post-processing the shipped macOS artifacts get, so a local run
         # tests the same bytes CI would publish.

@@ -34,9 +34,12 @@ e2e                          # build the artifacts from this tree, then test the
 e2e tui_pty                  # one test file
 e2e -- --nocapture           # args after `--` reach cargo test
 HEPH_E2E_FROM=dist e2e       # test an already-downloaded artifact set (what CI does)
+HEPH_E2E_KEEP_DIST=1 e2e     # keep the staged artifacts instead of deleting them
 ```
 
 One script, one code path — CI runs the same `e2e`, differing only in where the artifacts come from. Do not add a parallel script or inline the steps into the workflow.
+
+Concurrency-safe: `CARGO_TARGET_DIR` is inherited from the environment and worktrees routinely share one, so the suite stages into a `mktemp -d` unique to each run rather than a fixed path two runs would fight over. It also fingerprints `release/` around the copy — if another worktree's build lands in that window, the run aborts rather than quietly testing the wrong binary. Keep it that way when editing the script; a fixed staging path reintroduces both.
 
 It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run it reflexively: the `bin_e2e` CI job runs it on all three platforms on every push, and it gates `release`. Run it locally only when changing something it covers (the loader, the TUI, CLI exit codes, the `e2e` script itself) — and expect a full release build the first time.
 
