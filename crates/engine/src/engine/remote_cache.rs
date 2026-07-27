@@ -87,7 +87,8 @@ use tracing::{debug, warn};
 /// Fanning a revision out is what makes a multi-output target fast, but it must
 /// stay bounded: each in-flight download holds an open temp file plus a live
 /// response stream, and each in-flight upload holds an `object_store` multipart
-/// buffer (10 MiB). A target with thousands of artifacts, multiplied by the
+/// buffer (10 MiB per in-flight part; the writer is pinned to one part, so 10
+/// MiB). A target with thousands of artifacts, multiplied by the
 /// engine's own target-level parallelism, would otherwise run the process out of
 /// file descriptors or memory. Requests past this bound simply queue.
 pub(crate) const REVISION_BLOB_CONCURRENCY: usize = 32;
@@ -416,10 +417,14 @@ const META_SLOT_RESERVE: usize = 32;
 /// counts.
 ///
 /// The reserve is [`META_SLOT_RESERVE`], or half the budget when that is smaller,
-/// so a deliberately tiny `concurrency` still leaves room for both classes. The
-/// two sum to the budget, so the store's own request cap (`LimitStore`) is never
-/// the binding constraint and therefore never a place where the two classes
-/// contend again.
+/// so a deliberately tiny `concurrency` still leaves room for both classes.
+///
+/// The two sum to the budget, so the store's own request cap (`LimitStore`) is
+/// never the binding constraint and therefore never a place where the two
+/// classes contend again — but that holds only while **one slot means one store
+/// request**. A multipart writer left at `object_store`'s default concurrency
+/// takes a store permit per in-flight part, and one blob slot silently becomes
+/// eight; see `ObjStoreBackend::open_write`, which pins it to one.
 fn split_request_budget(concurrency: usize) -> (usize, usize) {
     let total = concurrency.max(2);
     let reserve = META_SLOT_RESERVE.min(total / 2).max(1);
