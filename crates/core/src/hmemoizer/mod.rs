@@ -684,9 +684,7 @@ where
         // deadlocking the runtime, and most runs don't have cycles. Opt back in
         // with `HEPH_DEBUG_MEMOIZER_CYCLE=1`.
         if !cycle_detection_enabled() {
-            return self
-                .process(key, || guard_panics(f()))
-                .await;
+            return self.process(key, || guard_panics(f())).await;
         }
 
         let key_hash = compute_key_hash(&key);

@@ -275,7 +275,9 @@ mod tests {
                         kept.retain(|v| v.len() % 3 == 0);
                         // Syscalls, and string formatting on top of the allocator.
                         for _ in 0..16 {
-                            drop(std::fs::metadata(std::env::current_exe().unwrap_or_default()));
+                            drop(std::fs::metadata(
+                                std::env::current_exe().unwrap_or_default(),
+                            ));
                         }
                         // Nested thread create/join: pthread + loader paths, and
                         // it deepens the stack the sampler has to walk.
@@ -385,7 +387,9 @@ mod tests {
     /// they must fire on the mangled symbols a real profile actually carries.
     #[test]
     fn filter_runtime_frames_matches_mangled_symbols() {
-        let mut f = frames(vec![vec![sym("_ZN5tokio7runtime4park4park17h0123456789abcdefE")]]);
+        let mut f = frames(vec![vec![sym(
+            "_ZN5tokio7runtime4park4park17h0123456789abcdefE",
+        )]]);
         filter_runtime_frames(&mut f);
         assert!(
             f.frames.is_empty(),

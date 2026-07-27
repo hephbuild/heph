@@ -416,7 +416,11 @@ mod tests {
         ready.store(true, Ordering::SeqCst);
         assert!(poll_with(&mut driver, &dw).is_ready());
         for (i, (_, c, _)) in parked.iter().enumerate() {
-            assert_eq!(count(c), 1, "parked awaiter {i} must be woken on completion");
+            assert_eq!(
+                count(c),
+                1,
+                "parked awaiter {i} must be woken on completion"
+            );
         }
     }
 
