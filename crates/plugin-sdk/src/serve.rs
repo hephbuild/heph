@@ -1875,6 +1875,159 @@ mod tests {
         );
     }
 
+    // The event stream is one-shot. `StableRemoteHook` is registered on the
+    // *engine* but `on_close` fires per *request*, so in a long-lived host every
+    // event after the first request ends reaches a closed stream. Those events
+    // must be dropped — never resurrect the stream, never reach the plugin — and
+    // must not pay for a frame encode on the way out.
+    #[test]
+    fn hook_events_after_close_are_dropped_and_never_reopen_the_stream() {
+        use hcore::events::{BuildEvent, BuildEventKind};
+        use hplugin::hook::Hook;
+        use hplugin_stabby::load_stable::StableRemoteHook;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: Mutex<Vec<u64>>,
+            closes: AtomicUsize,
+        }
+        impl Hook for Recorder {
+            fn name(&self) -> String {
+                "rec".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ev.at_unix_ms);
+            }
+            fn on_close(&self) {
+                self.closes.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        let rec = Arc::new(Recorder::default());
+        let remote = StableRemoteHook::new(make_dyn_hook(Arc::clone(&rec) as Arc<dyn Hook>), "rec");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let mk = |at| BuildEvent {
+                at_unix_ms: at,
+                kind: BuildEventKind::ResultStart {
+                    addr: "//a:b".into(),
+                },
+            };
+            remote.on_event(&mk(1));
+            remote.drain().await;
+            // Second request's worth of events, arriving after the close.
+            remote.on_event(&mk(2));
+            remote.on_event(&mk(3));
+            // A second drain must be a no-op, not a second stream.
+            remote.drain().await;
+        });
+
+        assert_eq!(
+            rec.seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec![1],
+            "events emitted after the stream closed must not reach the plugin"
+        );
+        assert_eq!(
+            rec.closes.load(Ordering::Acquire),
+            1,
+            "the stream is one-shot: no second stream is opened, so on_close fires once"
+        );
+    }
+
+    // Concurrent emitters all deliver. Guards the encode-outside-the-lock change
+    // in `StableRemoteHook::on_event`: the state mutex guards only the lazily
+    // opened stream handle, so exactly one stream must still be opened and every
+    // frame must arrive, regardless of how many threads race the first event.
+    #[test]
+    fn hook_concurrent_emitters_open_one_stream_and_lose_nothing() {
+        use hcore::events::{BuildEvent, BuildEventKind};
+        use hplugin::hook::Hook;
+        use hplugin_stabby::load_stable::StableRemoteHook;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: Mutex<Vec<u64>>,
+            closes: AtomicUsize,
+        }
+        impl Hook for Recorder {
+            fn name(&self) -> String {
+                "rec".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ev.at_unix_ms);
+            }
+            fn on_close(&self) {
+                self.closes.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        const EMITTERS: u64 = 8;
+        const PER_EMITTER: u64 = 32;
+
+        let rec = Arc::new(Recorder::default());
+        let remote = Arc::new(StableRemoteHook::new(
+            make_dyn_hook(Arc::clone(&rec) as Arc<dyn Hook>),
+            "rec",
+        ));
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            // `on_event` lazily `tokio::spawn`s the stream driver, so every
+            // emitter needs runtime context — the engine always emits from one.
+            let handle = tokio::runtime::Handle::current();
+            std::thread::scope(|scope| {
+                for t in 0..EMITTERS {
+                    let remote = Arc::clone(&remote);
+                    let handle = handle.clone();
+                    scope.spawn(move || {
+                        let _guard = handle.enter();
+                        for i in 0..PER_EMITTER {
+                            remote.on_event(&BuildEvent {
+                                at_unix_ms: t * PER_EMITTER + i,
+                                kind: BuildEventKind::ResultStart {
+                                    addr: "//a:b".into(),
+                                },
+                            });
+                        }
+                    });
+                }
+            });
+            remote.drain().await;
+        });
+
+        let mut seen = rec.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..EMITTERS * PER_EMITTER).collect::<Vec<_>>(),
+            "every concurrently emitted event must cross the seam exactly once"
+        );
+        assert_eq!(
+            rec.closes.load(Ordering::Acquire),
+            1,
+            "racing emitters must open exactly one stream"
+        );
+    }
+
     // Provider functions survive the guest→host stable-ABI round trip: the host
     // sees the same name/signature/doc, and invoking the proxied handler carries
     // both the arguments and the FnCallContext across the seam.
