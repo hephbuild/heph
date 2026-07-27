@@ -577,7 +577,14 @@ jobs:
     name: Binary E2E ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
-    needs: [gen, build]
+    # bin_e2e_warm is a hard dependency, not just an optimisation running
+    # nearby: both jobs pay the same nix-store restore before compiling
+    # anything, so on a run where `build` is mostly sccache hits it can finish
+    # first and this job would start while the warm is still going — compiling
+    # the same crates concurrently, with neither seeing the other's objects.
+    # Waiting makes the cache hit deterministic. The warm needs only `gen`, so
+    # it is finished well before `build` on any run where `build` does work.
+    needs: [gen, build, bin_e2e_warm]
     strategy:
       fail-fast: false
       matrix:
