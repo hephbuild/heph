@@ -233,14 +233,45 @@ async fn run_shell_fallback<'a, 'io>(
     shell_fallback.driver.run_shell(new_mreq, ctoken).await
 }
 
-pub fn collect_outputs(
-    res: &mut ManagedRunResponse,
+/// Tar, hash and stage every collectable output of a finished run, on the
+/// blocking pool.
+///
+/// This reads, tars and xxh3-hashes **every output byte** the target produced.
+/// Run inline in an `async fn` it holds a tokio worker for that whole time, and
+/// with `2 * ncpu` execute permits against `ncpu` workers, enough targets landing
+/// at once park every one of them — the reactor, the timer wheel and every
+/// in-flight transfer stop with them. A worker-second lost here is lost to the
+/// entire runtime, not just to this target.
+///
+/// The clones are of the output *declarations* (a handful of small structs), not
+/// of anything they name, and they buy the `'static` the pool needs.
+pub async fn collect_outputs(
     target: &hplugin::driver::targetdef::TargetDef,
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
-) -> anyhow::Result<()> {
-    for output in &target.outputs {
+) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
+    let outputs = target.outputs.clone();
+    let support_files = target.support_files.clone();
+    let hashin = hashin.to_string();
+    let (ws_dir, sandbox_dir) = (ws_dir.to_path_buf(), sandbox_dir.to_path_buf());
+    hcore::blocking::run(move || {
+        collect_outputs_inner(&outputs, &support_files, &hashin, &ws_dir, &sandbox_dir)
+    })
+    .await
+}
+
+/// The synchronous body of [`collect_outputs`], split out so it can be handed to
+/// the blocking pool whole.
+fn collect_outputs_inner(
+    target_outputs: &[hplugin::driver::targetdef::Output],
+    support_files: &[hplugin::driver::targetdef::path::Path],
+    hashin: &str,
+    ws_dir: &Path,
+    sandbox_dir: &Path,
+) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
+    let mut artifacts = Vec::new();
+    for output in target_outputs {
         if !output.paths.iter().any(|path| path.collect) {
             continue;
         }
@@ -252,7 +283,7 @@ pub fn collect_outputs(
             add_path_to_tar(&mut tar, ws_dir, path, &output.group)?;
         }
         let tarpath = pack_to_artifact_tar(sandbox_dir, hashin, &output.group, tar)?;
-        res.artifacts.push(outputartifact::OutputArtifact {
+        artifacts.push(outputartifact::OutputArtifact {
             group: output.group.clone(),
             name: format!("{}.tar", output.group),
             r#type: outputartifact::Type::Output,
@@ -260,13 +291,13 @@ pub fn collect_outputs(
             hashout: tarpath.1,
         });
     }
-    if !target.support_files.is_empty() {
+    if !support_files.is_empty() {
         let mut tar = hartifactcontent::tar::TarPacker::new();
-        for path in &target.support_files {
+        for path in support_files {
             add_path_to_tar(&mut tar, ws_dir, path, "support")?;
         }
         let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, hashin, "support", tar)?;
-        res.artifacts.push(outputartifact::OutputArtifact {
+        artifacts.push(outputartifact::OutputArtifact {
             group: String::new(),
             name: "support.tar".to_string(),
             r#type: outputartifact::Type::SupportFile,
@@ -274,7 +305,7 @@ pub fn collect_outputs(
             hashout,
         });
     }
-    Ok(())
+    Ok(artifacts)
 }
 
 /// Input annotation key opting a dep into source_map.json generation.
@@ -338,6 +369,25 @@ pub(crate) fn build_source_map(
 /// least one input opted in. With no opted-in inputs the map is empty and the
 /// file is skipped entirely — consumers (e.g. golist) treat a missing file as
 /// an empty map.
+/// [`write_source_map`] on the blocking pool, taking and returning the inputs so
+/// the job can own them.
+///
+/// Cheap when nothing opts in — but an input that does costs an `entry_paths()`
+/// per artifact, which for tar-backed cache content is a header scan over a
+/// sqlite blob. That is real I/O and it does not belong on a tokio worker.
+pub async fn write_source_map_blocking(
+    inputs: Vec<ManagedRunInput>,
+    ws_dir: &Path,
+    sandbox_pkg_dir: &Path,
+) -> anyhow::Result<Vec<ManagedRunInput>> {
+    let (ws_dir, sandbox_pkg_dir) = (ws_dir.to_path_buf(), sandbox_pkg_dir.to_path_buf());
+    hcore::blocking::run(move || {
+        write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir)?;
+        anyhow::Ok(inputs)
+    })
+    .await
+}
+
 pub fn write_source_map(
     inputs: &[ManagedRunInput],
     ws_dir: &Path,
@@ -892,5 +942,73 @@ mod source_map_tests {
             make_input("dep|b|0", "//pkg:_b", &[("pkg/x.txt", "2")]),
         ]);
         detect_output_collisions(&groups).expect("filtered-out path must not collide");
+    }
+
+    /// Sandbox materialization must not run on a tokio worker.
+    ///
+    /// `build_source_map` calls `entry_paths()` per opted-in input, which for
+    /// tar-backed cache content is a header scan over a sqlite blob. Inline in an
+    /// `async fn` that holds a worker; with `2 * ncpu` execute permits against
+    /// `ncpu` workers, enough targets in this window park the whole runtime.
+    ///
+    /// Asserted where the work is actually observable: the content itself records
+    /// the thread it was enumerated on. `hcore::blocking`'s pool threads are the
+    /// only ones named `heph-blocking-*`, so the name is the witness.
+    #[tokio::test]
+    async fn source_map_generation_runs_off_the_runtime_workers() {
+        /// Records the thread its enumeration ran on, then behaves like `TarBytes`.
+        struct ThreadRecordingTar {
+            inner: TarBytes,
+            thread: Arc<std::sync::Mutex<Option<String>>>,
+        }
+
+        impl Content for ThreadRecordingTar {
+            fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+                self.inner.reader()
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
+                *self.thread.lock().expect("thread slot") = std::thread::current()
+                    .name()
+                    .map(std::borrow::ToOwned::to_owned);
+                self.inner.walk()
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                self.inner.hashout()
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws_dir = dir.path().join("ws");
+        let pkg_dir = dir.path().join("ws/pkg");
+        fs::create_dir_all(&pkg_dir).expect("mkdir");
+
+        let thread = Arc::new(std::sync::Mutex::new(None));
+        let mut input = make_input("dep|a|0", "//pkg:_a", &[("pkg/x.txt", "1")]);
+        let tar = pack_files(&[("pkg/x.txt", "1")]);
+        input.input.artifact.content = Arc::new(ThreadRecordingTar {
+            inner: TarBytes(tar),
+            thread: Arc::clone(&thread),
+        });
+        input.unpack_root = ws_dir.clone();
+
+        let inputs = write_source_map_blocking(vec![input], &ws_dir, &pkg_dir)
+            .await
+            .expect("write source map");
+
+        assert_eq!(inputs.len(), 1, "the inputs must come back to the caller");
+        assert!(
+            pkg_dir.join("source_map.json").exists(),
+            "the map itself must still be written"
+        );
+        let ran_on = thread.lock().expect("thread slot").clone();
+        assert!(
+            ran_on
+                .as_deref()
+                .is_some_and(|n| n.starts_with("heph-blocking")),
+            "source map generation must run on the blocking pool, ran on {ran_on:?}"
+        );
     }
 }
