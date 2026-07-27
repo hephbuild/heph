@@ -3,12 +3,17 @@
 //! The interactive renderer engages only when stderr is a terminal, so a linked
 //! test — which has no controlling terminal — always takes the CI line backend
 //! and never executes a single line of this code. What is tested here is what
-//! only a terminal can show: that the TUI takes the alternate screen, renders
-//! the run to actual cells, and hands the terminal back on exit.
+//! only a terminal can show: that the TUI builds its viewport, renders the run
+//! to actual cells, and hands the terminal back on exit.
 //!
-//! Terminal restore is the one that matters most in practice. A TUI that dies
-//! without leaving the alternate screen and raw mode leaves the user's shell
-//! unusable, and every non-PTY test in the repo passes while it does.
+//! The TUI uses a ratatui *inline* viewport, not the alternate screen — it
+//! draws in place below the prompt and clears itself on exit. So the signals
+//! are the inline handshake (a cursor-position query the terminal must answer)
+//! and the cursor hide/show pair, not `?1049h`.
+//!
+//! Terminal restore is the one that matters most in practice. A TUI that exits
+//! leaving the cursor hidden and the viewport painted leaves the user's shell a
+//! mess, and every non-PTY test in the repo passes while it does.
 
 mod common;
 
@@ -18,13 +23,16 @@ use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// CSI ?1049h / ?1049l — enter and leave the alternate screen.
-const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
-const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
-
-/// CSI 6n — Device Status Report, "where is the cursor?". The child blocks on
-/// the reply, so the harness must answer it the way a real terminal would.
+/// CSI 6n — Device Status Report, "where is the cursor?". The inline viewport
+/// needs the answer to know where to draw, and the child blocks until it gets
+/// one, so the harness must reply the way a real terminal would. Only the
+/// interactive backend ever asks, which also makes it the marker for "the TUI
+/// engaged".
 const DSR_CURSOR: &[u8] = b"\x1b[6n";
+
+/// CSI ?25l / ?25h — hide and show the cursor, around the TUI's lifetime.
+const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
+const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
 /// Generous: this spawns a release binary that builds a target, on a shared CI
 /// runner. Long enough never to be the flake, short enough to fail the job
@@ -52,18 +60,29 @@ fn tui_renders_the_run_and_restores_the_terminal() {
         session.report()
     );
     assert!(
-        contains(&session.raw, ALT_SCREEN_ENTER),
+        contains(&session.raw, DSR_CURSOR),
         "interactive TUI never engaged with a tty attached\n{}",
-        session.report()
-    );
-    assert!(
-        contains(&session.raw, ALT_SCREEN_LEAVE),
-        "left the terminal in the alternate screen\n{}",
         session.report()
     );
     assert!(
         session.rendered.contains("//pkg:ok"),
         "the target never appeared on the rendered screen\n{}",
+        session.report()
+    );
+
+    // Handed the terminal back: the last thing the TUI does with the cursor is
+    // show it again. A crash or a missing teardown leaves the final hide
+    // unmatched and the user typing blind into an invisible prompt.
+    let hid = last_index(&session.raw, CURSOR_HIDE);
+    let shown = last_index(&session.raw, CURSOR_SHOW);
+    assert!(
+        hid.is_some(),
+        "TUI never hid the cursor\n{}",
+        session.report()
+    );
+    assert!(
+        shown > hid,
+        "exited with the cursor still hidden\n{}",
         session.report()
     );
 }
@@ -86,8 +105,13 @@ fn no_tui_flag_wins_over_an_attached_terminal() {
 
     assert!(session.status_success, "{}", session.report());
     assert!(
-        !contains(&session.raw, ALT_SCREEN_ENTER),
-        "--no-tui still entered the alternate screen\n{}",
+        !contains(&session.raw, DSR_CURSOR),
+        "--no-tui still built the inline viewport\n{}",
+        session.report()
+    );
+    assert!(
+        !contains(&session.raw, CURSOR_HIDE),
+        "--no-tui still took the cursor\n{}",
         session.report()
     );
 }
@@ -232,4 +256,8 @@ fn run_in_pty(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn last_index(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
 }

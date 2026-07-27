@@ -81,13 +81,12 @@ fn succeeding_target_exits_zero() {
 }
 
 /// With stderr piped rather than attached to a terminal, the interactive
-/// renderer must stay off: no alternate-screen switch, no raw mode. A tool that
-/// grabs the alternate screen when its output is being captured corrupts every
-/// CI log and every `heph … | tee` — and the tty check that prevents it is
-/// unobservable from a linked test, which has no controlling terminal either
-/// way and so passes vacuously.
+/// renderer must stay off. A tool that drives a viewport when its output is
+/// being captured corrupts every CI log and every `heph … | tee` — and the tty
+/// check that prevents it is unobservable from a linked test, which has no
+/// controlling terminal either way and so passes vacuously.
 #[test]
-fn piped_output_does_not_enter_the_alternate_screen() {
+fn piped_output_stays_plain() {
     let dist = Dist::locate();
     let ws = Workspace::new().expect("workspace");
     ws.write(
@@ -99,13 +98,19 @@ fn piped_output_does_not_enter_the_alternate_screen() {
     let out = ws.run(&dist, &["run", "//pkg:ok"]).expect("run");
     assert!(out.status.success(), "{}", describe(&out));
 
-    // CSI ?1049h — enter alternate screen. The PTY suite asserts the opposite.
-    const ALT_SCREEN: &[u8] = b"\x1b[?1049h";
-    assert!(
-        !contains(&out.stderr, ALT_SCREEN) && !contains(&out.stdout, ALT_SCREEN),
-        "entered the alternate screen with no tty attached: {}",
-        describe(&out)
-    );
+    // The two things only the interactive backend does: ask the terminal where
+    // the cursor is (to place its inline viewport) and take the cursor. The PTY
+    // suite asserts both are present when a tty *is* attached.
+    for (name, seq) in [
+        ("cursor-position query", b"\x1b[6n".as_slice()),
+        ("cursor hide", b"\x1b[?25l".as_slice()),
+    ] {
+        assert!(
+            !contains(&out.stderr, seq) && !contains(&out.stdout, seq),
+            "emitted a {name} with no tty attached: {}",
+            describe(&out)
+        );
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
