@@ -357,7 +357,9 @@ pub async fn run<A: App + 'static>(
                     // The tick is a synchronous draw-owning point, so the
                     // EventStream teardown/restore inside has no `.await` between
                     // them — the no-race invariant holds (see stderr_backend.rs).
-                    reanchor_after_resize(&mut terminal, &mut events, &mut cols, &mut rows);
+                    reanchor_after_resize(&mut terminal, &mut events, &mut cols, &mut rows, |h| {
+                        view.rows(h)
+                    });
                     needs_resize = false;
                 }
                 drain_logs_to_terminal(&mut terminal, &mut rx, cols);
@@ -458,9 +460,10 @@ fn reanchor_after_resize(
     events: &mut Option<EventStream>,
     cols: &mut u16,
     rows: &mut u16,
+    rows_for_height: impl Fn(u16) -> u16,
 ) {
     *events = None;
-    reanchor_inline(terminal, rows, |desired, _collapsed| {
+    reanchor_inline(terminal, rows, rows_for_height, |desired, _collapsed| {
         Terminal::with_options(
             StderrBackend::new(io::stderr()),
             TerminalOptions {
@@ -474,11 +477,12 @@ fn reanchor_after_resize(
     *cols = terminal_cols(terminal);
 }
 
-/// Re-anchor the inline viewport to the backend's current size, keeping it at
-/// ~1/3 of the new terminal height. Generic over the backend and over how a
-/// new terminal is built, so the ordering below can be exercised with a
-/// `TestBackend`; `reanchor_after_resize` layers the EventStream choreography on
-/// top.
+/// Re-anchor the inline viewport to the backend's current size. `rows_for_height`
+/// is the view's own sizing policy — the same one that sized the viewport at
+/// startup, so a resize can't quietly swap a bespoke view onto the progress
+/// view's ~1/3-of-height rule. Generic over the backend and over how a new
+/// terminal is built, so the ordering below can be exercised with a `TestBackend`;
+/// `reanchor_after_resize` layers the EventStream choreography on top.
 ///
 /// Two things must happen for a resize to land without artifacts:
 ///
@@ -498,11 +502,12 @@ fn reanchor_after_resize(
 fn reanchor_inline<B: Backend>(
     terminal: &mut Terminal<B>,
     rows: &mut u16,
+    rows_for_height: impl Fn(u16) -> u16,
     rebuild: impl FnOnce(u16, &mut Terminal<B>) -> Option<Terminal<B>>,
 ) {
     reanchor_terminal(terminal);
     let term_height = terminal.size().map(|r| r.height).unwrap_or(24).max(1);
-    let desired = crate::tui::progress::rows_for_height(term_height);
+    let desired = rows_for_height(term_height);
     if desired == *rows {
         return;
     }
@@ -820,22 +825,74 @@ mod tests {
         );
     }
 
+    /// Rows carrying at least one non-blank cell. The box is the only thing ever
+    /// drawn in these tests, so this is "where the box is" — and, more usefully,
+    /// "where anything the box left behind is".
+    fn painted_rows(buf: &ratatui::buffer::Buffer) -> Vec<u16> {
+        (buf.area.top()..buf.area.bottom())
+            .filter(|&y| {
+                (buf.area.left()..buf.area.right()).any(|x| !buf[(x, y)].symbol().trim().is_empty())
+            })
+            .collect()
+    }
+
+    /// An inline terminal anchored below `origin_row` with a progress box already
+    /// drawn into it, i.e. the state a live run is in when SIGWINCH arrives.
+    fn live_inline_terminal(
+        width: u16,
+        height: u16,
+        origin_row: u16,
+        rows: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use ratatui::backend::{Backend, TestBackend};
+        use ratatui::layout::Position;
+        use ratatui::text::Text;
+        use ratatui::widgets::Paragraph;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let mut backend = TestBackend::new(width, height);
+        // Anchor away from row 0 so "cursor is at the viewport origin" is a real
+        // assertion and not accidentally satisfied by any cursor-home.
+        backend
+            .set_cursor_position(Position::new(0, origin_row))
+            .expect("park cursor");
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(rows),
+            },
+        )
+        .expect("terminal");
+
+        let view = TuiProgressView::new("Running //a:b");
+        let lines = view.render("⠋", 10_000, width, rows);
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
+            .expect("draw");
+        terminal
+    }
+
     /// Regression: a resize that changes the viewport row count rebuilds the
     /// inline terminal, and `Terminal::with_options` anchors the new viewport at
     /// wherever the cursor happens to be. `autoresize` leaves that cursor at the
     /// *bottom* of the live box, so rebuilding straight after it walks the box a
     /// box-height down the screen on every resize and strands the rows it used to
-    /// occupy as a blank gap. The path must collapse the viewport first, parking
-    /// the cursor back at the box's origin.
+    /// occupy as leftover artifacts. The path must collapse the viewport first,
+    /// parking the cursor back at the box's origin.
     ///
-    /// The rebuild hook lets the test observe the terminal at the exact moment
-    /// the new one would be built: the cursor must be at the viewport origin
-    /// (column 0), not mid-box.
+    /// The discriminating observable is *where the rebuilt box lands*, asserted
+    /// against the origin captured before the rebuild: `autoresize` has already
+    /// erased the old region, so a skipped collapse does not leave glyphs behind —
+    /// it silently re-anchors the box a box-height lower (measured: origin 5 → 12
+    /// on one resize) and leaves the rows above it as a blank gap that grows with
+    /// every subsequent resize.
     #[test]
-    fn resize_rebuild_anchors_at_the_box_origin_not_the_live_cursor() {
+    fn resize_rebuild_anchors_at_the_old_origin_not_the_live_cursor() {
         use super::reanchor_inline;
         use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{MIN_PROGRESS_ROWS, TuiProgressView, rows_for_height};
+        use crate::tui::progress::{TuiProgressView, rows_for_height};
         use ratatui::Terminal;
         use ratatui::backend::{Backend, TestBackend};
         use ratatui::layout::Position;
@@ -844,30 +901,23 @@ mod tests {
         use ratatui::{TerminalOptions, Viewport};
 
         const WIDTH: u16 = 80;
+        const ORIGIN: u16 = 5;
 
-        let mut rows = MIN_PROGRESS_ROWS;
-        let mut terminal = Terminal::with_options(
-            TestBackend::new(WIDTH, 24),
-            TerminalOptions {
-                viewport: Viewport::Inline(rows),
-            },
-        )
-        .expect("terminal");
+        let mut rows = rows_for_height(24);
+        let mut terminal = live_inline_terminal(WIDTH, 24, ORIGIN, rows);
 
-        let view = TuiProgressView::new("Running //a:b");
-        let lines = view.render("⠋", 10_000, WIDTH, rows);
-        terminal
-            .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
-            .expect("draw");
-
-        // The draw left the cursor at the last cell it wrote — inside the box,
-        // not at its origin. That is what a naive rebuild would anchor to.
-        let after_draw = terminal
-            .backend_mut()
-            .get_cursor_position()
-            .expect("cursor");
+        let box_before: Vec<u16> = painted_rows(terminal.backend().buffer());
+        assert!(
+            box_before.first().is_some_and(|&y| y >= ORIGIN),
+            "precondition: the box is anchored below row 0, got {box_before:?}"
+        );
+        // The draw left the cursor at the last cell it wrote — inside the box, not
+        // at its origin. That is what a naive rebuild would anchor to.
         assert_ne!(
-            after_draw,
+            terminal
+                .backend_mut()
+                .get_cursor_position()
+                .expect("cursor"),
             Position::new(0, terminal.get_frame().area().y),
             "precondition: a live box leaves the cursor away from the viewport origin"
         );
@@ -883,32 +933,132 @@ mod tests {
         );
         terminal.backend_mut().resize(WIDTH, new_height);
 
-        let mut anchor_at_rebuild = None;
-        reanchor_inline(&mut terminal, &mut rows, |desired, collapsed| {
-            let origin = collapsed.get_frame().area().y;
-            let cursor = collapsed
-                .backend_mut()
-                .get_cursor_position()
-                .expect("cursor");
-            anchor_at_rebuild = Some((cursor, origin));
-            Terminal::with_options(
-                TestBackend::new(WIDTH, new_height),
-                TerminalOptions {
-                    viewport: Viewport::Inline(desired),
-                },
-            )
-            .ok()
-        });
-
-        let (cursor, origin) = anchor_at_rebuild.expect("rebuild hook ran");
-        assert_eq!(
-            cursor,
-            Position::new(0, origin),
-            "the rebuilt viewport must anchor at the old box's origin, not the live cursor"
+        // `autoresize` (the first thing `reanchor_inline` does) recomputes the
+        // inline anchor; that is the origin the rebuilt viewport has to reuse.
+        let origin_before = terminal.get_frame().area().y;
+        reanchor_inline(
+            &mut terminal,
+            &mut rows,
+            rows_for_height,
+            |desired, collapsed| {
+                // Carry the backend across, exactly as production does — the rebuild
+                // re-wraps the same stderr, it does not get a fresh screen.
+                Terminal::with_options(
+                    collapsed.backend().clone(),
+                    TerminalOptions {
+                        viewport: Viewport::Inline(desired),
+                    },
+                )
+                .ok()
+            },
         );
+        assert_eq!(rows, expected_rows, "viewport adopts the new row count");
         assert_eq!(
-            rows, expected_rows,
-            "viewport should adopt the new row count"
+            terminal.get_frame().area().y,
+            origin_before,
+            "the rebuilt viewport must reuse the old box's rows; anchoring on the \
+             live cursor walks it down the screen instead"
+        );
+
+        let view = TuiProgressView::new("Running //a:b");
+        let lines = view.render("⠋", 10_000, WIDTH, rows);
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
+            .expect("redraw");
+        assert_eq!(
+            painted_rows(terminal.backend().buffer()),
+            (origin_before..origin_before + rows).collect::<Vec<_>>(),
+            "exactly one box, starting where the old one did"
+        );
+    }
+
+    /// The common resize: a width-only drag. The row count is unchanged, so the
+    /// terminal must not be rebuilt at all — `autoresize` alone re-anchors and
+    /// resets the back buffer, and the box reflows to the new width in place.
+    #[test]
+    fn width_only_resize_reflows_without_rebuilding() {
+        use super::reanchor_inline;
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::{TuiProgressView, rows_for_height};
+        use ratatui::backend::Backend;
+        use ratatui::text::Text;
+        use ratatui::widgets::Paragraph;
+
+        let start_rows = rows_for_height(24);
+        let mut rows = start_rows;
+        let mut terminal = live_inline_terminal(80, 24, 5, rows);
+        // Same height, so `rows_for_height` is unchanged — only the width moved.
+        terminal.backend_mut().resize(50, 24);
+
+        let mut rebuilds = 0;
+        reanchor_inline(
+            &mut terminal,
+            &mut rows,
+            rows_for_height,
+            |_desired, _collapsed| {
+                rebuilds += 1;
+                None
+            },
+        );
+        assert_eq!(rebuilds, 0, "no row-count change, no rebuild");
+        assert_eq!(rows, start_rows);
+
+        let view = TuiProgressView::new("Running //a:b");
+        let lines = view.render("⠋", 10_000, 50, rows);
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
+            .expect("redraw");
+        let origin = terminal.get_frame().area().y;
+        assert_eq!(
+            painted_rows(terminal.backend().buffer()),
+            (origin..origin + rows).collect::<Vec<_>>(),
+            "the reflowed box is the only thing on screen — no stale wide-row tails"
+        );
+    }
+
+    /// `Terminal::with_options` re-queries the cursor and can fail on a terminal
+    /// that never answers. The old viewport has already been collapsed by then, so
+    /// the kept terminal must still repaint cleanly rather than sit blank.
+    #[test]
+    fn failed_rebuild_keeps_the_old_terminal_usable() {
+        use super::reanchor_inline;
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::{TuiProgressView, rows_for_height};
+        use ratatui::backend::Backend;
+        use ratatui::text::Text;
+        use ratatui::widgets::Paragraph;
+
+        const WIDTH: u16 = 80;
+        let start_rows = rows_for_height(24);
+        let mut rows = start_rows;
+        let mut terminal = live_inline_terminal(WIDTH, 24, 5, rows);
+        terminal.backend_mut().resize(WIDTH, 60);
+        assert_ne!(rows_for_height(60), rows, "must hit the rebuild branch");
+
+        let origin_before = terminal.get_frame().area().y;
+        reanchor_inline(
+            &mut terminal,
+            &mut rows,
+            rows_for_height,
+            |_desired, _collapsed| None,
+        );
+        assert_eq!(rows, start_rows, "row count only moves on a success");
+        assert_eq!(
+            terminal.get_frame().area().y,
+            origin_before,
+            "a failed rebuild leaves the viewport where the collapse parked it"
+        );
+
+        let view = TuiProgressView::new("Running //a:b");
+        let lines = view.render("⠋", 10_000, WIDTH, rows);
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
+            .expect("redraw");
+        let origin = terminal.get_frame().area().y;
+        assert_eq!(
+            painted_rows(terminal.backend().buffer()),
+            (origin..origin + rows).collect::<Vec<_>>(),
+            "the collapsed viewport repaints in full after a failed rebuild"
         );
     }
 
