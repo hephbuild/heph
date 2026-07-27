@@ -111,6 +111,11 @@ pub struct Engine {
     /// into consumers (the buildfile provider) exactly once, lazily on the first
     /// provider dispatch — by which point all registration has completed.
     pub(crate) provider_functions_wired: std::sync::Once,
+
+    /// The remote cache's temp directory, created and swept of abandoned temps
+    /// on first use (`Engine::remote_tmp_dir`). Lazy, so a build with no
+    /// `caches:` configured never touches the directory at all.
+    pub(crate) remote_tmp_ready: tokio::sync::OnceCell<PathBuf>,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -392,6 +397,7 @@ impl Engine {
             result_lock,
             remote_caches,
             provider_functions_wired: std::sync::Once::new(),
+            remote_tmp_ready: tokio::sync::OnceCell::new(),
         };
         engine.register_driver(|_| Box::new(hbuiltins::plugingroup::Driver))?;
         engine.register_provider(|_| Box::new(hplugin_query::pluginquery::Provider))?;

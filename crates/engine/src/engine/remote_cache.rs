@@ -115,6 +115,31 @@ static UPLOAD_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(MAX_C
 /// but a remote cache miss next time, since the revision is already local.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
+/// Age past which a file under `remote-tmp` cannot belong to a live transfer,
+/// used by [`sweep_abandoned_temps`].
+///
+/// The floor is derived: [`UPLOAD_DEADLINE`] bounds the push end to end, queue
+/// wait included, and the temp is created inside that bound; the pull side has no
+/// deadline of its own but stays fresh because a progressing transfer keeps
+/// advancing the temp's mtime, and a *stalled* one is killed by the backend's
+/// inactivity bound (see [`RemoteCacheBackend`]). Past that, plus the gap between
+/// the last byte and the decode, a file can only be residue from a run
+/// hard-killed before its [`TempBlob`] could be dropped.
+///
+/// The value sits far above that floor on purpose, because the two directions are
+/// not symmetric. Too *large* only delays reclaiming residue — disk, bounded by
+/// time rather than by crash count, so a crash loop retains at most this much no
+/// matter how often it crashes. Too *small* unlinks a live temp out from under a
+/// concurrent heph against the same home, which on the pull side is a hard error
+/// rather than a miss. The mtime-freshness premise also assumes the peer is
+/// *running*: a suspended laptop or a `SIGSTOP`ed process stops advancing mtime
+/// while its transfer is still perfectly live, and only a margin this wide keeps
+/// that from looking abandoned.
+///
+/// Because the `.blob` naming is unchanged, the first run of this binary reclaims
+/// what every pre-fix run left behind.
+const TEMP_SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Permits for the synchronous compress/decompress + local-cache I/O that
 /// brackets every transfer.
 ///
@@ -162,8 +187,151 @@ where
         .with_context(|| format!("remote cache {what}"))
 }
 
+/// Extension every transient blob under `remote-tmp` carries, so the sweep can
+/// tell its own residue from anything else that ends up in the directory.
+const TEMP_BLOB_EXT: &str = "blob";
+
+/// A transient file under `remote-tmp`, unlinked when dropped.
+///
+/// Every temp here is consumed and discarded within the operation that made it —
+/// none is ever promoted to a final path — so the guard is unconditional and
+/// needs no disarm.
+///
+/// It has to be RAII rather than a `remove_file` on each exit, because most of
+/// the exits are not `return`s. The future can be dropped at any `await`: a
+/// sibling in the same [`REVISION_BLOB_CONCURRENCY`] `buffered` stream failed,
+/// the request was cancelled, or the whole background push was abandoned at
+/// [`UPLOAD_DEADLINE`]. A [`run_codec`] closure that nobody is waiting for is the
+/// sharp case — it still runs to completion on the blocking pool, so the
+/// abandoned encode leaves behind a *complete* file. Nothing else deletes these
+/// (the age-gated [`sweep_abandoned_temps`] is a crash backstop, not a mechanism),
+/// so a missed path is disk that leaks past the process.
+#[derive(Debug)]
+pub(crate) struct TempBlob(PathBuf);
+
+impl TempBlob {
+    /// A fresh unique path under `dir`. The file itself is created by the caller;
+    /// dropping a `TempBlob` whose file was never created is a no-op.
+    fn new(dir: &Path) -> Self {
+        Self(dir.join(format!("{}.{TEMP_BLOB_EXT}", uuid::Uuid::new_v4())))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempBlob {
+    fn drop(&mut self) {
+        // A guard that cannot unlink is the exact failure this type exists to
+        // prevent, and the sweep won't look at the file for another
+        // `TEMP_SWEEP_AGE` — say so rather than swallowing it. `NotFound` is
+        // ordinary: the path is reserved before the file is created.
+        if let Err(e) = std::fs::remove_file(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            debug!(
+                error = %e,
+                path = %self.0.display(),
+                "could not reclaim a remote cache temp blob",
+            );
+        }
+    }
+}
+
+/// Remove temp blobs left by runs that died before their [`TempBlob`] could be
+/// dropped (SIGKILL, panic-abort, power loss) — nothing else reclaims those.
+///
+/// Age-gated on purpose, and best-effort throughout: the temp dir is shared by
+/// every heph process against this home, so an unconditional sweep would delete a
+/// concurrent run's live temps — and for a pull, a temp vanishing mid-transfer is
+/// a fatal error, not a miss. See [`TEMP_SWEEP_AGE`].
+fn sweep_abandoned_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // "Now" comes from the directory's own filesystem, not the process clock.
+    // The two can disagree — an NFS server running behind, a laptop resumed from
+    // sleep — and comparing across them can read a *live* temp as provably old.
+    // Deleting one out from under a transfer is not a miss on that pull, it is a
+    // hard error. Same clock on both sides, and any skew cancels.
+    let now = match sweep_clock(dir) {
+        Some(now) => now,
+        None => {
+            debug!(dir = %dir.display(), "no usable mtime clock; skipping temp sweep");
+            return;
+        }
+    };
+    let (mut swept, mut kept, mut failed) = (0usize, 0usize, 0usize);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != TEMP_BLOB_EXT) {
+            continue;
+        }
+        // Unreadable metadata or an mtime in the future both read as "not
+        // provably old" — keep it.
+        let abandoned = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= TEMP_SWEEP_AGE);
+        if !abandoned {
+            kept += 1;
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => swept += 1,
+            // A `.blob` directory, EPERM, an immutable flag: nothing will ever
+            // reclaim it and the sweep is the only thing that looks, so it has to
+            // be said out loud rather than counted as kept.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                failed += 1;
+                debug!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not reclaim an abandoned remote cache temp blob",
+                );
+            }
+        }
+    }
+    if swept > 0 || failed > 0 {
+        debug!(
+            swept,
+            kept,
+            failed,
+            dir = %dir.display(),
+            "reclaimed abandoned remote cache temp blobs",
+        );
+    }
+}
+
+/// The current time as `dir`'s own filesystem records it, by writing a file there
+/// and reading back its mtime.
+///
+/// Deliberately not [`std::time::SystemTime::now`] — see [`sweep_abandoned_temps`].
+/// The name is outside [`TEMP_BLOB_EXT`], so a concurrent sweep never treats it as
+/// residue; two processes racing on it only overwrite each other's timestamp,
+/// which is all either one wanted.
+fn sweep_clock(dir: &Path) -> Option<std::time::SystemTime> {
+    let probe = dir.join(".sweep-clock");
+    let now = std::fs::File::create(&probe)
+        .and_then(|f| f.metadata()?.modified())
+        .ok();
+    drop(std::fs::remove_file(&probe));
+    now
+}
+
 /// A streaming object store. The set layers cache semantics (manifest affinity,
 /// ordering, parallel fan-out) on top; a backend only moves bytes.
+///
+/// **A reader must bound its own inactivity.** `fetch_blob` puts a
+/// [`METADATA_TIMEOUT`] on opening the stream, but the body copy that follows is
+/// raced only against cancellation — an implementation that can sit forever
+/// mid-response holds a bulk request slot indefinitely, and leaves a temp file
+/// whose mtime stops advancing, which is the premise [`TEMP_SWEEP_AGE`] rests on.
+/// [`ObjStoreBackend`] does this with its `InactivityReader`.
 #[async_trait]
 pub trait RemoteCacheBackend: Send + Sync {
     /// Open a streaming reader for an object, or `None` if it does not exist.
@@ -1050,7 +1218,7 @@ impl RemoteCacheSet {
         hashin: &str,
         name: &str,
         dest_dir: &Path,
-    ) -> anyhow::Result<Option<PathBuf>> {
+    ) -> anyhow::Result<Option<TempBlob>> {
         let cache = self
             .caches
             .get(rev.cache_idx)
@@ -1084,9 +1252,11 @@ impl RemoteCacheSet {
                 return Ok(None);
             }
         };
-        let temp = dest_dir.join(format!("{}.blob", uuid::Uuid::new_v4()));
+        // Every early exit below — and every point the caller can drop this
+        // future — unlinks the partial temp through `TempBlob`'s drop.
+        let temp = TempBlob::new(dest_dir);
         // Temp-file I/O is local and genuinely fatal — propagate.
-        let mut file = tokio::fs::File::create(&temp)
+        let mut file = tokio::fs::File::create(temp.path())
             .await
             .with_context(|| format!("create temp for remote blob {name}"))?;
         let mut reader = reader;
@@ -1096,11 +1266,7 @@ impl RemoteCacheSet {
         // keeps hanging.
         let copied = tokio::select! {
             biased;
-            () = ctoken.cancelled() => {
-                drop(file);
-                drop(std::fs::remove_file(&temp));
-                return Ok(None);
-            }
+            () = ctoken.cancelled() => return Ok(None),
             r = tokio::io::copy(&mut reader, &mut file) => r,
         };
         if let Err(e) = copied {
@@ -1109,8 +1275,6 @@ impl RemoteCacheSet {
                 "blob download",
                 &anyhow::Error::new(e).context(format!("stream remote blob {name}")),
             );
-            drop(file);
-            drop(std::fs::remove_file(&temp));
             return Ok(None);
         }
         file.shutdown()
@@ -1407,10 +1571,42 @@ impl Engine {
         });
     }
 
-    /// Directory for transient gzip temp files, alongside the cache so temp and
-    /// final live on the same filesystem.
-    fn remote_tmp_dir(&self) -> PathBuf {
-        self.home.join("cache").join("remote-tmp")
+    /// The directory for transient gzip temp files — alongside the cache, so temp
+    /// and final live on the same filesystem — created, and swept once per engine
+    /// of anything a previous run abandoned.
+    ///
+    /// The path is only reachable through here, so it cannot be named without
+    /// having been created. The sweep runs once, not per transfer: it is a
+    /// `read_dir` plus a `stat` per entry, and this sits on the path of every
+    /// upload and every pull — at a hundred thousand targets, re-walking the
+    /// directory each time would cost far more than the residue it reclaims.
+    ///
+    /// It is also *detached*, so the first transfer of the run does not wait on
+    /// it. Nothing depends on the sweep having finished — its whole job is
+    /// deleting files this process will never look at — and a directory holding a
+    /// large backlog is precisely the case where it is slow and the case where
+    /// waiting would be most visible. Both it and the `create_dir_all` go to the
+    /// blocking pool.
+    async fn remote_tmp_dir(&self) -> anyhow::Result<&Path> {
+        let dir = self
+            .remote_tmp_ready
+            .get_or_try_init(|| {
+                let dir = self.home.join("cache").join("remote-tmp");
+                async move {
+                    let dir = hcore::blocking::run(move || {
+                        std::fs::create_dir_all(&dir)
+                            .with_context(|| format!("create remote temp dir {}", dir.display()))?;
+                        anyhow::Ok(dir)
+                    })
+                    .await?;
+                    tokio::spawn(enclose::enclose!((dir) async move {
+                        hcore::blocking::run(move || sweep_abandoned_temps(&dir)).await;
+                    }));
+                    anyhow::Ok(dir)
+                }
+            })
+            .await?;
+        Ok(dir.as_path())
     }
 
     /// Push a just-cached revision to the writable remote caches. Reads the
@@ -1430,9 +1626,7 @@ impl Engine {
             return Ok(());
         };
 
-        let tmp_dir = self.remote_tmp_dir();
-        std::fs::create_dir_all(&tmp_dir)
-            .with_context(|| format!("create remote temp dir {}", tmp_dir.display()))?;
+        let tmp_dir = self.remote_tmp_dir().await?;
 
         // Encode every blob to a temp file (synchronous local I/O, off the runtime
         // workers via `run_codec`; the non-`Send` local reader stays on that
@@ -1453,7 +1647,7 @@ impl Engine {
                     self.local_cache.clone(),
                     addr.clone(),
                     hashin.to_string(),
-                    tmp_dir.clone(),
+                    tmp_dir.to_path_buf(),
                 );
                 let (name, size) = (a.name.clone(), a.size);
                 async move {
@@ -1463,12 +1657,16 @@ impl Engine {
                             .reader(&addr, &hashin, &name)
                             .with_context(|| format!("open local blob {name}"))?;
                         let encoding = compression_for(size);
-                        let temp = tmp_dir.join(format!("{}.blob", uuid::Uuid::new_v4()));
+                        // Guarded from the moment the path exists: this closure
+                        // runs to completion on the blocking pool even when the
+                        // awaiting future is long gone, and the `TempBlob` it
+                        // returns is then dropped with the unwanted answer.
+                        let temp = TempBlob::new(&tmp_dir);
                         let reader = sized.reader.take(sized.size);
                         match encoding {
-                            ManifestArtifactEncoding::Gzip => gzip_to_file(reader, &temp)
+                            ManifestArtifactEncoding::Gzip => gzip_to_file(reader, temp.path())
                                 .with_context(|| format!("compress local blob {name}"))?,
-                            _ => copy_to_file(reader, &temp)
+                            _ => copy_to_file(reader, temp.path())
                                 .with_context(|| format!("copy local blob {name}"))?,
                         }
                         Ok((name, temp, encoding))
@@ -1479,7 +1677,7 @@ impl Engine {
             .collect();
         // Bounded so a revision with thousands of artifacts doesn't open a temp
         // file per artifact at once; `CODEC_SLOTS` bounds the CPU underneath.
-        let prepared: Vec<(String, PathBuf, ManifestArtifactEncoding)> = stream::iter(encodes)
+        let prepared: Vec<(String, TempBlob, ManifestArtifactEncoding)> = stream::iter(encodes)
             .buffered(REVISION_BLOB_CONCURRENCY)
             .try_collect()
             .await?;
@@ -1510,15 +1708,16 @@ impl Engine {
 
         let temps: Vec<(String, PathBuf)> = prepared
             .iter()
-            .map(|(name, path, _)| (name.clone(), path.clone()))
+            .map(|(name, temp, _)| (name.clone(), temp.path().to_path_buf()))
             .collect();
         self.remote_caches
             .put_revision(addr, hashin, &manifest_bytes, &temps)
             .await;
 
-        for (_, path, _) in &prepared {
-            drop(std::fs::remove_file(path));
-        }
+        // `prepared` still owns every `TempBlob`, so the encodes are unlinked
+        // here — and equally on each `?` above, and if this whole push is
+        // abandoned at `UPLOAD_DEADLINE` mid-`put_revision`.
+        drop(prepared);
         Ok(())
     }
 
@@ -1617,16 +1816,14 @@ impl Engine {
         if names.is_empty() {
             return Ok(true);
         }
-        let tmp_dir = self.remote_tmp_dir();
-        std::fs::create_dir_all(&tmp_dir)
-            .with_context(|| format!("create remote temp dir {}", tmp_dir.display()))?;
+        let tmp_dir = self.remote_tmp_dir().await?;
 
         // Bounded fan-out — see `REVISION_BLOB_CONCURRENCY`. A target whose caller
         // asks for many output groups must not open every stream at once.
         // Collected eagerly — see the note in `put_revision`.
         let pulls: Vec<_> = names
             .iter()
-            .map(|name| self.pull_remote_blob(ctoken, addr, hashin, rev, name, &tmp_dir))
+            .map(|name| self.pull_remote_blob(ctoken, addr, hashin, rev, name, tmp_dir))
             .collect();
         let served: Vec<bool> = stream::iter(pulls)
             .buffered(REVISION_BLOB_CONCURRENCY)
@@ -1638,6 +1835,13 @@ impl Engine {
     /// Stream one blob into a temp file, then decode it into the local cache. The
     /// temp file is dropped on both paths. `Ok(false)` if the remote could not
     /// serve it — see [`Self::pull_remote_blobs`].
+    ///
+    /// The [`TempBlob`] is handed **into** the decode closure rather than held
+    /// here. Once [`run_codec`] has queued the job it runs whatever the caller
+    /// does, so a guard left on this side would unlink the temp out from under a
+    /// decode that is about to read it — and the local-cache writer publishes
+    /// what it has when dropped, so that loses the race by writing an empty blob
+    /// over a manifest that already claims the artifact is present.
     async fn pull_remote_blob(
         &self,
         ctoken: &dyn Cancellable,
@@ -1671,23 +1875,23 @@ impl Engine {
         let addr_owned = addr.clone();
         let hashin_owned = hashin.to_string();
         let name_owned = name.to_string();
-        let temp_for_codec = temp.clone();
-        let res = run_codec("download decode", move || -> anyhow::Result<()> {
+        run_codec("download decode", move || -> anyhow::Result<()> {
+            // `temp` is captured by value, so it is unlinked when this closure
+            // ends — whether it ran, or was dropped un-run because the caller
+            // went away before the pool picked the job up.
             let mut w = local_cache
                 .writer(&addr_owned, &hashin_owned, &name_owned)
                 .with_context(|| format!("open local writer for downloaded blob {name_owned}"))?;
             match encoding {
-                ManifestArtifactEncoding::Gzip => gunzip_from_file(&temp_for_codec, &mut w)
+                ManifestArtifactEncoding::Gzip => gunzip_from_file(temp.path(), &mut w)
                     .with_context(|| format!("decompress downloaded blob {name_owned}"))?,
-                _ => copy_file_to(&temp_for_codec, &mut w)
+                _ => copy_file_to(temp.path(), &mut w)
                     .with_context(|| format!("write downloaded blob {name_owned}"))?,
             }
             Ok(())
         })
-        .await;
-
-        drop(std::fs::remove_file(&temp));
-        res.map(|()| true)
+        .await
+        .map(|()| true)
     }
 }
 
@@ -2646,7 +2850,7 @@ mod tests {
             .iter()
             .map(|a| set.fetch_blob(&ctoken, &rev, &addr, "h", &a.name, dir.path()))
             .collect();
-        let temps: Vec<Option<PathBuf>> = stream::iter(fetches)
+        let temps: Vec<Option<TempBlob>> = stream::iter(fetches)
             .buffered(REVISION_BLOB_CONCURRENCY)
             .try_collect()
             .await
@@ -2704,68 +2908,84 @@ mod tests {
         );
     }
 
+    /// Serves a manifest, then never delivers a single blob byte.
+    struct StalledBlobBackend {
+        manifest_key: String,
+        manifest: Vec<u8>,
+    }
+
+    impl StalledBlobBackend {
+        /// A set whose one cache serves `addr`'s manifest and stalls on its blobs.
+        fn set(addr: &Addr, home: PathBuf) -> Arc<RemoteCacheSet> {
+            let manifest = RemoteManifest {
+                version: REMOTE_MANIFEST_VERSION.to_string(),
+                target: addr.format(),
+                hashin: "h".to_string(),
+                artifacts: vec![probe_artifact(0)],
+            };
+            set_with(
+                Arc::new(Self {
+                    manifest_key: RemoteCacheSet::key(addr, "h", MANIFEST_V1),
+                    manifest: borsh::to_vec(&manifest).expect("serialize manifest"),
+                }),
+                home,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for StalledBlobBackend {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            if key == self.manifest_key {
+                return Ok(Some(Box::pin(std::io::Cursor::new(self.manifest.clone()))));
+            }
+            // A reader that is forever pending: the copy can only end via
+            // cancellation.
+            struct Never;
+            impl AsyncRead for Never {
+                fn poll_read(
+                    self: Pin<&mut Self>,
+                    _cx: &mut std::task::Context<'_>,
+                    _buf: &mut tokio::io::ReadBuf<'_>,
+                ) -> std::task::Poll<std::io::Result<()>> {
+                    std::task::Poll::Pending
+                }
+            }
+            Ok(Some(Box::pin(Never)))
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("read-only")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Temp blobs currently sitting in `dir`.
+    fn temp_blobs(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == TEMP_BLOB_EXT))
+            .collect()
+    }
+
     /// A pull in progress must abort when the run is cancelled. The blob copy is
     /// exactly where a wedged connection parks, and it happens under the
     /// target's per-addr write lock — so an uninterruptible copy means Ctrl-C
     /// leaves the build hanging on the very transfer the user gave up on.
     #[tokio::test]
     async fn blob_fetch_aborts_on_cancellation() {
-        /// Serves a manifest, then never delivers a single blob byte.
-        struct StalledBlobBackend {
-            manifest_key: String,
-            manifest: Vec<u8>,
-        }
-
-        #[async_trait]
-        impl RemoteCacheBackend for StalledBlobBackend {
-            async fn open_read(
-                &self,
-                key: &str,
-            ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
-                if key == self.manifest_key {
-                    return Ok(Some(Box::pin(std::io::Cursor::new(self.manifest.clone()))));
-                }
-                // A reader that is forever pending: the copy can only end via
-                // cancellation.
-                struct Never;
-                impl AsyncRead for Never {
-                    fn poll_read(
-                        self: Pin<&mut Self>,
-                        _cx: &mut std::task::Context<'_>,
-                        _buf: &mut tokio::io::ReadBuf<'_>,
-                    ) -> std::task::Poll<std::io::Result<()>> {
-                        std::task::Poll::Pending
-                    }
-                }
-                Ok(Some(Box::pin(Never)))
-            }
-            async fn open_write(
-                &self,
-                _key: &str,
-            ) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
-                anyhow::bail!("read-only")
-            }
-            async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
-                Ok(false)
-            }
-            async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
-                Ok(Vec::new())
-            }
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         let addr = addr();
-        let manifest = RemoteManifest {
-            version: REMOTE_MANIFEST_VERSION.to_string(),
-            target: addr.format(),
-            hashin: "h".to_string(),
-            artifacts: vec![probe_artifact(0)],
-        };
-        let backend = Arc::new(StalledBlobBackend {
-            manifest_key: RemoteCacheSet::key(&addr, "h", MANIFEST_V1),
-            manifest: borsh::to_vec(&manifest).expect("serialize manifest"),
-        });
-        let set = set_with(backend, dir.path().to_path_buf());
+        let set = StalledBlobBackend::set(&addr, dir.path().to_path_buf());
 
         let ctoken = never();
         let rev = set
@@ -2788,14 +3008,178 @@ mod tests {
             "a cancelled pull must report a miss"
         );
         // The abandoned temp must not be left behind.
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read temp dir")
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
-            .collect();
+        let leftovers = temp_blobs(dir.path());
         assert!(
             leftovers.is_empty(),
             "cancelling must not leak partial temp files, found {leftovers:?}"
+        );
+    }
+
+    /// Cancellation is only one of the ways a pull ends early — the plainer one
+    /// is the future simply being dropped at its `await`, which is what happens
+    /// to every other blob in a `buffered` fan-out the moment one sibling fails.
+    /// No code runs on that path, so only `TempBlob`'s drop can reclaim the
+    /// partial file.
+    #[tokio::test]
+    async fn a_dropped_blob_fetch_reclaims_its_partial_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let set = StalledBlobBackend::set(&addr, dir.path().to_path_buf());
+
+        let ctoken = never();
+        let rev = set
+            .fetch_manifest(&ctoken, &addr, "h")
+            .await
+            .expect("fetch manifest")
+            .expect("hit");
+        // `Box::pin`, not `tokio::pin!`: the latter shadows the future with a
+        // `Pin<&mut _>`, so `drop`ping that name is a no-op and the future — and
+        // its guard — would outlive the assertion below.
+        let mut fetch = Box::pin(set.fetch_blob(&ctoken, &rev, &addr, "h", "blob-0", dir.path()));
+
+        // Poll it far enough to have created the temp and parked on the copy.
+        // The budget is generous rather than tight: this is waiting on a
+        // `tokio::fs::File::create` to land, and on a loaded 2-core runner a
+        // one-second deadline is a coin flip, not a signal.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while temp_blobs(dir.path()).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fetch never created its temp file",
+            );
+            tokio::select! {
+                _ = &mut fetch => panic!("a stalled backend must never complete the copy"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        assert_eq!(
+            temp_blobs(dir.path()).len(),
+            1,
+            "the fetch should have exactly one temp file open"
+        );
+
+        drop(fetch);
+
+        let leftovers = temp_blobs(dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "dropping a pull mid-copy must not leak its temp, found {leftovers:?}"
+        );
+    }
+
+    /// The sharp edge of the blocking pool: a `run_codec` closure runs to
+    /// completion whether or not anyone still wants the answer, so an abandoned
+    /// encode finishes writing a *complete* temp file after its future is gone.
+    /// Nothing async is left to clean that up — the guard has to travel with the
+    /// value, so that dropping the unwanted answer is what unlinks the file.
+    // Multi-thread: the handshake with the closure is a blocking `recv`, so the
+    // runtime needs a worker other than the one parked on it to drive the task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_encode_reclaims_its_finished_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp_dir = dir.path().to_path_buf();
+        let (created_tx, created_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let encode = tokio::spawn(async move {
+            run_codec("test encode", move || {
+                let temp = TempBlob::new(&tmp_dir);
+                std::fs::write(temp.path(), b"encoded").expect("write temp");
+                created_tx.send(()).expect("signal created");
+                // Hold the closure open past the point the caller gives up.
+                release_rx.recv().expect("await release");
+                // The other half of the contract: a job still holding its guard
+                // keeps its file. This is what `pull_remote_blob`'s decode reads
+                // — a guard the *caller* held would have unlinked it by now.
+                assert_eq!(
+                    std::fs::read(temp.path()).expect("temp must outlive the caller"),
+                    b"encoded",
+                );
+                Ok(temp)
+            })
+            .await
+        });
+
+        created_rx.recv().expect("encode should start");
+        assert_eq!(
+            temp_blobs(dir.path()).len(),
+            1,
+            "the encode should have written its temp"
+        );
+
+        // The caller gives up while the blocking closure is still running.
+        encode.abort();
+        drop(encode.await);
+        release_tx.send(()).expect("release the encode");
+
+        // The closure now finishes and hands back a `TempBlob` nobody wants; it
+        // is dropped on the blocking thread, which is where the unlink happens.
+        for _ in 0..200 {
+            if temp_blobs(dir.path()).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "an abandoned encode leaked its temp: {:?}",
+            temp_blobs(dir.path())
+        );
+    }
+
+    /// A run killed outright (SIGKILL, panic-abort) never gets to drop anything,
+    /// so the sweep is the only thing that reclaims what it left. It is age-gated
+    /// because the directory is shared with any concurrent heph process, whose
+    /// live temps must survive untouched — for a pull, one vanishing mid-transfer
+    /// is fatal, not a miss.
+    #[test]
+    fn the_sweep_reclaims_only_provably_abandoned_temps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let plant = |name: &str, age: Option<Duration>| {
+            let path = dir.path().join(name);
+            let f = std::fs::File::create(&path).expect("create planted file");
+            if let Some(age) = age {
+                let when = std::time::SystemTime::now() - age;
+                f.set_times(std::fs::FileTimes::new().set_modified(when))
+                    .expect("backdate planted file");
+            }
+            path
+        };
+
+        let stale = plant("stale.blob", Some(TEMP_SWEEP_AGE + Duration::from_secs(60)));
+        // Well past any transfer's own bound, but still inside the sweep window —
+        // it could belong to a suspended peer, so the margin says keep it.
+        let borderline = plant("borderline.blob", Some(TEMP_SWEEP_AGE / 2));
+        let fresh = plant("fresh.blob", None);
+        let foreign = plant("notours.txt", Some(TEMP_SWEEP_AGE * 10));
+        // Clock skew the other way. `duration_since` fails rather than going
+        // negative, and that has to read as "keep" — a refactor to
+        // `elapsed().unwrap_or(MAX)` would silently invert it into "delete
+        // everything".
+        let future = {
+            let path = dir.path().join("future.blob");
+            let f = std::fs::File::create(&path).expect("create planted file");
+            let when = std::time::SystemTime::now() + Duration::from_secs(60 * 60);
+            f.set_times(std::fs::FileTimes::new().set_modified(when))
+                .expect("post-date planted file");
+            path
+        };
+
+        sweep_abandoned_temps(dir.path());
+
+        assert!(!stale.exists(), "an abandoned temp must be reclaimed");
+        assert!(
+            future.exists(),
+            "an mtime in the future is not evidence of abandonment"
+        );
+        assert!(
+            borderline.exists(),
+            "a temp that could still belong to a live transfer must be left alone"
+        );
+        assert!(fresh.exists(), "a live temp must be left alone");
+        assert!(
+            foreign.exists(),
+            "the sweep must only touch files it could have written"
         );
     }
 
@@ -2937,10 +3321,10 @@ mod tests {
             .expect("plain present");
 
         let mut restored_gz = Vec::new();
-        gunzip_from_file(&gz_temp, &mut restored_gz).expect("gunzip");
+        gunzip_from_file(gz_temp.path(), &mut restored_gz).expect("gunzip");
         assert_eq!(restored_gz, raw_gz);
 
-        let restored_plain = std::fs::read(&plain_temp).expect("read plain");
+        let restored_plain = std::fs::read(plain_temp.path()).expect("read plain");
         assert_eq!(
             restored_plain, raw_plain,
             "None-encoded artifact is stored verbatim"
