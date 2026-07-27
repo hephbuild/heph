@@ -217,7 +217,7 @@ pub fn clear_phase() {
     phases().lock().expect("phases mutex poisoned").remove(&inv);
 }
 
-fn dump_phases() -> String {
+pub fn dump_phases() -> String {
     if !phase_trace_enabled() {
         return "  (phase trace disabled — set heph_PHASE_TRACE=1)".to_string();
     }
@@ -415,8 +415,180 @@ pub fn downcast_chain_ref<T: std::error::Error + Send + Sync + 'static>(
     }
 }
 
+// ---- Stuck-cell inventory ----
+//
+// A thread dump answers "what is each *thread* doing", which for this engine is
+// the wrong question: the work lives in parked futures on the heap, and a wedged
+// build shows every thread idle and says nothing about the thousands of awaits
+// that are stuck. The inventory answers the question the dump cannot — *which*
+// cells are incomplete, how many tasks are parked on each, and whether anybody
+// is still on the hook to poll them.
+//
+// Unlike cycle detection and phase tracing, this is always on. It costs one
+// registration per `Memoizer` construction (a handful per request, not per
+// target) and nothing at all per `once` call; everything else happens only when
+// a dump is requested. A diagnostic that has to be switched on cannot help with
+// the hang you did not anticipate — the same argument `src/diag.rs` makes for
+// installing the `SIGQUIT` handler unconditionally.
+
+/// One incomplete cell, as reported by [`inventory`].
+#[derive(Debug, Clone)]
+pub struct StuckCell {
+    /// Which memoizer it belongs to (`result`, `spec`, `def`, …).
+    pub tag: &'static str,
+    /// `format!("{:?}")` of the cell key — for `mem_result` this is the addr.
+    pub key: String,
+    /// Registered awaiters, or `None` if the waker set was locked when sampled.
+    pub waiters: Option<usize>,
+    /// Whether an awaiter is elected to re-poll the inner future. See
+    /// [`cell::Cell::has_driver`] for why `false` here is the interesting case.
+    pub has_driver: bool,
+}
+
+impl StuckCell {
+    /// Waiters are parked on this cell and nobody is going to poll it.
+    pub fn is_stranded(&self) -> bool {
+        !self.has_driver && self.waiters.is_some_and(|n| n > 0)
+    }
+}
+
+/// Type-erased handle on one live `Memoizer`'s cache.
+trait CellSource: Send + Sync {
+    /// Append this memoizer's incomplete cells. Returns `false` once the
+    /// memoizer is gone, so the registry can drop the entry.
+    fn collect(&self, out: &mut Vec<StuckCell>) -> bool;
+}
+
+struct Source<K, V> {
+    tag: &'static str,
+    cache: std::sync::Weak<Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>>,
+}
+
+impl<K, V> CellSource for Source<K, V>
+where
+    K: fmt::Debug + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    fn collect(&self, out: &mut Vec<StuckCell>) -> bool {
+        let Some(cache) = self.cache.upgrade() else {
+            return false;
+        };
+        // `try_lock` for the same reason as `Cell::waiters`: never block a dump
+        // on the process being dumped.
+        let map = match cache.try_lock() {
+            Ok(m) => m,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+        };
+        for (key, cell) in map.iter() {
+            if cell.is_done() {
+                continue;
+            }
+            out.push(StuckCell {
+                tag: self.tag,
+                key: format!("{key:?}"),
+                waiters: cell.waiters(),
+                has_driver: cell.has_driver(),
+            });
+        }
+        true
+    }
+}
+
+static SOURCES: Mutex<Vec<Box<dyn CellSource>>> = Mutex::new(Vec::new());
+
+/// Registry length at which the next prune of dead entries happens. Doubles
+/// each time, so pruning is amortised O(1) per registration rather than a walk
+/// of the whole registry on every `Memoizer` construction.
+static PRUNE_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
+
+fn sources() -> std::sync::MutexGuard<'static, Vec<Box<dyn CellSource>>> {
+    SOURCES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn register_source(source: Box<dyn CellSource>) {
+    let mut sources = sources();
+    sources.push(source);
+    // Every request builds its own memoizers, so without this the registry
+    // grows for the life of the process even though most entries are dead.
+    if sources.len() >= PRUNE_AT.load(Ordering::Relaxed) {
+        let mut scratch = Vec::new();
+        sources.retain(|s| s.collect(&mut scratch));
+        PRUNE_AT.store(sources.len().saturating_mul(2).max(64), Ordering::Relaxed);
+    }
+}
+
+/// Every incomplete cell across every live memoizer.
+///
+/// Ordered stranded-first, then by descending waiter count, so the head of the
+/// list is the part of a wedged graph worth reading.
+pub fn inventory() -> Vec<StuckCell> {
+    let mut out = Vec::new();
+    {
+        let mut sources = sources();
+        sources.retain(|s| s.collect(&mut out));
+    }
+    out.sort_by(|a, b| {
+        b.is_stranded()
+            .cmp(&a.is_stranded())
+            .then(b.waiters.unwrap_or(0).cmp(&a.waiters.unwrap_or(0)))
+            .then(a.tag.cmp(b.tag))
+            .then(a.key.cmp(&b.key))
+    });
+    out
+}
+
+/// Render an [`inventory`] as diagnostic text, listing at most `limit` cells.
+///
+/// Diagnostic text, not an interface — nothing should parse it.
+pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
+    let mut out = String::new();
+    if cells.is_empty() {
+        out.push_str("  in-flight    none — no memoizer cell is incomplete\n");
+        return out;
+    }
+
+    let stranded = cells.iter().filter(|c| c.is_stranded()).count();
+    let mut by_tag: Vec<(&'static str, usize)> = Vec::new();
+    for cell in cells {
+        match by_tag.iter_mut().find(|(t, _)| *t == cell.tag) {
+            Some((_, n)) => *n += 1,
+            None => by_tag.push((cell.tag, 1)),
+        }
+    }
+    by_tag.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let parts: Vec<String> = by_tag.iter().map(|(tag, n)| format!("{n} {tag}")).collect();
+    out.push_str(&format!("  in-flight    {}\n", parts.join(", ")));
+
+    if stranded > 0 {
+        // The headline: waiters with no driver is a lost wake-up, not slow work.
+        out.push_str(&format!(
+            "  stranded     {stranded} cell(s) have waiters but no driver — nobody will poll them\n"
+        ));
+    }
+
+    for cell in cells.iter().take(limit) {
+        let waiters = match cell.waiters {
+            Some(n) => n.to_string(),
+            None => "?".to_string(),
+        };
+        let mark = if cell.is_stranded() { " STRANDED" } else { "" };
+        out.push_str(&format!(
+            "    [{}] {} waiters={waiters} driver={}{mark}\n",
+            cell.tag, cell.key, cell.has_driver
+        ));
+    }
+    if cells.len() > limit {
+        out.push_str(&format!("    … and {} more\n", cells.len() - limit));
+    }
+    out
+}
+
 pub struct Memoizer<K, V> {
-    cache: Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>,
+    /// Behind an `Arc` so the inventory can hold a `Weak` to it: a `Memoizer`
+    /// lives in a `RequestState` field, not an `Arc`, so there is nothing else
+    /// for the registry to keep a non-owning handle on.
+    cache: Arc<Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>>,
     /// Tag used in stall warnings to identify which memoizer is stuck.
     tag: &'static str,
 }
@@ -463,10 +635,12 @@ where
     }
 
     pub fn with_tag(tag: &'static str) -> Self {
-        Self {
-            cache: Mutex::new(FxHashMap::default()),
+        let cache = Arc::new(Mutex::new(FxHashMap::default()));
+        register_source(Box::new(Source {
             tag,
-        }
+            cache: Arc::downgrade(&cache),
+        }));
+        Self { cache, tag }
     }
 
     /// Non-inserting peek: returns the memoized value only if it is already
@@ -600,7 +774,7 @@ where
 /// Format the full wait-for graph for diagnostics. Includes every live cell
 /// (owner + debug key) and every task currently registered as a waiter. Used
 /// only by the stall-panic dump.
-fn dump_wait_graph() -> String {
+pub fn dump_wait_graph() -> String {
     if !cycle_detection_enabled() {
         return "  (cycle detection disabled — set HEPH_DEBUG_MEMOIZER_CYCLE=1)".to_string();
     }
@@ -873,6 +1047,160 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{Duration, sleep};
+
+    /// Only cells that are still computing. A completed cell is not stuck, and
+    /// a report that listed every warm hit on a 27k-target build would bury the
+    /// handful that matter.
+    #[tokio::test]
+    async fn inventory_lists_incomplete_cells_and_drops_completed_ones() {
+        let m: Memoizer<String, u32> = Memoizer::with_tag("inv-complete-test");
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let held = m.process("stuck".to_string(), {
+            let gate = Arc::clone(&gate);
+            move || async move {
+                gate.notified().await;
+                1
+            }
+        });
+        tokio::pin!(held);
+        // One poll to insert the cell and park on it.
+        assert!(
+            futures::poll!(&mut held).is_pending(),
+            "the gated cell must not resolve yet"
+        );
+
+        let ours = |tag: &str| -> Vec<StuckCell> {
+            inventory().into_iter().filter(|c| c.tag == tag).collect()
+        };
+
+        let listed = ours("inv-complete-test");
+        assert_eq!(listed.len(), 1, "the in-flight cell must be listed");
+        assert!(
+            listed[0].key.contains("stuck"),
+            "the key names the work: {:?}",
+            listed[0].key
+        );
+
+        gate.notify_waiters();
+        assert_eq!(held.await, 1);
+        assert!(
+            ours("inv-complete-test").is_empty(),
+            "a completed cell is not stuck"
+        );
+    }
+
+    /// Waiters with no driver is the signature the stall paragraph headlines.
+    #[tokio::test]
+    async fn a_cell_with_waiters_and_no_driver_is_stranded() {
+        let m: Memoizer<String, u32> = Memoizer::with_tag("inv-stranded-test");
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        // Two awaiters on one cell: the second to poll is the driver.
+        let mut parked = Box::pin(m.process("wedged".to_string(), {
+            let gate = Arc::clone(&gate);
+            move || async move {
+                gate.notified().await;
+                1
+            }
+        }));
+        assert!(futures::poll!(&mut parked).is_pending());
+        let mut driver = Box::pin(m.process("wedged".to_string(), || async { 0 }));
+        assert!(futures::poll!(&mut driver).is_pending());
+
+        let ours = || -> Vec<StuckCell> {
+            inventory()
+                .into_iter()
+                .filter(|c| c.tag == "inv-stranded-test")
+                .collect()
+        };
+
+        let listed = ours();
+        assert_eq!(listed.len(), 1, "one cell, two awaiters");
+        assert!(
+            !listed[0].is_stranded(),
+            "a driven cell is not stranded: {listed:?}"
+        );
+
+        // The driver goes away without the cell completing — a fail-fast sibling
+        // drop, or Ctrl-C. If the abdication wake fails to land, what is left is
+        // a task parked on a cell nobody will poll: the wedge, exactly.
+        drop(driver);
+        let listed = ours();
+        assert_eq!(listed.len(), 1, "the cell is still incomplete");
+        assert_eq!(
+            listed[0].waiters,
+            Some(1),
+            "the parked awaiter is still attached"
+        );
+        assert!(!listed[0].has_driver, "nobody is elected to poll it");
+        assert!(listed[0].is_stranded(), "{listed:?}");
+    }
+
+    /// The registry holds `Weak`s: a request's memoizers must not keep reporting
+    /// after the request is gone, or a long-lived process accumulates the whole
+    /// history of every build it ever ran.
+    #[tokio::test]
+    async fn inventory_drops_memoizers_that_are_gone() {
+        {
+            let m: Memoizer<String, u32> = Memoizer::with_tag("inv-dropped-test");
+            let mut held = Box::pin(m.process("x".to_string(), || async {
+                futures::future::pending::<u32>().await
+            }));
+            assert!(futures::poll!(&mut held).is_pending());
+            assert!(
+                inventory().iter().any(|c| c.tag == "inv-dropped-test"),
+                "listed while the memoizer is alive"
+            );
+        }
+        assert!(
+            !inventory().iter().any(|c| c.tag == "inv-dropped-test"),
+            "a dead memoizer must be pruned from the registry"
+        );
+    }
+
+    #[test]
+    fn render_inventory_headlines_stranded_cells() {
+        let cells = vec![
+            StuckCell {
+                tag: "result",
+                key: "//a:b".to_string(),
+                waiters: Some(3),
+                has_driver: false,
+            },
+            StuckCell {
+                tag: "spec",
+                key: "//c:d".to_string(),
+                waiters: Some(1),
+                has_driver: true,
+            },
+        ];
+        let text = render_inventory(&cells, 10);
+        assert!(text.contains("1 result, 1 spec"), "{text}");
+        assert!(text.contains("stranded     1 cell(s)"), "{text}");
+        assert!(
+            text.contains("[result] //a:b waiters=3 driver=false STRANDED"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("[spec] //c:d waiters=1 driver=true STRANDED"),
+            "a driven cell must not be marked stranded: {text}"
+        );
+    }
+
+    #[test]
+    fn render_inventory_caps_the_listing_but_says_so() {
+        let cells: Vec<StuckCell> = (0..5)
+            .map(|i| StuckCell {
+                tag: "result",
+                key: format!("//p:{i}"),
+                waiters: Some(1),
+                has_driver: true,
+            })
+            .collect();
+        let text = render_inventory(&cells, 2);
+        assert!(text.contains("… and 3 more"), "{text}");
+    }
 
     /// A panicking memoized computation must fail every awaiter, not hang them.
     ///

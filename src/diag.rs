@@ -136,10 +136,48 @@ fn sweep() {
     }
 
     let n = sweep_threads();
+    write_inventory(fd);
     // `warn!`, not `info!`: someone pressed `Ctrl-\` on a frozen build and the one
     // thing they need back is where the dump went. At `info!` that line sits in
     // the same stream as ordinary build chatter and scrolls past unread.
     warn!(threads = n, path = %path.display(), "Wrote thread backtraces");
+}
+
+/// Append the parked-future state to the dump, after the thread backtraces.
+///
+/// Thread backtraces answer "what is each *thread* doing", which for this engine
+/// is the wrong question. The work lives in futures parked on the heap: a wedged
+/// build shows every worker idle in `futex_wait` and every blocking-pool thread
+/// on an empty queue, and not one frame names the thousands of awaits that are
+/// actually stuck. The inventory is the other half of the dump, and on a lost
+/// wake-up it is the *only* half that says anything.
+///
+/// Runs on the sweeper thread, after every signalled thread has written its
+/// frames — never inside the signal handler, and never with a blocking lock (see
+/// `hmemoizer::inventory`).
+fn inventory_report() -> String {
+    let cells = hcore::hmemoizer::inventory();
+    format!(
+        "\n=== heph in-flight inventory ({} incomplete cells) ===\n{}\n\
+         === memoizer wait-for graph ===\n{}\n\
+         === memoizer phases ===\n{}\n",
+        cells.len(),
+        // No cap: this file is read once, by a human or an agent, on a build
+        // that has already gone wrong. Truncating it here is how you end up
+        // needing a second incident to see the line you cut.
+        hcore::hmemoizer::render_inventory(&cells, usize::MAX),
+        hcore::hmemoizer::dump_wait_graph(),
+        hcore::hmemoizer::dump_phases(),
+    )
+}
+
+fn write_inventory(fd: libc::c_int) {
+    let text = inventory_report();
+    let bytes = text.as_bytes();
+    // SAFETY: appending an owned, initialised byte buffer to the diag fd.
+    unsafe {
+        libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+    }
 }
 
 /// Signal used to make each thread dump itself. `SIGUSR1` is free here —
@@ -268,5 +306,28 @@ extern "C" fn on_dump_signal(_sig: libc::c_int) {
     // SAFETY: appending an owned, initialised byte buffer to the diag fd.
     unsafe {
         libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dump carries the parked-future state, and says how to turn on the
+    /// two views that are still gated.
+    ///
+    /// Thread backtraces alone answered "every thread is idle" on a wedged run
+    /// — true, and useless. The inventory is the half that names the stuck work,
+    /// and the gated sections must announce themselves rather than being absent,
+    /// or the next reader has no way to know a deeper view exists.
+    #[test]
+    fn the_dump_carries_the_in_flight_state_and_names_its_gated_sections() {
+        let text = inventory_report();
+        assert!(text.contains("heph in-flight inventory"), "{text}");
+        assert!(text.contains("memoizer wait-for graph"), "{text}");
+        assert!(text.contains("memoizer phases"), "{text}");
+        // Unset in a test process, so both must self-describe.
+        assert!(text.contains("HEPH_DEBUG_MEMOIZER_CYCLE"), "{text}");
+        assert!(text.contains("heph_PHASE_TRACE"), "{text}");
     }
 }
