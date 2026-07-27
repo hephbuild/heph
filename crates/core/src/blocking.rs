@@ -78,7 +78,12 @@ static BACKSTOP_THREAD: Once = Once::new();
 
 /// Re-wake `waker` within [`WAKE_BACKSTOP`], starting the backstop thread on the
 /// first pending waiter (a process that never blocks never pays for it).
-fn backstop(waker: Waker) {
+///
+/// Public because [`run`] is not the only future in the tree woken from a
+/// non-tokio thread: the sqlite cache's write-behind queue signals its commit
+/// from a dedicated writer thread, which is the same dropped-wake-up exposure
+/// for the same reason. One backstop thread serves every such waiter.
+pub fn backstop(waker: Waker) {
     BACKSTOP_THREAD.call_once(|| {
         thread::Builder::new()
             .name("heph-blocking-wake".to_string())

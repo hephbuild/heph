@@ -28,6 +28,17 @@ fn frame(msg: &str) -> Vec<u8> {
     format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg).into_bytes()
 }
 
+/// How long to allow for the server to go away.
+///
+/// Deliberately generous rather than tight. The bug guarded here is a *permanent*
+/// deadlock — a server stuck on `io_threads.join()` never exits at all — so a long
+/// budget costs nothing in detection power, while a tight one turns the assertion
+/// into a race against wall-clock. What has to fit inside it is a process spawn
+/// plus a full engine bootstrap (config, plugin registries, sqlite), and `tst` runs
+/// this alongside suites that saturate the machine; 15s was enough locally (~1.3s
+/// per test) and was observed timing out on a loaded `linux/amd64` CI runner.
+const EXIT_BUDGET: Duration = Duration::from_secs(60);
+
 /// Wait up to `timeout` for the child to exit; return whether it did.
 fn exited_within(child: &mut std::process::Child, timeout: Duration) -> bool {
     let start = Instant::now();
@@ -90,7 +101,7 @@ fn build_lsp_exits_on_exit_notification() {
     }
 
     assert!(
-        exited_within(&mut child, Duration::from_secs(15)),
+        exited_within(&mut child, EXIT_BUDGET),
         "server did not exit on the `exit` notification"
     );
 }
@@ -110,7 +121,7 @@ fn build_lsp_exits_on_stdin_close() {
         // Drop stdin → client disconnect without the shutdown/exit handshake.
     }
     assert!(
-        exited_within(&mut child, Duration::from_secs(15)),
+        exited_within(&mut child, EXIT_BUDGET),
         "server did not exit when stdin closed"
     );
 }

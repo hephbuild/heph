@@ -1,5 +1,5 @@
 use crate::engine::local_cache::{
-    LocalCache, MANIFEST_V1, Manifest, NotFoundError, SizedReader, TargetStream,
+    Existence, LocalCache, MANIFEST_V1, Manifest, NotFoundError, SizedReader, TargetStream,
 };
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
@@ -142,6 +142,12 @@ impl LocalCache for LocalCacheFS {
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
         let path = self.get_path(addr, hashin, name);
         Ok(path.exists())
+    }
+
+    fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
+        // A rename into place is the commit here — there is no queue behind it,
+        // so every answer this backend can give is already committed.
+        Ok(Existence::Committed(self.exists(addr, hashin, name)?))
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {

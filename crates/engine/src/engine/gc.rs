@@ -404,25 +404,46 @@ impl Engine {
             .list_target_entries(addr)
             .with_context(|| format!("gc: list entries for {addr}"))?;
 
+        // Everything below deletes, and `LocalCache::delete` parks the calling
+        // thread until the sqlite writer thread commits its batch. `gc_apply` is a
+        // plain `tokio::spawn`ed task and phase 2 runs `max_workers` of them at
+        // once, so parking here parks that many runtime workers on a batch commit —
+        // taking the reactor, the timer wheel and the TUI with them. Onto the
+        // blocking pool, where parking a thread is the contract. The write guard
+        // moves in with the job so the lock still spans every delete it covers.
+        let engine = Arc::clone(&self);
+        let addr_owned = addr.clone();
         match decision {
             Decision::Orphan => {
-                let mut bytes = 0u64;
-                for hashin in &hashins {
-                    bytes = bytes.saturating_add(
-                        self.gc_entry(addr, hashin)
-                            .with_context(|| format!("gc: drop orphan {addr}"))?,
-                    );
-                }
+                let removed = hashins.len();
+                let bytes = hcore::blocking::run(move || {
+                    // Moves the write lock into the job so it spans every delete
+                    // below; without the binding the closure would not capture it
+                    // and `gc_apply`'s frame would release it early.
+                    let _guard = guard;
+                    let mut bytes = 0u64;
+                    for hashin in &hashins {
+                        bytes = bytes.saturating_add(
+                            engine
+                                .gc_entry(&addr_owned, hashin)
+                                .with_context(|| format!("gc: drop orphan {addr_owned}"))?,
+                        );
+                    }
+                    anyhow::Ok(bytes)
+                })
+                .await?;
                 Ok(TargetOutcome {
-                    removed: hashins.len(),
+                    removed,
                     kept: 0,
                     bytes,
                     orphan: true,
                 })
             }
             Decision::Trim(history) => {
-                let (removed, kept, bytes) =
-                    self.trim_addr_history(&guard, addr, &hashins, history, None)?;
+                let (removed, kept, bytes) = hcore::blocking::run(move || {
+                    engine.trim_addr_history(&guard, &addr_owned, &hashins, history, None)
+                })
+                .await?;
                 Ok(TargetOutcome {
                     removed,
                     kept,

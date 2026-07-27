@@ -1,4 +1,4 @@
-use crate::engine::local_cache::{LocalCache, SizedReader, TargetStream};
+use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
@@ -99,6 +99,20 @@ impl LocalCache for LocalCacheMem {
             return Ok(true);
         }
         self.inner.exists(addr, hashin, name)
+    }
+
+    fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
+        let key = Self::key(addr, hashin, name);
+        // Must mirror `exists`, not just delegate. A resident entry is readable
+        // from this tier alone, and the durable row behind it can disappear
+        // without this process's `writer`/`delete` seeing it — another `heph`
+        // GC'ing the shared sqlite DB. Delegating blind would then answer absent
+        // for a key `exists` (and `reader`) still serve, and
+        // `artifacts_from_manifest` would silently degrade a hit to a rebuild.
+        if self.cache.peek(&key).is_some() {
+            return Ok(Existence::Committed(true));
+        }
+        self.inner.existence(addr, hashin, name)
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
@@ -221,6 +235,11 @@ mod tests {
             self.exists_calls.fetch_add(1, Ordering::Relaxed);
             let key = CountingCache::key(addr, hashin, name);
             Ok(self.store.lock().contains_key(&key))
+        }
+
+        // In-memory map, committed the instant the writer drops.
+        fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
+            Ok(Existence::Committed(self.exists(addr, hashin, name)?))
         }
 
         fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
@@ -384,6 +403,9 @@ mod tests {
         }
         fn exists(&self, _: &Addr, _: &str, _: &str) -> Result<bool> {
             Ok(true)
+        }
+        fn existence(&self, _: &Addr, _: &str, _: &str) -> Result<Existence> {
+            Ok(Existence::Committed(true))
         }
         fn delete(&self, _: &Addr, _: &str, _: &str) -> Result<()> {
             Ok(())

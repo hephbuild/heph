@@ -1,14 +1,18 @@
-use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader, TargetStream};
+use crate::engine::local_cache::{
+    Existence, LocalCache, NotFoundError, PendingWrite, SizedReader, TargetStream,
+};
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::io::{self, Seek};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tempfile::SpooledTempFile;
@@ -122,64 +126,180 @@ impl<R: io::Read> io::Read for GuardedReader<R> {
     }
 }
 
+/// One queued command's completion signal, waitable from either side of the
+/// async boundary.
+///
+/// Both kinds of waiter are real: GC and the FUSE reader are on OS threads where
+/// parking is exactly right, while the engine's read path is a tokio task where
+/// parking is the bug. [`complete`](Self::complete) serves both out of one
+/// critical section.
 struct PendingSlot {
-    done: Mutex<bool>,
+    state: Mutex<SlotState>,
     cond: Condvar,
+}
+
+#[derive(Default)]
+struct SlotState {
+    done: bool,
+    /// Tasks awaiting this slot.
+    ///
+    /// Raw wakers rather than a `tokio::sync::Notify`/`oneshot` so the slot needs
+    /// no runtime to exist: a cdylib plugin's futures are polled by host workers
+    /// with no reactor of the plugin's own, and any tokio timer/IO type there
+    /// panics across the `extern "C"` seam, which aborts. Plain waker traffic is
+    /// safe (same stance as `hcore::blocking`).
+    wakers: Vec<Waker>,
 }
 
 impl PendingSlot {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            done: Mutex::new(false),
+            state: Mutex::new(SlotState::default()),
             cond: Condvar::new(),
         })
     }
 
+    /// Park the calling thread until the command lands. For OS-thread callers
+    /// only — see [`PendingSlot`].
     fn wait(&self) {
-        let mut done = self.done.lock().expect("pending slot mutex poisoned");
-        while !*done {
-            done = self
+        let mut state = self.state.lock().expect("pending slot mutex poisoned");
+        while !state.done {
+            state = self
                 .cond
-                .wait(done)
+                .wait(state)
                 .expect("pending slot condvar wait failed");
         }
     }
 
+    /// Suspend the calling *task* until the command lands, leaving its worker
+    /// free to poll everything else.
+    fn wait_async(self: &Arc<Self>) -> impl Future<Output = ()> + Send + 'static {
+        let slot = self.clone();
+        poll_fn(move |cx| {
+            let mut state = slot.state.lock().expect("pending slot mutex poisoned");
+            if state.done {
+                return Poll::Ready(());
+            }
+            if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                state.wakers.push(cx.waker().clone());
+            }
+            drop(state);
+            // The wake-up is issued by the sqlite writer thread, off-runtime —
+            // the same dropped-cross-thread-wake-up exposure `hcore::blocking`
+            // documents, so the same backstop. A lost wake costs latency instead
+            // of stranding the task.
+            hcore::blocking::backstop(cx.waker().clone());
+            Poll::Pending
+        })
+    }
+
     fn complete(&self) {
-        let mut done = self.done.lock().expect("pending slot mutex poisoned");
-        *done = true;
+        let wakers = {
+            let mut state = self.state.lock().expect("pending slot mutex poisoned");
+            state.done = true;
+            std::mem::take(&mut state.wakers)
+        };
         self.cond.notify_all();
+        // Woken with the lock released: a wake can poll the future inline, and
+        // that poll takes this same mutex.
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
 #[derive(Default)]
 struct PendingTracker {
-    // Key → most recently registered slot for that key. Bg-thread processing is FIFO,
-    // so the latest slot is also the last to complete.
+    /// Key → the slot that will be the *last* to complete for that key.
+    ///
+    /// Upheld by [`register_and_send`](Self::register_and_send) holding this lock
+    /// across the channel send, so map order is channel order and the writer
+    /// thread's FIFO drain completes slots in registration order.
     map: Mutex<HashMap<Key, Arc<PendingSlot>>>,
 }
 
 impl PendingTracker {
-    fn register(&self, key: Key) -> Arc<PendingSlot> {
+    /// Register a completion slot for `key` and queue the command it belongs to,
+    /// in one critical section.
+    ///
+    /// The lock spans the send because the tracker's whole contract is that the
+    /// slot a reader finds for a key is the last one to complete for it.
+    /// Registering and sending separately breaks that: two writers of one key
+    /// interleave as *A registers, B registers, B sends, A sends*, leaving the map
+    /// pointing at B's slot while the channel completes it first — the reader
+    /// wakes and reads bytes A is about to overwrite. The send is a push onto an
+    /// unbounded channel, so the critical section stays a pointer swap either way.
+    ///
+    /// Registration deliberately happens here, at enqueue, and not when a writer
+    /// is *opened*: the window a reader can be made to wait for is the queue→commit
+    /// gap, which the writer thread bounds. Registering at open would stretch it
+    /// across the caller's whole streaming write — a remote blob's download and
+    /// gunzip, or a target's tar and compress — which nothing bounds.
+    /// `None` when the writer thread is gone and nothing could be queued.
+    fn register_and_send(
+        &self,
+        tx: &mpsc::Sender<WriterCmd>,
+        key: Key,
+        make: impl FnOnce(Key, Arc<PendingSlot>) -> WriterCmd,
+    ) -> Option<Arc<PendingSlot>> {
         let slot = PendingSlot::new();
+        let cmd = make(key.clone(), slot.clone());
         let mut m = self.map.lock().expect("pending tracker poisoned");
-        m.insert(key, slot.clone());
-        slot
+        let superseded = m.insert(key.clone(), slot.clone());
+        if tx.send(cmd).is_ok() {
+            return Some(slot);
+        }
+        // The send fails only when the receiver is gone, i.e. the writer thread
+        // died — which also dropped every command still in the channel. So neither
+        // this slot nor the one it displaced will ever be completed by anyone.
+        // Clear the key and complete the displaced slot by hand, or a reader that
+        // already found it waits on a commit that is never coming: an OS thread
+        // parks forever, and a task hangs on a `PendingWrite` with no timeout and
+        // nothing to see. Our own slot was never published — the insert and this
+        // rollback are one critical section — so it needs no completion.
+        m.remove(&key);
+        drop(m);
+        if let Some(previous) = superseded {
+            previous.complete();
+        }
+        None
+    }
+
+    /// The in-flight slot for a key, for a caller that wants to await the commit
+    /// rather than park on it. `None` — the common case — means a probe of this
+    /// key will not block.
+    fn pending(&self, addr: &str, hashin: &str, name: &str) -> Option<Arc<PendingSlot>> {
+        let m = self.map.lock().expect("pending tracker poisoned");
+        // Idle map short-circuits before the scan; the caller already paid for the
+        // formatted addr, which its own lookup needs either way.
+        if m.is_empty() {
+            return None;
+        }
+        Self::find(&m, addr, hashin, name)
     }
 
     fn wait_if_pending(&self, addr: &str, hashin: &str, name: &str) {
         let slot_opt = {
             let m = self.map.lock().expect("pending tracker poisoned");
-            // Map holds only in-flight writers/deletes (typically empty on the
-            // read hot path), so a borrowed scan beats allocating an owned Key
-            // tuple purely to call `get`.
-            m.iter()
-                .find(|(k, _)| k.0 == addr && k.1 == hashin && k.2 == name)
-                .map(|(_, slot)| slot.clone())
+            Self::find(&m, addr, hashin, name)
         };
         if let Some(slot) = slot_opt {
             slot.wait();
         }
+    }
+
+    /// Map holds only in-flight writes/deletes (typically empty on the read hot
+    /// path), so a borrowed scan beats allocating an owned `Key` tuple purely to
+    /// call `get`.
+    fn find(
+        m: &HashMap<Key, Arc<PendingSlot>>,
+        addr: &str,
+        hashin: &str,
+        name: &str,
+    ) -> Option<Arc<PendingSlot>> {
+        m.iter()
+            .find(|(k, _)| k.0 == addr && k.1 == hashin && k.2 == name)
+            .map(|(_, slot)| slot.clone())
     }
 
     fn complete(&self, key: &Key, slot: &Arc<PendingSlot>) {
@@ -214,6 +334,41 @@ enum WriterCmd {
     Delete(DeleteJob),
 }
 
+/// Test-only brake on the writer thread, held closed while a test observes the
+/// queued-but-uncommitted states.
+///
+/// `Existence::Queued`, a superseded write and a queued delete all live in the
+/// window between enqueue and commit, which the writer thread closes in
+/// microseconds — racing it produces flaky tests that mostly assert nothing. The
+/// whole type and its call site are `#[cfg(test)]`, so production keeps the
+/// unbraked loop.
+#[cfg(test)]
+#[derive(Default)]
+struct WriterGate {
+    closed: Mutex<bool>,
+    cond: Condvar,
+}
+
+#[cfg(test)]
+impl WriterGate {
+    /// Called by the writer thread before it drains each batch.
+    fn wait_while_closed(&self) {
+        let mut closed = self.closed.lock().expect("writer gate poisoned");
+        while *closed {
+            closed = self.cond.wait(closed).expect("writer gate wait failed");
+        }
+    }
+
+    fn close(&self) {
+        *self.closed.lock().expect("writer gate poisoned") = true;
+    }
+
+    fn open(&self) {
+        *self.closed.lock().expect("writer gate poisoned") = false;
+        self.cond.notify_all();
+    }
+}
+
 pub struct LocalCacheSQLite {
     read_pool: r2d2::Pool<SqliteConnectionManager>,
     writer_tx: Option<mpsc::Sender<WriterCmd>>,
@@ -221,6 +376,8 @@ pub struct LocalCacheSQLite {
     pending: Arc<PendingTracker>,
     pipe_sem: Arc<PipeSemaphore>,
     inline_threshold: usize,
+    #[cfg(test)]
+    gate: Arc<WriterGate>,
 }
 
 impl LocalCacheSQLite {
@@ -315,9 +472,21 @@ impl LocalCacheSQLite {
         let pending = Arc::new(PendingTracker::default());
         let (writer_tx, writer_rx) = mpsc::channel::<WriterCmd>();
         let pending_bg = pending.clone();
+        #[cfg(test)]
+        let gate = Arc::new(WriterGate::default());
+        #[cfg(test)]
+        let gate_bg = gate.clone();
         let writer_handle = std::thread::Builder::new()
             .name("heph-sqlite-writer".to_string())
-            .spawn(move || writer_loop(&mut write_conn, &writer_rx, &pending_bg))
+            .spawn(move || {
+                writer_loop(
+                    &mut write_conn,
+                    &writer_rx,
+                    &pending_bg,
+                    #[cfg(test)]
+                    &gate_bg,
+                )
+            })
             .context("spawning sqlite writer thread")?;
 
         Ok(Self {
@@ -327,6 +496,8 @@ impl LocalCacheSQLite {
             pending,
             pipe_sem: PipeSemaphore::new(pipe_limit),
             inline_threshold,
+            #[cfg(test)]
+            gate,
         })
     }
 
@@ -355,6 +526,24 @@ impl LocalCacheSQLite {
             .as_ref()
             .context("sqlite cache writer thread has shut down")
     }
+
+    /// The presence of a key in the *committed* state, with no regard for the
+    /// write queue. One indexed point lookup on a mmap'd read connection; it
+    /// never blocks on the writer thread.
+    fn exists_committed(&self, addr_key: &str, hashin: &str, name: &str) -> Result<bool> {
+        let conn = self.read_conn()?;
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT 1 FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3 LIMIT 1",
+            )
+            .context("preparing exists lookup")?;
+        match stmt.query_row(rusqlite::params![addr_key, hashin, name], |_| Ok(())) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e).context("checking artifact existence in sqlite cache"),
+        }
+    }
 }
 
 impl Drop for LocalCacheSQLite {
@@ -368,12 +557,49 @@ impl Drop for LocalCacheSQLite {
     }
 }
 
-fn writer_loop(conn: &mut Connection, rx: &mpsc::Receiver<WriterCmd>, pending: &PendingTracker) {
+/// Releases every slot still registered when the writer thread goes away, so that
+/// a reader waiting on one falls through to the DB and observes NotFound.
+///
+/// A panic anywhere in [`writer_loop`] used to leave the whole map registered
+/// forever. That parked an OS thread — visible in a stack dump — but now an
+/// awaiting task would hang on a `PendingWrite` that never resolves, with no
+/// timeout, no error and nothing to see. Draining on unwind turns a silent hang
+/// back into a cache miss.
+struct DrainOnExit<'a>(&'a PendingTracker);
+
+impl Drop for DrainOnExit<'_> {
+    fn drop(&mut self) {
+        let stranded: Vec<Arc<PendingSlot>> = {
+            let mut m = self.0.map.lock().expect("pending tracker poisoned");
+            m.drain().map(|(_, slot)| slot).collect()
+        };
+        if !stranded.is_empty() {
+            tracing::error!(
+                slots = stranded.len(),
+                "sqlite cache writer thread exited with writes still queued; releasing waiters"
+            );
+        }
+        for slot in stranded {
+            slot.complete();
+        }
+    }
+}
+
+fn writer_loop(
+    conn: &mut Connection,
+    rx: &mpsc::Receiver<WriterCmd>,
+    pending: &PendingTracker,
+    #[cfg(test)] gate: &WriterGate,
+) {
+    let _drain = DrainOnExit(pending);
     loop {
         let first = match rx.recv() {
             Ok(cmd) => cmd,
             Err(_) => return,
         };
+
+        #[cfg(test)]
+        gate.wait_while_closed();
 
         let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
         batch.push(first);
@@ -530,13 +756,14 @@ impl LocalCache for LocalCacheSQLite {
     }
 
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
-        let key = (Self::key(addr), hashin.to_string(), name.to_string());
-        let slot = self.pending.register(key.clone());
+        // No pending registration here: the key becomes pending when the finished
+        // spool is *queued*, in `SqliteCacheWriter::drop`. Registering at open
+        // would make every reader of the key wait out the caller's whole
+        // streaming write — see `PendingTracker::register_and_send`.
         Ok(Box::new(SqliteCacheWriter {
             writer_tx: self.writer_tx()?.clone(),
             pending: self.pending.clone(),
-            key: Some(key),
-            slot: Some(slot),
+            key: Some((Self::key(addr), hashin.to_string(), name.to_string())),
             buf: Some(SpooledTempFile::new(SPOOL_MEM_THRESHOLD)),
             size: 0,
         }))
@@ -545,23 +772,25 @@ impl LocalCache for LocalCacheSQLite {
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
         let addr_key = Self::key(addr);
         self.pending.wait_if_pending(&addr_key, hashin, name);
+        self.exists_committed(&addr_key, hashin, name)
+    }
 
-        let conn = self.read_conn()?;
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT 1 FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3 LIMIT 1",
-            )
-            .context("preparing exists lookup")?;
-        let found = match stmt.query_row(rusqlite::params![addr_key, hashin, name], |_| Ok(())) {
-            Ok(()) => true,
-            Err(rusqlite::Error::QueryReturnedNoRows) => false,
-            Err(e) => {
-                return Err(e).context("checking artifact existence in sqlite cache");
-            }
-        };
-
-        Ok(found)
+    fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
+        // Report the queue rather than wait on it — deliberately *not*
+        // `self.exists`, whose `wait_if_pending` would park on a slot registered
+        // after the check below and put the caller's thread right back on the
+        // condvar this method exists to avoid.
+        //
+        // Nothing here blocks: a write landing between the check and the SELECT
+        // simply isn't seen, and "absent" is a legitimate answer for a reader with
+        // no happens-before against a concurrent write.
+        let addr_key = Self::key(addr);
+        if let Some(slot) = self.pending.pending(&addr_key, hashin, name) {
+            return Ok(Existence::Queued(PendingWrite::new(slot.wait_async())));
+        }
+        Ok(Existence::Committed(
+            self.exists_committed(&addr_key, hashin, name)?,
+        ))
     }
 
     fn list_targets(&self) -> Result<TargetStream> {
@@ -617,13 +846,17 @@ impl LocalCache for LocalCacheSQLite {
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let key = (Self::key(addr), hashin.to_string(), name.to_string());
-        let slot = self.pending.register(key.clone());
-        self.writer_tx()?
-            .send(WriterCmd::Delete(DeleteJob {
-                key,
-                slot: slot.clone(),
-            }))
-            .map_err(|e| anyhow::anyhow!("sqlite cache writer thread is gone: {e}"))?;
+        let slot = self
+            .pending
+            .register_and_send(self.writer_tx()?, key, |key, slot| {
+                WriterCmd::Delete(DeleteJob { key, slot })
+            })
+            .context("queueing a cache delete: sqlite writer thread is gone")?;
+        // A delete must have landed before the caller moves on — GC counts freed
+        // bytes against it — so this waits rather than reporting the queue like
+        // `existence` does. That makes `delete` a thread-parking call by contract:
+        // its callers (`gc_entry`, `SpillWriter::spill`) must be on the blocking
+        // pool or a dedicated OS thread, never on a runtime worker.
         slot.wait();
         Ok(())
     }
@@ -709,7 +942,6 @@ struct SqliteCacheWriter {
     writer_tx: mpsc::Sender<WriterCmd>,
     pending: Arc<PendingTracker>,
     key: Option<Key>,
-    slot: Option<Arc<PendingSlot>>,
     buf: Option<SpooledTempFile>,
     size: usize,
 }
@@ -732,30 +964,39 @@ impl io::Write for SqliteCacheWriter {
 
 impl Drop for SqliteCacheWriter {
     fn drop(&mut self) {
-        let (Some(key), Some(slot), Some(buf)) =
-            (self.key.take(), self.slot.take(), self.buf.take())
-        else {
+        let (Some(key), Some(buf)) = (self.key.take(), self.buf.take()) else {
             return;
         };
 
         let Ok(size) = i64::try_from(self.size) else {
-            // Pathological size; release the slot so readers don't hang.
-            self.pending.complete(&key, &slot);
+            // Pathological size. Nothing was ever registered for this key — that
+            // now happens at enqueue — so dropping the write strands no waiter.
+            tracing::error!(
+                addr = key.0,
+                hashin = key.1,
+                name = key.2,
+                size = self.size,
+                "sqlite cache write is too large to address; dropping it"
+            );
             return;
         };
 
-        let job = WriteJob {
-            key,
-            buf,
-            size,
-            slot,
-        };
-
-        if let Err(mpsc::SendError(WriterCmd::Write(j))) =
-            self.writer_tx.send(WriterCmd::Write(job))
+        if self
+            .pending
+            .register_and_send(&self.writer_tx, key, move |key, slot| {
+                WriterCmd::Write(WriteJob {
+                    key,
+                    buf,
+                    size,
+                    slot,
+                })
+            })
+            .is_none()
         {
-            // Writer thread is gone — unblock waiters so they observe NotFound.
-            self.pending.complete(&j.key, &j.slot);
+            // Writer thread is gone; the registration was rolled back inside
+            // `register_and_send`, so readers fall through to the DB and observe
+            // NotFound rather than waiting for a commit that will never come.
+            tracing::error!("sqlite cache writer thread is gone; write dropped");
         }
     }
 }
@@ -939,6 +1180,469 @@ mod tests {
         assert!(!cache.exists(&addr, hashin, name)?);
 
         Ok(())
+    }
+
+    /// A key becomes pending when its finished spool is *queued*, not when a
+    /// writer is opened for it. Registering at open makes every reader of the key
+    /// wait out the caller's whole streaming write — a remote blob's download and
+    /// gunzip, or a target's tar and compress — which nothing bounds; only the
+    /// queue→commit gap is the writer thread's to close.
+    ///
+    /// Probed on a helper thread so a regression fails on the timeout instead of
+    /// hanging the suite on an untimed condvar.
+    #[test]
+    fn an_open_writer_does_not_make_the_key_pending() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = Arc::new(LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?);
+        let addr = make_addr("pkg", "streaming");
+
+        // Open and half-write, holding the writer the way a slow download does.
+        let mut writer = cache.writer(&addr, "h", "blob")?;
+        writer.write_all(b"first half")?;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn({
+            let (cache, addr) = (cache.clone(), addr.clone());
+            move || {
+                drop(tx.send(cache.exists(&addr, "h", "blob")));
+            }
+        });
+
+        let found = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("exists must not wait on a writer that is still being written to")?;
+        assert!(
+            !found,
+            "an unfinished write has no committed bytes, so the key is absent"
+        );
+
+        // And once queued, the wait is back on: the committed value is visible.
+        drop(writer);
+        assert!(cache.exists(&addr, "h", "blob")?);
+        Ok(())
+    }
+
+    /// The tracker's contract is that the slot a reader finds for a key is the
+    /// *last* one to complete for it, which holds only while map order matches
+    /// channel order. `register_and_send` keeps them in step by holding the map
+    /// lock across the send; registering and sending separately lets two writers
+    /// of one key interleave and leaves the map pointing at the slot that
+    /// completes first, so a reader wakes and reads bytes the other write is about
+    /// to overwrite.
+    #[test]
+    fn the_mapped_slot_belongs_to_the_last_queued_write() {
+        let tracker = PendingTracker::default();
+        // Receiver held here, so nothing drains and both commands stay queued.
+        let (tx, rx) = mpsc::channel();
+        let key: Key = ("//pkg:t".to_string(), "h".to_string(), "blob".to_string());
+
+        let first = tracker
+            .register_and_send(&tx, key.clone(), |key, slot| {
+                WriterCmd::Write(WriteJob {
+                    key,
+                    buf: SpooledTempFile::new(SPOOL_MEM_THRESHOLD),
+                    size: 1,
+                    slot,
+                })
+            })
+            .expect("first send");
+        let second = tracker
+            .register_and_send(&tx, key.clone(), |key, slot| {
+                WriterCmd::Write(WriteJob {
+                    key,
+                    buf: SpooledTempFile::new(SPOOL_MEM_THRESHOLD),
+                    size: 2,
+                    slot,
+                })
+            })
+            .expect("second send");
+
+        let queued: Vec<WriterCmd> = rx.try_iter().collect();
+        assert_eq!(queued.len(), 2);
+        let slot_of = |cmd: &WriterCmd| match cmd {
+            WriterCmd::Write(j) => j.slot.clone(),
+            WriterCmd::Delete(j) => j.slot.clone(),
+        };
+        assert!(
+            Arc::ptr_eq(&slot_of(&queued[0]), &first) && Arc::ptr_eq(&slot_of(&queued[1]), &second),
+            "the channel must carry the slots in registration order"
+        );
+
+        let mapped = {
+            let m = tracker.map.lock().expect("tracker");
+            PendingTracker::find(&m, &key.0, &key.1, &key.2).expect("key must be pending")
+        };
+        assert!(
+            Arc::ptr_eq(&mapped, &second),
+            "the map must point at the slot the writer thread completes last"
+        );
+    }
+
+    /// A failed send must leave nothing registered: the command was never queued,
+    /// so no slot for it will ever be completed and a reader that found one would
+    /// wait forever.
+    #[test]
+    fn a_rejected_send_registers_nothing() {
+        let tracker = PendingTracker::default();
+        let (tx, rx) = mpsc::channel::<WriterCmd>();
+        drop(rx);
+        let key: Key = ("//pkg:t".to_string(), "h".to_string(), "blob".to_string());
+
+        let sent = tracker.register_and_send(&tx, key.clone(), |key, slot| {
+            WriterCmd::Delete(DeleteJob { key, slot })
+        });
+
+        assert!(sent.is_none(), "a closed channel must report the failure");
+        let m = tracker.map.lock().expect("tracker");
+        assert!(
+            PendingTracker::find(&m, &key.0, &key.1, &key.2).is_none(),
+            "a write that was never queued must not leave the key pending"
+        );
+    }
+
+    /// The point of the async waiter: a task waiting on a queued write must leave
+    /// its worker free for everything else.
+    ///
+    /// The waiter is `tokio::spawn`ed rather than awaited inline, and that is the
+    /// whole test. `#[tokio::test(flavor = "multi_thread")]` drives the test body
+    /// on the *calling* thread via `block_on`, so an inline wait leaves the worker
+    /// free and the test passes even against a thread-parking implementation —
+    /// verified by swapping in `PendingSlot::wait`. Spawned, the waiter competes
+    /// for the single worker: a parking implementation occupies it, the ticker
+    /// never advances, the completer never fires, and the timeout fails the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn awaiting_a_slot_leaves_the_worker_polling() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let slot = PendingSlot::new();
+        let ticks = Arc::new(AtomicUsize::new(0));
+
+        let waiter = tokio::spawn({
+            let slot = slot.clone();
+            async move { slot.wait_async().await }
+        });
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                for _ in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        // Stands in for the sqlite writer thread: completes the slot off-runtime,
+        // and only once the runtime has demonstrably kept running. The spin is
+        // bounded so a failing run ends instead of burning a core for the rest of
+        // the test binary's life.
+        let completer = std::thread::spawn({
+            let (slot, ticks) = (slot.clone(), ticks.clone());
+            move || {
+                for _ in 0..2_000 {
+                    if ticks.load(Ordering::SeqCst) >= 3 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                slot.complete();
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("a spawned waiter must not park the runtime's only worker")
+            .expect("waiter task");
+
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 3,
+            "the runtime must have kept polling while the slot was pending"
+        );
+        ticker.await.expect("ticker");
+        completer.join().expect("completer");
+    }
+
+    /// A slot completed before the first poll must resolve at once rather than
+    /// stranding a late waiter on a wake-up that already happened.
+    #[tokio::test]
+    async fn a_slot_completed_before_the_first_poll_resolves_at_once() {
+        let slot = PendingSlot::new();
+        slot.complete();
+        tokio::time::timeout(std::time::Duration::from_secs(5), slot.wait_async())
+            .await
+            .expect("a slot completed before the first poll must resolve at once");
+    }
+
+    /// `complete` drains a `Vec` of wakers, so every task parked on one slot has to
+    /// be woken — a single-waiter test would pass against a `notify_one`-shaped
+    /// implementation that strands the rest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_task_awaiting_a_slot_is_woken() {
+        let slot = PendingSlot::new();
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let slot = slot.clone();
+                tokio::spawn(async move { slot.wait_async().await })
+            })
+            .collect();
+
+        // Give them a chance to register before the completion lands.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        slot.complete();
+
+        for w in waiters {
+            tokio::time::timeout(std::time::Duration::from_secs(5), w)
+                .await
+                .expect("every waiter on a completed slot must be woken")
+                .expect("waiter task");
+        }
+    }
+
+    fn queued_write(cache: &LocalCacheSQLite, addr: &Addr, name: &str, bytes: &[u8]) {
+        let mut w = cache.writer(addr, "h", name).expect("writer");
+        w.write_all(bytes).expect("write");
+        drop(w);
+    }
+
+    fn committed(e: Existence) -> bool {
+        match e {
+            Existence::Committed(found) => found,
+            Existence::Queued(_) => panic!("expected a committed answer, got a queued one"),
+        }
+    }
+
+    fn queued(e: Existence) -> PendingWrite {
+        match e {
+            Existence::Queued(p) => p,
+            Existence::Committed(found) => {
+                panic!("expected a queued answer, got Committed({found})")
+            }
+        }
+    }
+
+    /// `existence` is the read path's probe now, and it must clear a saturated pool
+    /// for the same reason `exists` must: it is one indexed lookup, and the whole
+    /// point of it not waiting on the write queue is lost if it instead waits
+    /// [`READ_POOL_TIMEOUT`] for a connection.
+    ///
+    /// Sibling of `undrained_streaming_reads_do_not_starve_an_indexed_lookup`, over
+    /// the method the engine actually calls.
+    #[test]
+    fn undrained_streaming_reads_do_not_starve_existence() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = Arc::new(LocalCacheSQLite::with_pool_config(
+            dir.path().join("cache.db"),
+            0,
+            HELD_PIPES,
+            read_pool_headroom(HELD_PIPES),
+            READ_POOL_TIMEOUT,
+        )?);
+
+        let addr = make_addr("pkg", "t");
+        let _held = saturate_pipes(&cache, &addr)?;
+
+        let found = answers_promptly(
+            "existence",
+            enclose::enclose!((cache, addr) move || cache
+                .existence(&addr, "h", "blob0")
+                .map(committed)),
+        )?;
+        assert!(found, "the blob was written, so existence must report it");
+
+        Ok(())
+    }
+
+    /// The settled states: `existence` must agree with `exists` whenever nothing is
+    /// in flight, or every caller of `exists_local` gets a different answer to the
+    /// probe it replaced.
+    #[test]
+    fn existence_matches_exists_when_nothing_is_queued() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "settled");
+
+        assert!(!committed(cache.existence(&addr, "h", "blob")?));
+        queued_write(&cache, &addr, "blob", b"bytes");
+        assert!(cache.exists(&addr, "h", "blob")?); // barrier: commit has landed
+        assert!(committed(cache.existence(&addr, "h", "blob")?));
+        Ok(())
+    }
+
+    /// A queued write has no settled answer, so `existence` reports the queue
+    /// rather than guessing — and once the gate opens, the awaited answer is the
+    /// write that landed.
+    #[tokio::test]
+    async fn existence_of_a_queued_write_is_queued_then_present() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "queued");
+
+        cache.gate.close();
+        queued_write(&cache, &addr, "blob", b"bytes");
+
+        let pending = queued(cache.existence(&addr, "h", "blob")?);
+        cache.gate.open();
+        tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("the queued write must land");
+
+        assert!(
+            committed(cache.existence(&addr, "h", "blob")?),
+            "after the queue drains the key is present"
+        );
+        Ok(())
+    }
+
+    /// The case a "queued means present" shortcut would get wrong: `delete`
+    /// registers a slot too, so a key mid-GC reports `Queued` and then resolves to
+    /// *absent*.
+    #[tokio::test]
+    async fn existence_of_a_queued_delete_is_queued_then_absent() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = Arc::new(LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?);
+        let addr = make_addr("pkg", "doomed");
+
+        queued_write(&cache, &addr, "blob", b"bytes");
+        assert!(cache.exists(&addr, "h", "blob")?); // barrier
+
+        cache.gate.close();
+        // `delete` parks until its commit lands, so it has to run off this thread
+        // while the gate is shut.
+        let deleter = std::thread::spawn({
+            let (cache, addr) = (cache.clone(), addr.clone());
+            move || cache.delete(&addr, "h", "blob")
+        });
+        // Let the delete reach the queue before probing.
+        while cache
+            .pending
+            .pending(&LocalCacheSQLite::key(&addr), "h", "blob")
+            .is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let pending = queued(cache.existence(&addr, "h", "blob")?);
+        cache.gate.open();
+        tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("the queued delete must land");
+        deleter.join().expect("deleter thread").expect("delete");
+
+        assert!(
+            !committed(cache.existence(&addr, "h", "blob")?),
+            "a queued delete resolves to absent, not present"
+        );
+        Ok(())
+    }
+
+    /// The property the tracker exists for, end to end. Two writers on one key are
+    /// opened in one order and queued in the *reverse* order; the reader must
+    /// observe the last-enqueued bytes.
+    ///
+    /// Registering at writer-open would map the key to the slot of the
+    /// last-*opened* writer — `second` here — which the writer thread completes
+    /// first, so the reader would wake early and read "second" just before "first"
+    /// overwrote it.
+    #[test]
+    fn two_queued_writes_to_one_key_read_back_the_last_enqueued() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "superseded");
+
+        cache.gate.close();
+        let mut first = cache.writer(&addr, "h", "blob")?;
+        first.write_all(b"first")?;
+        let mut second = cache.writer(&addr, "h", "blob")?;
+        second.write_all(b"second")?;
+
+        // Reverse of the open order, so last-opened != last-enqueued.
+        drop(second);
+        drop(first);
+        cache.gate.open();
+
+        let mut got = String::new();
+        cache
+            .reader(&addr, "h", "blob")?
+            .reader
+            .read_to_string(&mut got)?;
+        assert_eq!(
+            got, "first",
+            "the read must observe the last write enqueued"
+        );
+        Ok(())
+    }
+
+    /// A leaked map entry is invisible and fatal: `existence` would report `Queued`
+    /// forever and `exists_local` would wait out its retries on every probe of that
+    /// key for the rest of the process.
+    #[test]
+    fn the_pending_map_drains_once_every_write_commits() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "drains");
+
+        cache.gate.close();
+        for i in 0..32 {
+            queued_write(&cache, &addr, &format!("blob{i}"), b"bytes");
+        }
+        // Same key twice, so a superseded entry is in the mix.
+        queued_write(&cache, &addr, "blob0", b"again");
+        cache.gate.open();
+
+        // Barrier on the last key written; FIFO means everything before it landed.
+        assert!(cache.exists(&addr, "h", "blob0")?);
+        assert!(
+            cache.pending.map.lock().expect("tracker").is_empty(),
+            "every committed write must remove its registration"
+        );
+        Ok(())
+    }
+
+    /// A waiter that goes away mid-wait leaves its `Waker` in the slot until
+    /// `complete` drains it. Waking a dropped task must be a harmless no-op, and it
+    /// must not consume the completion that the surviving waiter needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_one_awaiter_does_not_strand_the_others() {
+        let slot = PendingSlot::new();
+        let doomed = tokio::spawn({
+            let slot = slot.clone();
+            async move { slot.wait_async().await }
+        });
+        let survivor = tokio::spawn({
+            let slot = slot.clone();
+            async move { slot.wait_async().await }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        doomed.abort();
+        slot.complete();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), survivor)
+            .await
+            .expect("an aborted sibling must not strand the surviving waiter")
+            .expect("survivor task");
     }
 
     #[test]
