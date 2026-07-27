@@ -1,5 +1,6 @@
+mod cell;
+
 use futures::FutureExt;
-use futures::future::{BoxFuture, Shared};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::fmt;
@@ -415,7 +416,7 @@ pub fn downcast_chain_ref<T: std::error::Error + Send + Sync + 'static>(
 }
 
 pub struct Memoizer<K, V> {
-    cache: Mutex<FxHashMap<K, Shared<BoxFuture<'static, V>>>>,
+    cache: Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>,
     /// Tag used in stall warnings to identify which memoizer is stuck.
     tag: &'static str,
 }
@@ -474,7 +475,7 @@ where
     /// full `result`) without disturbing the cache or deduping with in-flight work.
     pub fn peek(&self, key: &K) -> Option<V> {
         let cache = self.cache.lock().expect("memoizer lock poisoned");
-        cache.get(key).and_then(|shared| shared.peek().cloned())
+        cache.get(key).and_then(|cell| cell.peek().cloned())
     }
 
     pub async fn process<F, Fut>(&self, key: K, f: F) -> V
@@ -482,55 +483,82 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = V> + Send + 'static,
     {
-        // Phase 1: fast path — check without creating the future.
-        // Block ensures MutexGuard is dropped before any await.
-        let existing = {
-            let cache = self.cache.lock().expect("memoizer lock poisoned");
-            cache.get(&key).cloned()
-        };
-
-        if let Some(shared) = existing {
-            // Post-completion fast path: a Shared future that has already
-            // resolved exposes its output via `peek`. Cloning that directly
-            // skips the full `Shared::poll` path (waker registration, inner
-            // Mutex acquire) and the `take_or_clone_output` profile hotspot.
-            if let Some(v) = shared.peek() {
-                return v.clone();
-            }
-            return await_with_stall_check(shared, &key, self.tag).await;
-        }
-
-        // Phase 2: create candidate, then re-lock to insert.
-        // Another caller may have inserted between phase 1 and phase 2;
-        // entry().or_insert_with() handles that race correctly.
-        let candidate = f().boxed().shared();
-        let shared = {
+        // One lock acquisition, and no handle clone on the warm hit: the
+        // completed value is read through the guard we already hold. Cloning the
+        // cell's `Arc` only to `peek` and drop it costs two atomic RMWs on the
+        // hottest path the engine has — `spec`, `def`, `meta` and `result` all
+        // land here for every target of every build.
+        let cell = {
             let mut cache = self.cache.lock().expect("memoizer lock poisoned");
-            cache
-                .entry(key.clone())
-                .or_insert_with(|| candidate)
-                .clone()
+            match cache.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    if let Some(v) = e.get().peek() {
+                        return v.clone();
+                    }
+                    Arc::clone(e.get())
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    // `f()` only builds the async block's state machine — async
+                    // blocks are lazy, so no user code runs and nothing can
+                    // await — which makes it safe to construct under the lock.
+                    // Constructing it *outside* meant every loser of an insert
+                    // race boxed a large future just to discard it, and on a
+                    // cell with hundreds of concurrent callers that is hundreds
+                    // of wasted allocations.
+                    let cell = cell::Cell::new(f().boxed());
+                    e.insert(Arc::clone(&cell));
+                    cell
+                }
+            }
         };
 
-        await_with_stall_check(shared, &key, self.tag).await
+        await_with_stall_check(cell::Await::new(cell), &key, self.tag).await
     }
 }
 
-async fn await_with_stall_check<V, K>(
-    shared: Shared<BoxFuture<'static, V>>,
-    key: &K,
-    tag: &'static str,
-) -> V
+/// Run a memoized computation, turning a panic into an `Err` for every awaiter.
+///
+/// Without this a panicking cell strands the graph rather than failing it. The
+/// cell can only ever publish a value, so an unwinding poll leaves it with no
+/// value and no future, and every task parked on it waits forever — one
+/// panicking target silently hanging every one of its reverse-deps. (`Shared`
+/// has the same defect: its poison path never drains the waker slab. It was
+/// partly masked before, because any inner progress woke everyone; with
+/// completion-only wakes there is no masking left.)
+///
+/// It also removes an abort vector. `provider_get` / `provider_list` /
+/// `driver_parse` are awaited directly by host workers with nothing between them
+/// and the `extern "C"` seam, where an unwind aborts the process — and
+/// `unwrap_used` / `panic` are `warn`, not `deny`, so panics inside plugin
+/// providers are reachable. `hcore::blocking` already takes this shape.
+async fn guard_panics<T, Fut>(fut: Fut) -> Result<T, Arc<anyhow::Error>>
 where
-    V: Clone,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(r) => r.map_err(Arc::new),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            Err(Arc::new(anyhow::anyhow!("memoized task panicked: {msg}")))
+        }
+    }
+}
+
+async fn await_with_stall_check<V, K>(waiter: cell::Await<V>, key: &K, tag: &'static str) -> V
+where
+    V: Clone + Send + Sync + 'static,
     K: fmt::Debug,
 {
     let Some(threshold) = stall_threshold() else {
-        return shared.await;
+        return waiter.await;
     };
-    match tokio::time::timeout(threshold, shared).await {
+    match cell::timeout_without_reactor(threshold, waiter).await {
         Ok(v) => v,
-        Err(_) => {
+        Err(()) => {
             // Debug-only: opt-in via HEPH_MEMOIZER_STALL_SECS. Panic surfaces a
             // suspected deadlock with as much state as we can dump:
             //   * the offending cell.
@@ -656,9 +684,7 @@ where
         // deadlocking the runtime, and most runs don't have cycles. Opt back in
         // with `HEPH_DEBUG_MEMOIZER_CYCLE=1`.
         if !cycle_detection_enabled() {
-            return self
-                .process(key, || async move { f().await.map_err(Arc::new) })
-                .await;
+            return self.process(key, || guard_panics(f())).await;
         }
 
         let key_hash = compute_key_hash(&key);
@@ -743,10 +769,25 @@ where
         let frame = push_frame(tag, key_hash, Arc::clone(&debug_key), me);
         let key_for_evict = key.clone();
 
+        // The scope goes around the *cell's* future, not around the await.
+        //
+        // `IN_FLIGHT` is a task-local, so a cell polled by a driver other than
+        // its creator would otherwise see that driver's chain. Under the old
+        // wake-everyone behavior the creator kept retaking the poll, so a wrong
+        // chain was transient; with the driver stable, whichever chain first won
+        // the election would be captured for good — and `check_recursion` would
+        // then report `SelfRecursion` for a graph that has no cycle, which makes
+        // `EngineProviderExecutor::query` skip a perfectly good addr. Scoping at
+        // creation makes `IN_FLIGHT` mean "the lineage that created this cell",
+        // which is exactly what self-recursion detection needs; cross-lineage
+        // cycles remain the wait-for graph's job.
+        let creator_frame = frame.clone();
         let result = IN_FLIGHT
             .scope(
                 frame,
-                self.process(key, || async move { f().await.map_err(Arc::new) }),
+                self.process(key, move || {
+                    IN_FLIGHT.scope(creator_frame, guard_panics(f()))
+                }),
             )
             .await;
 
@@ -832,6 +873,48 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{Duration, sleep};
+
+    /// A panicking memoized computation must fail every awaiter, not hang them.
+    ///
+    /// Before `guard_panics`, an unwinding cell left no value and no future, and
+    /// every task parked on it waited forever — one panicking target silently
+    /// hanging all of its reverse-deps. The `tokio::time::timeout` here is the
+    /// assertion: without the fix these awaits never return.
+    #[tokio::test]
+    async fn panic_in_a_memoized_task_fails_every_waiter() {
+        let memo: Arc<Memoizer<String, Result<Arc<i32>, Arc<anyhow::Error>>>> =
+            Arc::new(Memoizer::new());
+        let key = "boom".to_string();
+
+        // The first caller panics; three more join the same in-flight cell.
+        let waiters: Vec<_> = (0..4)
+            .map(|i| {
+                let (memo, key) = (Arc::clone(&memo), key.clone());
+                tokio::spawn(async move {
+                    memo.once(key, move || async move {
+                        if i == 0 {
+                            sleep(Duration::from_millis(20)).await;
+                            panic!("cell exploded");
+                        }
+                        Ok(Arc::new(1))
+                    })
+                    .await
+                })
+            })
+            .collect();
+
+        for w in waiters {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), w)
+                .await
+                .expect("a panicking cell must not strand its waiters")
+                .expect("waiter task itself must not panic");
+            let err = outcome.expect_err("a panicking cell must surface as an error");
+            assert!(
+                err.to_string().contains("cell exploded"),
+                "the panic payload must survive into the error: {err}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_memoizer() {
