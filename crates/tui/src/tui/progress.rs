@@ -464,10 +464,22 @@ pub struct BuildState {
     /// Whether the matched set is final (matcher fully resolved). While false
     /// the total is provisional and rendered with a `~` prefix.
     matched_complete: bool,
-    /// Every addr that reached `ResultEnd` (deduped). Used to compute matched
-    /// progress as `matched ∩ finished` — order-independent, since `Matched`
-    /// events can arrive after some matched results already finished.
+    /// Every addr that reached `ResultEnd` (deduped). Matched progress is
+    /// `matched ∩ finished` — order-independent, since `Matched` events can
+    /// arrive after some matched results already finished.
     finished: HashSet<String>,
+    /// `|matched ∩ finished|`, folded incrementally by [`BuildState::apply`].
+    ///
+    /// The header reads this on every frame, and rescanning `matched` there cost
+    /// ~21-24 ms at 100k targets. Maintained at **both** edges of the
+    /// intersection — a `Matched` event that names an already-finished addr, and
+    /// a `ResultEnd` for an already-matched addr — because neither event is
+    /// guaranteed to arrive first. Each edge fires only when its `HashSet::insert`
+    /// reports the addr was new, so duplicate events cannot double-count.
+    matched_finished: usize,
+    /// `|matched ∩ cache_hit|`, folded on the same two-edge rule as
+    /// [`BuildState::matched_finished`].
+    matched_cached: usize,
     completed: usize,
     errored: usize,
     /// Failed targets in failure order, each with its error message (if the
@@ -582,7 +594,23 @@ impl BuildState {
             }
             BuildEventKind::Matched { addrs, complete } => {
                 self.matched_seen = true;
-                self.matched.extend(addrs.iter().cloned());
+                // The loop below replaced an `extend`, which reserved off the
+                // iterator's size hint; keep that so a wide `Matched` batch does
+                // not rehash its way up.
+                self.matched.reserve(addrs.len());
+                for addr in addrs {
+                    // The matched-set edge of both intersections: an addr can be
+                    // named here *after* it finished or hit cache, so fold those
+                    // in now. `insert` guards against a repeated addr.
+                    if self.matched.insert(addr.clone()) {
+                        if self.finished.contains(addr) {
+                            self.matched_finished += 1;
+                        }
+                        if self.cache_hit.contains(addr) {
+                            self.matched_cached += 1;
+                        }
+                    }
+                }
                 if *complete {
                     self.matched_complete = true;
                 }
@@ -600,10 +628,12 @@ impl BuildState {
                         self.done.push(addr.clone());
                     }
                 }
-                // Record every terminal addr; matched progress is computed as
-                // `matched ∩ finished` so it works regardless of whether the
-                // `Matched` event arrived before or after this result.
-                self.finished.insert(addr.clone());
+                // Record every terminal addr. This is the result edge of
+                // `matched ∩ finished`; the `Matched` arm covers the other one,
+                // so the count is right whichever event arrives first.
+                if self.finished.insert(addr.clone()) && self.matched.contains(addr) {
+                    self.matched_finished += 1;
+                }
             }
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `built` counter side effect on a successful end.
@@ -615,12 +645,12 @@ impl BuildState {
             }
             BuildEventKind::LocalCacheHit { addr } => {
                 self.local_hits += 1;
-                self.cache_hit.insert(addr.clone());
+                self.note_cache_hit(addr);
             }
             BuildEventKind::LocalCacheMiss { .. } => self.local_misses += 1,
             BuildEventKind::RemoteCacheHit { addr } => {
                 self.remote_hits += 1;
-                self.cache_hit.insert(addr.clone());
+                self.note_cache_hit(addr);
             }
             BuildEventKind::RemoteCacheMiss { .. } => self.remote_misses += 1,
             BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
@@ -642,6 +672,16 @@ impl BuildState {
             // elapsed-clock anchor at the top of `apply` still runs, so the
             // clock works during a gc sweep.
             BuildEventKind::GcTargetSwept { .. } => {}
+        }
+    }
+
+    /// Record a cache hit (local or remote). This is the cache edge of
+    /// `matched ∩ cache_hit`; the `Matched` arm of [`BuildState::apply`] covers
+    /// the other one, so the count is right whichever event arrives first. A
+    /// repeat hit on an addr already in the set does not re-count.
+    fn note_cache_hit(&mut self, addr: &str) {
+        if self.cache_hit.insert(addr.to_string()) && self.matched.contains(addr) {
+            self.matched_cached += 1;
         }
     }
 
@@ -685,16 +725,27 @@ impl BuildState {
     /// top-level targets have finished, the total matched so far, and whether the
     /// matcher fully resolved (`false` ⇒ the total is provisional). `None` until
     /// a `Matched` event arrives (e.g. a single-target `result_addr` entry).
+    ///
+    /// `O(1)` — the intersection is folded in [`BuildState::apply`], not scanned
+    /// here. This runs on every frame.
     pub fn matched_progress(&self) -> Option<(usize, usize, bool)> {
         if !self.matched_seen {
             return None;
         }
-        let done = self
-            .matched
-            .iter()
-            .filter(|a| self.finished.contains(*a))
-            .count();
-        Some((done, self.matched.len(), self.matched_complete))
+        // A subset-count that has drifted above the set it counts into is the
+        // observable symptom of a missed fold edge. Free in release; turns a
+        // desync into a failure across the whole suite, not just one test.
+        debug_assert!(
+            self.matched_finished <= self.matched.len(),
+            "matched_finished {} exceeds matched {}",
+            self.matched_finished,
+            self.matched.len(),
+        );
+        Some((
+            self.matched_finished,
+            self.matched.len(),
+            self.matched_complete,
+        ))
     }
 
     /// The count fields for one frame — see [`Counts`]. Runs one
@@ -852,15 +903,22 @@ impl BuildState {
     /// (`matched ∩ cache_hit`), falling back to all cache hits before any
     /// `Matched` event arrives, or to every cached addr under
     /// [`CountScope::All`].
+    ///
+    /// `O(1)` — the intersection is folded in [`BuildState::apply`], not scanned
+    /// here. This runs on every frame.
     pub fn cached_count(&self, scope: CountScope) -> usize {
         match scope {
             // All-targets scope: every addr that hit cache (deduped), deps included.
             CountScope::All => self.cache_hit.len(),
-            CountScope::Matched if self.matched_seen => self
-                .matched
-                .iter()
-                .filter(|a| self.cache_hit.contains(*a))
-                .count(),
+            CountScope::Matched if self.matched_seen => {
+                debug_assert!(
+                    self.matched_cached <= self.matched.len(),
+                    "matched_cached {} exceeds matched {}",
+                    self.matched_cached,
+                    self.matched.len(),
+                );
+                self.matched_cached
+            }
             CountScope::Matched => self.local_hits + self.remote_hits,
         }
     }
@@ -907,17 +965,13 @@ impl BuildState {
     pub fn summary(&self) -> String {
         let hits = self.local_hits + self.remote_hits;
         let misses = self.local_misses + self.remote_misses;
-        let matched = if self.matched_seen {
-            let done = self
-                .matched
-                .iter()
-                .filter(|a| self.finished.contains(*a))
-                .count();
+        let matched = match self.matched_progress() {
             // `~` marks a provisional total while the matcher is still streaming.
-            let tilde = if self.matched_complete { "" } else { "~" };
-            format!("matched {done} / {tilde}{}, ", self.matched.len())
-        } else {
-            String::new()
+            Some((done, total, complete)) => {
+                let tilde = if complete { "" } else { "~" };
+                format!("matched {done} / {tilde}{total}, ")
+            }
+            None => String::new(),
         };
         format!(
             "{matched}done {}, err {}, running {}, cache {} hit / {} miss",
@@ -2383,6 +2437,110 @@ mod tests {
 
     fn local_cache_hit(addr: &str) -> BuildEventKind {
         BuildEventKind::LocalCacheHit { addr: addr.into() }
+    }
+
+    fn remote_cache_hit(addr: &str) -> BuildEventKind {
+        BuildEventKind::RemoteCacheHit { addr: addr.into() }
+    }
+
+    /// The two matched intersections computed the slow way, straight off the
+    /// sets. The oracle for the counters folded in `apply`.
+    fn scan_matched(s: &BuildState) -> (usize, usize) {
+        (
+            s.matched.iter().filter(|a| s.finished.contains(*a)).count(),
+            s.matched
+                .iter()
+                .filter(|a| s.cache_hit.contains(*a))
+                .count(),
+        )
+    }
+
+    /// The same two intersections as the render path reports them.
+    fn rendered_matched(s: &BuildState) -> (usize, usize) {
+        let (done, _, _) = s.matched_progress().expect("a Matched event has landed");
+        (done, s.cached_count(CountScope::Matched))
+    }
+
+    #[test]
+    fn matched_counters_track_the_full_scan_under_out_of_order_events() {
+        // `matched ∩ finished` and `matched ∩ cache_hit` are folded incrementally
+        // rather than rescanned every frame, so they have to be maintained at
+        // *both* edges of each intersection. `Engine::result` really does emit a
+        // target's `ResultEnd` before the `Matched` event that names it, so a
+        // counter folded only on the result edge undercounts. Pin both against a
+        // full scan of the same sets, after every interleaving.
+        let mut s = BuildState::new();
+        let mut clock = 0u64;
+        let mut apply = |s: &mut BuildState, kind| {
+            clock += 1;
+            s.apply(&ev(clock, kind));
+        };
+
+        // Edge 1: these finish (and one hits cache) BEFORE anything is matched.
+        apply(&mut s, result_start("//early:a"));
+        apply(&mut s, local_cache_hit("//early:a"));
+        apply(&mut s, result_end("//early:a", None));
+        apply(&mut s, result_start("//early:b"));
+        apply(&mut s, result_end("//early:b", None));
+        // A transitive dep that is never matched — proves these are
+        // intersections, not running totals.
+        apply(&mut s, result_start("//dep:x"));
+        apply(&mut s, remote_cache_hit("//dep:x"));
+        apply(&mut s, result_end("//dep:x", None));
+
+        apply(
+            &mut s,
+            matched(
+                &["//early:a", "//early:b", "//late:c", "//late:d", "//late:e"],
+                false,
+            ),
+        );
+        assert_eq!(
+            rendered_matched(&s),
+            scan_matched(&s),
+            "matched arrives last"
+        );
+        assert_eq!(rendered_matched(&s), (2, 1));
+
+        // Edge 2: these finish AFTER the Matched event that named them.
+        apply(&mut s, result_start("//late:c"));
+        apply(&mut s, remote_cache_hit("//late:c"));
+        apply(&mut s, result_end("//late:c", None));
+        assert_eq!(
+            rendered_matched(&s),
+            scan_matched(&s),
+            "matched arrives first"
+        );
+        assert_eq!(rendered_matched(&s), (3, 2));
+
+        // A cache hit on a matched target that has not finished: the cached
+        // counter moves, the done counter does not.
+        apply(&mut s, local_cache_hit("//late:d"));
+        assert_eq!(
+            rendered_matched(&s),
+            scan_matched(&s),
+            "cache hit, no result"
+        );
+        assert_eq!(rendered_matched(&s), (3, 3));
+
+        // A matched target that *fails* still advances the done count — the
+        // header reads `4 / 5 done · … · 1 failed`, and `finished` is recorded
+        // outside the success branch precisely so it does. The scan oracle cannot
+        // see a regression here (it reads the same `finished` set), so this one
+        // needs the literal.
+        apply(&mut s, result_start("//late:e"));
+        apply(&mut s, result_end("//late:e", Some("boom".into())));
+        assert_eq!(rendered_matched(&s), scan_matched(&s), "matched failure");
+        assert_eq!(rendered_matched(&s), (4, 3));
+
+        // Repeats on every path are idempotent: a duplicate `ResultEnd`, a second
+        // cache hit on an already-cached addr, and a `Matched` event re-naming an
+        // addr already in the set.
+        apply(&mut s, result_end("//early:a", None));
+        apply(&mut s, remote_cache_hit("//early:a"));
+        apply(&mut s, matched(&["//early:a", "//late:c"], true));
+        assert_eq!(rendered_matched(&s), scan_matched(&s), "duplicate events");
+        assert_eq!(rendered_matched(&s), (4, 3));
     }
 
     #[test]
