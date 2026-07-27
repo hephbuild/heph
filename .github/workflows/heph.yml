@@ -258,6 +258,15 @@ jobs:
           # syslibroot and fails to find `-lfuse`, so the (native arm64) macOS
           # runner uses plain `cargo build` — no cross needed there.
           #
+          # Both Linux targets go through zigbuild even though amd64 runs on a
+          # native runner (and arm64 could now, since the test job uses
+          # ubuntu-24.04-arm). This is about the glibc floor, not the host arch:
+          # zigbuild pins it independent of the runner image — the shipped
+          # binaries need at most GLIBC_2.30 — where a native build on
+          # ubuntu-24.04 would link 2.39 and stop running on RHEL 9 (2.34),
+          # Debian 12 (2.36), Ubuntu 22.04 (2.35) and Amazon Linux 2023 (2.34).
+          # Do not "simplify" this to a native cargo build.
+          #
           # The heph bin and the two plugin cdylibs build in ONE invocation. They
           # share nearly the whole workspace dep graph, and under the release
           # profile (thin-LTO + opt-level=3) each artifact's final codegen/LTO pass
