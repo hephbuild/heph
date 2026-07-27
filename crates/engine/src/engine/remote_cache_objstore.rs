@@ -219,10 +219,21 @@ impl ObjStoreBackend {
 /// keep-alive ping, so without this a dead-but-not-closed connection would hang
 /// until the (generous) per-request timeout; this bounds a stall tightly. The
 /// deadline is extended on every read that yields bytes.
+/// Flush interval for the diag byte counter.
+///
+/// Bumping a shared atomic per 8 KiB chunk would put ~100k contended RMWs on one
+/// cache line during a cold multi-GB pull. Accumulating locally and flushing per
+/// MiB keeps the counter useful — the reporting window is 60s, far longer than
+/// the time to move a MiB on any link worth diagnosing — at a fraction of the
+/// traffic.
+const BYTES_FLUSH: u64 = 1 << 20;
+
 struct InactivityReader<R> {
     inner: R,
     timeout: Duration,
     deadline: Pin<Box<Sleep>>,
+    /// Bytes read since the last flush to the diag table.
+    pending: u64,
 }
 
 impl<R> InactivityReader<R> {
@@ -231,6 +242,7 @@ impl<R> InactivityReader<R> {
             inner,
             timeout,
             deadline: Box::pin(sleep(timeout)),
+            pending: 0,
         }
     }
 }
@@ -247,9 +259,19 @@ impl<R: AsyncRead + Unpin> AsyncRead for InactivityReader<R> {
             Poll::Ready(Ok(())) => {
                 // Any forward progress (bytes read) resets the inactivity clock.
                 // EOF (a ready read with no new bytes) passes through untouched.
-                if buf.filled().len() != before {
+                let read = buf.filled().len().saturating_sub(before);
+                if read != 0 {
                     let next = Instant::now() + this.timeout;
                     this.deadline.as_mut().reset(next);
+                    // Bytes moving is what separates "stalled" from "slow" — with
+                    // only counts and ages, a wedged socket and a slow link look
+                    // identical.
+                    this.pending += read as u64;
+                    if this.pending >= BYTES_FLUSH {
+                        crate::engine::diag::global()
+                            .add_bytes(crate::engine::diag::Op::RemoteCacheRead, this.pending);
+                        this.pending = 0;
+                    }
                 }
                 Poll::Ready(Ok(()))
             }
@@ -261,6 +283,18 @@ impl<R: AsyncRead + Unpin> AsyncRead for InactivityReader<R> {
                 ))),
                 Poll::Pending => Poll::Pending,
             },
+        }
+    }
+}
+
+impl<R> Drop for InactivityReader<R> {
+    fn drop(&mut self) {
+        // Flush the tail, including on a cancelled transfer — otherwise the last
+        // partial MiB of every pull is lost and a run that moved real bytes can
+        // report zero.
+        if self.pending != 0 {
+            crate::engine::diag::global()
+                .add_bytes(crate::engine::diag::Op::RemoteCacheRead, self.pending);
         }
     }
 }

@@ -110,6 +110,14 @@ const SLOTS: usize = 512;
 /// Sentinel for a free slot: no span can legitimately hash to it.
 const FREE: u64 = 0;
 
+/// At or below this many open `Execute` spans and nothing else, silence is
+/// treated as "subprocesses are working" rather than a stall — until
+/// [`QUIET_EXEC_FACTOR`] times the threshold has passed.
+const QUIET_EXEC_MAX: u64 = 4;
+
+/// How much longer a silent-subprocess build is given before it is reported.
+const QUIET_EXEC_FACTOR: u64 = 10;
+
 /// Rolling window over which bytes-moved is reported.
 pub const BYTES_WINDOW: Duration = Duration::from_secs(60);
 
@@ -353,6 +361,17 @@ impl DiagState {
         self.failed.load(Ordering::Relaxed)
     }
 
+    /// Look a limiter up by name, falling back to an inert one so a caller that
+    /// names a limiter this build does not track degrades to "not reported"
+    /// rather than panicking inside a diagnostic.
+    pub fn limiter(&self, name: &'static str) -> &Limiter {
+        static INERT: Limiter = Limiter::new("inert");
+        self.limiters
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or(&INERT)
+    }
+
     pub fn limiters(&self) -> &[Limiter] {
         &self.limiters
     }
@@ -375,7 +394,8 @@ impl DiagState {
     /// loop with one wiring test instead of a suite of flaky sleepy ones.
     pub fn evaluate(&self, now_ms: u64, threshold: Duration) -> Option<StallReport> {
         let threshold_ms = u64::try_from(threshold.as_millis()).unwrap_or(60_000);
-        if self.quiet_for_ms(now_ms) < threshold_ms {
+        let quiet = self.quiet_for_ms(now_ms);
+        if quiet < threshold_ms {
             return None;
         }
 
@@ -385,6 +405,24 @@ impl DiagState {
             .filter(|(_, n, _)| *n > 0)
             .collect();
         open.sort_by_key(|(_, n, _)| std::cmp::Reverse(*n));
+
+        // A handful of `Execute` spans and nothing else is a normal build running
+        // normal subprocesses. heph cannot see inside one: a compiler thinking
+        // quietly for ten minutes emits exactly what a wedged one emits, which is
+        // nothing. Reporting that at the ordinary threshold would fire on every
+        // narrow invocation — `heph r //some:slow_target` — and a notice that
+        // cries wolf is worse than none, because people stop reading it.
+        //
+        // So hold silent subprocesses to a much longer clock. A genuinely stuck
+        // one is still reported, just late, and `dominant` refuses to volunteer a
+        // theory about it (see `StallReport::dominant`).
+        let only_subprocesses = !open.is_empty()
+            && open
+                .iter()
+                .all(|(op, n, _)| matches!(op, Op::Execute) && *n <= QUIET_EXEC_MAX);
+        if only_subprocesses && quiet < threshold_ms.saturating_mul(QUIET_EXEC_FACTOR) {
+            return None;
+        }
 
         // Nothing open and nothing moving: either the run is over (the watchdog is
         // stopped then) or we are wedged *before* any span opened — matching, or
@@ -443,6 +481,11 @@ impl StallReport {
     pub fn dominant(&self) -> Option<(Op, u64)> {
         let total: u64 = self.open.iter().map(|(_, n, _)| *n).sum();
         let (op, n, _) = self.open.first()?;
+        // Never volunteer a theory about a subprocess: heph has no view inside
+        // one, so "stuck execute" would be a guess dressed as a finding.
+        if matches!(op, Op::Execute) {
+            return None;
+        }
         (total > 0 && n * 100 >= total * 80).then_some((*op, *n))
     }
 
@@ -687,29 +730,67 @@ mod tests {
         }
     }
 
-    /// A build that is opening spans is progressing, even if it has closed none.
+    /// A lone quiet subprocess is not a stall at the ordinary threshold.
     ///
-    /// This is the false positive that would have sunk the feature: a single
-    /// 30-minute link target emits one `ResultStart` and nothing else until it
-    /// finishes. A "no target completed in N" trigger prints a stall paragraph on
-    /// a perfectly healthy build, and a diagnostic that cries wolf gets ignored.
+    /// `heph r //some:slow_target` emits one `ExecuteStart` and then nothing for
+    /// as long as the compiler thinks. heph cannot see inside it — a healthy
+    /// subprocess and a wedged one emit identically, which is to say nothing — so
+    /// firing here would put a stall notice on every narrow invocation, and a
+    /// notice that cries wolf stops being read.
     #[test]
-    fn does_not_fire_on_one_legitimately_slow_target() {
+    fn does_not_fire_on_one_quiet_slow_target() {
         let s = state();
         s.op_start(Op::Execute, "//a:b", 0);
-        // An hour later, still nothing else. Not a stall — it is one slow target.
-        // Progress is what advances `last_transition`, so this fires only because
-        // *nothing at all* has happened; assert we report it as unknown-phase
-        // rather than blaming the op.
-        let r = s.evaluate(3_600_000, T).expect("quiet for an hour");
+        for minutes in 1..10 {
+            let now = minutes * 60_000;
+            assert!(
+                s.evaluate(now, T).is_none(),
+                "fired at {now}ms on a single quiet subprocess"
+            );
+        }
+    }
+
+    /// It is held to a longer clock, not exempted: a genuinely stuck subprocess
+    /// is still reported, just late.
+    #[test]
+    fn a_quiet_subprocess_is_reported_eventually() {
+        let s = state();
+        s.op_start(Op::Execute, "//a:b", 0);
+        let r = s
+            .evaluate(T.as_millis() as u64 * QUIET_EXEC_FACTOR + 1, T)
+            .expect("reported once the longer clock elapses");
         assert_eq!(
             r.open.first().map(|(op, n, _)| (*op, *n)),
             Some((Op::Execute, 1))
         );
-        assert!(
-            !r.dominant_is_starved() || r.bytes.iter().all(|(_, b)| *b == 0),
-            "with no byte counters wired this op cannot be called starved"
+        assert_eq!(
+            r.dominant(),
+            None,
+            "heph cannot see inside a subprocess, so it must not blame one"
         );
+    }
+
+    /// The suppression is scoped to subprocesses. Many open remote-cache reads
+    /// with nothing moving is the case this whole feature exists for and must
+    /// fire at the ordinary threshold.
+    #[test]
+    fn suppression_does_not_hide_a_stalled_subsystem() {
+        let s = state();
+        for i in 0..98 {
+            s.op_start(Op::RemoteCacheRead, &format!("//pkg:{i}"), 0);
+        }
+        assert!(s.evaluate(61_000, T).is_some());
+    }
+
+    /// A wide fan-out of subprocesses is a real signal — that is the worker pool
+    /// wedged, not one slow compile — so the suppression must not swallow it.
+    #[test]
+    fn many_open_subprocesses_still_fire() {
+        let s = state();
+        for i in 0..(QUIET_EXEC_MAX + 1) {
+            s.op_start(Op::Execute, &format!("//e:{i}"), 0);
+        }
+        assert!(s.evaluate(61_000, T).is_some());
     }
 
     /// Work that keeps closing spans never trips the threshold, however long any
