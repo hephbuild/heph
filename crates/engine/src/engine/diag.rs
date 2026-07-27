@@ -567,12 +567,13 @@ fn human_bytes(b: u64) -> String {
     "0 B".to_string()
 }
 
-/// Render a stall report as the paragraph printed to stderr.
+/// Render a stall report as the paragraph appended to the [`StallLog`].
 ///
 /// The wording deliberately avoids the vocabulary of a *failure* — no "error",
-/// no "failed". This lands in the CI log of every slow build, and a log processor
-/// grepping stderr for failure signatures must not match a progress notice. It
-/// says "no progress", never "hung": the run may well be fine.
+/// no "failed". The file is read (and often catted into a CI log) on every slow
+/// build, and a log processor grepping for failure signatures must not match a
+/// progress notice. It says "no progress", never "hung": the run may well be
+/// fine.
 ///
 /// The text is a diagnostic, not an interface. Nothing should parse it — that is
 /// what the machine-readable surface is for.
@@ -645,16 +646,69 @@ pub fn render_stall(r: &StallReport) -> String {
     out
 }
 
-/// Poll [`DiagState::evaluate`] and emit a paragraph when it reports a stall.
+/// Where stall paragraphs are appended.
+///
+/// A file rather than the terminal, because the two readers want opposite
+/// things. The paragraph is six lines of table that repeats as the stall
+/// escalates; inlined into a TUI frame or a CI log it buries the build output it
+/// is meant to annotate, and in CI it lands in the middle of whatever the
+/// compiler was printing. A file keeps the full history, keeps it in one place
+/// across every fire of the run, and leaves the terminal with a single line
+/// naming the path.
+///
+/// It sits next to the `SIGQUIT` thread dumps (`<home>/diag/`) — the two are read
+/// together when diagnosing the same hang, and `heph tool gc` already sweeps that
+/// directory. Per-pid, so concurrent heph processes in one workspace do not
+/// interleave their reports into one unreadable file.
+pub struct StallLog {
+    path: std::path::PathBuf,
+}
+
+impl StallLog {
+    pub fn new(home: &std::path::Path) -> Self {
+        Self {
+            path: home
+                .join("diag")
+                .join(format!("stall-{}.log", std::process::id())),
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Append one rendered report, creating the directory on first write.
+    ///
+    /// Appends rather than truncates: the escalation sequence *is* the
+    /// diagnostic — "98 open, oldest 60s" followed by "98 open, oldest 512s" says
+    /// wedged, where either line alone says only slow.
+    pub fn append(&self, text: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        f.write_all(text.as_bytes())
+    }
+}
+
+/// Poll [`DiagState::evaluate`] and emit a report when it detects a stall.
 ///
 /// Runs on a plain OS thread, never a tokio timer: the whole point is to keep
 /// working when the runtime is saturated or the reactor is not turning, which is
 /// the condition being diagnosed. It is deliberately *not* merged into
 /// `hcore::blocking`'s backstop thread — that one is a correctness mechanism for
-/// dropped wake-ups, and this one ends in a blocking `write` to stderr. In CI
-/// stderr is a pipe; a stalled consumer would fill the 64 KiB buffer and block
-/// forever, freezing waker delivery for the entire blocking pool. The watchdog
-/// would then hang the process it exists to diagnose.
+/// dropped wake-ups, and this one ends in blocking I/O. In CI stderr is a pipe;
+/// a stalled consumer would fill the 64 KiB buffer and block forever, freezing
+/// waker delivery for the entire blocking pool. The watchdog would then hang the
+/// process it exists to diagnose.
+///
+/// `emit` takes the report, not the rendered text: the caller decides what goes
+/// to the file and what goes to the terminal, and rendering inside the watchdog
+/// would fix that policy here.
 pub struct Watchdog {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -663,7 +717,7 @@ impl Watchdog {
     pub fn spawn(
         state: std::sync::Arc<DiagState>,
         threshold: Duration,
-        emit: impl Fn(&str) + Send + 'static,
+        emit: impl Fn(&StallReport) + Send + 'static,
     ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_thread = std::sync::Arc::clone(&stop);
@@ -689,7 +743,7 @@ impl Watchdog {
                             >= u64::try_from(threshold.as_millis()).unwrap_or(60_000) * 2
                     });
                     if due {
-                        emit(&render_stall(&report));
+                        emit(&report);
                         last_fired = Some(now);
                     }
                 }
@@ -968,6 +1022,40 @@ mod tests {
         let s = state();
         let text = render_stall(&s.evaluate(120_000, T).expect("stalled"));
         assert!(text.contains("still resolving targets"), "{text}");
+    }
+
+    /// The log lands under the home dir's `diag/` — beside the `SIGQUIT` thread
+    /// dumps, which is where a reader chasing a hang already looks — and creates
+    /// that directory itself, since nothing else does before the first stall.
+    #[test]
+    fn stall_log_writes_under_the_home_diag_dir() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let log = StallLog::new(home.path());
+        assert_eq!(
+            log.path().parent(),
+            Some(home.path().join("diag").as_path())
+        );
+
+        log.append("first\n").expect("append into a missing dir");
+        assert_eq!(
+            std::fs::read_to_string(log.path()).expect("read back"),
+            "first\n"
+        );
+    }
+
+    /// Successive fires accumulate. The escalation sequence is the diagnostic —
+    /// "oldest 60s" then "oldest 512s" says wedged, where either alone says only
+    /// slow — so a truncating write would destroy the signal.
+    #[test]
+    fn stall_log_appends_rather_than_truncating() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let log = StallLog::new(home.path());
+        log.append("oldest 60s\n").expect("append");
+        log.append("oldest 512s\n").expect("append");
+        assert_eq!(
+            std::fs::read_to_string(log.path()).expect("read back"),
+            "oldest 60s\noldest 512s\n"
+        );
     }
 
     /// The hook folds the real event stream, and `ResultEnd` counts failures.

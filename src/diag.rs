@@ -31,7 +31,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use tracing::{info, warn};
+use tracing::warn;
 
 /// File descriptor the handler appends dumps to; `-1` until [`install`] opens it.
 static DIAG_FD: AtomicI32 = AtomicI32::new(-1);
@@ -136,7 +136,10 @@ fn sweep() {
     }
 
     let n = sweep_threads();
-    info!(threads = n, path = %path.display(), "Wrote thread backtraces");
+    // `warn!`, not `info!`: someone pressed `Ctrl-\` on a frozen build and the one
+    // thing they need back is where the dump went. At `info!` that line sits in
+    // the same stream as ordinary build chatter and scrolls past unread.
+    warn!(threads = n, path = %path.display(), "Wrote thread backtraces");
 }
 
 /// Signal used to make each thread dump itself. `SIGUSR1` is free here —

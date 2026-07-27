@@ -279,11 +279,14 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     };
     let interactive = tui::should_use_tui(global.no_tui);
 
-    // Stall watchdog. Registered before the run so it observes the whole stream,
-    // and it emits through the same `LogSink` the logs use rather than a bare
-    // `eprintln!` — while the TUI owns the terminal a raw stderr write from an
-    // unrelated OS thread interleaves mid-frame and corrupts the display, which
-    // would make the paragraph unreadable in exactly the interactive case.
+    // Stall watchdog. Registered before the run so it observes the whole stream.
+    //
+    // The paragraph goes to `<home>/diag/stall-<pid>.log` and the terminal gets
+    // one `warn!` naming it. Inline, the table repeated on every escalation
+    // buries the build output it is meant to annotate — and it grows exactly when
+    // the terminal is least readable. The `warn!` goes through `tracing`, hence
+    // the same `LogSink` as every other log, so while the TUI owns the terminal
+    // it lands as a proper line instead of interleaving mid-frame.
     //
     // It runs in both TUI and `--no-tui` mode: the CI backend creates the same
     // event channel, so the fold is already paid for, and a hung CI build is
@@ -291,10 +294,31 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     let watchdog = (!global.stall_notice.is_zero()).then(|| {
         let threshold = global.stall_notice;
         let diag_sink = sink.clone();
+        let log = hengine::engine::diag::StallLog::new(&engine.home);
         hengine::engine::diag::Watchdog::spawn(
             std::sync::Arc::clone(hengine::engine::diag::global()),
             threshold,
-            move |text| diag_sink.write_diagnostic(text),
+            move |report| {
+                let text = hengine::engine::diag::render_stall(report);
+                if let Err(e) = log.append(&text) {
+                    // Read-only fs, full disk, gc'd home. The paragraph is the
+                    // whole point of the watchdog, so print it rather than lose
+                    // it to the failure of its own delivery mechanism.
+                    tracing::warn!(
+                        path = %log.path().display(),
+                        error = %e,
+                        "Cannot write the stall diagnostic; printing it instead"
+                    );
+                    diag_sink.write_diagnostic(&text);
+                    return;
+                }
+                tracing::warn!(
+                    path = %log.path().display(),
+                    quiet_for_s = report.quiet_for.as_secs(),
+                    open = report.open.iter().map(|(_, n, _)| n).sum::<u64>(),
+                    "No progress; wrote a stall diagnostic"
+                );
+            },
         )
     });
 
