@@ -63,6 +63,22 @@ struct FdState {
     file: Option<File>,
     readers: usize,
     writer: bool,
+    /// Whether the stale-retry budget has already been reported exhausted since
+    /// the last successful acquire. `try_lock_fresh` is the `poll_acquire`
+    /// attempt closure, so a permanently stale path re-exhausts every backoff
+    /// round — ten times a second once the backoff saturates. Latching keeps the
+    /// first occurrence at `warn!` and drops the repeats to `debug!`.
+    stale_warned: bool,
+    /// Test-only: number of remaining [`FLockState::fd_matches_path`] calls that
+    /// must report "stale" regardless of the real inodes.
+    ///
+    /// A genuine stale inode needs a releaser to `unlink` in the window between
+    /// our `open` and our `flock` — nothing in-process can schedule that, and
+    /// racing for it would make the test flake green. Lives in `FdState` rather
+    /// than beside it so "only touched under the `fd` mutex" is structural
+    /// instead of a comment (and there is no atomic ordering to get wrong).
+    #[cfg(test)]
+    force_stale: usize,
 }
 
 #[derive(Debug)]
@@ -79,6 +95,9 @@ impl FLockState {
                 file: None,
                 readers: 0,
                 writer: false,
+                stale_warned: false,
+                #[cfg(test)]
+                force_stale: 0,
             }),
         })
     }
@@ -120,7 +139,15 @@ impl FLockState {
     /// Whether the currently open fd still names the inode at `path`. A `false`
     /// means a releaser unlinked the file out from under us between our open and
     /// our lock, so we hold a lock on a dead inode and must re-open.
-    fn fd_matches_path(&self, st: &FdState) -> Result<bool> {
+    fn fd_matches_path(&self, st: &mut FdState) -> Result<bool> {
+        // Test injection deliberately sits *inside* this function, ahead of the
+        // real comparison: hardwiring the body to `Ok(true)` — the mutation that
+        // used to pass the whole suite — then kills the retry tests too.
+        #[cfg(test)]
+        if st.force_stale > 0 {
+            st.force_stale -= 1;
+            return Ok(false);
+        }
         let f = st.file.as_ref().context("fd must be open to validate")?;
         let fd_meta = f.metadata().context("fstat-ing held lock fd")?;
         match std::fs::metadata(&self.path) {
@@ -150,11 +177,36 @@ impl FLockState {
                 return Ok(false);
             }
             if self.fd_matches_path(st)? {
+                st.stale_warned = false;
                 return Ok(true);
             }
             // Locked a file that a releaser already unlinked; drop it and retry
             // a fresh open (which re-creates the path).
             self.discard_fd(st);
+        }
+        // Giving up is reported as would-block, which the blocking callers
+        // retry forever and the `try_*` callers surface as "busy". That is the
+        // intended behaviour — the condition is transient by construction — but
+        // a path that is *permanently* stale would otherwise spin with nothing
+        // in the log.
+        //
+        // Latched, because this function is `poll_acquire`'s attempt closure:
+        // unlatched, a permanently stale path emits a warn per backoff round,
+        // ~10/s per addr, for the life of the run. The first one is the signal;
+        // the rest are the same fact again.
+        if st.stale_warned {
+            tracing::debug!(
+                path = %self.path.display(),
+                retries = STALE_RETRIES,
+                "lock file still being unlinked under us"
+            );
+        } else {
+            st.stale_warned = true;
+            tracing::warn!(
+                path = %self.path.display(),
+                retries = STALE_RETRIES,
+                "lock file kept being unlinked under us; reporting it busy"
+            );
         }
         Ok(false)
     }
@@ -241,6 +293,11 @@ impl FLockState {
         // waiter that grabbed this inode fails its post-lock inode check and
         // re-opens, and any fresh acquire creates a new file. Best-effort: a
         // missing file (someone raced us, or it was never created) is fine.
+        //
+        // The *order* here is the invariant, and no test can pin it: unlink after
+        // `LOCK_UN` reintroduces the two-holders race the module doc describes,
+        // yet leaves the same end state, so every assertion still passes. Only
+        // this comment stands between the two.
         if st.file.is_some() {
             match std::fs::remove_file(&self.path) {
                 Ok(()) => {}
@@ -257,6 +314,35 @@ impl FLockState {
     fn counts(&self) -> (usize, bool, bool) {
         let st = self.fd.lock();
         (st.readers, st.writer, st.file.is_some())
+    }
+
+    /// `(dev, ino)` of the currently held fd, or `None` when none is open.
+    /// Tests assert against this rather than calling
+    /// [`fd_matches_path`](Self::fd_matches_path) — asserting a guard with the
+    /// guard is circular, and would survive hardwiring it to `Ok(true)`.
+    #[cfg(test)]
+    fn held_ids(&self) -> Option<(u64, u64)> {
+        let st = self.fd.lock();
+        let meta = st
+            .file
+            .as_ref()?
+            .metadata()
+            .expect("fstat-ing held lock fd");
+        Some((meta.dev(), meta.ino()))
+    }
+
+    /// Make the next `n` inode checks report "stale". See
+    /// [`FdState::force_stale`].
+    #[cfg(test)]
+    fn inject_stale(&self, n: usize) {
+        self.fd.lock().force_stale = n;
+    }
+
+    /// Injections not yet consumed — how many of the forced-stale iterations the
+    /// acquire actually performed.
+    #[cfg(test)]
+    fn pending_stale(&self) -> usize {
+        self.fd.lock().force_stale
     }
 
     /// Current offset of the shared open file description. Exists so tests can
@@ -327,6 +413,59 @@ impl FLock {
         Self {
             state: FLockState::new(path.as_ref().to_path_buf()),
         }
+    }
+
+    /// Whether *some* open file description currently holds an exclusive lock on
+    /// `path`. Probe-only: it never creates the file, never waits, and leaves no
+    /// lock behind.
+    ///
+    /// The probe is a shared `flock(LOCK_SH | LOCK_NB)` on a fresh fd —
+    /// `EWOULDBLOCK` means an exclusive holder exists, success means none did at
+    /// that instant. It answers for the *lock*, not for a process: it is immune
+    /// to pid reuse, to a zombie whose pid still answers `kill(pid, 0)`, and to a
+    /// holder owned by another user.
+    ///
+    /// A missing file is "not held". Not because an unlinked inode cannot carry
+    /// a lock — this module is built on the fact that it can, which is what
+    /// [`fd_matches_path`](FLockState::fd_matches_path) exists to catch — but
+    /// because [`release_write`](FLockState::release_write) unlinks *before*
+    /// `LOCK_UN`: no path means any holder is already mid-release, or never
+    /// created the file. Either way there is nobody worth naming.
+    ///
+    /// On a local filesystem `flock` locks belong to the open file description,
+    /// not the process, so a lock this same process holds through some other fd
+    /// correctly reads as held. (Over NFS, Linux emulates `flock` with
+    /// per-process `fcntl` locks and a self-probe would read as unheld; macOS
+    /// does not emulate. Cross-process exclusion on NFS is already outside what
+    /// this module promises — this only notes that the probe inherits that.)
+    ///
+    /// Inherently a snapshot: the holder may release the moment after the probe.
+    /// It is a diagnostic, never an admission decision — use [`try_lock`] for
+    /// that, which acquires or does not.
+    ///
+    /// [`try_lock`]: Lock::try_lock
+    pub fn is_path_held(path: impl AsRef<Path>) -> Result<bool> {
+        let path = path.as_ref();
+        let f = match OpenOptions::new().read(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("opening lock file {} to probe", path.display()));
+            }
+        };
+        let held = !flock_nb(f.as_raw_fd(), libc::LOCK_SH)
+            .with_context(|| format!("probing lock file {}", path.display()))?;
+        if !held {
+            // We took the shared lock to learn nobody held it; release it
+            // explicitly rather than leaning on the `close` below, matching
+            // `discard_fd`'s idiom. A transient `LOCK_SH` here can make a
+            // concurrent `LOCK_EX|LOCK_NB` spuriously report busy, which costs
+            // the caller one backoff round — bounded, and once per wait.
+            // SAFETY: `f` owns a valid open fd for the duration of this call.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+        Ok(held)
     }
 }
 
@@ -491,6 +630,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_instance_shared_read_is_blocked_by_a_writer() {
+        // The mirror of `cross_instance_contention`, which only ever contends
+        // EX-against-SH. This is the SH-against-EX direction: it is the only
+        // thing that drives `try_lock_fresh`'s would-block early return down the
+        // *read* path, where leaving the failed fd open would keep a phantom
+        // reader alive for the lifetime of the instance.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let a = FRWLock::new(&path);
+        let b = FRWLock::new(&path);
+
+        let held = a.try_write().unwrap().expect("free lock acquires");
+        assert!(b.try_read().unwrap().is_none(), "SH blocked by other EX");
+        let (readers, writer, fd_open) = b.state.counts();
+        assert_eq!(
+            (readers, writer, fd_open),
+            (0, false, false),
+            "a refused read must leave no fd behind"
+        );
+
+        drop(held);
+        assert!(b.try_read().unwrap().is_some(), "SH ok after EX released");
+    }
+
+    #[tokio::test]
     async fn write_contents_persists_and_truncates_through_held_fd() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lock");
@@ -637,23 +801,176 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_inode_is_rejected_and_reopened() {
-        // Simulate the race tail: a lock file is unlinked and a *different*
-        // inode now sits at the path. A fresh acquire must not be fooled by the
-        // post-lock inode check — it re-opens the live file and succeeds.
+    async fn stale_locked_inode_is_discarded_and_the_live_file_reacquired() {
+        // The tail of the delete-on-unlock race: a releaser unlinked the file
+        // between our `open` and our `flock`, so the lock we just took is on a
+        // dead inode while a different one sits at the path.
+        //
+        // The window is between `ensure_open` and `flock_nb` and nothing
+        // in-process can schedule it — but `ensure_open` hands back an
+        // already-open `st.file` untouched, so seeding one reaches the same
+        // state. This is the *real* check: no injection, actual inode
+        // comparison. (Its predecessor swapped the inode before `lock()`, so the
+        // fd was opened after the swap, the first iteration matched, and the
+        // retry arm never ran.)
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lock");
         let l = FLock::new(&path);
 
-        // Create then remove the original file, leaving a new inode behind.
-        std::fs::write(&path, b"stale").unwrap();
+        let dead = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let dead_ids = {
+            let m = dead.metadata().unwrap();
+            (m.dev(), m.ino())
+        };
         std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"fresh").unwrap();
+        std::fs::write(&path, b"live").unwrap();
+        l.state.fd.lock().file = Some(dead);
 
         let g = l.lock(&ct()).await.unwrap();
-        let (_, writer, fd_open) = l.state.counts();
-        assert!(writer && fd_open, "acquired the live file");
+
+        let live = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            l.state.held_ids(),
+            Some(dead_ids),
+            "the dead inode must not survive the acquire"
+        );
+        assert_eq!(
+            l.state.held_ids(),
+            Some((live.dev(), live.ino())),
+            "the retry must end up holding the file at the path"
+        );
         drop(g);
+    }
+
+    #[tokio::test]
+    async fn stale_retries_are_exhausted_rather_than_looping_forever() {
+        // Pins `STALE_RETRIES` from both sides. One fewer stale iteration than
+        // the budget still acquires; the full budget gives up — and gives up as
+        // *would-block*, so the caller's backoff retries rather than erroring.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+
+        let survives = FLock::new(&path);
+        survives.state.inject_stale(STALE_RETRIES - 1);
+        let g = survives
+            .try_lock()
+            .unwrap()
+            .expect("one fewer than the budget still acquires");
+        assert_eq!(survives.state.pending_stale(), 0, "all retries consumed");
+        drop(g);
+
+        let exhausts = FLock::new(&path);
+        exhausts.state.inject_stale(STALE_RETRIES);
+        assert!(
+            exhausts.try_lock().unwrap().is_none(),
+            "the full budget gives up"
+        );
+        assert_eq!(exhausts.state.pending_stale(), 0, "all retries consumed");
+        let (readers, writer, fd_open) = exhausts.state.counts();
+        assert_eq!(
+            (readers, writer, fd_open),
+            (0, false, false),
+            "giving up must leave no lock and no fd behind"
+        );
+
+        // Would-block, not failure: once the condition clears the same instance
+        // acquires.
+        exhausts
+            .try_lock()
+            .unwrap()
+            .expect("acquires once it clears");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn permanent_staleness_spins_cancellably_without_stranding_the_fd() {
+        // Exhaustion reports would-block, and `poll_acquire` retries would-block
+        // forever. That is the decision, not an oversight — but it must stay
+        // interruptible, and each of the STALE_RETRIES fds per round must be
+        // closed rather than accumulated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = FLock::new(dir.path().join("lock"));
+        l.state.inject_stale(usize::MAX);
+
+        let token = ct();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token2.cancel();
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(5), l.lock(&token))
+            .await
+            .expect("a permanently stale path must not hang")
+            .expect_err("cancellation is the only way out");
+        assert!(hplugin::error::is_cancelled(&err));
+
+        let (readers, writer, fd_open) = l.state.counts();
+        assert_eq!(
+            (readers, writer, fd_open),
+            (0, false, false),
+            "clean after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_path_held_answers_for_the_lock_not_for_a_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let l = FLock::new(&path);
+
+        assert!(
+            !FLock::is_path_held(&path).unwrap(),
+            "no file yet: nothing can hold it"
+        );
+
+        // A file left behind by a holder that died: present, but its flock went
+        // with the process. This is the case a pid stamped in the file cannot
+        // answer — the pid may since have been reused by a live process.
+        std::fs::write(&path, b"stamp\n").unwrap();
+        assert!(
+            !FLock::is_path_held(&path).unwrap(),
+            "an unheld file is not held, whatever it contains"
+        );
+
+        // `flock` is per open file description, so our own guard is visible
+        // through the probe's separate fd.
+        let g = l.lock(&ct()).await.unwrap();
+        assert!(
+            FLock::is_path_held(&path).unwrap(),
+            "held while a guard lives"
+        );
+
+        // The probe must not have taken a lock of its own, or the guard below
+        // could not be re-acquired after release.
+        drop(g);
+        assert!(
+            !FLock::is_path_held(&path).unwrap(),
+            "released (and unlinked) on drop"
+        );
+        l.try_lock()
+            .unwrap()
+            .expect("probing must leave no lock behind");
+    }
+
+    #[tokio::test]
+    async fn is_path_held_sees_a_shared_reader_as_unheld() {
+        // The probe asks "is an exclusive holder present", which is what the
+        // gateway lock is. A shared reader coexists with the probe's own
+        // LOCK_SH, so it reads as unheld — correct for the gateway, and the
+        // reason this is on `FLock` rather than shared with `FRWLock`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let rw = FRWLock::new(&path);
+
+        let r = rw.read(&ct()).await.unwrap();
+        assert!(!FLock::is_path_held(&path).unwrap());
+        drop(r);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
