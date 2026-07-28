@@ -3,8 +3,17 @@ name: CI
 on:
   push:
     branches: ["master"]
+  # Every pull request, whatever it targets. Deliberately unfiltered: a
+  # `branches:` filter here matches the PR's *base*, so restricting it to
+  # master silently gives zero CI to any PR stacked on another branch — no
+  # runs queued, no failed checks, nothing to notice. The upper layers of a
+  # stack are exactly the changes that most want testing before the layer
+  # below them merges.
+  #
+  # The ABI guard diffs against `github.base_ref` rather than a hardcoded
+  # master, so it keeps working here and reports the ABI delta for that layer
+  # alone.
   pull_request:
-    branches: ["master"]
 
 # Cancel superseded runs on a branch/PR so a new push doesn't leave the old run
 # burning runners (and showing up as a noisy "cancelled"). master is never
