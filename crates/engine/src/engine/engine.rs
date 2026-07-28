@@ -730,7 +730,7 @@ impl Engine {
     /// plus the glob `fs.skip` entries (e.g. `**/node_modules/**`). All are
     /// root-relative.
     pub fn skip_globs(&self) -> Vec<String> {
-        std::iter::once("**/.git/**".to_string())
+        std::iter::once(hwalk::GIT_SKIP_GLOB.to_string())
             .chain(
                 self.cfg
                     .fs_skip

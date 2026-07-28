@@ -20,6 +20,14 @@
 //! correct-by-fallback — a missing/locked db, a decode error, or any mismatch
 //! just re-reads from disk.
 //!
+//! Entry names are UTF-8 by construction: a directory holding a name that is not
+//! valid UTF-8 fails [`read_dir`] rather than listing without it, so no
+//! walker-backed consumer can hash, glob, or name a path the rest of heph cannot
+//! represent. See [`DIR_LISTING_VERSION`] for how that guarantee survives a warm
+//! cache. It binds only what goes through here: code that calls `std::fs` and
+//! matches on a lossy name — `pluginbuildfile`'s `build_files_in_dir`, used by
+//! the formatter and the LSP — can still act on a file the build refuses.
+//!
 //! Backed by a dedicated `fswalk.db` (separate from the artifact cache so it can
 //! be pruned independently). Rows carry a last-access stamp; [`prune`] drops
 //! stale and orphaned rows so the db cannot grow without bound.
@@ -42,6 +50,25 @@ use xxhash_rust::xxh3::Xxh3;
 /// Default time-to-live for fswalk rows: entries untouched for this long are
 /// dropped by [`CachedWalker::prune`].
 pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Semantic version of a cached `dirs` listing — **bump on any change to which
+/// entries [`read_dir_uncached`] puts in a [`DirListing`]**.
+///
+/// A `dirs` row is otherwise revalidated by directory mtime alone, and a
+/// filtering change does not touch any mtime. Without this, a row written by an
+/// older binary that silently dropped an entry would be decoded and served
+/// verbatim by a newer one that would have refused it — the fix would be inert
+/// on every warm cache, and the same tree would build on a machine with a stale
+/// db and fail on a freshly-cloned one, decided by a per-machine sqlite file
+/// that is in nobody's hash. Same rationale as `GO_TESTMAIN_FORMAT_VERSION`.
+///
+/// Compared per row rather than stamped db-wide so that a mixed fleet is safe in
+/// both directions: an older binary's `INSERT` omits the column and lands on the
+/// `DEFAULT 0`, which no current version accepts.
+///
+/// - 1: `read_dir_uncached` errors on a non-UTF-8 entry name instead of dropping
+///   it (rows written before this may be missing entries).
+const DIR_LISTING_VERSION: i64 = 1;
 
 /// Escape hatch: set `HEPH_DEBUG_CACHED_WALKER=0` to bypass caching entirely and
 /// fall back to reading every directory listing and file hash straight from disk
@@ -385,10 +412,42 @@ fn read_dir_uncached(dir: &Path) -> Result<DirListing> {
     let mut entries = Vec::new();
     for entry in rd {
         let entry = entry.with_context(|| format!("read dir entry in '{}'", dir.display()))?;
-        let Ok(ft) = entry.file_type() else { continue };
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
+        // `d_type` is free on Linux, but a `DT_UNKNOWN` filesystem makes this an
+        // `lstat`, which can fail. Only a vanished entry is skippable — it is
+        // genuinely not in the tree, and a concurrent delete must not fail a
+        // walk. Anything else (EACCES, EIO) is a real entry this listing would
+        // otherwise silently omit, and the omission would then be cached under
+        // the directory's current mtime and outlive the run.
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("stat dir entry '{}'", entry.path().display()));
+            }
         };
+        // A name that is not valid UTF-8 is a hard error, not a skipped entry.
+        // Dropping it silently removed a real path from every consumer's view:
+        // a `*.BUILD` file that names a package (so the package, and its
+        // ancestors, vanish from the def-hash-bearing package list) or a source
+        // file a glob would have matched (so its content hash never reaches the
+        // parent's `hashin` — edit it and the stale artifact is served). heph
+        // represents every path as UTF-8 all the way to addresses and cache
+        // manifests, so such a name cannot be built with; refusing to walk past
+        // it is the only outcome that is neither wrong nor silent.
+        let name = entry.file_name().into_string().map_err(|raw| {
+            anyhow::anyhow!(
+                // `{:?}` on the `OsStr`, not a lossy render: `caf\xe9` and
+                // `caf\xea` both *display* as `caf\u{FFFD}`, so the one message
+                // that has to identify a name precisely must not use the
+                // rendering this whole change exists to reject. Debug escapes
+                // the invalid bytes, which is injective and pasteable.
+                "directory entry name is not valid UTF-8: {:?} (in '{}'); heph paths must be \
+                 UTF-8 — rename it, or `fs.skip` the containing directory",
+                raw,
+                dir.display(),
+            )
+        })?;
         entries.push(DirEntry {
             name,
             kind: entry_kind(ft),
@@ -398,9 +457,20 @@ fn read_dir_uncached(dir: &Path) -> Result<DirListing> {
     Ok(DirListing { entries })
 }
 
-/// A path's db key. Lossy is fine — a non-UTF-8 path just gets a stable lossy
-/// key; the worst case is a cache miss, never an incorrect hit (the on-disk
-/// mtime/size still gate every reuse).
+/// A path's db key.
+///
+/// `to_string_lossy` is **not** injective — `x\xffy` and `x\xfey` both render to
+/// `x\u{FFFD}y`, and `path` is the `dirs`/`files` PRIMARY KEY, so two distinct
+/// paths would share one row and could serve each other's listing or content
+/// hash under a matching mtime. What rules that out is not the mtime/size guard
+/// (mtime collides routinely after `tar -x`, `cp -p`, or `rsync -t`) but the
+/// walk's own invariant: every walked path is `root.join(<name from
+/// read_dir_uncached>)`, and that function rejects non-UTF-8 names outright, so
+/// the only possible source of lossiness is `root` itself — and a single root
+/// mangles to a single consistent prefix, while each workspace's db lives under
+/// its own heph home, so two roots that render alike never share a `dirs` table.
+/// The one way to break that is to point two roots at one db by hand, which
+/// `crates/plugin-go-cdylib`'s `walk_db` option makes possible.
 fn path_key(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -442,7 +512,8 @@ impl FsWalkStore {
                      path        TEXT PRIMARY KEY,
                      mtime_ns    INTEGER NOT NULL,
                      entries     BLOB NOT NULL,
-                     accessed_ns INTEGER NOT NULL
+                     accessed_ns INTEGER NOT NULL,
+                     listing_version INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE IF NOT EXISTS files (
                      path        TEXT PRIMARY KEY,
@@ -454,6 +525,28 @@ impl FsWalkStore {
                  );",
             )
             .context("initialising fswalk schema")?;
+        // Migration for a db created before `listing_version` existed. Probed
+        // rather than attempted-and-ignored: on a fresh db the `CREATE TABLE`
+        // above already declares the column, so an unconditional `ALTER` fails
+        // every time and swallowing that failure would also swallow a real one —
+        // and a real one leaves `get_dir`/`put_dir` unable to prepare, which
+        // disables the durable listing cache silently and forever.
+        let mut cols = write
+            .prepare("PRAGMA table_info(dirs)")
+            .context("inspecting the fswalk dirs schema")?;
+        let has_listing_version = cols
+            .query_map([], |r| r.get::<_, String>(1))
+            .context("reading the fswalk dirs columns")?
+            .filter_map(std::result::Result::ok)
+            .any(|name| name == "listing_version");
+        drop(cols);
+        if !has_listing_version {
+            write
+                .execute_batch(
+                    "ALTER TABLE dirs ADD COLUMN listing_version INTEGER NOT NULL DEFAULT 0;",
+                )
+                .context("adding listing_version to the fswalk dirs table")?;
+        }
 
         let manager = SqliteConnectionManager::file(db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -479,10 +572,15 @@ impl FsWalkStore {
     fn get_dir(&self, path: &Path) -> Option<(i64, Vec<u8>)> {
         let conn = self.read_pool.get().ok()?;
         let mut stmt = conn
-            .prepare_cached("SELECT mtime_ns, entries FROM dirs WHERE path = ?1")
+            .prepare_cached(
+                "SELECT mtime_ns, entries FROM dirs WHERE path = ?1 AND listing_version = ?2",
+            )
             .ok()?;
-        stmt.query_row([path_key(path)], |r| Ok((r.get(0)?, r.get(1)?)))
-            .ok()
+        stmt.query_row(
+            rusqlite::params![path_key(path), DIR_LISTING_VERSION],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
     }
 
     fn put_dir(&self, path: &Path, mtime_ns: i64, entries: &[u8], now: i64) {
@@ -494,12 +592,18 @@ impl FsWalkStore {
         // `synchronous = OFF`, so the implicit commit is a WAL append and it is
         // the parse, not the transaction, that is worth removing.
         let Ok(mut stmt) = conn.prepare_cached(
-            "INSERT OR REPLACE INTO dirs (path, mtime_ns, entries, accessed_ns) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO dirs (path, mtime_ns, entries, accessed_ns, listing_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         ) else {
             return;
         };
-        drop(stmt.execute(rusqlite::params![path_key(path), mtime_ns, entries, now]));
+        drop(stmt.execute(rusqlite::params![
+            path_key(path),
+            mtime_ns,
+            entries,
+            now,
+            DIR_LISTING_VERSION
+        ]));
     }
 
     fn get_file(&self, path: &Path) -> Option<FileHash> {
@@ -601,6 +705,220 @@ mod tests {
 
     fn walker(dir: &Path) -> CachedWalker {
         CachedWalker::open(&dir.join("fswalk.db"))
+    }
+
+    /// Create a file whose name is the raw byte sequence `raw`, or `None` when
+    /// the filesystem refuses it. APFS rejects names that are not valid UTF-8
+    /// with `EILSEQ`, so this fixture is unconstructible on
+    /// `aarch64-apple-darwin` — the caller must skip loudly rather than assert
+    /// on a file it never created.
+    fn try_create_non_utf8_file(dir: &Path, raw: &[u8]) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = dir.join(std::ffi::OsStr::from_bytes(raw));
+        match std::fs::write(&path, b"") {
+            Ok(()) => Some(path),
+            Err(e) => {
+                // macOS is the only supported target where this is expected. On
+                // Linux — the one platform that exercises the fix at all — a
+                // refusal means `$TMPDIR` is on a filesystem that cannot host
+                // the fixture, and skipping would turn the only real coverage
+                // into a silent green.
+                assert!(
+                    cfg!(target_os = "macos"),
+                    "the non-UTF-8 fixture must be constructible on this target, \
+                     but {dir:?} refused it: {e}"
+                );
+                eprintln!(
+                    "SKIP: this filesystem refuses non-UTF-8 file names ({e}); \
+                     the non-UTF-8 fixture cannot be built here"
+                );
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn read_dir_rejects_a_non_utf8_entry_name() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("pkg");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), b"").unwrap();
+        let Some(_bad) = try_create_non_utf8_file(&dir, b"caf\xe9.txt") else {
+            return;
+        };
+
+        let w = walker(tmp.path());
+        let err = w
+            .read_dir(&dir)
+            .expect_err("a non-UTF-8 entry name must fail the walk, not vanish from the listing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not valid UTF-8"),
+            "error should name the problem, got: {msg}"
+        );
+        assert!(
+            msg.contains("pkg"),
+            "error should name the directory, got: {msg}"
+        );
+    }
+
+    /// Two names that differ only in bytes `to_string_lossy` would both render
+    /// as `U+FFFD`. Silently dropping them (the old behavior) hid two real
+    /// paths; rendering them lossily would have fused them into one. Neither is
+    /// acceptable for something that ends up in a package name and a db key.
+    #[test]
+    fn read_dir_rejects_names_that_would_collide_under_lossy_rendering() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("pkg");
+        std::fs::create_dir(&dir).unwrap();
+        let Some(_a) = try_create_non_utf8_file(&dir, b"x\xffy") else {
+            return;
+        };
+        let Some(_b) = try_create_non_utf8_file(&dir, b"x\xfey") else {
+            return;
+        };
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "the two names must be distinct on disk for this test to mean anything"
+        );
+
+        let w = walker(tmp.path());
+        let err = w
+            .read_dir(&dir)
+            .expect_err("names that render to the same lossy string must not reach a listing");
+        // The message must distinguish the two, or it sends the user to rename
+        // a file they cannot tell from its neighbour. `\u{FFFD}` in the text
+        // would mean the lossy render leaked into the one place precision is
+        // the whole point.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(r"\xFF") || msg.contains(r"\xFE"),
+            "error must name the offending bytes escaped, got: {msg}"
+        );
+        assert!(
+            !msg.contains('\u{FFFD}'),
+            "error must not render the name lossily, got: {msg}"
+        );
+    }
+
+    /// A `dirs` row is revalidated by directory mtime alone, so a listing
+    /// written under older filtering rules is byte-identical-valid to the mtime
+    /// guard. Only [`DIR_LISTING_VERSION`] stops it being served — without it
+    /// the entry-name fix is inert on every warm cache.
+    #[test]
+    fn a_listing_cached_under_an_older_version_is_not_reused() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let pkg = root.join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("a.txt"), b"a").unwrap();
+
+        let w = walker(root);
+        assert_eq!(w.read_dir(&pkg).unwrap().entries.len(), 1);
+        drop(w);
+
+        // Rewrite the cached row the way a pre-fix binary would have left it:
+        // same path, same mtime, but a listing missing an entry.
+        let conn = Connection::open(root.join("fswalk.db")).unwrap();
+        let truncated = borsh::to_vec(&DirListing::default()).unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE dirs SET entries = ?1, listing_version = 0 WHERE path = ?2",
+                rusqlite::params![truncated, pkg.to_str().unwrap()],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "the first walk should have cached one dirs row");
+        drop(conn);
+
+        let w2 = walker(root);
+        let listing = w2.read_dir(&pkg).unwrap();
+        assert_eq!(
+            listing.entries.len(),
+            1,
+            "a listing cached under an older listing version must be re-read, not served"
+        );
+    }
+
+    /// The `ALTER TABLE` path is never taken on a db this suite creates (the
+    /// `CREATE TABLE` already declares the column), so without this test the
+    /// migration every existing user's db actually takes is the one line no
+    /// test executes. Builds the pre-migration schema by hand and asserts the
+    /// walker both works on it and writes a current row.
+    #[test]
+    fn a_pre_migration_db_is_upgraded_in_place() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let pkg = root.join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("a.txt"), b"a").unwrap();
+
+        let db = root.join("fswalk.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dirs (
+                 path        TEXT PRIMARY KEY,
+                 mtime_ns    INTEGER NOT NULL,
+                 entries     BLOB NOT NULL,
+                 accessed_ns INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let w = CachedWalker::open(&db);
+        assert_eq!(w.read_dir(&pkg).unwrap().entries.len(), 1);
+        drop(w);
+
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row(
+                "SELECT listing_version FROM dirs WHERE path = ?1",
+                [pkg.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .expect("the migrated db must hold a row for the walked dir");
+        assert_eq!(
+            version, DIR_LISTING_VERSION,
+            "the migrated column must be written with the current version"
+        );
+    }
+
+    /// The inverse of the test above, and the reason it is worth having: a
+    /// version predicate that never matches is *invisibly* correct — every
+    /// directory quietly falls back to disk and the durable cache stops
+    /// existing. Nothing else asserts a durable **hit** (equal content passes
+    /// whether the row was served or re-read), so a future
+    /// [`DIR_LISTING_VERSION`] written by `put_dir` and not accepted by
+    /// `get_dir` would cost the whole dir cache with nothing going red.
+    #[test]
+    fn a_current_listing_is_served_from_the_durable_cache() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let pkg = root.join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("a.txt"), b"a").unwrap();
+        let stamped = std::fs::metadata(&pkg).unwrap().modified().unwrap();
+
+        let w = walker(root);
+        assert_eq!(w.read_dir(&pkg).unwrap().entries.len(), 1);
+        drop(w);
+
+        // Change the directory behind the cache's back and put its mtime back,
+        // so reuse is decided by the row alone. A walker that re-read from disk
+        // would see two entries.
+        std::fs::write(pkg.join("b.txt"), b"b").unwrap();
+        std::fs::File::open(&pkg)
+            .unwrap()
+            .set_modified(stamped)
+            .unwrap();
+
+        let w2 = walker(root);
+        assert_eq!(
+            w2.read_dir(&pkg).unwrap().entries.len(),
+            1,
+            "the durable listing was not reused — the dirs cache is not being hit at all"
+        );
     }
 
     #[test]
