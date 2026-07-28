@@ -6,6 +6,7 @@
 
 use super::index::{DocIndex, SharedState};
 use crate::pluginbuildfile::Provider;
+use crate::pluginbuildfile::provider::PackageList;
 use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
 };
@@ -101,6 +102,7 @@ impl HephLspContext {
     }
 
     fn loader(&self) -> BuildFileLoader {
+        let walker = Arc::new(hwalk::CachedWalker::disabled());
         BuildFileLoader::new(
             self.root.clone(),
             self.patterns.clone(),
@@ -110,8 +112,20 @@ impl HephLspContext {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::clone(&self.registry),
             Arc::clone(&self.globals),
-            Arc::new(hwalk::CachedWalker::disabled()),
-            Arc::new(hwalk::Ignore::default()),
+            Arc::clone(&walker),
+            // Fresh package list per call, for the same reason: a session-lifetime
+            // one would freeze editor results — create a package and it would
+            // never appear. Within one buffer evaluation it still dedupes the
+            // walk. Note this passes `Ignore::default()` (prunes nothing) where
+            // the build passes the configured `fs.skip`, so the editor can see
+            // packages the build does not; a pre-existing divergence, now at least
+            // confined to a cell that is never shared with the build's.
+            Arc::new(PackageList::new(
+                self.root.clone(),
+                self.patterns.clone(),
+                Arc::new(hwalk::Ignore::default()),
+                walker,
+            )),
         )
     }
 

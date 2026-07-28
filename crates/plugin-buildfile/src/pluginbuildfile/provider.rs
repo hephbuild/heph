@@ -1,6 +1,5 @@
 use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
-use enclose::enclose;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
 use hcore::hmemoizer::Memoizer;
@@ -13,6 +12,7 @@ use hplugin::provider::{
     Provider as EProvider, ProviderFunctionRegistry, State, TargetSpec,
 };
 use hwalk::{CachedWalker, Ignore};
+use once_cell::sync::OnceCell;
 use starlark::environment::Globals;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -138,10 +138,20 @@ pub struct Provider {
     /// pkg. Caches errors too — a failed parse stays failed for the lifetime of
     /// the provider (BUILD file contents don't change mid-session).
     pub(crate) pkg_cache: Memoizer<String, Result<Arc<RunResult>, Arc<anyhow::Error>>>,
-    /// Cache: full BUILD-file walk of `root`. `find_packages_sync` does a recursive
-    /// readdir of the workspace tree; once per provider lifetime is enough since the
-    /// layout doesn't change mid-session. `()` key — single global entry.
-    pub(crate) packages_cache: Memoizer<(), Result<Arc<Vec<String>>, Arc<anyhow::Error>>>,
+    /// The sorted workspace package list, walked once. Shared with every
+    /// [`BuildFileLoader`] so `heph.core.packages()` reads the same list from any
+    /// package's evaluation instead of re-walking the tree per call, and reused
+    /// by [`Self::list_packages`] so there is exactly one walk and one order for
+    /// the whole session.
+    ///
+    /// Built lazily by [`Self::packages`] rather than stored directly: the
+    /// `Provider` is assembled with struct-update syntax (`..Self::default()`)
+    /// and further mutated by [`Self::with_walker`], so a field initialized at
+    /// construction time would capture the *defaults* of `root`/`patterns`/
+    /// `skip`/`walker` rather than the configured values.
+    ///
+    /// [`BuildFileLoader`]: crate::pluginbuildfile::run_file::BuildFileLoader
+    pub(crate) packages: OnceLock<Arc<PackageList>>,
     /// Sync cache: resolved BUILD-file path → parsed result. Populated during Starlark
     /// evaluation (both top-level `run_pkg` and transitive `load(...)` resolution share
     /// the same cache, so a file is parsed at most once per provider lifetime).
@@ -174,7 +184,7 @@ impl Default for Provider {
             default_driver: None,
             requests: Mutex::new(HashMap::new()),
             pkg_cache: Memoizer::with_tag("buildfile_pkg"),
-            packages_cache: Memoizer::with_tag("buildfile_packages"),
+            packages: OnceLock::new(),
             file_cache: Arc::new(Mutex::new(HashMap::new())),
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             function_registry: OnceLock::new(),
@@ -194,10 +204,28 @@ impl Provider {
 
     /// Use `walker` (the shared cross-run fs-walk cache) for package discovery, so
     /// an unchanged tree skips `readdir`. Without it the provider walks the tree
-    /// live every run (the in-process `packages_cache` only dedupes within a run).
+    /// live every run (the in-process package list only dedupes within a run).
     pub fn with_walker(mut self, walker: Arc<CachedWalker>) -> Self {
         self.walker = walker;
+        // The package list binds to the walker it was built from, so a builder
+        // call after one exists must discard it rather than leave a cell whose
+        // contents no longer match the provider's configuration. Free: nothing
+        // has been walked yet at any real call site.
+        self.packages = OnceLock::new();
         self
+    }
+
+    /// The shared, sorted package list, bound on first use to this provider's
+    /// configured `root`/`patterns`/`skip`/`walker`.
+    pub(crate) fn packages(&self) -> Arc<PackageList> {
+        Arc::clone(self.packages.get_or_init(|| {
+            Arc::new(PackageList::new(
+                self.root.clone(),
+                self.build_file_patterns.clone(),
+                Arc::clone(&self.skip),
+                Arc::clone(&self.walker),
+            ))
+        }))
     }
 
     pub fn from_options(
@@ -231,10 +259,119 @@ impl Provider {
     }
 }
 
+/// The workspace package list: one BUILD-file walk, **sorted**, computed at most
+/// once and shared by every consumer.
+///
+/// # Why sorted
+///
+/// [`find_packages_sync`] accumulates into a `HashSet`, whose iteration order is
+/// a function of a per-instance `RandomState` seed — it differs between two sets
+/// in the same process, let alone between runs. That order was reaching the def
+/// hash by two routes: `heph.core.packages()` hands its result straight to a
+/// `target(...)` config value, and `Provider::list_packages` order carries
+/// through `Engine::packages` → `Engine::query` → `pluginquery`'s `deps` →
+/// `plugingroup`, which folds `deps` into its def hash in order. Sorting here is
+/// therefore not a nicety, it is what makes the value safe to cache and share at
+/// all — which is also why the raw `HashSet` never leaves this type. Ordering is
+/// `String`'s byte-lexicographic compare and must stay that way: a
+/// collation-aware compare would make `LC_COLLATE` an undeclared hash input.
+///
+/// # Why bound to its inputs
+///
+/// The cell is constructed from the `(root, patterns, skip, walker)` it will be
+/// filled from, rather than exposing a `get_or_init(closure)`, so two callers
+/// with different skip configuration can never race to fill one cell and have
+/// the loser silently served the winner's list. The LSP in particular builds its
+/// loaders with `Ignore::default()` (it prunes nothing) — a divergence that
+/// predates this type; binding keeps it from becoming a *shared* wrong answer.
+///
+/// # Hash-input caveat
+///
+/// [`CachedWalker::read_dir`] revalidates a listing by directory **mtime only**,
+/// so a tree mutated without bumping a directory's mtime yields a stale listing.
+/// That was a performance property of the walker; because this list reaches the
+/// def hash, here it is a correctness one — a stale list is a stale *definition*.
+/// `HEPH_DEBUG_CACHED_WALKER=0` bypasses the cache and can likewise compute a
+/// different def hash from the same tree.
+pub(crate) struct PackageList {
+    root: PathBuf,
+    patterns: Vec<glob::Pattern>,
+    skip: Arc<Ignore>,
+    walker: Arc<CachedWalker>,
+    cell: OnceCell<Arc<Vec<String>>>,
+}
+
+impl PackageList {
+    pub(crate) fn new(
+        root: PathBuf,
+        patterns: Vec<glob::Pattern>,
+        skip: Arc<Ignore>,
+        walker: Arc<CachedWalker>,
+    ) -> Self {
+        Self {
+            root,
+            patterns,
+            skip,
+            walker,
+            cell: OnceCell::new(),
+        }
+    }
+
+    /// The already-walked list, if there is one. Lets an async caller skip the
+    /// blocking-pool round-trip in the common case without duplicating the cache.
+    pub(crate) fn cached(&self) -> Option<Arc<Vec<String>>> {
+        self.cell.get().cloned()
+    }
+
+    /// The sorted package list, walking the tree on the first call and serving
+    /// the same `Arc` afterwards.
+    ///
+    /// The layout is treated as fixed for this cell's lifetime — the same
+    /// assumption `pkg_cache` makes about BUILD file contents. That *removes* a
+    /// non-determinism (without it, two packages evaluated in one run can observe
+    /// different package sets — a codegen target writing into the tree between
+    /// them — so a def hash could depend on evaluation order) at the cost of a
+    /// visible semantic change: a package that appears mid-run stays invisible
+    /// for the rest of it. The bound that makes this safe is that a provider
+    /// lives for one CLI invocation; a long-lived engine (a daemon, a watch mode)
+    /// would have to revisit it.
+    ///
+    /// `get_or_try_init` is a blocking single-flight: concurrent callers park,
+    /// exactly one walk runs, and the steady state is a lock-free read. A failed
+    /// walk is **not** cached — the cell stays empty and the next caller retries.
+    /// That is deliberately unlike `pkg_cache`, which caches errors stickily; a
+    /// `readdir` failure is a transient environment fault, not a fact about the
+    /// workspace.
+    pub(crate) fn get(&self) -> anyhow::Result<Arc<Vec<String>>> {
+        self.cell
+            .get_or_try_init(|| {
+                let mut set = std::collections::HashSet::new();
+                find_packages_sync(
+                    &self.walker,
+                    &self.root,
+                    &self.root,
+                    &self.patterns,
+                    &self.skip,
+                    &mut set,
+                )
+                .with_context(|| format!("walking {} for the package list", self.root.display()))?;
+                let mut pkgs: Vec<String> = set.into_iter().collect();
+                // Non-negotiable: see the type doc. Dropping this returns
+                // `HashSet` iteration order into the def hash.
+                pkgs.sort_unstable();
+                anyhow::Ok(Arc::new(pkgs))
+            })
+            .cloned()
+    }
+}
+
 /// Recursively discover packages under `path`, reading each directory through
 /// the shared [`CachedWalker`] (so an unchanged tree skips `readdir`). Filtering
 /// (build-file pattern, skip-dir pruning) is applied here.
-pub(crate) fn find_packages_sync(
+///
+/// Private on purpose — go through [`PackageList`], which owns the sort the def
+/// hash depends on.
+fn find_packages_sync(
     walker: &CachedWalker,
     path: &std::path::Path,
     root: &std::path::Path,
@@ -333,24 +470,19 @@ impl EProvider for Provider {
         anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
     > {
         Box::pin(async move {
-            let packages = self
-                .packages_cache
-                .once(
-                    (),
-                    enclose!((self.root => root, self.build_file_patterns => patterns, self.skip => skip, self.walker => walker) move || async move {
-                        let packages = hcore::blocking::run(move || {
-                            // Recursion reads dirs through the shared walker, so an
-                            // unchanged tree is served from the cross-run fswalk cache.
-                            let mut packages = std::collections::HashSet::new();
-                            find_packages_sync(&walker, &root, &root, &patterns, &skip, &mut packages)?;
-                            Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
-                        })
-                        .await?;
-                        Ok(Arc::new(packages))
-                    }),
-                )
-                .await
-                .map_err(hcore::hmemoizer::unwrap_arc_err)?;
+            // The same sorted cell `heph.core.packages()` reads: one walk, one
+            // order, one error policy for the whole session. `PackageList` is its
+            // own single-flight, so no memoizer is needed in front of it.
+            let list = self.packages();
+            let packages = match list.cached() {
+                // Already walked: a lock-free read, not worth a pool round-trip.
+                Some(packages) => packages,
+                // The walk is a synchronous recursive `readdir` of the workspace
+                // — never on a runtime worker. It reads dirs through the shared
+                // walker, so an unchanged tree comes from the cross-run fswalk
+                // cache.
+                None => hcore::blocking::run(move || list.get()).await?,
+            };
 
             let items: Vec<anyhow::Result<ListPackageResponse>> = packages
                 .iter()
@@ -455,6 +587,75 @@ mod tests {
     use hplugin::provider::GetRequest;
     use std::fs;
     use tempfile::tempdir;
+
+    /// `Provider::list_packages` and the `heph.core.packages()` builtin are one
+    /// list in one order.
+    ///
+    /// Both orders reach a def hash: the builtin's through the calling target's
+    /// config, and `list_packages`' through `Engine::packages` → `Engine::query`
+    /// → `pluginquery`'s `deps` → `plugingroup`, which folds `deps` into its def
+    /// hash in order. Before they shared [`PackageList`], `list_packages` handed
+    /// back raw `HashSet` iteration order, so a cold-cache run computed a
+    /// different group def hash — and a different `LIST_*` file line order inside
+    /// the sandbox — every time, from a byte-identical tree.
+    ///
+    /// Deliberately does **not** sort the result before comparing: coming out
+    /// sorted is the property under test.
+    #[tokio::test]
+    async fn test_list_packages_is_sorted_and_agrees_with_the_starlark_builtin() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // Names whose creation order is not their sorted order, and enough of
+        // them that a `HashSet` matching sorted order by chance is not a concern.
+        let names = ["zeta", "alpha", "mid/x", "beta", "mid/a", "gamma", "mid"];
+        for p in names {
+            let d = root.join(p);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("BUILD"), "").unwrap();
+        }
+        fs::write(
+            root.join("BUILD"),
+            r#"target(name = "t", driver = "d", pkgs = heph.core.packages("//..."))"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        };
+
+        let ctoken = StdCancellationToken::new();
+        let listed: Vec<String> = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().pkg.to_string())
+            .collect();
+
+        let mut expected: Vec<String> = names.iter().map(|p| p.to_string()).collect();
+        expected.push(String::new()); // the root package, from the ancestor walk
+        expected.sort();
+        assert_eq!(listed, expected);
+
+        let result = provider.run_pkg("").await.expect("eval root package");
+        let from_builtin: Vec<String> = match result.targets[0].config.get("pkgs").unwrap() {
+            hcore::htvalue::Value::List(v) => v
+                .iter()
+                .map(|e| match e {
+                    hcore::htvalue::Value::String(s) => s.clone(),
+                    other => panic!("expected string pkg, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected pkgs list, got {other:?}"),
+        };
+        assert_eq!(from_builtin, listed);
+    }
+
     /// Package discovery is cached across runs through the shared walker: a fresh
     /// provider sharing the fswalk db reuses the discovered set for an unchanged
     /// tree, and a newly-added package (which bumps a recorded dir's mtime) is

@@ -40,8 +40,11 @@ impl Engine {
 
         let mut all_packages = Vec::new();
         // Different providers can list the same package; dedup so callers
-        // (e.g. `query`) don't scan a package more than once. First-seen
-        // order is preserved for determinism.
+        // (e.g. `query`) don't scan a package more than once. First-seen order
+        // is preserved — but that only *propagates* determinism, it does not
+        // create it: this order reaches a def hash (`query` → `pluginquery`'s
+        // `deps` → `plugingroup` folds them in order), so each provider owes a
+        // stable `list_packages` order of its own.
         let mut seen: FxHashSet<String> = FxHashSet::default();
 
         for provider in &self.providers {
@@ -97,8 +100,8 @@ mod tests {
         PkgBuf::from(s)
     }
 
-    // Lists `foo` twice; also used to register two instances under distinct names.
-    struct DupPkgs(&'static str);
+    /// Fake provider: `name`, and the exact package sequence it lists.
+    struct DupPkgs(&'static str, &'static [&'static str]);
     impl crate::engine::provider::Provider for DupPkgs {
         fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
             Ok(ConfigResponse {
@@ -129,14 +132,15 @@ mod tests {
             anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
         > {
             Box::pin(async {
-                let items: Vec<anyhow::Result<ListPackageResponse>> = vec![
-                    Ok(ListPackageResponse {
-                        pkg: PkgBuf::from("foo"),
-                    }),
-                    Ok(ListPackageResponse {
-                        pkg: PkgBuf::from("foo"),
-                    }),
-                ];
+                let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                    .1
+                    .iter()
+                    .map(|p| {
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(*p),
+                        })
+                    })
+                    .collect();
                 Ok(Box::new(items.into_iter())
                     as Box<
                         dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
@@ -178,8 +182,8 @@ mod tests {
             ..Default::default()
         })?;
         // Each provider lists `foo` twice; two providers list it again.
-        engine.register_provider(move |_| Box::new(DupPkgs("p1")))?;
-        engine.register_provider(move |_| Box::new(DupPkgs("p2")))?;
+        engine.register_provider(move |_| Box::new(DupPkgs("p1", &["foo", "foo"])))?;
+        engine.register_provider(move |_| Box::new(DupPkgs("p2", &["foo", "foo"])))?;
         let engine = Arc::new(engine);
         let rs = engine.new_state();
 
@@ -192,6 +196,38 @@ mod tests {
         // package; it sorts first because it is registered before `p1`/`p2`.
         // `foo` still appears exactly once despite four listings across providers.
         assert_eq!(pkgs, vec!["@heph/fs".to_string(), "foo".to_string()]);
+        Ok(())
+    }
+
+    /// The dedup must preserve each provider's listing order verbatim. This
+    /// order is not cosmetic: it reaches a def hash through `query` →
+    /// `pluginquery`'s `deps` → `plugingroup`, which folds `deps` in order.
+    /// Collecting into a hash set here — the obvious way to write a dedup —
+    /// would put the engine's own hasher seed into a build definition.
+    #[tokio::test]
+    async fn packages_preserves_each_providers_listing_order() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        // Deliberately not in sorted order: the engine must not impose one, and
+        // must not lose the one it was given.
+        engine.register_provider(move |_| Box::new(DupPkgs("p1", &["zeta", "alpha", "mid"])))?;
+        engine.register_provider(move |_| Box::new(DupPkgs("p2", &["mid", "beta"])))?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let pkgs: Vec<String> = engine
+            .packages(&Matcher::PackagePrefix(pkg("")), &rs)
+            .await?
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // `@heph/fs` from the always-on built-in provider, registered first;
+        // then p1's order untouched; then p2's only new package.
+        assert_eq!(pkgs, vec!["@heph/fs", "zeta", "alpha", "mid", "beta"]);
         Ok(())
     }
 

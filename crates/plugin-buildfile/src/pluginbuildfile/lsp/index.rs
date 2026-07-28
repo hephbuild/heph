@@ -310,15 +310,22 @@ mod tests {
 
     fn index_for(content: &str) -> DocIndex {
         let tmp = tempfile::tempdir().unwrap();
+        let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
+        let walker = Arc::new(hwalk::CachedWalker::disabled());
         let loader = BuildFileLoader::new(
             tmp.path().to_path_buf(),
-            vec![glob::Pattern::new("BUILD").unwrap()],
+            patterns.clone(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(hplugin::provider::ProviderFunctionRegistry::default()),
             Arc::new(std::sync::OnceLock::new()),
-            Arc::new(hwalk::CachedWalker::disabled()),
-            Arc::new(hwalk::Ignore::default()),
+            Arc::clone(&walker),
+            Arc::new(crate::pluginbuildfile::provider::PackageList::new(
+                tmp.path().to_path_buf(),
+                patterns,
+                Arc::new(hwalk::Ignore::default()),
+                walker,
+            )),
         );
         let result = eval_source("BUILD", content.to_string(), "pkg", &loader).unwrap();
         DocIndex::build(&result, "pkg", content.to_string())

@@ -1,4 +1,4 @@
-use crate::pluginbuildfile::provider::Provider;
+use crate::pluginbuildfile::provider::{PackageList, Provider};
 use anyhow::Context;
 use enclose::enclose;
 use hcore::hmemoizer::unwrap_arc_err;
@@ -11,7 +11,7 @@ use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::provider::{
     Approval, FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
 };
-use hwalk::{CachedWalker, EntryKind, Ignore};
+use hwalk::{CachedWalker, EntryKind};
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
@@ -563,11 +563,13 @@ pub(crate) struct Extra<'a> {
     pub root: &'a Path,
     pub on_state: Box<dyn Fn(OnStatePayload) -> anyhow::Result<()>>,
     pub on_target: Box<dyn Fn(OnTargetPayload) -> anyhow::Result<()>>,
-    /// Enumerate every package in the workspace (dir with a matching BUILD file,
-    /// plus its ancestors), pruning `fs.skip`ped subtrees. Backs
-    /// `heph.core.packages()`; runs through the shared walker so unchanged dirs
-    /// skip the `readdir` syscall.
-    pub list_packages: Box<dyn Fn() -> anyhow::Result<Vec<String>>>,
+    /// Every package in the workspace (dir with a matching BUILD file, plus its
+    /// ancestors), pruning `fs.skip`ped subtrees, **sorted**. Backs
+    /// `heph.core.packages()`; served from a shared [`PackageList`], so the tree
+    /// is walked once rather than once per call and the order — which reaches the
+    /// def hash — is the same for every caller. See [`PackageList`] for why that
+    /// matters.
+    pub list_packages: Box<dyn Fn() -> anyhow::Result<Arc<Vec<String>>>>,
     /// Capture each target's source call-stack provenance. Off on the normal
     /// build path (walking `eval.call_stack()` per `target()` call is needless
     /// overhead there); on only for the LSP, which needs it to map a source
@@ -976,6 +978,11 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// against the current package). It is evaluated per package, so only
     /// package-level matchers work — one that needs target/label info (e.g.
     /// `label(x)` or `//pkg:name`) errors rather than silently matching nothing.
+    ///
+    /// The result is a snapshot of the workspace taken once per run, and passing
+    /// it to a `target(...)` puts it in that target's def hash: adding or
+    /// removing a matched package rebuilds the target, and a package created
+    /// while the run is already going is not seen until the next one.
     fn packages<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         matcher: &str,
@@ -989,11 +996,15 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
         let base = PkgBuf::from(extra.pkg);
         let m = hmodel::htquery::parse(matcher, &base)
             .map_err(|e| anyhow::anyhow!("heph.core.packages: invalid matcher `{matcher}`: {e}"))?;
+        // `.context`, not a formatted `map_err`: flattening the chain here drops
+        // the cause, so an EACCES from the walk surfaces without its
+        // "Permission denied".
         let pkgs = (extra.list_packages)()
-            .map_err(|e| anyhow::anyhow!("heph.core.packages: enumerating packages: {e}"))?;
+            .context("heph.core.packages: enumerating packages")
+            .map_err(starlark::Error::new_other)?;
 
-        let mut matched: Vec<String> = Vec::new();
-        for pkg in pkgs {
+        let mut matched: Vec<&str> = Vec::new();
+        for pkg in pkgs.iter() {
             // A synthetic package-only addr (empty target name): package matchers
             // decide Yes/No; target-level matchers return Shrug, which we reject.
             let addr = htaddr::Addr::new(
@@ -1002,7 +1013,7 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
                 Default::default(),
             );
             match m.matches_addr(&addr) {
-                MatchResult::MatchYes => matched.push(pkg),
+                MatchResult::MatchYes => matched.push(pkg.as_str()),
                 MatchResult::MatchNo => {}
                 MatchResult::MatchShrug => {
                     return Err(anyhow::anyhow!(
@@ -1015,9 +1026,10 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
             }
         }
 
-        // `pkgs` arrives sorted, so `matched` is already sorted.
+        // `pkgs` arrives sorted (see `PackageList`), so `matched` is too — and the
+        // order this returns lands in the calling target's def hash.
         let heap = eval.heap();
-        Ok(heap.alloc(AllocList(matched.iter().map(|p| heap.alloc(p.as_str())))))
+        Ok(heap.alloc(AllocList(matched.iter().map(|p| heap.alloc(*p)))))
     }
 }
 
@@ -1060,7 +1072,7 @@ impl Provider {
         let registry = self.function_registry.get().cloned().unwrap_or_default();
         let globals = self.globals.clone();
         let walker = self.walker.clone();
-        let skip = self.skip.clone();
+        let packages = self.packages();
         self.pkg_cache
             .once(
                 key.clone(),
@@ -1079,7 +1091,7 @@ impl Provider {
                     // `hcore::blocking`.
                     hcore::blocking::run(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
-                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, skip);
+                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
@@ -1110,9 +1122,13 @@ pub(crate) struct BuildFileLoader {
     /// Shared cross-run fs-walk cache. `find_build_files` lists each package dir
     /// through it, so an unchanged dir skips the `readdir` syscall.
     walker: Arc<CachedWalker>,
-    /// Engine `fs.skip` + provider skip config, used to prune directories when
-    /// `heph.core.packages()` walks the tree for the package set.
-    skip: Arc<Ignore>,
+    /// The sorted workspace package list backing `heph.core.packages()`, bound to
+    /// the root/patterns/skip/walker it is walked from. Scoped to whatever built
+    /// it: the engine shares one per provider (a loader is built per package
+    /// evaluation, so the tree is walked once for the whole run and both the
+    /// Starlark and `Provider::list_packages` paths see one order), while the LSP
+    /// deliberately builds a fresh one per loader.
+    packages: Arc<PackageList>,
 }
 
 impl BuildFileLoader {
@@ -1125,7 +1141,7 @@ impl BuildFileLoader {
         registry: Arc<ProviderFunctionRegistry>,
         globals: Arc<OnceLock<Globals>>,
         walker: Arc<CachedWalker>,
-        skip: Arc<Ignore>,
+        packages: Arc<PackageList>,
     ) -> Self {
         Self {
             root,
@@ -1136,7 +1152,7 @@ impl BuildFileLoader {
             registry,
             globals,
             walker,
-            skip,
+            packages,
         }
     }
 
@@ -1437,20 +1453,9 @@ fn eval_ast(
                 })
             },
             list_packages: {
-                // Owned clones so the closure outlives this borrow of `loader`.
-                let walker = Arc::clone(&loader.walker);
-                let root = loader.root.clone();
-                let patterns = loader.patterns.clone();
-                let skip = Arc::clone(&loader.skip);
-                Box::new(move || {
-                    let mut set = HashSet::new();
-                    crate::pluginbuildfile::provider::find_packages_sync(
-                        &walker, &root, &root, &patterns, &skip, &mut set,
-                    )?;
-                    let mut pkgs: Vec<String> = set.into_iter().collect();
-                    pkgs.sort();
-                    Ok(pkgs)
-                })
+                // Owned clone so the closure outlives this borrow of `loader`.
+                let packages = Arc::clone(&loader.packages);
+                Box::new(move || packages.get())
             },
         };
         let scoped = ScopedLoader {
@@ -1595,7 +1600,7 @@ mod tests {
             registry,
             provider.globals.clone(),
             provider.walker.clone(),
-            provider.skip.clone(),
+            provider.packages(),
         );
         loader.load_pkg(pkg)
     }
@@ -1610,15 +1615,22 @@ mod tests {
     }
 
     fn source_loader(root: PathBuf) -> BuildFileLoader {
+        let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
+        let walker = Arc::new(CachedWalker::disabled());
         BuildFileLoader::new(
-            root,
-            vec![glob::Pattern::new("BUILD").unwrap()],
+            root.clone(),
+            patterns.clone(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(ProviderFunctionRegistry::default()),
             Arc::new(OnceLock::new()),
-            Arc::new(CachedWalker::disabled()),
-            Arc::new(Ignore::default()),
+            Arc::clone(&walker),
+            Arc::new(PackageList::new(
+                root,
+                patterns,
+                Arc::new(hwalk::Ignore::default()),
+                walker,
+            )),
         )
     }
 
@@ -2676,6 +2688,97 @@ target(
         // `//foo/...` = the prefix `foo`: matches `foo` and `foo/bar`, not `other`
         // (nor the root package).
         assert_eq!(names, vec!["foo", "foo/bar"]);
+    }
+
+    /// The `pkgs` config value a BUILD file built from `heph.core.packages(...)`.
+    fn packages_config(result: &RunResult) -> Vec<String> {
+        match result.targets[0].config.get("pkgs").expect("pkgs config") {
+            htvalue::Value::List(v) => v
+                .iter()
+                .map(|e| match e {
+                    htvalue::Value::String(s) => s.clone(),
+                    other => panic!("expected string pkg, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected pkgs list, got {other:?}"),
+        }
+    }
+
+    /// `heph.core.packages()` must return the same packages in the same order on
+    /// every run: the list goes straight into the calling target's config and so
+    /// into its **def hash**. The walk accumulates into a `HashSet` whose
+    /// iteration order is reseeded per instance, so the sort in `PackageList` is
+    /// the only thing between an unchanged tree and a definition that changes
+    /// identity run to run.
+    ///
+    /// Asserted against the exact expected vector, not "is sorted": the point is
+    /// that the order is *this* one — byte-lexicographic, the same one shipped
+    /// today — so nobody's cache is invalidated by this change either.
+    #[test]
+    fn test_heph_core_packages_order_is_stable_across_runs() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // Enough packages that a `HashSet` happening to iterate in sorted order
+        // is not an outcome worth worrying about (40! orderings).
+        let names: Vec<String> = (0..40).map(|i| format!("w/p{i:02}")).collect();
+        for p in &names {
+            let d = root.join(p);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("BUILD"), "").unwrap();
+        }
+        fs::write(
+            root.join("w/BUILD"),
+            r#"target(name = "t", driver = "d", pkgs = heph.core.packages("//w/..."))"#,
+        )
+        .unwrap();
+
+        let mut expected = vec!["w".to_string()];
+        expected.extend(names.iter().cloned());
+
+        for run in 0..5 {
+            // A fresh provider per run means a fresh `HashSet` seed — which is
+            // exactly what differs between two real runs over the same tree.
+            let provider = make_provider(&tmp);
+            let result = run_pkg_blocking(&provider, "w").expect("eval w");
+            assert_eq!(packages_config(&result), expected, "run {run}");
+        }
+    }
+
+    /// The package list is walked once and then frozen for the provider's
+    /// lifetime. Two packages evaluated in the same run must observe the same
+    /// set even if the tree changes in between (a codegen target writing into the
+    /// workspace, say) — otherwise a target's def hash would depend on the order
+    /// packages happened to be evaluated in, which under concurrent discovery is
+    /// not even stable within one machine.
+    #[test]
+    fn test_heph_core_packages_frozen_within_a_run() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let build = r#"target(name = "t", driver = "d", pkgs = heph.core.packages("//w/..."))"#;
+        for p in ["w/a", "w/b"] {
+            let d = root.join(p);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("BUILD"), build).unwrap();
+        }
+        // A fully bypassing walker, so what this test observes is the package
+        // list's own freeze and not the walker's mtime-keyed listing cache.
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        }
+        .with_walker(Arc::new(CachedWalker::bypassing()));
+
+        let first = packages_config(&run_pkg_blocking(&provider, "w/a").expect("eval w/a"));
+        assert_eq!(first, vec!["w", "w/a", "w/b"]);
+
+        // A package appearing mid-run must not change what a later evaluation
+        // sees.
+        let late = root.join("w/c");
+        fs::create_dir_all(&late).unwrap();
+        fs::write(late.join("BUILD"), "").unwrap();
+
+        let second = packages_config(&run_pkg_blocking(&provider, "w/b").expect("eval w/b"));
+        assert_eq!(second, first);
     }
 
     /// A target-level matcher (`label(...)`) can't be decided from a package path,
