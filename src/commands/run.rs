@@ -302,10 +302,22 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         let threshold = global.stall_notice;
         let diag_sink = sink.clone();
         let log = hengine::engine::diag::StallLog::new(&engine.home);
+        let inflight = hengine::engine::diag::InflightLog::new(&engine.home);
         hengine::engine::diag::Watchdog::spawn(
             std::sync::Arc::clone(hengine::engine::diag::global()),
             threshold,
             move |report| {
+                // Best-effort and first: the paragraph points at this file, and
+                // a hang that ends with the process being killed takes every
+                // byte of in-flight state with it unless it was already on disk.
+                // A failure here must not cost us the paragraph itself.
+                if let Err(e) = inflight.write(&hcore::hmemoizer::render_full_report()) {
+                    tracing::warn!(
+                        path = %inflight.path().display(),
+                        error = %e,
+                        "Cannot write the in-flight report"
+                    );
+                }
                 let text = hengine::engine::diag::render_stall(report);
                 if let Err(e) = log.append(&text) {
                     // Read-only fs, full disk, gc'd home. The paragraph is the

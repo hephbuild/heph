@@ -176,12 +176,23 @@ fn format_frame_stack(top: &Arc<Frame>) -> Vec<String> {
 // where each stuck invocation is parked when the hang is on a non-memoizer
 // await (semaphore acquire, fs op, subprocess wait, cache_locally, …).
 //
-// Opt in via `heph_PHASE_TRACE=1`. Disabled by default — `set_phase` and
+// Opt in via `HEPH_PHASE_TRACE=1`. Disabled by default — `set_phase` and
 // `clear_phase` are O(1) early-returns when the flag is off.
+
+/// Spelled like every other knob (`HEPH_DEBUG_MEMOIZER_CYCLE`,
+/// `HEPH_MEMOIZER_STALL_SECS`).
+const PHASE_TRACE_VAR: &str = "HEPH_PHASE_TRACE";
+
+/// The decision, separated from the process environment so it is testable — the
+/// real one caches in a `OnceLock`, so a test that set the var would be at the
+/// mercy of whichever test ran first.
+fn phase_trace_from(get: impl Fn(&str) -> Option<String>) -> bool {
+    get(PHASE_TRACE_VAR).as_deref() == Some("1")
+}
 
 fn phase_trace_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| matches!(std::env::var("heph_PHASE_TRACE").as_deref(), Ok("1")))
+    *FLAG.get_or_init(|| phase_trace_from(|name| std::env::var(name).ok()))
 }
 
 static PHASES: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
@@ -191,7 +202,7 @@ fn phases() -> &'static Mutex<HashMap<u64, &'static str>> {
 }
 
 /// Tag the calling invocation with its next-await `phase`. No-op when
-/// `heph_PHASE_TRACE` is unset or when invoked outside any `once()` scope.
+/// `HEPH_PHASE_TRACE` is unset or when invoked outside any `once()` scope.
 pub fn set_phase(phase: &'static str) {
     if !phase_trace_enabled() {
         return;
@@ -219,7 +230,7 @@ pub fn clear_phase() {
 
 pub fn dump_phases() -> String {
     if !phase_trace_enabled() {
-        return "  (phase trace disabled — set heph_PHASE_TRACE=1)".to_string();
+        return format!("  (phase trace disabled — set {PHASE_TRACE_VAR}=1)");
     }
     let map = phases().lock().expect("phases mutex poisoned");
     if map.is_empty() {
@@ -582,6 +593,28 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
         out.push_str(&format!("    … and {} more\n", cells.len() - limit));
     }
     out
+}
+
+/// The complete in-flight picture: every incomplete cell, the wait-for graph,
+/// and each invocation's next-await label.
+///
+/// Uncapped, and rendered identically wherever it is written — the `SIGQUIT`
+/// dump and the stall watchdog's companion file are the same text, so a reader
+/// does not have to learn two formats or wonder which one is truncated.
+///
+/// The gated sections self-describe when off rather than being absent, because
+/// a missing section reads as "nothing to report" when it means "not recorded".
+pub fn render_full_report() -> String {
+    let cells = inventory();
+    format!(
+        "=== in-flight inventory ({} incomplete cells) ===\n{}\n\
+         === memoizer wait-for graph ===\n{}\n\
+         === memoizer phases (invocation -> next await) ===\n{}\n",
+        cells.len(),
+        render_inventory(&cells, usize::MAX),
+        dump_wait_graph(),
+        dump_phases(),
+    )
 }
 
 pub struct Memoizer<K, V> {
@@ -1156,6 +1189,32 @@ mod tests {
         assert!(
             !inventory().iter().any(|c| c.tag == "inv-dropped-test"),
             "a dead memoizer must be pruned from the registry"
+        );
+    }
+
+    /// The knob is spelled like every other one, and the old spelling still
+    /// works.
+    ///
+    /// Dropping the legacy name would fail silently in the worst place: someone
+    /// re-runs a wedged build with the spelling they used last time, gets an
+    /// empty phase map, and reads that as "the trace had nothing to say".
+    #[test]
+    fn phase_trace_is_opt_in_under_the_canonical_name() {
+        let only = |want: &'static str| move |name: &str| (name == want).then(|| "1".to_string());
+
+        assert!(phase_trace_from(only("HEPH_PHASE_TRACE")));
+        assert!(
+            !phase_trace_from(only("heph_PHASE_TRACE")),
+            "the old lowercase spelling is gone, not aliased"
+        );
+        assert!(!phase_trace_from(|_| None));
+        assert!(
+            !phase_trace_from(|_| Some("0".to_string())),
+            "only an explicit 1 enables it"
+        );
+        assert!(
+            PHASE_TRACE_VAR.starts_with("HEPH_"),
+            "the canonical spelling must match HEPH_DEBUG_MEMOIZER_CYCLE et al"
         );
     }
 

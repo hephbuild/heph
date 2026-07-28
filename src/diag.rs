@@ -63,9 +63,45 @@ extern "C" fn on_sigquit(_sig: libc::c_int) {
     DUMP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
+/// The directory dumps land in, once the engine has resolved its home.
+static DUMP_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Point dumps at the engine's `<home>/diag`, so they land beside the stall log
+/// and the in-flight report rather than wherever the process happened to start.
+///
+/// Called once the home is known; before that, [`dump_dir`] falls back to the
+/// launch directory. The fallback matters — a hang during startup still has to
+/// produce a dump somewhere findable.
+pub fn set_dump_dir(dir: &std::path::Path) {
+    drop(DUMP_DIR.set(absolute(dir)));
+}
+
+/// Make `path` absolute without touching the filesystem.
+///
+/// `std::path::absolute` rather than `canonicalize`: the directory does not
+/// exist yet on the first dump, and `canonicalize` fails on a path that is not
+/// already there. Symlink resolution is not wanted here anyway — the point is a
+/// path the reader can paste, not the shortest one.
+fn absolute(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn dump_dir() -> std::path::PathBuf {
+    DUMP_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| absolute(std::path::Path::new(".heph3/diag")))
+}
+
 /// Where a dump lands. In-workspace so `heph tool gc` can sweep it.
+///
+/// **Absolute.** It used to be `.heph3/diag/dump-<pid>.txt`, resolved against
+/// whatever the process's cwd happened to be — which is not something the person
+/// reading a stall log, or an agent handed the file an hour later, has any way to
+/// know. "Your dump is at a relative path, good luck" costs a round trip in
+/// exactly the situation where the process may already be gone.
 fn dump_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(".heph3/diag").join(format!("dump-{}.txt", std::process::id()))
+    dump_dir().join(format!("dump-{}.txt", std::process::id()))
 }
 
 /// Poll for a requested dump and perform the sweep off the signal handler.
@@ -156,19 +192,10 @@ fn sweep() {
 /// frames — never inside the signal handler, and never with a blocking lock (see
 /// `hmemoizer::inventory`).
 fn inventory_report() -> String {
-    let cells = hcore::hmemoizer::inventory();
-    format!(
-        "\n=== heph in-flight inventory ({} incomplete cells) ===\n{}\n\
-         === memoizer wait-for graph ===\n{}\n\
-         === memoizer phases ===\n{}\n",
-        cells.len(),
-        // No cap: this file is read once, by a human or an agent, on a build
-        // that has already gone wrong. Truncating it here is how you end up
-        // needing a second incident to see the line you cut.
-        hcore::hmemoizer::render_inventory(&cells, usize::MAX),
-        hcore::hmemoizer::dump_wait_graph(),
-        hcore::hmemoizer::dump_phases(),
-    )
+    // Same renderer the stall watchdog writes to its companion file, so the two
+    // are byte-identical and neither is the "truncated" one. No cap: this is
+    // read once, on a build that has already gone wrong.
+    format!("\n{}", hcore::hmemoizer::render_full_report())
 }
 
 fn write_inventory(fd: libc::c_int) {
@@ -323,11 +350,44 @@ mod tests {
     #[test]
     fn the_dump_carries_the_in_flight_state_and_names_its_gated_sections() {
         let text = inventory_report();
-        assert!(text.contains("heph in-flight inventory"), "{text}");
+        assert!(text.contains("in-flight inventory"), "{text}");
         assert!(text.contains("memoizer wait-for graph"), "{text}");
         assert!(text.contains("memoizer phases"), "{text}");
         // Unset in a test process, so both must self-describe.
         assert!(text.contains("HEPH_DEBUG_MEMOIZER_CYCLE"), "{text}");
-        assert!(text.contains("heph_PHASE_TRACE"), "{text}");
+        assert!(text.contains("HEPH_PHASE_TRACE"), "{text}");
+    }
+
+    /// The dump lands at an absolute path.
+    ///
+    /// It used to be `.heph3/diag/dump-<pid>.txt`, resolved against whatever cwd
+    /// the process was launched from — so telling someone where their dump went
+    /// meant telling them "under the directory you started the build in", which
+    /// is a round trip in exactly the situation where the process may already be
+    /// gone.
+    #[test]
+    fn the_dump_path_is_absolute() {
+        let path = dump_path();
+        assert!(path.is_absolute(), "dump path must be absolute: {path:?}");
+        assert!(
+            path.ends_with(format!("dump-{}.txt", std::process::id())),
+            "{path:?}"
+        );
+        assert!(
+            path.parent().is_some_and(|p| p.ends_with("diag")),
+            "it sits in a diag dir beside the stall log: {path:?}"
+        );
+    }
+
+    /// The `SIGQUIT` dump and the watchdog's companion file must be the same
+    /// text. Two formats for one thing means a reader has to work out which of
+    /// them is the truncated one, during an incident, which is exactly when
+    /// nobody should be reverse-engineering a diagnostic.
+    #[test]
+    fn the_dump_and_the_watchdog_companion_file_render_identically() {
+        assert_eq!(
+            inventory_report().trim(),
+            hcore::hmemoizer::render_full_report().trim()
+        );
     }
 }

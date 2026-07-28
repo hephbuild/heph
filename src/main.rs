@@ -5,7 +5,7 @@ use heph::log;
 use std::process::ExitCode;
 use tracing::error;
 
-mod diag;
+use heph::diag;
 mod pprof_dump;
 
 #[derive(Parser)]
