@@ -388,7 +388,16 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
-            result_semaphore: Arc::new(Semaphore::new(max_workers)),
+            result_semaphore: {
+                let sem = Arc::new(Semaphore::new(max_workers));
+                // Let a stall report read the pool's free permits directly,
+                // instead of inferring them from the last acquire.
+                crate::engine::diag::global().register_worker_pool(max_workers, {
+                    let sem = Arc::clone(&sem);
+                    move || sem.available_permits()
+                });
+                sem
+            },
             max_workers,
             provider_factories: HashMap::new(),
             driver_factories: HashMap::new(),

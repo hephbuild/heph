@@ -63,6 +63,11 @@ impl Engine {
             .acquire()
             .await
             .context("result semaphore closed")?;
+        // Counted only once `acquire` has *returned*. A permit handed to a
+        // waiter that is never polled again never reaches this line, which is
+        // precisely what makes the pool's free count and this counter disagree
+        // — see `WorkerPermits::unaccounted`.
+        let _running = crate::engine::diag::RunningPermit::new();
 
         let addr_str = addr.format();
         // Telemetry: per-target execute wall time. This path runs only on a real
