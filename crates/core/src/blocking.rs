@@ -92,6 +92,25 @@ static NEXT_REGISTRATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 static BACKSTOP_THREAD: Once = Once::new();
 
+/// One pass of the backstop: wake every live registration, keeping them armed.
+///
+/// Split out of the thread's loop so the retention contract can be asserted by
+/// calling this directly. Timing a real tick means sleeping for a multiple of
+/// [`WAKE_BACKSTOP`] and counting wakes, which on a loaded CI runner measures the
+/// scheduler rather than the invariant.
+///
+/// Returns how many registrations were woken.
+fn tick() -> usize {
+    // Cloned under the lock and woken outside it: a waker may re-enter this
+    // module from inside `wake`.
+    let due: Vec<Waker> = lock_pending().iter().map(|(_, w)| w.clone()).collect();
+    let n = due.len();
+    for waker in due {
+        waker.wake();
+    }
+    n
+}
+
 fn start_backstop_thread() {
     BACKSTOP_THREAD.call_once(|| {
         thread::Builder::new()
@@ -99,12 +118,7 @@ fn start_backstop_thread() {
             .spawn(|| {
                 loop {
                     thread::sleep(WAKE_BACKSTOP);
-                    // Clone under the lock and wake outside it: a waker may
-                    // re-enter this module from inside `wake`.
-                    let due: Vec<Waker> = lock_pending().iter().map(|(_, w)| w.clone()).collect();
-                    for waker in due {
-                        waker.wake();
-                    }
+                    tick();
                 }
             })
             // Same stance as the pool itself: no fallback worth having.
@@ -498,15 +512,26 @@ mod tests {
         let armed = Backstop::new();
         armed.arm(&waker);
 
-        // Two ticks' worth. Under the old drain-once list the first tick would
+        // Driven, not timed. Under the old drain-once list the first tick would
         // consume the registration and the second would find nothing, because a
-        // swallowed wake never produces the re-registering poll.
-        thread::sleep(WAKE_BACKSTOP * 2 + WAKE_BACKSTOP / 2);
+        // swallowed wake never produces the re-registering poll. Calling `tick`
+        // directly asserts exactly that and nothing about the scheduler.
+        for round in 1..=3 {
+            tick();
+            assert_eq!(
+                wakes.load(Ordering::SeqCst),
+                round,
+                "a waiter whose wakes are swallowed must be re-woken on every tick"
+            );
+        }
 
-        assert!(
-            wakes.load(Ordering::SeqCst) >= 2,
-            "a waiter whose wakes are swallowed must keep being re-woken; got {}",
-            wakes.load(Ordering::SeqCst)
+        drop(armed);
+        let before = wakes.load(Ordering::SeqCst);
+        tick();
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            before,
+            "and must stop being woken once its wait has ended"
         );
     }
 
