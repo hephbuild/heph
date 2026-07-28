@@ -247,12 +247,21 @@ fn inner_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
 /// this design (`release_write` unlinks while still holding the lock), so the
 /// stronger form is worth having before some future caller opens that window.
 ///
-/// The payload is newline-framed. `write_contents` writes positionally and only
-/// then truncates, so between those two syscalls a reader in another process
-/// sees the new pid followed by the tail of a longer previous one — all digits,
-/// and therefore a perfectly parseable pid belonging to nobody. The terminator
-/// bounds the frame: a torn read yields the real pid or nothing (see
-/// [`read_pid`]).
+/// The payload is newline-framed, and `write_contents` empties the file before
+/// writing. Together those two make every state a concurrent reader can observe
+/// either a complete stamp or an unterminated prefix — never a *blend* that
+/// parses. Without the frame, a shorter pid written over a longer stale one left
+/// `<new><stale tail>`, all digits and perfectly parseable, naming a pid that
+/// belongs to nobody; without the truncate-first order, a partially visible
+/// write could still land inside the old frame. See [`read_pid`].
+///
+/// This bounds what a *torn* read can report. It does not make the pid fresh: a
+/// stamp outlives the process that wrote it whenever the holder is killed
+/// without running `Drop` (nothing unlinks the gateway file then), and the stamp
+/// lands only after the acquire completes, so a waiter can also read the
+/// previous holder's pid while the current one is still parked on the inner
+/// lock. Both are pre-existing and unaddressed here; a liveness check on the
+/// pid, or blanking the stamp at acquire, would be the fix.
 fn stamp_pid(gateway: Option<&FWriteGuard>) {
     debug_assert!(
         gateway.is_some(),
@@ -270,16 +279,24 @@ fn stamp_pid(gateway: Option<&FWriteGuard>) {
 }
 
 /// Read a pid previously stamped by the lock holder. `None` on any read/parse
-/// failure (missing file, empty, non-numeric) and on a torn read.
+/// failure (missing file, empty, non-numeric, not UTF-8, past `u32`) and on a
+/// torn read.
 ///
-/// Only the bytes before the first newline are a pid: everything after it is
-/// either absent or the unreclaimed tail of a longer previous stamp (see
-/// [`stamp_pid`]). An unterminated payload is a half-visible write, never a
-/// holder — reporting a pid the user might `kill` is worse than reporting none.
+/// Only the bytes before the first newline are a pid; an unterminated payload is
+/// not one. That covers a half-visible write, and also a stamp left by a binary
+/// from before the frame existed — the two are indistinguishable from here, so
+/// both read as "holder unknown". That costs a correct pid in the second case,
+/// during a rollout, on a file that is transient anyway; naming a pid the user
+/// might `kill` in the first case costs more.
+///
+/// The read is capped: the payload is a pid and a newline, while the directory
+/// it sits in could hold a stray or corrupted file of any size.
 fn read_pid(path: &Path) -> Option<u32> {
+    const MAX_STAMP: u64 = 64;
     let mut s = String::new();
     std::fs::File::open(path)
         .ok()?
+        .take(MAX_STAMP)
         .read_to_string(&mut s)
         .ok()?;
     s.split_once('\n')?.0.trim().parse().ok()
@@ -567,6 +584,36 @@ mod tests {
             None,
             "an unframed payload is not a pid"
         );
+    }
+
+    // Everything `read_pid` documents as `None`, in one place. The interesting
+    // half is that a malformed payload must not become a pid: `holder_pid` feeds
+    // a number the user may act on.
+    #[test]
+    fn read_pid_accepts_only_a_framed_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases: &[(&[u8], Option<u32>, &str)] = &[
+            (b"", None, "fresh gateway file, not yet stamped"),
+            (b"\n", None, "frame around an empty pid"),
+            (b"abc\n", None, "non-numeric"),
+            (b"99999999999\n", None, "past u32"),
+            (&[0xff, 0xfe, b'\n'], None, "not UTF-8"),
+            (b"42", None, "unterminated: a half-visible write"),
+            (b"  42\n", Some(42), "surrounding whitespace tolerated"),
+            (
+                b"421\n304\n",
+                Some(421),
+                "torn: new pid over a longer stale tail",
+            ),
+        ];
+
+        for (i, (bytes, want, why)) in cases.iter().enumerate() {
+            let path = dir.path().join(format!("case{i}.lock"));
+            std::fs::write(&path, bytes).expect("case bytes");
+            assert_eq!(read_pid(&path), *want, "{why}");
+        }
+
+        assert_eq!(read_pid(&dir.path().join("absent.lock")), None, "no file");
     }
 
     // The stamp must go through the gateway guard's open fd, never a second

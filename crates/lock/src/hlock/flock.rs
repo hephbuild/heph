@@ -194,8 +194,17 @@ impl FLockState {
 
     /// Overwrite the lock file's contents through the already-open lock fd
     /// (no second `open`). Only valid while a guard is held — the fd is open
-    /// exactly then. Truncates to `bytes.len()` so stale trailing bytes from a
-    /// prior, longer payload do not linger.
+    /// exactly then.
+    ///
+    /// **Truncate first, then write.** Both orders leave the same final bytes and
+    /// cost the same two syscalls, but they differ in what a concurrent reader in
+    /// another process can observe in between. Writing first leaves the tail of a
+    /// longer previous payload in place, so every intermediate state is a *blend*
+    /// of the new payload and the old one — and a blend can be indistinguishable
+    /// from a complete, well-formed payload. Truncating first makes every
+    /// intermediate state a strict prefix of the new payload over an empty file,
+    /// which a framed reader can always reject. See `result_lock::read_pid`, whose
+    /// whole framing argument rests on this order.
     ///
     /// Positioned (`pwrite`) rather than seek-then-write: it saves the `lseek`,
     /// and no reader of this fd depends on the offset today — `pwrite` keeps it
@@ -211,14 +220,10 @@ impl FLockState {
             .file
             .as_ref()
             .context("write_contents requires a held lock (fd open)")?;
+        f.set_len(0)
+            .with_context(|| format!("emptying lock file {}", self.path.display()))?;
         f.write_all_at(bytes, 0)
-            .with_context(|| format!("writing lock file contents {}", self.path.display()))?;
-        f.set_len(bytes.len() as u64).with_context(|| {
-            format!(
-                "truncating lock file {} to payload length",
-                self.path.display()
-            )
-        })?;
+            .with_context(|| format!("writing contents of lock file {}", self.path.display()))?;
         Ok(())
     }
 
@@ -555,8 +560,8 @@ mod tests {
         drop(g);
     }
 
-    #[tokio::test]
-    async fn write_contents_error_names_the_lock_file() {
+    #[test]
+    fn write_contents_error_names_the_lock_file() {
         // Callers reach `write_contents` holding only a guard, so they have no
         // path of their own to log. The error must carry the lock file's
         // identity or an ENOSPC/EIO with several addrs in flight cannot be
@@ -566,13 +571,15 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
 
         let state = FLockState::new(path.clone());
-        // A read-only file description fails the positioned write with EBADF,
-        // which beats filling a disk to reach the same branch.
+        // A read-only file description fails on the first syscall that mutates
+        // the file, which beats filling a disk to reach the same branch. Which
+        // of the two it is depends on their order, so the assertion pins the
+        // identity rather than the wording — both carry the path.
         state.fd.lock().file = Some(std::fs::File::open(&path).unwrap());
 
         let err = state
             .write_contents(b"42")
-            .expect_err("a read-only description cannot be written");
+            .expect_err("a read-only description cannot be modified");
         assert!(
             format!("{err}").contains(&path.display().to_string()),
             "error must name the lock file, got: {err}"
