@@ -173,6 +173,73 @@ mod tests {
         assert_eq!(pool.available(), 1);
     }
 
+    /// The production wedge at this pool's level: a memoized
+    /// `result → locked_result → execute_cache` chain whose leaf holds a
+    /// [`WorkerPermit`] across a park on a waker-storing await, abandoned by
+    /// fail-fast. The permit — this pool's, not a bare tokio semaphore's —
+    /// must come back, and a live caller must be served.
+    ///
+    /// Deliberately not asserted here: `diag`'s `RunningPermit` / unaccounted
+    /// bookkeeping. `diag::global()` is process-wide and the engine suite runs
+    /// in parallel, so those numbers are not this test's to observe; the
+    /// permit accounting itself is what wedged production and is what this
+    /// asserts.
+    #[tokio::test]
+    async fn an_abandoned_memoized_chain_returns_its_worker_permit() {
+        use hcore::hmemoizer::Memoizer;
+        use std::sync::Mutex;
+
+        let pool = WorkerPool::new(1);
+        let mem_result: Arc<Memoizer<String, u32>> =
+            Arc::new(Memoizer::with_tag("wp-repro-result"));
+        let mem_locked: Arc<Memoizer<String, u32>> =
+            Arc::new(Memoizer::with_tag("wp-repro-locked_result"));
+        let mem_execute: Arc<Memoizer<String, u32>> =
+            Arc::new(Memoizer::with_tag("wp-repro-execute_cache"));
+        let stash: Arc<Mutex<Option<std::task::Waker>>> = Arc::new(Mutex::new(None));
+
+        let mut outer = Box::pin(mem_result.process("//pkg:tgt".to_string(), {
+            let (mem_locked, mem_execute) = (Arc::clone(&mem_locked), Arc::clone(&mem_execute));
+            let (pool, stash) = (Arc::clone(&pool), Arc::clone(&stash));
+            move || async move {
+                mem_locked
+                    .process("//pkg:tgt".to_string(), move || async move {
+                        mem_execute
+                            .process("//pkg:tgt".to_string(), move || async move {
+                                let _permit = pool.acquire().await.expect("pool is never closed");
+                                futures::future::poll_fn(move |cx| {
+                                    *stash.lock().expect("stash") = Some(cx.waker().clone());
+                                    std::task::Poll::<u32>::Pending
+                                })
+                                .await
+                            })
+                            .await
+                    })
+                    .await
+            }
+        }));
+
+        assert!(futures::poll!(&mut outer).is_pending());
+        assert_eq!(pool.available(), 0, "the parked leaf must hold the permit");
+        assert!(
+            stash.lock().expect("stash").is_some(),
+            "leaf must have stored a waker"
+        );
+
+        drop(outer);
+
+        assert_eq!(
+            pool.available(),
+            1,
+            "abandoning the chain must return the worker permit to the pool"
+        );
+        let live = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
+            .await
+            .expect("a live caller must not be blocked by the abandoned chain")
+            .expect("acquire");
+        drop(live);
+    }
+
     /// Dropping a waiter mid-wait leaves the pool untouched.
     #[tokio::test]
     async fn a_cancelled_waiter_leaves_no_trace() {

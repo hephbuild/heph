@@ -608,6 +608,78 @@ mod tests {
         assert_eq!(futures::executor::block_on(fut), 11);
     }
 
+    /// The production wedge's leaf, driven through the real machinery: a
+    /// memoized chain whose innermost computation holds a semaphore permit and
+    /// parks inside [`run`], with a live backstop registration — then the
+    /// chain's only awaiter is dropped, as fail-fast does.
+    ///
+    /// Everything the parked leaf holds must come back: the permit returns to
+    /// the semaphore, and the backstop registration is disarmed (a `tick()`
+    /// wakes nobody). Pre-fix, the memoizer cell retained the whole chain, the
+    /// permit stayed captured, and the backstop re-woke the abandoned cell
+    /// every 250ms forever — the dumps show ~1000 such ticks over 269s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_memoized_wait_releases_its_permit_and_its_backstop() {
+        use crate::hmemoizer::Memoizer;
+
+        let _exclusive = exclusive();
+
+        let mem_result: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag("bk-result"));
+        let mem_execute: Arc<Memoizer<String, u32>> =
+            Arc::new(Memoizer::with_tag("bk-execute_cache"));
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+
+        // The job blocks until released, so the wait is genuinely pending (and
+        // the backstop genuinely armed) when the abandonment happens.
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+
+        let mut outer = Box::pin(mem_result.process("//pkg:tgt".to_string(), {
+            let mem_execute = Arc::clone(&mem_execute);
+            let permits = Arc::clone(&permits);
+            move || async move {
+                mem_execute
+                    .process("//pkg:tgt".to_string(), move || async move {
+                        let _permit = permits
+                            .acquire_owned()
+                            .await
+                            .expect("semaphore is never closed");
+                        run(move || {
+                            drop(release_rx.recv());
+                            7
+                        })
+                        .await
+                    })
+                    .await
+            }
+        }));
+        assert!(
+            futures::poll!(&mut outer).is_pending(),
+            "the chain must park inside blocking::run"
+        );
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "permit captured by the wait"
+        );
+
+        // Fail-fast: the only awaiter goes away while the job is still running.
+        drop(outer);
+
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "abandoning the chain must release the permit held across the blocking wait"
+        );
+        // The permit coming back proves the innermost future was dropped, and
+        // dropping it drops its `Backstop` — whose registration removal is
+        // proven deterministically by `a_registration_is_released_when_its_wait_ends`.
+        // Asserting `tick() == 0` here instead would race the non-exclusive
+        // tests in this module, which arm registrations of their own.
+
+        // Let the job finish; its answer goes nowhere, and that is fine.
+        release_tx.send(()).expect("job is waiting on this");
+    }
+
     /// Many jobs at once all complete, exercising the queue past the pool size.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queues_beyond_the_pool_size() {
