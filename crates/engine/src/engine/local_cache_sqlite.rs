@@ -189,6 +189,9 @@ impl PendingSlot {
     /// free to poll everything else.
     fn wait_async(self: &Arc<Self>) -> impl Future<Output = ()> + Send + 'static {
         let slot = self.clone();
+        // Held for the whole wait and dropped with the future, so the
+        // registration never outlives what it is waking. See `hcore::blocking`.
+        let armed = hcore::blocking::Backstop::new();
         poll_fn(move |cx| {
             let mut state = slot.state.lock().expect("pending slot mutex poisoned");
             if state.done {
@@ -202,7 +205,7 @@ impl PendingSlot {
             // the same dropped-cross-thread-wake-up exposure `hcore::blocking`
             // documents, so the same backstop. A lost wake costs latency instead
             // of stranding the task.
-            hcore::blocking::backstop(cx.waker().clone());
+            armed.arm(cx.waker());
             Poll::Pending
         })
     }
