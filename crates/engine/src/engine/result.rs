@@ -2765,7 +2765,7 @@ impl Engine {
                     // here means its `try_write` can never succeed, which is
                     // exactly how `cache.history` came to be unenforced during a
                     // run. `RequestState::defer_trim` submits it once the guards
-                    // are gone, still on the background lane and still
+                    // are gone, onto the bookkeeping lane and still
                     // fire-and-forget.
                     if out.is_ok() && !use_tmp_cache {
                         rs.defer_trim(&addr, def.target.cache.history, hashin);
@@ -6679,6 +6679,11 @@ mod tests {
         exec_count: SArc<AtomicUsize>,
         /// `(output group, artifact name)` pairs this target emits.
         outputs: SArc<Vec<(String, String)>>,
+        /// When set, `run` hands `execute_cache` a sandbox-cleanup job (the way a
+        /// real sandboxing bridge does) whose body records the name of the thread
+        /// it ran on. That name is the only direct evidence of which background
+        /// lane the rmdir was routed to.
+        cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
     }
 
     #[async_trait]
@@ -6749,7 +6754,16 @@ mod tests {
                         hashout: "feedface".to_string(),
                     })
                     .collect(),
-                sandbox_cleanup: None,
+                sandbox_cleanup: self.cleanup_thread.clone().map(|cell| {
+                    Box::new(move || {
+                        let name = std::thread::current()
+                            .name()
+                            .unwrap_or("<unnamed>")
+                            .to_string();
+                        drop(cell.set(name));
+                        Ok(())
+                    }) as crate::engine::driver::SandboxCleanupJob
+                }),
                 sandbox_guards: vec![],
             })
         }
@@ -6834,6 +6848,26 @@ mod tests {
         exec_count: SArc<AtomicUsize>,
         outputs: Vec<(String, String)>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
+        blocking_engine_full(exec_count, outputs, "a", None, None)
+    }
+
+    /// Full form.
+    ///
+    /// `target_name` names the single target under `//pkg`. `cleanup_thread`
+    /// makes the driver hand back a sandbox-cleanup job that records the thread
+    /// it ran on. `wrap_cache` wraps the engine's `LocalCache`, which is how a
+    /// test observes the thread the post-write trim ran on.
+    fn blocking_engine_full(
+        exec_count: SArc<AtomicUsize>,
+        outputs: Vec<(String, String)>,
+        target_name: &str,
+        cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
+        wrap_cache: Option<
+            &dyn Fn(
+                SArc<dyn crate::engine::local_cache::LocalCache>,
+            ) -> SArc<dyn crate::engine::local_cache::LocalCache>,
+        >,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
         let dir = tempdir()?;
         let mut engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
@@ -6848,13 +6882,21 @@ mod tests {
             },
             ..Default::default()
         })?;
+        if let Some(wrap) = wrap_cache {
+            engine.local_cache = wrap(engine.local_cache.clone());
+        }
         engine.register_driver(|_| {
             Box::new(BlockingDriver {
                 exec_count,
                 outputs: SArc::new(outputs),
+                cleanup_thread,
             })
         })?;
-        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let addr = Addr::new(
+            PkgBuf::from("pkg"),
+            target_name.to_string(),
+            Default::default(),
+        );
         let spec = TargetSpec {
             addr: addr.clone(),
             driver: "blocking".to_string(),
@@ -6862,6 +6904,137 @@ mod tests {
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
+    }
+
+    /// P6.2: each background job class must reach its own lane.
+    ///
+    /// The two `Lane::` literals — the sandbox rmdir in `execute_cache`'s
+    /// `defer!` and the batched post-write trim in `DeferredTrims::drop` — are the
+    /// whole of the routing decision, and every other lane test drives `enqueue`
+    /// with a lane the test itself supplies. Swap those two literals and the lanes
+    /// invert while the rest of the suite stays green.
+    ///
+    /// Asserted on the *thread each job actually ran on*, not on the argument
+    /// passed to `enqueue`, so a `sender()` that ignored its lane would fail here
+    /// too. `Thread::name` reports the requested name on every supported target
+    /// (Linux's 16-byte `PR_SET_NAME` truncation affects `/proc`, not this).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_background_job_class_runs_on_its_own_lane() {
+        use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
+
+        /// Records the thread of the first `list_target_entries` call. In this
+        /// test that call can only come from `try_trim_after_write`, which starts
+        /// with an unlocked revision count — so it is reached whether or not the
+        /// trim goes on to take the write lock.
+        struct TrimThreadCache {
+            inner: SArc<dyn LocalCache>,
+            thread: SArc<std::sync::OnceLock<String>>,
+        }
+        impl LocalCache for TrimThreadCache {
+            fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
+                self.inner.reader(addr, hashin, name)
+            }
+            fn writer(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<Box<dyn std::io::Write>> {
+                self.inner.writer(addr, hashin, name)
+            }
+            fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
+                self.inner.exists(addr, hashin, name)
+            }
+            fn existence(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<Existence> {
+                self.inner.existence(addr, hashin, name)
+            }
+            fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
+                self.inner.delete(addr, hashin, name)
+            }
+            fn list_targets(&self) -> anyhow::Result<TargetStream> {
+                self.inner.list_targets()
+            }
+            fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
+                drop(
+                    self.thread.set(
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("<unnamed>")
+                            .to_string(),
+                    ),
+                );
+                self.inner.list_target_entries(addr)
+            }
+            fn seekable_reader(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
+            {
+                self.inner.seekable_reader(addr, hashin, name)
+            }
+        }
+
+        let exec_count = SArc::new(AtomicUsize::new(0));
+        let rmdir_thread: SArc<std::sync::OnceLock<String>> = SArc::new(std::sync::OnceLock::new());
+        let trim_thread: SArc<std::sync::OnceLock<String>> = SArc::new(std::sync::OnceLock::new());
+        let wrap_trim = SArc::clone(&trim_thread);
+        let (engine, _dir, addr) = blocking_engine_full(
+            SArc::clone(&exec_count),
+            vec![("main".to_string(), "out".to_string())],
+            "p62_lane_routing",
+            Some(SArc::clone(&rmdir_thread)),
+            Some(&|inner| {
+                SArc::new(TrimThreadCache {
+                    inner,
+                    thread: SArc::clone(&wrap_trim),
+                })
+            }),
+        )
+        .expect("engine");
+
+        let rs = engine.new_state();
+        engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("cold build resolves");
+        assert_eq!(exec_count.load(Ordering::SeqCst), 1, "target executed once");
+
+        // The trim is only *submitted* when the request state drops, so it cannot
+        // have run yet. This is the deferral the lane split has to compose with —
+        // if it ever regresses to running inline, the assertion below would be
+        // measuring the calling thread instead of a lane.
+        assert!(
+            trim_thread.get().is_none(),
+            "post-write trim must not run before the request state drops"
+        );
+
+        // Releases the request, which submits the trim batch, then waits for both
+        // lanes to drain through the counter they share.
+        drain_bg(rs).await;
+
+        assert_eq!(
+            rmdir_thread.get().map(String::as_str),
+            Some("heph-sandbox-cleaner"),
+            "the sandbox rmdir must run on the reclaim lane"
+        );
+        assert_eq!(
+            trim_thread.get().map(String::as_str),
+            Some("heph-cache-gc"),
+            "the batched post-write cache.history trim must run on the bookkeeping lane"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7156,6 +7329,7 @@ mod tests {
                     Box::new(BlockingDriver {
                         exec_count,
                         outputs: SArc::new(vec![("main".to_string(), "out".to_string())]),
+                        cleanup_thread: None,
                     })
                 }
             ))

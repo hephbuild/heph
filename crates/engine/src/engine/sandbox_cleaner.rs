@@ -1,7 +1,7 @@
-//! Fire-and-forget sandbox cleanup on a dedicated OS thread.
+//! Fire-and-forget background cleanup on dedicated OS threads.
 //!
-//! Posting to the queue is a non-blocking `crossbeam_channel::send`. A
-//! single long-lived worker thread drains the queue and runs each job
+//! Posting to a queue is a non-blocking `crossbeam_channel::send`. A
+//! long-lived worker thread drains that queue and runs each job
 //! inline. No tokio waker is involved (avoids the macOS cross-thread
 //! waker bug — see `RCA_MACOS_WAKER.md`), and no tokio runtime worker
 //! is parked for the cleanup (avoids the `block_in_place` concurrency
@@ -12,9 +12,49 @@
 //! rms its upper-side dir directly (bypassing the live mount); the OS
 //! bridge rms the plain sandbox dir. The cleaner doesn't branch.
 //!
+//! ## Two lanes, one job class each
+//!
+//! There are two classes of background job and they must not share a
+//! queue. [`Lane::Reclaim`] is disk reclamation — a `remove_dir_all` of
+//! 5k–50k inodes for a finished Go sandbox, one job per executed target —
+//! and it is what keeps a build from running the disk out from under
+//! itself. [`Lane::Bookkeeping`] is cache housekeeping: today exactly one
+//! job, the batched post-write `cache.history` trim that
+//! `RequestStateData`'s drop submits, dominated by sqlite round-trips and
+//! reclaiming comparatively little per target.
+//!
+//! What makes them incompatible on one queue is *when* the bookkeeping job
+//! arrives. It is submitted at request-state drop — precisely the moment
+//! the reclaim backlog is deepest, since every sandbox the run finished
+//! with is still queued for removal. On a shared FIFO the trim batch lands
+//! behind all of them, so `cache.history` is only enforced after the last
+//! 5k–50k-inode removal completes, and process exit — gated on
+//! `bg_pending`, which both lanes feed — pays the rmdir drain *plus* the
+//! trim rather than the max of the two. Separate threads make the two
+//! costs concurrent, and keep a stalled sqlite round-trip from costing
+//! anything but bookkeeping latency.
+//!
+//! The split also keeps the classes separated structurally. Before the
+//! deferred-trim work the trim was enqueued *per target, mid-run, ahead of
+//! that same target's rmdir* (the rmdir rides a `defer!` firing at the end
+//! of the same scope), which put every removal behind a sqlite wait exactly
+//! when execution peaked. That specific shape is gone, but nothing except
+//! this lane boundary stops the next per-target bookkeeping job from
+//! recreating it.
+//!
+//! Lanes stay dedicated OS threads rather than moving onto
+//! `hcore::blocking`: that pool is sized for *bounded* jobs and already
+//! carries the cache writes (tar/gzip/borsh), so queued sqlite waits
+//! would contend with the very work they are bookkeeping for. Neither lane
+//! may move onto a tokio runtime — see the waker note above.
+//!
 //! Ordering: callers must invoke `enqueue` only *after* any read of the
-//! sandbox completes (per `project_sandbox_cleanup_ordering.md`). Within
-//! the queue, jobs are processed in FIFO order on one thread.
+//! sandbox completes (per `project_sandbox_cleanup_ordering.md`). Within a
+//! lane, jobs run in FIFO order on that lane's one thread. There is no
+//! ordering guarantee *between* lanes — that is the point.
+//!
+//! Both lanes decrement the same per-request `bg_pending` counter, so the
+//! shutdown path that blocks on it drains both.
 use crossbeam_channel::{Sender, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -52,44 +92,19 @@ pub type PendingCounter = Arc<AtomicUsize>;
 /// decrement when it completes.
 type Job = (String, SandboxCleanupJob, PendingCounter);
 
-static CLEANER: OnceLock<Sender<Job>> = OnceLock::new();
-
-fn sender() -> &'static Sender<Job> {
-    CLEANER.get_or_init(|| {
-        let (tx, rx) = unbounded::<Job>();
-        thread::Builder::new()
-            .name("heph-sandbox-cleaner".into())
-            .spawn(move || {
-                for (label, job, pending) in rx.iter() {
-                    // catch_unwind so a panicking job doesn't kill the
-                    // long-lived cleaner thread and silently drop every
-                    // subsequent cleanup for the process lifetime.
-                    let outcome = catch_unwind(AssertUnwindSafe(job));
-                    // Decrement after the job runs (not on dequeue) so the
-                    // counter only hits zero once the work is genuinely done.
-                    pending.fetch_sub(1, Ordering::AcqRel);
-                    match outcome {
-                        Ok(Ok(())) => (),
-                        Ok(Err(err)) if err.kind() == io::ErrorKind::NotFound => (),
-                        Ok(Err(err)) => {
-                            tracing::error!(
-                                error = %err,
-                                label = %label,
-                                "failed to clean up sandbox",
-                            );
-                        }
-                        Err(_) => {
-                            tracing::error!(
-                                label = %label,
-                                "sandbox cleanup job panicked",
-                            );
-                        }
-                    }
-                }
-            })
-            .expect("spawn sandbox-cleaner thread");
-        tx
-    })
+/// Which worker thread a job runs on.
+///
+/// The two classes have very different cost profiles and one must never be able
+/// to queue behind the other; see the module docs for why. Every job picks its
+/// lane explicitly so a third class cannot be added by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// Disk reclamation — `remove_dir_all` of a finished sandbox. Latency here
+    /// is the build's peak disk footprint and its post-build serial tail.
+    Reclaim,
+    /// Cache bookkeeping — the post-write GC trim. Blocks on sqlite; reclaims
+    /// little. Delaying it is cheap, so it never shares a queue with `Reclaim`.
+    Bookkeeping,
 }
 
 /// Per-sandbox-path generations, serializing destructive jobs against the
@@ -332,6 +347,7 @@ impl SandboxTeardown {
         self.armed = false;
         if let Some(job) = self.job.take() {
             enqueue(
+                Lane::Reclaim,
                 label,
                 generation::guarded(self.dir.clone(), self.generation, job),
                 Arc::clone(&self.pending),
@@ -361,6 +377,7 @@ impl Drop for SandboxTeardown {
         let (dir, generation) = (self.dir.clone(), self.generation);
         let label = format!("reclaim {}", dir.display());
         enqueue(
+            Lane::Reclaim,
             label,
             Box::new(move || generation::remove_stale(&dir, generation)),
             Arc::clone(&self.pending),
@@ -368,11 +385,101 @@ impl Drop for SandboxTeardown {
     }
 }
 
-/// Enqueue a cleanup job for asynchronous execution. `label` is used only for
-/// log lines emitted if the job fails. `pending` is the request's in-flight
-/// counter, bumped here and dropped back by the cleaner once the job has run.
-/// Non-blocking.
-pub fn enqueue(label: String, job: SandboxCleanupJob, pending: PendingCounter) {
+impl Lane {
+    /// This lane's queue.
+    ///
+    /// One `OnceLock` per lane rather than one for both: a lane is only spawned
+    /// when something is actually enqueued onto it (a run with no cacheable
+    /// target never starts the bookkeeping thread), and a spawn failure on one
+    /// lane cannot take the other's already-created sender down with it.
+    fn cell(self) -> &'static OnceLock<Sender<Job>> {
+        static RECLAIM: OnceLock<Sender<Job>> = OnceLock::new();
+        static BOOKKEEPING: OnceLock<Sender<Job>> = OnceLock::new();
+        match self {
+            Lane::Reclaim => &RECLAIM,
+            Lane::Bookkeeping => &BOOKKEEPING,
+        }
+    }
+
+    /// The OS thread name this lane's worker carries.
+    ///
+    /// The reclaim lane keeps the historical name — it is what
+    /// `RCA_MACOS_WAKER.md` refers to and what shows up in existing stack dumps.
+    /// It is 20 bytes, so Linux's 16-byte `PR_SET_NAME` limit has always
+    /// truncated it to `heph-sandbox-cl` in `/proc/*/comm`, `gdb` and `perf`;
+    /// `heph-cache-gc` fits. Rust's own `Thread::name` reports the full string on
+    /// every target either way.
+    fn thread_name(self) -> &'static str {
+        match self {
+            Lane::Reclaim => "heph-sandbox-cleaner",
+            Lane::Bookkeeping => "heph-cache-gc",
+        }
+    }
+}
+
+/// Spawn one lane's worker thread and return its queue.
+fn spawn_lane(lane: Lane) -> io::Result<Sender<Job>> {
+    let name = lane.thread_name();
+    let (tx, rx) = unbounded::<Job>();
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            for (label, job, pending) in rx.iter() {
+                // catch_unwind so a panicking job doesn't kill the
+                // long-lived cleaner thread and silently drop every
+                // subsequent cleanup for the process lifetime.
+                let outcome = catch_unwind(AssertUnwindSafe(job));
+                // Decrement after the job runs (not on dequeue) so the
+                // counter only hits zero once the work is genuinely done.
+                pending.fetch_sub(1, Ordering::AcqRel);
+                match outcome {
+                    Ok(Ok(())) => (),
+                    Ok(Err(err)) if err.kind() == io::ErrorKind::NotFound => (),
+                    // `?lane` here and in `enqueue`, never the thread name: one
+                    // `lane` field with one value space, or a log query for
+                    // `lane=Reclaim` silently misses every failure line.
+                    Ok(Err(err)) => {
+                        tracing::error!(
+                            error = %err,
+                            label = %label,
+                            ?lane,
+                            "background cleanup job failed",
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            label = %label,
+                            ?lane,
+                            "background cleanup job panicked",
+                        );
+                    }
+                }
+            }
+        })
+        // Name the lane in the error: `sender` resolves both lanes through one
+        // expression, so the panic location alone doesn't say which one failed.
+        .map_err(|e| io::Error::new(e.kind(), format!("spawn {name} thread: {e}")))?;
+    Ok(tx)
+}
+
+fn sender(lane: Lane) -> &'static Sender<Job> {
+    // Same stance as `hcore::blocking`: a process that cannot spawn its worker
+    // threads has nothing to fall back to.
+    lane.cell()
+        .get_or_init(|| spawn_lane(lane).expect("spawn background cleanup lane"))
+}
+
+/// Enqueue a cleanup job onto `lane` for asynchronous execution. `label` is used
+/// only for log lines emitted if the job fails. `pending` is the request's
+/// in-flight counter, bumped here and dropped back by the lane's worker once the
+/// job has run — both lanes share one counter, so a shutdown blocking on it
+/// drains both. Non-blocking.
+pub fn enqueue(lane: Lane, label: String, job: SandboxCleanupJob, pending: PendingCounter) {
+    // Resolve the queue *before* counting: `sender` spawns the lane's thread on
+    // first use and panics if that fails. Bumping first would leave `bg_pending`
+    // permanently above zero, and the shutdown path only breaks when it reaches
+    // zero — a failed spawn would hang the run instead of ending it.
+    let tx = sender(lane);
     // Count before sending so the counter can never observe an enqueued job as
     // already drained. The worker decrements once the job has run.
     //
@@ -385,16 +492,16 @@ pub fn enqueue(label: String, job: SandboxCleanupJob, pending: PendingCounter) {
     // then turn a silent leak into a process that never exits. A slot exists
     // only for work already in this queue.
     pending.fetch_add(1, Ordering::AcqRel);
-    if let Err(err) = sender().send((label, job, Arc::clone(&pending))) {
+    if let Err(err) = tx.send((label, job, Arc::clone(&pending))) {
         pending.fetch_sub(1, Ordering::AcqRel);
-        tracing::error!(error = %err, "sandbox cleaner channel closed");
+        tracing::error!(error = %err, ?lane, "background cleanup lane closed");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -413,22 +520,59 @@ mod tests {
         Arc::new(AtomicUsize::new(0))
     }
 
+    /// Opens a gate on drop, so a failing assertion cannot leave a lane's worker
+    /// thread parked for the rest of the test binary.
+    struct OpenOnDrop(Arc<AtomicBool>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A job that occupies its lane's thread until `gate` opens, raising
+    /// `started` as soon as it is genuinely running rather than merely queued.
+    fn gated_job(started: Arc<AtomicBool>, gate: Arc<AtomicBool>) -> SandboxCleanupJob {
+        Box::new(move || {
+            started.store(true, Ordering::SeqCst);
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(())
+        })
+    }
+
+    const ALL_LANES: [Lane; 2] = [Lane::Reclaim, Lane::Bookkeeping];
+
+    /// The lane threads are process-global, so a test that deliberately parks one
+    /// would make any *other* test waiting on that lane look like a lane-split
+    /// failure. Every test that parks a lane holds this first, so at most one
+    /// does at a time.
+    static PARKED: Mutex<()> = Mutex::new(());
+
+    fn park_lock() -> std::sync::MutexGuard<'static, ()> {
+        PARKED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
-    fn enqueue_runs_job_on_cleaner_thread() {
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_clone = Arc::clone(&ran);
-        enqueue(
-            "enqueue_runs_job_on_cleaner_thread".to_string(),
-            Box::new(move || {
-                ran_clone.store(true, Ordering::SeqCst);
-                Ok(())
-            }),
-            counter(),
-        );
-        assert!(
-            wait_for(&ran, Duration::from_secs(2)),
-            "job did not run within 2s"
-        );
+    fn enqueue_runs_job_on_every_lane() {
+        for lane in ALL_LANES {
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_clone = Arc::clone(&ran);
+            enqueue(
+                lane,
+                format!("enqueue_runs_job_on_every_lane {lane:?}"),
+                Box::new(move || {
+                    ran_clone.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+                counter(),
+            );
+            assert!(
+                wait_for(&ran, Duration::from_secs(5)),
+                "job did not run on {lane:?}"
+            );
+        }
     }
 
     #[test]
@@ -442,6 +586,7 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = Arc::clone(&done);
         enqueue(
+            Lane::Reclaim,
             "enqueue_removes_tempdir_via_closure".to_string(),
             Box::new(move || {
                 let res = std::fs::remove_dir_all(&target_for_job);
@@ -451,8 +596,8 @@ mod tests {
             counter(),
         );
         assert!(
-            wait_for(&done, Duration::from_secs(2)),
-            "job did not run within 2s"
+            wait_for(&done, Duration::from_secs(5)),
+            "job did not run within 5s"
         );
         assert!(!target.exists(), "cleanup closure did not remove target");
     }
@@ -460,49 +605,48 @@ mod tests {
     #[test]
     fn enqueue_swallows_notfound() {
         // No assertion on log output (tracing is global); the
-        // important behavior is that the cleaner thread doesn't die
+        // important behavior is that a lane's worker thread doesn't die
         // when a job returns NotFound. We follow up with another job
         // that must run on the same thread.
-        enqueue(
-            "enqueue_swallows_notfound_first".to_string(),
-            Box::new(|| Err(io::Error::from(io::ErrorKind::NotFound))),
-            counter(),
-        );
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_clone = Arc::clone(&ran);
-        enqueue(
-            "enqueue_swallows_notfound_followup".to_string(),
-            Box::new(move || {
-                ran_clone.store(true, Ordering::SeqCst);
-                Ok(())
-            }),
-            counter(),
-        );
-        assert!(
-            wait_for(&ran, Duration::from_secs(2)),
-            "cleaner thread stopped processing after NotFound"
-        );
+        for lane in ALL_LANES {
+            enqueue(
+                lane,
+                format!("enqueue_swallows_notfound_first {lane:?}"),
+                Box::new(|| Err(io::Error::from(io::ErrorKind::NotFound))),
+                counter(),
+            );
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_clone = Arc::clone(&ran);
+            enqueue(
+                lane,
+                format!("enqueue_swallows_notfound_followup {lane:?}"),
+                Box::new(move || {
+                    ran_clone.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+                counter(),
+            );
+            assert!(
+                wait_for(&ran, Duration::from_secs(5)),
+                "{lane:?} stopped processing after NotFound"
+            );
+        }
     }
 
     #[test]
     fn pending_counter_drains_to_zero_after_job_runs() {
         // A blocked job holds the request counter at 1 until released, then drops
-        // it back to 0 once the cleaner finishes it. This is the signal the
+        // it back to 0 once the lane finishes it. This is the signal the
         // shutdown path waits on to keep the TUI/process alive during drain.
+        let _parked = park_lock();
         let pending = counter();
         let gate = Arc::new(AtomicBool::new(false));
-        let gate_job = Arc::clone(&gate);
-        let done = Arc::new(AtomicBool::new(false));
-        let done_job = Arc::clone(&done);
+        let _release = OpenOnDrop(Arc::clone(&gate));
+        let started = Arc::new(AtomicBool::new(false));
         enqueue(
+            Lane::Reclaim,
             "pending_counter_drains_to_zero_after_job_runs".to_string(),
-            Box::new(move || {
-                while !gate_job.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                done_job.store(true, Ordering::SeqCst);
-                Ok(())
-            }),
+            gated_job(Arc::clone(&started), Arc::clone(&gate)),
             Arc::clone(&pending),
         );
         assert_eq!(
@@ -511,11 +655,120 @@ mod tests {
             "counter must rise while job is in flight"
         );
         gate.store(true, Ordering::SeqCst);
-        assert!(wait_for(&done, Duration::from_secs(2)), "job did not run");
+        assert!(
+            wait_for(&started, Duration::from_secs(5)),
+            "job did not run"
+        );
         // Spin until the worker's post-job decrement lands.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while pending.load(Ordering::Acquire) > 0 {
             assert!(Instant::now() < deadline, "counter did not drain to zero");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// P6.2: neither lane may be gated by the other, in either direction.
+    ///
+    /// The direction that matters in production is a blocked bookkeeping job
+    /// delaying a reclaim: it mirrors the execute path's real ordering — the
+    /// post-write GC trim is enqueued first, because the sandbox rmdir rides a
+    /// `defer!` that only fires at the end of the same scope — and the trim blocks
+    /// on a sqlite round-trip. With both classes on one FIFO thread the rmdir
+    /// cannot start until that round-trip returns; with a lane per class it runs
+    /// immediately. The mirror direction is asserted too so a future collapse onto
+    /// *either* single queue is caught.
+    #[test]
+    fn a_blocked_lane_does_not_delay_the_other() {
+        for (blocked, observed) in [
+            (Lane::Bookkeeping, Lane::Reclaim),
+            (Lane::Reclaim, Lane::Bookkeeping),
+        ] {
+            let _parked = park_lock();
+            let gate = Arc::new(AtomicBool::new(false));
+            // Opens the gate even if an assertion below unwinds, so a failing run
+            // does not wedge a lane for the rest of the test binary.
+            let _release = OpenOnDrop(Arc::clone(&gate));
+
+            let started = Arc::new(AtomicBool::new(false));
+            enqueue(
+                blocked,
+                format!("a_blocked_lane_does_not_delay_the_other/blocked {blocked:?}"),
+                gated_job(Arc::clone(&started), Arc::clone(&gate)),
+                counter(),
+            );
+            // Only enqueue onto the observed lane once the blocked job genuinely
+            // owns a worker thread. Otherwise a shared queue could drain the second
+            // job first by luck and the test would pass against a single queue.
+            assert!(
+                wait_for(&started, Duration::from_secs(5)),
+                "{blocked:?} job never started"
+            );
+
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_job = Arc::clone(&ran);
+            enqueue(
+                observed,
+                format!("a_blocked_lane_does_not_delay_the_other/observed {observed:?}"),
+                Box::new(move || {
+                    ran_job.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+                counter(),
+            );
+            // Generous on purpose. On a genuinely shared queue `ran` can never
+            // fire until `_release` drops, so this budget bounds only the failing
+            // case; it costs nothing when passing. A tight budget would instead
+            // turn ordinary CI load — the lanes are process-global and every other
+            // test in this binary feeds them — into a "the lanes share a queue"
+            // verdict that sends the reader to the wrong file.
+            assert!(
+                wait_for(&ran, Duration::from_secs(30)),
+                "{observed:?} did not run while {blocked:?} was parked — the lanes share a queue"
+            );
+        }
+    }
+
+    /// Shutdown blocks until `bg_pending` reaches zero. Splitting the lanes must
+    /// not let a job on either one escape that counter, or the process can exit
+    /// out from under an in-progress rmdir or trim.
+    #[test]
+    fn both_lanes_drain_the_same_pending_counter() {
+        let _parked = park_lock();
+        let pending = counter();
+        let gate = Arc::new(AtomicBool::new(false));
+        let _release = OpenOnDrop(Arc::clone(&gate));
+
+        let started = ALL_LANES.map(|lane| {
+            let started = Arc::new(AtomicBool::new(false));
+            enqueue(
+                lane,
+                format!("both_lanes_drain_the_same_pending_counter {lane:?}"),
+                gated_job(Arc::clone(&started), Arc::clone(&gate)),
+                Arc::clone(&pending),
+            );
+            started
+        });
+        // Both jobs must genuinely be running, not merely queued, or "in flight"
+        // below would be an assertion about the enqueue side alone.
+        for (lane, started) in ALL_LANES.iter().zip(&started) {
+            assert!(
+                wait_for(started, Duration::from_secs(30)),
+                "{lane:?} job never started"
+            );
+        }
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            ALL_LANES.len(),
+            "every lane must count into the request's single bg_pending"
+        );
+
+        gate.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pending.load(Ordering::Acquire) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "bg_pending did not drain: shutdown would exit before cleanup finished"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -903,33 +1156,37 @@ mod tests {
 
     #[test]
     fn enqueue_survives_panicking_job() {
-        // Same shape as the NotFound case: panic shouldn't kill the
+        // Same shape as the NotFound case: a panic shouldn't kill a lane's
         // thread; subsequent jobs still run.
-        let pending = counter();
-        enqueue(
-            "enqueue_survives_panicking_job_panicker".to_string(),
-            Box::new(|| panic!("boom")),
-            Arc::clone(&pending),
-        );
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_clone = Arc::clone(&ran);
-        enqueue(
-            "enqueue_survives_panicking_job_followup".to_string(),
-            Box::new(move || {
-                ran_clone.store(true, Ordering::SeqCst);
-                Ok(())
-            }),
-            Arc::clone(&pending),
-        );
-        assert!(
-            wait_for(&ran, Duration::from_secs(2)),
-            "cleaner thread stopped processing after panic"
-        );
-        // A panicking job must still decrement the counter (catch_unwind path).
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while pending.load(Ordering::Acquire) > 0 {
-            assert!(Instant::now() < deadline, "counter leaked after panic");
-            std::thread::sleep(Duration::from_millis(2));
+        for lane in ALL_LANES {
+            let pending = counter();
+            enqueue(
+                lane,
+                format!("enqueue_survives_panicking_job_panicker {lane:?}"),
+                Box::new(|| panic!("boom")),
+                Arc::clone(&pending),
+            );
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_clone = Arc::clone(&ran);
+            enqueue(
+                lane,
+                format!("enqueue_survives_panicking_job_followup {lane:?}"),
+                Box::new(move || {
+                    ran_clone.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+                Arc::clone(&pending),
+            );
+            assert!(
+                wait_for(&ran, Duration::from_secs(5)),
+                "{lane:?} stopped processing after panic"
+            );
+            // A panicking job must still decrement the counter (catch_unwind path).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pending.load(Ordering::Acquire) > 0 {
+                assert!(Instant::now() < deadline, "counter leaked after panic");
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
     }
 }
