@@ -855,12 +855,17 @@ pub fn render_stall(r: &StallReport) -> String {
                 "  {stranded} of them have waiters with no driver elected.\n"
             ));
         }
+        // The full path, not a bare filename: this is read later, often by
+        // someone who did not start the build and has no idea what its cwd was.
+        let inflight = INFLIGHT_PATH.get().map_or_else(
+            || format!("inflight-{}.log beside this file", std::process::id()),
+            |p| p.display().to_string(),
+        );
         out.push_str(&format!(
             "  The full list, the wait-for graph and each invocation's next await are in\n  \
-             `inflight-{}.log` beside this file, refreshed on every report. Re-run with\n  \
+             {inflight}, refreshed on every report. Re-run with\n  \
              `HEPH_DEBUG_MEMOIZER_CYCLE=1 HEPH_PHASE_TRACE=1` to populate the last two,\n  \
-             and to fail a real cycle instead of hanging on it.\n",
-            std::process::id()
+             and to fail a real cycle instead of hanging on it.\n"
         ));
     } else if let Some((op, _)) = r.dominant()
         && r.dominant_is_starved()
@@ -902,6 +907,23 @@ pub fn render_stall(r: &StallReport) -> String {
 /// together when diagnosing the same hang, and `heph tool gc` already sweeps that
 /// directory. Per-pid, so concurrent heph processes in one workspace do not
 /// interleave their reports into one unreadable file.
+/// `<home>/diag/<name>`, made absolute.
+///
+/// Absolute because these paths are *reported* — the stall paragraph names the
+/// in-flight file, a `warn!` names the stall log, and both are read later, often
+/// by someone who was not the one who started the build and has no idea what its
+/// cwd was. `home` is normally absolute already; this makes it so when a caller
+/// passes a relative root (tests, `--home` with a relative path) rather than
+/// emitting a path that resolves differently depending on where you stand.
+///
+/// `std::path::absolute` rather than `canonicalize`: the directory does not exist
+/// until the first write, and `canonicalize` fails on a path that is not already
+/// there.
+fn diag_path(home: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = home.join("diag").join(name);
+    std::path::absolute(&path).unwrap_or(path)
+}
+
 /// The full in-flight state, rewritten on every stall fire.
 ///
 /// Separate from [`StallLog`] because the two want opposite things. The stall
@@ -923,13 +945,19 @@ pub struct InflightLog {
     path: std::path::PathBuf,
 }
 
+/// Where the in-flight report is being written, for the stall paragraph to name.
+///
+/// A static rather than a field threaded through `StallReport`: `render_stall`
+/// is called from the watchdog thread, which builds the report from
+/// [`DiagState`] alone and has no handle on the log. Same shape as
+/// [`global`].
+static INFLIGHT_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 impl InflightLog {
     pub fn new(home: &std::path::Path) -> Self {
-        Self {
-            path: home
-                .join("diag")
-                .join(format!("inflight-{}.log", std::process::id())),
-        }
+        let path = diag_path(home, &format!("inflight-{}.log", std::process::id()));
+        drop(INFLIGHT_PATH.set(path.clone()));
+        Self { path }
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -952,9 +980,7 @@ pub struct StallLog {
 impl StallLog {
     pub fn new(home: &std::path::Path) -> Self {
         Self {
-            path: home
-                .join("diag")
-                .join(format!("stall-{}.log", std::process::id())),
+            path: diag_path(home, &format!("stall-{}.log", std::process::id())),
         }
     }
 
@@ -1397,6 +1423,35 @@ mod tests {
         assert!(!r.no_work_in_flight());
         let text = render_stall(&r);
         assert!(!text.contains("idle with work outstanding"), "{text}");
+    }
+
+    /// Both diagnostic paths are absolute, whatever root they were given.
+    ///
+    /// These paths get *reported* — the paragraph names the in-flight file, a
+    /// `warn!` names the stall log — and are read later, often by someone who did
+    /// not start the build. A path relative to the process's cwd resolves
+    /// differently depending on where the reader stands, which is worth nothing
+    /// when the process it described is already gone.
+    #[test]
+    fn diagnostic_paths_are_absolute_even_from_a_relative_home() {
+        let stall = StallLog::new(std::path::Path::new("rel/home"));
+        assert!(
+            stall.path().is_absolute(),
+            "stall log path must be absolute: {:?}",
+            stall.path()
+        );
+        assert!(
+            stall
+                .path()
+                .ends_with(format!("stall-{}.log", std::process::id()))
+        );
+
+        let inflight = InflightLog::new(std::path::Path::new("rel/home"));
+        assert!(
+            inflight.path().is_absolute(),
+            "in-flight log path must be absolute: {:?}",
+            inflight.path()
+        );
     }
 
     /// The paragraph points at the companion file by name, so the reader does

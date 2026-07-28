@@ -42,6 +42,10 @@ pub use htui::tui;
 pub use hwalk as htwalk;
 
 pub mod commands;
+/// Lives in the library, not the binary, because `commands::bootstrap` points it
+/// at the engine's resolved home once that is known — and `bootstrap` is library
+/// code. The `SIGQUIT` handler is still installed from `main`.
+pub mod diag;
 pub mod fdlimit;
 pub mod log;
 #[cfg(test)]

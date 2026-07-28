@@ -181,6 +181,11 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         remote_cache_backends,
     );
 
+    // Point `SIGQUIT` dumps at the resolved home, so they land beside the stall
+    // log and the in-flight report instead of under whatever cwd the process was
+    // launched from. Every command routes through here, so every command gets it.
+    crate::diag::set_dump_dir(&engine.home.join("diag"));
+
     let (trigger, rx) = ShutdownTrigger::new();
     spawn_sigint_producer(trigger.clone());
     spawn_shutdown_handler(Arc::downgrade(&engine), rx);
