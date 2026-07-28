@@ -328,3 +328,70 @@ target(
     );
     Ok(())
 }
+
+/// Discovery now overlaps package evaluation, so which BUILD file finishes first
+/// is a race. The order the matched addrs come back in must not be: it becomes
+/// `plugingroup`'s `deps`, folded in order into the group's def hash. A
+/// `buffer_unordered` fan-out would make that hash a function of scheduling.
+///
+/// Built as several independent workspaces from byte-identical sources, with
+/// deliberately uneven per-package evaluation cost so the completion order does
+/// differ between runs. The emitted sequence must still be identical every time.
+#[tokio::test]
+async fn test_query_dep_order_is_stable_across_runs() -> anyhow::Result<()> {
+    // Uneven Starlark work per package: every third package spins a loop before
+    // declaring its target, so packages finish out of listing order.
+    fn build_src(i: usize) -> String {
+        let spin = if i % 3 == 0 { 20000 } else { 10 };
+        format!(
+            r#"
+_acc = 0
+for _i in range({spin}):
+    _acc = _acc + _i
+
+target(
+    name = "t",
+    driver = "bash",
+    run = "echo {i} > $OUT",
+    out = "o.txt",
+    labels = ["scan"],
+)
+"#
+        )
+    }
+
+    const PKGS: usize = 24;
+    let mut runs: Vec<Vec<String>> = Vec::new();
+
+    for _ in 0..3 {
+        let ws = Workspace::new();
+        for i in 0..PKGS {
+            ws.write_build_file(&format!("scan/p{i:02}"), &build_src(i));
+        }
+
+        let spec = ws
+            .get_spec(&format!("//{PACKAGE}:q@expr=\"//scan/... && label(scan)\""))
+            .await?;
+        let deps = match spec.config.get("deps") {
+            Some(TargetSpecValue::List(l)) => l,
+            _ => panic!("expected deps list, got: {:?}", spec.config.get("deps")),
+        };
+        let dep_strs: Vec<String> = deps
+            .iter()
+            .map(|v| match v {
+                TargetSpecValue::String(s) => s.clone(),
+                _ => panic!("expected string dep"),
+            })
+            .collect();
+        assert_eq!(dep_strs.len(), PKGS, "got: {dep_strs:?}");
+        runs.push(dep_strs);
+    }
+
+    // Sorted package listing order, verbatim — not "the same set", the same
+    // sequence, because the sequence is what is hashed.
+    let expected: Vec<String> = (0..PKGS).map(|i| format!("//scan/p{i:02}:t")).collect();
+    for (n, got) in runs.iter().enumerate() {
+        assert_eq!(got, &expected, "run {n} emitted a different dep order");
+    }
+    Ok(())
+}

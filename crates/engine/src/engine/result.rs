@@ -115,12 +115,57 @@ impl ProviderExecutor for EngineProviderExecutor {
                         let pkg_iter = engine.packages(&matcher, &rs).await?;
                         let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
 
-                        let mut acc: Vec<State> = Vec::new();
-                        for pkg_str in pkgs {
+                        // One probe per `(package, provider)` pair, overlapped.
+                        //
+                        // `buffered`, never `buffer_unordered`: `acc` order is
+                        // the order plugin-go's `variant::build_universe` walks
+                        // the module universe in, which is the order its `list`
+                        // emits library addrs in, which reaches a def hash
+                        // through `pluginquery` → `plugingroup`. `buffered`
+                        // yields in submission order, so `acc` is byte-identical
+                        // to what the serial nested loop produced no matter
+                        // which probe lands first; `buffer_unordered` would put
+                        // completion order — i.e. probe latency — into a build
+                        // definition.
+                        //
+                        // The pair sequence is produced lazily and mapped to
+                        // futures one at a time, so the live set stays O(K) —
+                        // materializing `packages × providers` up front would be
+                        // ~80k `(PkgBuf, Arc)` pairs on a 20k-package workspace,
+                        // for no gain. Everything the iterator touches is owned
+                        // (the memoized closure's future must be `'static`), so
+                        // the registry is shared by `Arc` rather than borrowed.
+                        let providers: Arc<Vec<Arc<crate::engine::engine::Provider>>> =
+                            Arc::new(engine.providers.clone());
+                        let n_providers = providers.len();
+                        // Set when the walk is abandoning. A probe is *not* cheap
+                        // — `pluginbuildfile::probe` is `run_pkg`, the heaviest
+                        // synchronous unit in a build, and it takes a
+                        // `PKG_EVAL_SLOTS` permit — so without this the drain
+                        // below keeps topping the buffer from the underlying
+                        // iterator and Starlark-evaluates the whole workspace
+                        // *after* the walk has already failed.
+                        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let probes = futures::stream::iter(pkgs.into_iter().flat_map(move |pkg_str| {
                             let pkg = PkgBuf::from(pkg_str.as_str());
-                            for provider in engine.providers.iter() {
-                                let inner = rs
-                                    .data
+                            let providers = Arc::clone(&providers);
+                            // `i < n_providers` holds by construction; `get`
+                            // rather than `[]` keeps this panic-free without an
+                            // unwrap, and without allocating a `Vec` per package.
+                            (0..n_providers).filter_map(move |i| {
+                                providers
+                                    .get(i)
+                                    .map(|provider| (pkg.clone(), Arc::clone(provider)))
+                            })
+                        }))
+                        .map(|(pkg, provider)| {
+                            enclose!((rs, stop) async move {
+                                if rs.ctoken().is_cancelled()
+                                    || stop.load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    return Err(anyhow::Error::new(CancelledError));
+                                }
+                                rs.data
                                     .mem_probe_inner
                                     .once(
                                         (provider.name.clone(), pkg.clone()),
@@ -139,8 +184,39 @@ impl ProviderExecutor for EngineProviderExecutor {
                                         }),
                                     )
                                     .await
-                                    .map_err(unwrap_arc_err)?;
-                                acc.extend(inner.iter().cloned());
+                                    .map_err(unwrap_arc_err)
+                            })
+                        })
+                        .buffered(crate::engine::fanout::discovery_concurrency());
+                        tokio::pin!(probes);
+
+                        let mut acc: Vec<State> = Vec::new();
+                        loop {
+                            match probes.next().await {
+                                None => break,
+                                Some(Ok(inner)) => acc.extend(inner.iter().cloned()),
+                                // Same reason as the two `query` walks: returning
+                                // here would drop up to K in-flight probes, each
+                                // holding an `Arc<RequestState>`, while this
+                                // fan-out is itself running *inside* the
+                                // `mem_states_under` cell. Since #241 that is no
+                                // longer a leak — dropping a probe releases its
+                                // memoizer interest, and the last one out evicts
+                                // the `mem_probe_inner` cell and drops its future
+                                // — so what the drain buys now is ordering, not
+                                // liveness: the request's in-flight probes are
+                                // finished before the error escapes, rather than
+                                // torn down underneath a caller that may still
+                                // want them. `Buffered` refills from the
+                                // underlying iterator on every poll, so the drain
+                                // visits all N pairs, not just the K in flight;
+                                // `stop` is what keeps the tail from costing a
+                                // package evaluation each.
+                                Some(Err(e)) => {
+                                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    while probes.next().await.is_some() {}
+                                    return Err(e);
+                                }
                             }
                         }
                         Ok(Arc::new(acc))
@@ -168,66 +244,150 @@ impl ProviderExecutor for EngineProviderExecutor {
             let pkg_iter = engine.packages(m, &rs).await?;
             let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
 
-            let mut result = Vec::new();
+            // One `list` callback surface for the whole walk, not one per
+            // (package, provider) pair — it is stateless apart from the engine
+            // handle and the request.
+            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::new(
+                Arc::downgrade(&engine),
+                rs.clone(),
+            ));
 
-            for pkg_str in pkgs {
+            // Set when the walk is abandoning; see `Engine::query`.
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Owned copy: each package runs as its own `'static` task (see the
+            // spawn note below), so the borrowed `extra_skip` cannot cross into
+            // it. One `Arc` for the whole walk, cloned per package, not per
+            // (package, provider) pair.
+            let extra_skip: Arc<[String]> = extra_skip.into();
+
+            // Enumeration overlapped, matcher evaluation serial — the same split,
+            // for the same reasons, as `Engine::query`; see the long note there.
+            // The short version: the `MatchShrug` arm runs on a *speculative*
+            // `RequestState` whose cycle detection is a per-chain breadcrumb walk
+            // that bypasses the shared `DepDag`, so two concurrent chains are
+            // mutually invisible — which decides by race both which provider wins
+            // a shared `mem_spec` cell (and so `hashin`, which folds
+            // `def.driver`) and whether a two-chain cycle is reported or hangs.
+            // Serial *within this walk* is structural: the arm is in the consumer
+            // below, so the fan-out is not polled while it awaits. Across walks it
+            // is not guaranteed — see the note in `Engine::query`.
+            //
+            // ABI note: `ListRequest::executor` hands this `query()` to K
+            // concurrent `list` calls, so a provider that calls back into it from
+            // `list` gets K nested walks. No in-tree provider does (plugin-go's
+            // `list` calls only `states_under`), but it is a constraint on the
+            // plugin surface, not an accident of the current callers.
+            let per_pkg = futures::stream::iter(pkgs.into_iter()
+                // Ends the source when abandoning, so the drain joins only the
+                // <=K tasks already spawned instead of spawning one per remaining
+                // package — see `Engine::query`.
+                .take_while(enclose!((stop) move |_| !stop.load(std::sync::atomic::Ordering::Relaxed)))
+                .filter_map(|pkg_str| {
                 let pkg = PkgBuf::from(pkg_str.as_str());
 
                 // Same pruning as `Engine::query`: skip packages the matcher
-                // cannot select before paying for probe + list.
+                // cannot select before paying for probe + list. Done here, off
+                // the buffered stream, so a pruned package costs no slot.
                 if m.matches_pkg(&pkg) == hmodel::htmatcher::MatchResult::MatchNo {
-                    continue;
+                    return None;
                 }
 
-                let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
+                // Spawned here, not through a later `.map()` — see `Engine::query`.
+                Some(hcore::hmemoizer::spawn_with_cycle_ctx(
+                    enclose!((engine, rs, executor, stop, extra_skip) async move {
+                        // See `Engine::query`: an abandoning walk stops evaluating
+                        // packages it has not started, so the drain below costs a
+                        // cheap poll per remaining package rather than a package
+                        // evaluation each. `Err`, never `Ok(vec![])` — this sequence
+                        // is `pluginquery`'s `deps` and is folded in order into a def
+                        // hash, so a short answer would hash a truncated graph.
+                        if rs.ctoken().is_cancelled()
+                            || stop.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            return Err(anyhow::Error::new(CancelledError));
+                        }
+                        let mut candidates: Vec<Addr> = Vec::new();
+                        let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
 
-                for provider in &engine.providers {
-                    if rs.skip_providers.contains(&provider.name)
-                        || extra_skip.iter().any(|n| n == &provider.name)
-                    {
-                        continue;
-                    }
-                    // Collect list results eagerly (non-Send iterator dropped before next await)
-                    let list_iter = provider
-                        .provider
-                        .list(
-                            ListRequest {
-                                request_id: rs.request_id().to_string(),
-                                package: pkg.clone(),
-                                states: states
-                                    .iter()
-                                    .filter(|s| s.provider == provider.name)
-                                    .cloned()
-                                    .collect(),
-                                executor: Arc::new(EngineProviderExecutor::new(
-                                    Arc::downgrade(&engine),
-                                    rs.clone(),
-                                )),
-                            },
-                            rs.ctoken(),
-                        )
-                        .await?;
-                    let raw: Vec<_> = list_iter.collect::<anyhow::Result<_>>()?;
+                        for provider in &engine.providers {
+                            if rs.skip_providers.contains(&provider.name)
+                                || extra_skip.iter().any(|n| n == &provider.name)
+                            {
+                                continue;
+                            }
+                            // Collect list results eagerly (non-Send iterator dropped before next await)
+                            let list_iter = provider
+                                .provider
+                                .list(
+                                    ListRequest {
+                                        request_id: rs.request_id().to_string(),
+                                        package: pkg.clone(),
+                                        states: states
+                                            .iter()
+                                            .filter(|s| s.provider == provider.name)
+                                            .cloned()
+                                            .collect(),
+                                        executor: Arc::clone(&executor),
+                                    },
+                                    rs.ctoken(),
+                                )
+                                .await?;
+                            let raw: Vec<_> = list_iter.collect::<anyhow::Result<Vec<_>>>()?;
 
-                    for item in raw {
-                        let addr = item.addr;
-                        if addr.package != pkg {
-                            continue;
+                            for item in raw {
+                                if item.addr.package == pkg {
+                                    candidates.push(item.addr);
+                                }
+                            }
                         }
 
-                        match m.matches_addr(&addr) {
-                            MatchResult::MatchYes => result.push(addr),
-                            MatchResult::MatchNo => {}
-                            MatchResult::MatchShrug => {
-                                // Resolve the candidate's spec/def only to evaluate the
-                                // matcher — a speculative inspection, not a dependency. Use a
-                                // speculative rs so a rejected candidate leaves no edge in the
-                                // shared dep DAG (an edge would close a false cycle later).
-                                let spec_rs = rs.speculative();
-                                let spec = match Arc::clone(&engine)
-                                    .get_spec(spec_rs.clone(), &addr)
-                                    .await
-                                {
+                        anyhow::Ok(candidates)
+                    }),
+                ))
+            }))
+            // One task per package — see the long note in `Engine::query`: as
+            // plain futures the `PKG_EVAL_SLOTS` permit holders would be
+            // unpollable while this walk's consumer awaits the `MatchShrug` arm,
+            // and the consumer would then queue behind them on the same
+            // semaphore.
+            .buffered(crate::engine::fanout::discovery_concurrency())
+            .map(|joined| match joined {
+                Ok(res) => res,
+                Err(e) => Err(anyhow::Error::new(e).context("package discovery task panicked")),
+            });
+            tokio::pin!(per_pkg);
+
+            let mut result = Vec::new();
+            loop {
+                let candidates = match per_pkg.next().await {
+                    None => break,
+                    Some(Ok(candidates)) => candidates,
+                    // Never `?` straight out — returning drops `per_pkg` with up
+                    // to K-1 package *tasks* still running, each holding an
+                    // `Arc<RequestState>` it releases only when it finishes. See
+                    // `Engine::query` for why late deregistration races
+                    // `drain_bg`.
+                    Some(Err(e)) => {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        while per_pkg.next().await.is_some() {}
+                        return Err(e);
+                    }
+                };
+                for addr in candidates {
+                    match m.matches_addr(&addr) {
+                        MatchResult::MatchYes => result.push(addr),
+                        MatchResult::MatchNo => {}
+                        MatchResult::MatchShrug => {
+                            // Resolve the candidate's spec/def only to evaluate the
+                            // matcher — a speculative inspection, not a dependency. Use a
+                            // speculative rs so a rejected candidate leaves no edge in the
+                            // shared dep DAG (an edge would close a false cycle later).
+                            // One chain at a time *within this walk* — see the note
+                            // above the fan-out.
+                            let spec_rs = rs.speculative();
+                            let spec =
+                                match Arc::clone(&engine).get_spec(spec_rs.clone(), &addr).await {
                                     Ok(spec) => Ok(spec),
                                     Err(e)
                                         if downcast_chain_ref::<TargetNotFoundError>(&e)
@@ -244,33 +404,30 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     res => res,
                                 }?;
 
-                                match crate::engine::matcher_spec::match_spec(m, &spec) {
-                                    MatchResult::MatchYes => result.push(addr),
-                                    MatchResult::MatchNo => {}
-                                    MatchResult::MatchShrug => {
-                                        let def_res = Arc::clone(&engine)
-                                            .get_def(spec_rs.clone(), &addr)
-                                            .await;
-                                        let def = match def_res {
-                                            Ok(def) => def,
-                                            // Same as the get_spec branch: cycle means this
-                                            // target transitively depends on the query caller —
-                                            // it can't be a dep of the caller. Skip it.
-                                            Err(e)
-                                                if downcast_chain_ref::<CycleError>(&e)
-                                                    .is_some() =>
-                                            {
-                                                continue;
-                                            }
-                                            Err(e) => return Err(e),
-                                        };
-                                        if crate::engine::matcher_target::match_target(
-                                            m,
-                                            &def.target_def,
-                                        ) == MatchResult::MatchYes
+                            match crate::engine::matcher_spec::match_spec(m, &spec) {
+                                MatchResult::MatchYes => result.push(addr),
+                                MatchResult::MatchNo => {}
+                                MatchResult::MatchShrug => {
+                                    let def_res =
+                                        Arc::clone(&engine).get_def(spec_rs.clone(), &addr).await;
+                                    let def = match def_res {
+                                        Ok(def) => def,
+                                        // Same as the get_spec branch: cycle means this
+                                        // target transitively depends on the query caller —
+                                        // it can't be a dep of the caller. Skip it.
+                                        Err(e)
+                                            if downcast_chain_ref::<CycleError>(&e).is_some() =>
                                         {
-                                            result.push(addr);
+                                            continue;
                                         }
+                                        Err(e) => return Err(e),
+                                    };
+                                    if crate::engine::matcher_target::match_target(
+                                        m,
+                                        &def.target_def,
+                                    ) == MatchResult::MatchYes
+                                    {
+                                        result.push(addr);
                                     }
                                 }
                             }
@@ -1521,11 +1678,38 @@ impl Engine {
             }
         } else {
             // Broke early (cancelled, or a fatal landed): its answer is no longer
-            // wanted, and it may be deep inside a whole-package Starlark
-            // evaluation. Abort rather than wait it out — the previous shape
-            // dropped the stream mid-poll and Ctrl-C must stay that responsive.
+            // wanted. Abort rather than wait it out, so the *enqueue* side of
+            // Ctrl-C stays immediate.
+            //
+            // Read this precisely: aborting stops the walk **task**, which is the
+            // consumer of the discovery fan-out. It does not stop the fan-out.
+            // `Engine::query` runs each package as its own task and a dropped
+            // `JoinHandle` detaches rather than cancels, so up to K
+            // whole-package Starlark evaluations that were already in flight run
+            // to completion after this returns. Ctrl-C therefore stops
+            // *scheduling* new package work, not the work already started.
+            //
+            // That is deliberate, and it is the cheaper side of the trade: a
+            // detached package task drives its `mem_probe` cell to completion, so
+            // the cell releases its future and the `Arc<RequestState>` inside it,
+            // and the ≤K whole-package evaluations already paid for land in the
+            // memoizer instead of being thrown away. The residue is bounded at K
+            // because `query`'s per-package futures short-circuit on a cancelled
+            // token before starting anything new.
+            //
+            // Detaching is no longer what *rescues* those cells, only what
+            // happens to them. Before #241 a cell nobody polled kept its future
+            // forever — an Arc cycle through the `RequestStateData` that owns the
+            // memoizer, so the request never deregistered — and running the tasks
+            // out was the only way to avoid it. `Memoizer::process` now registers
+            // an interest per frame, and the last one to go on an incomplete cell
+            // evicts it and drops its future (`hmemoizer::cancel_abandoned`). So
+            // aborting the package tasks would be *safe* today; detaching is kept
+            // because it is the better trade, not because the alternative leaks.
+            // The `JoinSet` drain below stands on its own reasoning, not on this.
             walk.abort();
         }
+
         // Matcher fully resolved: mark the matched set final (drops the `~`).
         // Not on a failed walk — the set never became final, so claiming it did
         // would paint a wrong denominator over an aborting run.
@@ -3877,6 +4061,352 @@ mod tests {
         Ok(())
     }
 
+    /// A provider over a fixed package set whose `probe` is slow, with a
+    /// per-package delay the test picks. Tracks peak in-flight probes.
+    struct SlowProbe {
+        pkgs: Vec<String>,
+        delay: SArc<dyn Fn(usize) -> Duration + Send + Sync>,
+        inflight: SArc<AtomicUsize>,
+        peak: SArc<AtomicUsize>,
+    }
+
+    impl crate::engine::provider::Provider for SlowProbe {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "slowprobe".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                .pkgs
+                .iter()
+                .map(|p| {
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from(p.as_str()),
+                    })
+                })
+                .collect();
+            Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            let pkg = req.package.clone();
+            // Packages this provider does not own (the always-on built-in
+            // `@heph/fs`) cost nothing and declare nothing.
+            let Some(idx) = self.pkgs.iter().position(|p| p == pkg.as_str()) else {
+                return Box::pin(async { Ok(ProbeResponse { states: vec![] }) });
+            };
+            let d = (self.delay)(idx);
+            let (inflight, peak) = (SArc::clone(&self.inflight), SArc::clone(&self.peak));
+            Box::pin(async move {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(d).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                Ok(ProbeResponse {
+                    states: vec![State {
+                        package: pkg,
+                        provider: "slowprobe".to_string(),
+                        state: Default::default(),
+                    }],
+                })
+            })
+        }
+    }
+
+    fn slow_probe_engine(
+        pkgs: Vec<String>,
+        delay: impl Fn(usize) -> Duration + Send + Sync + 'static,
+        inflight: SArc<AtomicUsize>,
+        peak: SArc<AtomicUsize>,
+    ) -> anyhow::Result<(SArc<Engine>, tempfile::TempDir)> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let delay: SArc<dyn Fn(usize) -> Duration + Send + Sync> = SArc::new(delay);
+        engine.register_provider(move |_| {
+            Box::new(SlowProbe {
+                pkgs: pkgs.clone(),
+                delay: SArc::clone(&delay),
+                inflight: SArc::clone(&inflight),
+                peak: SArc::clone(&peak),
+            })
+        })?;
+        Ok((SArc::new(engine), root))
+    }
+
+    fn states_under_of(engine: &SArc<Engine>, rs: &SArc<RequestState>) -> EngineProviderExecutor {
+        EngineProviderExecutor::new(SArc::downgrade(engine), SArc::clone(rs))
+    }
+
+    /// `states_under`'s output order is a build input, not a display detail:
+    /// plugin-go feeds it straight into `variant::build_universe`, which walks it
+    /// in order to build the module variant universe, which fixes the order its
+    /// `list` emits library addrs in — and that reaches a def hash.
+    ///
+    /// So the fan-out must be `buffered`, never `buffer_unordered`. The delays
+    /// here make the probes complete in the exact reverse of listing order, so a
+    /// `buffer_unordered` implementation returns the reverse sequence.
+    #[tokio::test]
+    async fn states_under_returns_states_in_package_order_not_completion_order()
+    -> anyhow::Result<()> {
+        const N: usize = 8;
+        let pkgs: Vec<String> = (0..N).map(|i| format!("p{i:02}")).collect();
+        let (engine, _root) = slow_probe_engine(
+            pkgs.clone(),
+            // First package probed sleeps longest, last sleeps least.
+            |i| Duration::from_millis(((N - i) * 15) as u64),
+            SArc::new(AtomicUsize::new(0)),
+            SArc::new(AtomicUsize::new(0)),
+        )?;
+        let rs = engine.new_state();
+
+        let states = states_under_of(&engine, &rs)
+            .states_under(&PkgBuf::from(""))
+            .await?;
+
+        let got: Vec<String> = states
+            .iter()
+            .filter(|s| s.provider == "slowprobe")
+            .map(|s| s.package.as_str().to_string())
+            .collect();
+        assert_eq!(
+            got, pkgs,
+            "states must accumulate in package-listing order even though the \
+             probes complete in the reverse order"
+        );
+        Ok(())
+    }
+
+    /// The same walk, overlapped: `for pkg { for provider { probe.await } }` paid
+    /// the sum of every probe. plugin-go calls this for a whole module root
+    /// before it can emit a single addr, so it sits on the critical path of a
+    /// Go workspace's discovery.
+    /// A failed `states_under` walk must stop probing.
+    ///
+    /// `Buffered` refills its queue from the underlying iterator on *every*
+    /// poll, so `while probes.next().await.is_some() {}` walks the entire
+    /// remaining `(package, provider)` sequence rather than the K in flight.
+    /// Without the `stop` flag each of those pulls runs a real probe — and
+    /// `pluginbuildfile::probe` is `run_pkg`, a whole-package Starlark
+    /// evaluation holding a `PKG_EVAL_SLOTS` permit. The observable difference
+    /// is stark: the whole workspace gets evaluated *after* the walk has
+    /// already failed.
+    ///
+    /// The drain itself stays — it finishes this request's in-flight probes
+    /// before the error escapes, rather than tearing them down from inside the
+    /// `mem_states_under` cell they run under. (Since #241 dropping them would
+    /// not *leak*: an abandoned cell now evicts itself and drops its future. The
+    /// drain is about ordering, not liveness.) What the flag buys is that the
+    /// drain costs a cheap poll per remaining pair instead of a package
+    /// evaluation per remaining pair.
+    #[tokio::test]
+    async fn failed_states_under_walk_stops_probing() -> anyhow::Result<()> {
+        /// Counts real probes; the first package it is asked about fails.
+        struct CountingFailProbe {
+            pkgs: Vec<String>,
+            probes: SArc<AtomicUsize>,
+        }
+
+        impl crate::engine::provider::Provider for CountingFailProbe {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "countingfail".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                _req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                    .pkgs
+                    .iter()
+                    .map(|p| {
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(p.as_str()),
+                        })
+                    })
+                    .collect();
+                Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                let pkg = req.package.clone();
+                let Some(idx) = self.pkgs.iter().position(|p| p == pkg.as_str()) else {
+                    return Box::pin(async { Ok(ProbeResponse { states: vec![] }) });
+                };
+                let probes = SArc::clone(&self.probes);
+                Box::pin(async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    // Yield so the fan-out actually fills before the first
+                    // result is consumed — otherwise a single-threaded runtime
+                    // could complete pair 0 before any sibling starts and the
+                    // test would prove nothing about the drain.
+                    tokio::task::yield_now().await;
+                    if idx == 0 {
+                        anyhow::bail!("probe blew up on package 0");
+                    }
+                    Ok(ProbeResponse {
+                        states: vec![State {
+                            package: pkg,
+                            provider: "countingfail".to_string(),
+                            state: Default::default(),
+                        }],
+                    })
+                })
+            }
+        }
+
+        // Large enough that "bounded" and "the whole workspace" cannot be
+        // confused on any core count.
+        const N: usize = 400;
+        let pkgs: Vec<String> = (0..N).map(|i| format!("p{i:04}")).collect();
+        let probes = SArc::new(AtomicUsize::new(0));
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(enclose!((probes) move |_| Box::new(CountingFailProbe {
+            pkgs: pkgs.clone(),
+            probes: SArc::clone(&probes),
+        })))?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let err = states_under_of(&engine, &rs)
+            .states_under(&PkgBuf::from(""))
+            .await
+            .expect_err("package 0's probe fails, so the walk must fail");
+        assert!(
+            format!("{err:#}").contains("blew up"),
+            "expected the probe's error, got: {err:#}"
+        );
+
+        // Package 0 is the first pair submitted, so `buffered` surfaces its
+        // error before anything later. Everything already in flight when that
+        // lands still counts — the bound is K-ish, not 1 — but the ~N-K pairs
+        // behind it must cost nothing.
+        let ran = probes.load(Ordering::SeqCst);
+        let k = crate::engine::fanout::discovery_concurrency();
+        assert!(
+            ran <= k * 4,
+            "a failed walk must stop probing: ran {ran} probes over {N} packages \
+             (K={k}). Unbounded would be ~{N} — the whole workspace evaluated \
+             after the walk had already failed."
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn states_under_overlaps_probes() -> anyhow::Result<()> {
+        const N: usize = 8;
+        let delay = Duration::from_millis(40);
+        let pkgs: Vec<String> = (0..N).map(|i| format!("p{i:02}")).collect();
+        let inflight = SArc::new(AtomicUsize::new(0));
+        let peak = SArc::new(AtomicUsize::new(0));
+        let (engine, _root) = slow_probe_engine(
+            pkgs,
+            move |_| delay,
+            SArc::clone(&inflight),
+            SArc::clone(&peak),
+        )?;
+        let rs = engine.new_state();
+
+        let start = std::time::Instant::now();
+        let states = states_under_of(&engine, &rs)
+            .states_under(&PkgBuf::from(""))
+            .await?;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            states.iter().filter(|s| s.provider == "slowprobe").count(),
+            N
+        );
+        // A serial `for pkg { for provider { probe.await } }` peaks at exactly
+        // one in-flight probe, on every machine.
+        assert!(
+            peak.load(Ordering::SeqCst) > 1,
+            "probes must overlap; serial discovery peaks at 1 in-flight probe"
+        );
+        // The buffer interleaves this provider's slow probes with the built-in
+        // `fs` provider's instant ones, so only about K/2 slow probes are live
+        // at once. At K=2 — a 1-CPU cgroup, where `available_parallelism`
+        // reports 1 — that is ~1, and no wall-clock bound can distinguish
+        // overlapped from serial. Rather than assert something vacuous there,
+        // the timing claim is made only where it means something; `peak > 1`
+        // above is the machine-independent half and carries the test either way.
+        let k = crate::engine::fanout::discovery_concurrency();
+        if k >= 4 {
+            assert!(
+                elapsed < delay * (N as u32) * 3 / 4,
+                "overlapped probing of {N} packages at K={k} must beat serial ({:?}), \
+                 took {elapsed:?}",
+                delay * (N as u32)
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn provider_functions_lists_exposed_functions() {
         let root = tempdir().unwrap();
@@ -5938,6 +6468,395 @@ mod tests {
              un-polled futures in this request's memoizers, and those futures hold an \
              Arc back into the RequestStateData that owns them, so its Drop — which \
              cancels the token and deregisters the request — can never run"
+        );
+        Ok(())
+    }
+
+    /// The deep `MatchShrug` arm — the one that shrugs *again* at spec level and
+    /// so reaches `get_def` + `matcher_target::match_target`.
+    ///
+    /// This arm is the entire justification for the shape of this walk
+    /// (enumeration overlapped, matcher evaluation serial in the consumer), and
+    /// the change physically moved it: it used to run inside the per-provider
+    /// loop, interleaved with that provider's listing, and now runs after every
+    /// provider for a package has listed, while K other packages are mid-`list`.
+    /// `label(...)` does not reach it — that resolves at `match_spec` —
+    /// so without a `TreeOutputTo` case the deepest path has no coverage at all.
+    #[tokio::test]
+    async fn query_tree_output_matcher_resolves_through_get_def() -> anyhow::Result<()> {
+        // Both targets live in `gen`, so both survive the addr-level cheap
+        // reject (which needs the two packages to be prefix-related) and both
+        // shrug all the way down. Only `//gen:a`'s codegen tree actually lands
+        // in `gen/dst`, and deciding that needs the def, not the spec.
+        let engine = engine_with(vec![
+            codegen_target("//gen:a", &[], "dst", &[]),
+            codegen_target("//gen:b", &[], "other", &[]),
+        ])?;
+        let rs = engine.new_state();
+
+        let matcher = Matcher::TreeOutputTo(PkgBuf::from("gen/dst"));
+        let addrs: Vec<Addr> = SArc::clone(&engine)
+            .query(rs, &matcher)
+            .try_collect()
+            .await?;
+
+        let names: Vec<&str> = addrs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "only the target whose codegen tree lands in //gen/dst may match"
+        );
+        Ok(())
+    }
+
+    /// The same arm through `EngineProviderExecutor::query` — a second, separately
+    /// edited copy of the loop, and the one `pluginquery` actually drives.
+    #[tokio::test]
+    async fn executor_query_tree_output_matcher_resolves_through_get_def() -> anyhow::Result<()> {
+        let engine = engine_with(vec![
+            codegen_target("//gen:a", &[], "dst", &[]),
+            codegen_target("//gen:b", &[], "other", &[]),
+        ])?;
+        let rs = engine.new_state();
+        let executor = EngineProviderExecutor::new(SArc::downgrade(&engine), SArc::clone(&rs));
+
+        let matcher = Matcher::TreeOutputTo(PkgBuf::from("gen/dst"));
+        let addrs = executor.query(&matcher, &[]).await?;
+
+        let names: Vec<&str> = addrs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["a"]);
+        Ok(())
+    }
+
+    /// Models the `PKG_EVAL_SLOTS` shape: `probe` takes a permit and holds it
+    /// across a yield, `get` (reached from the shrug arm) needs one too.
+    struct PermitProvider {
+        pkgs: Vec<String>,
+        slots: SArc<tokio::sync::Semaphore>,
+    }
+
+    impl crate::engine::provider::Provider for PermitProvider {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "permit".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            let pkg = req.package.clone();
+            if !self.pkgs.iter().any(|p| p == pkg.as_str()) {
+                return Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) });
+            }
+            Box::pin(async move {
+                let items: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse {
+                    addr: Addr::new(pkg, "t".to_string(), Default::default()),
+                })];
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                .pkgs
+                .iter()
+                .map(|p| {
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from(p.as_str()),
+                    })
+                })
+                .collect();
+            Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+        }
+        fn get<'a>(
+            &'a self,
+            req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            let slots = SArc::clone(&self.slots);
+            let addr = req.addr.clone();
+            Box::pin(async move {
+                // The consumer's shrug arm lands here and needs a permit —
+                // the ones the fan-out is holding.
+                let _permit = slots
+                    .acquire()
+                    .await
+                    .map_err(|e| GetError::Other(anyhow::Error::new(e)))?;
+                Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr,
+                        driver: "exec".to_string(),
+                        config: Default::default(),
+                        ..Default::default()
+                    },
+                })
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            let pkg = req.package.clone();
+            if !self.pkgs.iter().any(|p| p == pkg.as_str()) {
+                return Box::pin(async { Ok(ProbeResponse { states: vec![] }) });
+            }
+            let slots = SArc::clone(&self.slots);
+            Box::pin(async move {
+                // Mirrors `run_pkg`: permit acquired in async-land, then held
+                // across a yield point.
+                let _permit = slots.acquire().await.context("permit")?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(ProbeResponse { states: vec![] })
+            })
+        }
+    }
+
+    /// The discovery fan-out must not be able to starve its own consumer.
+    ///
+    /// `pluginbuildfile`'s `probe`/`list` reach `run_pkg`, which holds a
+    /// `PKG_EVAL_SLOTS` permit — a global semaphore sized `cores` — across an
+    /// await. The consumer of the fan-out then awaits `get_spec`/`get_def` in the
+    /// `MatchShrug` arm, which can need a permit for a *different* package. If
+    /// the fan-out's futures are only advanced by the consumer polling them, the
+    /// permit holders are unpollable exactly while the consumer needs a permit,
+    /// and `Semaphore` is FIFO: deadlock.
+    ///
+    /// Modelled here with the provider's own semaphore rather than
+    /// `PKG_EVAL_SLOTS` (which is buildfile-internal): `probe` takes a permit and
+    /// holds it across a yield, `get` — reached from the shrug arm via a `Label`
+    /// matcher — needs one too, and there are more in-flight packages than
+    /// permits. Fails by timing out rather than by assertion, which is the only
+    /// honest way to test a deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn discovery_fanout_does_not_starve_the_matcher_consumer() -> anyhow::Result<()> {
+        let k = crate::engine::fanout::discovery_concurrency();
+        // Fewer permits than the fan-out width, so the fan-out can hold them all.
+        let slots = SArc::new(tokio::sync::Semaphore::new((k / 2).max(1)));
+        let n = k * 2;
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
+        engine.register_provider(enclose!((slots) move |_| Box::new(PermitProvider {
+            pkgs: pkgs.clone(),
+            slots: SArc::clone(&slots),
+        })))?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        // A `Label` matcher shrugs at `matches_addr` for every candidate, so the
+        // consumer awaits `get_spec` — and therefore a permit — between batches.
+        let matcher = Matcher::Label("nope".to_string());
+        let walk = SArc::clone(&engine)
+            .query(rs, &matcher)
+            .try_collect::<Vec<Addr>>();
+
+        let addrs = tokio::time::timeout(Duration::from_secs(20), walk)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "discovery deadlocked: the fan-out held every permit while the \
+                     consumer's MatchShrug arm waited for one, and the holders were \
+                     only pollable by the consumer"
+                )
+            })??;
+        // No target carries the label, so nothing matches — the point is that it
+        // terminated.
+        assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
+        Ok(())
+    }
+
+    /// The same starvation through `EngineProviderExecutor::query` — a separate
+    /// copy of the loop, and the one behind every BUILD-file `query(...)` and
+    /// every `//@heph/query:q@expr=` target. It is also the *nested* case: this
+    /// walk runs inside `pluginquery::get`, reachable from `Engine::query`'s own
+    /// shrug arm, so before the fix an outer walk could deadlock through it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn executor_query_fanout_does_not_starve_its_consumer() -> anyhow::Result<()> {
+        let k = crate::engine::fanout::discovery_concurrency();
+        let slots = SArc::new(tokio::sync::Semaphore::new((k / 2).max(1)));
+        let n = k * 2;
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
+        engine.register_provider(enclose!((slots) move |_| Box::new(PermitProvider {
+            pkgs: pkgs.clone(),
+            slots: SArc::clone(&slots),
+        })))?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+        let executor = EngineProviderExecutor::new(SArc::downgrade(&engine), rs);
+
+        let matcher = Matcher::Label("nope".to_string());
+        let addrs = tokio::time::timeout(Duration::from_secs(20), executor.query(&matcher, &[]))
+            .await
+            .map_err(|_e| {
+                anyhow::anyhow!(
+                    "executor discovery deadlocked: the fan-out held every permit \
+                     while the consumer's MatchShrug arm waited for one"
+                )
+            })??;
+        assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
+        Ok(())
+    }
+
+    /// Cancelling a walk must stop it *starting* packages it has not reached.
+    ///
+    /// Discovery is overlapped now, so an abandoned walk is abandoned with up to
+    /// K package futures in flight. Those cannot be un-started — but everything
+    /// behind them can, and must be: without the short-circuit the walk keeps
+    /// evaluating whole BUILD files, one per remaining package, for a request
+    /// whose answer nobody wants. On a 20k-package workspace that is the entire
+    /// workspace evaluated after Ctrl-C.
+    ///
+    /// The provider counts `list` calls. Slow, non-cancellation-aware packages
+    /// hold the fan-out open long enough for the cancel to land mid-walk.
+    #[tokio::test]
+    async fn cancelling_a_walk_stops_starting_new_packages() -> anyhow::Result<()> {
+        struct CountingSlowList {
+            pkgs: Vec<String>,
+            lists: SArc<AtomicUsize>,
+        }
+
+        impl crate::engine::provider::Provider for CountingSlowList {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "slowcount".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                if !self.pkgs.iter().any(|p| p == req.package.as_str()) {
+                    return Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) });
+                }
+                let lists = SArc::clone(&self.lists);
+                Box::pin(async move {
+                    lists.fetch_add(1, Ordering::SeqCst);
+                    // Deliberately not cancellation-aware: a whole-package
+                    // Starlark evaluation does not stop early either.
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok(Box::new(std::iter::empty()) as Box<_>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                    .pkgs
+                    .iter()
+                    .map(|p| {
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(p.as_str()),
+                        })
+                    })
+                    .collect();
+                Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+        }
+
+        let k = crate::engine::fanout::discovery_concurrency();
+        // Far more packages than the buffer, so an un-short-circuited walk has
+        // plenty left to start after the cancel lands.
+        let n = k * 8;
+        let root = tempdir()?;
+        let lists = SArc::new(AtomicUsize::new(0));
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
+        engine.register_provider(enclose!((lists) move |_| Box::new(CountingSlowList {
+            pkgs: pkgs.clone(),
+            lists: SArc::clone(&lists),
+        })))?;
+        let engine = SArc::new(engine);
+
+        let rs = engine.new_state();
+        let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
+        let stream = SArc::clone(&engine).query(rs.clone(), &matcher);
+        tokio::pin!(stream);
+
+        // Let one buffer-load get under way, then cancel and keep draining.
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            rs.ctoken().cancel();
+        };
+        let consume = async {
+            let mut last: Option<anyhow::Error> = None;
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item {
+                    last = Some(e);
+                }
+            }
+            last
+        };
+        let (err, ()) = tokio::join!(consume, drain);
+
+        let started = lists.load(Ordering::SeqCst);
+        assert!(
+            started < n,
+            "a cancelled walk must stop starting packages: it listed {started} of {n}"
+        );
+        // And it must *say so*. Returning `Ok(vec![])` for the packages it
+        // skipped would let the walk complete normally with a short answer —
+        // and that answer becomes `pluginquery`'s `deps`, folded in order into
+        // `plugingroup`'s def hash. A Ctrl-C during discovery would then write a
+        // cache entry keyed on a graph whose size depends on when the cancel
+        // landed, and that entry outlives the run that was abandoned.
+        let err = err.expect("a cancelled walk must surface an error, not a short answer");
+        assert!(
+            downcast_chain_ref::<CancelledError>(&err).is_some(),
+            "expected CancelledError, got: {err:#}"
         );
         Ok(())
     }
