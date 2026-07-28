@@ -1,8 +1,8 @@
 //! Linux subprocess pipeline: vanilla `tokio::process`.
 //!
-//! Linux uses `epoll` + `pidfd` and is unaffected by the macOS
-//! `EVFILT_USER` wake reliability bug documented in `RCA_MACOS_WAKER.md`.
-//! No workarounds — plain `tokio::process::Command` + `.wait().await`.
+//! Linux uses `epoll` + `pidfd` and is unaffected by the macOS `EVFILT_USER`
+//! wake reliability bug described in the [`super`] module docs. No
+//! workarounds — plain `tokio::process::Command` + `.wait().await`.
 
 use crate::process_supervisor;
 use hcore::hasync::Cancellable;
@@ -11,15 +11,19 @@ use std::process::{ExitStatus, Output};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, ChildStdin, Command};
 
-use super::{CHUNK_SIZE, Spec};
+use super::{CHUNK_SIZE, Spec, StreamId};
 
-pub struct ChunkReader {
+/// Single-stream reader. Internal: the streaming consumer takes an
+/// [`OutputReader`], which carries both streams. `output` keeps using the two
+/// halves separately because it drives them under one `join!` and wants a
+/// per-stream verdict.
+struct ChunkReader {
     src: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     buf: Vec<u8>,
 }
 
 impl ChunkReader {
-    pub async fn recv(&mut self) -> io::Result<Option<Vec<u8>>> {
+    async fn recv(&mut self) -> io::Result<Option<Vec<u8>>> {
         if self.buf.is_empty() {
             self.buf.resize(CHUNK_SIZE, 0);
         }
@@ -33,6 +37,65 @@ impl ChunkReader {
         )]
         let chunk = self.buf[..n].to_vec();
         Ok(Some(chunk))
+    }
+}
+
+/// Async reader over **both** of the child's output streams.
+///
+/// Same *delivery* contract as the macOS type of the same name, reached
+/// differently: here each stream is a genuine `AsyncRead` over its pipe, so a
+/// `select!` over the two is all the merge needs. There is no intermediate
+/// buffer at all — a consumer that stalls simply stops reading and the 64 KiB
+/// kernel pipe backpressures the child, which is the behaviour the macOS
+/// backend's bounded drain channel reproduces.
+///
+/// **Termination differs, and callers that care must know it.** This `recv`
+/// stays `Pending` when a stray descendant holds the pipe write end open, so
+/// it never ends on its own — the caller's `timeout`/`select!` ends it, which
+/// is what `pluginexec`'s post-wait drain does. The macOS reader cannot be
+/// dropped mid-park (`block_in_place` is never `Pending`) and so self-
+/// terminates on an `abandoned` flag instead. Both give "the tee always
+/// ends"; neither mechanism is available on the other platform.
+pub struct OutputReader {
+    stdout: Option<ChunkReader>,
+    stderr: Option<ChunkReader>,
+}
+
+impl OutputReader {
+    /// Wait for the next chunk from either stream. Returns `Ok(None)` once
+    /// **both** streams have hit EOF.
+    ///
+    /// Cancel-safe: each arm bottoms out in `AsyncReadExt::read`, which loses
+    /// nothing when its branch is dropped, so an abandoned `recv` can be
+    /// retried without a gap in the stream.
+    pub async fn recv(&mut self) -> io::Result<Option<(StreamId, Vec<u8>)>> {
+        loop {
+            let (id, res) = match (self.stdout.as_mut(), self.stderr.as_mut()) {
+                (None, None) => return Ok(None),
+                (Some(out), None) => (StreamId::Stdout, out.recv().await),
+                (None, Some(err)) => (StreamId::Stderr, err.recv().await),
+                (Some(out), Some(err)) => tokio::select! {
+                    r = out.recv() => (StreamId::Stdout, r),
+                    r = err.recv() => (StreamId::Stderr, r),
+                },
+            };
+            match res {
+                Ok(Some(chunk)) => return Ok(Some((id, chunk))),
+                // This stream is done; keep serving the other one.
+                Ok(None) => self.close(id),
+                Err(e) => {
+                    self.close(id);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn close(&mut self, id: StreamId) {
+        match id {
+            StreamId::Stdout => self.stdout = None,
+            StreamId::Stderr => self.stderr = None,
+        }
     }
 }
 
@@ -57,6 +120,13 @@ impl StdinPump {
     }
 }
 
+/// Live child handle.
+///
+/// # Invariant: never poll a wait on the same task as [`OutputReader::recv`]
+///
+/// Harmless here — both are ordinary futures — but the macOS backend
+/// deadlocks on it, and this is the same public API. See the macOS `Handle`
+/// docs for the mechanism.
 pub struct Handle {
     pid: i32,
     child: Child,
@@ -77,19 +147,26 @@ impl Handle {
         self.stdin.take()
     }
 
-    pub fn take_stdout(&mut self) -> Option<ChunkReader> {
+    fn take_stdout(&mut self) -> Option<ChunkReader> {
         self.stdout.take()
     }
 
-    pub fn take_stderr(&mut self) -> Option<ChunkReader> {
+    fn take_stderr(&mut self) -> Option<ChunkReader> {
         self.stderr.take()
     }
 
-    pub async fn wait(mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
+    /// Take the merged stdout+stderr reader. `None` when neither stream was
+    /// piped.
+    pub fn take_output(&mut self) -> Option<OutputReader> {
+        let stdout = self.stdout.take();
+        let stderr = self.stderr.take();
+        if stdout.is_none() && stderr.is_none() {
+            return None;
+        }
+        Some(OutputReader { stdout, stderr })
     }
 
-    pub async fn wait_or_cancel(
+    pub(super) async fn wait_or_cancel(
         mut self,
         cancel: &(dyn Cancellable + Send + Sync),
     ) -> io::Result<ExitStatus> {

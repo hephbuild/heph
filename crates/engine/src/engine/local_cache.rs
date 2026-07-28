@@ -381,7 +381,7 @@ impl Engine {
         // unaware, and enough concurrent writes stop the reactor entirely) and not
         // `spawn_blocking` (whose JoinHandle wake-up rides tokio's cross-thread
         // waker, observed to drop wakeups on macOS under load — see
-        // `RCA_MACOS_WAKER.md`). See `hcore::blocking`.
+        // the macOS waker hazard in `hproc::proc_exec`). See `hcore::blocking`.
         hcore::blocking::run(enclose!((cache => local_cache, addr, artifact) move || {
             let open_writer =
                 |name: &str| -> anyhow::Result<Box<dyn io::Write>> {

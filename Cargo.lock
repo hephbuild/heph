@@ -3831,6 +3831,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tracing",
  "xxhash-rust",
 ]
 
@@ -4154,6 +4155,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "core",
+ "crossbeam-channel",
  "libc",
  "tempfile",
  "tokio",

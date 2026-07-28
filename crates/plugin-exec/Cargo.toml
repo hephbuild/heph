@@ -21,6 +21,7 @@ tar = "0.4"
 libc = "0.2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 minijinja = "2"
+tracing = "0.1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "net"] }
 

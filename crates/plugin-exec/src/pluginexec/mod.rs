@@ -405,30 +405,146 @@ async fn tee_stream(
     }
 }
 
-/// Tee chunks from a [`proc_exec::ChunkReader`] into the log file and the
-/// optional TUI sink. Used in non-PTY mode where the child stdout/stderr
-/// pipes are drained on a dedicated `std::thread` (inside `proc_exec`) and
-/// surfaced to async-land via `std::sync::mpsc` — `ChunkReader::recv`
-/// internally uses `block_in_place` on a kernel condvar, bypassing tokio's
-/// macOS-flaky cross-thread waker.
-async fn tee_chunks(
-    reader: Option<proc_exec::ChunkReader>,
+/// Tee chunks from a [`proc_exec::OutputReader`] into the log file and the
+/// per-stream TUI sinks. Used in non-PTY mode, where the child's stdout and
+/// stderr pipes are drained on dedicated `std::thread`s (inside `proc_exec`
+/// on macOS) and surfaced to async-land over one `std::sync::mpsc`.
+///
+/// **One reader, both streams, one loop.** The obvious shape — a tee per
+/// stream under `tokio::join!` — is wrong on macOS: `OutputReader::recv`
+/// parks the worker in `block_in_place`, so whichever tee is polled first
+/// owns the task until the child exits and the other stream is never read.
+/// Its chunks pile up in the drain channel and nothing reaches `log.txt` or
+/// the TUI until the target finishes. A build that is quiet on stdout and
+/// chatty on stderr — a compile — is the common case, so that was the common
+/// case. Merging the two streams into a single receiver makes fairness
+/// automatic rather than something the scheduler has to arrange.
+///
+/// It also fixes `log.txt`: chunks are now appended in true arrival order
+/// instead of one stream's entire output followed by the other's.
+///
+/// **Absorption is timed.** The child is throttled whenever this loop is
+/// slower than the child writes — on macOS by the bounded drain channel, on
+/// Linux by the 64 KiB kernel pipe. Backpressure is the design, but a
+/// throttled target is otherwise indistinguishable from a slow one, so the
+/// time is accumulated per stream and reported against the target's address.
+/// Measuring here rather than in the drain is what makes the diagnostic name
+/// a target and cover both platforms with no `cfg`.
+async fn tee_output<'io>(
+    reader: Option<proc_exec::OutputReader>,
     log: Arc<std::sync::Mutex<std::fs::File>>,
-    mut sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    // One lifetime for both: the loop reborrows whichever sink the current
+    // chunk belongs to, so the two must be interchangeable.
+    mut stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    mut stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    addr: &str,
 ) {
     use tokio::io::AsyncWriteExt;
     let Some(mut reader) = reader else { return };
+    let mut absorbed = SinkCost::default();
     loop {
-        let chunk = match reader.recv().await {
+        let (stream, chunk) = match reader.recv().await {
             Ok(Some(c)) => c,
-            _ => break,
+            Ok(None) => break,
+            // One reader now carries both streams, so treating a read error as
+            // EOF would stop teeing the *other* stream too — `log.txt` would
+            // truncate with no note, and dropping the reader would SIGPIPE the
+            // child, failing the target for a reason unrelated to the cause.
+            // The failed stream has already retired itself (its drain dropped
+            // its sender / `close(id)` ran), so the survivor runs on.
+            Err(e) => {
+                tracing::warn!(
+                    addr,
+                    error = %e,
+                    "stopped reading one of this target's output streams"
+                );
+                continue;
+            }
         };
+        let started = std::time::Instant::now();
         if let Ok(mut g) = log.lock() {
             drop(g.write_all(&chunk));
         }
-        if let Some(ref mut out) = sink {
+        let sink = match stream {
+            proc_exec::StreamId::Stdout => stdout.as_mut(),
+            proc_exec::StreamId::Stderr => stderr.as_mut(),
+        };
+        if let Some(out) = sink {
             drop(out.write_all(&chunk).await);
+            // Flush immediately so an interactive consumer sees each chunk
+            // as it appears rather than at process exit.
             drop(out.flush().await);
+        }
+        if absorbed.record(stream, started.elapsed()) {
+            tracing::warn!(
+                addr,
+                %stream,
+                "heph is writing this target's output more slowly than the target \
+                 produces it, so the target is being paused. Reduce how much it \
+                 prints, or run without a live terminal so the output is not rendered"
+            );
+        }
+    }
+    absorbed.finish(addr);
+}
+
+/// Cumulative time a target spent blocked while heph wrote the target's own
+/// output, per stream.
+///
+/// Split out of [`tee_output`] so the hot loop stays a loop: `record` is two
+/// adds and a compare per chunk.
+#[derive(Default)]
+struct SinkCost {
+    stdout: std::time::Duration,
+    stderr: std::time::Duration,
+    warned: bool,
+}
+
+/// How much accumulated blocked time makes a target *demonstrably* throttled
+/// by heph rather than slow on its own work. High enough that a chatty
+/// compile writing to a file never trips it; low enough to catch a genuinely
+/// stuck sink while the run is still going.
+const SINK_STALL_WARN: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl SinkCost {
+    /// Add this chunk's cost. Returns `true` exactly once — on the chunk that
+    /// takes the *combined* cost past [`SINK_STALL_WARN`]. Separated from the
+    /// emission so the threshold is testable without a subscriber.
+    #[must_use]
+    fn record(&mut self, stream: proc_exec::StreamId, elapsed: std::time::Duration) -> bool {
+        let slot = match stream {
+            proc_exec::StreamId::Stdout => &mut self.stdout,
+            proc_exec::StreamId::Stderr => &mut self.stderr,
+        };
+        *slot = slot.saturating_add(elapsed);
+        if self.warned || self.stdout.saturating_add(self.stderr) < SINK_STALL_WARN {
+            return false;
+        }
+        self.warned = true;
+        true
+    }
+
+    /// Always reported, threshold crossed or not — the number is the answer to
+    /// "why did that target take so long", and it only exists here.
+    fn finish(&self, addr: &str) {
+        let total = self.stdout.saturating_add(self.stderr);
+        if self.warned {
+            tracing::warn!(
+                addr,
+                stalled_ms = total.as_millis(),
+                stdout_ms = self.stdout.as_millis(),
+                stderr_ms = self.stderr.as_millis(),
+                "target finished; this much of its wall time was spent waiting for \
+                 heph to write its output"
+            );
+        } else {
+            tracing::debug!(
+                addr,
+                stalled_ms = total.as_millis(),
+                stdout_ms = self.stdout.as_millis(),
+                stderr_ms = self.stderr.as_millis(),
+                "target output absorbed"
+            );
         }
     }
 }
@@ -450,16 +566,55 @@ async fn pump_stdin_pty(
     drop(sink.shutdown().await);
 }
 
-/// Pump bytes from an async source into a [`proc_exec::StdinPump`]. Mirrors
-/// the existing tokio `io::copy` path but writes through the platform-aware
-/// stdin pump (sync `write_all` under `block_in_place` on macOS, native
-/// tokio AsyncWrite on Linux).
+/// Pump bytes from an async source into a [`proc_exec::StdinPump`].
+///
+/// **The write runs on its own task, and that is load-bearing.** On macOS
+/// `StdinPump::write_all` is a synchronous `write` under `block_in_place`,
+/// which blocks — not `Pending` — once the child's 64 KiB stdin pipe fills
+/// and the child is not reading. Sharing a task with [`tee_output`] would
+/// then close a cycle with no participant able to break it: the tee stops
+/// draining, the bounded drain channel fills, the child blocks in `write(2)`
+/// on its *output*, so it never gets as far as reading the input we are
+/// blocked writing. (Before the drain was bounded this healed by luck — the
+/// child could still run to completion into an unbounded buffer and exit,
+/// giving our write `EPIPE`.)
+///
+/// `src` is borrowed from the request and cannot be spawned, but the pump is
+/// `'static`, so the split goes the other way: the borrowed reader stays on
+/// this task and hands bytes to the spawned writer over a channel. Linux is
+/// unaffected either way — its pump is a genuine `AsyncWrite` — but it runs
+/// the same code so the two backends keep one shape.
+///
+/// **Untested, and knowingly so.** The reasoning above is from the code, not
+/// from a reproducer: an attempt to build one — 512 KiB of stdin into a child
+/// that only writes 4 MiB of output — did *not* wedge even with the writer
+/// forced back onto this task, so something upstream ends the write before the
+/// pipe fills and the exact trigger is not pinned down. The spawn is kept as
+/// cheap insurance rather than as a fix with coverage behind it; if this needs
+/// to change, find the reproducer first.
 async fn pump_stdin(
     src: &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin),
     mut sink: proc_exec::StdinPump,
     cancel: tokio::sync::oneshot::Receiver<()>,
 ) {
     use tokio::io::AsyncReadExt;
+    // Small: this is a keystroke relay, and a deep queue would only delay the
+    // EOF that `shutdown` below turns into the child's end-of-input.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    // Deliberately not awaited. If the child never reads its stdin this task
+    // stays parked in `write` until the child exits and the pipe gives it
+    // `EPIPE` — joining it here would drag that park back onto the tee's task,
+    // which is the whole thing we are avoiding.
+    tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            if sink.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        // Dropping the pump closes the write end, so the child sees EOF.
+        drop(sink.shutdown().await);
+    });
+
     let copy = async {
         let mut buf = vec![0u8; 8192];
         loop {
@@ -471,8 +626,8 @@ async fn pump_stdin(
                 clippy::indexing_slicing,
                 reason = "n <= buf.len() by AsyncRead::read contract"
             )]
-            let chunk = &buf[..n];
-            if sink.write_all(chunk).await.is_err() {
+            let chunk = buf[..n].to_vec();
+            if tx.send(chunk).await.is_err() {
                 return;
             }
         }
@@ -481,7 +636,9 @@ async fn pump_stdin(
         _ = cancel => {}
         _ = copy => {}
     }
-    drop(sink.shutdown().await);
+    // Closes the channel, which ends the writer's loop and triggers the
+    // shutdown that gives the child its EOF.
+    drop(tx);
 }
 
 #[async_trait]
@@ -1108,8 +1265,8 @@ impl Driver {
         // Shell mode runs the child attached to a freshly-allocated PTY so bash
         // sees a real terminal and runs interactively. The parent forwards
         // stdin/stdout via the PTY master through the same tee paths used by
-        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_chunks`
-        // on ChunkReader for piped stdio).
+        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_output`
+        // on the merged OutputReader for piped stdio).
         let pty_pair = if shell {
             Some(pty::open_pty().context("openpty")?)
         } else {
@@ -1216,15 +1373,30 @@ impl Driver {
             None
         };
 
+        // Named once so the tee's diagnostics can say which target is being
+        // throttled; the reader borrows it for the length of the run.
+        let tee_addr = rreq.target.addr.format();
+
         // Signal that cancels the stdin pump once the child has exited. Without
         // it, shell mode would deadlock waiting on a parent-stdin read that
         // nothing intends to satisfy.
         let (stdin_cancel_tx, stdin_cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Build futures for stdin pump and stdout/stderr tee. The two modes
+        // Build futures for the stdin pump and the output tee. The two modes
         // differ in plumbing — PTY uses AsyncPty over the master fd (tokio
         // IO driver, EVFILT_READ — reliable on macOS), pipe mode uses the
-        // off-tokio ChunkReader / StdinPump from proc_exec.
+        // off-tokio OutputReader / StdinPump from proc_exec.
+        //
+        // Both live on one task under `join!` below, and in pipe mode the
+        // stdin pump's `write_all` can park that task (it is a synchronous
+        // write under `block_in_place` on macOS). Since `proc_exec::spawn`
+        // bounds the drain, a child that is simultaneously ignoring >64 KiB
+        // of stdin and producing more than the drain bound would deadlock:
+        // we would be blocked writing its stdin while it blocks writing its
+        // stdout. Unreachable as wired — pipe-mode stdin exists only for
+        // interactive runs, where the source is a tty relay measured in
+        // keystrokes — but it is the reason a future non-tty stdin source
+        // needs its own task, not another `join!` arm.
         enum IoFutures<'r> {
             Pty {
                 stdin: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
@@ -1232,8 +1404,8 @@ impl Driver {
             },
             Pipes {
                 stdin: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
-                stdout: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
-                stderr: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
+                /// Single tee over both streams — see [`tee_output`].
+                output: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
             },
         }
 
@@ -1258,12 +1430,15 @@ impl Driver {
             }
         } else {
             let stdin_pump = handle.take_stdin();
-            let stdout_reader = handle.take_stdout();
-            let stderr_reader = handle.take_stderr();
+            let output_reader = handle.take_output();
             let log_for_out = Arc::clone(&output_log_file);
-            let log_for_err = Arc::clone(&output_log_file);
-            let stdout_fut = Box::pin(tee_chunks(stdout_reader, log_for_out, rreq.stdout));
-            let stderr_fut = Box::pin(tee_chunks(stderr_reader, log_for_err, rreq.stderr));
+            let output_fut = Box::pin(tee_output(
+                output_reader,
+                log_for_out,
+                rreq.stdout,
+                rreq.stderr,
+                &tee_addr,
+            ));
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
                 match (rreq.stdin, stdin_pump) {
                     (Some(src), Some(pump)) => Box::pin(pump_stdin(src, pump, stdin_cancel_rx)),
@@ -1271,36 +1446,26 @@ impl Driver {
                 };
             IoFutures::Pipes {
                 stdin: stdin_fut,
-                stdout: stdout_fut,
-                stderr: stderr_fut,
+                output: output_fut,
             }
         };
 
         hcore::hmemoizer::set_phase("pluginexec:wait_subprocess");
-        // The wait happens in a spawned task. `Handle::wait_or_cancel` uses
-        // `block_in_place` internally to park on a `std::sync::mpsc` from the
-        // kqueue watcher — kernel condvar wake, no tokio waker on the wait
-        // path itself. We `tokio::spawn` so the wait doesn't share a worker
-        // with the IO pumps (which would deadlock when the child's pipe
-        // buffer fills behind a parked worker).
+        // `spawn_wait` puts the wait on its own task, which is mandatory
+        // rather than a preference: it parks its worker in `block_in_place`
+        // until the child exits, so sharing a task with the IO pumps would
+        // stop them draining and the child would wedge on a full pipe.
+        // `proc_exec` owns that rule now — the wait is only reachable through
+        // the spawn.
         //
-        // Cancellation lives INSIDE this task via `wait_or_cancel`: it runs the
+        // Cancellation lives INSIDE the task via `wait_or_cancel`: it runs the
         // SIGINT → grace → SIGKILL escalation with no `tokio::time` timer, so a
         // Ctrl-C that races runtime teardown can't poll a timer on a
         // shutting-down runtime (the "context found, but it is being shutdown"
         // panic this design avoids). `ctoken` is a borrowed trait object, so we
-        // move an owned `clone_arc` handle into the task; the original borrow
-        // stays usable below for the post-wait cancellation check.
-        let cancel = ctoken.clone_arc();
-        let wait_handle: tokio::task::JoinHandle<anyhow::Result<std::process::ExitStatus>> =
-            tokio::spawn(async move {
-                let status = handle
-                    .wait_or_cancel(&*cancel)
-                    .await
-                    .context("wait for child process")?;
-                _ = stdin_cancel_tx.send(());
-                Ok(status)
-            });
+        // hand the task an owned `clone_arc`; the original borrow stays usable
+        // below for the post-wait cancellation check.
+        let wait_handle = handle.spawn_wait(ctoken.clone_arc());
         tokio::pin!(wait_handle);
 
         // Drive the IO pumps alongside the wait. On a clean exit we briefly
@@ -1313,6 +1478,9 @@ impl Driver {
                 tokio::pin!(io);
                 tokio::select! {
                     wait_res = &mut wait_handle => {
+                        // The child is gone, so nothing will read its stdin
+                        // again; release the pump's borrow of the request.
+                        _ = stdin_cancel_tx.send(());
                         if !ctoken.is_cancelled() {
                             hcore::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
                             _ = tokio::time::timeout(
@@ -1328,15 +1496,14 @@ impl Driver {
                     }
                 }
             }
-            IoFutures::Pipes {
-                stdin,
-                stdout,
-                stderr,
-            } => {
-                let io = async { tokio::join!(stdin, stdout, stderr) };
+            IoFutures::Pipes { stdin, output } => {
+                let io = async { tokio::join!(stdin, output) };
                 tokio::pin!(io);
                 tokio::select! {
                     wait_res = &mut wait_handle => {
+                        // The child is gone, so nothing will read its stdin
+                        // again; release the pump's borrow of the request.
+                        _ = stdin_cancel_tx.send(());
                         if !ctoken.is_cancelled() {
                             hcore::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
                             _ = tokio::time::timeout(
@@ -2012,6 +2179,330 @@ mod tests {
             "expected >= {payload_bytes} bytes, got {}",
             stdout.len()
         );
+        Ok(())
+    }
+
+    /// The stall report triggers on the two streams' *combined* cost, not
+    /// each stream's on its own, and it fires once rather than per chunk.
+    ///
+    /// Both halves matter: a target throttled 1.2 s on stdout and 1.2 s on
+    /// stderr is a target throttled 2.4 s, and a per-stream threshold would
+    /// stay silent through it. A per-chunk warn would bury the run in
+    /// hundreds of identical lines.
+    #[test]
+    fn sink_cost_reports_on_combined_stall_exactly_once() {
+        let half = SINK_STALL_WARN / 2;
+        let mut cost = SinkCost::default();
+
+        assert!(
+            !cost.record(proc_exec::StreamId::Stdout, half),
+            "half the budget on one stream is not a stall",
+        );
+        // The other stream carries the rest — neither alone would trip it.
+        assert!(
+            cost.record(proc_exec::StreamId::Stderr, half),
+            "the two streams' cost must be counted together",
+        );
+        assert_eq!(cost.stdout, half);
+        assert_eq!(cost.stderr, half);
+
+        assert!(
+            !cost.record(proc_exec::StreamId::Stdout, SINK_STALL_WARN),
+            "the report is once per target, not once per chunk past the threshold",
+        );
+        assert_eq!(cost.stdout, half.saturating_add(SINK_STALL_WARN));
+    }
+
+    /// An `AsyncWrite` that records when its first byte landed. Lets a test
+    /// distinguish "streamed while the child was running" from "flushed in a
+    /// lump once the child exited" — which is the whole difference P7.2 is
+    /// about, and is invisible to a test that only inspects final contents.
+    #[derive(Clone, Default)]
+    struct TimedSink(Arc<std::sync::Mutex<TimedSinkState>>);
+
+    #[derive(Default)]
+    struct TimedSinkState {
+        first_write: Option<std::time::Instant>,
+        bytes: Vec<u8>,
+    }
+
+    impl TimedSink {
+        fn first_write(&self) -> Option<std::time::Instant> {
+            self.0.lock().expect("sink mutex").first_write
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("sink mutex").bytes.clone()
+        }
+    }
+
+    impl tokio::io::AsyncWrite for TimedSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut state = self.0.lock().expect("sink mutex");
+            state
+                .first_write
+                .get_or_insert_with(std::time::Instant::now);
+            state.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Both of a target's output streams must reach their sinks *while it
+    /// runs*, not in a burst once it exits.
+    ///
+    /// This is the regression for the head-of-line block between the two
+    /// tees. When stdout and stderr each had their own tee under
+    /// `tokio::join!`, the first one polled parked the shared task inside
+    /// `block_in_place` until the child exited, and the other stream reached
+    /// neither `log.txt` nor the TUI until then. A compile that is quiet on
+    /// stdout and chatty on stderr — the common case — showed nothing at all
+    /// while it ran.
+    ///
+    /// Deliberately symmetric: **both** streams speak early and both speak
+    /// again at the end. Under the old shape exactly one of them starved, but
+    /// which one depended on the order `join!` happened to poll — so a test
+    /// that only checked one stream would have been a coin flip. Checking
+    /// both fails under either order.
+    ///
+    /// macOS-only in effect: Linux's reader is a real `AsyncRead` that yields
+    /// rather than parking the task, so it streamed both ways already.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_streams_both_pipes_while_the_child_runs() -> anyhow::Result<()> {
+        /// The child's quiet stretch between its first and last writes.
+        const MIDDLE: std::time::Duration = std::time::Duration::from_secs(1);
+        /// How much of that stretch a stream must beat to count as streamed.
+        /// Half, so a loaded runner cannot turn a real pass into a failure
+        /// while a starved stream (delta ~0) stays unambiguously red.
+        const EARLY_BY: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec![
+                    "echo out-first; echo err-first >&2; sleep 1; echo out-last; echo err-last >&2"
+                        .to_string(),
+                ],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let out_sink = TimedSink::default();
+        let err_sink = TimedSink::default();
+        let mut out_handle = out_sink.clone();
+        let mut err_handle = err_sink.clone();
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: Some(&mut out_handle),
+            stderr: Some(&mut err_handle),
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
+            .await
+            .context("driver.run did not finish")??;
+        let finished = std::time::Instant::now();
+
+        for (name, sink) in [("stdout", &out_sink), ("stderr", &err_sink)] {
+            let first = sink
+                .first_write()
+                .unwrap_or_else(|| panic!("{name} sink never received anything"));
+            let lead = finished.saturating_duration_since(first);
+            assert!(
+                lead >= EARLY_BY,
+                "{name} only reached its sink {lead:?} before the target exited — it was \
+                 buffered until exit rather than streamed",
+            );
+        }
+
+        assert_eq!(
+            String::from_utf8_lossy(&out_sink.bytes()),
+            "out-first\nout-last\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&err_sink.bytes()),
+            "err-first\nerr-last\n"
+        );
+        Ok(())
+    }
+
+    /// `log.txt` must record the two streams in arrival order.
+    ///
+    /// It is a returned `Log` artifact and the text `--log-lines` renders in
+    /// the failure box, so its byte order is user-visible. Before the merge,
+    /// on macOS, it held one stream's entire output followed by the other's —
+    /// a failing target's log claimed an ordering that never happened. The
+    /// sleeps make the true order unambiguous, so this is not a race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_log_records_both_streams_in_arrival_order() -> anyhow::Result<()> {
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec![
+                    "echo a; sleep 0.3; echo b >&2; sleep 0.3; echo c; sleep 0.3; echo d >&2"
+                        .to_string(),
+                ],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        driver.run(make_req(req), &ctoken).await?;
+
+        let log = std::fs::read_to_string(tmp.path().join("log.txt"))?;
+        assert_eq!(
+            log, "a\nb\nc\nd\n",
+            "log.txt must interleave the streams as they arrived",
+        );
+        Ok(())
+    }
+
+    /// Companion to `test_run_large_output_does_not_deadlock_multi_thread`.
+    ///
+    /// That one clears the 64 KiB kernel pipe. This one clears the macOS
+    /// drain channel's own bound (`STREAM_DRAIN_CHUNKS` × `CHUNK_SIZE`,
+    /// 512 KiB) eight times over, on **both** streams at once, which is the
+    /// configuration that bounding introduces a deadlock risk into: a drain
+    /// thread blocked in `send` stops reading its pipe, so if the consumer
+    /// ever stops consuming — including because the *other* stream is
+    /// starving it — the child never exits. Every byte must still arrive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_output_far_beyond_drain_bound_does_not_deadlock() -> anyhow::Result<()> {
+        const PER_STREAM: usize = 4 * 1024 * 1024;
+
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                // Interleaved rather than sequential so both drains are live
+                // at once and each can stall the other. No pipeline: the
+                // wrapper runs under `pipefail`, and a producer killed by
+                // SIGPIPE when `head` exits would fail the target for
+                // reasons that have nothing to do with the drain.
+                run: vec![format!(
+                    "head -c {PER_STREAM} /dev/zero & head -c {PER_STREAM} /dev/zero >&2; wait"
+                )],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: Some(&mut stderr),
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            driver.run(make_req(req), &ctoken),
+        )
+        .await
+        .context("driver.run deadlocked past the bounded drain")??;
+
+        assert_eq!(stdout.len(), PER_STREAM, "stdout truncated");
+        assert_eq!(stderr.len(), PER_STREAM, "stderr truncated");
         Ok(())
     }
 

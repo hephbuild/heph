@@ -2,7 +2,7 @@
 //! children and verifies every one resolves with the real exit status.
 //! This is the load profile that triggered the macOS
 //! `tokio::process::Child::wait` starvation documented in
-//! `RCA_MACOS_WAKER.md`.
+//! the macOS waker hazard documented in `hproc::proc_exec`.
 
 #![cfg(unix)]
 
