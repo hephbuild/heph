@@ -13,7 +13,8 @@
 //!   the revision that was just written. Deferred to the end of the request
 //!   that wrote the revision (see `RequestState::defer_trim`) — a request holds
 //!   a read on every addr it resolved, so a trim run inline could never take
-//!   the write lock.
+//!   the write lock. The whole request's batch is drained by
+//!   [`Engine::run_trim_batch_with_delay`], which retries the contended subset.
 //!
 //! Revision recency comes from each group's `manifest-v1.borsh`
 //! (`created_at_nanos`); the full artifact name list to delete comes from the
@@ -28,7 +29,145 @@ use anyhow::{Context, Result};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinSet;
+
+/// How long a [`Engine::run_trim_batch_with_delay`] waits before its one delayed
+/// retry, when an immediate re-probe of the contended subset has already failed.
+///
+/// **This is a hedge, not a synchronization edge, and it is best-effort.** The
+/// batch is submitted by `RequestStateData`'s drop, which flushes the blocking
+/// pool's backstop registrations (`hcore::blocking::flush_backstop`) —
+/// releasing, per its own contract, the `Waker`s it was holding. Those `Waker`s
+/// are what reach the addr's riding cache read: one is an `Arc<hmemoizer::Cell>`
+/// whose memoized `mem_locked_result` value *is* that read guard.
+///
+/// For that shape the flush **is** the release edge, and a synchronous one: the
+/// flush drops its last `Arc<Cell>` inline, on the flushing thread, before it
+/// returns. What is not guaranteed is that it is the *last* owner. Another live
+/// `Arc` — an in-flight remote upload, a task mid-poll on a runtime worker —
+/// keeps the read alive, and then the release lands whenever that owner
+/// finishes, unordered with respect to the `try_write` this batch is about to
+/// attempt. A trim can still be lost, and a lost trim leaves a revision on disk
+/// until the next write's trim or the next `heph gc`.
+///
+/// One owner that used to belong on that list no longer does: an abandoned
+/// memoizer cell, retained after its last awaiter was dropped by a `fail_fast`
+/// fanout, pinned its riding read indefinitely. `hmemoizer` now evicts a key and
+/// drops its in-flight future when the last holder goes (#241), which disarms
+/// the backstop registration with it. So the population this hedge is covering
+/// is smaller than it was, and it should reach the delayed attempt below less
+/// often — which costs nothing extra, because the free re-probe is what absorbs
+/// the difference.
+///
+/// So the delay is sized against the cases the wait can actually recover: a
+/// woken task that needs a scheduler hop to reach its next poll, and the tail of
+/// a concurrent backstop tick finishing its own wake loop. Both are typically
+/// microseconds to low milliseconds — usually shorter still, which is why the
+/// batch re-probes *before* sleeping and skips the delay entirely when the flush
+/// already did the job — and long-tailed under load, so single-digit
+/// milliseconds would be too tight for the tail. The ceiling is that the wait is
+/// charged to the cleaner thread that gates process exit, *after* the user has
+/// their output, ahead of every sandbox rmdir still queued behind it — so it has
+/// to stay well under the ~100ms at which an exit stall becomes noticeable.
+///
+/// Related to, but deliberately not derived from,
+/// `hcore::blocking::WAKE_BACKSTOP` (250ms): that tick is the upper bound on how
+/// late a *missed* wake can still arrive, so a delay at or above it would cover
+/// strictly more — at ten times the exit cost, on every contended run, to buy a
+/// case the flush is already designed to prevent. 25ms is the cost decision, not
+/// an independence claim. Raising it towards the tick is the knob if enforcement
+/// is ever measured to be losing.
+pub(crate) const TRIM_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+/// Serialises the tests that arm a backstop registration and then assert on
+/// *which* of a batch's flushes released it.
+///
+/// `hcore::blocking`'s pending list is process-wide and `flush_backstop` takes
+/// all of it, so any other test in this binary that drops a request state with
+/// deferred trims can wake — and therefore advance — a registration this one is
+/// still counting. Held by every test here that cares, and by the request-state
+/// test that measures the batch's wait.
+///
+/// It cannot cover the flushes that happen inside unrelated `result.rs` tests,
+/// so a foreign wake landing inside a microsecond-wide window remains possible.
+/// It would make an assertion on the *phase* fail, never a reclamation
+/// assertion; the residual is documented rather than engineered away, because
+/// the alternative is a lock every request teardown in the crate must take.
+#[cfg(test)]
+pub(crate) fn backstop_exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Poisoning is ignored: the guard protects no invariant of its own, and one
+    // failing test must not cascade into every later one.
+    EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What one [`Engine::try_trim_after_write`] attempt did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TrimOutcome {
+    /// Nothing further is owed for this target: either it was already within
+    /// budget (no lock taken) or the lock was free and the trim ran.
+    Settled { removed: usize, bytes: u64 },
+    /// `try_write` reported the lock held by another request or process. The
+    /// **only** outcome worth retrying — a holder exists, and it may let go.
+    Contended,
+    /// Something else went wrong and was logged at the site: the unlocked
+    /// pre-count, an `Err` from `try_write` (a vanished or unwritable lock dir,
+    /// `EMFILE`, `ENOLCK`), or a failure with the lock held — the barrier, the
+    /// enumerate, or the trim itself.
+    ///
+    /// Never retried. Not because these faults are permanent — `EMFILE` and
+    /// `ENOLCK` are exactly the transient ones, and fd exhaustion at the end of a
+    /// large build is precisely when a batch runs — but because the retry's only
+    /// mechanism is *waiting for a lock holder to let go*, and an `Err` is not
+    /// evidence that a holder exists. Waiting buys nothing here, and reporting an
+    /// IO fault as contention would send an operator looking for a concurrent
+    /// `heph` that is not there.
+    Failed,
+}
+
+impl TrimOutcome {
+    /// Settled having deleted nothing — the within-budget early return.
+    pub(crate) const SETTLED_NOTHING: Self = Self::Settled {
+        removed: 0,
+        bytes: 0,
+    };
+}
+
+/// What one batch of deferred post-write trims did.
+///
+/// Logged by the caller. A silent drain is how `cache.history` went unenforced
+/// for so long, and these are the states a bare success count collapses into one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrimBatchReport {
+    /// Targets in the batch.
+    pub batch: usize,
+    /// Targets contended after the first pass — the size of the subset the batch
+    /// re-probed. Not a count of passes.
+    pub retried: usize,
+    /// Targets still contended after the immediate re-probe, i.e. the subset the
+    /// batch actually paid [`TRIM_RETRY_DELAY`] for. Zero here with `retried`
+    /// non-zero is the good case: the flush released the guards synchronously and
+    /// no delay was charged.
+    pub delayed: usize,
+    /// Targets still contended after the final attempt. Their `cache.history`
+    /// was not enforced by this run.
+    pub still_contended: usize,
+    /// Targets whose trim failed outright (see [`TrimOutcome::Failed`]), summed
+    /// over every pass.
+    pub failed: usize,
+    /// Revisions actually reclaimed, and their bytes.
+    pub removed: usize,
+    pub bytes: u64,
+    /// Backstop registrations handed back by this batch's flushes, summed.
+    ///
+    /// The one number that says whether the hedge is *doing* anything: with it at
+    /// zero, `still_contended` means the release edge is somewhere this batch
+    /// cannot reach, and the delay is being paid for nothing. `flush_backstop`
+    /// returns it for exactly this reason. It counts every registration in the
+    /// process-wide list, not only this request's.
+    pub flushed: usize,
+}
 
 /// Outcome of a [`Engine::gc_all`] sweep.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -177,24 +316,33 @@ impl Engine {
     /// deletes, so it needs no lock, and a revision that lands between the count
     /// and the lock is reclaimed by the next write's trim or by `heph gc`. The
     /// authoritative enumeration is re-taken under the write lock below.
+    ///
+    /// Deliberately `try_write` and not a blocking `write`: the lock is a
+    /// cross-process `flock`, so a blocking acquire can wait on another `heph`
+    /// arbitrarily long — on the single FIFO cleaner thread that also owes every
+    /// sandbox rmdir, on the path that gates exit, and with no runtime to await
+    /// the async `ResultLock::write` on anyway. A skip is recoverable; an
+    /// unbounded stall of all cleanup is not. [`Engine::run_trim_batch_with_delay`] hedges
+    /// the skip instead, with one immediate re-probe and one delayed retry.
     pub(crate) fn try_trim_after_write(
-        self: &Arc<Self>,
+        &self,
         addr: &Addr,
         keep: u32,
         written_hashin: &str,
-    ) {
+    ) -> TrimOutcome {
         let pre = match self.local_cache.list_target_entries(addr) {
             Ok(h) => h,
             Err(e) => {
                 tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc pre-count");
-                return;
+                return TrimOutcome::Failed;
             }
         };
         // Undercount is safe (see above): the just-written revision may not be
         // visible to this read yet, and a target at exactly `keep` has nothing to
-        // delete anyway.
+        // delete anyway. `Settled`, not `Contended` — the lock was never asked
+        // for, so there is nothing for a retry to win.
         if pre.len() as u32 <= keep {
-            return;
+            return TrimOutcome::SETTLED_NOTHING;
         }
 
         match self.result_lock().try_write(addr) {
@@ -204,7 +352,7 @@ impl Engine {
                 // fresh revision uncounted.
                 if let Err(e) = self.local_cache.exists(addr, written_hashin, MANIFEST_V1) {
                     tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc barrier");
-                    return;
+                    return TrimOutcome::Failed;
                 }
                 // Re-listed under the lock: authoritative, and it may have grown
                 // since the unlocked pre-count above.
@@ -212,25 +360,181 @@ impl Engine {
                     Ok(h) => h,
                     Err(e) => {
                         tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc enumerate");
-                        return;
+                        return TrimOutcome::Failed;
                     }
                 };
-                if let Err(e) =
-                    self.trim_addr_history(&guard, addr, &hashins, keep, Some(written_hashin))
-                {
-                    tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc trim");
+                match self.trim_addr_history(&guard, addr, &hashins, keep, Some(written_hashin)) {
+                    Ok((removed, _kept, bytes)) => TrimOutcome::Settled { removed, bytes },
+                    Err(e) => {
+                        tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc trim");
+                        TrimOutcome::Failed
+                    }
                 }
             }
             // Contended — another request or process holds the lock. Skip
             // without blocking, but say so: a silent skip here is exactly how
             // `cache.history` went unenforced for so long. `debug`, not `warn`,
             // because a concurrent build of the same target is ordinary and this
-            // fires per addr; the revision is reclaimed by the next write's trim
-            // or by `heph gc`.
+            // fires per addr; the caller retries once, and anything it still
+            // cannot take is reclaimed by the next write's trim or by `heph gc`.
             Ok(None) => {
-                tracing::debug!(%addr, "post-write gc contended; history not enforced this run")
+                tracing::debug!(%addr, "post-write gc contended");
+                TrimOutcome::Contended
             }
-            Err(e) => tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc try_write"),
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc try_write");
+                TrimOutcome::Failed
+            }
+        }
+    }
+
+    /// Drain one request's batch of deferred post-write trims.
+    ///
+    /// Runs on the background cleaner thread, from `DeferredTrims::drop`. Three
+    /// bounded attempts per target and **at most one sleep for the whole batch**:
+    ///
+    /// 1. one pass over the batch;
+    /// 2. a flush, then an *immediate* re-probe of whatever came back contended
+    ///    — free, and it is the pass that usually wins, because the flush hands
+    ///    back the `Waker` that owns the riding read and drops it inline on this
+    ///    thread (see [`TRIM_RETRY_DELAY`]);
+    /// 3. only if that still loses: sleep once, flush once more, and try that
+    ///    subset a final time.
+    ///
+    /// Never a loop, and never a blocking `write`: either would trade a
+    /// recoverable skip for an unbounded stall of every queued sandbox rmdir on
+    /// the thread that gates process exit.
+    ///
+    /// `delay` is [`TRIM_RETRY_DELAY`] in production, carried in by the request
+    /// (`DeferredTrims::retry_delay_nanos`) rather than read from the constant
+    /// here — so a test can widen the window it has to release a guard in instead
+    /// of racing 25ms on a loaded runner. A flaky test here gets quarantined, and
+    /// then the retry has no coverage at all.
+    pub(crate) fn run_trim_batch_with_delay(
+        &self,
+        trims: impl IntoIterator<Item = (Addr, u32, String)>,
+        delay: Duration,
+    ) -> TrimBatchReport {
+        let mut report = TrimBatchReport::default();
+
+        // INVARIANT for every `flush_backstop` below: **no result-lock guard is
+        // held on this thread across a flush.** A flush wakes arbitrary `Waker`s
+        // and hands their registrations back, which can drop an entire abandoned
+        // future graph inline, here — including read guards on addrs this batch
+        // is about to lock. That is the point. But it also means a flush must
+        // never run underneath one of our own guards: `try_trim_after_write`
+        // takes the write lock and drops it before returning, so flushing from
+        // inside it would let a woken task's drop path meet a lock we hold.
+        // Flushes belong here, between attempts, and nowhere else.
+        //
+        // This first one is not redundant with the drop site's: that one ran on
+        // the *dropping* thread, and this batch is dequeued an unbounded time
+        // later. Anything armed in that gap still pins whatever its task holds.
+        report.flushed += hcore::blocking::flush_backstop();
+
+        // Consumed lazily; the `Vec` is allocated only if something is contended
+        // and is *moved* into, never cloned into. Not pre-sized: the expected
+        // subset is a straggler or two, and reserving the whole batch would cost
+        // the full footprint on every run with a single one.
+        let mut contended: Vec<(Addr, u32, String)> = Vec::new();
+        for trim in trims {
+            report.batch += 1;
+            self.attempt_trim(trim, &mut report, &mut contended);
+        }
+        if contended.is_empty() {
+            // The overwhelmingly common case: no retry, and so no sleep. The
+            // delay is charged only to a run that actually lost a lock.
+            return report;
+        }
+        report.retried = contended.len();
+
+        // Flush, then re-probe *before* sleeping. `flush_backstop` releases the
+        // `Waker`s it takes, and for the shape that matters here — an
+        // `Arc<hmemoizer::Cell>` whose memoized value is the addr's riding read —
+        // dropping the last one tears the cell down inline, on this thread,
+        // before the call returns. When that was the only owner the guard is
+        // already gone by now and the delay would be pure exit latency. One
+        // non-blocking `flock` per contended addr to find out is a good trade
+        // against 25ms.
+        report.flushed += hcore::blocking::flush_backstop();
+        let mut delayed: Vec<(Addr, u32, String)> = Vec::new();
+        for trim in contended {
+            self.attempt_trim(trim, &mut report, &mut delayed);
+        }
+        if delayed.is_empty() {
+            return report;
+        }
+        report.delayed = delayed.len();
+
+        // Somebody else's release edge, then: give it one bounded wait. The
+        // flush after the sleep collects anything that finished during it — the
+        // registrations taken above are gone, and a waiter still genuinely
+        // pending re-armed from the poll that wake provoked.
+        std::thread::sleep(delay);
+        report.flushed += hcore::blocking::flush_backstop();
+
+        for (addr, keep, hashin) in delayed {
+            match self.trim_contained(&addr, keep, &hashin) {
+                TrimOutcome::Settled { removed, bytes } => {
+                    report.removed += removed;
+                    report.bytes = report.bytes.saturating_add(bytes);
+                }
+                TrimOutcome::Contended => {
+                    report.still_contended += 1;
+                    // Only worth printing when it is *not* us: `holder_pid`
+                    // reports whoever holds the gateway or last held it, and this
+                    // process stamps it on its own acquires, so our own pid here
+                    // is the uninformative default rather than a finding.
+                    let holder = self.result_lock().holder_pid(&addr);
+                    tracing::debug!(
+                        %addr,
+                        other_holder_pid = ?holder.filter(|p| *p != std::process::id()),
+                        "post-write gc still contended after retry; history not enforced this run",
+                    );
+                }
+                TrimOutcome::Failed => report.failed += 1,
+            }
+        }
+
+        report
+    }
+
+    /// One attempt, folding a settled or failed outcome into `report` and
+    /// moving a contended one onto `again` for the next pass — moved, not
+    /// cloned, so a batch that never contends allocates nothing beyond the
+    /// (empty) `Vec`.
+    fn attempt_trim(
+        &self,
+        trim: (Addr, u32, String),
+        report: &mut TrimBatchReport,
+        again: &mut Vec<(Addr, u32, String)>,
+    ) {
+        match self.trim_contained(&trim.0, trim.1, &trim.2) {
+            TrimOutcome::Settled { removed, bytes } => {
+                report.removed += removed;
+                report.bytes = report.bytes.saturating_add(bytes);
+            }
+            TrimOutcome::Contended => again.push(trim),
+            TrimOutcome::Failed => report.failed += 1,
+        }
+    }
+
+    /// One trim with its panic contained.
+    ///
+    /// The cleaner's own `catch_unwind` wraps the whole job, so an uncontained
+    /// panic here would discard every trim after it with nothing to say which
+    /// one it was. A panicked trim reports [`TrimOutcome::Failed`], never
+    /// `Contended` — retrying it would only panic again, and charge the whole
+    /// batch the delay for the privilege.
+    fn trim_contained(&self, addr: &Addr, keep: u32, hashin: &str) -> TrimOutcome {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.try_trim_after_write(addr, keep, hashin)
+        })) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::error!(%addr, "post-write gc trim panicked, continuing");
+                TrimOutcome::Failed
+            }
         }
     }
 
@@ -838,7 +1142,14 @@ mod tests {
         write_revision(&engine, &a, "h1", 100, &["o.tar"]);
         write_revision(&engine, &a, "h2", 200, &["o.tar"]);
 
-        engine.try_trim_after_write(&a, 1, "h2");
+        assert_eq!(
+            engine.try_trim_after_write(&a, 1, "h2"),
+            TrimOutcome::Settled {
+                removed: 1,
+                bytes: 4
+            },
+            "the outcome carries what it reclaimed, not just that it ran",
+        );
 
         assert!(present(&engine, &a, "h2"), "just-written revision kept");
         assert!(!present(&engine, &a, "h1"), "stale revision trimmed");
@@ -859,7 +1170,11 @@ mod tests {
             .await
             .expect("write lock");
 
-        engine.try_trim_after_write(&a, 1, "h2");
+        assert_eq!(
+            engine.try_trim_after_write(&a, 1, "h2"),
+            TrimOutcome::Contended,
+            "a held lock is contention, the one outcome worth retrying",
+        );
 
         assert!(
             present(&engine, &a, "h1"),
@@ -882,8 +1197,13 @@ mod tests {
         barrier_reads.store(0, Ordering::SeqCst);
         manifest_reads.store(0, Ordering::SeqCst);
 
-        // 2 revisions, history 2 → within budget, nothing to trim.
-        engine.try_trim_after_write(&a, 2, "h2");
+        // 2 revisions, history 2 → within budget, nothing to trim. `Settled`,
+        // not `Contended`: the lock was never asked for, so a retry has nothing
+        // to win and must not be charged the delay for it.
+        assert_eq!(
+            engine.try_trim_after_write(&a, 2, "h2"),
+            TrimOutcome::SETTLED_NOTHING,
+        );
 
         assert_eq!(
             barrier_reads.load(Ordering::SeqCst),
@@ -925,6 +1245,510 @@ mod tests {
              of the one revision actually deleted"
         );
         assert!(!present(&engine, &a, "h1"), "stale revision trimmed");
+    }
+
+    /// Take `addr`'s write lock synchronously, the way the trim itself asks for
+    /// it. Synchronous on purpose: these tests model the cleaner thread, which
+    /// has no tokio runtime.
+    fn hold_write(engine: &Engine, addr: &Addr) -> ResultWriteGuard {
+        engine
+            .result_lock()
+            .try_write(addr)
+            .expect("try_write")
+            .expect("lock must be free")
+    }
+
+    /// Two revisions of `name`, the older one over any `keep = 1` budget.
+    fn two_revisions(engine: &Engine, name: &str) -> Addr {
+        let a = addr(name);
+        write_revision(engine, &a, "h1", 100, &["o.tar"]);
+        write_revision(engine, &a, "h2", 200, &["o.tar"]);
+        a
+    }
+
+    /// **The point of the retry.** A target whose write lock is held when the
+    /// batch first reaches it must still be trimmed once the guard lands.
+    ///
+    /// Constructed, not raced. Batch order is load-bearing: `busy` is probed
+    /// first and `sentinel` second, so `sentinel`'s stale revision disappearing
+    /// *proves* the first pass already asked for `busy`'s lock and lost it. Only
+    /// then is the guard released, inside the (deliberately wide) delay. With no
+    /// retry there is no later attempt and `busy` keeps its stale revision.
+    ///
+    /// That ordering is a property of the `Vec` this test passes, not of
+    /// production — `DeferredTrims` hands over an `FxHashMap` whose iteration
+    /// order is arbitrary.
+    ///
+    /// `thread::scope` rather than a detached `spawn`: on an assertion failure
+    /// the scope still joins the worker, so it cannot outlive the `TempDir` it is
+    /// deleting out of.
+    #[test]
+    fn trim_batch_retries_the_contended_subset_and_reclaims() {
+        let (engine, _dir) = test_engine();
+        let busy = two_revisions(&engine, "busy");
+        let sentinel = two_revisions(&engine, "sentinel");
+
+        let mut held = Some(hold_write(&engine, &busy));
+        let batch = vec![
+            (busy.clone(), 1, "h2".to_string()),
+            (sentinel.clone(), 1, "h2".to_string()),
+        ];
+
+        let report = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                // Wide enough that releasing the guard below is never a race
+                // against the clock; the production constant is banded
+                // separately.
+                engine.run_trim_batch_with_delay(batch, Duration::from_secs(2))
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while present(&engine, &sentinel, "h1") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the first pass never reached the sentinel",
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                present(&engine, &busy, "h1"),
+                "the first pass must have lost the contended target's lock",
+            );
+
+            drop(held.take());
+            worker.join().expect("trim batch thread")
+        });
+
+        assert!(
+            !present(&engine, &busy, "h1"),
+            "a later attempt must reclaim the revision the first pass could not",
+        );
+        assert!(
+            present(&engine, &busy, "h2"),
+            "the just-written revision is still protected on the retry",
+        );
+        assert_eq!(
+            (report.batch, report.retried, report.still_contended),
+            (2, 1, 0),
+            "exactly the contended target was retried, and it succeeded: {report:?}",
+        );
+        assert_eq!(
+            report.removed, 2,
+            "both stale revisions reclaimed: {report:?}"
+        );
+    }
+
+    /// The retry re-enumerates under the lock it newly acquired rather than
+    /// reusing anything decided before the delay, and it still protects the
+    /// revision the request wrote.
+    ///
+    /// `keep = 1` is what makes that second half load-bearing: a revision written
+    /// during the delay sorts newest and takes the only budgeted slot, so the
+    /// recorded `written_hashin` survives *only* because it is passed as
+    /// `protect`. Dropping `protect` deletes a revision the request is still
+    /// handing out.
+    #[test]
+    fn trim_batch_retry_sees_revisions_written_during_the_delay() {
+        let (engine, _dir) = test_engine();
+        let busy = two_revisions(&engine, "busy");
+        let sentinel = two_revisions(&engine, "sentinel");
+
+        let mut held = Some(hold_write(&engine, &busy));
+        let batch = vec![
+            (busy.clone(), 1, "h2".to_string()),
+            (sentinel.clone(), 1, "h2".to_string()),
+        ];
+
+        let report = std::thread::scope(|scope| {
+            let worker =
+                scope.spawn(|| engine.run_trim_batch_with_delay(batch, Duration::from_secs(2)));
+
+            // Same ordered-batch signal as above. Watched through the cache
+            // rather than through the lock — asking for the sentinel's lock here
+            // would contend the pass under test for it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while present(&engine, &sentinel, "h1") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the first pass never reached the sentinel",
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            // A third party lands a newer revision while the batch waits.
+            write_revision(&engine, &busy, "h3", 300, &["o.tar"]);
+            drop(held.take());
+            worker.join().expect("trim batch thread")
+        });
+
+        assert_eq!(report.retried, 1, "{report:?}");
+        assert_eq!(report.still_contended, 0, "{report:?}");
+        assert!(
+            present(&engine, &busy, "h3"),
+            "a revision written during the delay is enumerated and kept as newest",
+        );
+        assert!(
+            present(&engine, &busy, "h2"),
+            "the recorded written revision is protected even though it is no longer newest",
+        );
+        assert!(
+            !present(&engine, &busy, "h1"),
+            "the oldest revision is still reclaimed",
+        );
+    }
+
+    /// A batch that loses nothing must not pay the delay. This is the common
+    /// case — every clean run — so the cost has to be zero, not small.
+    #[test]
+    fn trim_batch_pays_nothing_when_nothing_is_contended() {
+        let (engine, _dir) = test_engine();
+        let a = two_revisions(&engine, "a");
+        let b = two_revisions(&engine, "b");
+
+        // A delay this long is never survivable if the delayed pass is entered.
+        let delay = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let report = engine.run_trim_batch_with_delay(
+            vec![
+                (a.clone(), 1, "h2".to_string()),
+                (b.clone(), 1, "h2".to_string()),
+            ],
+            delay,
+        );
+
+        assert!(
+            started.elapsed() < delay,
+            "an uncontended batch must not sleep",
+        );
+        assert_eq!(
+            (report.batch, report.retried, report.delayed, report.failed),
+            (2, 0, 0, 0),
+            "{report:?}",
+        );
+        assert_eq!((report.removed, report.bytes), (2, 8), "{report:?}");
+        assert!(!present(&engine, &a, "h1"));
+        assert!(!present(&engine, &b, "h1"));
+    }
+
+    /// An empty batch costs nothing at all. Pinned here rather than relying on
+    /// `DeferredTrims::drop`'s own early return, which is a different guard in a
+    /// different file.
+    #[test]
+    fn trim_batch_is_free_when_empty() {
+        let (engine, _dir) = test_engine();
+        let delay = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let report = engine.run_trim_batch_with_delay(Vec::new(), delay);
+        assert!(started.elapsed() < delay);
+        assert_eq!(
+            (report.batch, report.retried, report.delayed, report.removed),
+            (0, 0, 0, 0),
+            "{report:?}",
+        );
+    }
+
+    /// One delayed attempt, not a loop. A target whose lock is held for the whole
+    /// batch is given up on — and the elapsed time proves it was given up after
+    /// exactly one wait, which the counts alone cannot: a three-attempt loop
+    /// reports identical counts.
+    #[test]
+    fn trim_batch_gives_up_after_a_single_delay() {
+        let (engine, _dir) = test_engine();
+        let a = two_revisions(&engine, "a");
+        let b = two_revisions(&engine, "b");
+
+        let _ha = hold_write(&engine, &a);
+        let _hb = hold_write(&engine, &b);
+
+        let delay = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let report = engine.run_trim_batch_with_delay(
+            vec![
+                (a.clone(), 1, "h2".to_string()),
+                (b.clone(), 1, "h2".to_string()),
+            ],
+            delay,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            (
+                report.batch,
+                report.retried,
+                report.delayed,
+                report.still_contended
+            ),
+            (2, 2, 2, 2),
+            "the counts are per *target*, and both stayed contended throughout: {report:?}",
+        );
+        assert!(
+            elapsed >= delay,
+            "the delayed pass must have waited: {elapsed:?}"
+        );
+        assert!(
+            elapsed < delay * 2,
+            "a second wait means this is a loop, not one delayed attempt: {elapsed:?}",
+        );
+        assert!(
+            present(&engine, &a, "h1"),
+            "nothing trimmed under contention"
+        );
+        assert!(present(&engine, &b, "h1"));
+        assert_eq!(report.removed, 0, "{report:?}");
+    }
+
+    /// A trim that fails while *holding* the lock is not contention: waiting
+    /// cannot help, and charging the batch a delay for it would turn a permanent
+    /// fault into a per-run cost that reads as flakiness.
+    #[test]
+    fn trim_batch_does_not_retry_a_failure() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        // An unreadable manifest makes `trim_addr_history` fail with the lock
+        // held — `Failed`, not `Contended`.
+        {
+            let mut w = engine
+                .local_cache
+                .writer(&a, "h1", MANIFEST_V1)
+                .expect("writer");
+            w.write_all(b"not a valid borsh manifest").expect("write");
+            drop(w);
+        }
+        write_revision(&engine, &a, "h2", 200, &["o.tar"]);
+
+        let delay = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let report =
+            engine.run_trim_batch_with_delay(vec![(a.clone(), 1, "h2".to_string())], delay);
+
+        assert!(
+            started.elapsed() < delay,
+            "a failure must not charge the batch the retry delay",
+        );
+        assert_eq!(
+            (report.batch, report.retried, report.failed),
+            (1, 0, 1),
+            "{report:?}",
+        );
+    }
+
+    /// The same for a lock that cannot be *asked for* at all. An `Err` from
+    /// `try_write` is not evidence that a holder exists, so there is nothing for
+    /// a wait to win — the batch must charge no delay and report `failed`, not
+    /// `still_contended`, so an operator is not sent looking for a concurrent
+    /// `heph` that is not there.
+    ///
+    /// Provoked by replacing the lock directory with a regular file, so creating
+    /// the per-addr lock file fails with `ENOTDIR` — which, unlike a permission
+    /// bit, also holds when the suite runs as root.
+    #[test]
+    fn trim_batch_does_not_retry_an_unaskable_lock() {
+        let (engine, _dir) = test_engine();
+        let a = two_revisions(&engine, "t");
+
+        let lock_dir = engine.home.join("lock");
+        std::fs::remove_dir_all(&lock_dir).expect("remove lock dir");
+        std::fs::write(&lock_dir, b"not a directory").expect("write file over lock dir");
+
+        let delay = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let report =
+            engine.run_trim_batch_with_delay(vec![(a.clone(), 1, "h2".to_string())], delay);
+
+        assert!(
+            started.elapsed() < delay,
+            "an unaskable lock must not charge the batch the retry delay",
+        );
+        assert_eq!(
+            (
+                report.batch,
+                report.retried,
+                report.still_contended,
+                report.failed
+            ),
+            (1, 0, 0, 1),
+            "{report:?}",
+        );
+    }
+
+    /// A waker that releases a held write guard on its `nth` wake, re-arming
+    /// itself on every earlier one — the shape `hcore::blocking`'s contract
+    /// requires of a waiter that is still pending.
+    ///
+    /// This is the whole mechanism the batch's flushes exist for, in miniature:
+    /// `flush_backstop` hands back the `Waker`s it holds, and dropping one can
+    /// release a cache read guard inline on the flushing thread. Choosing which
+    /// wake releases is what lets a test name *which* flush it is pinning.
+    ///
+    /// **Only wakes arriving on `only_from` are counted.** `hcore::blocking`'s
+    /// pending list is process-wide, so the backstop tick and every other test in
+    /// this binary that tears down a request state can wake this registration
+    /// too. An uncounted foreign wake would advance the phase and release the
+    /// guard a flush early — which does not break reclamation, but does make an
+    /// assertion about *which* flush released it fail for an unrelated reason
+    /// (observed, before this filter existed). `flush_backstop` wakes inline on
+    /// the flushing thread and the tick has a thread of its own, so the thread id
+    /// is exactly the discriminator: a wake from anywhere else re-arms and is
+    /// ignored.
+    struct ReleasingWaker {
+        remaining: std::sync::atomic::AtomicUsize,
+        guard: std::sync::Mutex<Option<ResultWriteGuard>>,
+        backstop: hcore::blocking::Backstop,
+        only_from: std::thread::ThreadId,
+    }
+
+    impl ReleasingWaker {
+        /// Arm a waker that releases `guard` on the `nth` wake delivered by the
+        /// calling thread — which must also be the thread that runs the batch.
+        fn arm(guard: ResultWriteGuard, nth: usize) -> Arc<Self> {
+            let me = Arc::new(Self {
+                remaining: std::sync::atomic::AtomicUsize::new(nth),
+                guard: std::sync::Mutex::new(Some(guard)),
+                backstop: hcore::blocking::Backstop::new(),
+                only_from: std::thread::current().id(),
+            });
+            Self::rearm(&me);
+            me
+        }
+
+        fn released(&self) -> bool {
+            self.guard.lock().expect("guard lock").is_none()
+        }
+
+        fn rearm(me: &Arc<Self>) {
+            me.backstop.arm(&futures::task::waker(Arc::clone(me)));
+        }
+    }
+
+    impl futures::task::ArcWake for ReleasingWaker {
+        fn wake_by_ref(me: &Arc<Self>) {
+            use std::sync::atomic::Ordering;
+            if std::thread::current().id() != me.only_from {
+                // Somebody else's flush, or the tick. It took our registration;
+                // put it back, and do not advance the phase.
+                Self::rearm(me);
+                return;
+            }
+            let before = me
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .unwrap_or(0);
+            if before <= 1 {
+                // The wait is over: release, and deliberately do not re-arm.
+                drop(me.guard.lock().expect("guard lock").take());
+            } else {
+                Self::rearm(me);
+            }
+        }
+    }
+
+    /// The batch flushes *before* its first pass.
+    ///
+    /// Not redundant with the flush `DeferredTrims::drop` already does: that one
+    /// runs on the dropping thread, and the batch is dequeued an unbounded time
+    /// later. A registration armed in that gap still pins whatever its task
+    /// holds — here, literally the write guard the trim needs.
+    ///
+    /// Pinned by `retried == 0`: with the flush the guard is gone before the
+    /// first pass, so nothing is ever contended. Remove it and the first pass
+    /// loses, and the *second* flush recovers it — same reclamation, different
+    /// count.
+    #[test]
+    fn trim_batch_flushes_before_the_first_pass() {
+        let _exclusive = crate::engine::gc::backstop_exclusive();
+        let (engine, _dir) = test_engine();
+        let a = two_revisions(&engine, "t");
+
+        let waker = ReleasingWaker::arm(hold_write(&engine, &a), 1);
+        let report = engine
+            .run_trim_batch_with_delay(vec![(a.clone(), 1, "h2".to_string())], Duration::ZERO);
+
+        assert!(waker.released(), "the flush must have woken our waker");
+        assert!(report.flushed >= 1, "the batch must flush: {report:?}");
+        assert_eq!(
+            (report.retried, report.removed),
+            (0, 1),
+            "the pre-pass flush released the guard before anything was contended: {report:?}",
+        );
+    }
+
+    /// The batch flushes again before it *re-probes* the contended subset, and
+    /// that re-probe is what usually spares the delay.
+    ///
+    /// Pinned by `delayed == 0`: the guard is released by the second flush, the
+    /// immediate re-probe wins, and no wait is charged. Remove that flush and the
+    /// re-probe loses, the batch sleeps, and the post-sleep flush recovers it —
+    /// same reclamation, but the run paid `TRIM_RETRY_DELAY` for nothing.
+    #[test]
+    fn trim_batch_reprobes_after_a_flush_before_paying_the_delay() {
+        let _exclusive = crate::engine::gc::backstop_exclusive();
+        let (engine, _dir) = test_engine();
+        let a = two_revisions(&engine, "t");
+
+        // Releases on the *second* wake, so the first flush cannot do it.
+        let waker = ReleasingWaker::arm(hold_write(&engine, &a), 2);
+        let delay = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let report =
+            engine.run_trim_batch_with_delay(vec![(a.clone(), 1, "h2".to_string())], delay);
+
+        assert!(waker.released());
+        assert!(
+            started.elapsed() < delay,
+            "the re-probe must land before any wait is charged",
+        );
+        assert_eq!(
+            (report.retried, report.delayed, report.removed),
+            (1, 0, 1),
+            "contended once, then reclaimed by the free re-probe: {report:?}",
+        );
+    }
+
+    /// And the batch flushes once more *after* the wait, before its final
+    /// attempt.
+    ///
+    /// The pre-sleep flush took every registration it found; anything that
+    /// re-armed during the wait — a waiter that was genuinely still pending — is
+    /// only handed back by a flush on the far side of it. Without this one the
+    /// batch sleeps and then asks for a lock whose owner it never woke.
+    ///
+    /// Pinned by `still_contended == 0` with the guard released on the third
+    /// wake, which only the third flush can deliver.
+    #[test]
+    fn trim_batch_flushes_again_after_the_delay() {
+        let _exclusive = crate::engine::gc::backstop_exclusive();
+        let (engine, _dir) = test_engine();
+        let a = two_revisions(&engine, "t");
+
+        let waker = ReleasingWaker::arm(hold_write(&engine, &a), 3);
+        let report = engine.run_trim_batch_with_delay(
+            vec![(a.clone(), 1, "h2".to_string())],
+            Duration::from_millis(20),
+        );
+
+        assert!(waker.released());
+        assert_eq!(
+            (report.retried, report.delayed, report.still_contended),
+            (1, 1, 0),
+            "the post-wait flush released the guard for the final attempt: {report:?}",
+        );
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(!present(&engine, &a, "h1"));
+    }
+
+    /// The delay is exit latency paid by every run whose contention outlives a
+    /// flush, so it is held to a band rather than left to drift. Below ~10ms it
+    /// cannot cover a scheduler hop on a loaded runner and the wait is theatre;
+    /// above ~50ms it is a visible stall after the user already has their output,
+    /// on the thread that also owes every queued sandbox rmdir.
+    #[test]
+    fn trim_retry_delay_stays_in_its_band() {
+        assert!(
+            (Duration::from_millis(10)..=Duration::from_millis(50)).contains(&TRIM_RETRY_DELAY),
+            "TRIM_RETRY_DELAY is {TRIM_RETRY_DELAY:?}; re-justify it before moving it out of band",
+        );
     }
 
     #[tokio::test]
