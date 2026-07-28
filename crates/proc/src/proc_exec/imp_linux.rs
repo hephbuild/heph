@@ -191,38 +191,135 @@ fn make_reader<R: tokio::io::AsyncRead + Send + Unpin + 'static>(s: R) -> ChunkR
     }
 }
 
+/// Read `reader` to EOF, appending into `out` and recording the outcome in
+/// `res`.
+///
+/// Both are borrowed rather than owned so that abandoning this future on the
+/// post-exit deadline still leaves every byte read so far — and any error a
+/// stream hit before the other one stalled — in the caller's hands.
+///
+/// This deliberately stays on `ChunkReader::recv` rather than calling
+/// `AsyncReadExt::read_to_end` directly. It costs one 8 KiB allocation and
+/// one extra copy per chunk, and buys two things: `output` reads through the
+/// exact same path as the streaming consumer (`pluginexec`), and
+/// partial-data-on-drop is a property of this loop rather than an internal
+/// detail of tokio's `read_to_end` that a version bump could change under a
+/// correctness argument that depends on it.
+async fn read_into(
+    reader: Option<&mut ChunkReader>,
+    out: &mut Vec<u8>,
+    res: &mut Option<io::Result<()>>,
+) {
+    *res = Some(
+        async {
+            let Some(r) = reader else { return Ok(()) };
+            while let Some(chunk) = r.recv().await? {
+                out.extend_from_slice(&chunk);
+            }
+            Ok(())
+        }
+        .await,
+    );
+}
+
 pub(super) async fn output(
     spec: Spec,
     cancel: &(dyn Cancellable + Send + Sync),
 ) -> io::Result<Output> {
     let mut handle = spawn(spec)?;
+    let pid = handle.pid();
     let mut stdout_reader = handle.take_stdout();
     let mut stderr_reader = handle.take_stderr();
 
-    let stdout_fut = async move {
-        let mut out = Vec::new();
-        if let Some(r) = stdout_reader.as_mut() {
-            while let Some(chunk) = r.recv().await? {
-                out.extend_from_slice(&chunk);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    // Per-stream, so a stream that finished still reports its error even when
+    // the other one is stalled behind a stray descendant. A single combined
+    // result would only exist once *both* halves completed, which is exactly
+    // the case abandonment rules out.
+    let mut stdout_res: Option<io::Result<()>> = None;
+    let mut stderr_res: Option<io::Result<()>> = None;
+
+    let (status, abandoned) = {
+        // Both pipes must be drained *while* the child runs: the kernel pipe
+        // buffer is 64 KiB, and a child that outruns it blocks in `write`
+        // forever if nobody is reading.
+        let readers = async {
+            tokio::join!(
+                read_into(stdout_reader.as_mut(), &mut stdout, &mut stdout_res),
+                read_into(stderr_reader.as_mut(), &mut stderr, &mut stderr_res),
+            );
+        };
+        tokio::pin!(readers);
+        let mut all_drained = false;
+
+        let status = {
+            let wait = handle.wait_or_cancel(cancel);
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    // The readers reaching EOF does not end the wait, and the
+                    // wait ending does not (yet) end the readers — whichever
+                    // lands first, we keep polling the other. The guard is
+                    // load-bearing: polling `readers` again after it resolved
+                    // panics with "`async fn` resumed after completion".
+                    res = &mut wait => break res?,
+                    () = &mut readers, if !all_drained => all_drained = true,
+                }
             }
-        }
-        Ok::<Vec<u8>, io::Error>(out)
-    };
-    let stderr_fut = async move {
-        let mut out = Vec::new();
-        if let Some(r) = stderr_reader.as_mut() {
-            while let Some(chunk) = r.recv().await? {
-                out.extend_from_slice(&chunk);
-            }
-        }
-        Ok::<Vec<u8>, io::Error>(out)
+        };
+
+        // The child is reaped. Anything it wrote is already read or sitting
+        // in the pipe, so EOF is moments away — unless a descendant it
+        // double-forked inherited the write end, in which case it never
+        // comes. Bound the wait and abandon the readers if it does not.
+        //
+        // The timer is armed only on the success path. A cancelled wait
+        // returns above, which keeps `tokio::time` off the runtime-teardown
+        // path for the same reason `wait_or_cancel` sleeps on the blocking
+        // pool rather than the time driver.
+        let abandoned = if all_drained {
+            false
+        } else {
+            // `Timeout` polls the inner future before it polls the delay, and
+            // `read_into` loops until `recv` is `Pending`. So the poll that
+            // precedes `Elapsed` has already drained the pipe to `EAGAIN`:
+            // bytes lost here can only be bytes written *after* the child was
+            // reaped and the pipe ran dry — i.e. a descendant's, never the
+            // child's.
+            tokio::time::timeout(super::DRAIN_DEADLINE, &mut readers)
+                .await
+                .is_err()
+        };
+
+        (status, abandoned)
+        // The borrows end here. The read ends themselves close a few
+        // statements later when `stdout_reader` / `stderr_reader` drop at
+        // function exit, at which point a descendant still holding the write
+        // end gets EPIPE on its next write.
     };
 
-    let (status_res, stdout_res, stderr_res) =
-        tokio::join!(handle.wait_or_cancel(cancel), stdout_fut, stderr_fut);
-    let status = status_res?;
-    let stdout = stdout_res?;
-    let stderr = stderr_res?;
+    if abandoned {
+        tracing::warn!(
+            pid,
+            stdout_len = stdout.len(),
+            stderr_len = stderr.len(),
+            stdout_open = stdout_res.is_none(),
+            stderr_open = stderr_res.is_none(),
+            "proc_exec: pipe still open after child exit; abandoning the drain \
+             (a surviving descendant holds the write end)"
+        );
+    }
+
+    // Surface a genuine read error from either stream that ran to completion.
+    // An abandoned stream has no verdict to report; it is covered by the
+    // warning above rather than by failing the child.
+    if let Some(res) = stdout_res {
+        res?;
+    }
+    if let Some(res) = stderr_res {
+        res?;
+    }
 
     Ok(Output {
         status,
