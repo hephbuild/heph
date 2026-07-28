@@ -81,4 +81,26 @@ mod tests {
             .expect("spawn small-stack thread");
         assert_eq!(handle.join().expect("thread must not overflow"), 20_000);
     }
+
+    /// `maybe_grow` has to work on a *tokio worker*, not just on a thread we sized
+    /// ourselves: `remaining_stack()` must resolve the bounds of a runtime-owned
+    /// thread, and the segment switch must survive being driven through a task.
+    /// That is the shape every caller uses — `Engine::result` spawns each target,
+    /// and both TUI backends spawn the app future — so the wrapper is load-bearing
+    /// exactly here.
+    ///
+    /// The stack size is set explicitly rather than left to tokio's 2 MiB default:
+    /// the default honours `RUST_MIN_STACK`, and under a large value this would
+    /// pass with the wrapper removed — a test that cannot fail.
+    #[test]
+    fn grow_stack_survives_deep_recursion_on_a_tokio_worker() {
+        const DEPTH: usize = 20_000;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(2 * 1024 * 1024)
+            .build()
+            .expect("build runtime");
+        let reached = rt.block_on(async { tokio::spawn(grow_stack(deep(DEPTH))).await });
+        assert_eq!(reached.expect("app task"), DEPTH);
+    }
 }
