@@ -79,11 +79,12 @@ pub enum ManifestArtifactType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlobResidency {
     /// Nothing has looked yet — probe each needed blob, and degrade the hit to a
-    /// miss if one is gone. The state of a plain local hit, where the manifest
-    /// may well outlive the blobs a GC reclaimed.
+    /// miss if one is gone. The state of a read that did not go through
+    /// `Engine::materialize_blobs`, where the manifest may well outlive the blobs
+    /// a GC reclaimed.
     Unknown,
     /// Every needed blob was just confirmed present or pulled, by
-    /// `Engine::materialize_from_remote` over exactly this artifact set
+    /// `Engine::materialize_blobs` over exactly this artifact set
     /// ([`Engine::needed_artifacts`] is shared by both paths). Re-probing has
     /// nothing left to learn, and skipping it does not skip the wait so much as
     /// move it to whoever actually reads the bytes — `reader` does its own
@@ -316,6 +317,51 @@ impl hartifactcontent::Content for CacheArtifact {
 
     fn file_path(&self) -> Option<std::path::PathBuf> {
         self.cache.file_path(&self.addr, &self.hashin, &self.name)
+    }
+}
+
+/// Whether a caller asking for `outputs` reads this revision's support files.
+///
+/// Support files materialize into a sandbox *alongside* an output group, so a
+/// caller that requested none opens none of them — that is the hashout-only path,
+/// which reads no bytes at all.
+///
+/// The exception is a revision with no Output artifact whatsoever: there, an
+/// empty `outputs` is not "I want nothing", it is "there was nothing to ask
+/// for" (`OutputMatcher::All` over a target that declares no output group
+/// resolves to the same empty vec). Its support files are the only thing it
+/// has, so they stay needed — a runtime dep on such a target still gets them
+/// staged.
+///
+/// The rule itself is [`support_files_needed_for`], so the cached read path and
+/// the freshly-executed path in `build_eresult` cannot drift apart — a caller
+/// must be handed the same support files whether the target hit or built.
+fn support_files_needed(manifest: &Manifest, outputs: &[String]) -> bool {
+    let has_output = manifest
+        .artifacts
+        .iter()
+        .any(|a| a.r#type == ManifestArtifactType::Output);
+    support_files_needed_for(has_output, outputs)
+}
+
+/// [`support_files_needed`] over an artifact set that is not a manifest —
+/// `has_output_artifact` is "does this revision have any Output at all".
+pub(crate) fn support_files_needed_for(has_output_artifact: bool, outputs: &[String]) -> bool {
+    !outputs.is_empty() || !has_output_artifact
+}
+
+/// Whether one manifest artifact is a blob a caller asking for `outputs` will
+/// actually read — the single predicate behind [`Engine::needed_artifacts`] and
+/// the per-artifact gate in [`Engine::artifacts_from_manifest`], so residency is
+/// never decided against a different set than the one that gets read.
+///
+/// `support_needed` comes from [`support_files_needed`]; it is passed in rather
+/// than recomputed so a per-artifact loop stays linear.
+fn artifact_is_needed(a: &ManifestArtifact, outputs: &[String], support_needed: bool) -> bool {
+    match a.r#type {
+        ManifestArtifactType::Output => outputs.contains(&a.group),
+        ManifestArtifactType::SupportFile => support_needed,
+        ManifestArtifactType::Log => false,
     }
 }
 
@@ -642,9 +688,29 @@ impl Engine {
     }
 
     /// The blobs a caller asking for `outputs` will actually read: its Output
-    /// groups plus every SupportFile (which travels with the target wherever it is
-    /// referenced), and never a Log — logs are written to the cache but no read
-    /// path surfaces them.
+    /// groups plus — **when it asked for at least one group** — every SupportFile
+    /// (which travels with the target wherever its outputs are referenced), and
+    /// never a Log — logs are written to the cache but no read path surfaces them.
+    ///
+    /// A caller that requested **no** output group reads nothing at all. It wants
+    /// the revision's `hashout`s (to fold into its own `hashin`), which the
+    /// manifest already carries; the bytes behind them are never opened. Support
+    /// files only ever materialize into a sandbox alongside an output group, so
+    /// with no group requested there is no reader for them either. That is the
+    /// whole hashout-only path of a cached build — and the reason it moves no
+    /// bytes and, on a manifest mirrored from a remote, makes no network call.
+    /// Their `ArtifactMeta` is still reported: see
+    /// [`artifacts_from_manifest`](Self::artifacts_from_manifest).
+    ///
+    /// **One exception, and it costs the network call.** An empty `outputs` is
+    /// ambiguous: `OutputMatcher::None` and `OutputMatcher::All` over a target
+    /// that declares no output group both arrive here as an empty vec, and only
+    /// the second still wants its support files staged. [`support_files_needed`]
+    /// resolves it from the manifest, erring towards staging — so a hashout-only
+    /// resolve of an **output-less target that carries support files** (the
+    /// `go_lint_gate` / `go_format_check` shape) still needs those blobs, and
+    /// still pays a lookup for them. Threading the caller's intent down here
+    /// instead of inferring it would close that; see the PR that introduced this.
     ///
     /// The single definition of "needed", shared by the read path
     /// ([`artifacts_from_manifest`](Self::artifacts_from_manifest)), the residency
@@ -655,11 +721,11 @@ impl Engine {
         manifest: &'a Manifest,
         outputs: &'a [String],
     ) -> impl Iterator<Item = &'a ManifestArtifact> {
-        manifest.artifacts.iter().filter(|a| match a.r#type {
-            ManifestArtifactType::Output => outputs.contains(&a.group),
-            ManifestArtifactType::SupportFile => true,
-            ManifestArtifactType::Log => false,
-        })
+        let support_needed = support_files_needed(manifest, outputs);
+        manifest
+            .artifacts
+            .iter()
+            .filter(move |a| artifact_is_needed(a, outputs, support_needed))
     }
 
     /// Names of the blobs a caller asking for `outputs` needs that are not in the
@@ -744,10 +810,22 @@ impl Engine {
     }
 
     /// Build this caller's artifact set from an already-parsed `manifest`, gating
-    /// Output groups to `outputs` (SupportFiles always travel). Returns `None`
+    /// the blobs to [`needed_artifacts`](Self::needed_artifacts). Returns `None`
     /// when a required blob is missing — treat as a miss. Splitting this from
     /// [`read_manifest`](Self::read_manifest) lets a confirmed hit reuse the parsed
     /// manifest instead of re-reading + re-deserializing it for each caller.
+    ///
+    /// The two returned sets are deliberately not symmetric:
+    ///
+    /// - the **artifacts** are only the needed ones — what this caller reads;
+    /// - the **metas** are *every* Output and SupportFile of the revision,
+    ///   regardless of what was requested.
+    ///
+    /// The meta set is the target's contribution to its dependents' `hashin`, so
+    /// it must depend on the revision alone. Were it narrowed to the requested
+    /// groups, what a caller asked for would leak into the cache key — two
+    /// dependents of the same revision would compute different keys, and the
+    /// hit/miss decision would become an input to itself.
     ///
     /// `residency` says whether the per-blob probe is still needed — see
     /// [`BlobResidency`].
@@ -766,6 +844,7 @@ impl Engine {
         // `exists_local` keeping the probe non-blocking.
         let mut results: Vec<CacheArtifact> = Vec::with_capacity(manifest.artifacts.len());
         let mut result_meta: Vec<ArtifactMeta> = Vec::with_capacity(manifest.artifacts.len());
+        let support_needed = support_files_needed(manifest, outputs);
 
         for artifact in &manifest.artifacts {
             // Outputs and SupportFiles both flow back to dependents — Output
@@ -781,10 +860,10 @@ impl Engine {
                 hashout: artifact.hashout.clone(),
             });
 
-            // Outputs are gated on the caller's requested output groups.
-            // SupportFiles travel with the target wherever it's referenced.
-            if artifact.r#type == ManifestArtifactType::Output && !outputs.contains(&artifact.group)
-            {
+            // Past the meta, only what this caller actually reads is probed and
+            // handed back — Outputs gated on the requested groups, SupportFiles
+            // gated on there being a requested group at all.
+            if !artifact_is_needed(artifact, outputs, support_needed) {
                 continue;
             }
 

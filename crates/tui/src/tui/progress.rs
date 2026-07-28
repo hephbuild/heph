@@ -447,6 +447,15 @@ fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
     }
 }
 
+/// Which cache answered for an addr — kept so a hit can be taken back off the
+/// right counter when the target turns out to need building after all. See the
+/// `ExecuteStart` arm of [`BuildState::apply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheHitKind {
+    Local,
+    Remote,
+}
+
 /// Folds the engine's build-progress event stream into renderable state.
 #[derive(Debug, Default)]
 pub struct BuildState {
@@ -496,10 +505,18 @@ pub struct BuildState {
     local_misses: usize,
     remote_hits: usize,
     remote_misses: usize,
-    /// Addrs that had a cache hit (local or remote). The header's "cached" count
-    /// is `matched ∩ cache_hit` so it tracks matched targets only, not the
-    /// transitive deps that also hit cache.
-    cache_hit: HashSet<String>,
+    /// Addrs that had a cache hit, and which kind. The header's "cached" count is
+    /// `matched ∩ cache_hit` so it tracks matched targets only, not the transitive
+    /// deps that also hit cache.
+    ///
+    /// The kind is kept because a hit can be **retracted**: the engine decides a
+    /// hit from the revision's manifest, and a manifest can outlive its blobs (a
+    /// local GC, an object-store lifecycle rule, or simply a revision whose blobs
+    /// were never pulled on a run that is now offline). The engine then rebuilds
+    /// the target, which arrives here as an `ExecuteStart` for an addr already
+    /// counted as cached. Without the kind there is no way to know which counter
+    /// to take it back out of.
+    cache_hit: HashMap<String, CacheHitKind>,
     /// Worker capacity announced by the engine via `MaxWorkers`. `None` until
     /// the event lands (no worker indicator rendered before then).
     max_workers: Option<usize>,
@@ -606,7 +623,7 @@ impl BuildState {
                         if self.finished.contains(addr) {
                             self.matched_finished += 1;
                         }
-                        if self.cache_hit.contains(addr) {
+                        if self.cache_hit.contains_key(addr) {
                             self.matched_cached += 1;
                         }
                     }
@@ -637,7 +654,17 @@ impl BuildState {
             }
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `built` counter side effect on a successful end.
-            BuildEventKind::ExecuteStart { .. } => {}
+            //
+            // A target that executes is not a cached target — even if it was
+            // announced as a hit first. The engine decides a hit from the
+            // revision's manifest, which can outlive its blobs, so the bytes may
+            // turn out to be unreadable (GC'd, expired on a shared cache, or
+            // simply never pulled and the remote is now unreachable) and the
+            // target is rebuilt. Retract the hit here rather than counting the
+            // same addr as both cached and built, which would let "built + cached"
+            // exceed the number of targets — and, on an offline run over a
+            // remote-mirrored cache, report a full rebuild as "N cached".
+            BuildEventKind::ExecuteStart { addr, .. } => self.retract_cache_hit(addr),
             BuildEventKind::ExecuteEnd { error, .. } => {
                 if error.is_none() {
                     self.built += 1;
@@ -645,12 +672,12 @@ impl BuildState {
             }
             BuildEventKind::LocalCacheHit { addr } => {
                 self.local_hits += 1;
-                self.note_cache_hit(addr);
+                self.note_cache_hit(addr, CacheHitKind::Local);
             }
             BuildEventKind::LocalCacheMiss { .. } => self.local_misses += 1,
             BuildEventKind::RemoteCacheHit { addr } => {
                 self.remote_hits += 1;
-                self.note_cache_hit(addr);
+                self.note_cache_hit(addr, CacheHitKind::Remote);
             }
             BuildEventKind::RemoteCacheMiss { .. } => self.remote_misses += 1,
             BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
@@ -679,9 +706,44 @@ impl BuildState {
     /// `matched ∩ cache_hit`; the `Matched` arm of [`BuildState::apply`] covers
     /// the other one, so the count is right whichever event arrives first. A
     /// repeat hit on an addr already in the set does not re-count.
-    fn note_cache_hit(&mut self, addr: &str) {
-        if self.cache_hit.insert(addr.to_string()) && self.matched.contains(addr) {
+    ///
+    /// `kind` is remembered so [`retract_cache_hit`](Self::retract_cache_hit) can
+    /// undo this exact bookkeeping if the hit turns out not to stand.
+    fn note_cache_hit(&mut self, addr: &str, kind: CacheHitKind) {
+        if self.cache_hit.insert(addr.to_string(), kind).is_none() && self.matched.contains(addr) {
             self.matched_cached += 1;
+        }
+    }
+
+    /// Take a cache hit back off every counter [`note_cache_hit`](Self::note_cache_hit)
+    /// put it on, because the target is about to build after all.
+    ///
+    /// The engine decides a hit from the revision's manifest, which can outlive
+    /// its blobs — a local GC, an expiry rule on a shared cache, or blobs that
+    /// were never pulled and a remote that is now unreachable. It announces the
+    /// hit, discovers the bytes are unreadable, and rebuilds. Dropping the addr
+    /// from `cache_hit` alone is not enough: `matched_cached` is folded, not
+    /// rescanned, so it has to be decremented in the same breath or the header
+    /// keeps reporting a target as cached while it builds.
+    ///
+    /// A no-op for an addr that never hit — the ordinary cache miss, which is
+    /// most `ExecuteStart`s.
+    fn retract_cache_hit(&mut self, addr: &str) {
+        let Some(kind) = self.cache_hit.remove(addr) else {
+            return;
+        };
+        if self.matched.contains(addr) {
+            self.matched_cached = self.matched_cached.saturating_sub(1);
+        }
+        match kind {
+            CacheHitKind::Local => {
+                self.local_hits = self.local_hits.saturating_sub(1);
+                self.local_misses += 1;
+            }
+            CacheHitKind::Remote => {
+                self.remote_hits = self.remote_hits.saturating_sub(1);
+                self.remote_misses += 1;
+            }
         }
     }
 
@@ -878,7 +940,7 @@ impl BuildState {
     pub fn cached_lines(&self, scope: CountScope, filter: &str) -> Vec<Line<'static>> {
         let mut addrs: Vec<&String> = self
             .cache_hit
-            .iter()
+            .keys()
             .filter(|a| match scope {
                 CountScope::All => true,
                 CountScope::Matched if self.matched_seen => self.matched.contains(*a),
@@ -2162,6 +2224,89 @@ mod tests {
         assert!(summary.contains("2 miss"), "summary: {summary}");
     }
 
+    /// A cache hit the engine later has to rebuild must stop counting as a hit.
+    ///
+    /// The engine decides a hit from the revision's manifest, which can outlive
+    /// its blobs — a local GC, an expiry rule on a shared cache, or blobs that
+    /// were never pulled and a remote that is now unreachable. It announces the
+    /// hit, discovers the bytes are unreadable, and rebuilds. Counting both would
+    /// let "built + cached" exceed the number of targets, and would report a
+    /// fully-offline rebuild of the whole graph as "N cached" — the header would
+    /// say the opposite of what happened.
+    #[test]
+    fn a_hit_that_rebuilds_stops_counting_as_a_hit() {
+        let mut s = BuildState::new();
+        // `matched_cached` is folded at both edges — a hit can be announced
+        // before or after its addr is matched — so retraction has to survive
+        // both orders. `//a:local` and `//a:stands` are matched first and hit
+        // after; `//a:remote` hits first and is matched after.
+        s.apply(&ev(1, matched(&["//a:local", "//a:stands"], false)));
+        s.apply(&ev(2, local_cache_hit("//a:local")));
+        s.apply(&ev(3, remote_cache_hit("//a:remote")));
+        s.apply(&ev(4, local_cache_hit("//a:stands")));
+        s.apply(&ev(5, matched(&["//a:remote"], true)));
+        assert_eq!((s.local_hits, s.remote_hits), (2, 1));
+        assert_eq!(
+            s.cached_count(CountScope::Matched),
+            3,
+            "all three matched targets are announced cached to begin with"
+        );
+
+        // Two of the three revisions turn out to be unreadable and get rebuilt.
+        s.apply(&ev(6, execute_start("//a:local")));
+        s.apply(&ev(7, execute_start("//a:remote")));
+        s.apply(&ev(8, execute_end("//a:local")));
+        s.apply(&ev(9, execute_end("//a:remote")));
+
+        assert_eq!(
+            (s.local_hits, s.remote_hits),
+            (1, 0),
+            "a rebuilt target must be taken back off the cache counter it was put on"
+        );
+        assert_eq!(
+            (s.local_misses, s.remote_misses),
+            (1, 1),
+            "and counted as the miss it turned out to be"
+        );
+        assert_eq!(s.built, 2);
+        // Through the header's own accessors, not the raw counters: these are the
+        // numbers the user reads, and the point is that `built + cached` (2 + 1)
+        // does not exceed the three targets seen.
+        assert_eq!(
+            s.cached_count(CountScope::All),
+            1,
+            "only the hit that stood may still be reported as cached"
+        );
+        assert_eq!(
+            s.cached_count(CountScope::Matched),
+            1,
+            "the folded `matched ∩ cache_hit` counter must be decremented too — \
+             dropping the addr from the set alone leaves the count stale"
+        );
+        assert_eq!(
+            s.cached_count(CountScope::Matched),
+            scan_matched(&s).1,
+            "the folded counter must still agree with the set it stands in for"
+        );
+        assert!(
+            !s.cache_hit.contains_key("//a:local") && s.cache_hit.contains_key("//a:stands"),
+            "only the rebuilt addrs are retracted: {:?}",
+            s.cache_hit
+        );
+    }
+
+    /// A target that executes without ever being announced as a hit — the plain
+    /// miss — must not underflow the hit counters.
+    #[test]
+    fn executing_a_target_that_never_hit_leaves_the_counters_alone() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1, execute_start("//a:fresh")));
+        s.apply(&ev(2, execute_end("//a:fresh")));
+        assert_eq!((s.local_hits, s.remote_hits), (0, 0));
+        assert_eq!((s.local_misses, s.remote_misses), (0, 0));
+        assert_eq!(s.built, 1);
+    }
+
     #[test]
     fn long_running_filters_by_threshold_and_sorts_desc() {
         let mut s = BuildState::new();
@@ -2449,7 +2594,7 @@ mod tests {
             s.matched.iter().filter(|a| s.finished.contains(*a)).count(),
             s.matched
                 .iter()
-                .filter(|a| s.cache_hit.contains(*a))
+                .filter(|a| s.cache_hit.contains_key(*a))
                 .count(),
         )
     }

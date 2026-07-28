@@ -128,6 +128,9 @@ pub struct TelemetryCollector {
     size_histogram: AtomicHistogram,
     /// Targets that actually executed (cache misses) this process.
     executes: AtomicU64,
+    /// Announced cache hits that then had to be rebuilt because the revision's
+    /// bytes could not be read — see [`record_cache_hit_rebuilt`](Self::record_cache_hit_rebuilt).
+    cache_hits_rebuilt: AtomicU64,
     /// Power-of-two histogram of per-target execute wall time (ms), for p99.
     execute_ms_histogram: AtomicHistogram,
     /// Total target count of a whole-graph (`//...`) query, when one ran. `0`
@@ -189,6 +192,7 @@ impl TelemetryCollector {
             max_artifact_bytes: AtomicU64::new(0),
             size_histogram: AtomicHistogram::new(),
             executes: AtomicU64::new(0),
+            cache_hits_rebuilt: AtomicU64::new(0),
             execute_ms_histogram: AtomicHistogram::new(),
             graph_size: AtomicU64::new(0),
             remote_cache_hits: AtomicU64::new(0),
@@ -268,6 +272,20 @@ impl TelemetryCollector {
     pub fn record_execute_ms(&self, ms: u64) {
         self.executes.fetch_add(1, Ordering::Relaxed);
         self.execute_ms_histogram.record(ms);
+    }
+
+    /// Record a cache hit that had to be rebuilt after all.
+    ///
+    /// A hit is decided from the revision's manifest, which can outlive its blobs
+    /// (a local GC, an object-store lifecycle rule, or blobs that were never
+    /// pulled on a run that is now offline), so `local_cache_hits` /
+    /// `remote_cache_hits` count *announced* hits and this counts the subset that
+    /// then executed. Reported rather than subtracted: how often a cache promises
+    /// bytes it cannot produce is the interesting number, and the collector holds
+    /// no per-addr state to subtract from — deliberately, so its memory never
+    /// grows with the build.
+    pub fn record_cache_hit_rebuilt(&self) {
+        self.cache_hits_rebuilt.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the total target count of a whole-graph (`//...`) query. Keeps the
@@ -356,6 +374,7 @@ impl TelemetryCollector {
             p99_artifact_bytes: self.size_histogram.percentile_99(),
             sized_artifacts: self.sized_artifacts.load(Ordering::Relaxed),
             executes: self.executes.load(Ordering::Relaxed),
+            cache_hits_rebuilt: self.cache_hits_rebuilt.load(Ordering::Relaxed),
             p99_execute_ms: self.execute_ms_histogram.percentile_99(),
             graph_size: self.graph_size.load(Ordering::Relaxed),
             remote_cache_hits: self.remote_cache_hits.load(Ordering::Relaxed),
@@ -406,6 +425,9 @@ pub struct TelemetrySnapshot {
     /// Targets that actually executed (cache misses); population behind the
     /// execute p99. `0` means `p99_execute_ms` is not meaningful.
     pub executes: u64,
+    /// Announced cache hits that then had to be rebuilt (the revision's bytes
+    /// were gone). A subset of `local_cache_hits + remote_cache_hits`.
+    pub cache_hits_rebuilt: u64,
     /// Approximate 99th percentile per-target execute wall time (ms).
     pub p99_execute_ms: u64,
     pub graph_size: u64,
