@@ -101,8 +101,7 @@ fn start_backstop_thread() {
                     thread::sleep(WAKE_BACKSTOP);
                     // Clone under the lock and wake outside it: a waker may
                     // re-enter this module from inside `wake`.
-                    let due: Vec<Waker> =
-                        lock_pending().iter().map(|(_, w)| w.clone()).collect();
+                    let due: Vec<Waker> = lock_pending().iter().map(|(_, w)| w.clone()).collect();
                     for waker in due {
                         waker.wake();
                     }
