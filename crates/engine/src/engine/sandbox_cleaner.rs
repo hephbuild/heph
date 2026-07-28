@@ -98,9 +98,33 @@ fn sender() -> &'static Sender<Job> {
 pub fn enqueue(label: String, job: SandboxCleanupJob, pending: PendingCounter) {
     // Count before sending so the counter can never observe an enqueued job as
     // already drained. The worker decrements once the job has run.
+    reserve(&pending);
+    enqueue_reserved(label, job, pending);
+}
+
+/// Take a slot in `pending` for a job that will only be submitted later.
+///
+/// The counter is what the shutdown path polls to decide the process may exit
+/// (`tui::backend::ci`, `tui::backend::interactive`), so work that is *decided*
+/// now but *submitted* later has to hold its slot across the gap — otherwise
+/// the drain can read zero in between and exit out from under it. The
+/// reservation must end up in exactly one [`enqueue_reserved`], or be given
+/// back with [`release_reservation`].
+pub fn reserve(pending: &PendingCounter) {
     pending.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Give back a slot taken by [`reserve`] when the job will never be submitted.
+/// Without this the shutdown drain would wait forever on work that cannot run.
+pub fn release_reservation(pending: &PendingCounter) {
+    pending.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// [`enqueue`] for a job whose slot was already taken by [`reserve`]. The
+/// worker drops the slot once the job has run, exactly as for [`enqueue`].
+pub fn enqueue_reserved(label: String, job: SandboxCleanupJob, pending: PendingCounter) {
     if let Err(err) = sender().send((label, job, Arc::clone(&pending))) {
-        pending.fetch_sub(1, Ordering::AcqRel);
+        release_reservation(&pending);
         tracing::error!(error = %err, "sandbox cleaner channel closed");
     }
 }

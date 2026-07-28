@@ -236,6 +236,15 @@ pub struct RequestStateData {
     /// finished (queued + in-flight on the global cleaner thread). Carried into
     /// each cleanup job so the cleaner decrements it on completion; the shutdown
     /// path keeps the TUI open — and the process alive — until it drains to zero.
+    ///
+    /// **Wait on this only after releasing the request.** Not all of it is
+    /// already submitted: once this request has written a cacheable revision,
+    /// [`DeferredTrims`] holds a slot that is handed to the cleaner when the
+    /// request state drops (see there for why the trim cannot run any earlier).
+    /// A waiter that keeps its `Arc<RequestState>` alive therefore waits on a
+    /// counter that cannot reach zero. `heph run` unwinds in the right order
+    /// already: the drain loops in `tui::backend` run after the app future,
+    /// which owns the request, has returned.
     pub bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
     /// Per-request registry of genuinely-failing targets, keyed by addr. Populated
     /// by the `result_addr` classifier (first-writer-wins dedup) and drained once
@@ -264,6 +273,106 @@ pub struct RequestStateData {
     /// `resolve_locked_inner`'s `skip_lock`) still execute normally — re-reading
     /// the tree is the entire point of these requests.
     pub hash_only: bool,
+    /// Post-write `cache.history` trims held back until this request's cache
+    /// read guards are gone.
+    ///
+    /// **Must stay the last field.** See [`DeferredTrims`] — being last is what
+    /// makes the drop order correct, not a stylistic choice.
+    deferred_trims: DeferredTrims,
+}
+
+/// One deferred post-write trim: how many revisions of a target to keep, and
+/// the revision this request wrote (which the trim must never delete).
+#[derive(Debug)]
+struct PendingTrim {
+    keep: u32,
+    hashin: String,
+}
+
+/// The request's post-write `cache.history` trims, submitted once the request
+/// state — and every cache read guard it holds — is gone.
+///
+/// Trimming deletes revisions, so it needs the target's **write** lock; the
+/// lock is per-addr, not per-revision, and `gc.rs` documents why a read is not
+/// enough. Running the trim inline, where `cache_locally` finishes, therefore
+/// could never succeed: the addr's riding read guard lives in
+/// [`RequestStateData::mem_locked_result`] and is cloned into every artifact
+/// handed out, and the memoizer only evicts on a cycle error. The read is held
+/// for the whole request, so the trim's non-blocking `try_write` always lost
+/// and `cache.history` was silently never enforced *during* a run — only by the
+/// next `heph gc`.
+///
+/// So the decision is recorded here as the revision is written and executed
+/// afterwards, on the background cleaner lane.
+///
+/// **This must stay the last field of [`RequestStateData`].** Rust drops a
+/// struct's fields in declaration order *after* its own `Drop::drop` returns,
+/// so being last is exactly what guarantees every memoizer — and every riding
+/// read guard it holds — has already dropped by the time this one's `Drop`
+/// submits the trims. Moving it earlier reinstates the bug silently.
+struct DeferredTrims {
+    engine: Weak<Engine>,
+    bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+    /// Keyed by addr so a target written more than once in a request is trimmed
+    /// once, protecting the last revision written for it.
+    trims: Mutex<FxHashMap<Addr, PendingTrim>>,
+}
+
+impl DeferredTrims {
+    fn push(&self, addr: &Addr, keep: u32, hashin: &str) {
+        let mut trims = self.trims.lock();
+        if trims.is_empty() {
+            // One background slot for the whole batch, taken the first time
+            // there is anything to submit. Reserved *now* rather than at submit
+            // time because the submit happens in `Drop`, by which point this
+            // request's other background work may already have drained the
+            // counter to zero — and the shutdown path exits on zero.
+            crate::engine::sandbox_cleaner::reserve(&self.bg_pending);
+        }
+        trims.insert(
+            addr.clone(),
+            PendingTrim {
+                keep,
+                hashin: hashin.to_string(),
+            },
+        );
+    }
+}
+
+impl Drop for DeferredTrims {
+    fn drop(&mut self) {
+        let trims = std::mem::take(&mut *self.trims.lock());
+        if trims.is_empty() {
+            return;
+        }
+        // Hand back the blocking pool's stale backstop registrations first.
+        // Each one is a `Waker` that still owns its (finished) task, and one of
+        // those tasks is this request's `mem_locked_result` cell — which holds
+        // the addr's riding cache read. Left alone it is released on the
+        // backstop's next tick, up to 250ms from now, and every trim below would
+        // find its target contended and skip. See `hcore::blocking::backstop`.
+        hcore::blocking::flush_backstop();
+
+        let Some(engine) = self.engine.upgrade() else {
+            // The engine is gone, so nothing can run these. Give the slot back
+            // rather than hold shutdown open on work that will never happen.
+            crate::engine::sandbox_cleaner::release_reservation(&self.bg_pending);
+            return;
+        };
+        // One job for the batch: `try_trim_after_write` is non-blocking and
+        // short, and a job per target would allocate a boxed closure per
+        // written revision — which is exactly what this replaces.
+        crate::engine::sandbox_cleaner::enqueue_reserved(
+            format!("gc trim {} target(s)", trims.len()),
+            Box::new(move || {
+                for (addr, trim) in trims {
+                    engine.try_trim_after_write(&addr, trim.keep, &trim.hashin);
+                }
+                Ok(())
+            }),
+            Arc::clone(&self.bg_pending),
+        );
+    }
 }
 
 /// One frame of the live resolution path (the breadcrumb chain). Built as an
@@ -322,6 +431,14 @@ impl RequestState {
     /// `sandbox_cleaner::enqueue`, or to the renderer so it can poll for drain.
     pub fn bg_pending(&self) -> crate::engine::sandbox_cleaner::PendingCounter {
         Arc::clone(&self.data.bg_pending)
+    }
+
+    /// Record a post-write `cache.history` trim for `addr`, to run once this
+    /// request's cache read guards are released. `hashin` is the revision just
+    /// written, which the trim will preserve. See [`DeferredTrims`] for why it
+    /// cannot run inline.
+    pub(crate) fn defer_trim(&self, addr: &Addr, keep: u32, hashin: &str) {
+        self.data.deferred_trims.push(addr, keep, hashin);
     }
 
     /// True when this request may hash, probe and read but must never take the
@@ -641,10 +758,15 @@ impl Engine {
             hooks: self.hooks(),
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
-            bg_pending,
+            bg_pending: Arc::clone(&bg_pending),
             failures: Mutex::new(indexmap::IndexMap::new()),
             approval,
             hash_only,
+            deferred_trims: DeferredTrims {
+                engine: Arc::downgrade(self),
+                bg_pending,
+                trims: Mutex::new(FxHashMap::default()),
+            },
         });
 
         let state = Arc::new(RequestState {
@@ -686,6 +808,70 @@ mod tests {
             ..Default::default()
         })?);
         Ok((dir, engine))
+    }
+
+    /// A recorded trim must hold the request's background slot from the moment
+    /// it is recorded, not from the moment it is submitted. The shutdown path
+    /// exits when that counter reads zero, and the submit only happens when the
+    /// request state drops — so a slot taken only at submit time leaves a window
+    /// where the process can exit with trims still owed.
+    #[tokio::test]
+    async fn deferred_trim_holds_the_background_slot_until_it_runs() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_dir, engine) = test_engine()?;
+        let bg: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let rs = engine.new_state_full(
+            true,
+            None,
+            Arc::clone(&bg),
+            Engine::DEFAULT_LOG_TAIL_LINES,
+            None,
+        );
+
+        rs.defer_trim(&addr("t"), 1, "h1");
+        assert_eq!(
+            bg.load(Ordering::Acquire),
+            1,
+            "a recorded trim holds a slot before it is submitted"
+        );
+        // A second target joins the same batch — one slot, not two.
+        rs.defer_trim(&addr("u"), 1, "h1");
+        assert_eq!(bg.load(Ordering::Acquire), 1, "the batch holds one slot");
+
+        drop(rs);
+
+        // Submitted on drop and released by the cleaner once it has run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while bg.load(Ordering::Acquire) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred trim never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        Ok(())
+    }
+
+    /// A request that never wrote a cacheable revision must not touch the
+    /// counter at all — otherwise every `hash_only` / query request would hold
+    /// shutdown open on an empty batch.
+    #[tokio::test]
+    async fn no_deferred_trim_means_no_background_slot() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_dir, engine) = test_engine()?;
+        let bg: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let rs = engine.new_state_full(
+            true,
+            None,
+            Arc::clone(&bg),
+            Engine::DEFAULT_LOG_TAIL_LINES,
+            None,
+        );
+        drop(rs);
+        assert_eq!(bg.load(Ordering::Acquire), 0);
+        Ok(())
     }
 
     #[test]

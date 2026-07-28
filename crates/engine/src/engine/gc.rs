@@ -10,7 +10,10 @@
 //!   trimmed to its `cache.history` newest revisions.
 //! - [`Engine::try_trim_after_write`] — the post-write trim. Non-blocking: it
 //!   trims the just-written target only if its lock is free, and never deletes
-//!   the revision that was just written.
+//!   the revision that was just written. Deferred to the end of the request
+//!   that wrote the revision (see `RequestState::defer_trim`) — a request holds
+//!   a read on every addr it resolved, so a trim run inline could never take
+//!   the write lock.
 //!
 //! Revision recency comes from each group's `manifest-v1.borsh`
 //! (`created_at_nanos`); the full artifact name list to delete comes from the

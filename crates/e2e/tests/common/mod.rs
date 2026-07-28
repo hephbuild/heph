@@ -1,11 +1,13 @@
 #![allow(dead_code, unused_imports)]
 
 use anyhow::Result;
+use heph::engine::{Config, Engine};
 use heph::pluginbuildfile;
 use heph::pluginexec;
 use heph::pluginhttp;
 use heph::pluginstatictarget;
 use htestkit::WorkspaceBuilder;
+use std::sync::Arc;
 
 pub use htestkit::{artifact_bytes, artifact_paths, artifact_string, root};
 
@@ -37,6 +39,29 @@ impl Workspace {
             builder
         };
         Self(builder.build().expect("build workspace"))
+    }
+
+    /// A second `Engine` over this workspace's root — what the *next* `heph`
+    /// invocation sees: the same on-disk cache and lock directory, but empty
+    /// in-memory provider/driver caches.
+    ///
+    /// Needed by any test that must observe a *changed* BUILD file. The spec a
+    /// target resolves to is memoized per engine, so rewriting the BUILD file
+    /// and re-running through the same engine replays the original definition
+    /// and produces no new cache revision.
+    pub fn reopen(&self) -> Result<Arc<Engine>> {
+        let root = self.dir.path().to_path_buf();
+        let mut engine = Engine::new(Config {
+            root: root.clone(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(move |_| Box::new(pluginbuildfile::Provider::new(root)))?;
+        engine.register_managed_driver(|_| Box::new(pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash()))?;
+        engine.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
+        Ok(Arc::new(engine))
     }
 
     pub fn with_static(targets: Vec<pluginstatictarget::Target>) -> Result<Self> {

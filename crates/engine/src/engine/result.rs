@@ -2144,21 +2144,21 @@ impl Engine {
                         engine.spawn_remote_upload(&rs, addr.clone(), hashin.clone());
                     }
 
-                    // Post-write GC: trim this target's stale revisions in the
-                    // background (same lane as sandbox cleanup), skipping
-                    // uncacheable/tmp entries which are ephemeral and would be
-                    // dropped anyway. Fire-and-forget; the trim runs only if the
-                    // addr's lock is free, so it never blocks the hot path.
+                    // Post-write GC: record that this target's stale revisions
+                    // are due a trim, skipping uncacheable/tmp entries which are
+                    // ephemeral and would be dropped anyway.
+                    //
+                    // Recorded, not run: the trim needs the addr's write lock,
+                    // and this request is holding a read on it — the riding read
+                    // in `mem_locked_result`, plus a clone in every artifact
+                    // handed out — until the request state drops. Running it
+                    // here means its `try_write` can never succeed, which is
+                    // exactly how `cache.history` came to be unenforced during a
+                    // run. `RequestState::defer_trim` submits it once the guards
+                    // are gone, still on the background lane and still
+                    // fire-and-forget.
                     if out.is_ok() && !use_tmp_cache {
-                        let keep = def.target.cache.history;
-                        crate::engine::sandbox_cleaner::enqueue(
-                            format!("gc {addr}"),
-                            Box::new(enclose!((engine, addr, hashin) move || {
-                                engine.try_trim_after_write(&addr, keep, &hashin);
-                                Ok(())
-                            })),
-                            rs.bg_pending(),
-                        );
+                        rs.defer_trim(&addr, def.target.cache.history, &hashin);
                     }
 
                     hcore::hmemoizer::clear_phase();
@@ -3562,8 +3562,15 @@ mod tests {
 
     /// Drain background uploads tracked by the request's `bg_pending` counter so
     /// the remote-cache assertions observe a settled state.
-    async fn drain_bg(rs: &Arc<crate::engine::request_state::RequestState>) {
+    async fn drain_bg(rs: Arc<crate::engine::request_state::RequestState>) {
         let bg = rs.bg_pending();
+        // Takes the request by value and releases it before waiting. Some
+        // background work is only *submitted* when the request state drops (the
+        // post-write cache trim) and holds a slot until then, so a waiter that
+        // keeps `rs` alive waits on a counter that cannot reach zero. `heph run`
+        // unwinds in this order too — the drain loop runs after the app future,
+        // which owns the request, has returned.
+        drop(rs);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while bg.load(Ordering::Acquire) > 0 {
             assert!(
@@ -3596,7 +3603,7 @@ mod tests {
                 &ResultOptions::default(),
             )
             .await?;
-        drain_bg(&rs).await;
+        drain_bg(rs).await;
         assert_eq!(
             count_files(remote.path()),
             0,
@@ -3620,7 +3627,7 @@ mod tests {
                 &ResultOptions::default(),
             )
             .await?;
-        drain_bg(&rs).await;
+        drain_bg(rs).await;
         assert!(
             count_files(remote_on.path()) > 0,
             "remote-enabled target must upload to the remote cache"
@@ -3652,7 +3659,7 @@ mod tests {
                 &ResultOptions::default(),
             )
             .await?;
-        drain_bg(&rs).await;
+        drain_bg(rs).await;
         assert!(
             count_files(remote.path()) > 0,
             "seed must populate the remote"
@@ -3819,7 +3826,7 @@ mod tests {
                 &ResultOptions::default(),
             )
             .await?;
-        drain_bg(&seed_rs).await;
+        drain_bg(seed_rs).await;
 
         // Cold engine whose remote serves the manifest, claims the blobs exist,
         // and then cannot produce them.
@@ -3889,7 +3896,7 @@ mod tests {
                 &ResultOptions::default(),
             )
             .await?;
-        drain_bg(&seed_rs).await;
+        drain_bg(seed_rs).await;
         assert!(
             count_files(remote.path()) > 0,
             "seed must populate the remote"
@@ -4635,8 +4642,7 @@ mod tests {
             "the gate must have opened because every target parked, not by timing out"
         );
 
-        drain_bg(&rs).await;
-        drop(rs);
+        drain_bg(rs).await;
 
         assert!(
             engine.requests.lock().expect("requests lock").is_empty(),
@@ -5913,19 +5919,13 @@ mod tests {
             "cold build executes once"
         );
 
-        // The cold build's cache write enqueues a fire-and-forget history-trim GC
+        // The cold build's cache write records a fire-and-forget history-trim GC
         // on the background lane (see `try_trim_after_write`), which itself reads
         // the manifest. Drain it before resetting the counter so that lagging read
         // is never attributed to the hit below — otherwise the count races to 2.
-        let pending = cold_rs.bg_pending();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pending.load(Ordering::SeqCst) > 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "background GC did not drain"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // The trim is only *submitted* when the request state drops, and holds a
+        // background slot until then, so the request goes first.
+        drain_bg(cold_rs).await;
 
         // Fresh request → full cache hit. The manifest backing read must happen
         // exactly once for the whole resolution.

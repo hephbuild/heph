@@ -63,6 +63,12 @@ async fn run_drain(engine: &Arc<Engine>, addr: &str) -> String {
         .expect("run target");
 
     let bg = rs.bg_pending();
+    // Release the request before waiting on its counter. Some background work is
+    // only *submitted* when the request state drops (the post-write cache trim),
+    // and holds a slot until then — so a waiter that keeps `rs` alive waits on a
+    // counter that cannot reach zero. `heph run` unwinds in this order too: the
+    // drain loop runs after the app future, which owns the request, has returned.
+    drop(rs);
     let deadline = Instant::now() + Duration::from_secs(10);
     while bg.load(Ordering::Acquire) > 0 {
         assert!(Instant::now() < deadline, "background upload never drained");
