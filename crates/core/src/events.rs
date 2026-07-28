@@ -70,8 +70,10 @@ pub enum BuildEventKind {
         error: Option<String>,
     },
     /// Acquiring the per-addr result lock has been blocked past the notice
-    /// threshold. `holder_pid` is the process believed to hold the lock
-    /// (best-effort; `None` if unknown). Paired one-to-one with
+    /// threshold. `holder_pid` is a process that stamped the lock and still held
+    /// it when it was probed — a snapshot, and `None` whenever the holder cannot
+    /// be named (including the common case of waiting on readers to drain, which
+    /// nothing stamps). Paired one-to-one with
     /// `ResultLockWaitEnd` (which fires on acquire **or** cancellation), so a
     /// consumer can show the notice for exactly the duration of the wait.
     ResultLockWaitStart {
