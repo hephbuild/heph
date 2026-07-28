@@ -326,6 +326,7 @@ mod tests {
                 Arc::new(hwalk::Ignore::default()),
                 walker,
             )),
+            Arc::default(),
         );
         let result = eval_source("BUILD", content.to_string(), "pkg", &loader).unwrap();
         DocIndex::build(&result, "pkg", content.to_string())

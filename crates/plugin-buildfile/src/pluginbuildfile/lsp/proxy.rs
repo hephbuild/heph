@@ -1192,6 +1192,7 @@ mod tests {
                 Arc::new(hwalk::Ignore::default()),
                 walker,
             )),
+            Arc::default(),
         );
         // Mirror context.rs: a buffer that fails to eval falls back to a
         // source-only index (the realistic mid-edit case).
