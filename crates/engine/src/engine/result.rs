@@ -2158,7 +2158,7 @@ impl Engine {
                     // are gone, still on the background lane and still
                     // fire-and-forget.
                     if out.is_ok() && !use_tmp_cache {
-                        rs.defer_trim(&addr, def.target.cache.history, &hashin);
+                        rs.defer_trim(&addr, def.target.cache.history, hashin);
                     }
 
                     hcore::hmemoizer::clear_phase();

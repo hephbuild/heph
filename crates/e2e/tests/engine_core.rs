@@ -284,18 +284,29 @@ async fn cache_history_is_enforced_by_the_end_of_the_run() -> anyhow::Result<()>
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         drop(engine);
-    }
 
-    let engine = ws.reopen()?;
-    let stats = engine.clone().gc_all(engine.new_state()).await?;
-    assert_eq!(
-        stats.revisions_kept, 1,
-        "exactly the newest revision survives: {stats:?}"
-    );
-    assert_eq!(
-        stats.revisions_removed, 0,
-        "a post-run sweep still found revisions to reclaim, so `cache.history` \
-         was never enforced during the run: {stats:?}"
-    );
+        // Assert per run, not once at the end. A single check after the last run
+        // cannot tell "every run enforced its budget" from "only the last one
+        // did" — run 3's trim protects its own revision and deletes both older
+        // ones, so an end-only assertion passes even when two of the three trims
+        // silently lost their lock.
+        //
+        // `gc_all` is the oracle because it reports what a sweep still finds to
+        // reclaim; anything above zero is a trim that did not happen. It is also
+        // destructive, which is what makes it a *tight* check — it leaves the
+        // cache in the state the trim should already have produced, so the next
+        // iteration starts clean and any failure is attributable to one run.
+        let sweeper = ws.reopen()?;
+        let stats = sweeper.clone().gc_all(sweeper.new_state()).await?;
+        assert_eq!(
+            stats.revisions_removed, 0,
+            "after the `{v}` run a sweep still found revisions to reclaim, so \
+             that run's post-write trim never ran: {stats:?}"
+        );
+        assert_eq!(
+            stats.revisions_kept, 1,
+            "exactly the newest revision survives the `{v}` run: {stats:?}"
+        );
+    }
     Ok(())
 }

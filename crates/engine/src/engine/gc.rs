@@ -192,8 +192,15 @@ impl Engine {
                     tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc trim");
                 }
             }
-            // Contended — another request holds the lock; skip without blocking.
-            Ok(None) => {}
+            // Contended — another request or process holds the lock. Skip
+            // without blocking, but say so: a silent skip here is exactly how
+            // `cache.history` went unenforced for so long. `debug`, not `warn`,
+            // because a concurrent build of the same target is ordinary and this
+            // fires per addr; the revision is reclaimed by the next write's trim
+            // or by `heph gc`.
+            Ok(None) => {
+                tracing::debug!(%addr, "post-write gc contended; history not enforced this run")
+            }
             Err(e) => tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc try_write"),
         }
     }
@@ -289,6 +296,11 @@ impl Engine {
             Self::DEFAULT_LOG_TAIL_LINES,
             None,
         );
+        // Phase 1 resolves, and resolving executes shared cacheable deps — each
+        // of which would otherwise record a post-write trim that fires when this
+        // state drops, i.e. concurrently with phase 2's write locks. This sweep
+        // is the authoritative trim; it does not need a second one racing it.
+        resolve_rs.suppress_deferred_trims();
         let targets = match self.local_cache.list_targets() {
             Ok(t) => t,
             Err(e) => {

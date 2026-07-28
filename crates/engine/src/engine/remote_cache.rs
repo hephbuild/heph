@@ -1591,6 +1591,14 @@ impl Engine {
                 addr: addr.format(),
                 error: None,
             });
+
+            // Release the request before `_dec` gives its slot back. This task
+            // can be the last owner of the `RequestStateData` — it outlives the
+            // app future — and dropping it is what submits the request's
+            // deferred cache-history trims (`RequestState::defer_trim`). Letting
+            // `_dec` go first would leave a window where the counter reads zero
+            // and the shutdown drain exits with those trims never enqueued.
+            drop(rs);
         });
     }
 

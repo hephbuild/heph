@@ -118,14 +118,31 @@ pub fn backstop(waker: Waker) {
 /// alive past the request that made it.
 ///
 /// Waking early is always sound: a spurious wake costs one poll, and a waiter
-/// still genuinely pending re-registers from that poll.
-pub fn flush_backstop() {
+/// still genuinely pending re-registers from that poll. That re-registration is
+/// the invariant this rests on — [`run`] below and the sqlite cache's
+/// write-behind waiter both register on *every* pending poll. A future
+/// registrant that registers once and relies on the tick would be stranded by a
+/// flush; register per pending poll.
+///
+/// Returns how many registrations were taken, so a caller can tell its own flush
+/// from a tick that happened to land first.
+pub fn flush_backstop() -> usize {
     // Taken before waking, and the lock released first, so a waker that
     // re-registers from inside `wake` cannot deadlock against us.
     let due = std::mem::take(&mut *lock_pending());
+    let n = due.len();
     for waker in due {
-        waker.wake();
+        // Callers reach this from `Drop` on a teardown path. A panicking waker
+        // there would unwind out of a destructor — and abort outright if that
+        // drop is itself already unwinding — so one bad waker is contained
+        // rather than allowed to take the process with it. The panic is still
+        // reported by the default hook before this returns, and this crate has
+        // no `tracing` (it is linked into cdylib plugins, where no subscriber is
+        // ever installed), so there is nothing further to say about it here.
+        // `lock_pending` already contemplates this case for the tick thread.
+        drop(catch_unwind(AssertUnwindSafe(|| waker.wake())));
     }
+    n
 }
 
 /// A waker panicking mid-`wake` would poison the list and strand every later
@@ -305,8 +322,12 @@ mod tests {
         let owned = Arc::new(());
         let started = std::time::Instant::now();
         backstop(futures::task::waker(Arc::new(Owning(Arc::clone(&owned)))));
-        flush_backstop();
+        let taken = flush_backstop();
 
+        assert!(
+            taken >= 1,
+            "the flush itself must have taken our registration, not a tick",
+        );
         assert_eq!(
             Arc::strong_count(&owned),
             1,
@@ -315,6 +336,38 @@ mod tests {
         assert!(
             started.elapsed() < WAKE_BACKSTOP,
             "the release must not have come from a backstop tick",
+        );
+    }
+
+    /// A waiter that is genuinely still pending must survive a flush: it is
+    /// woken, re-polls, finds its job unfinished and re-registers. This is the
+    /// invariant that makes `flush_backstop` safe to call from anywhere.
+    #[test]
+    fn flush_backstop_does_not_strand_a_still_pending_waiter() {
+        let out = futures::executor::block_on(async {
+            let job = run(|| {
+                thread::sleep(WAKE_BACKSTOP / 2);
+                "done"
+            });
+            futures::pin_mut!(job);
+            // Flush repeatedly while the job is still running; each one takes the
+            // waiter's registration out from under it.
+            loop {
+                let mut flushed = 0;
+                let polled = futures::poll!(&mut job);
+                if let Poll::Ready(v) = polled {
+                    break v;
+                }
+                while flushed < 3 {
+                    flush_backstop();
+                    flushed += 1;
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        assert_eq!(
+            out, "done",
+            "a flushed-but-pending waiter must still finish"
         );
     }
 
