@@ -194,6 +194,47 @@ impl<V> Cell<V> {
             waker.wake();
         }
     }
+
+    /// Whether the value has been published.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done.get().is_some()
+    }
+
+    /// How many awaiters are attached to this cell, or `None` if the waker set
+    /// was locked when sampled.
+    ///
+    /// Counts *allocated slots*, not slots currently holding a `Waker`. The two
+    /// differ exactly when it matters: waking an awaiter `take`s its waker and
+    /// leaves the slot empty until that awaiter re-polls and re-registers. So a
+    /// live-waker count reads zero for the population this diagnostic exists to
+    /// find — tasks that were woken, never re-polled, and are therefore parked
+    /// forever. A slot is returned to the free list only by [`Await::drop`], so
+    /// `slots - free` is the number of awaiters that still exist.
+    ///
+    /// `try_lock`, never `lock`: this is read by the stall watchdog and the
+    /// `SIGQUIT` dump, and a diagnostic that can block is a diagnostic that can
+    /// hang the process it exists to explain. A missed sample costs one cell in
+    /// one report; the next fire re-reads it.
+    pub(crate) fn waiters(&self) -> Option<usize> {
+        let guard = match self.wakers.try_lock() {
+            Ok(g) => g,
+            // Same stance as `wakers()`: a poisoned set is structurally intact.
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(guard.slots.len().saturating_sub(guard.free.len()))
+    }
+
+    /// Whether an awaiter is currently elected to re-poll the inner future.
+    ///
+    /// `false` together with a non-zero [`waiters`](Self::waiters) is the
+    /// signature of a lost wake-up: tasks are parked on this cell and nobody is
+    /// on the hook to poll it. Transiently normal (abdication clears the driver
+    /// and wakes everyone to re-elect); a standing condition on a build that has
+    /// made no progress for a minute is not.
+    pub(crate) fn has_driver(&self) -> bool {
+        self.driver.load(Ordering::Relaxed) != NO_DRIVER
+    }
 }
 
 /// The inner future is polled with this, so a wake from deep inside it lands on
@@ -391,6 +432,52 @@ mod tests {
 
     fn poll_with(waiter: &mut Await<u32>, waker: &Waker) -> Poll<u32> {
         Pin::new(waiter).poll(&mut Context::from_waker(waker))
+    }
+
+    /// The shape a lost wake-up leaves behind, which is what the inventory reads.
+    ///
+    /// A driven cell has waiters *and* a driver. When the driver goes away
+    /// without the cell completing, the driver is cleared — and if the wake it
+    /// broadcasts on the way out never lands, what remains is waiters parked on
+    /// a cell nobody is on the hook to poll. That is the state a wedged build
+    /// sits in, and until it was observable the only evidence was 250 threads
+    /// idle in `futex_wait`.
+    #[test]
+    fn a_cell_reports_waiters_and_whether_anyone_will_poll_it() {
+        let (cell, _stashed, ready) = stash_cell(3);
+
+        let (_pc, pw) = counting();
+        let mut parked = Await::new(Arc::clone(&cell));
+        assert!(poll_with(&mut parked, &pw).is_pending());
+
+        let (_dc, dw) = counting();
+        let mut driver = Await::new(Arc::clone(&cell));
+        assert!(poll_with(&mut driver, &dw).is_pending());
+
+        assert_eq!(cell.waiters(), Some(2));
+        assert!(cell.has_driver(), "the last poller is on the hook");
+        assert!(!cell.is_done());
+
+        // The driver goes away mid-flight — a fail-fast sibling drop or Ctrl-C.
+        // Abdication wakes the rest, which `take`s their wakers; the awaiters
+        // themselves are still attached and still parked, and that is what must
+        // be reported. Counting live wakers here would read 0 and hide the very
+        // population this exists to find.
+        drop(driver);
+        assert!(
+            !cell.has_driver(),
+            "abdication must clear the driver so another awaiter can re-elect"
+        );
+        assert_eq!(
+            cell.waiters(),
+            Some(1),
+            "the departing awaiter releases its slot; the parked one is still attached"
+        );
+
+        // Completion is what takes a cell out of the inventory.
+        ready.store(true, Ordering::SeqCst);
+        assert!(poll_with(&mut parked, &pw).is_ready());
+        assert!(cell.is_done());
     }
 
     /// **The reason this module exists.** A wake from inside the shared future

@@ -96,6 +96,19 @@ impl Op {
     pub const fn tracks_oldest(self) -> bool {
         !matches!(self, Op::Result)
     }
+
+    /// Whether [`DiagState::add_bytes`] is ever called for this op.
+    ///
+    /// Only the remote-cache read path moves bytes through a counter. For every
+    /// other op the window is structurally zero, which makes "0 B in the last
+    /// 60s" both meaningless as a line and *actively misleading* as evidence:
+    /// [`StallReport::dominant_is_starved`] would read that hard zero as proof
+    /// of starvation and print a confident hypothesis derived from a counter
+    /// that cannot move. A wrong automated hypothesis costs more credibility
+    /// than a missing one, so ops that do not report bytes say nothing.
+    pub const fn reports_bytes(self) -> bool {
+        matches!(self, Op::RemoteCacheRead)
+    }
 }
 
 /// Per-op slots for oldest-open tracking.
@@ -138,6 +151,17 @@ struct OpState {
     /// Bytes at the start of the current window, and when that window opened.
     bytes_window_base: AtomicU64,
     window_opened_ms: AtomicU64,
+}
+
+/// Age of the oldest span still holding a slot on `st`.
+fn oldest_of(st: &OpState, now_ms: u64) -> Option<Duration> {
+    st.slot_key
+        .iter()
+        .zip(st.slot_start.iter())
+        .filter(|(k, _)| k.load(Ordering::Acquire) != FREE)
+        .map(|(_, start)| start.load(Ordering::Acquire))
+        .min()
+        .map(|s| Duration::from_millis(now_ms.saturating_sub(s)))
 }
 
 impl OpState {
@@ -211,6 +235,21 @@ pub struct DiagState {
     /// Completed / failed targets, for the progress line.
     done: AtomicU64,
     failed: AtomicU64,
+    /// Blocked acquisitions of the per-addr result lock.
+    ///
+    /// Not an [`Op`]: `Op` is the vocabulary of the TUI's per-target operation
+    /// timeline, and a lock wait is not an operation the target is performing —
+    /// it is the target being prevented from performing one. Tracked separately
+    /// so the stall paragraph can name it without perturbing what `Op` means.
+    ///
+    /// The wait is what makes cross-*process* contention diagnosable at all: the
+    /// filesystem lock backend is the default, so the holder can be another heph
+    /// on the same machine, and no amount of introspection into this process
+    /// would ever find it.
+    lock_wait: OpState,
+    /// Pid believed to hold the lock at the most recent blocked acquisition;
+    /// `0` for none/unknown. Last-writer-wins — a diagnostic hint, not a census.
+    lock_holder_pid: AtomicU64,
 }
 
 impl DiagState {
@@ -228,7 +267,38 @@ impl DiagState {
             limiters,
             done: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            lock_wait: OpState::new(),
+            lock_holder_pid: AtomicU64::new(0),
         }
+    }
+
+    /// Record the start of a blocked result-lock acquisition.
+    pub fn lock_wait_start(&self, addr: &str, holder_pid: Option<u32>, now_ms: u64) {
+        if let Some(pid) = holder_pid {
+            self.lock_holder_pid
+                .store(u64::from(pid), Ordering::Relaxed);
+        }
+        self.span_start(&self.lock_wait, addr, now_ms);
+    }
+
+    /// Record the end of a blocked result-lock acquisition (acquired or
+    /// cancelled — `ResultLockWaitEnd` fires for both).
+    pub fn lock_wait_end(&self, addr: &str, now_ms: u64) {
+        self.span_end(&self.lock_wait, addr, now_ms);
+    }
+
+    /// `(open waits, oldest age, holder pid)` — `None` when nothing is blocked.
+    pub fn lock_waits(&self, now_ms: u64) -> Option<(u64, Option<Duration>, Option<u32>)> {
+        let open = u64::try_from(self.lock_wait.open.load(Ordering::Relaxed).max(0)).unwrap_or(0);
+        if open == 0 {
+            return None;
+        }
+        let pid = self.lock_holder_pid.load(Ordering::Relaxed);
+        Some((
+            open,
+            oldest_of(&self.lock_wait, now_ms),
+            (pid != 0).then(|| u32::try_from(pid).unwrap_or(0)),
+        ))
     }
 
     /// Infallible by construction (`ops` is sized to `Op::ALL`), but resolved
@@ -261,13 +331,10 @@ impl DiagState {
         h.finish() | 1
     }
 
-    fn op_start(&self, op: Op, addr: &str, now_ms: u64) {
-        let Some(st) = self.op(op) else { return };
+    /// Open a span on `st`, claiming an oldest-tracking slot for `addr`.
+    fn span_start(&self, st: &OpState, addr: &str, now_ms: u64) {
         st.open.fetch_add(1, Ordering::Relaxed);
         self.touch(now_ms);
-        if !op.tracks_oldest() {
-            return;
-        }
         let key = Self::key_of(addr);
         for (slot, start) in st.slot_key.iter().zip(st.slot_start.iter()) {
             if slot
@@ -281,13 +348,10 @@ impl DiagState {
         // All slots busy: the count is still exact, only the age is unknown.
     }
 
-    fn op_end(&self, op: Op, addr: &str, now_ms: u64) {
-        let Some(st) = self.op(op) else { return };
+    /// Close a span on `st`, releasing `addr`'s slot.
+    fn span_end(&self, st: &OpState, addr: &str, now_ms: u64) {
         st.open.fetch_sub(1, Ordering::Relaxed);
         self.touch(now_ms);
-        if !op.tracks_oldest() {
-            return;
-        }
         let key = Self::key_of(addr);
         for slot in st.slot_key.iter() {
             if slot.load(Ordering::Acquire) == key
@@ -297,6 +361,28 @@ impl DiagState {
             {
                 return;
             }
+        }
+    }
+
+    fn op_start(&self, op: Op, addr: &str, now_ms: u64) {
+        let Some(st) = self.op(op) else { return };
+        if op.tracks_oldest() {
+            self.span_start(st, addr, now_ms);
+        } else {
+            // Unbounded op: count only. A slot array would silently evict the
+            // span whose age we care about.
+            st.open.fetch_add(1, Ordering::Relaxed);
+            self.touch(now_ms);
+        }
+    }
+
+    fn op_end(&self, op: Op, addr: &str, now_ms: u64) {
+        let Some(st) = self.op(op) else { return };
+        if op.tracks_oldest() {
+            self.span_end(st, addr, now_ms);
+        } else {
+            st.open.fetch_sub(1, Ordering::Relaxed);
+            self.touch(now_ms);
         }
     }
 
@@ -325,15 +411,7 @@ impl DiagState {
         if !op.tracks_oldest() {
             return None;
         }
-        let st = self.op(op)?;
-        let oldest = st
-            .slot_key
-            .iter()
-            .zip(st.slot_start.iter())
-            .filter(|(k, _)| k.load(Ordering::Acquire) != FREE)
-            .map(|(_, start)| start.load(Ordering::Acquire))
-            .min();
-        oldest.map(|s| Duration::from_millis(now_ms.saturating_sub(s)))
+        oldest_of(self.op(op)?, now_ms)
     }
 
     /// Bytes moved by `op` within the rolling window, and the cumulative total.
@@ -438,6 +516,9 @@ impl DiagState {
             saturated: self.saturated(now_ms),
             done: self.done(),
             failed: self.failed(),
+            lock_waits: self.lock_waits(now_ms),
+            delta: None,
+            stuck: Vec::new(),
         })
     }
 }
@@ -470,6 +551,13 @@ pub struct StallReport {
     pub saturated: Vec<(&'static str, Duration)>,
     pub done: u64,
     pub failed: u64,
+    /// `(open waits, oldest age, holder pid)` when the result lock is blocking.
+    pub lock_waits: Option<(u64, Option<Duration>, Option<u32>)>,
+    /// Change since the previous fire; `None` on the first.
+    pub delta: Option<StallDelta>,
+    /// Incomplete memoizer cells. Filled in by [`Watchdog`] after `evaluate`,
+    /// which stays pure — see its docs.
+    pub stuck: Vec<hcore::hmemoizer::StuckCell>,
 }
 
 impl StallReport {
@@ -496,10 +584,35 @@ impl StallReport {
         let Some((op, _)) = self.dominant() else {
             return false;
         };
+        // An op with no byte counter is not "starved", it is unmeasured. See
+        // [`Op::reports_bytes`].
+        if !op.reports_bytes() {
+            return false;
+        }
         self.bytes
             .iter()
             .find(|(o, _)| *o == op)
             .is_some_and(|(_, b)| *b == 0)
+    }
+}
+
+/// How the run changed between two consecutive fires of the watchdog.
+///
+/// Two stall paragraphs that are byte-identical are the strongest signal the
+/// log can carry — "wedged", not "slow" — and until this existed the only way
+/// to see it was to diff them by eye. Filled in by [`Watchdog`], which is the
+/// only thing that knows what the previous fire looked like.
+#[derive(Debug, Clone, Copy)]
+pub struct StallDelta {
+    pub since: Duration,
+    pub done: i64,
+    pub open: i64,
+}
+
+impl StallDelta {
+    /// Nothing at all moved since the previous report.
+    pub fn is_flat(&self) -> bool {
+        self.done == 0 && self.open == 0
     }
 }
 
@@ -540,6 +653,26 @@ impl hplugin::hook::Hook for DiagHook {
             BuildEventKind::RemoteCacheReadEnd { addr, .. } => {
                 s.op_end(Op::RemoteCacheRead, addr, now);
             }
+            // The cache-write spans. Unwired until now, which cut both ways: a
+            // build wedged in a cache write reported "0 open" for it, and — worse
+            // — a build *progressing* through the write-heavy tail of a cached
+            // run never touched the quiet clock and so read as stalled.
+            BuildEventKind::LocalCacheWriteStart { addr } => {
+                s.op_start(Op::LocalCacheWrite, addr, now);
+            }
+            BuildEventKind::LocalCacheWriteEnd { addr, .. } => {
+                s.op_end(Op::LocalCacheWrite, addr, now);
+            }
+            BuildEventKind::RemoteCacheWriteStart { addr } => {
+                s.op_start(Op::RemoteCacheWrite, addr, now);
+            }
+            BuildEventKind::RemoteCacheWriteEnd { addr, .. } => {
+                s.op_end(Op::RemoteCacheWrite, addr, now);
+            }
+            BuildEventKind::ResultLockWaitStart { addr, holder_pid } => {
+                s.lock_wait_start(addr, *holder_pid, now);
+            }
+            BuildEventKind::ResultLockWaitEnd { addr } => s.lock_wait_end(addr, now),
             // Cache hit/miss carry no span but are unambiguous progress.
             BuildEventKind::LocalCacheHit { .. }
             | BuildEventKind::LocalCacheMiss { .. }
@@ -553,8 +686,19 @@ impl hplugin::hook::Hook for DiagHook {
     fn on_close(&self) {}
 }
 
+/// Cells listed individually in a stall paragraph. The paragraph repeats on
+/// every escalation, so the full inventory (thousands of cells on a big graph)
+/// would bury the run's own output; the `SIGQUIT` dump prints all of them.
+const INVENTORY_LINES: usize = 20;
+
 fn secs(d: Duration) -> String {
     format!("{}s", d.as_secs())
+}
+
+/// Render a delta with an explicit sign, so `+0` reads as "measured, no change"
+/// rather than as a missing value.
+fn signed(n: i64) -> String {
+    format!("{n:+}")
 }
 
 fn human_bytes(b: u64) -> String {
@@ -600,7 +744,10 @@ pub fn render_stall(r: &StallReport) -> String {
     }
 
     for (op, b) in &r.bytes {
-        if r.open.iter().any(|(o, _, _)| o == op) {
+        // Only ops that actually move bytes through a counter. Printing a hard
+        // zero for the rest reads as evidence of starvation when it is evidence
+        // of nothing — see [`Op::reports_bytes`].
+        if op.reports_bytes() && r.open.iter().any(|(o, _, _)| o == op) {
             out.push_str(&format!(
                 "  bytes        {} in the last {}s on {}\n",
                 human_bytes(*b),
@@ -608,6 +755,22 @@ pub fn render_stall(r: &StallReport) -> String {
                 op.label()
             ));
         }
+    }
+
+    // Cross-process contention: the holder may be another heph on this machine,
+    // which nothing else in this report could ever surface.
+    if let Some((n, oldest, pid)) = r.lock_waits {
+        let age = match oldest {
+            Some(a) => format!(", oldest {}", secs(a)),
+            None => String::new(),
+        };
+        let holder = match pid {
+            Some(p) => format!(", holder pid {p}"),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "  lock waits   {n} on the result lock{age}{holder}\n"
+        ));
     }
 
     if !r.saturated.is_empty() {
@@ -627,10 +790,41 @@ pub fn render_stall(r: &StallReport) -> String {
         r.done, r.failed
     ));
 
+    // The escalation *is* the diagnostic: identical consecutive paragraphs mean
+    // wedged where either alone means only slow. Stating the delta saves the
+    // reader diffing two tables by eye — and is the difference between a build
+    // that is crawling and one that has stopped.
+    if let Some(d) = r.delta {
+        out.push_str(&format!(
+            "  since last   {} done, {} open, over {}\n",
+            signed(d.done),
+            signed(d.open),
+            secs(d.since)
+        ));
+    }
+
+    // What a thread dump structurally cannot show: the parked futures. On a
+    // wedged build every thread is idle and this is the only place the stuck
+    // work is visible at all.
+    out.push_str(&hcore::hmemoizer::render_inventory(
+        &r.stuck,
+        INVENTORY_LINES,
+    ));
+
     // Only volunteer a cause when one op clearly dominates *and* something
     // corroborates it. A wrong automated hypothesis costs more credibility than
     // no hypothesis — better to show the table and let the reader conclude.
-    if let Some((op, _)) = r.dominant()
+    let stranded = r.stuck.iter().filter(|c| c.is_stranded()).count();
+    if stranded > 0 && r.delta.is_some_and(|d| d.is_flat()) {
+        // Evidence, not inference: tasks are parked on a cell that has no
+        // driver, and nothing moved between two fires. Neither alone would be
+        // enough — a driverless cell is momentarily normal during re-election.
+        out.push_str(&format!(
+            "\n  {stranded} cell(s) have tasks parked on them with nobody elected to poll\n  \
+             them, and nothing moved since the last report. That is a lost wake-up,\n  \
+             not slow work.\n"
+        ));
+    } else if let Some((op, _)) = r.dominant()
         && r.dominant_is_starved()
     {
         out.push_str(&format!(
@@ -641,6 +835,16 @@ pub fn render_stall(r: &StallReport) -> String {
             op.label()
         ));
     }
+
+    // Ctrl-C is what a human reaches for on a frozen build, and on a wedged run
+    // it is exactly what cannot help — the TUI clears ISIG, so the terminal
+    // never raises SIGINT. Name the escalation that does work, here, where it is
+    // read, rather than leaving it to be rediscovered per incident.
+    out.push_str(&format!(
+        "\n  Still stuck? `kill -QUIT {}` writes every thread's backtrace plus the\n  \
+         full in-flight inventory next to this file; it does not kill the process.\n",
+        std::process::id()
+    ));
 
     out.push_str("  (diagnostic text, not a stable interface)\n");
     out
@@ -729,11 +933,13 @@ impl Watchdog {
             .name("heph-stall-watchdog".to_string())
             .spawn(move || {
                 let mut last_fired: Option<u64> = None;
+                let mut last_seen: Option<(u64, i64, u64)> = None;
                 while !stop_thread.load(Ordering::Relaxed) {
                     std::thread::sleep(tick);
                     let now = state.now_ms();
-                    let Some(report) = state.evaluate(now, threshold) else {
+                    let Some(mut report) = state.evaluate(now, threshold) else {
                         last_fired = None;
+                        last_seen = None;
                         continue;
                     };
                     // Escalate rather than repeat every tick: a stall that lasts
@@ -743,8 +949,28 @@ impl Watchdog {
                             >= u64::try_from(threshold.as_millis()).unwrap_or(60_000) * 2
                     });
                     if due {
+                        let open: i64 = report
+                            .open
+                            .iter()
+                            .map(|(_, n, _)| i64::try_from(*n).unwrap_or(i64::MAX))
+                            .sum();
+                        let done = report.done;
+                        if let Some((prev_done, prev_open, at)) = last_seen {
+                            report.delta = Some(StallDelta {
+                                since: Duration::from_millis(now.saturating_sub(at)),
+                                done: i64::try_from(done.saturating_sub(prev_done))
+                                    .unwrap_or(i64::MAX),
+                                open: open - prev_open,
+                            });
+                        }
+                        // Collected here rather than in `evaluate` so that stays
+                        // pure and testable by passing a time: this walks live
+                        // maps and formats keys, which is affordable once a stall
+                        // is already confirmed and not on every tick.
+                        report.stuck = hcore::hmemoizer::inventory();
                         emit(&report);
                         last_fired = Some(now);
+                        last_seen = Some((done, open, now));
                     }
                 }
             })
@@ -821,6 +1047,182 @@ mod tests {
             r.dominant(),
             None,
             "heph cannot see inside a subprocess, so it must not blame one"
+        );
+    }
+
+    /// The cache-write spans reach the table at all.
+    ///
+    /// They are emitted by the engine and consumed by the TUI, but the diag hook
+    /// dropped them on the floor, so a build wedged in a cache write reported
+    /// "0 open" for the subsystem it was stuck in.
+    #[test]
+    fn cache_write_spans_are_counted() {
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        hook.on_event(&ev(BuildEventKind::LocalCacheWriteStart {
+            addr: "//a:b".into(),
+        }));
+        hook.on_event(&ev(BuildEventKind::RemoteCacheWriteStart {
+            addr: "//c:d".into(),
+        }));
+        assert_eq!(s.open_count(Op::LocalCacheWrite), 1);
+        assert_eq!(s.open_count(Op::RemoteCacheWrite), 1);
+
+        hook.on_event(&ev(BuildEventKind::LocalCacheWriteEnd {
+            addr: "//a:b".into(),
+            error: None,
+        }));
+        assert_eq!(s.open_count(Op::LocalCacheWrite), 0);
+    }
+
+    /// The sharper half of the same bug: because the write spans never touched
+    /// the quiet clock, a run *progressing* through the write-heavy tail of a
+    /// mostly-cached build looked silent and got reported as stalled. A stall
+    /// notice that fires on a healthy build stops being read.
+    #[test]
+    fn a_build_progressing_through_cache_writes_is_not_a_stall() {
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        s.op_start(Op::Result, "//root:all", 0);
+
+        for i in 0..20 {
+            // Only cache-write activity, spaced under the threshold.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            hook.on_event(&ev(BuildEventKind::LocalCacheWriteStart {
+                addr: format!("//t:{i}"),
+            }));
+            hook.on_event(&ev(BuildEventKind::LocalCacheWriteEnd {
+                addr: format!("//t:{i}"),
+                error: None,
+            }));
+            assert!(
+                s.evaluate(s.now_ms(), T).is_none(),
+                "cache writes are progress; iteration {i} read as a stall"
+            );
+        }
+    }
+
+    /// A blocked result lock is named, with the holder — which for the default
+    /// filesystem backend can be a different heph process entirely, something no
+    /// amount of introspection into this one would ever find.
+    #[test]
+    fn a_blocked_result_lock_is_reported_with_its_holder() {
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        hook.on_event(&ev(BuildEventKind::ResultLockWaitStart {
+            addr: "//a:b".into(),
+            holder_pid: Some(4242),
+        }));
+        s.op_start(Op::Result, "//a:b", 0);
+
+        let r = s.evaluate(61_000, T).expect("stalled");
+        let (n, _, pid) = r.lock_waits.expect("the wait must be reported");
+        assert_eq!(n, 1);
+        assert_eq!(pid, Some(4242));
+        let text = render_stall(&r);
+        assert!(text.contains("lock waits   1"), "{text}");
+        assert!(text.contains("holder pid 4242"), "{text}");
+
+        hook.on_event(&ev(BuildEventKind::ResultLockWaitEnd {
+            addr: "//a:b".into(),
+        }));
+        assert!(
+            s.evaluate(200_000, T)
+                .expect("still stalled")
+                .lock_waits
+                .is_none(),
+            "an acquired (or cancelled) wait must stop being reported"
+        );
+    }
+
+    /// `add_bytes` is only ever called for remote-cache reads, so for every other
+    /// op the window is a structural zero. Printing it reads as evidence of
+    /// starvation when it is evidence of nothing.
+    #[test]
+    fn no_byte_line_or_starvation_claim_for_ops_that_never_report_bytes() {
+        let s = state();
+        for i in 0..98 {
+            s.op_start(Op::Result, &format!("//pkg:{i}"), 0);
+        }
+        let r = s.evaluate(61_000, T).expect("stalled");
+        assert_eq!(
+            r.dominant().map(|(op, _)| op),
+            Some(Op::Result),
+            "result dominates this report"
+        );
+        assert!(
+            !r.dominant_is_starved(),
+            "an op with no byte counter is unmeasured, not starved"
+        );
+
+        let text = render_stall(&r);
+        assert!(
+            !text.contains("bytes"),
+            "no byte line for an op that cannot move the counter: {text}"
+        );
+        assert!(
+            !text.contains("Nothing has been read"),
+            "no hypothesis derived from a counter that cannot move: {text}"
+        );
+    }
+
+    /// The escalation is the diagnostic: two identical paragraphs mean wedged,
+    /// where either alone means only slow. Say it rather than making the reader
+    /// diff two tables by eye.
+    #[test]
+    fn the_delta_since_the_last_report_is_stated() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let mut r = s.evaluate(61_000, T).expect("stalled");
+        r.delta = Some(StallDelta {
+            since: Duration::from_secs(120),
+            done: 0,
+            open: 0,
+        });
+        let text = render_stall(&r);
+        assert!(
+            text.contains("since last   +0 done, +0 open, over 120s"),
+            "{text}"
+        );
+        assert!(r.delta.expect("delta").is_flat());
+    }
+
+    /// Waiters parked on a cell with nobody elected to poll it, plus a flat
+    /// delta, is a lost wake-up — and unlike the byte-starvation claim it is
+    /// backed by two independent observations rather than one structural zero.
+    #[test]
+    fn a_stranded_cell_with_a_flat_delta_is_called_a_lost_wakeup() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let mut r = s.evaluate(61_000, T).expect("stalled");
+        r.delta = Some(StallDelta {
+            since: Duration::from_secs(120),
+            done: 0,
+            open: 0,
+        });
+        r.stuck = vec![hcore::hmemoizer::StuckCell {
+            tag: "result",
+            key: "//a:b".to_string(),
+            waiters: Some(4),
+            has_driver: false,
+        }];
+        let text = render_stall(&r);
+        assert!(text.contains("That is a lost wake-up"), "{text}");
+        assert!(text.contains("[result] //a:b waiters=4"), "{text}");
+    }
+
+    /// A frozen TUI swallows Ctrl-C (raw mode clears ISIG), so the paragraph must
+    /// name the escalation that does work instead of leaving it to be
+    /// rediscovered per incident.
+    #[test]
+    fn the_paragraph_names_the_next_step() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let text = render_stall(&s.evaluate(61_000, T).expect("stalled"));
+        assert!(text.contains("kill -QUIT"), "{text}");
+        assert!(
+            text.contains(&std::process::id().to_string()),
+            "the pid must be filled in, not left as a placeholder: {text}"
         );
     }
 
