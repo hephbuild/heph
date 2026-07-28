@@ -4580,7 +4580,7 @@ mod tests {
         let (seeder, _seeder_home) = engine_with_remote_bash(targets(), &remote_uri)?;
         let seed_rs = seeder.new_state();
         resolve(&seeder, &seed_rs, &app, OutputMatcher::All).await?;
-        drain_bg(&seed_rs).await;
+        drain_bg(seed_rs).await;
 
         let backend = Arc::new(CountingRemoteBackend::new(remote.path()));
         let (engine, _home) = engine_with_remote_bash(targets(), &remote_uri)?;
@@ -4589,11 +4589,11 @@ mod tests {
         // Run 1: cold local cache, so both manifests are fetched and mirrored.
         let rs1 = engine.new_state();
         resolve(&engine, &rs1, &app, OutputMatcher::All).await?;
-        drain_bg(&rs1).await;
         // A run ends by dropping its state — which releases the riding read locks
         // its results hold. Run 2 must start from the same footing a fresh process
-        // would.
-        drop(rs1);
+        // would. `drain_bg` takes the state by value and drops it before waiting,
+        // so handing it over *is* that drop.
+        drain_bg(rs1).await;
         let after_run1 = backend.metadata();
         assert!(
             after_run1 > 0,
@@ -4607,7 +4607,7 @@ mod tests {
         // Run 2: every manifest is local and every blob anyone reads is local.
         let rs2 = engine.new_state();
         resolve(&engine, &rs2, &app, OutputMatcher::All).await?;
-        drain_bg(&rs2).await;
+        drain_bg(rs2).await;
         assert_eq!(
             backend.metadata(),
             after_run1,
@@ -4635,7 +4635,7 @@ mod tests {
             engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
         let seed_rs = seeder.new_state();
         resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
-        drain_bg(&seed_rs).await;
+        drain_bg(seed_rs).await;
 
         let backend = Arc::new(CountingRemoteBackend::new(remote.path()));
         let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
@@ -4644,7 +4644,10 @@ mod tests {
         // Run 1 — hashout only. The manifest is mirrored; no blob is pulled.
         let rs1 = engine.new_state();
         let folded = resolve(&engine, &rs1, &addr, OutputMatcher::None).await?;
-        drain_bg(&rs1).await;
+        // End of run 1: `drain_bg` takes the state by value and drops it before
+        // waiting, which is what releases its riding read locks — so run 2 starts
+        // from the same footing a fresh process would.
+        drain_bg(rs1).await;
         let promised = hashouts(&folded);
         assert!(
             !promised.is_empty(),
@@ -4655,10 +4658,8 @@ mod tests {
             "a hashout-only resolve must carry no artifact"
         );
         assert_eq!(backend.blobs(), 0, "no byte may move for a hashout");
-        // End of run 1: dropping the state releases its riding read locks, so run
-        // 2 starts from the same footing a fresh process would.
+        // The result carries the riding read guards too, so it has to go as well.
         drop(folded);
-        drop(rs1);
 
         // The remote loses the bytes but keeps the manifest — an object-store
         // lifecycle rule expiring blobs is exactly this.
@@ -4725,7 +4726,7 @@ mod tests {
             engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
         let seed_rs = seeder.new_state();
         resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
-        drain_bg(&seed_rs).await;
+        drain_bg(seed_rs).await;
 
         let real = retag_remote_hashouts(remote.path(), "deadbeefdeadbeef");
         assert!(!real.is_empty(), "the seeded manifest must be rewritten");
@@ -4737,10 +4738,12 @@ mod tests {
         // A dependent folds the (now wrong) hashout, mirroring the manifest.
         let rs1 = engine.new_state();
         let folded = resolve(&engine, &rs1, &addr, OutputMatcher::None).await?;
-        drain_bg(&rs1).await;
+        // Takes the state by value and drops it before waiting — that drop is
+        // what releases the run's riding read locks.
+        drain_bg(rs1).await;
         assert_eq!(hashouts(&folded), vec!["deadbeefdeadbeef".to_string()]);
+        // The result carries the riding read guards too, so it has to go as well.
         drop(folded);
-        drop(rs1);
 
         assert!(evict_remote_blobs(remote.path()) > 0);
 
