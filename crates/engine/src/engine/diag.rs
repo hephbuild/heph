@@ -594,6 +594,22 @@ impl StallReport {
             .find(|(o, _)| *o == op)
             .is_some_and(|(_, b)| *b == 0)
     }
+
+    /// Nothing is actually *doing* anything: no subprocess, no cache transfer,
+    /// no cache write, no blocked lock.
+    ///
+    /// [`Op::Result`] is excluded deliberately — a result span is bookkeeping for
+    /// "this addr is being resolved", and every ancestor holds one open while
+    /// awaiting its children. Thousands of them open says nothing about whether
+    /// work is happening. Every *other* op is a real operation in flight, so
+    /// "only result spans are open" means the process has nothing to do.
+    pub fn no_work_in_flight(&self) -> bool {
+        self.lock_waits.is_none()
+            && self
+                .open
+                .iter()
+                .all(|(op, n, _)| matches!(op, Op::Result) || *n == 0)
+    }
 }
 
 /// How the run changed between two consecutive fires of the watchdog.
@@ -815,14 +831,36 @@ pub fn render_stall(r: &StallReport) -> String {
     // corroborates it. A wrong automated hypothesis costs more credibility than
     // no hypothesis — better to show the table and let the reader conclude.
     let stranded = r.stuck.iter().filter(|c| c.is_stranded()).count();
-    if stranded > 0 && r.delta.is_some_and(|d| d.is_flat()) {
-        // Evidence, not inference: tasks are parked on a cell that has no
-        // driver, and nothing moved between two fires. Neither alone would be
-        // enough — a driverless cell is momentarily normal during re-election.
+    if r.delta.is_some_and(|d| d.is_flat()) && !r.stuck.is_empty() && r.no_work_in_flight() {
+        // Three independent observations: nothing changed between two fires, no
+        // operation of any kind is in flight, and cells are still incomplete. A
+        // build with work to do would have *something* open.
+        //
+        // Keyed on "no work in flight" rather than on the driver bit, because a
+        // parked driver still occupies the driver slot: a cell whose awaiter was
+        // woken and never re-polled reads `driver=true` forever. Keying on that
+        // alone reported nothing on a build wedged with 578 result cells and all
+        // drivers populated.
         out.push_str(&format!(
-            "\n  {stranded} cell(s) have tasks parked on them with nobody elected to poll\n  \
-             them, and nothing moved since the last report. That is a lost wake-up,\n  \
-             not slow work.\n"
+            "\n  Nothing is executing, transferring, or waiting on a lock, {} cell(s) are\n  \
+             still incomplete, and nothing moved since the last report. The process is\n  \
+             idle with work outstanding — a lost wake-up or a dependency cycle, not\n  \
+             slow work.\n",
+            r.stuck.len()
+        ));
+        if stranded > 0 {
+            // Sharper still when present: these have waiters and no driver at
+            // all, so not even a re-poll is pending.
+            out.push_str(&format!(
+                "  {stranded} of them have waiters with no driver elected.\n"
+            ));
+        }
+        out.push_str(&format!(
+            "  The full list, the wait-for graph and each invocation's next await are in\n  \
+             `inflight-{}.log` beside this file, refreshed on every report. Re-run with\n  \
+             `HEPH_DEBUG_MEMOIZER_CYCLE=1 HEPH_PHASE_TRACE=1` to populate the last two,\n  \
+             and to fail a real cycle instead of hanging on it.\n",
+            std::process::id()
         ));
     } else if let Some((op, _)) = r.dominant()
         && r.dominant_is_starved()
@@ -864,6 +902,49 @@ pub fn render_stall(r: &StallReport) -> String {
 /// together when diagnosing the same hang, and `heph tool gc` already sweeps that
 /// directory. Per-pid, so concurrent heph processes in one workspace do not
 /// interleave their reports into one unreadable file.
+/// The full in-flight state, rewritten on every stall fire.
+///
+/// Separate from [`StallLog`] because the two want opposite things. The stall
+/// log is a short, readable paragraph that *appends*, so the escalation history
+/// survives; this is the complete uncapped dump — every incomplete cell, the
+/// wait-for graph, every invocation's next-await label — which is thousands of
+/// lines on a large graph and would bury that history if appended fourteen
+/// times.
+///
+/// Truncated on each write, so it always holds the *current* state rather than a
+/// stack of stale ones. The stall log's own history says how the run got here.
+///
+/// Written by the watchdog, without anyone having to catch the process alive:
+/// the first incident this machinery was built for ended with the process dying
+/// before a `SIGQUIT` could be sent, and every byte of in-flight state went with
+/// it. `SIGQUIT` still produces the same report on demand — this one just does
+/// not require someone to be watching.
+pub struct InflightLog {
+    path: std::path::PathBuf,
+}
+
+impl InflightLog {
+    pub fn new(home: &std::path::Path) -> Self {
+        Self {
+            path: home
+                .join("diag")
+                .join(format!("inflight-{}.log", std::process::id())),
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Replace the file with the current in-flight report.
+    pub fn write(&self, text: &str) -> std::io::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&self.path, text)
+    }
+}
+
 pub struct StallLog {
     path: std::path::PathBuf,
 }
@@ -1207,8 +1288,200 @@ mod tests {
             has_driver: false,
         }];
         let text = render_stall(&r);
-        assert!(text.contains("That is a lost wake-up"), "{text}");
+        assert!(text.contains("The process is"), "{text}");
+        assert!(text.contains("idle with work outstanding"), "{text}");
+        assert!(
+            text.contains("1 of them have waiters with no driver elected"),
+            "the sharper sub-case is called out when present: {text}"
+        );
         assert!(text.contains("[result] //a:b waiters=4"), "{text}");
+    }
+
+    /// The shape the driver-keyed check missed.
+    ///
+    /// A real wedge had 578 result cells, 455 meta, 123 locked_result — and
+    /// `driver=true` on every one of them, because an awaiter that is woken and
+    /// never re-polled keeps occupying the driver slot forever. Keying the
+    /// headline on "no driver" reported nothing at all on 25 minutes of a
+    /// completely idle process.
+    #[test]
+    fn a_wedge_is_reported_even_when_every_cell_still_has_a_driver() {
+        let s = state();
+        for i in 0..578 {
+            s.op_start(Op::Result, &format!("//pkg:{i}"), 0);
+        }
+        let mut r = s.evaluate(61_000, T).expect("stalled");
+        r.delta = Some(StallDelta {
+            since: Duration::from_secs(120),
+            done: 0,
+            open: 0,
+        });
+        r.stuck = (0..3)
+            .map(|i| hcore::hmemoizer::StuckCell {
+                tag: "locked_result",
+                key: format!("@heph/fs:file {i}"),
+                waiters: Some(1),
+                has_driver: true,
+            })
+            .collect();
+
+        assert_eq!(
+            r.stuck.iter().filter(|c| c.is_stranded()).count(),
+            0,
+            "none are stranded by the narrow definition — that is the point"
+        );
+        assert!(r.no_work_in_flight(), "only result spans are open");
+
+        let text = render_stall(&r);
+        assert!(text.contains("idle with work outstanding"), "{text}");
+        assert!(
+            !text.contains("have waiters with no driver elected"),
+            "the sub-case line must not appear when nothing is stranded: {text}"
+        );
+        assert!(
+            text.contains("HEPH_DEBUG_MEMOIZER_CYCLE=1"),
+            "the paragraph must name the two vars that resolve it: {text}"
+        );
+    }
+
+    /// The claim is "nothing is happening", so any real operation in flight
+    /// must retract it — otherwise it fires on a build that is merely slow.
+    #[test]
+    fn work_in_flight_retracts_the_idle_claim() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        s.op_start(Op::Execute, "//a:b", 0);
+        let mut r = s
+            .evaluate(T.as_millis() as u64 * QUIET_EXEC_FACTOR + 1, T)
+            .expect("stalled");
+        r.delta = Some(StallDelta {
+            since: Duration::from_secs(120),
+            done: 0,
+            open: 0,
+        });
+        r.stuck = vec![hcore::hmemoizer::StuckCell {
+            tag: "result",
+            key: "//a:b".to_string(),
+            waiters: Some(1),
+            has_driver: true,
+        }];
+        assert!(!r.no_work_in_flight(), "an execute span is real work");
+        let text = render_stall(&r);
+        assert!(!text.contains("idle with work outstanding"), "{text}");
+    }
+
+    /// A blocked lock is work in flight too — the process is waiting on
+    /// something real, quite possibly another process, and calling that "idle"
+    /// would point the reader at the wrong subsystem entirely.
+    #[test]
+    fn a_blocked_lock_retracts_the_idle_claim() {
+        let s = state();
+        let hook = DiagHook::new(std::sync::Arc::clone(&s));
+        s.op_start(Op::Result, "//a:b", 0);
+        hook.on_event(&ev(BuildEventKind::ResultLockWaitStart {
+            addr: "//a:b".into(),
+            holder_pid: Some(99),
+        }));
+        let mut r = s.evaluate(61_000, T).expect("stalled");
+        r.delta = Some(StallDelta {
+            since: Duration::from_secs(120),
+            done: 0,
+            open: 0,
+        });
+        r.stuck = vec![hcore::hmemoizer::StuckCell {
+            tag: "locked_result",
+            key: "//a:b".to_string(),
+            waiters: Some(1),
+            has_driver: true,
+        }];
+        assert!(!r.no_work_in_flight());
+        let text = render_stall(&r);
+        assert!(!text.contains("idle with work outstanding"), "{text}");
+    }
+
+    /// The paragraph points at the companion file by name, so the reader does
+    /// not have to already know it exists.
+    #[test]
+    fn the_paragraph_names_the_inflight_companion_file() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let mut r = s.evaluate(61_000, T).expect("stalled");
+        r.delta = Some(StallDelta {
+            since: Duration::from_secs(120),
+            done: 0,
+            open: 0,
+        });
+        r.stuck = vec![hcore::hmemoizer::StuckCell {
+            tag: "result",
+            key: "//a:b".to_string(),
+            waiters: Some(1),
+            has_driver: true,
+        }];
+        let text = render_stall(&r);
+        assert!(
+            text.contains(&format!("inflight-{}.log", std::process::id())),
+            "{text}"
+        );
+    }
+
+    /// The companion file holds the *current* state, not a pile of stale ones.
+    ///
+    /// It is the uncapped dump — thousands of lines on a large graph — so
+    /// appending it on all fourteen fires of a 25-minute wedge would bury the
+    /// stall log's own escalation history, which is the thing that says "wedged"
+    /// rather than "slow". The stall log appends; this one replaces.
+    #[test]
+    fn the_inflight_log_is_replaced_not_appended() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let log = InflightLog::new(home.path());
+
+        log.write("first report").expect("write");
+        log.write("second report").expect("write");
+
+        let body = std::fs::read_to_string(log.path()).expect("read");
+        assert_eq!(body, "second report");
+        assert!(
+            log.path().to_string_lossy().contains("diag"),
+            "it sits beside the stall log and the SIGQUIT dumps: {:?}",
+            log.path()
+        );
+    }
+
+    /// It carries all three sections, and the gated ones announce themselves
+    /// rather than being silently absent — "no wait-for graph" and "wait-for
+    /// graph not recorded" are very different messages to someone reading this
+    /// during an incident.
+    #[test]
+    fn the_inflight_report_carries_every_section() {
+        let text = hcore::hmemoizer::render_full_report();
+        assert!(text.contains("in-flight inventory"), "{text}");
+        assert!(text.contains("memoizer wait-for graph"), "{text}");
+        assert!(text.contains("memoizer phases"), "{text}");
+        assert!(text.contains("HEPH_DEBUG_MEMOIZER_CYCLE"), "{text}");
+        assert!(text.contains("HEPH_PHASE_TRACE"), "{text}");
+    }
+
+    /// The `workers` limiter is declared by `global()` and, until now, fed by
+    /// nothing — so `saturated_for` was permanently `None` and an exhausted
+    /// worker pool could not appear in the paragraph at any threshold. The
+    /// permit is taken after dep resolution but before `ExecuteStart`, so a
+    /// target queued there shows up as neither an open `execute` span nor a
+    /// limits line: completely invisible.
+    #[test]
+    fn a_saturated_worker_pool_reaches_the_paragraph() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let d = s.limiter("workers");
+        d.observe(0, 1_000);
+
+        let r = s.evaluate(61_000, T).expect("stalled");
+        assert!(
+            r.saturated.iter().any(|(name, _)| *name == "workers"),
+            "workers must be reportable: {:?}",
+            r.saturated
+        );
+        let text = render_stall(&r);
+        assert!(text.contains("workers saturated for"), "{text}");
     }
 
     /// A frozen TUI swallows Ctrl-C (raw mode clears ISIG), so the paragraph must

@@ -179,6 +179,12 @@ where
     F: FnOnce() -> anyhow::Result<R> + Send + 'static,
     R: Send + 'static,
 {
+    // Observe before queueing, so "saturated" times the wait rather than the
+    // moment a permit came free. `codec` is declared by `diag::global()` and was
+    // never fed, so its saturation was structurally unreportable.
+    let d = crate::engine::diag::global();
+    d.limiter("codec")
+        .observe(CODEC_SLOTS.available_permits(), d.now_ms());
     let _permit = CODEC_SLOTS
         .acquire()
         .await

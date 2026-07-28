@@ -50,6 +50,15 @@ impl Engine {
         // waiting for a leaf that also needs a permit.
         hcore::hmemoizer::set_phase("execute:semaphore_acquire");
         let semaphore = Arc::clone(&self.result_semaphore);
+        // Observed *before* the acquire, so the stamp times the wait rather than
+        // its end. This queue is invisible everywhere else: the permit is taken
+        // after dep resolution but before `ExecuteStart`, so a target parked here
+        // has no open `execute` span and shows only as an open `result`. A build
+        // wedged with every worker held reported "N result" and no limits line at
+        // all, because the `workers` limiter was declared and never fed.
+        let d = crate::engine::diag::global();
+        d.limiter("workers")
+            .observe(semaphore.available_permits(), d.now_ms());
         let _permit = semaphore
             .acquire()
             .await

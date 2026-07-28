@@ -156,19 +156,10 @@ fn sweep() {
 /// frames — never inside the signal handler, and never with a blocking lock (see
 /// `hmemoizer::inventory`).
 fn inventory_report() -> String {
-    let cells = hcore::hmemoizer::inventory();
-    format!(
-        "\n=== heph in-flight inventory ({} incomplete cells) ===\n{}\n\
-         === memoizer wait-for graph ===\n{}\n\
-         === memoizer phases ===\n{}\n",
-        cells.len(),
-        // No cap: this file is read once, by a human or an agent, on a build
-        // that has already gone wrong. Truncating it here is how you end up
-        // needing a second incident to see the line you cut.
-        hcore::hmemoizer::render_inventory(&cells, usize::MAX),
-        hcore::hmemoizer::dump_wait_graph(),
-        hcore::hmemoizer::dump_phases(),
-    )
+    // Same renderer the stall watchdog writes to its companion file, so the two
+    // are byte-identical and neither is the "truncated" one. No cap: this is
+    // read once, on a build that has already gone wrong.
+    format!("\n{}", hcore::hmemoizer::render_full_report())
 }
 
 fn write_inventory(fd: libc::c_int) {
@@ -323,11 +314,23 @@ mod tests {
     #[test]
     fn the_dump_carries_the_in_flight_state_and_names_its_gated_sections() {
         let text = inventory_report();
-        assert!(text.contains("heph in-flight inventory"), "{text}");
+        assert!(text.contains("in-flight inventory"), "{text}");
         assert!(text.contains("memoizer wait-for graph"), "{text}");
         assert!(text.contains("memoizer phases"), "{text}");
         // Unset in a test process, so both must self-describe.
         assert!(text.contains("HEPH_DEBUG_MEMOIZER_CYCLE"), "{text}");
-        assert!(text.contains("heph_PHASE_TRACE"), "{text}");
+        assert!(text.contains("HEPH_PHASE_TRACE"), "{text}");
+    }
+
+    /// The `SIGQUIT` dump and the watchdog's companion file must be the same
+    /// text. Two formats for one thing means a reader has to work out which of
+    /// them is the truncated one, during an incident, which is exactly when
+    /// nobody should be reverse-engineering a diagnostic.
+    #[test]
+    fn the_dump_and_the_watchdog_companion_file_render_identically() {
+        assert_eq!(
+            inventory_report().trim(),
+            hcore::hmemoizer::render_full_report().trim()
+        );
     }
 }
