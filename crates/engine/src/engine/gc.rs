@@ -161,12 +161,39 @@ impl Engine {
     /// returns immediately (trimming nothing) when contended, never blocking.
     /// Fire-and-forget from the background cleaner; errors are logged, not
     /// propagated.
+    ///
+    /// Ordered cheapest-first, mirroring [`gc_apply`](Self::gc_apply): a single
+    /// *unlocked* revision count decides whether there is anything to do at all,
+    /// and only a target genuinely over budget pays for the write lock, the
+    /// write barrier and the per-revision manifest reads. The steady state — a
+    /// target rebuilt within its `cache.history` budget — is the common case on
+    /// every warm run, and it now costs one `list_target_entries` instead of a
+    /// lock acquire plus one manifest read per revision.
+    ///
+    /// The unlocked count is safe precisely because it can only *skip*: it never
+    /// deletes, so it needs no lock, and a revision that lands between the count
+    /// and the lock is reclaimed by the next write's trim or by `heph gc`. The
+    /// authoritative enumeration is re-taken under the write lock below.
     pub(crate) fn try_trim_after_write(
         self: &Arc<Self>,
         addr: &Addr,
         keep: u32,
         written_hashin: &str,
     ) {
+        let pre = match self.local_cache.list_target_entries(addr) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc pre-count");
+                return;
+            }
+        };
+        // Undercount is safe (see above): the just-written revision may not be
+        // visible to this read yet, and a target at exactly `keep` has nothing to
+        // delete anyway.
+        if pre.len() as u32 <= keep {
+            return;
+        }
+
         match self.result_lock().try_write(addr) {
             Ok(Some(guard)) => {
                 // Barrier on the just-written manifest so enumeration observes it
@@ -176,6 +203,8 @@ impl Engine {
                     tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc barrier");
                     return;
                 }
+                // Re-listed under the lock: authoritative, and it may have grown
+                // since the unlocked pre-count above.
                 let hashins = match self.local_cache.list_target_entries(addr) {
                     Ok(h) => h,
                     Err(e) => {
@@ -520,13 +549,15 @@ mod tests {
     use super::*;
     use crate::engine::Config;
     use crate::engine::local_cache::{
-        MANIFEST_V1, Manifest, ManifestArtifact, ManifestArtifactContentType,
-        ManifestArtifactEncoding, ManifestArtifactType,
+        Existence, LocalCache, MANIFEST_V1, Manifest, ManifestArtifact,
+        ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType, SizedReader,
+        TargetStream,
     };
     use hcore::hasync::StdCancellationToken;
     use hmodel::htpkg::PkgBuf;
     use std::collections::BTreeMap;
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_engine() -> (Arc<Engine>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -554,6 +585,92 @@ mod tests {
         })
         .expect("engine");
         (Arc::new(engine), dir)
+    }
+
+    /// Counts the two cache round-trips the post-write trim must not make when
+    /// the target is already inside its history budget: the write barrier
+    /// (`exists` on the manifest key) and the per-revision recency reads
+    /// (`reader` on the manifest key, one per revision). Everything else is
+    /// forwarded verbatim to the real backend, so the target under test is a
+    /// genuine sqlite cache rather than a stub.
+    struct CountingCache {
+        inner: Arc<dyn LocalCache>,
+        barrier_reads: Arc<AtomicUsize>,
+        manifest_reads: Arc<AtomicUsize>,
+    }
+
+    impl LocalCache for CountingCache {
+        fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
+            if name == MANIFEST_V1 {
+                self.manifest_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.reader(addr, hashin, name)
+        }
+        fn writer(
+            &self,
+            addr: &Addr,
+            hashin: &str,
+            name: &str,
+        ) -> anyhow::Result<Box<dyn std::io::Write>> {
+            self.inner.writer(addr, hashin, name)
+        }
+        fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
+            if name == MANIFEST_V1 {
+                self.barrier_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.exists(addr, hashin, name)
+        }
+        fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Existence> {
+            // Forwarded to the layer that owns the write-behind queue, per the
+            // trait's contract — never re-derived from `exists`.
+            self.inner.existence(addr, hashin, name)
+        }
+        fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
+            self.inner.delete(addr, hashin, name)
+        }
+        fn list_targets(&self) -> anyhow::Result<TargetStream> {
+            self.inner.list_targets()
+        }
+        fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
+            self.inner.list_target_entries(addr)
+        }
+        fn seekable_reader(
+            &self,
+            addr: &Addr,
+            hashin: &str,
+            name: &str,
+        ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>> {
+            self.inner.seekable_reader(addr, hashin, name)
+        }
+        fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
+            self.inner.file_path(addr, hashin, name)
+        }
+    }
+
+    /// Engine whose cache counts manifest barrier/recency reads. Returns the two
+    /// counters alongside it.
+    fn test_engine_counting() -> (
+        Arc<Engine>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })
+        .expect("engine");
+        let barrier_reads = Arc::new(AtomicUsize::new(0));
+        let manifest_reads = Arc::new(AtomicUsize::new(0));
+        engine.local_cache = Arc::new(CountingCache {
+            inner: Arc::clone(&engine.local_cache),
+            barrier_reads: Arc::clone(&barrier_reads),
+            manifest_reads: Arc::clone(&manifest_reads),
+        });
+        (Arc::new(engine), barrier_reads, manifest_reads, dir)
     }
 
     fn addr(name: &str) -> Addr {
@@ -728,6 +845,65 @@ mod tests {
             "contended lock → nothing trimmed"
         );
         assert!(present(&engine, &a, "h2"));
+    }
+
+    /// The no-op case — a target rebuilt while still inside its history budget —
+    /// must cost exactly one unlocked enumeration. No write barrier, no manifest
+    /// recency reads: those only exist to decide *what* to delete, and there is
+    /// nothing to delete.
+    #[tokio::test]
+    async fn try_trim_after_write_skips_reads_when_within_budget() {
+        let (engine, barrier_reads, manifest_reads, _dir) = test_engine_counting();
+        let a = addr("t");
+        write_revision(&engine, &a, "h1", 100, &["o.tar"]);
+        write_revision(&engine, &a, "h2", 200, &["o.tar"]);
+        // Setup wrote and barriered its own revisions; only the trim is measured.
+        barrier_reads.store(0, Ordering::SeqCst);
+        manifest_reads.store(0, Ordering::SeqCst);
+
+        // 2 revisions, history 2 → within budget, nothing to trim.
+        engine.try_trim_after_write(&a, 2, "h2");
+
+        assert_eq!(
+            barrier_reads.load(Ordering::SeqCst),
+            0,
+            "within budget: no post-write barrier read"
+        );
+        assert_eq!(
+            manifest_reads.load(Ordering::SeqCst),
+            0,
+            "within budget: no per-revision manifest read"
+        );
+        assert!(present(&engine, &a, "h1"), "nothing trimmed");
+        assert!(present(&engine, &a, "h2"));
+    }
+
+    /// The mirror of the above: over budget, the trim *does* pay for the barrier
+    /// and the recency reads. Without this the skip assertion could pass on a
+    /// trim that had stopped working entirely.
+    #[tokio::test]
+    async fn try_trim_after_write_reads_manifests_when_over_budget() {
+        let (engine, barrier_reads, manifest_reads, _dir) = test_engine_counting();
+        let a = addr("t");
+        write_revision(&engine, &a, "h1", 100, &["o.tar"]);
+        write_revision(&engine, &a, "h2", 200, &["o.tar"]);
+        barrier_reads.store(0, Ordering::SeqCst);
+        manifest_reads.store(0, Ordering::SeqCst);
+
+        engine.try_trim_after_write(&a, 1, "h2");
+
+        assert_eq!(
+            barrier_reads.load(Ordering::SeqCst),
+            1,
+            "over budget: the just-written manifest is barriered once"
+        );
+        assert_eq!(
+            manifest_reads.load(Ordering::SeqCst),
+            3,
+            "over budget: one recency read per revision, plus the artifact list \
+             of the one revision actually deleted"
+        );
+        assert!(!present(&engine, &a, "h1"), "stale revision trimmed");
     }
 
     #[tokio::test]
