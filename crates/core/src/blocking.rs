@@ -163,31 +163,43 @@ impl Drop for Backstop {
     }
 }
 
-/// Wake every registered backstop waiter now rather than on the next tick.
+/// Wake every registered backstop waiter now rather than on the next tick, and
+/// hand back the `Waker`s it was holding.
 ///
 /// Waking early is always sound: a spurious wake costs one poll, and a waiter
-/// that is still genuinely pending stays armed either way.
+/// that is genuinely still pending re-arms from the poll that wake provokes.
 ///
-/// This used to also *release* every registration, because a registration
-/// outlived the future that made it: a waiter re-registered on each pending poll
-/// and never unregistered, so its last push sat in [`PENDING`] until a tick swept
-/// it — and a `Waker` owns its task, which owns everything that task's state
-/// holds. The post-run cache trim needs the request's cache read guards actually
-/// gone before it can take a write lock, and one stale registration was enough to
-/// keep a guard alive past the request that made it.
+/// **Releasing is half the point, and it is not only about *finished* waits.** A
+/// `Waker` owns whatever it can reach — here an `Arc<hmemoizer::Cell>`, whose
+/// memoized value for `mem_locked_result` is the addr's riding cache read. The
+/// post-run cache trim has to take a write lock, so every one of those reads must
+/// be gone before it runs, or the trim finds its target contended and silently
+/// skips.
 ///
-/// [`Backstop`] removes that at the source: a registration is dropped when the
-/// wait ends, so nothing finished is ever still reachable from this list and
-/// there is nothing stale left to release. What remains here is the other half
-/// of the caller's need — pulling the next poll forward instead of waiting up to
-/// [`WAKE_BACKSTOP`] for it.
+/// [`Backstop`] fixes the *finished* half at the source: a registration is
+/// dropped when its wait ends, so a completed waiter no longer pins anything
+/// until a tick sweeps it. But a request can be torn down while background work
+/// is still in flight, and those registrations are live, not stale — the guard
+/// will not release them because the wait genuinely has not ended. Taking them
+/// here is what unpins the read guards, and the still-pending waiter re-arms on
+/// its next poll.
 ///
-/// Returns how many registrations were woken, so a caller can tell its own flush
+/// (That re-arm is the same assumption the tick deliberately no longer makes: see
+/// [`PENDING`]. It is sound here because this is a teardown path — the wedge the
+/// tick's retention guards against happens mid-run, under a memoizer cell that
+/// swallows a wake it thinks is redundant.)
+///
+/// Returns how many registrations were taken, so a caller can tell its own flush
 /// from a tick that happened to land first.
 pub fn flush_backstop() -> usize {
-    // Cloned under the lock and the lock released before waking, so a waker that
-    // re-enters this module from inside `wake` cannot deadlock against us.
-    let due: Vec<Waker> = lock_pending().iter().map(|(_, w)| w.clone()).collect();
+    // Taken, not cloned: releasing the `Waker`s is half the point (see above).
+    // Taken before waking, and the lock released first, so a waker that re-arms
+    // from inside `wake` cannot deadlock against us — its `arm` simply pushes a
+    // fresh entry under the same id.
+    let due: Vec<Waker> = std::mem::take(&mut *lock_pending())
+        .into_iter()
+        .map(|(_, w)| w)
+        .collect();
     let n = due.len();
     for waker in due {
         // Callers reach this from `Drop` on a teardown path. A panicking waker
@@ -306,6 +318,18 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// [`PENDING`] is process-wide, and `flush_backstop` takes *everything* in
+    /// it. Cargo runs these tests in threads of one process, so a test that
+    /// flushes will happily disarm a registration another test is still watching.
+    /// Every test that touches the shared list holds this first.
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+    /// Poisoning is ignored: the guard protects no invariant of its own, and a
+    /// failing test must not cascade into every later one.
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[tokio::test]
     async fn runs_off_the_calling_thread_and_returns_the_value() {
         let here = thread::current().id();
@@ -375,6 +399,7 @@ mod tests {
     /// tick or a flush, which is what the post-run cache trim depends on.
     #[test]
     fn a_registration_is_released_when_its_wait_ends() {
+        let _exclusive = exclusive();
         struct Owning(#[expect(dead_code, reason = "held to observe the refcount")] Arc<()>);
         impl futures::task::ArcWake for Owning {
             fn wake_by_ref(_: &Arc<Self>) {}
@@ -396,21 +421,54 @@ mod tests {
             "armed: the registration is the only thing still holding the waker"
         );
 
-        // A flush wakes, and deliberately does *not* release — releasing is the
-        // guard's job, so a waiter that is still pending stays armed through it.
-        flush_backstop();
-        assert_eq!(
-            Arc::strong_count(&owned),
-            2,
-            "a flush must not disarm a live registration"
-        );
-
         drop(armed);
         assert_eq!(
             Arc::strong_count(&owned),
             1,
             "ending the wait must release the waker the registration held"
         );
+    }
+
+    /// A flush must hand back the wakers of waits that are *still pending*, not
+    /// only of finished ones.
+    ///
+    /// A `Waker` owns whatever it can reach — an `Arc<hmemoizer::Cell>`, whose
+    /// memoized `mem_locked_result` value is the addr's riding cache read. A
+    /// request can be torn down while background uploads are still in flight, and
+    /// those registrations are live rather than stale, so [`Backstop`]'s
+    /// end-of-wait release does not cover them. Leaving them armed pins the read
+    /// guards, and the post-run cache-history trim then finds every target
+    /// contended and silently skips
+    /// (`e2e::cache_history_is_enforced_by_the_end_of_the_run`).
+    #[test]
+    fn a_flush_releases_a_still_pending_registration() {
+        let _exclusive = exclusive();
+        struct Owning(#[expect(dead_code, reason = "held to observe the refcount")] Arc<()>);
+        impl futures::task::ArcWake for Owning {
+            fn wake_by_ref(_: &Arc<Self>) {}
+        }
+
+        let owned = Arc::new(());
+        // Deliberately kept alive for the whole test: this stands for a wait that
+        // has not ended, so nothing but the flush can release its waker.
+        let armed = Backstop::new();
+        {
+            let waker = futures::task::waker(Arc::new(Owning(Arc::clone(&owned))));
+            armed.arm(&waker);
+        }
+        assert_eq!(Arc::strong_count(&owned), 2, "armed");
+
+        assert!(
+            flush_backstop() >= 1,
+            "the flush must take our registration"
+        );
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "a flush must release the waker even though the wait is still live"
+        );
+
+        drop(armed);
     }
 
     /// The bug this module's retention exists to prevent.
@@ -424,6 +482,7 @@ mod tests {
     /// blocking pool idle because their jobs had already finished.
     #[test]
     fn a_swallowed_wake_does_not_disarm_the_backstop() {
+        let _exclusive = exclusive();
         /// Counts wakes and drops every one, like a cell that already has a
         /// driver on the hook.
         struct Swallowing(Arc<AtomicUsize>);
@@ -456,6 +515,7 @@ mod tests {
     /// invariant that makes `flush_backstop` safe to call from anywhere.
     #[test]
     fn flush_backstop_does_not_strand_a_still_pending_waiter() {
+        let _exclusive = exclusive();
         let out = futures::executor::block_on(async {
             let job = run(|| {
                 thread::sleep(WAKE_BACKSTOP / 2);
@@ -489,6 +549,7 @@ mod tests {
     /// from the backstop and not from the job answering.
     #[test]
     fn backstop_re_wakes_a_waiter_while_its_job_is_still_running() {
+        let _exclusive = exclusive();
         use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
         static WAKES: AtomicUsize = AtomicUsize::new(0);
