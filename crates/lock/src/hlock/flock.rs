@@ -197,9 +197,14 @@ impl FLockState {
     /// exactly then. Truncates to `bytes.len()` so stale trailing bytes from a
     /// prior, longer payload do not linger.
     ///
-    /// Positioned (`pwrite`) rather than seek-then-write: it saves the `lseek`
-    /// and leaves the fd's shared file offset alone, which matters because the
-    /// same open file description is shared by every in-process guard.
+    /// Positioned (`pwrite`) rather than seek-then-write: it saves the `lseek`,
+    /// and no reader of this fd depends on the offset today — `pwrite` keeps it
+    /// that way, since the same open file description is shared by every
+    /// in-process guard and a seek here would move it under all of them.
+    ///
+    /// Both syscalls name the lock file in their context: the caller holds only
+    /// a guard, so with several addrs in flight an `ENOSPC`/`EIO` here is
+    /// otherwise unattributable to a lock.
     fn write_contents(&self, bytes: &[u8]) -> Result<()> {
         let st = self.fd.lock();
         let f = st
@@ -207,9 +212,13 @@ impl FLockState {
             .as_ref()
             .context("write_contents requires a held lock (fd open)")?;
         f.write_all_at(bytes, 0)
-            .context("writing lock file contents")?;
-        f.set_len(bytes.len() as u64)
-            .context("truncating lock file to payload length")?;
+            .with_context(|| format!("writing lock file contents {}", self.path.display()))?;
+        f.set_len(bytes.len() as u64).with_context(|| {
+            format!(
+                "truncating lock file {} to payload length",
+                self.path.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -243,6 +252,19 @@ impl FLockState {
     fn counts(&self) -> (usize, bool, bool) {
         let st = self.fd.lock();
         (st.readers, st.writer, st.file.is_some())
+    }
+
+    /// Current offset of the shared open file description. Exists so tests can
+    /// pin the invariant [`write_contents`](Self::write_contents) documents:
+    /// stamping contents must not move the offset every in-process guard shares.
+    #[cfg(test)]
+    fn stream_pos(&self) -> u64 {
+        let st = self.fd.lock();
+        let mut f = st
+            .file
+            .as_ref()
+            .expect("fd must be open to read its offset");
+        std::io::Seek::stream_position(&mut f).expect("stream_position on lock fd")
     }
 }
 
@@ -483,22 +505,78 @@ mod tests {
     async fn write_contents_targets_the_held_inode_not_the_path() {
         // The guard writes through its open file description. Proven by swapping
         // a decoy inode in at the path: a write that re-resolved the path would
-        // land on the decoy.
+        // land on the decoy. Both halves are asserted — that the bytes reached
+        // the held inode, and that the decoy was left alone — so a
+        // `write_contents` that wrote nothing at all cannot pass.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lock");
         let l = FLock::new(&path);
 
         let g = l.lock(&ct()).await.unwrap();
+        // A second handle on the *held* inode, opened before the unlink, so what
+        // lands there stays readable once the path names a different file.
+        let held_inode = std::fs::File::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"decoy").unwrap();
 
         g.write_contents(b"held").unwrap();
+
+        let mut buf = [0u8; 4];
+        held_inode
+            .read_exact_at(&mut buf, 0)
+            .expect("payload landed on the held inode");
+        assert_eq!(&buf, b"held", "write_contents must write the held inode");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"decoy",
             "write_contents must not re-open the lock path"
         );
         drop(g);
+    }
+
+    #[tokio::test]
+    async fn write_contents_leaves_the_shared_file_offset_untouched() {
+        // The open file description is shared by every in-process guard on this
+        // lock, so stamping contents must be positioned (`pwrite`) rather than
+        // seek-then-write: a `rewind` + `write_all` leaves the offset at the
+        // payload length, silently relocating any other guard's next read.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = FLock::new(dir.path().join("lock"));
+
+        let g = l.lock(&ct()).await.unwrap();
+        assert_eq!(l.state.stream_pos(), 0, "a fresh fd starts at offset 0");
+
+        g.write_contents(b"42").unwrap();
+        assert_eq!(
+            l.state.stream_pos(),
+            0,
+            "write_contents must not move the shared file offset"
+        );
+        drop(g);
+    }
+
+    #[tokio::test]
+    async fn write_contents_error_names_the_lock_file() {
+        // Callers reach `write_contents` holding only a guard, so they have no
+        // path of their own to log. The error must carry the lock file's
+        // identity or an ENOSPC/EIO with several addrs in flight cannot be
+        // attributed to a lock.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        std::fs::write(&path, b"x").unwrap();
+
+        let state = FLockState::new(path.clone());
+        // A read-only file description fails the positioned write with EBADF,
+        // which beats filling a disk to reach the same branch.
+        state.fd.lock().file = Some(std::fs::File::open(&path).unwrap());
+
+        let err = state
+            .write_contents(b"42")
+            .expect_err("a read-only description cannot be written");
+        assert!(
+            format!("{err}").contains(&path.display().to_string()),
+            "error must name the lock file, got: {err}"
+        );
     }
 
     #[tokio::test]

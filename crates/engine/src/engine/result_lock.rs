@@ -240,29 +240,49 @@ fn inner_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
 /// Writes through the gateway guard's *already-open* file description rather
 /// than re-opening the lock file by path: it drops the `open`/`close` pair (and
 /// the path resolution that comes with them) from every gateway acquire, and it
-/// makes the stamp structurally incapable of landing on a file this process
-/// does not hold.
+/// makes the stamp structurally incapable of landing on a file this process does
+/// not hold. That last part is robustness, not a bug fixed — at the instant this
+/// runs we hold the gateway exclusively and are the only party that unlinks it,
+/// so path and locked inode cannot yet diverge here. They are *allowed* to in
+/// this design (`release_write` unlinks while still holding the lock), so the
+/// stronger form is worth having before some future caller opens that window.
+///
+/// The payload is newline-framed. `write_contents` writes positionally and only
+/// then truncates, so between those two syscalls a reader in another process
+/// sees the new pid followed by the tail of a longer previous one — all digits,
+/// and therefore a perfectly parseable pid belonging to nobody. The terminator
+/// bounds the frame: a torn read yields the real pid or nothing (see
+/// [`read_pid`]).
 fn stamp_pid(gateway: Option<&FWriteGuard>) {
+    debug_assert!(
+        gateway.is_some(),
+        "pid stamp with no held gateway guard: the guard owns the gateway for \
+         its whole observable lifetime"
+    );
     let Some(gateway) = gateway else {
-        // Unreachable in practice: the guard owns the gateway for its whole
-        // observable lifetime.
         tracing::debug!("gateway guard unavailable for pid stamp");
         return;
     };
-    if let Err(err) = gateway.write_contents(std::process::id().to_string().as_bytes()) {
+    let stamp = format!("{}\n", std::process::id());
+    if let Err(err) = gateway.write_contents(stamp.as_bytes()) {
         tracing::debug!(error = %err, "stamping pid into gateway lock file");
     }
 }
 
 /// Read a pid previously stamped by the lock holder. `None` on any read/parse
-/// failure (missing file, empty, non-numeric).
+/// failure (missing file, empty, non-numeric) and on a torn read.
+///
+/// Only the bytes before the first newline are a pid: everything after it is
+/// either absent or the unreclaimed tail of a longer previous stamp (see
+/// [`stamp_pid`]). An unterminated payload is a half-visible write, never a
+/// holder — reporting a pid the user might `kill` is worse than reporting none.
 fn read_pid(path: &Path) -> Option<u32> {
     let mut s = String::new();
     std::fs::File::open(path)
         .ok()?
         .read_to_string(&mut s)
         .ok()?;
-    s.trim().parse().ok()
+    s.split_once('\n')?.0.trim().parse().ok()
 }
 
 impl std::fmt::Debug for ResultLock {
@@ -473,12 +493,91 @@ mod tests {
         drop(held);
     }
 
+    // The two live production stamp sites. `upgradable_read` above has no
+    // production caller today, so without these the whole
+    // `outer_guard()` → `stamp_pid` → `write_contents` chain would be asserted
+    // only through a path nothing but a test walks — a mis-wired guard on either
+    // live site would ship green.
+    #[tokio::test]
+    async fn fs_holder_pid_reports_the_pid_stamped_by_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+
+        assert_eq!(lock.holder_pid(&addr("a")), None, "no holder yet");
+
+        let held = lock.write(&addr("a"), &ct()).await.expect("write");
+        assert_eq!(lock.holder_pid(&addr("a")), Some(std::process::id()));
+
+        // Releasing the write unlinks the gateway file, so the holder is
+        // unknown again rather than stale.
+        drop(held);
+        assert_eq!(lock.holder_pid(&addr("a")), None, "unknown after release");
+    }
+
+    #[tokio::test]
+    async fn fs_holder_pid_reports_the_pid_stamped_by_try_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+
+        assert_eq!(lock.holder_pid(&addr("a")), None, "no holder yet");
+
+        let held = lock
+            .try_write(&addr("a"))
+            .expect("try_write ok")
+            .expect("free addr acquires");
+        assert_eq!(lock.holder_pid(&addr("a")), Some(std::process::id()));
+
+        drop(held);
+        assert_eq!(lock.holder_pid(&addr("a")), None, "unknown after release");
+    }
+
+    // `write_contents` writes positionally and truncates second, so a reader in
+    // another process can catch the gateway file mid-stamp. A killed holder
+    // leaves a 7-digit pid behind (Linux `pid_max` defaults to 4194304); the
+    // next holder stamps a 3-digit one over it, and this is what a third process
+    // sees before the truncate lands. Unframed, `4214304` parses cleanly and the
+    // TUI names a pid the user might kill.
+    #[test]
+    fn holder_pid_ignores_a_torn_stamp_rather_than_reporting_a_wrong_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+        let a = addr("a");
+
+        std::fs::write(outer_lock_path(dir.path(), &a), b"421\n304\n").expect("torn stamp");
+
+        assert_eq!(
+            lock.holder_pid(&a),
+            Some(421),
+            "the framed pid, never the concatenation with the stale tail"
+        );
+    }
+
+    #[test]
+    fn holder_pid_is_unknown_for_an_unterminated_stamp() {
+        // A write only half visible has no terminator. Naming `42` while the
+        // holder is really `4211592` is worse than naming nobody.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+        let a = addr("a");
+
+        std::fs::write(outer_lock_path(dir.path(), &a), b"42").expect("partial stamp");
+
+        assert_eq!(
+            lock.holder_pid(&a),
+            None,
+            "an unframed payload is not a pid"
+        );
+    }
+
     // The stamp must go through the gateway guard's open fd, never a second
     // `open` of the path. Proven by swapping a decoy inode in at the path while
     // the guard holds the original: a path-based stamp would land on the decoy.
+    // Asserted in both directions — the pid reached the held inode, and the
+    // decoy was untouched — so a `stamp_pid` that wrote nothing cannot pass.
     #[tokio::test]
     async fn stamp_pid_writes_through_the_held_fd_not_the_path() {
         use hlock::hlock::Lock;
+        use std::os::unix::fs::FileExt as _;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("gateway.lock");
@@ -488,11 +587,24 @@ mod tests {
             .await
             .expect("gateway");
 
+        // A second handle on the held inode, opened before the unlink, so what
+        // lands there stays readable once the path names a different file.
+        let held_inode = std::fs::File::open(&path).expect("reopen held inode");
         std::fs::remove_file(&path).expect("unlink held lock file");
         std::fs::write(&path, b"decoy").expect("decoy");
 
         stamp_pid(Some(&held));
 
+        let expected = format!("{}\n", std::process::id());
+        let mut buf = vec![0u8; expected.len()];
+        held_inode
+            .read_exact_at(&mut buf, 0)
+            .expect("stamp landed on the held inode");
+        assert_eq!(
+            buf,
+            expected.as_bytes(),
+            "the framed pid must land on the held inode"
+        );
         assert_eq!(
             std::fs::read(&path).expect("decoy readable"),
             b"decoy",

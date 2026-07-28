@@ -81,9 +81,11 @@ impl<O: Lock, I: RWLock> TBridgeUpgradableGuard<O, I> {
     /// gateway lock itself — e.g. write through its already-open file
     /// description instead of re-opening the lock file by path.
     ///
-    /// `Some` for this guard's whole observable lifetime: the option is emptied
-    /// only by [`upgrade`](TUpgradableReadGuard::upgrade) and `drop`, both of
-    /// which consume `self`.
+    /// `Some` for this guard's whole observable lifetime. Two things empty the
+    /// option: [`upgrade`](TUpgradableReadGuard::upgrade), which consumes `self`
+    /// and hands the gateway to the write guard it returns, and `Drop`, which
+    /// takes `&mut self` but is the end of the guard — nothing can call this
+    /// accessor after it.
     pub fn outer_guard(&self) -> Option<&O::Guard> {
         self.outer_guard.as_ref()
     }
@@ -91,7 +93,9 @@ impl<O: Lock, I: RWLock> TBridgeUpgradableGuard<O, I> {
 
 impl<O: Lock, I: RWLock> TBridgeWriteGuard<O, I> {
     /// Borrow the held outer (gateway) guard. See
-    /// [`TBridgeUpgradableGuard::outer_guard`].
+    /// [`TBridgeUpgradableGuard::outer_guard`] — same invariant, with
+    /// [`downgrade`](TWriteGuard::downgrade) in place of `upgrade` as the
+    /// transition that moves the gateway on.
     pub fn outer_guard(&self) -> Option<&O::Guard> {
         self.outer_guard.as_ref()
     }
@@ -375,6 +379,47 @@ mod tests {
 
         drop(u);
         assert!(l.try_write().unwrap().is_some(), "writer after read drains");
+    }
+
+    // The gateway guard is *moved* between guard types by `upgrade` and
+    // `downgrade`, and callers reach through `outer_guard()` to write the holder
+    // pid into the gateway lock file. A transition that dropped it on the floor
+    // would turn that stamp into a permanent silent no-op with nothing failing,
+    // so pin the invariant the accessor's doc comment claims.
+    #[tokio::test]
+    async fn outer_guard_survives_every_acquire_and_transition() {
+        let l = mem_tlock();
+
+        let u = l.upgradable_read(&ct()).await.unwrap();
+        assert!(
+            u.outer_guard().is_some(),
+            "upgradable_read holds the gateway"
+        );
+        let w = u.upgrade(&ct()).await.unwrap();
+        assert!(
+            w.outer_guard().is_some(),
+            "upgrade carries the gateway over"
+        );
+        let u = w.downgrade(&ct()).await.unwrap();
+        assert!(
+            u.outer_guard().is_some(),
+            "downgrade carries the gateway back"
+        );
+        drop(u);
+
+        let w = l.write(&ct()).await.unwrap();
+        assert!(w.outer_guard().is_some(), "write holds the gateway");
+        drop(w);
+
+        let w = l.try_write().unwrap().expect("lock is free");
+        assert!(w.outer_guard().is_some(), "try_write holds the gateway");
+        drop(w);
+
+        let u = l.try_upgradable_read().unwrap().expect("lock is free");
+        assert!(
+            u.outer_guard().is_some(),
+            "try_upgradable_read holds the gateway"
+        );
     }
 
     #[tokio::test]
