@@ -19,6 +19,8 @@ use std::sync::Arc;
 fn narrowing_prefix(m: &htmatcher::Matcher) -> PkgBuf {
     match m {
         htmatcher::Matcher::Package(p) | htmatcher::Matcher::PackagePrefix(p) => p.clone(),
+        // An exact addr lives in exactly one package.
+        htmatcher::Matcher::Addr(a) => a.package.clone(),
         htmatcher::Matcher::And(ms) => ms
             .iter()
             .map(narrowing_prefix)
@@ -207,6 +209,12 @@ mod tests {
             narrowing_prefix(&Matcher::PackagePrefix(pkg("foo"))),
             pkg("foo")
         );
+    }
+
+    #[test]
+    fn addr_returns_its_package() {
+        let a = hmodel::htaddr::Addr::new(pkg("foo/bar"), "baz".to_string(), Default::default());
+        assert_eq!(narrowing_prefix(&Matcher::Addr(a)), pkg("foo/bar"));
     }
 
     #[test]

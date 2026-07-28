@@ -37,6 +37,17 @@ impl Engine {
             for pkg_result in self.packages(m, &rs).await? {
                 let pkg = PkgBuf::from(pkg_result?);
 
+                // Prune before probing or listing. `list` is a whole-package
+                // Starlark evaluation for the buildfile provider, so without
+                // this a scoped query (`//foo/...`, `label(l) && //foo/...`,
+                // a bare `//foo:bar`) still pays to evaluate every BUILD file
+                // in the repo and then throws the results away at the addr
+                // check below. Providers are free to ignore `ListPackagesRequest::prefix`
+                // — most do — so the narrowing has to happen here too.
+                if m.matches_pkg(&pkg) == MatchResult::MatchNo {
+                    continue;
+                }
+
                 let states = Arc::clone(&self).probe_segments(&rs, &pkg).await?;
 
                 for provider in &self.providers {
@@ -457,6 +468,184 @@ mod tests {
             .expect("list called for queried package a/b/c");
         let pkgs: Vec<String> = abc.iter().map(|s| s.package.as_str().to_string()).collect();
         assert_eq!(pkgs, vec!["a/b/c", "a/b", "a", ""]);
+        Ok(())
+    }
+
+    /// A provider over a fixed package set that records every package `list`
+    /// was actually asked for — the cost a scoped query must not pay.
+    struct ListSpy {
+        pkgs: Vec<&'static str>,
+        listed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::engine::provider::Provider for ListSpy {
+        fn config(
+            &self,
+            _req: crate::engine::provider::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::provider::ConfigResponse> {
+            Ok(crate::engine::provider::ConfigResponse {
+                name: "spy".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<Item = anyhow::Result<crate::engine::provider::ListResponse>>
+                        + Send,
+                >,
+            >,
+        > {
+            let pkg = req.package.clone();
+            let listed = Arc::clone(&self.listed);
+            Box::pin(async move {
+                listed.lock().unwrap().push(pkg.as_str().to_string());
+                let items: Vec<anyhow::Result<crate::engine::provider::ListResponse>> =
+                    vec![Ok(crate::engine::provider::ListResponse {
+                        addr: Addr::new(pkg, "t".to_string(), Default::default()),
+                    })];
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: crate::engine::provider::ListPackagesRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            anyhow::Result<
+                Box<
+                    dyn Iterator<
+                            Item = anyhow::Result<crate::engine::provider::ListPackageResponse>,
+                        > + Send,
+                >,
+            >,
+        > {
+            // Deliberately ignores `req.prefix`, like every real provider in
+            // the tree: the engine must do the narrowing itself.
+            let items: Vec<anyhow::Result<crate::engine::provider::ListPackageResponse>> = self
+                .pkgs
+                .iter()
+                .map(|p| {
+                    Ok(crate::engine::provider::ListPackageResponse {
+                        pkg: PkgBuf::from(*p),
+                    })
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: crate::engine::provider::GetRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<crate::engine::provider::GetResponse, crate::engine::provider::GetError>,
+        > {
+            Box::pin(async { Err(crate::engine::provider::GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: crate::engine::provider::ProbeRequest,
+            _ctoken: &'a (dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<crate::engine::provider::ProbeResponse>>
+        {
+            let pkg = req.package.clone();
+            Box::pin(async move {
+                Ok(crate::engine::provider::ProbeResponse {
+                    states: vec![crate::engine::provider::State {
+                        package: pkg,
+                        provider: "spy".to_string(),
+                        state: Default::default(),
+                    }],
+                })
+            })
+        }
+    }
+
+    async fn listed_packages_for(m: Matcher) -> anyhow::Result<Vec<String>> {
+        let root = tempdir()?;
+        let listed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spy_listed = Arc::clone(&listed);
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(move |_| {
+            Box::new(ListSpy {
+                pkgs: vec!["foo", "foo/deep", "bar", "bar/deep", "unrelated"],
+                listed: Arc::clone(&spy_listed),
+            })
+        })?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let _: Vec<Addr> = engine.query(rs, &m).try_collect().await?;
+
+        let mut out = listed.lock().unwrap().clone();
+        out.sort();
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn scoped_query_does_not_list_packages_outside_its_scope() -> anyhow::Result<()> {
+        // `label(lint) && //foo/...`: the label arm can never prune, but the
+        // package arm must keep `list` (a whole-package Starlark evaluation
+        // for the buildfile provider) off every package outside `foo`.
+        let listed = listed_packages_for(Matcher::And(vec![
+            Matcher::Label("lint".to_string()),
+            Matcher::PackagePrefix(PkgBuf::from("foo")),
+        ]))
+        .await?;
+        assert_eq!(listed, vec!["foo".to_string(), "foo/deep".to_string()]);
+
+        // Arm order must not change what gets paid for.
+        let flipped = listed_packages_for(Matcher::And(vec![
+            Matcher::PackagePrefix(PkgBuf::from("foo")),
+            Matcher::Label("lint".to_string()),
+        ]))
+        .await?;
+        assert_eq!(flipped, listed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn addr_query_lists_only_the_owning_package() -> anyhow::Result<()> {
+        let listed = listed_packages_for(Matcher::Addr(Addr::new(
+            PkgBuf::from("bar"),
+            "t".to_string(),
+            Default::default(),
+        )))
+        .await?;
+        assert_eq!(listed, vec!["bar".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unprunable_matcher_still_scans_everything() -> anyhow::Result<()> {
+        // A bare label has no package information — pruning must not invent any.
+        // The always-on built-in `fs` provider contributes `@heph/fs`, and every
+        // provider is listed for every surviving package.
+        let listed = listed_packages_for(Matcher::Label("lint".to_string())).await?;
+        assert_eq!(
+            listed,
+            vec![
+                "@heph/fs".to_string(),
+                "bar".to_string(),
+                "bar/deep".to_string(),
+                "foo".to_string(),
+                "foo/deep".to_string(),
+                "unrelated".to_string(),
+            ]
+        );
         Ok(())
     }
 
