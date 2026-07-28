@@ -15,7 +15,6 @@ use hsandboxfuse as sandboxfuse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::Semaphore;
 use tracing::warn;
 
 /// Context the engine injects when constructing any plugin (provider, driver, or
@@ -83,8 +82,8 @@ pub struct Engine {
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
     pub home: PathBuf,
-    pub(crate) result_semaphore: Arc<Semaphore>,
-    /// Maximum concurrent executes (the `result_semaphore` permit count). Cached
+    pub(crate) result_permits: Arc<crate::engine::worker_pool::WorkerPool>,
+    /// Maximum concurrent executes (the `result_permits` capacity). Cached
     /// here so it can be announced to clients via a `MaxWorkers` build event
     /// without reaching into the semaphore (whose live `available_permits` only
     /// reflects the *free* count, not the configured max).
@@ -388,21 +387,21 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
-            result_semaphore: {
-                let sem = Arc::new(Semaphore::new(max_workers));
+            result_permits: {
+                let pool = crate::engine::worker_pool::WorkerPool::new(max_workers);
                 // Two readers of the same pool, for two different lines: the
                 // permit accounting (`N max, N free, N running`) and the
                 // `workers` limiter's saturation age. Both must sample when the
                 // report is rendered, not at the last acquire.
                 let free = {
-                    let sem = Arc::clone(&sem);
-                    move || sem.available_permits()
+                    let pool = Arc::clone(&pool);
+                    move || pool.available()
                 };
                 crate::engine::diag::global().register_worker_pool(max_workers, free.clone());
                 crate::engine::diag::global()
                     .limiter("workers")
                     .attach_gauge(free);
-                sem
+                pool
             },
             max_workers,
             provider_factories: HashMap::new(),

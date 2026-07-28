@@ -49,24 +49,17 @@ impl Engine {
         // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
         // waiting for a leaf that also needs a permit.
         hcore::hmemoizer::set_phase("execute:semaphore_acquire");
-        let semaphore = Arc::clone(&self.result_semaphore);
+        let pool = Arc::clone(&self.result_permits);
         // Observed *before* the acquire, so the stamp times the wait rather than
         // its end. This queue is invisible everywhere else: the permit is taken
         // after dep resolution but before `ExecuteStart`, so a target parked here
-        // has no open `execute` span and shows only as an open `result`. A build
-        // wedged with every worker held reported "N result" and no limits line at
-        // all, because the `workers` limiter was declared and never fed.
+        // has no open `execute` span and shows only as an open `result`.
         let d = crate::engine::diag::global();
-        d.limiter("workers")
-            .observe(semaphore.available_permits(), d.now_ms());
-        let _permit = semaphore
-            .acquire()
-            .await
-            .context("result semaphore closed")?;
-        // Counted only once `acquire` has *returned*. A permit handed to a
-        // waiter that is never polled again never reaches this line, which is
-        // precisely what makes the pool's free count and this counter disagree
-        // — see `WorkerPermits::unaccounted`.
+        d.limiter("workers").observe(pool.available(), d.now_ms());
+        // Parks holding nothing until a permit is genuinely free — see
+        // `worker_pool`. A caller abandoned mid-wait strands no permit.
+        let _permit = pool.acquire().await.context("worker pool closed")?;
+        // Counted once the permit is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
 
         let addr_str = addr.format();
