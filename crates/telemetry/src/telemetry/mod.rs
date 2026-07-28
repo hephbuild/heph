@@ -61,6 +61,14 @@ pub fn record_execute_ms(ms: u64) {
     COLLECTOR.record_execute_ms(ms);
 }
 
+/// Record a cache hit whose bytes turned out to be unreadable, so the target was
+/// rebuilt. Not derivable from the event stream: the collector holds no per-addr
+/// state, so it cannot tell that an `ExecuteStart` belongs to an addr it already
+/// counted as a hit.
+pub fn record_cache_hit_rebuilt() {
+    COLLECTOR.record_cache_hit_rebuilt();
+}
+
 /// Record the total target count of a whole-graph (`//...`) enumeration.
 pub fn record_graph_size(total: u64) {
     COLLECTOR.record_graph_size(total);
@@ -518,6 +526,12 @@ fn build_props(
     put("local_cache_hits", stats.local_cache_hits.into());
     put("local_cache_misses", stats.local_cache_misses.into());
     put("executes", stats.executes.into());
+    // Announced hits that then had to be rebuilt — a cache promising bytes it
+    // could not produce. Only sent when it happened, so the common 0 costs
+    // nothing on the wire.
+    if stats.cache_hits_rebuilt > 0 {
+        put("cache_hits_rebuilt", stats.cache_hits_rebuilt.into());
+    }
     // Approx p99 execute wall time — only when something actually executed.
     if stats.executes > 0 {
         put("p99_execute_ms", stats.p99_execute_ms.into());
@@ -699,6 +713,7 @@ mod tests {
             p99_artifact_bytes: 0,
             sized_artifacts: 0,
             executes: 0,
+            cache_hits_rebuilt: 0,
             p99_execute_ms: 0,
             graph_size: 0,
             remote_cache_hits: 0,
@@ -785,6 +800,7 @@ mod tests {
             p99_artifact_bytes: 0,
             sized_artifacts: 0,
             executes: 0,
+            cache_hits_rebuilt: 0,
             p99_execute_ms: 0,
             graph_size: 0,
             remote_cache_hits: 2,

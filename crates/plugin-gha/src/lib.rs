@@ -104,6 +104,14 @@ impl Tally {
             BuildEventKind::ExecuteStart { addr, .. } => {
                 self.running
                     .insert(addr.clone(), (Phase::Execute, ev.at_unix_ms));
+                // A target that executes is not a cached target, even when it was
+                // announced as a hit first: the engine decides a hit from the
+                // revision's manifest, and a manifest can outlive its blobs (GC,
+                // an object-store lifecycle rule, or blobs never pulled on a run
+                // that is now offline), in which case it rebuilds. Retract the
+                // hit, or the summary counts the same addr under both "built" and
+                // "cached" and the two can sum past the target count.
+                self.cache_hit.remove(addr);
             }
             BuildEventKind::ExecuteEnd { addr, error } => {
                 self.running.remove(addr);
