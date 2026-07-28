@@ -1047,6 +1047,35 @@ impl Engine {
         }
     }
 
+    /// Resolve every addr a matcher selects, admitting a bounded number at a
+    /// time (see `top_level_spawn_limit`).
+    ///
+    /// # Two invariants keep the admission bound deadlock-free
+    ///
+    /// Neither is enforced by the type system, and breaking either one wedges a
+    /// build rather than slowing it, so they are written down here:
+    ///
+    /// 1. **This function is only ever called from the top of a request** —
+    ///    today `src/commands/run.rs` and the testkit harness, and nothing
+    ///    else. It must never be reached from inside a running resolution (a
+    ///    plugin entry point, a batch-within-a-batch): a permit holder that
+    ///    re-entered here would be waiting for a permit it can only release by
+    ///    finishing, which is a deadlock with no diagnostic. Every re-entrant
+    ///    path goes to [`Engine::result_addr`] instead — provider callbacks via
+    ///    `EngineProviderExecutor::result`, dep fan-out via `execute.rs`, and
+    ///    the transparent-group re-inline — and none of them take a permit.
+    ///
+    /// 2. **The permit is taken around the *spawn*, never lower.** Gating
+    ///    `result_addr` (or `execute`) on the same semaphore would put a permit
+    ///    holder behind a permit request. `result_semaphore` is deliberately
+    ///    acquired inside `execute` instead, for the diamond-deadlock reason
+    ///    documented there.
+    ///
+    /// Together these give the property the bound relies on: **no holder of a
+    /// permit is ever waiting for one.** A matched addr that is also some other
+    /// target's dep does *not* wait for its own admission — `hmemoizer::Cell`
+    /// elects a driver per poll, so the parent computes it inline in its own
+    /// task, and the admission loop later hits the same memoized cell.
     pub async fn result(
         self: Arc<Self>,
         rs: Arc<RequestState>,
