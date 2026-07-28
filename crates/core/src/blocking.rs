@@ -69,28 +69,39 @@ type Panic = Box<dyn Any + Send + 'static>;
 /// queued jobs isn't paying for a busy poll.
 const WAKE_BACKSTOP: Duration = Duration::from_millis(250);
 
-/// Waiters to re-wake on the next tick. Drained by the backstop thread, so a
-/// registration is consumed by one tick and a still-pending waiter re-registers
-/// from the poll that tick provokes.
-static PENDING: Mutex<Vec<Waker>> = Mutex::new(Vec::new());
+/// Waiters to re-wake on every tick, keyed by registration.
+///
+/// **Retained**, not drained. The list used to be emptied by each tick, on the
+/// reasoning that waking a waiter provokes a poll and the poll re-registers it.
+/// That holds only if the wake actually reaches the future — and in this engine
+/// it need not. `run` is awaited inside a `hmemoizer` cell, so the waker handed
+/// to it is the *cell's* waker, and `Cell::wake_by_ref` deliberately drops a wake
+/// when the cell already has a driver that owes it a re-poll. One swallowed wake
+/// then meant the waiter was never polled, never re-registered, and never woken
+/// again — with the blocking pool sitting idle on an empty queue because its job
+/// had long since finished.
+///
+/// That stranded twelve targets inside `execute`'s sandbox cleanup while they
+/// held every worker permit, with ninety more queued behind them on the
+/// semaphore and the whole build wedged. Retaining the registration until the
+/// waiter is done makes the backstop's guarantee hold no matter what the waker
+/// does with a wake.
+static PENDING: Mutex<Vec<(u64, Waker)>> = Mutex::new(Vec::new());
+
+static NEXT_REGISTRATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 static BACKSTOP_THREAD: Once = Once::new();
 
-/// Re-wake `waker` within [`WAKE_BACKSTOP`], starting the backstop thread on the
-/// first pending waiter (a process that never blocks never pays for it).
-///
-/// Public because [`run`] is not the only future in the tree woken from a
-/// non-tokio thread: the sqlite cache's write-behind queue signals its commit
-/// from a dedicated writer thread, which is the same dropped-wake-up exposure
-/// for the same reason. One backstop thread serves every such waiter.
-pub fn backstop(waker: Waker) {
+fn start_backstop_thread() {
     BACKSTOP_THREAD.call_once(|| {
         thread::Builder::new()
             .name("heph-blocking-wake".to_string())
             .spawn(|| {
                 loop {
                     thread::sleep(WAKE_BACKSTOP);
-                    let due = std::mem::take(&mut *lock_pending());
+                    // Clone under the lock and wake outside it: a waker may
+                    // re-enter this module from inside `wake`.
+                    let due: Vec<Waker> = lock_pending().iter().map(|(_, w)| w.clone()).collect();
                     for waker in due {
                         waker.wake();
                     }
@@ -99,37 +110,84 @@ pub fn backstop(waker: Waker) {
             // Same stance as the pool itself: no fallback worth having.
             .expect("spawn heph blocking-wake thread");
     });
-    lock_pending().push(waker);
+}
+
+/// A live backstop registration. The waker stays armed until this is dropped.
+///
+/// Held by the awaiting future, so the registration's lifetime is exactly the
+/// wait's: it goes away when the result arrives *or* when the future is
+/// cancelled, and never outlives either. That is what lets the tick retain
+/// entries instead of draining them.
+pub struct Backstop {
+    id: u64,
+}
+
+impl Backstop {
+    /// Reserve a registration, starting the backstop thread on first use (a
+    /// process that never blocks never pays for it). Nothing is armed until
+    /// [`arm`](Self::arm) is called with a waker.
+    pub fn new() -> Self {
+        start_backstop_thread();
+        Self {
+            id: NEXT_REGISTRATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Arm (or refresh) this registration with the polling task's waker. Call
+    /// from every pending poll; re-arming with the same waker is free.
+    pub fn arm(&self, waker: &Waker) {
+        let mut pending = lock_pending();
+        match pending.iter_mut().find(|(id, _)| *id == self.id) {
+            Some((_, armed)) => {
+                if !armed.will_wake(waker) {
+                    *armed = waker.clone();
+                }
+            }
+            None => pending.push((self.id, waker.clone())),
+        }
+    }
+}
+
+impl Default for Backstop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Backstop {
+    fn drop(&mut self) {
+        let mut pending = lock_pending();
+        if let Some(i) = pending.iter().position(|(id, _)| *id == self.id) {
+            pending.swap_remove(i);
+        }
+    }
 }
 
 /// Wake every registered backstop waiter now rather than on the next tick.
 ///
-/// A registration outlives the future that made it. [`backstop`] is a
-/// fire-and-forget push: a waiter re-registers on every pending poll and never
-/// unregisters, so once its result arrives its last registration simply sits in
-/// [`PENDING`] until a tick sweeps it — and a `Waker` owns its task, which owns
-/// everything that task's state holds. For up to [`WAKE_BACKSTOP`] after a piece
-/// of work is completely finished, its state is still reachable from this list.
-///
-/// Usually that is invisible: it is bounded, and it costs a little memory. It is
-/// *not* invisible to a caller that must observe those values actually released
-/// — the post-run cache trim needs the request's cache read guards gone before
-/// it can take a write lock, and a stale registration here is enough to keep one
-/// alive past the request that made it.
-///
 /// Waking early is always sound: a spurious wake costs one poll, and a waiter
-/// still genuinely pending re-registers from that poll. That re-registration is
-/// the invariant this rests on — [`run`] below and the sqlite cache's
-/// write-behind waiter both register on *every* pending poll. A future
-/// registrant that registers once and relies on the tick would be stranded by a
-/// flush; register per pending poll.
+/// that is still genuinely pending stays armed either way.
 ///
-/// Returns how many registrations were taken, so a caller can tell its own flush
+/// This used to also *release* every registration, because a registration
+/// outlived the future that made it: a waiter re-registered on each pending poll
+/// and never unregistered, so its last push sat in [`PENDING`] until a tick swept
+/// it — and a `Waker` owns its task, which owns everything that task's state
+/// holds. The post-run cache trim needs the request's cache read guards actually
+/// gone before it can take a write lock, and one stale registration was enough to
+/// keep a guard alive past the request that made it.
+///
+/// [`Backstop`] removes that at the source: a registration is dropped when the
+/// wait ends, so nothing finished is ever still reachable from this list and
+/// there is nothing stale left to release. What remains here is the other half
+/// of the caller's need — pulling the next poll forward instead of waiting up to
+/// [`WAKE_BACKSTOP`] for it.
+///
+/// Returns how many registrations were woken, so a caller can tell its own flush
 /// from a tick that happened to land first.
 pub fn flush_backstop() -> usize {
-    // Taken before waking, and the lock released first, so a waker that
-    // re-registers from inside `wake` cannot deadlock against us.
-    let due = std::mem::take(&mut *lock_pending());
+    // Cloned under the lock and the lock released before waking, so a waker that
+    // re-enters this module from inside `wake` cannot deadlock against us.
+    let due: Vec<Waker> = lock_pending().iter().map(|(_, w)| w.clone()).collect();
     let n = due.len();
     for waker in due {
         // Callers reach this from `Drop` on a teardown path. A panicking waker
@@ -147,7 +205,7 @@ pub fn flush_backstop() -> usize {
 
 /// A waker panicking mid-`wake` would poison the list and strand every later
 /// waiter, so poisoning is ignored — the `Vec` is still consistent.
-fn lock_pending() -> std::sync::MutexGuard<'static, Vec<Waker>> {
+fn lock_pending() -> std::sync::MutexGuard<'static, Vec<(u64, Waker)>> {
     PENDING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -221,15 +279,19 @@ where
     }
 
     // Arm the backstop on every pending poll rather than trusting a single
-    // wake-up: see the dropped-wake-up note in the module docs.
+    // wake-up: see the dropped-wake-up note in the module docs. The registration
+    // is held for the whole wait and released here on the way out — including on
+    // cancellation, when this future is dropped mid-`await`.
+    let armed = Backstop::new();
     let received = poll_fn(|cx| match Pin::new(&mut rx).poll(cx) {
         Poll::Ready(out) => Poll::Ready(out),
         Poll::Pending => {
-            backstop(cx.waker().clone());
+            armed.arm(cx.waker());
             Poll::Pending
         }
     })
     .await;
+    drop(armed);
 
     match received {
         Ok(Ok(value)) => value,
@@ -308,34 +370,84 @@ mod tests {
     }
 
     /// A registration owns its waker, and a waker owns its task — so anything a
-    /// finished task still holds stays reachable from `PENDING` until a tick
-    /// sweeps it. `flush_backstop` is how a caller that needs those values
-    /// *actually* released gets them back without waiting out the tick, which is
-    /// what the post-run cache trim depends on.
+    /// finished task still holds would stay reachable from `PENDING` for as long
+    /// as the registration does. It must therefore end with the wait, not with a
+    /// tick or a flush, which is what the post-run cache trim depends on.
     #[test]
-    fn flush_backstop_releases_registered_wakers_without_waiting_for_a_tick() {
+    fn a_registration_is_released_when_its_wait_ends() {
         struct Owning(#[expect(dead_code, reason = "held to observe the refcount")] Arc<()>);
         impl futures::task::ArcWake for Owning {
             fn wake_by_ref(_: &Arc<Self>) {}
         }
 
         let owned = Arc::new(());
-        let started = std::time::Instant::now();
-        backstop(futures::task::waker(Arc::new(Owning(Arc::clone(&owned)))));
-        let taken = flush_backstop();
+        let armed = Backstop::new();
 
-        assert!(
-            taken >= 1,
-            "the flush itself must have taken our registration, not a tick",
+        // Cloning a `Waker` clones the `Arc<Owning>`, so every clone shares the
+        // one inner `Arc<()>`: the count moves only when the last `Waker` goes.
+        // Drop the local one here so what remains is the registration's alone.
+        {
+            let waker = futures::task::waker(Arc::new(Owning(Arc::clone(&owned))));
+            armed.arm(&waker);
+        }
+        assert_eq!(
+            Arc::strong_count(&owned),
+            2,
+            "armed: the registration is the only thing still holding the waker"
         );
+
+        // A flush wakes, and deliberately does *not* release — releasing is the
+        // guard's job, so a waiter that is still pending stays armed through it.
+        flush_backstop();
+        assert_eq!(
+            Arc::strong_count(&owned),
+            2,
+            "a flush must not disarm a live registration"
+        );
+
+        drop(armed);
         assert_eq!(
             Arc::strong_count(&owned),
             1,
-            "flushing must drop the registration, not just wake it",
+            "ending the wait must release the waker the registration held"
         );
+    }
+
+    /// The bug this module's retention exists to prevent.
+    ///
+    /// The list used to be drained by each tick, on the reasoning that waking a
+    /// waiter provokes a poll that re-registers it. A waker that swallows the
+    /// wake — `hmemoizer`'s cell does, when it already has a driver owing it a
+    /// re-poll — broke that: one dropped wake and the waiter was never polled,
+    /// never re-registered, and never woken again. That stranded twelve targets
+    /// in `execute`'s sandbox cleanup holding every worker permit, with the
+    /// blocking pool idle because their jobs had already finished.
+    #[test]
+    fn a_swallowed_wake_does_not_disarm_the_backstop() {
+        /// Counts wakes and drops every one, like a cell that already has a
+        /// driver on the hook.
+        struct Swallowing(Arc<AtomicUsize>);
+        impl futures::task::ArcWake for Swallowing {
+            fn wake_by_ref(me: &Arc<Self>) {
+                me.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = futures::task::waker(Arc::new(Swallowing(Arc::clone(&wakes))));
+
+        let armed = Backstop::new();
+        armed.arm(&waker);
+
+        // Two ticks' worth. Under the old drain-once list the first tick would
+        // consume the registration and the second would find nothing, because a
+        // swallowed wake never produces the re-registering poll.
+        thread::sleep(WAKE_BACKSTOP * 2 + WAKE_BACKSTOP / 2);
+
         assert!(
-            started.elapsed() < WAKE_BACKSTOP,
-            "the release must not have come from a backstop tick",
+            wakes.load(Ordering::SeqCst) >= 2,
+            "a waiter whose wakes are swallowed must keep being re-woken; got {}",
+            wakes.load(Ordering::SeqCst)
         );
     }
 
