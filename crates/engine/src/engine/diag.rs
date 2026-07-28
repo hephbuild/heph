@@ -189,6 +189,16 @@ pub struct Limiter {
     pub name: &'static str,
     /// Millis at which this limiter last went from "has permits" to "none", or 0.
     saturated_since_ms: AtomicU64,
+    /// Reads the limiter's *current* free permits, when one has been attached.
+    ///
+    /// Without it a limiter is only ever sampled from its own acquire path, so
+    /// the reading freezes the moment nothing acquires any more — which is
+    /// exactly when the stall watchdog fires. A wedged build then reported
+    /// "workers saturated for 90s" from a stamp left by the last acquire
+    /// attempt, indistinguishable from a pool that is still fully held.
+    /// Telling those two apart is the whole question at a stall: permits held
+    /// means deadlocked on the pool, permits free means wedged elsewhere.
+    gauge: std::sync::OnceLock<Box<dyn Fn() -> usize + Send + Sync>>,
 }
 
 impl Limiter {
@@ -196,6 +206,24 @@ impl Limiter {
         Self {
             name,
             saturated_since_ms: AtomicU64::new(0),
+            gauge: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Attach a live reader of this limiter's free permits.
+    ///
+    /// Idempotent: the first attachment wins and later ones are dropped, so a
+    /// call site on a hot path can arm it without a separate one-time hook.
+    /// Only read when a report is being rendered, never on the acquire path.
+    pub fn attach_gauge(&self, gauge: impl Fn() -> usize + Send + Sync + 'static) {
+        drop(self.gauge.set(Box::new(gauge)));
+    }
+
+    /// Re-read the live gauge, if there is one, so a report reflects the present
+    /// rather than the last acquire.
+    fn refresh(&self, now_ms: u64) {
+        if let Some(gauge) = self.gauge.get() {
+            self.observe(gauge(), now_ms);
         }
     }
 
@@ -459,7 +487,13 @@ impl DiagState {
         let mut v: Vec<_> = self
             .limiters
             .iter()
-            .filter_map(|l| l.saturated_for(now_ms).map(|d| (l.name, d)))
+            .filter_map(|l| {
+                // Sample now, not at the last acquire. A stall report is rendered
+                // precisely when nothing is acquiring, so an acquire-only reading
+                // is frozen at whatever it was when work stopped.
+                l.refresh(now_ms);
+                l.saturated_for(now_ms).map(|d| (l.name, d))
+            })
             .collect();
         v.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
         v
@@ -1705,6 +1739,85 @@ mod tests {
         );
         l.observe(3, 50_000);
         assert!(s.saturated(60_000).is_empty());
+    }
+
+    /// A limiter sampled only from its own acquire path freezes exactly when it
+    /// matters.
+    ///
+    /// A stall report is rendered *because* nothing is acquiring any more, so
+    /// the last acquire-time reading is by definition stale. A real wedge
+    /// reported "workers saturated for 90s" from a stamp left behind when work
+    /// stopped, while zero `execute` spans were open — the pool was in fact
+    /// free, and the paragraph could not say so. Permits held means deadlocked
+    /// on the pool; permits free means wedged elsewhere. That is the whole
+    /// question at a stall, and the two must not look identical.
+    #[test]
+    fn a_live_gauge_reports_the_present_not_the_last_acquire() {
+        let s = state();
+        let l = &s.limiters()[0];
+        let free = std::sync::Arc::new(AtomicU64::new(0));
+
+        l.attach_gauge({
+            let free = std::sync::Arc::clone(&free);
+            move || usize::try_from(free.load(Ordering::Relaxed)).unwrap_or(0)
+        });
+
+        // Exhausted, and nothing has acquired since.
+        l.observe(0, 1_000);
+        assert_eq!(
+            s.saturated(48_000),
+            vec![("workers", Duration::from_millis(47_000))]
+        );
+
+        // Permits come back with no acquire to notice — the frozen reading would
+        // still claim saturation here.
+        free.store(4, Ordering::Relaxed);
+        assert!(
+            s.saturated(60_000).is_empty(),
+            "a live gauge must retract a stale saturation claim"
+        );
+
+        // And the reverse: it can go saturated between reports, without an
+        // acquire, and still be reported.
+        free.store(0, Ordering::Relaxed);
+        assert_eq!(
+            s.saturated(61_000)
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
+            vec!["workers"]
+        );
+    }
+
+    /// Without a gauge the old acquire-only behaviour is untouched, so a limiter
+    /// nobody has wired up cannot start reporting phantom saturation.
+    #[test]
+    fn a_limiter_without_a_gauge_keeps_its_acquire_only_reading() {
+        let s = state();
+        let l = &s.limiters()[0];
+        l.observe(0, 1_000);
+        assert_eq!(
+            s.saturated(5_000),
+            vec![("workers", Duration::from_millis(4_000))]
+        );
+    }
+
+    /// First attachment wins, so arming it from a hot path is safe.
+    #[test]
+    fn attaching_a_gauge_twice_keeps_the_first() {
+        let s = state();
+        let l = &s.limiters()[0];
+        l.attach_gauge(|| 0);
+        l.attach_gauge(|| 7);
+        l.observe(9, 1_000);
+        assert_eq!(
+            s.saturated(2_000)
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
+            vec!["workers"],
+            "the first gauge (0 permits) must still be the one consulted"
+        );
     }
 
     /// The paragraph must name the subsystem, the count and the age, and must not

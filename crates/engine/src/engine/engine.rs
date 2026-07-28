@@ -388,7 +388,19 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
-            result_semaphore: Arc::new(Semaphore::new(max_workers)),
+            result_semaphore: {
+                let sem = Arc::new(Semaphore::new(max_workers));
+                // Let the stall watchdog read the pool's free permits when it
+                // renders, instead of inferring them from the last acquire. The
+                // gauge is only called while a report is being built.
+                crate::engine::diag::global()
+                    .limiter("workers")
+                    .attach_gauge({
+                        let sem = Arc::clone(&sem);
+                        move || sem.available_permits()
+                    });
+                sem
+            },
             max_workers,
             provider_factories: HashMap::new(),
             driver_factories: HashMap::new(),
