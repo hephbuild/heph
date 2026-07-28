@@ -76,6 +76,27 @@ pub struct TBridgeWriteGuard<O: Lock, I: RWLock> {
     inner_write: Option<I::WriteGuard>,
 }
 
+impl<O: Lock, I: RWLock> TBridgeUpgradableGuard<O, I> {
+    /// Borrow the held outer (gateway) guard, so a caller can act on the
+    /// gateway lock itself — e.g. write through its already-open file
+    /// description instead of re-opening the lock file by path.
+    ///
+    /// `Some` for this guard's whole observable lifetime: the option is emptied
+    /// only by [`upgrade`](TUpgradableReadGuard::upgrade) and `drop`, both of
+    /// which consume `self`.
+    pub fn outer_guard(&self) -> Option<&O::Guard> {
+        self.outer_guard.as_ref()
+    }
+}
+
+impl<O: Lock, I: RWLock> TBridgeWriteGuard<O, I> {
+    /// Borrow the held outer (gateway) guard. See
+    /// [`TBridgeUpgradableGuard::outer_guard`].
+    pub fn outer_guard(&self) -> Option<&O::Guard> {
+        self.outer_guard.as_ref()
+    }
+}
+
 impl<O: Lock, I: RWLock> Drop for TBridgeUpgradableGuard<O, I> {
     fn drop(&mut self) {
         // Release inner first, then outer (matches the write-guard order).
