@@ -159,6 +159,9 @@ pub struct Provider {
     /// Sync cache: package directory → merged result across every matching BUILD file
     /// in that dir. Loaded once and reused by both `run_pkg` and `load("//pkg", ...)`.
     pub(crate) dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+    /// Single-flights file evaluation so concurrently-evaluating packages that
+    /// `load()` the same shared build-file helper evaluate it once between them.
+    pub(crate) loads: Arc<crate::pluginbuildfile::run_file::LoadRegistry>,
     /// Aggregated provider functions, injected once by the engine. Drives the
     /// `heph.<provider>.<fn>` Starlark namespace. Empty until injected (some unit
     /// tests run the provider without an engine).
@@ -187,6 +190,7 @@ impl Default for Provider {
             packages: OnceLock::new(),
             file_cache: Arc::new(Mutex::new(HashMap::new())),
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
+            loads: Arc::default(),
             function_registry: OnceLock::new(),
             globals: Arc::new(OnceLock::new()),
             walker: Arc::new(CachedWalker::disabled()),

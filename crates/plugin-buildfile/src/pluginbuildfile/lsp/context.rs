@@ -126,6 +126,7 @@ impl HephLspContext {
                 Arc::new(hwalk::Ignore::default()),
                 walker,
             )),
+            Arc::default(),
         )
     }
 

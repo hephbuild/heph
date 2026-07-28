@@ -1073,6 +1073,7 @@ impl Provider {
         let globals = self.globals.clone();
         let walker = self.walker.clone();
         let packages = self.packages();
+        let loads = self.loads.clone();
         self.pkg_cache
             .once(
                 key.clone(),
@@ -1091,7 +1092,7 @@ impl Provider {
                     // `hcore::blocking`.
                     hcore::blocking::run(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
-                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages);
+                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages, loads);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
@@ -1129,6 +1130,11 @@ pub(crate) struct BuildFileLoader {
     /// Starlark and `Provider::list_packages` paths see one order), while the LSP
     /// deliberately builds a fresh one per loader.
     packages: Arc<PackageList>,
+    /// Single-flights the evaluation of a `load()`ed file across concurrent
+    /// package evaluations.
+    loads: Arc<LoadRegistry>,
+    /// This loader's identity in [`LoadRegistry`]'s wait-for graph.
+    chain: u64,
 }
 
 impl BuildFileLoader {
@@ -1142,7 +1148,9 @@ impl BuildFileLoader {
         globals: Arc<OnceLock<Globals>>,
         walker: Arc<CachedWalker>,
         packages: Arc<PackageList>,
+        loads: Arc<LoadRegistry>,
     ) -> Self {
+        let chain = loads.new_chain();
         Self {
             root,
             patterns,
@@ -1153,6 +1161,8 @@ impl BuildFileLoader {
             globals,
             walker,
             packages,
+            loads,
+            chain,
         }
     }
 
@@ -1232,38 +1242,181 @@ impl BuildFileLoader {
     }
 
     fn load_file(&self, file_path: &Path, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
-        if let Some(cached) = self
-            .file_cache
-            .lock()
-            .map_err(|_e| anyhow::anyhow!("file_cache lock poisoned"))?
-            .get(file_path)
-        {
-            return Ok(cached.clone());
-        }
-
-        {
-            let mut in_flight = self
-                .in_flight
+        loop {
+            if let Some(cached) = self
+                .file_cache
                 .lock()
-                .map_err(|_e| anyhow::anyhow!("in_flight lock poisoned"))?;
-            if !in_flight.insert(file_path.to_path_buf()) {
-                anyhow::bail!("load() cycle detected at {}", file_path.display());
+                .map_err(|_e| anyhow::anyhow!("file_cache lock poisoned"))?
+                .get(file_path)
+            {
+                return Ok(cached.clone());
+            }
+
+            // Own-chain cycle, checked before the cross-chain claim: this one is
+            // local knowledge and needs no shared state.
+            {
+                let mut in_flight = self
+                    .in_flight
+                    .lock()
+                    .map_err(|_e| anyhow::anyhow!("in_flight lock poisoned"))?;
+                if !in_flight.insert(file_path.to_path_buf()) {
+                    anyhow::bail!("load() cycle detected at {}", file_path.display());
+                }
+            }
+            let _guard = InFlightGuard {
+                set: &self.in_flight,
+                path: file_path.to_path_buf(),
+            };
+
+            // Another package may be evaluating this very file — see
+            // `LoadRegistry`. Wait for it rather than repeating the work.
+            let _claim = match self.loads.claim(file_path, self.chain)? {
+                Claim::Owned => ClaimGuard {
+                    registry: &self.loads,
+                    path: file_path.to_path_buf(),
+                },
+                // The other chain finished: re-check the cache. If it *failed*,
+                // the cache is still empty and this chain takes its turn.
+                Claim::Retry => continue,
+            };
+
+            let result = Arc::new(
+                eval_file(file_path, pkg, self)
+                    .with_context(|| format!("evaluating {}", file_path.display()))?,
+            );
+            self.file_cache
+                .lock()
+                .map_err(|_e| anyhow::anyhow!("file_cache lock poisoned"))?
+                .insert(file_path.to_path_buf(), result.clone());
+            return Ok(result);
+        }
+    }
+}
+
+/// Single-flights the evaluation of a `load()`ed file across concurrently-evaluating
+/// packages.
+///
+/// `file_cache` is a plain check-then-insert, so N packages that all `load()` the
+/// same shared build-file helper each evaluate it: K-fold duplicate work on exactly
+/// the file that is shared the most. Serial discovery hides this — there is only ever
+/// one package in flight — so it is a latent bug that goes live the moment
+/// discovery runs wide.
+///
+/// It has to block rather than merely deduplicate opportunistically: the whole
+/// point is that K-1 chains *wait* instead of repeating the evaluation. And
+/// blocking is what introduces the hazard this type exists to handle.
+///
+/// **The wait-for graph.** Each evaluating chain holds the paths it is inside and
+/// blocks on at most one path held by another chain, so an edge in the wait-for
+/// graph is always a real `load()` edge. A cycle in it is therefore exactly a
+/// genuine `load()` cycle spread across two chains — which the per-loader
+/// `in_flight` set cannot see, because neither chain is cyclic on its own. Left
+/// alone that hangs; detected, it reports the same `load() cycle` error a
+/// single-chain cycle already does.
+#[derive(Default)]
+pub(crate) struct LoadRegistry {
+    state: Mutex<LoadRegistryState>,
+    progress: std::sync::Condvar,
+    next_chain: std::sync::atomic::AtomicU64,
+    /// Evaluations actually started, i.e. claims granted. The number this type
+    /// exists to keep at one per file however many packages want it.
+    started: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct LoadRegistryState {
+    /// Path → the chain currently evaluating it.
+    holder: HashMap<PathBuf, u64>,
+    /// Chain → the path it is blocked on, if any.
+    waiting: HashMap<u64, PathBuf>,
+}
+
+/// Outcome of trying to take ownership of a path's evaluation.
+enum Claim {
+    /// This chain owns it; evaluate, then `release`.
+    Owned,
+    /// Another chain finished (or failed) it — re-check the cache and retry.
+    Retry,
+}
+
+impl LoadRegistry {
+    /// A fresh chain identity. One per [`BuildFileLoader`], which is one per
+    /// package evaluation and stays on a single thread, so a chain is exactly a
+    /// `load()` call stack.
+    pub(crate) fn new_chain(&self) -> u64 {
+        self.next_chain
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn claim(&self, path: &Path, chain: u64) -> anyhow::Result<Claim> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_e| anyhow::anyhow!("load registry lock poisoned"))?;
+        loop {
+            let Some(&owner) = state.holder.get(path) else {
+                state.holder.insert(path.to_path_buf(), chain);
+                state.waiting.remove(&chain);
+                self.started
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(Claim::Owned);
+            };
+            // Follow the wait-for edges from the owner. Reaching this chain means
+            // the two are waiting on each other, which can only happen through a
+            // real `load()` cycle.
+            let mut at = owner;
+            loop {
+                if at == chain {
+                    state.waiting.remove(&chain);
+                    anyhow::bail!("load() cycle detected at {}", path.display());
+                }
+                match state.waiting.get(&at).and_then(|p| state.holder.get(p)) {
+                    Some(&next) => at = next,
+                    None => break,
+                }
+            }
+            state.waiting.insert(chain, path.to_path_buf());
+            state = self
+                .progress
+                .wait(state)
+                .map_err(|_e| anyhow::anyhow!("load registry condvar poisoned"))?;
+            // The owner is done — cached on success, absent on failure. Either
+            // way the caller re-checks the cache, so hand it back rather than
+            // silently taking over.
+            if !state.holder.contains_key(path) {
+                state.waiting.remove(&chain);
+                return Ok(Claim::Retry);
             }
         }
-        let _guard = InFlightGuard {
-            set: &self.in_flight,
-            path: file_path.to_path_buf(),
-        };
+    }
 
-        let result = Arc::new(
-            eval_file(file_path, pkg, self)
-                .with_context(|| format!("evaluating {}", file_path.display()))?,
-        );
-        self.file_cache
-            .lock()
-            .map_err(|_e| anyhow::anyhow!("file_cache lock poisoned"))?
-            .insert(file_path.to_path_buf(), result.clone());
-        Ok(result)
+    /// Evaluations started since this registry was created.
+    ///
+    /// Only the single-flight tests read this; the counter itself is always
+    /// maintained so the two paths cannot drift.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> u64 {
+        self.started.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn release(&self, path: &Path) {
+        if let Ok(mut state) = self.state.lock() {
+            state.holder.remove(path);
+        }
+        self.progress.notify_all();
+    }
+}
+
+/// Releases a [`LoadRegistry`] claim however the evaluation ends — including a
+/// Starlark evaluation that returns `Err` partway down a `load()` chain.
+struct ClaimGuard<'a> {
+    registry: &'a LoadRegistry,
+    path: PathBuf,
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.release(&self.path);
     }
 }
 
@@ -1586,6 +1739,121 @@ mod tests {
         assert!(approval_from(v).is_err());
     }
 
+    /// Two packages loading the same shared file at once must evaluate it once
+    /// between them.
+    ///
+    /// `file_cache` is check-then-insert, so before this every concurrent
+    /// package re-evaluated every shared macro file — K-fold duplicate work on
+    /// precisely the file that is shared the most. Serial discovery hid it: only
+    /// one package was ever in flight.
+    ///
+    /// Counted at the registry, because the evaluation count is the whole claim
+    /// — `file_cache` holds every file the run touched, so its size says nothing
+    /// about how many times any one of them was evaluated.
+    #[test]
+    fn concurrent_packages_evaluate_a_shared_load_once() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // The shared file is slow enough that both packages are inside
+        // `load_file` at the same time, which is the case being tested.
+        fs::write(
+            root.join("shared.BUILD"),
+            "N = len([x for x in range(400000)])\n",
+        )
+        .unwrap();
+        for pkg in ["a", "b"] {
+            let p = root.join(pkg);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(
+                p.join("BUILD"),
+                "load(\"//shared.BUILD\", \"N\")\ntarget(name = \"t\", driver = \"d\")\n",
+            )
+            .unwrap();
+        }
+
+        let provider = Arc::new(Provider {
+            root: root.to_path_buf(),
+            build_file_patterns: vec![glob::Pattern::new("BUILD").unwrap()],
+            ..Provider::default()
+        });
+
+        // Both loaders share the provider's caches and load registry, exactly as
+        // two concurrent `run_pkg` calls do.
+        std::thread::scope(|s| {
+            for pkg in ["a", "b"] {
+                s.spawn(enclose!((provider) move || {
+                    run_pkg_blocking(&provider, pkg).expect("evaluate package");
+                }));
+            }
+        });
+
+        assert!(
+            provider
+                .file_cache
+                .lock()
+                .unwrap()
+                .contains_key(&root.join("shared.BUILD")),
+            "the shared file must be cached",
+        );
+        // Three files exist — `a/BUILD`, `b/BUILD`, `shared.BUILD` — so three
+        // evaluations is one apiece. Four would be the shared file evaluated
+        // twice, which is the defect.
+        assert_eq!(
+            provider.loads.started(),
+            3,
+            "the shared file must be evaluated once, not once per package",
+        );
+    }
+
+    /// A `load()` cycle split across two chains must still report a cycle.
+    ///
+    /// Neither chain is cyclic on its own, so the per-loader `in_flight` set
+    /// cannot see it: `a.BUILD` loads `b.BUILD` and `b.BUILD` loads `a.BUILD`, with one
+    /// chain starting at each. Without the wait-for graph check the two block on
+    /// each other forever — a hang where the serial code reported an error.
+    #[test]
+    fn a_load_cycle_across_two_chains_reports_a_cycle_rather_than_hanging() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.BUILD"), "load(\"//b.BUILD\", \"B\")\nA = B\n").unwrap();
+        fs::write(root.join("b.BUILD"), "load(\"//a.BUILD\", \"A\")\nB = A\n").unwrap();
+        for (pkg, first) in [("pa", "a"), ("pb", "b")] {
+            let p = root.join(pkg);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(
+                p.join("BUILD"),
+                format!(
+                    "load(\"//{first}.BUILD\", \"{}\")\ntarget(name = \"t\", driver = \"d\")\n",
+                    first.to_uppercase()
+                ),
+            )
+            .unwrap();
+        }
+
+        let provider = Arc::new(Provider {
+            root: root.to_path_buf(),
+            build_file_patterns: vec![glob::Pattern::new("BUILD").unwrap()],
+            ..Provider::default()
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            for pkg in ["pa", "pb"] {
+                s.spawn(enclose!((provider, tx) move || {
+                    drop(tx.send(run_pkg_blocking(&provider, pkg).is_err()));
+                }));
+            }
+            drop(tx);
+            // Both must answer; a hang here is the bug.
+            for _ in 0..2 {
+                let errored = rx
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("a cross-chain load cycle must error, not deadlock");
+                assert!(errored, "a load cycle must be reported as an error");
+            }
+        });
+    }
+
     fn run_pkg_blocking(provider: &Provider, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
         let registry = provider
             .function_registry
@@ -1601,6 +1869,9 @@ mod tests {
             provider.globals.clone(),
             provider.walker.clone(),
             provider.packages(),
+            // The provider's own registry, not a fresh one: two concurrent
+            // `run_pkg` calls share it, and that sharing is the point.
+            provider.loads.clone(),
         );
         loader.load_pkg(pkg)
     }
@@ -1631,6 +1902,7 @@ mod tests {
                 Arc::new(hwalk::Ignore::default()),
                 walker,
             )),
+            Arc::default(),
         )
     }
 
