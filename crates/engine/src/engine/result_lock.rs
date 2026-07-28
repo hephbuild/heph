@@ -23,9 +23,9 @@
 use anyhow::Result;
 use hcore::hasync::Cancellable;
 use hlock::hlock::{
-    FLock, FRWLock, KeyedGuard, KeyedTLock, MemLock, MemRWLock, TBridge, TBridgeReadGuard,
-    TBridgeUpgradableGuard, TBridgeWriteGuard, TUpgradableReadGuard, TWriteGuard, fs_tlock,
-    mem_tlock,
+    FLock, FRWLock, FWriteGuard, KeyedGuard, KeyedTLock, MemLock, MemRWLock, TBridge,
+    TBridgeReadGuard, TBridgeUpgradableGuard, TBridgeWriteGuard, TUpgradableReadGuard, TWriteGuard,
+    fs_tlock, mem_tlock,
 };
 use hmodel::htaddr::Addr;
 use std::io::Read as _;
@@ -166,9 +166,9 @@ impl ResultLock {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> Result<ResultUpgradableGuard> {
         match self {
-            ResultLock::Fs { dir, lock } => {
+            ResultLock::Fs { lock, .. } => {
                 let guard = lock.upgradable_read(addr.clone(), ctoken).await?;
-                stamp_pid(&outer_lock_path(dir, addr));
+                stamp_pid(guard.outer_guard());
                 Ok(ResultUpgradableGuard::Fs(guard))
             }
             ResultLock::Mem(kl) => Ok(ResultUpgradableGuard::Mem(
@@ -186,9 +186,9 @@ impl ResultLock {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> Result<ResultWriteGuard> {
         match self {
-            ResultLock::Fs { dir, lock } => {
+            ResultLock::Fs { lock, .. } => {
                 let guard = lock.write(addr.clone(), ctoken).await?;
-                stamp_pid(&outer_lock_path(dir, addr));
+                stamp_pid(guard.outer_guard());
                 Ok(ResultWriteGuard::Fs(guard))
             }
             ResultLock::Mem(kl) => Ok(ResultWriteGuard::Mem(kl.write(addr.clone(), ctoken).await?)),
@@ -201,9 +201,9 @@ impl ResultLock {
     /// path. Stamps pid on success like [`write`](ResultLock::write).
     pub fn try_write(&self, addr: &Addr) -> Result<Option<ResultWriteGuard>> {
         match self {
-            ResultLock::Fs { dir, lock } => match lock.try_write(addr.clone())? {
+            ResultLock::Fs { lock, .. } => match lock.try_write(addr.clone())? {
                 Some(guard) => {
-                    stamp_pid(&outer_lock_path(dir, addr));
+                    stamp_pid(guard.outer_guard());
                     Ok(Some(ResultWriteGuard::Fs(guard)))
                 }
                 None => Ok(None),
@@ -235,11 +235,22 @@ fn inner_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
 }
 
 /// Best-effort stamp of this process's pid into the gateway lock file, for
-/// cross-process contention diagnostics. Only called while the gateway is held
-/// (cold path), so it never burdens cache hits. A failure is logged, not fatal.
-fn stamp_pid(path: &Path) {
-    if let Err(err) = std::fs::write(path, std::process::id().to_string().as_bytes()) {
-        tracing::debug!(error = %err, path = %path.display(), "stamping pid into lock file");
+/// cross-process contention diagnostics. A failure is logged, not fatal.
+///
+/// Writes through the gateway guard's *already-open* file description rather
+/// than re-opening the lock file by path: it drops the `open`/`close` pair (and
+/// the path resolution that comes with them) from every gateway acquire, and it
+/// makes the stamp structurally incapable of landing on a file this process
+/// does not hold.
+fn stamp_pid(gateway: Option<&FWriteGuard>) {
+    let Some(gateway) = gateway else {
+        // Unreachable in practice: the guard owns the gateway for its whole
+        // observable lifetime.
+        tracing::debug!("gateway guard unavailable for pid stamp");
+        return;
+    };
+    if let Err(err) = gateway.write_contents(std::process::id().to_string().as_bytes()) {
+        tracing::debug!(error = %err, "stamping pid into gateway lock file");
     }
 }
 
@@ -459,6 +470,34 @@ mod tests {
             .await
             .expect("acquire");
         assert_eq!(lock.holder_pid(&addr("a")), Some(std::process::id()));
+        drop(held);
+    }
+
+    // The stamp must go through the gateway guard's open fd, never a second
+    // `open` of the path. Proven by swapping a decoy inode in at the path while
+    // the guard holds the original: a path-based stamp would land on the decoy.
+    #[tokio::test]
+    async fn stamp_pid_writes_through_the_held_fd_not_the_path() {
+        use hlock::hlock::Lock;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway.lock");
+        let gateway = FLock::new(&path);
+        let held = gateway
+            .lock(&StdCancellationToken::new())
+            .await
+            .expect("gateway");
+
+        std::fs::remove_file(&path).expect("unlink held lock file");
+        std::fs::write(&path, b"decoy").expect("decoy");
+
+        stamp_pid(Some(&held));
+
+        assert_eq!(
+            std::fs::read(&path).expect("decoy readable"),
+            b"decoy",
+            "stamp_pid must not re-open the lock path"
+        );
         drop(held);
     }
 

@@ -42,9 +42,8 @@ use hplugin::error::CancelledError;
 use libc::c_int;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,7 +141,12 @@ impl FLockState {
         for _ in 0..STALE_RETRIES {
             let fd = self.ensure_open(st)?;
             if !flock_nb(fd, op)? {
-                self.discard_fd(st);
+                // Would-block: this fd never acquired anything, so there is
+                // nothing to `LOCK_UN`. Just close it — dropping the last fd of
+                // an open file description releases any lock anyway, and the
+                // extra `flock` would be a wasted syscall on *every* failed poll
+                // of a contended acquire.
+                st.file = None;
                 return Ok(false);
             }
             if self.fd_matches_path(st)? {
@@ -192,14 +196,18 @@ impl FLockState {
     /// (no second `open`). Only valid while a guard is held — the fd is open
     /// exactly then. Truncates to `bytes.len()` so stale trailing bytes from a
     /// prior, longer payload do not linger.
+    ///
+    /// Positioned (`pwrite`) rather than seek-then-write: it saves the `lseek`
+    /// and leaves the fd's shared file offset alone, which matters because the
+    /// same open file description is shared by every in-process guard.
     fn write_contents(&self, bytes: &[u8]) -> Result<()> {
         let st = self.fd.lock();
-        let mut f = st
+        let f = st
             .file
             .as_ref()
             .context("write_contents requires a held lock (fd open)")?;
-        f.rewind().context("seeking lock file to start")?;
-        f.write_all(bytes).context("writing lock file contents")?;
+        f.write_all_at(bytes, 0)
+            .context("writing lock file contents")?;
         f.set_len(bytes.len() as u64)
             .context("truncating lock file to payload length")?;
         Ok(())
@@ -468,6 +476,28 @@ mod tests {
         // A shorter payload truncates the trailing bytes of the longer one.
         g.write_contents(b"42").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"42");
+        drop(g);
+    }
+
+    #[tokio::test]
+    async fn write_contents_targets_the_held_inode_not_the_path() {
+        // The guard writes through its open file description. Proven by swapping
+        // a decoy inode in at the path: a write that re-resolved the path would
+        // land on the decoy.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let l = FLock::new(&path);
+
+        let g = l.lock(&ct()).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"decoy").unwrap();
+
+        g.write_contents(b"held").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"decoy",
+            "write_contents must not re-open the lock path"
+        );
         drop(g);
     }
 
