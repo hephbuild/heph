@@ -65,6 +65,77 @@ impl fmt::Display for HashUnknownError {
 
 impl std::error::Error for HashUnknownError {}
 
+/// How many group members the `--shell` diagnostic lists before eliding.
+const SHELL_MEMBERS_SHOWN: usize = 5;
+
+/// `--shell` was asked for on something that does not resolve to a single
+/// executing target — a multi-target selection, or a transparent group that is
+/// not an alias for one target.
+///
+/// A property of the *request*, not a failure of any target: nothing ran, and
+/// nothing was going to. So `classify_failure` propagates it unchanged rather
+/// than recording it against whichever frame happened to raise it — a nested
+/// group would otherwise render the same user error as a failed-target box for
+/// a group that never executed.
+///
+/// The fields stay structured so a caller can render or serialize them; the
+/// `Display` is the human-facing form and always names the next command to run,
+/// so the message is recoverable on its own by a human or an agent.
+#[derive(Debug, Clone)]
+pub enum ShellNeedsSingleTarget {
+    /// A query or label/package matcher that selects more than one target.
+    Selection {
+        /// The selection as the user wrote it.
+        query: String,
+    },
+    /// A transparent group whose inputs are not exactly one distinct member.
+    Group {
+        addr: Addr,
+        /// The group's distinct members, in declaration order.
+        members: Vec<Addr>,
+    },
+}
+
+impl fmt::Display for ShellNeedsSingleTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("--shell needs exactly one target; ")?;
+        match self {
+            Self::Selection { query } => write!(
+                f,
+                "{query} selects many\n  try: heph run --shell //pkg:name with one address"
+            ),
+            Self::Group { addr, members } => {
+                write!(
+                    f,
+                    "{} is a group with {} members",
+                    addr.format(),
+                    members.len()
+                )?;
+                let Some(first) = members.first() else {
+                    return f.write_str(
+                        "\n  the group is empty — there is nothing to shell into\
+                         \n  try: heph run --shell //pkg:name with a target address",
+                    );
+                };
+                f.write_str("\n  members: ")?;
+                for (i, member) in members.iter().take(SHELL_MEMBERS_SHOWN).enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&member.format())?;
+                }
+                let rest = members.len().saturating_sub(SHELL_MEMBERS_SHOWN);
+                if rest > 0 {
+                    write!(f, " … and {rest} more")?;
+                }
+                write!(f, "\n  try: heph run --shell {}", first.format())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShellNeedsSingleTarget {}
+
 #[derive(Debug, Clone)]
 pub struct CycleError {
     pub from: Addr,

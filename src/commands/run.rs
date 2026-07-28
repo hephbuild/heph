@@ -70,6 +70,13 @@ pub struct RunArgs {
     #[arg(long = "force")]
     pub force: bool,
     /// Drop into an interactive shell in the target's sandbox instead of running it
+    ///
+    /// The terminal goes to the single target you name, never to its
+    /// dependencies. A group of exactly one member *is* that member, so it can
+    /// be shelled into; a group of two or more inlines its members as
+    /// dependencies of the run, and dependencies are not interactive. Shell
+    /// into the member you want instead. Likewise for a multi-target selection,
+    /// which names no single target at all.
     #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
     pub shell: Option<String>,
     /// Print output artifacts to stdout

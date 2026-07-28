@@ -2,8 +2,8 @@ use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
-    CancelledError, CycleError, HashUnknownError, MultiError, ProcessFailed, TargetFailure,
-    TargetNotFoundError, UpstreamFailed,
+    CancelledError, CycleError, HashUnknownError, MultiError, ProcessFailed,
+    ShellNeedsSingleTarget, TargetFailure, TargetNotFoundError, UpstreamFailed,
 };
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
@@ -681,6 +681,34 @@ struct ExecutedArtifacts {
     meta: Vec<ArtifactMeta>,
 }
 
+/// Whether a transparent target's inputs name exactly one distinct member addr.
+///
+/// The unit is the *executing target*, not the input entry: a group may list one
+/// member twice under different output filters, and both entries resolve to the
+/// same addr-keyed `mem_locked_result` / `mem_execute_cache` cell, so only one
+/// execute — and therefore only one terminal wrapper — ever runs. Allocation-free
+/// on the hot path; the deduplicated list is materialized only for diagnostics.
+fn has_single_member(inputs: &[Input]) -> bool {
+    let mut members = inputs.iter().map(|input| &input.r#ref.r#ref);
+    match members.next() {
+        Some(first) => members.all(|member| member == first),
+        None => false,
+    }
+}
+
+/// The distinct member addrs of a transparent target, in declaration order.
+/// Diagnostics only — quadratic in the member count, which is why the hot-path
+/// check is [`has_single_member`].
+fn distinct_members(inputs: &[Input]) -> Vec<Addr> {
+    let mut out: Vec<Addr> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if !out.contains(&input.r#ref.r#ref) {
+            out.push(input.r#ref.r#ref.clone());
+        }
+    }
+    out
+}
+
 /// Single classifier chokepoint for any target error.
 ///
 /// Decides whether an error is this target's **own** failure (record it once in
@@ -718,6 +746,15 @@ fn classify_failure(
         return e;
     }
 
+    // "--shell needs one target" is a property of the request, not a failure of
+    // the target that raised it — nothing ran. Propagate unchanged so a group
+    // nested inside a single-member group doesn't record the user's own input
+    // error as a failed target and render a failure box for something that never
+    // executed.
+    if downcast_chain_ref::<ShellNeedsSingleTarget>(&e).is_some() {
+        return e;
+    }
+
     // Already a collateral marker: reuse the existing root, do not record.
     if let Some(uf) = downcast_chain_ref::<UpstreamFailed>(&e) {
         return UpstreamFailed {
@@ -735,6 +772,14 @@ fn classify_failure(
     // through and record the whole aggregation against this target so the detail
     // (every broken input) isn't lost.
     if let Some(multi) = downcast_chain_ref::<MultiError>(&e) {
+        // A request-shape error aggregated with `fail_fast = false` is still a
+        // request error, not this target's failure. Surface it alone: every
+        // sibling raised the identical one.
+        for inner in &multi.0 {
+            if let Some(shell) = downcast_chain_ref::<ShellNeedsSingleTarget>(inner) {
+                return anyhow::Error::new(shell.clone());
+            }
+        }
         let all_collateral = multi.0.iter().all(|inner| {
             downcast_chain_ref::<UpstreamFailed>(inner).is_some()
                 || downcast_chain_ref::<CancelledError>(inner).is_some()
@@ -899,8 +944,63 @@ impl Engine {
         };
         if def.target_def.transparent {
             let mut opts = opts.clone();
-            if opts.shell {
-                opts.interactive = None;
+            // Dependencies are never interactive. The terminal goes to the
+            // single target the user named — never to something the engine
+            // pulled in on its behalf.
+            //
+            // A transparent group with two or more members is exactly that
+            // case: inlining is an implementation detail, and what the members
+            // *are* is the run's dependencies. So this gate and the
+            // `ResultOptions::default()` that dependency resolution already uses
+            // are one principle enforced at two points, not two rules that
+            // happen to agree — which is why `deps_never_inherit_the_terminal`
+            // guards the general form of what this line is an instance of.
+            // (Dependency resolution is doubly safe: deps are built by `meta`
+            // while computing the parent's `hashin`, and `meta` is memoized per
+            // addr with no `opts` in scope at all, so it *cannot* propagate a
+            // wrapper; `inputs_result_exec` then re-fetches them with
+            // `ResultOptions::default()`.)
+            //
+            // A group of one is a *name*, not a fan-out — there is nothing to
+            // call a dependency — so inlining hands the terminal straight
+            // through and `heph run //:dev` behaves like running its one member.
+            //
+            // The third enforcement point is `Engine::result`, which clears
+            // `interactive` for any non-`Addr` matcher: a selection names no
+            // single target to give the terminal to. Together the three
+            // guarantee at most one live terminal wrapper per request, at any
+            // nesting depth.
+            //
+            // Sharing the terminal between siblings is not merely untidy: each
+            // member's wrapper builds its own `TtyReader` on fd 0, the first
+            // member to finish resumes the TUI (re-enabling raw mode and
+            // clearing Ctrl-C suppression) underneath its live siblings, and
+            // `TtyReader::drop` restores blocking mode on fd 0 while a sibling
+            // still drives it through `AsyncFd` — leaving a blocking `read(0)`
+            // on a tokio worker that the request's cancellation token cannot
+            // reach.
+            if !has_single_member(&def.target_def.inputs) {
+                if opts.shell {
+                    return Err(ShellNeedsSingleTarget::Group {
+                        addr: addr.clone(),
+                        members: distinct_members(&def.target_def.inputs),
+                    }
+                    .into());
+                }
+                // `debug!`, not `info!` or a warning: nothing surprising
+                // happened. Dependencies have never been interactive, and these
+                // members are dependencies — there is no expectation to correct,
+                // only a "why didn't I get a prompt?" to answer under `-v`.
+                let dropped_terminal = opts.interactive.take().is_some();
+                if dropped_terminal {
+                    tracing::debug!(
+                        addr = %addr.format(),
+                        members = def.target_def.inputs.len(),
+                        reason = "group_multi_member",
+                        "group members are dependencies of the run; the terminal is not \
+                         forwarded to them",
+                    );
+                }
             }
 
             let futures: Vec<_> = def
@@ -985,7 +1085,20 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<BatchResult> {
         let mut opts = opts.clone();
+        // First leg of the one-target rule: a selection is many targets, so no
+        // target gets the terminal (see the transparent-group gate in
+        // `result_addr_impl` for the full rationale). `--shell` has nothing to
+        // attach to once it is gone, so refuse it here — once, naming the
+        // selection — rather than letting every matched target hit the
+        // "non-interactive mode" guard below and tell a user sitting at a
+        // terminal that they are not on one.
         if !matches!(matcher, Matcher::Addr(_)) {
+            if opts.shell && opts.interactive.is_some() {
+                return Err(ShellNeedsSingleTarget::Selection {
+                    query: hmodel::htquery::format(matcher),
+                }
+                .into());
+            }
             opts.interactive = None;
         }
 
@@ -6772,6 +6885,827 @@ mod tests {
             gen_def.target_def.cache.history, 1,
             "copy target keeps its declared history",
         );
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // Terminal forwarding across transparent groups.
+    //
+    // `TtyReader` (crates/tui/src/tui/tty.rs) owns fd 0 exclusively and the TUI
+    // pause is not refcounted, so at most one target per request may hold the
+    // terminal. These tests pin the rule that enforces it: a run is interactive
+    // only when it resolves to exactly one target that executes.
+    // ----------------------------------------------------------------------
+
+    /// Observes the [`InteractiveWrapper`] the way fd 0 experiences it: how many
+    /// targets asked for the terminal, and how many held it *at the same time*.
+    /// `max_live > 1` is the two-`TtyReader`s-on-one-fd bug.
+    #[derive(Default)]
+    struct TerminalProbe {
+        calls: AtomicUsize,
+        live: AtomicUsize,
+        max_live: AtomicUsize,
+    }
+
+    /// Wrapper that records its own concurrency, then runs the target.
+    ///
+    /// The assertions that matter are on `calls`, which is 0-or-1 by
+    /// construction and so deterministic. The sleep only sharpens `max_live`:
+    /// it is an await point every sibling reaches before any of them finishes,
+    /// so with enough execute-semaphore permits (hence `parallelism: Some(4)`)
+    /// a shared terminal reads as 2 rather than 1. It cannot turn a red
+    /// `calls` assertion green.
+    fn probe_wrapper(probe: SArc<TerminalProbe>) -> InteractiveWrapper {
+        SArc::new(move |inner: InteractiveInner| {
+            let probe = SArc::clone(&probe);
+            Box::pin(async move {
+                probe.calls.fetch_add(1, Ordering::SeqCst);
+                let live = probe.live.fetch_add(1, Ordering::SeqCst) + 1;
+                probe.max_live.fetch_max(live, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let res = inner(None, None, None).await;
+                probe.live.fetch_sub(1, Ordering::SeqCst);
+                res
+            })
+        })
+    }
+
+    /// Test driver for the terminal tests. A spec carrying `group = [addr, …]`
+    /// parses as a transparent group over those addrs; anything else is a leaf
+    /// that executes (and so reaches the interactive wrapper). A leaf carrying
+    /// `fail = true` returns a [`ProcessFailed`] over a real log file, so the
+    /// recorded failure's log tail can be asserted.
+    struct TerminalDriver {
+        runs: SArc<AtomicUsize>,
+        shell_runs: SArc<AtomicUsize>,
+        log_path: std::path::PathBuf,
+    }
+
+    /// Label the driver stamps on a leaf whose `run` must fail; `TargetSpec`
+    /// config is not visible from `run`, so the marker rides on the `TargetDef`.
+    const FAIL_LABEL: &str = "terminal-test:fail";
+
+    #[async_trait]
+    impl RawDriver for TerminalDriver {
+        fn config(&self, _req: DriverConfigRequest) -> anyhow::Result<DriverConfigResponse> {
+            Ok(DriverConfigResponse {
+                name: "terminal".to_string(),
+            })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            req: ParseRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            let transparent = req.target_spec.config.contains_key("group");
+            let key = if transparent { "group" } else { "deps" };
+            let members = match req.target_spec.config.get(key) {
+                Some(hcore::htvalue::Value::List(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        hcore::htvalue::Value::String(s) => {
+                            crate::engine::driver::TargetAddr::parse(
+                                s,
+                                &req.target_spec.addr.package,
+                            )
+                        }
+                        other => anyhow::bail!("member must be a string, got {other:?}"),
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+                _ => vec![],
+            };
+            let inputs = members
+                .into_iter()
+                .enumerate()
+                .map(|(i, r#ref)| Input {
+                    r#ref,
+                    mode: crate::engine::driver::targetdef::InputMode::Standard,
+                    origin_id: format!("group:{i}"),
+                    annotations: BTreeMap::new(),
+                    hashed: true,
+                    runtime: true,
+                })
+                .collect();
+            let fails = matches!(
+                req.target_spec.config.get("fail"),
+                Some(hcore::htvalue::Value::Bool(true))
+            );
+            Ok(ParseResponse {
+                target_def: TargetDef {
+                    addr: req.target_spec.addr.clone(),
+                    labels: if fails {
+                        vec![FAIL_LABEL.to_string()]
+                    } else {
+                        vec![]
+                    },
+                    raw_def: SArc::new(()),
+                    inputs,
+                    outputs: if transparent {
+                        vec![]
+                    } else {
+                        vec![Output {
+                            group: "main".to_string(),
+                            paths: vec![],
+                        }]
+                    },
+                    support_files: vec![],
+                    cache: if transparent {
+                        CacheConfig::off()
+                    } else {
+                        CacheConfig::on(false)
+                    },
+                    pty: false,
+                    hash: req.target_spec.addr.format().into_bytes(),
+                    transparent,
+                },
+            })
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if req.target.labels.iter().any(|l| l == FAIL_LABEL) {
+                return Err(anyhow::Error::new(crate::engine::error::ProcessFailed {
+                    status: "exit status: 1".to_string(),
+                    log: SArc::new(hcore::hartifactcontent::FileContent::new(&self.log_path)),
+                })
+                .context("driver run"));
+            }
+            Ok(RunResponse {
+                artifacts: vec![outputartifact::OutputArtifact {
+                    group: "main".to_string(),
+                    name: "out".to_string(),
+                    r#type: outputartifact::Type::Output,
+                    content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                        data: b"hi".to_vec(),
+                        path: "out".to_string(),
+                        x: false,
+                    }),
+                    hashout: "feedface".to_string(),
+                }],
+                sandbox_cleanup: None,
+                sandbox_guards: vec![],
+            })
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            self.shell_runs.fetch_add(1, Ordering::SeqCst);
+            Ok(RunResponse {
+                artifacts: vec![],
+                sandbox_cleanup: None,
+                sandbox_guards: vec![],
+            })
+        }
+    }
+
+    /// Provider serving a fixed set of `TargetSpec`s. Listable, so the batch
+    /// (matcher) path can be driven through it as well as `result_addr`.
+    struct SpecsProvider {
+        targets: Vec<TargetSpec>,
+    }
+
+    impl crate::engine::provider::Provider for SpecsProvider {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "specs".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            let items: Vec<anyhow::Result<ListResponse>> = self
+                .targets
+                .iter()
+                .filter(|t| t.addr.package == req.package)
+                .map(|t| {
+                    Ok(ListResponse {
+                        addr: t.addr.clone(),
+                    })
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            let mut pkgs: Vec<PkgBuf> = Vec::new();
+            for t in &self.targets {
+                if !pkgs.contains(&t.addr.package) {
+                    pkgs.push(t.addr.package.clone());
+                }
+            }
+            let items: Vec<anyhow::Result<ListPackageResponse>> = pkgs
+                .into_iter()
+                .map(|pkg| Ok(ListPackageResponse { pkg }))
+                .collect();
+            Box::pin(async move {
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            let found = self.targets.iter().find(|t| t.addr == req.addr).cloned();
+            Box::pin(async move {
+                match found {
+                    Some(target_spec) => Ok(GetResponse { target_spec }),
+                    None => Err(GetError::NotFound),
+                }
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    /// A transparent group over `members`.
+    fn group_spec(addr: &str, members: &[&str]) -> anyhow::Result<TargetSpec> {
+        Ok(TargetSpec {
+            addr: hmodel::htaddr::parse_addr(addr)?,
+            driver: "terminal".to_string(),
+            config: HashMap::from([(
+                "group".to_string(),
+                hcore::htvalue::Value::List(
+                    members
+                        .iter()
+                        .map(|m| hcore::htvalue::Value::String((*m).to_string()))
+                        .collect(),
+                ),
+            )]),
+            ..Default::default()
+        })
+    }
+
+    /// An executable leaf; `fail` makes its `run` return a `ProcessFailed`.
+    fn leaf_spec(addr: &str, fail: bool) -> anyhow::Result<TargetSpec> {
+        let mut config = HashMap::new();
+        if fail {
+            config.insert("fail".to_string(), hcore::htvalue::Value::Bool(true));
+        }
+        Ok(TargetSpec {
+            addr: hmodel::htaddr::parse_addr(addr)?,
+            driver: "terminal".to_string(),
+            config,
+            ..Default::default()
+        })
+    }
+
+    /// An executable leaf with real (non-group) dependencies — the path
+    /// `inputs_result_exec` resolves with `ResultOptions::default()`.
+    fn leaf_with_deps_spec(addr: &str, deps: &[&str]) -> anyhow::Result<TargetSpec> {
+        Ok(TargetSpec {
+            addr: hmodel::htaddr::parse_addr(addr)?,
+            driver: "terminal".to_string(),
+            config: HashMap::from([(
+                "deps".to_string(),
+                hcore::htvalue::Value::List(
+                    deps.iter()
+                        .map(|d| hcore::htvalue::Value::String((*d).to_string()))
+                        .collect(),
+                ),
+            )]),
+            ..Default::default()
+        })
+    }
+
+    struct TerminalHarness {
+        engine: Arc<Engine>,
+        probe: SArc<TerminalProbe>,
+        runs: SArc<AtomicUsize>,
+        shell_runs: SArc<AtomicUsize>,
+        _root: tempfile::TempDir,
+        _logs: tempfile::TempDir,
+    }
+
+    /// Engine wired to [`TerminalDriver`] + [`SpecsProvider`], with a 12-line
+    /// process log on disk for the failing-leaf case.
+    fn terminal_harness(targets: Vec<TargetSpec>) -> anyhow::Result<TerminalHarness> {
+        let root = tempdir()?;
+        let logs = tempdir()?;
+        let log_path = logs.path().join("log.txt");
+        std::fs::write(
+            &log_path,
+            (1..=12).map(|i| format!("line{i}\n")).collect::<String>(),
+        )?;
+
+        let runs = SArc::new(AtomicUsize::new(0));
+        let shell_runs = SArc::new(AtomicUsize::new(0));
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            // Enough workers that concurrent members are genuinely concurrent —
+            // otherwise the execute semaphore would serialize them and hide the
+            // shared-terminal overlap this suite is looking for.
+            parallelism: Some(4),
+            ..Default::default()
+        })?;
+        engine.register_driver(enclose!((runs, shell_runs, log_path) move |_| {
+            Box::new(TerminalDriver {
+                runs,
+                shell_runs,
+                log_path,
+            })
+        }))?;
+        engine.register_provider(move |_| Box::new(SpecsProvider { targets }))?;
+        Ok(TerminalHarness {
+            engine: Arc::new(engine),
+            probe: SArc::new(TerminalProbe::default()),
+            runs,
+            shell_runs,
+            _root: root,
+            _logs: logs,
+        })
+    }
+
+    impl TerminalHarness {
+        fn opts(&self, shell: bool) -> ResultOptions {
+            ResultOptions {
+                shell,
+                interactive: Some(probe_wrapper(SArc::clone(&self.probe))),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Reproduction for the shared-tty bug: a group with two uncached members
+    /// used to propagate `interactive` to both, so both built a `TtyReader` on
+    /// fd 0, both paused/resumed the TUI, and whichever finished first restored
+    /// blocking mode on the fd its sibling was still reading. No member may get
+    /// the terminal — and in particular two of them may never hold it at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_member_group_forwards_the_terminal_to_no_member() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            2,
+            "both members must still execute",
+        );
+        assert_eq!(
+            h.probe.max_live.load(Ordering::SeqCst),
+            0,
+            "no group member may own the terminal",
+        );
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            0,
+            "the interactive wrapper must not reach any group member",
+        );
+        Ok(())
+    }
+
+    /// The rule is "exactly one target that executes", not "groups are never
+    /// interactive": a group used as an alias is its member, at any nesting
+    /// depth. `//pkg:g0` → `//pkg:g1` → `//pkg:a` must hand the terminal to
+    /// `//pkg:a` exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_member_group_forwards_the_terminal_through_nesting() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g0", &["//pkg:g1"])?,
+            group_spec("//pkg:g1", &["//pkg:a"])?,
+            leaf_spec("//pkg:a", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g0")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "a nested single-member group is its member: it keeps the terminal",
+        );
+        assert_eq!(
+            h.probe.max_live.load(Ordering::SeqCst),
+            1,
+            "…and exactly one holder at a time",
+        );
+        Ok(())
+    }
+
+    /// `--shell` on a group that is not a single target is refused at the group
+    /// frame, with a message naming the group, its members, and the command to
+    /// run instead. Previously the member frames bailed with "cannot use --shell
+    /// in non-interactive mode", which is false — the user *is* on a terminal.
+    #[tokio::test]
+    async fn shell_on_multi_member_group_names_the_members() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(true))
+            .await
+            .err()
+            .expect("--shell on a multi-member group must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--shell needs exactly one target"),
+            "msg: {msg}"
+        );
+        assert!(
+            msg.contains("//pkg:g is a group with 2 members"),
+            "msg: {msg}"
+        );
+        assert!(msg.contains("members: //pkg:a, //pkg:b"), "msg: {msg}");
+        assert!(msg.contains("try: heph run --shell //pkg:a"), "msg: {msg}");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            0,
+            "no member may be entered once --shell is refused",
+        );
+        Ok(())
+    }
+
+    /// …and `--shell` on a single-member group shells into that member, because
+    /// an alias *is* its target.
+    #[tokio::test]
+    async fn shell_on_single_member_group_shells_into_the_member() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a"])?,
+            leaf_spec("//pkg:a", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(true))
+            .await?;
+
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            1,
+            "the single member must be shelled into",
+        );
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "…through the interactive wrapper, exactly once",
+        );
+        Ok(())
+    }
+
+    /// `classify_failure` drops the captured log tail for interactive targets on
+    /// the grounds that their output already streamed to the terminal. A group
+    /// member never streamed anything, so while `interactive` was propagated to
+    /// members a failing one lost its log tail — `heph run //pkg:group` gave
+    /// *worse* diagnostics than `heph run //...`. Not forwarding the terminal
+    /// restores it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failing_member_of_multi_member_group_keeps_its_log_tail() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", true)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+        let failing = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
+            .await
+            .err()
+            .expect("a failing member must fail the group");
+
+        let recorded = rs.get_failure(&failing).expect("failure must be recorded");
+        let tail = recorded
+            .log_tail
+            .as_ref()
+            .expect("a non-interactive member keeps its process log tail");
+        assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        Ok(())
+    }
+
+    /// The general rule the transparent-group gate is an instance of:
+    /// dependencies never inherit the terminal.
+    ///
+    /// Characterization rather than a mutation-provable assertion —
+    /// deps are built by `meta` while computing the parent's `hashin`, and
+    /// `meta` is memoized per addr with no `opts` in scope, so there is no line
+    /// to flip. (Verified: deliberately handing the wrapper to
+    /// `inputs_result_exec` changes nothing, because by then every dep is
+    /// already a memoizer hit.) The test guards against a future refactor that
+    /// threads the caller's options into either path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deps_never_inherit_the_terminal() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_with_deps_spec("//pkg:root", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:root")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(h.runs.load(Ordering::SeqCst), 3, "root plus both deps run");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "only the requested target may own the terminal",
+        );
+        assert_eq!(h.probe.max_live.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Third leg: a batch (matcher) request is many targets, so none of them
+    /// gets the terminal — `Engine::result` clears `interactive` up front.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_matcher_forwards_the_terminal_to_nobody() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let matcher = Matcher::Package(PkgBuf::from("pkg"));
+
+        Arc::clone(&h.engine)
+            .result(rs, &matcher, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(h.runs.load(Ordering::SeqCst), 2, "both targets must run");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            0,
+            "a multi-target selection gives the terminal to nobody",
+        );
+        Ok(())
+    }
+
+    /// The composition the commit claims to handle "at any nesting depth": the
+    /// terminal is forwarded through a single-member group and then dropped by
+    /// the multi-member group beneath it. This is the only path where the
+    /// `take()` runs on a wrapper that was actually forwarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_member_group_under_single_member_group_drops_the_terminal() -> anyhow::Result<()>
+    {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g0", &["//pkg:g1"])?,
+            group_spec("//pkg:g1", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g0")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(h.runs.load(Ordering::SeqCst), 2, "both members must run");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            0,
+            "the forwarded terminal must be dropped at the multi-member frame",
+        );
+        Ok(())
+    }
+
+    /// A group listing the same member twice (different output filters) is
+    /// still one executing target: both entries share the addr-keyed
+    /// `mem_locked_result` / `mem_execute_cache` cells, so there is exactly one
+    /// execute and exactly one terminal holder. Counting input *entries* rather
+    /// than distinct members would drop the terminal here and print "a group
+    /// with 2 members: //pkg:a, //pkg:a".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn group_listing_one_member_twice_is_still_a_single_target() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a", "//pkg:a"])?,
+            leaf_spec("//pkg:a", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(h.runs.load(Ordering::SeqCst), 1, "one target, one execute");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "one distinct member is one target: it keeps the terminal",
+        );
+        Ok(())
+    }
+
+    /// An empty group is legal (`group(name = "g")` with no `deps`). It runs
+    /// nothing, so it needs no terminal — and nothing may index `inputs[0]`.
+    #[tokio::test]
+    async fn empty_group_runs_nothing_and_takes_no_terminal() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![group_spec("//pkg:g", &[])?])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+        assert_eq!(h.probe.calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// …and `--shell` on it still says something actionable, even with no
+    /// member to name.
+    #[tokio::test]
+    async fn shell_on_empty_group_reports_zero_members() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![group_spec("//pkg:g", &[])?])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(true))
+            .await
+            .err()
+            .expect("--shell on an empty group must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is a group with 0 members"), "msg: {msg}");
+        assert!(msg.contains("the group is empty"), "msg: {msg}");
+        assert!(
+            msg.contains("try: heph run --shell"),
+            "an actionable message must still name an action: {msg}",
+        );
+        Ok(())
+    }
+
+    /// `--shell` on a group nested inside a single-member group is the *same*
+    /// user error as at the top, and must render the same way. It is a property
+    /// of the request, not a target failure: `classify_failure` propagates it
+    /// unchanged, so no failure is recorded and the CLI does not print a
+    /// failed-target box for a group that never executed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_error_from_a_nested_group_is_not_recorded_as_a_target_failure()
+    -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g0", &["//pkg:g1"])?,
+            group_spec("//pkg:g1", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:g0")?;
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(true))
+            .await
+            .err()
+            .expect("--shell on a nested multi-member group must fail");
+        assert!(
+            downcast_chain_ref::<ShellNeedsSingleTarget>(&err).is_some(),
+            "the request-shape error must survive the nesting: {err:#}",
+        );
+        assert!(
+            msg_names_group(&err, "//pkg:g1"),
+            "the message must name the group that is not a single target: {err:#}",
+        );
+        assert!(
+            rs.take_failures().is_empty(),
+            "a request-shape error is nobody's target failure",
+        );
+        Ok(())
+    }
+
+    fn msg_names_group(err: &anyhow::Error, addr: &str) -> bool {
+        format!("{err:#}").contains(addr)
+    }
+
+    /// `--shell` with a multi-target selection is refused once, naming the
+    /// selection — not once per matched target with "cannot use --shell in
+    /// non-interactive mode", which is false for a user sitting at a terminal.
+    #[tokio::test]
+    async fn shell_with_a_multi_target_selection_names_the_selection() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.engine.new_state();
+        let matcher = Matcher::Package(PkgBuf::from("pkg"));
+
+        let err = Arc::clone(&h.engine)
+            .result(rs, &matcher, OutputMatcher::All, &h.opts(true))
+            .await
+            .err()
+            .expect("--shell on a selection must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--shell needs exactly one target"),
+            "msg: {msg}"
+        );
+        assert!(msg.contains("selects many"), "msg: {msg}");
+        assert!(
+            !msg.contains("non-interactive mode"),
+            "the user is on a terminal; do not claim otherwise: {msg}",
+        );
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            0,
+            "nothing may run once --shell is refused",
+        );
+        Ok(())
+    }
+
+    /// The warm path: a single-member group whose member is already cached
+    /// executes nothing, so it takes no terminal — `probe.calls` counts
+    /// executes, and the whole suite rests on that. `--shell` still shells in,
+    /// because the shell path is never served from cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cached_single_member_group_takes_no_terminal_but_still_shells() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a"])?,
+            leaf_spec("//pkg:a", false)?,
+        ])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        // Cold: executes, and takes the terminal.
+        let rs = h.engine.new_state();
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+        assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(h.probe.calls.load(Ordering::SeqCst), 1);
+
+        // Warm: cache hit, nothing executes, nothing needs the terminal.
+        let rs = h.engine.new_state();
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            1,
+            "warm run must not execute"
+        );
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "a cache hit needs no terminal",
+        );
+
+        // …but `--shell` is never a cache hit.
+        let rs = h.engine.new_state();
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(true))
+            .await?;
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            1,
+            "--shell on a cached alias still shells into the member",
+        );
+        assert_eq!(h.probe.calls.load(Ordering::SeqCst), 2);
         Ok(())
     }
 }
