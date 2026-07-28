@@ -128,14 +128,8 @@ impl<'a> BodyRows<'a> {
     }
 
     /// Render the `rows`-tall window at `scroll`, returning it and the clamped
-    /// offset. Clamps like [`windowed`]: the window never runs off the end.
-    ///
-    /// An addr-ordered list is never sorted whole. Two `select_nth_unstable_by`
-    /// partitions put exactly the window's rows into `[start, end)` in `O(n)` —
-    /// first splitting off everything that sorts after the window, then
-    /// everything before it — and only that window, `rows` long, is sorted.
-    /// Every list this backs is keyed by a unique addr, so the partition order
-    /// is total and the result is the full sort's window, row for row.
+    /// offset. Clamps like [`windowed`]: the window never runs off the end. An
+    /// addr-ordered list is placed by [`place_window`], never sorted whole.
     fn window(mut self, rows: usize, scroll: usize) -> (Vec<Line<'static>>, usize) {
         let total = self.rows.len();
         if rows == 0 {
@@ -148,21 +142,10 @@ impl<'a> BodyRows<'a> {
         };
         let end = start.saturating_add(rows).min(total);
         if self.sort_by_addr {
-            let by_addr = |a: &BodyRow<'_>, b: &BodyRow<'_>| a.addr.cmp(b.addr);
-            if end < total {
-                // Ranks `[0, end)` move to the front; the tail is left unordered.
-                self.rows.select_nth_unstable_by(end, by_addr);
-            }
-            // `end <= total`, so the split is in bounds.
-            let (head, _) = self.rows.split_at_mut(end);
-            if start > 0 {
-                // Ranks `[0, start)` move to the front of that prefix, leaving
-                // exactly the window's rows behind them.
-                head.select_nth_unstable_by(start, by_addr);
-            }
-            // `start <= end == head.len()`, so this split is in bounds too.
-            let (_, window) = head.split_at_mut(start);
-            window.sort_unstable_by(by_addr);
+            // Addrs are unique within every list `by_addr` backs — they come out
+            // of `BuildState`'s `matched` / `cache_hit`, both keyed by addr — so
+            // the order is total and the unstable partition is unambiguous.
+            place_window(&mut self.rows, start, end, |a, b| a.addr.cmp(b.addr));
         }
         let window = self
             .rows
@@ -173,6 +156,54 @@ impl<'a> BodyRows<'a> {
             .collect();
         (window, start)
     }
+}
+
+/// A row buffer sized for a list of `len` rows that `filter` will thin out.
+///
+/// Unfiltered, the whole list lands in it, so one reservation beats `collect`'s
+/// geometric growth and its repeated copies. Filtered, the match count is not
+/// known ahead and can be a handful out of 100k, so reserving the full length
+/// every frame would ask the allocator for megabytes to hold three rows.
+fn row_buffer<T>(len: usize, filter: &str) -> Vec<T> {
+    if filter.is_empty() {
+        Vec::with_capacity(len)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Move the elements that belong at `[start, end)` in `cmp` order into that
+/// range, leaving the rest of `rows` in no particular order.
+///
+/// This is the sort the viewport does *not* do. Two `select_nth_unstable_by`
+/// partitions place the range in `O(n)` — first splitting off everything that
+/// sorts after the window, then everything before it — and only the window
+/// itself, `end - start` long, is sorted. A full sort would be `O(n log n)`
+/// to then throw all but a screenful away.
+///
+/// `start <= end <= rows.len()`. Callers must order on a key that is unique
+/// across `rows`: the partitions are unstable, so with duplicate keys the
+/// window could hold a different pick than a stable full sort would.
+fn place_window<T>(
+    rows: &mut [T],
+    start: usize,
+    end: usize,
+    mut cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) {
+    if end < rows.len() {
+        // Ranks `[0, end)` move to the front; the tail is left unordered.
+        rows.select_nth_unstable_by(end, &mut cmp);
+    }
+    // `end <= rows.len()`, so the split is in bounds.
+    let (head, _) = rows.split_at_mut(end);
+    if start > 0 {
+        // Ranks `[0, start)` move to the front of that prefix, leaving exactly
+        // the window's elements behind them.
+        head.select_nth_unstable_by(start, &mut cmp);
+    }
+    // `start <= end == head.len()`, so this split is in bounds too.
+    let (_, window) = head.split_at_mut(start);
+    window.sort_unstable_by(&mut cmp);
 }
 
 /// One frame's body: the live view's already-rendered lines, or a list tab's
@@ -1055,7 +1086,7 @@ impl BuildState {
     /// addr in red followed by its error message (when one was reported), in
     /// failure order. Empty when nothing has failed.
     fn failed_rows(&self, filter: &str) -> BodyRows<'_> {
-        let mut rows = Vec::with_capacity(self.failed.len());
+        let mut rows = row_buffer(self.failed.len(), filter);
         rows.extend(
             self.failed
                 .iter()
@@ -1075,8 +1106,7 @@ impl BuildState {
     /// addrs in the matched top-level set, `All` lists every completed target
     /// (transitive deps included). Empty when nothing has finished.
     fn done_rows(&self, scope: CountScope, filter: &str) -> BodyRows<'_> {
-        // One allocation for the whole list; the filter can only shrink it.
-        let mut rows = Vec::with_capacity(self.done.len());
+        let mut rows = row_buffer(self.done.len(), filter);
         rows.extend(
             self.done
                 .iter()
@@ -1099,7 +1129,7 @@ impl BuildState {
     /// `HashSet`). Finished targets render green, still-pending ones
     /// default-white. Empty before any `Matched` event arrives.
     fn matched_rows(&self, filter: &str) -> BodyRows<'_> {
-        let mut rows = Vec::with_capacity(self.matched.len());
+        let mut rows = row_buffer(self.matched.len(), filter);
         rows.extend(
             self.matched
                 .iter()
@@ -1123,7 +1153,7 @@ impl BuildState {
     /// `All` lists every cached target. Ordered by addr for a stable list (cache
     /// hits are keyed by addr). Empty when nothing has hit cache.
     fn cached_rows(&self, scope: CountScope, filter: &str) -> BodyRows<'_> {
-        let mut rows = Vec::with_capacity(self.cache_hit.len());
+        let mut rows = row_buffer(self.cache_hit.len(), filter);
         rows.extend(
             self.cache_hit
                 .keys()
@@ -1174,11 +1204,14 @@ impl BuildState {
     /// not every target that has ever run an op. The header calls this on every
     /// frame in every view.
     pub fn busy_workers(&self) -> usize {
+        // A stale entry here would be silently skipped by this filter and by
+        // `long_running`'s `?`, under-reporting the worker count rather than
+        // failing. `O(in-flight)`, and free in release.
         debug_assert!(
-            self.open_ops.len() <= self.ops.len(),
-            "open_ops {} exceeds tracked targets {}",
-            self.open_ops.len(),
-            self.ops.len(),
+            self.open_ops
+                .iter()
+                .all(|addr| self.ops.get(addr).is_some_and(|tl| tl.active.is_some())),
+            "open_ops holds an addr whose timeline has no op open",
         );
         self.open_ops
             .iter()
@@ -3926,9 +3959,11 @@ mod tests {
         s
     }
 
-    /// One builder per list tab. `fn` pointers so each can be called twice —
-    /// once for the reference list, once for the windowed one.
-    const LIST_TABS: [(&str, fn(&BuildState) -> BodyRows<'_>); 4] = [
+    /// Builds one list tab's rows off a state. A fn pointer so each tab can be
+    /// called twice — once for the reference list, once for the windowed one.
+    type TabRows = for<'a> fn(&'a BuildState) -> BodyRows<'a>;
+
+    const LIST_TABS: [(&str, TabRows); 4] = [
         ("done", |s| s.done_rows(CountScope::All, "")),
         ("matched", |s| s.matched_rows("")),
         ("cached", |s| s.cached_rows(CountScope::All, "")),
@@ -3940,19 +3975,122 @@ mod tests {
         // The correctness bar for clipping before rendering: at any viewport
         // position, the rows shown must be exactly the ones the full-list build
         // would have put there, and the clamped scroll offset must agree.
-        let s = list_state(137);
-        for (name, build) in LIST_TABS {
-            let reference = all_lines(build(&s));
-            assert_eq!(reference.len(), 137, "{name}");
-            for rows in [0usize, 1, 7, 20, 136, 137, 200] {
-                for scroll in 0..=(reference.len() + 5) {
-                    let (want, want_off) = windowed(reference.clone(), rows, scroll);
-                    let (got, got_off) = build(&s).window(rows, scroll);
-                    assert_eq!(got_off, want_off, "{name} rows={rows} scroll={scroll}");
-                    assert_eq!(got, want, "{name} rows={rows} scroll={scroll}");
+        // Empty and single-row lists are in here because they are the sizes the
+        // two partitions have to decline to run at all.
+        for n in [0usize, 1, 137] {
+            let s = list_state(n);
+            for (name, build) in LIST_TABS {
+                let reference = all_lines(build(&s));
+                assert_eq!(reference.len(), n, "{name}");
+                for rows in [0usize, 1, 7, 20, 136, 137, 200] {
+                    for scroll in 0..=(reference.len() + 5) {
+                        let (want, want_off) = windowed(reference.clone(), rows, scroll);
+                        let (got, got_off) = build(&s).window(rows, scroll);
+                        assert_eq!(
+                            got_off, want_off,
+                            "{name} n={n} rows={rows} scroll={scroll}"
+                        );
+                        assert_eq!(got, want, "{name} n={n} rows={rows} scroll={scroll}");
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn placing_a_window_selects_rather_than_sorting_the_whole_list() {
+        // The headline of this change is that the ordered tabs stop sorting a
+        // list they are about to throw away. That is invisible in the rendered
+        // output and allocates nothing, so nothing else here would notice it
+        // being undone — count the comparisons instead. A full sort of n
+        // elements costs about n·log2(n); the two partitions plus a 20-row sort
+        // are linear. At n = 50k that is ~780k against ~150k, so a bound of 8n
+        // separates them with room to spare and never needs a clock.
+        let n = 50_000usize;
+        // Scrambled, not reversed: pdqsort spots a reversed run and flips it in
+        // O(n), which would let a full sort slip under the bound.
+        let mut rows: Vec<u32> = (0..n as u32)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .collect();
+        let mut want = rows.clone();
+        want.sort_unstable();
+
+        let calls = Cell::new(0usize);
+        place_window(&mut rows, 25_000, 25_020, |a, b| {
+            calls.set(calls.get() + 1);
+            a.cmp(b)
+        });
+
+        assert_eq!(
+            &rows[25_000..25_020],
+            &want[25_000..25_020],
+            "the window must hold the same rows a full sort would put there",
+        );
+        assert!(
+            calls.get() < 8 * n,
+            "{} comparisons to place a 20-row window in {n} rows — that is a \
+             full sort, not a selection",
+            calls.get(),
+        );
+    }
+
+    #[test]
+    fn panning_a_list_tab_clamps_against_the_whole_list() {
+        // The pan clamp is deliberately measured over every row, not just the
+        // visible ones, so it does not shift as you scroll. This is also the
+        // only path that reads `Body::max_width` on a list tab.
+        let mut v = TuiProgressView::new("L");
+        // One row far wider than the viewport, then a screenful of short ones.
+        let wide = format!("//wide:{}", "x".repeat(300));
+        v.apply(&ev(0, result_start(&wide)));
+        v.apply(&ev(1, result_end(&wide, Some("boom".into()))));
+        for i in 0..50 {
+            let addr = format!("//s:{i:02}");
+            v.apply(&ev(2, result_start(&addr)));
+            v.apply(&ev(3, result_end(&addr, Some("boom".into()))));
+        }
+        v.view.set(ViewMode::Failed);
+
+        // Pan far right: it clamps at the widest row's tail, not at zero.
+        v.hscroll(100_000);
+        let lines = v.render("⠋", 0, 40, 9);
+        let pan = v.hscroll.get();
+        assert!(pan > 0, "a list tab must be pannable");
+        let row0 = format!("{}", lines[1]);
+        assert!(
+            !row0.contains("//wide"),
+            "pan did not drop the head: {row0}"
+        );
+
+        // Scroll the wide row out of the window. The clamp must not move — if it
+        // were measured over the visible rows it would collapse to zero here.
+        v.scroll(20);
+        drop(v.render("⠋", 0, 40, 9));
+        assert_eq!(
+            v.hscroll.get(),
+            pan,
+            "the pan clamp shifted when the widest row scrolled out of view",
+        );
+    }
+
+    #[test]
+    fn a_failed_row_keeps_its_error_on_one_line() {
+        // A `\n` inside a `Span` does not wrap in ratatui, it corrupts the box
+        // the whole viewport is laid out in — and multi-line stderr is exactly
+        // what lands on this tab.
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(
+            1,
+            result_end("//a:bad", Some("first line\nsecond line".into())),
+        ));
+        v.view.set(ViewMode::Failed);
+
+        let lines = v.render("⠋", 0, 120, 8);
+        assert_eq!(lines.len(), 8, "a multi-line error must not grow the box");
+        let row = format!("{}", lines[1]);
+        assert!(row.contains("first line"), "{row}");
+        assert!(!row.contains("second line"), "{row}");
     }
 
     #[test]
@@ -4016,7 +4154,11 @@ mod tests {
         s.apply(&ev(2, local_write_start("//live:c")));
 
         assert_eq!(s.ops.len(), 2_003, "history keeps every target");
-        assert_eq!(s.open_ops.len(), 3, "the frame path only walks the live ops");
+        assert_eq!(
+            s.open_ops.len(),
+            3,
+            "the frame path only walks the live ops"
+        );
         assert_eq!(s.busy_workers(), 2, "only Execute holds a worker slot");
         // The slow-row scan reads the same index, so it sees all three.
         assert_eq!(s.body_lines(LONG_RUNNING_THRESHOLD_MS + 3).len(), 3);
@@ -4119,18 +4261,36 @@ mod tests {
     }
 
     #[test]
-    fn a_list_frame_costs_the_same_at_1k_and_20k_targets() {
-        // The viewport shows ~20 rows. Rendering one frame must cost the same
+    fn a_list_frame_allocates_the_same_at_1k_and_20k_targets() {
+        // The viewport shows ~20 rows, so one frame must allocate the same
         // whether the list behind it holds 1k or 20k targets: every row used to
         // be formatted into a `Line` (two allocations) that the window then
         // discarded, and a filter lower-cased two `String`s per row on top.
-        let frame_allocs = |n: usize, mode: ViewMode, filter: &str| -> usize {
-            let mut v = TuiProgressView::new("bench");
-            v.state = list_state(n);
+        //
+        // Allocation *count*, not bytes — the row buffer is still one
+        // allocation of `O(n)` bytes, and the selection still touches all of it.
+        // What must not come back is a heap allocation per row.
+        let mut small_view = TuiProgressView::new("bench");
+        small_view.state = list_state(1_000);
+        let mut big_view = TuiProgressView::new("bench");
+        big_view.state = list_state(20_000);
+
+        let frame_allocs = |v: &TuiProgressView, mode: ViewMode, filter: &str| -> usize {
             v.view.set(mode);
+            v.scroll.set(0);
+            v.hscroll.set(0);
             filter.clone_into(&mut v.search_query.borrow_mut());
             // The first frame settles the scroll/pan clamps; measure a steady one.
-            drop(v.render("⠋", 0, 120, 24));
+            let settled = v.render("⠋", 0, 120, 24);
+            // Guard against measuring the "nothing here" placeholder: the border
+            // only carries a scroll indicator when the list overflows the
+            // viewport, which is the whole premise of the measurement.
+            let border = format!("{}", settled[settled.len() - 2]);
+            assert!(
+                border.contains(" of "),
+                "the measured frame does not overflow its viewport: {border}",
+            );
+            drop(settled);
             allocs_during(|| drop(v.render("⠋", 0, 120, 24)))
         };
 
@@ -4143,8 +4303,8 @@ mod tests {
             // Unfiltered, then filtered — the filter has to be tried against
             // every row, so it is its own scaling risk.
             for filter in ["", "t7"] {
-                let small = frame_allocs(1_000, mode, filter);
-                let big = frame_allocs(20_000, mode, filter);
+                let small = frame_allocs(&small_view, mode, filter);
+                let big = frame_allocs(&big_view, mode, filter);
                 assert!(
                     big <= small + 64,
                     "{name} tab (filter {filter:?}): {small} allocations for a frame \
