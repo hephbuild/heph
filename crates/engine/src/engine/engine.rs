@@ -390,12 +390,18 @@ impl Engine {
             requests: Mutex::new(HashMap::new()),
             result_semaphore: {
                 let sem = Arc::new(Semaphore::new(max_workers));
-                // Let a stall report read the pool's free permits directly,
-                // instead of inferring them from the last acquire.
-                crate::engine::diag::global().register_worker_pool(max_workers, {
+                // Two readers of the same pool, for two different lines: the
+                // permit accounting (`N max, N free, N running`) and the
+                // `workers` limiter's saturation age. Both must sample when the
+                // report is rendered, not at the last acquire.
+                let free = {
                     let sem = Arc::clone(&sem);
                     move || sem.available_permits()
-                });
+                };
+                crate::engine::diag::global().register_worker_pool(max_workers, free.clone());
+                crate::engine::diag::global()
+                    .limiter("workers")
+                    .attach_gauge(free);
                 sem
             },
             max_workers,

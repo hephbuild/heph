@@ -183,8 +183,12 @@ where
     // moment a permit came free. `codec` is declared by `diag::global()` and was
     // never fed, so its saturation was structurally unreportable.
     let d = crate::engine::diag::global();
-    d.limiter("codec")
-        .observe(CODEC_SLOTS.available_permits(), d.now_ms());
+    let codec = d.limiter("codec");
+    // Idempotent, so arming it here costs one atomic load per call and saves a
+    // separate one-time hook. `CODEC_SLOTS` is a process-wide static, so the
+    // closure captures nothing.
+    codec.attach_gauge(|| CODEC_SLOTS.available_permits());
+    codec.observe(CODEC_SLOTS.available_permits(), d.now_ms());
     let _permit = CODEC_SLOTS
         .acquire()
         .await
