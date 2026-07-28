@@ -32,7 +32,13 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// reparented to pid 1) is holding the pipe write end. We escalate with
 /// `killpg` on the pgid (relies on the spawning driver setting
 /// `setsid: true`) and grant a second budget.
-const DRAIN_JOIN_BUDGET: Duration = Duration::from_millis(500);
+///
+/// One window, taken from the cross-backend [`super::DRAIN_DEADLINE`] so the
+/// two backends share a single knob — but note this side spends it *twice*
+/// (once before the `killpg`, once after), so the worst-case post-exit drain
+/// is ~2x Linux's. See [`super::DRAIN_DEADLINE`] for what that divergence
+/// does and does not cost.
+const DRAIN_JOIN_BUDGET: Duration = super::DRAIN_DEADLINE;
 
 /// Polling interval while waiting for drain threads' "done" flags after
 /// `exit_rx`. Short enough to keep latency low; large enough not to spin.
@@ -512,31 +518,56 @@ pub(super) async fn output(
     let mut handle = spawn(spec)?;
     let stdout_rx = handle.take_stdout();
     let stderr_rx = handle.take_stderr();
-    // Collect stdout/stderr on dedicated buffer threads. We can't await the
-    // `ChunkReader::recv` here because we also want to race the wait/cancel
-    // — and `ChunkReader::recv` requires block_in_place. Collect on threads
-    // so the wait poll loop has a clean single-shot signal to wait on.
-    let stdout_handle = collect_chunks(stdout_rx);
-    let stderr_handle = collect_chunks(stderr_rx);
 
+    // No collector needed on this side: the drain threads spawned by
+    // `spawn` already read the pipes concurrently with the child (so the
+    // 64 KiB pipe buffer can never wedge it) and park the chunks in their
+    // unbounded channels. `wait_or_cancel` bounds the join on those threads
+    // via `drain_with_deadline`, so by the time it returns either every
+    // chunk has been queued or the drain has been abandoned.
+    //
+    // This drops the two `heph-proc-collect` threads a previous version
+    // spawned per subprocess. Those threads were the actual hang: the
+    // abandoned drain thread still holds its sender, so the collector's
+    // `rx.recv()` never returned and `output` joined it under
+    // `block_in_place`, parking a tokio worker for the descendant's whole
+    // lifetime. The trade is memory: chunks now sit in the channel as
+    // separate 8 KiB `Vec`s until the child exits instead of being folded
+    // into one growing buffer as they arrive, so peak is ~2x the payload
+    // while `take_queued` copies them out. Unbounded, as it was before.
     let status = handle.wait_or_cancel(cancel).await?;
 
-    let stdout = block_or_inline(|| {
-        stdout_handle.join().map_err(|panic| {
-            io::Error::other(format!("stdout collect thread panicked: {panic:?}"))
-        })?
-    })?;
-    let stderr = block_or_inline(|| {
-        stderr_handle.join().map_err(|panic| {
-            io::Error::other(format!("stderr collect thread panicked: {panic:?}"))
-        })?
-    })?;
+    let stdout = take_queued(stdout_rx)?;
+    let stderr = take_queued(stderr_rx)?;
 
     Ok(Output {
         status,
         stdout,
         stderr,
     })
+}
+
+/// Collect everything the drain thread has already queued, without blocking.
+///
+/// A finished drain has dropped its sender, so this walks the channel to
+/// `Disconnected` and returns the complete stream. An abandoned one (a
+/// descendant that outlived the child still holds the pipe write end) leaves
+/// the sender alive; we stop at `Empty` and return what the child itself
+/// wrote rather than parking on bytes that are not ours. Dropping the
+/// receiver here also releases the stuck thread the moment its `read`
+/// returns, since its next `send` fails.
+fn take_queued(reader: Option<ChunkReader>) -> io::Result<Vec<u8>> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    loop {
+        match reader.rx.try_recv() {
+            Ok(Ok(chunk)) => out.extend_from_slice(&chunk),
+            Ok(Err(e)) => return Err(e),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(out),
+        }
+    }
 }
 
 fn spawn_drain_thread<R: io::Read + Send + 'static>(
@@ -575,74 +606,4 @@ fn spawn_drain_thread<R: io::Read + Send + 'static>(
         })
         .expect("spawn heph-proc-drain thread");
     (rx, DrainHandle { join: jh, done })
-}
-
-fn collect_chunks(reader: Option<ChunkReader>) -> JoinHandle<io::Result<Vec<u8>>> {
-    std::thread::Builder::new()
-        .name("heph-proc-collect".into())
-        .spawn(move || -> io::Result<Vec<u8>> {
-            let Some(reader) = reader else {
-                return Ok(Vec::new());
-            };
-            // ChunkReader holds an mpsc::Receiver — drain it synchronously here
-            // since this thread is std (not in the tokio runtime).
-            let mut out = Vec::new();
-            loop {
-                match reader.rx.recv() {
-                    Ok(Ok(chunk)) => out.extend_from_slice(&chunk),
-                    Ok(Err(e)) => return Err(e),
-                    Err(_disconnected) => return Ok(out),
-                }
-            }
-        })
-        .expect("spawn heph-proc-collect thread")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsString;
-    use std::path::PathBuf;
-    use std::time::Instant;
-
-    /// Regression: a child that backgrounds a long-lived descendant
-    /// inheriting stdout/stderr must not park `Handle::wait` indefinitely.
-    /// The bounded drain join + `killpg` escalation reaps the descendant
-    /// once `setsid: true` puts the child in its own process group.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stray_daemon_does_not_park_wait() {
-        // sh forks a 10s sleep into the background (inheriting stdout +
-        // stderr fds), then the immediate child exits. Without
-        // `setsid: true` + the bounded drain-join, the sleep would keep
-        // the pipe write end open and `Handle::wait` would block on the
-        // unbounded drain `join()` for the full 10 seconds.
-        let spec = super::super::Spec {
-            program: PathBuf::from("/bin/sh"),
-            args: vec![
-                OsString::from("-c"),
-                OsString::from("( /bin/sleep 10 ) & exit 0"),
-            ],
-            env: Vec::new(),
-            cwd: PathBuf::from("/"),
-            stdin: super::super::StdioSpec::Null,
-            stdout: super::super::StdioSpec::Piped,
-            stderr: super::super::StdioSpec::Piped,
-            setsid: true,
-            ctty: false,
-        };
-
-        let handle = spawn(spec).expect("spawn child");
-        let started = Instant::now();
-        let status = handle.wait().await.expect("wait should return");
-        let elapsed = started.elapsed();
-
-        assert!(status.success(), "child should exit 0; got {status:?}");
-        // Generous cap: two drain budgets (≈1s) + scheduling slack. The
-        // backgrounded sleep would extend this to ~10s without the
-        // killpg escalation.
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "Handle::wait took {elapsed:?} — bounded drain join should escape via killpg",
-        );
-    }
 }
