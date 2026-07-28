@@ -203,3 +203,110 @@ async fn test_output_selection_unknown_name_errors() -> anyhow::Result<()> {
     assert!(msg.contains("output not found"), "got: {msg}");
     Ok(())
 }
+
+/// `cache.history` must be enforced *by the run that broke the budget*, not
+/// left for the next `heph gc`.
+///
+/// Three runs of one target, each with a different script, write three cache
+/// revisions; the default history budget is 1, so by the end of the third run
+/// the two older revisions owe us their disk back. Observed through `gc_all`:
+/// a post-run sweep that still finds revisions to reclaim is proof the in-run
+/// trim never happened.
+///
+/// Each run gets a fresh engine over the same root — the next `heph run`'s view
+/// of the same on-disk cache. That is not incidental: an in-process re-run
+/// replays the memoized spec, so the rewritten BUILD file would produce the
+/// same `hashin` and no second revision, and the test could not fail.
+///
+/// The run is driven through `result_addr` rather than `Workspace::run` so the
+/// test owns the two things that decide the outcome, exactly as `heph run`
+/// does: the result is released before the request state, and the run is not
+/// over until the background queue drains.
+#[tokio::test]
+async fn cache_history_is_enforced_by_the_end_of_the_run() -> anyhow::Result<()> {
+    use heph::engine::{Engine, OutputMatcher, ResultOptions};
+    use heph::htaddr::parse_addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let ws = Workspace::new();
+    let addr = parse_addr("//hist:t")?;
+
+    for v in ["v1", "vv22", "vvv333"] {
+        // A different script is a different def hash, hence a different
+        // `hashin` — a genuinely new revision rather than a re-hit.
+        ws.write_build_file(
+            "hist",
+            &format!(
+                r#"target(name = "t", driver = "bash", run = "printf '{v}' > $OUT", out = "out.txt")"#
+            ),
+        );
+
+        let engine = ws.reopen()?;
+        let bg: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let rs = engine.new_state_full(
+            true,
+            None,
+            Arc::clone(&bg),
+            Engine::DEFAULT_LOG_TAIL_LINES,
+            None,
+        );
+        let result = engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        // Precondition: each run really did rebuild. If this ever reports a
+        // stale value the runs are sharing a revision and the assertions below
+        // become vacuous.
+        assert_eq!(
+            common::artifact_string(&result),
+            v,
+            "each run must produce its own revision"
+        );
+        // Release the artifacts, then the request — the order `heph run`'s
+        // locals unwind in, and the order that frees the addr's riding read.
+        drop(result);
+        drop(rs);
+
+        // `bg` is the counter the CLI blocks on before exiting; the run's
+        // background cache work is not finished until it reads zero.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while bg.load(Ordering::Acquire) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background work never drained"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        drop(engine);
+
+        // Assert per run, not once at the end. A single check after the last run
+        // cannot tell "every run enforced its budget" from "only the last one
+        // did" — run 3's trim protects its own revision and deletes both older
+        // ones, so an end-only assertion passes even when two of the three trims
+        // silently lost their lock.
+        //
+        // `gc_all` is the oracle because it reports what a sweep still finds to
+        // reclaim; anything above zero is a trim that did not happen. It is also
+        // destructive, which is what makes it a *tight* check — it leaves the
+        // cache in the state the trim should already have produced, so the next
+        // iteration starts clean and any failure is attributable to one run.
+        let sweeper = ws.reopen()?;
+        let stats = sweeper.clone().gc_all(sweeper.new_state()).await?;
+        assert_eq!(
+            stats.revisions_removed, 0,
+            "after the `{v}` run a sweep still found revisions to reclaim, so \
+             that run's post-write trim never ran: {stats:?}"
+        );
+        assert_eq!(
+            stats.revisions_kept, 1,
+            "exactly the newest revision survives the `{v}` run: {stats:?}"
+        );
+    }
+    Ok(())
+}

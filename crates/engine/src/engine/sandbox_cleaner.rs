@@ -98,6 +98,15 @@ fn sender() -> &'static Sender<Job> {
 pub fn enqueue(label: String, job: SandboxCleanupJob, pending: PendingCounter) {
     // Count before sending so the counter can never observe an enqueued job as
     // already drained. The worker decrements once the job has run.
+    //
+    // Deliberately *not* split into a reserve-now / submit-later pair. The
+    // counter gates process exit through an untimed loop in both TUI backends,
+    // so a slot taken before the work is submitted is only ever released by
+    // whatever was supposed to submit it — and a `RequestStateData` pinned by an
+    // abandoned memoizer cell (a live hazard, see `hmemoizer::cell`'s retained
+    // future and the `fail_fast` fanout that drops in-flight awaiters) would
+    // then turn a silent leak into a process that never exits. A slot exists
+    // only for work already in this queue.
     pending.fetch_add(1, Ordering::AcqRel);
     if let Err(err) = sender().send((label, job, Arc::clone(&pending))) {
         pending.fetch_sub(1, Ordering::AcqRel);

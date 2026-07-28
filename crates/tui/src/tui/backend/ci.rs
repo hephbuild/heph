@@ -122,7 +122,7 @@ pub async fn run<A: App + 'static>(
             tracing::info!(
                 pending = bg_pending.load(std::sync::atomic::Ordering::Acquire),
                 elapsed_secs = started.elapsed().as_secs(),
-                "waiting for background cache uploads and sandbox cleanup to finish",
+                "waiting for background cache uploads, history trims and sandbox cleanup to finish",
             );
             announced = true;
         }
