@@ -27,7 +27,6 @@ use crate::engine::remote_cache::RemoteRevision;
 use crate::engine::result_lock::ResultReadGuard;
 use anyhow::Context;
 use futures::{StreamExt, TryStreamExt};
-use hcore::defer;
 use hcore::hartifactcontent::{Content, ReadSeek, WalkEntry, WalkEntryKind};
 use hmodel::htmatcher::Matcher;
 use std::future::Future;
@@ -2651,13 +2650,13 @@ impl Engine {
                         .await
                         .with_context(|| format!("approval {addr}"))?;
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
-                    let (artifacts, sandbox_cleanup, sandbox_guards) = engine
+                    let (artifacts, sandbox_teardown, sandbox_guards) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell)
                         .await
                         .with_context(|| format!("execute {addr}"))?;
 
-                    let artifacts_meta = artifacts
+                    let artifacts_meta = match artifacts
                         .iter()
                         .filter(|a| matches!(
                             a.r#type,
@@ -2665,22 +2664,21 @@ impl Engine {
                         ))
                         .map(|a| Ok(ArtifactMeta { hashout: a.hashout()? }))
                         .collect::<anyhow::Result<Vec<_>>>()
-                        .with_context(|| format!("read artifact metas for {addr}"))?;
-
-                    // SlotGuards drop here too — moved into the defer so
-                    // they live across cache_locally (which reads from
-                    // the FUSE-side sandbox) and only deregister after
-                    // cleanup is enqueued. The cleanup closure is owned
-                    // by the bridge that built the sandbox; it knows
-                    // whether to rm the plain dir or the FUSE upper.
-                    let cleanup_label = format!("{addr}");
-                    let bg_pending = rs.bg_pending();
-                    defer! {
-                        drop(sandbox_guards);
-                        if let Some(job) = sandbox_cleanup {
-                            crate::engine::sandbox_cleaner::enqueue(cleanup_label, job, bg_pending);
+                        .with_context(|| format!("read artifact metas for {addr}"))
+                    {
+                        Ok(metas) => metas,
+                        Err(err) => {
+                            // A target failure, like any `Err` leaving the
+                            // execute: the sandbox stays on disk for the
+                            // failure diagnostic (which reads it lazily) and
+                            // for a post-mortem of the artifacts it failed to
+                            // hash. A bare `?` here would fall into the drop
+                            // path, which reclaims — that path must mean
+                            // cancellation only.
+                            sandbox_teardown.leave_for_diagnostics();
+                            return Err(err);
                         }
-                    }
+                    };
 
                     hcore::hmemoizer::set_phase("execute_cache:cache_locally");
 
@@ -2772,6 +2770,41 @@ impl Engine {
                     if out.is_ok() && !use_tmp_cache {
                         rs.defer_trim(&addr, def.target.cache.history, hashin);
                     }
+
+                    // Completion path of the sandbox teardown. The teardown is
+                    // an RAII guard armed in `Engine::execute` when the path
+                    // was claimed, and every exit resolves it exactly once,
+                    // three ways:
+                    //
+                    // * Reaching this line enqueues the bridge-owned cleanup
+                    //   closure, generation-guarded. That includes a *failed
+                    //   cache write* (`out` is `Err` here after a successful
+                    //   run) — deliberately, matching the old `defer!`: the
+                    //   run itself succeeded, so there is no process log tail
+                    //   riding on this sandbox's survival.
+                    // * A *failing target* never gets here: the run error in
+                    //   `Engine::execute` and the `artifacts_meta` error above
+                    //   both resolve as `leave_for_diagnostics`, keeping the
+                    //   sandbox (and its log) on disk for the lazily-rendered
+                    //   failure diagnostic, exactly as before teardown
+                    //   ownership existed.
+                    // * A bare drop — cancellation or an unwind, and only
+                    //   those — enqueues a generation-checked reclaim.
+                    //
+                    // The old `defer!` here also enqueued at drop time in this
+                    // window, but *unguarded*: with cancellation now routine
+                    // (cancel-on-abandonment), that handed the cleaner a
+                    // `remove_dir_all` at an arbitrarily later time, racing the
+                    // next execute of the same addr as it recreates this very
+                    // directory. The generation check is what makes drop-time
+                    // teardown safe in every ordering.
+                    //
+                    // Runs after `cache_locally`, which reads from the sandbox
+                    // (`project_sandbox_cleanup_ordering`). SlotGuards drop
+                    // first, having lived across that read; the bridge closure
+                    // knows whether to rm the plain dir or the FUSE upper.
+                    drop(sandbox_guards);
+                    sandbox_teardown.complete(format!("{addr}"));
 
                     hcore::hmemoizer::clear_phase();
                     out
