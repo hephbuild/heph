@@ -500,6 +500,39 @@ pub struct BuildState {
     lock_waits: HashMap<String, Option<u32>>,
 }
 
+/// The header's count fields for one frame, as rendered strings.
+///
+/// Every consumer — the split header, the plain-text summary — goes through
+/// [`BuildState::counts`], which walks the matched set exactly once per
+/// intersection it needs. That is the point of the type: two callers each
+/// asking for "their" subset of the fields is how the same `matched ∩ finished`
+/// scan ended up running twice on every frame of every view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Counts {
+    /// The finished count, bound to the [`ViewMode::Done`] tab.
+    pub done: String,
+    /// The denominator, bound to the [`ViewMode::Matched`] tab and `~`-prefixed
+    /// while the matcher is still streaming. `None` before any `Matched` event,
+    /// where the segment reads `{done} done` with no denominator (and `done` is
+    /// the built count, not a matched count).
+    pub total: Option<String>,
+    /// Cache hits in scope, e.g. `"3 cached"`.
+    pub cached: String,
+    /// Failures, e.g. `"0 failed"`.
+    pub failed: String,
+}
+
+impl Counts {
+    /// The done segment as one string: `"{done} / {total} done"`, or
+    /// `"{done} done"` when there is no denominator.
+    pub fn done_segment(&self) -> String {
+        match &self.total {
+            Some(total) => format!("{} / {total} done", self.done),
+            None => format!("{} done", self.done),
+        }
+    }
+}
+
 impl BuildState {
     pub fn new() -> Self {
         Self::default()
@@ -664,40 +697,15 @@ impl BuildState {
         Some((done, self.matched.len(), self.matched_complete))
     }
 
-    /// The three freestanding count fields — `(done, cached, failed)` — each
-    /// without separators. The header model wraps these in [`HeaderItem`]s (so
-    /// the view owns the ` · ` joins); [`BuildState::counts_segment`] joins them
-    /// for the plain-text final summary.
-    pub fn count_fields(&self, scope: CountScope) -> (String, String, String) {
-        let (built, cached, _running, failed) = self.header_counts(scope);
-        let done = match scope {
+    /// The count fields for one frame — see [`Counts`]. Runs one
+    /// `matched ∩ finished` pass (via [`BuildState::matched_progress`]) and one
+    /// `matched ∩ cache_hit` pass (via [`BuildState::cached_count`]), never two
+    /// of either.
+    pub fn counts(&self, scope: CountScope) -> Counts {
+        let (done, total) = match scope {
             // All-targets scope: every observed target (`finished ∪ in_flight`),
             // with the finished count over that running total. No `~` — the total
             // grows as deps stream rather than resolving to a fixed matched set.
-            CountScope::All => {
-                let done = self.finished.len();
-                let total = done + self.in_flight_results.len();
-                format!("{done} / {total} done")
-            }
-            CountScope::Matched => match self.matched_progress() {
-                Some((done, total, complete)) => {
-                    let tilde = if complete { "" } else { "~" };
-                    format!("{done} / {tilde}{total} done")
-                }
-                None => format!("{built} done"),
-            },
-        };
-        (done, format!("{cached} cached"), format!("{failed} failed"))
-    }
-
-    /// The done segment split for per-view header tabs: `(count, total)`.
-    /// `count` is the finished number (bound to the Done view); `total` is the
-    /// denominator (bound to the Matched view, `~`-prefixed while the matcher is
-    /// still streaming). `total` is `None` before any `Matched` event, where the
-    /// segment reads `{built} done` with no denominator. Mirrors the string built
-    /// by [`BuildState::count_fields`] so the split header and plain summary agree.
-    pub fn done_parts(&self, scope: CountScope) -> (String, Option<String>) {
-        match scope {
             CountScope::All => {
                 let done = self.finished.len();
                 let total = done + self.in_flight_results.len();
@@ -710,7 +718,23 @@ impl BuildState {
                 }
                 None => (self.built.to_string(), None),
             },
+        };
+        Counts {
+            done,
+            total,
+            cached: format!("{} cached", self.cached_count(scope)),
+            failed: format!("{} failed", self.errored),
         }
+    }
+
+    /// The three freestanding count fields — `(done, cached, failed)` — each
+    /// without separators. The plain-text rendering of [`BuildState::counts`],
+    /// used by [`BuildState::counts_segment`] for the final summary; the live
+    /// header takes [`Counts`] directly so it can split the done segment into
+    /// per-view tabs.
+    pub fn count_fields(&self, scope: CountScope) -> (String, String, String) {
+        let counts = self.counts(scope);
+        (counts.done_segment(), counts.cached, counts.failed)
     }
 
     /// The textual count segment shared by the live header and the final
@@ -824,13 +848,12 @@ impl BuildState {
             .collect()
     }
 
-    /// Header counts, in render order: `(built, cached, running, failed)`.
-    /// `built` is targets whose driver actually ran; `cached` counts matched
-    /// targets that hit cache (`matched ∩ cache_hit`), falling back to all cache
-    /// hits before any `Matched` event arrives; `running` is in-flight results;
-    /// `failed` is errors.
-    pub fn header_counts(&self, scope: CountScope) -> (usize, usize, usize, usize) {
-        let cached = match scope {
+    /// The header's cached count: matched targets that hit cache
+    /// (`matched ∩ cache_hit`), falling back to all cache hits before any
+    /// `Matched` event arrives, or to every cached addr under
+    /// [`CountScope::All`].
+    pub fn cached_count(&self, scope: CountScope) -> usize {
+        match scope {
             // All-targets scope: every addr that hit cache (deduped), deps included.
             CountScope::All => self.cache_hit.len(),
             CountScope::Matched if self.matched_seen => self
@@ -839,13 +862,7 @@ impl BuildState {
                 .filter(|a| self.cache_hit.contains(*a))
                 .count(),
             CountScope::Matched => self.local_hits + self.remote_hits,
-        };
-        (
-            self.built,
-            cached,
-            self.in_flight_results.len(),
-            self.errored,
-        )
+        }
     }
 
     /// Workers currently holding an execute slot (targets whose active op is
@@ -1040,14 +1057,22 @@ impl BuildHeader {
 
 impl ProgressHeader for BuildHeader {
     fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
-        let (_, cached, failed) = core.count_fields(scope);
+        // One `counts` call per frame: it is the only place the matched set is
+        // walked, and it walks it once per intersection. Asking for the done
+        // segment and the other fields separately is what made the
+        // `matched ∩ finished` scan run twice on every frame of every view.
+        let Counts {
+            done,
+            total,
+            cached,
+            failed,
+        } = core.counts(scope);
         // The done segment `X / Y done` splits into two independent tabs: `X`
         // (the finished count → Done view) and `Y` (the matched total → Matched
         // view). The connective ` / ` and trailing ` done` are inert text. Before
         // any `Matched` event there is no denominator, so it reads `{built} done`
         // with only the Done tab.
-        let (done_n, total) = core.done_parts(scope);
-        let mut done_parts = vec![HeaderPart::tab(ViewMode::Done, done_n)];
+        let mut done_parts = vec![HeaderPart::tab(ViewMode::Done, done)];
         match total {
             Some(total) => {
                 done_parts.push(HeaderPart::text(" / "));
@@ -2384,6 +2409,76 @@ mod tests {
         let (done, cached, _) = s.count_fields(CountScope::All);
         assert_eq!(done, "2 / 3 done", "all done");
         assert_eq!(cached, "2 cached", "all cached");
+    }
+
+    /// The three count fields as the split header renders them, in header order.
+    fn header_count_fields(s: &BuildState, scope: CountScope) -> (String, String, String) {
+        let items = BuildHeader::new("L").header(s, scope);
+        let text = |i: usize| header_text(&items[i..=i]);
+        (text(0), text(1), text(2))
+    }
+
+    /// Shorthand for a `(done, cached, failed)` golden.
+    fn fields(done: &str, cached: &str, failed: &str) -> (String, String, String) {
+        (done.to_string(), cached.to_string(), failed.to_string())
+    }
+
+    #[test]
+    fn split_header_count_fields_match_the_plain_count_fields() {
+        // The header destructures `Counts` and splits the done segment into
+        // tabs; `count_fields` renders the same `Counts` as flat strings for the
+        // final summary. The two must stay character-identical in every scope and
+        // in every branch of the done segment — the counts are computed once per
+        // frame precisely so the header does not re-derive them.
+        let mut s = BuildState::new();
+
+        // Before any Matched event: the done segment falls back to `{built} done`
+        // with no denominator, and cached falls back to raw hit counts.
+        s.apply(&ev(0, execute_start("//a:built")));
+        s.apply(&ev(1, execute_end("//a:built")));
+        s.apply(&ev(2, local_cache_hit("//a:cached")));
+        s.apply(&ev(3, result_start("//a:failed")));
+        s.apply(&ev(4, result_end("//a:failed", Some("boom".into()))));
+        for scope in [CountScope::Matched, CountScope::All] {
+            assert_eq!(header_count_fields(&s, scope), s.count_fields(scope));
+        }
+        // The no-denominator branch is the one the done segment re-sources, so
+        // pin it to a literal rather than only cross-checking it.
+        assert_eq!(
+            header_count_fields(&s, CountScope::Matched),
+            fields("1 done", "1 cached", "1 failed"),
+        );
+        assert_eq!(
+            header_count_fields(&s, CountScope::All),
+            fields("1 / 1 done", "1 cached", "1 failed"),
+        );
+
+        // Provisional matched total (`~`): three matched, one finished, two of
+        // them cached. The distinct cached/failed counts keep a transposition of
+        // the two fields visible.
+        s.apply(&ev(5, matched(&["//m:x", "//m:y", "//m:z"], false)));
+        s.apply(&ev(6, result_start("//m:x")));
+        s.apply(&ev(7, local_cache_hit("//m:x")));
+        s.apply(&ev(8, local_cache_hit("//m:y")));
+        s.apply(&ev(9, result_end("//m:x", None)));
+        s.apply(&ev(10, result_start("//m:y")));
+        for scope in [CountScope::Matched, CountScope::All] {
+            assert_eq!(header_count_fields(&s, scope), s.count_fields(scope));
+        }
+        assert_eq!(
+            header_count_fields(&s, CountScope::Matched),
+            fields("1 / ~3 done", "2 cached", "1 failed"),
+        );
+
+        // Matcher resolves: the `~` drops on both paths.
+        s.apply(&ev(11, matched(&[], true)));
+        for scope in [CountScope::Matched, CountScope::All] {
+            assert_eq!(header_count_fields(&s, scope), s.count_fields(scope));
+        }
+        assert_eq!(
+            header_count_fields(&s, CountScope::Matched),
+            fields("1 / 3 done", "2 cached", "1 failed"),
+        );
     }
 
     #[test]
