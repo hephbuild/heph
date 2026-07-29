@@ -446,7 +446,35 @@ jobs:
   # direction (`#[expect]` is fulfilled-or-error, so a lint that fires on one OS
   # and not the other is a hard error on the other), and that only stays closed
   # if every leg runs the same command as the developer does.
-  lint_matrix:
+  #
+  # This is a matrix, so the published status contexts are the *rendered* names,
+  # one per leg — `Lint linux/amd64` and `Lint darwin/arm64`. There is no longer
+  # any context named plain `Lint`. Branch protection must require the two new
+  # names; until it does, a red lint does not block a merge. (Verified from a
+  # real run of this matrix, not inferred: GitHub publishes the rendered name,
+  # with no parenthesised matrix suffix.)
+  #
+  # `needs: lint` elsewhere in this file waits for *every* leg and is skipped if
+  # any of them fails — the same fan-in the `build` matrix already relies on via
+  # `bin_e2e`'s `needs: [gen, build, …]`. Downstream gating therefore needs no
+  # aggregator job.
+  #
+  # No `continue-on-error:` and no `if:` on the Lint step, ever. Either one lets
+  # a leg conclude `success` with clippy never having run, which makes the leg's
+  # own check green — and, because `needs` treats a successful job as satisfied,
+  # lets `release` proceed over a platform that was not linted. It is the one
+  # remaining way to reach a silent pass here, and it is invisible in the check
+  # list. `tests/lint_gate.rs` asserts their absence.
+  #
+  # Cost, measured rather than assumed — see the PR body. The darwin leg is a
+  # fourth concurrent `macos-latest` job in the `needs: gen` wave, which is the
+  # real price rather than the minutes: the darwin build chain has been observed
+  # on the critical path, and macOS jobs in this repo have queued up to ~2m30s
+  # waiting for a slot. macOS also starts colder — the Nix setup alone measures
+  # 3m15s-4m42s there, and the cargo registry cache is restore-only on PRs
+  # (only master saves), so the darwin leg stays near its cold ~10min until this
+  # key is populated from master.
+  lint:
     name: Lint ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
@@ -499,49 +527,6 @@ jobs:
         if: always()
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
-
-  # Aggregator. Does no work; it exists so the status context stays named
-  # exactly `Lint`.
-  #
-  # The branch ruleset requires a context named literally `Lint`. A bare matrix
-  # publishes one context per leg and never that name again, so every open PR
-  # would block forever on a required check that can no longer appear — a worse
-  # failure than the one being fixed, and the workflow edit and the ruleset edit
-  # cannot land atomically. Matrixing the work and keeping this fan-in gives
-  # per-platform legs with their own logs *and* an unchanged required context,
-  # so this lands with **no branch-protection change at all**.
-  #
-  # `if: always()` is what makes it able to report when a leg fails — without it
-  # a failed leg would *skip* this job, and a skipped required check is not a
-  # red one. That inverts the danger: `always()` alone would let it succeed on a
-  # failed leg, since a job whose steps all pass is green regardless of why its
-  # dependencies ended. Hence the explicit `result` check below. `needs` alone
-  # decides *ordering* here, not outcome.
-  #
-  # `needs.lint_matrix.result` is the aggregate over every leg: `success` only
-  # when all of them succeeded, otherwise `failure` / `cancelled` / `skipped`.
-  # Comparing against `success` therefore fails closed for a new leg too — add a
-  # third platform and it is covered without touching this job.
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: lint_matrix
-    if: always()
-    steps:
-      - name: Require every lint leg to have succeeded
-        env:
-          # Read through env rather than interpolated into the script body, so
-          # the value can never be parsed as shell.
-          LINT_MATRIX_RESULT: ${{ needs.lint_matrix.result }}
-        run: |
-          set -euo pipefail
-          echo "lint_matrix: $LINT_MATRIX_RESULT"
-          if [ "$LINT_MATRIX_RESULT" != "success" ]; then
-            echo "::error title=Lint::lint_matrix did not succeed (result: $LINT_MATRIX_RESULT). Open the 'Lint linux/amd64' and 'Lint darwin/arm64' jobs for the failing leg. A 'skipped' or 'cancelled' result counts as a failure here on purpose: it means a platform was never linted."
-            exit 1
-          fi
-          echo "every lint leg succeeded"
 
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
