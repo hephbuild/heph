@@ -51,11 +51,33 @@ Don't run the full test suite locally — CI runs `tst` on every push, so runnin
 
 1. Make the change, with tests.
 2. Run `lint` and the tests relevant to the change (`cargo test <test_name>`).
-3. Commit, push, open the PR. CI takes it from there.
+3. Commit, push, open the PR — if the change depends on an unmerged PR, stack it (see below). CI takes it from there.
 
 The same applies to subsequent pushes on an open PR: push the fix and let CI run the suite.
 
 Run the full `tst` suite locally only for a large blast radius change — one touching the engine core, provider/driver traits, or caching, where a break is likely to be wide rather than local. Run it before opening the PR: the cost of a broken PR there is higher than the wait.
+
+### Stacked PRs
+
+**Stack dependent work**, with the `gh stack` extension (`github/gh-stack`) — a change that cannot compile, or cannot be reviewed on its merits, without the one below it. Everything else branches off `master` in parallel: independent PRs review independently, merge in any order, and one being blocked doesn't block the rest. A recent effort produced ~20 PRs and exactly two of them needed a stack.
+
+```bash
+gh stack init -b master feat/base       # start a stack (adopts existing branches, bottom to top)
+gh stack add feat/on-top                # start a dependent branch on top of the current stack
+gh stack submit --auto                  # push branches, create/update the PRs, link the stack
+gh stack view --short                   # the branches and each PR's state
+gh stack sync                           # fetch, cascade-rebase onto trunk, atomic force-with-lease push
+gh stack rebase                         # cascade rebase only; --continue / --abort for conflicts
+gh stack link <pr-url> <pr-url>         # register already-open PRs as a stack, bottom to top, no local tracking
+```
+
+Plain `gh stack submit` opens an editor for PR titles — pass `--auto` from a script or an agent. `gh stack sync` aborts instead of prompting when the local and remote stacks have diverged and there is no tty; that is the safe outcome, not a failure.
+
+- **Merge bottom-up, and sync after each merge.** GitHub retargets a child PR at `master` on its own when the base merges, but the branch still carries the base's commits — run `gh stack sync` (or `gh stack rebase`) once the base lands so the PR's diff is its own change again. `master` is squash-only, so the base's commits have no counterpart in trunk after the merge: expect that rebase to conflict, and resolve it under the rule below.
+- **A red check on a stacked PR is not necessarily its own.** Before debugging, check the base: `gh pr checks <base-pr>`. Same job red there → not your bug; say so on your PR and fix it in the base, not in yours. This has already cost real time — a stacked PR reddened on a flake inherited from its base, and the fix for it lived in a third PR entirely.
+- **Don't fold a fix for the base into your stack.** It muddies the revert line — the fix disappears if your PR is reverted, and it lands bundled with an unrelated change. Fix the base in the base, or in its own PR.
+- **After resolving a stack conflict, diff against the lower branch and re-run the *lower* PR's tests.** For each conflicted file, `git diff <lower-branch> -- <file>` and confirm every remaining difference is deliberately yours. A resolution can compile, pass your tests, and still revert the change below you: git applies an upper-PR copy of a moved code block cleanly *above* the conflict region and marks only the code below, so taking the upper side verbatim silently dropped a lower PR's `sort`/`dedup` and put a `HashSet` seed back into a def hash.
+- **Stacked PRs do get CI.** `pull_request:` in `.github/workflows/heph.yml` is deliberately unfiltered — a `branches: ["master"]` filter matches the PR's *base*, so stacked PRs got zero runs and an empty check list that reads like a pass (fixed in #240). Don't re-add the filter.
 
 ## Review Board
 
