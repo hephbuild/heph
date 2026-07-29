@@ -1727,6 +1727,118 @@ mod tests {
         Ok(())
     }
 
+    /// **The asymmetry the post-write cache trim is built on.**
+    ///
+    /// `exists` waits on this key's in-flight write (`wait_if_pending`);
+    /// `list_target_entries` is a plain `SELECT DISTINCT hashin` and does not.
+    /// So a revision whose every write is still queued is *invisible to an
+    /// enumeration and knowable to a probe*.
+    ///
+    /// `Engine::try_trim_after_write` depends on exactly this: it counts with
+    /// `list_target_entries`, corrects that count with `existence`, and orders the
+    /// enumeration that chooses what to delete with `exists`. Its own tests use a
+    /// double that *models* the asymmetry, so this is the test that says the
+    /// backend really has it — delete `wait_if_pending` from `exists` and this
+    /// fails here, where the property lives, instead of nowhere.
+    ///
+    /// Every observation is *captured* while the gate is shut and asserted only
+    /// after it reopens. A panic with the gate closed would leave the writer
+    /// thread parked in it, and `LocalCacheSQLite::drop` joins that thread — so
+    /// asserting in place turns any failure into a hung test process instead of a
+    /// red one. (Found exactly that way: the first version of this test deadlocked
+    /// under the mutation it exists to catch.)
+    #[tokio::test]
+    async fn a_queued_revision_is_invisible_to_list_target_entries_and_awaited_by_exists()
+    -> Result<()> {
+        let dir = tempdir()?;
+        let cache = Arc::new(LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?);
+        let addr = make_addr("pkg", "trimmed");
+
+        cache.gate.close();
+        queued_write(&cache, &addr, "manifest-v1.borsh", b"manifest");
+
+        let listed_while_queued = cache.list_target_entries(&addr)?;
+        // The non-blocking probe knows better, and does not settle it either.
+        let existence_while_queued = cache.existence(&addr, "h", "manifest-v1.borsh")?;
+
+        // `exists` must *block* until the write lands, on another thread since
+        // this one has to open the gate.
+        let probe = std::thread::spawn({
+            let (cache, addr) = (cache.clone(), addr.clone());
+            move || cache.exists(&addr, "h", "manifest-v1.borsh")
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let probe_parked = !probe.is_finished();
+
+        cache.gate.open();
+
+        assert!(
+            listed_while_queued.is_empty(),
+            "an enumeration does not wait on the write queue — this is the \
+             undercount that makes a post-write trim skip a target that is over \
+             budget, and it is silent"
+        );
+        assert!(
+            probe_parked,
+            "`exists` must park on the queued write, not answer from the \
+             committed state — that wait is the barrier"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            queued(existence_while_queued),
+        )
+        .await
+        .expect("the queued write must land");
+        assert!(
+            probe.join().expect("probe thread")?,
+            "present once it lands"
+        );
+        assert_eq!(
+            cache.list_target_entries(&addr)?,
+            vec!["h".to_string()],
+            "and only then does the enumeration see it"
+        );
+        Ok(())
+    }
+
+    /// The other half of the same story, and the reason the trim's correction is
+    /// *conditional*: `cache_locally` writes artifacts before the manifest on one
+    /// FIFO writer, so a revision whose blob has committed is already in the
+    /// enumeration even while its manifest is queued. That is the common case on a
+    /// warm run, and it must cost no probe at all.
+    #[tokio::test]
+    async fn a_revision_with_one_committed_blob_is_listed_while_its_manifest_is_queued()
+    -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "partial");
+
+        queued_write(&cache, &addr, "out.tar", b"bytes");
+        assert!(cache.exists(&addr, "h", "out.tar")?); // barrier: the blob landed
+
+        cache.gate.close();
+        queued_write(&cache, &addr, "manifest-v1.borsh", b"manifest");
+
+        // Captured, not asserted, while the gate is shut — see the test above.
+        let listed = cache.list_target_entries(&addr)?;
+        cache.gate.open();
+
+        assert_eq!(
+            listed,
+            vec!["h".to_string()],
+            "the hashin is listed on the strength of the committed blob alone"
+        );
+        Ok(())
+    }
+
     /// The case a "queued means present" shortcut would get wrong: `delete`
     /// registers a slot too, so a key mid-GC reports `Queued` and then resolves to
     /// *absent*.

@@ -517,6 +517,42 @@ mod tests {
         assert_eq!(inner.exists_calls.load(Ordering::Relaxed), before);
     }
 
+    /// **The mem tier must never answer `exists` for a key it has just written.**
+    ///
+    /// `exists` short-circuits on a resident entry, which is only safe because
+    /// `writer` *invalidates* the key instead of populating it — so the sole way
+    /// an entry becomes resident is through `reader`, which has already waited on
+    /// the inner backend's write queue. Populating the cache from `writer` with
+    /// the bytes it already holds is an obvious optimization, and it would quietly
+    /// turn `exists` into a non-barrier: `Engine::try_trim_after_write` would stop
+    /// being ordered against its own write, `cache.history` would go unenforced,
+    /// and every test of the trim itself would stay green.
+    ///
+    /// This is that invariant, pinned where it lives.
+    #[test]
+    fn exists_delegates_after_a_write_with_no_intervening_read() {
+        let inner = Arc::new(CountingCache::default());
+        let dec = LocalCacheMem::new(inner.clone(), 1024, 64 * 1024);
+        let addr = make_addr();
+
+        // A read first, to make the key resident and prove the short-circuit is
+        // otherwise live (see `exists_short_circuits_on_cache_hit`).
+        write_blob(&dec, &addr, "k", b"v");
+        let _ = drain(dec.reader(&addr, "h1", "k").expect("r").reader);
+
+        // Now rewrite it, with no read in between.
+        write_blob(&dec, &addr, "k", b"v2");
+
+        let before = inner.exists_calls.load(Ordering::Relaxed);
+        assert!(dec.exists(&addr, "h1", "k").expect("exists"));
+        assert_eq!(
+            inner.exists_calls.load(Ordering::Relaxed),
+            before + 1,
+            "the write invalidated the entry, so `exists` must reach the inner \
+             backend — that call is what makes it a write barrier"
+        );
+    }
+
     #[test]
     fn delete_invalidates_cache() {
         let inner = Arc::new(CountingCache::default());
