@@ -5,34 +5,44 @@
 //! parses the default `cargo test` text harness output (no nightly-only
 //! `--format json`, since the workspace pins a stable toolchain) and reports
 //! which tests failed how often, so a flake is a number instead of a hunch.
+//!
+//! Standalone CI tooling, not a `heph` subcommand: it has nothing to do with
+//! building or running targets, so it doesn't belong in the binary every
+//! `heph` user installs.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use clap::Parser;
 use serde::Serialize;
 
-#[derive(clap::Args)]
+#[derive(Parser)]
 #[command(
-    override_usage = "heph tool flake-report --logs-dir <DIR>\n       heph tool flake-report --logs-dir <DIR> --json-out <PATH>"
+    name = "flake-report",
+    override_usage = "flake-report --logs-dir <DIR>\n       flake-report --logs-dir <DIR> --json-out <PATH>"
 )]
-pub struct Args {
+struct Args {
     /// Directory containing one `cargo test` stdout capture per run (any
     /// filenames; every file in the directory is treated as one run).
     #[arg(long, value_name = "DIR")]
-    pub logs_dir: PathBuf,
+    logs_dir: PathBuf,
     /// Also write the full per-test report as JSON to this path.
     #[arg(long, value_name = "PATH")]
-    pub json_out: Option<PathBuf>,
+    json_out: Option<PathBuf>,
     /// Exit with a non-zero status if any test failed in some runs but not
     /// all (i.e. is flaky rather than consistently broken or consistently
     /// passing). Off by default: the nightly job reports, it doesn't gate.
     #[arg(long)]
-    pub fail_on_flake: bool,
+    fail_on_flake: bool,
 }
 
-pub fn execute(args: &Args) -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    run(&Args::parse())
+}
+
+fn run(args: &Args) -> anyhow::Result<()> {
     let mut run_names = Vec::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&args.logs_dir)
         .with_context(|| format!("reading logs dir {}", args.logs_dir.display()))?
@@ -599,19 +609,19 @@ test late_test ... FAILED
     }
 
     #[test]
-    fn execute_on_an_empty_logs_dir_returns_an_error() {
+    fn run_on_an_empty_logs_dir_returns_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let args = Args {
             logs_dir: dir.path().to_path_buf(),
             json_out: None,
             fail_on_flake: false,
         };
-        let err = execute(&args).expect_err("an empty logs dir has nothing to aggregate");
+        let err = run(&args).expect_err("an empty logs dir has nothing to aggregate");
         assert!(err.to_string().contains("no run logs found"));
     }
 
     #[test]
-    fn execute_ignores_subdirectories_and_writes_the_json_report() {
+    fn run_ignores_subdirectories_and_writes_the_json_report() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("run-1.log"), RUN_ALL_PASS).expect("write run log");
         std::fs::create_dir(dir.path().join("not-a-run")).expect("create subdir");
@@ -627,7 +637,7 @@ test late_test ... FAILED
             json_out: Some(json_out.clone()),
             fail_on_flake: false,
         };
-        execute(&args).expect("subdirectories are skipped, not read as a run");
+        run(&args).expect("subdirectories are skipped, not read as a run");
 
         let json = std::fs::read_to_string(&json_out).expect("json report written");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
@@ -642,7 +652,7 @@ test late_test ... FAILED
     }
 
     #[test]
-    fn execute_fail_on_flake_gates_on_flakiness_not_on_any_failure() {
+    fn run_fail_on_flake_gates_on_flakiness_not_on_any_failure() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("run-1.log"), RUN_ALL_PASS).expect("write run log");
         std::fs::write(dir.path().join("run-2.log"), RUN_ONE_FAILS).expect("write run log");
@@ -652,14 +662,14 @@ test late_test ... FAILED
             json_out: None,
             fail_on_flake: false,
         };
-        execute(&not_gated).expect("fail_on_flake=false must succeed despite a flaky test");
+        run(&not_gated).expect("fail_on_flake=false must succeed despite a flaky test");
 
         let gated = Args {
             logs_dir: dir.path().to_path_buf(),
             json_out: None,
             fail_on_flake: true,
         };
-        let err = execute(&gated).expect_err("fail_on_flake=true must fail on a flaky test");
+        let err = run(&gated).expect_err("fail_on_flake=true must fail on a flaky test");
         assert!(err.to_string().contains("flaky"));
     }
 

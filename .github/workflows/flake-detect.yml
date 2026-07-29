@@ -107,14 +107,15 @@ jobs:
           cache-suffix: "-flake"
           r2-secret: ${{ secrets.CF_SSCACHE }}
 
-      # Prebuilds the heph binary and every test binary once; each run in the
-      # loop below re-executes these same binaries (cargo no-ops the compile
-      # step when nothing changed), so the N-run loop's cost is dominated by
-      # actual test execution, not rebuilds.
-      - name: Build heph + test binaries
+      # Prebuilds the flake-report tool (standalone CI tooling — not part of
+      # the shipped `heph` binary, see crates/flake-report) and every test
+      # binary once; each run in the loop below re-executes these same
+      # binaries (cargo no-ops the compile step when nothing changed), so the
+      # N-run loop's cost is dominated by actual test execution, not rebuilds.
+      - name: Build flake-report + test binaries
         shell: devenv shell bash -- -e {0}
         run: |
-          cargo build --locked -p heph --bin heph
+          cargo build --locked -p flake-report
           cargo test --locked --workspace --exclude bin-e2e --no-run
 
       # The two feature-gated `tst` passes (plugin-stabby --features host,
@@ -158,20 +159,20 @@ jobs:
           # `pipefail`, --fail-on-flake's non-zero exit is swallowed here and
           # the job stays green regardless.
           set -o pipefail
-          bin="$CARGO_TARGET_DIR/debug/heph"
+          bin="$CARGO_TARGET_DIR/debug/flake-report"
           extra_args=()
           if [ "${{ inputs.fail_on_flake || false }}" = "true" ]; then
             extra_args+=(--fail-on-flake)
           fi
-          "$bin" tool flake-report --logs-dir flake-logs --json-out flake-report.json "${extra_args[@]}" \
+          "$bin" --logs-dir flake-logs --json-out flake-report.json "${extra_args[@]}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Serial-vs-parallel divergence
         shell: devenv shell bash -- -e {0}
         run: |
-          bin="$CARGO_TARGET_DIR/debug/heph"
+          bin="$CARGO_TARGET_DIR/debug/flake-report"
           mkdir -p compare
-          "$bin" tool flake-report --logs-dir flake-logs-serial --json-out compare/serial.json > /dev/null
+          "$bin" --logs-dir flake-logs-serial --json-out compare/serial.json > /dev/null
 
           # The parallel side reuses the 20-run aggregate from the previous
           # step instead of a single parallel log: a test that only fails
