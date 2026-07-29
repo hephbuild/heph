@@ -5801,6 +5801,15 @@ mod tests {
         inner: pluginstatictarget::Provider,
         parked: SArc<AtomicUsize>,
         expect_parked: usize,
+        /// Held with **zero** permits until the test hands them out, so a task
+        /// that wakes on cancellation cannot finish on its own. That is what makes
+        /// the drain observable as an *ordering* rather than a count: while this
+        /// is shut, a `result` that is genuinely draining cannot return, and one
+        /// that dropped its `JoinSet` returns anyway.
+        release: SArc<tokio::sync::Semaphore>,
+        /// Parked tasks that were let go — resumed after cancellation *and* after
+        /// the release, so their `get` returned instead of being dropped mid-poll.
+        resumed: SArc<AtomicUsize>,
     }
 
     impl crate::engine::provider::Provider for GateProvider {
@@ -5855,10 +5864,16 @@ mod tests {
         ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
             Box::pin(async move {
                 self.parked.fetch_add(1, Ordering::SeqCst);
-                // Park until the request is cancelled. Pre-fix nothing ever
-                // cancels it, because the early return skips `ctoken().cancel()`
-                // and `RequestStateData::drop` can't run either.
+                // Park until the request is cancelled, then wait for the test to
+                // let go. Both waits matter, and for different regressions: an
+                // early return that skips `ctoken().cancel()` never gets past the
+                // first, and one that cancels *and then* returns is caught by the
+                // second — its tasks are still held here, so `result` returning is
+                // proof it abandoned them rather than waiting.
                 ctoken.cancelled().await;
+                let permit = self.release.acquire().await;
+                self.resumed.fetch_add(1, Ordering::SeqCst);
+                drop(permit);
                 Err(GetError::NotFound)
             })
         }
@@ -5872,14 +5887,39 @@ mod tests {
     }
 
     /// A failing matcher walk must surface its error *through the drain*, not by
-    /// returning early. Returning drops the `JoinSet`, which leaves each spawned
-    /// task's future un-polled inside this request's `mem_result` — and those
-    /// futures hold an `Arc<RequestState>` back into the very memoizer that owns
-    /// them. That cycle pins `RequestStateData` forever, so its `Drop` never runs:
-    /// the token is never cancelled, running children are never signalled, and
-    /// their sandboxes are never enqueued for cleanup. Releasing the last external
-    /// `Arc` and finding the request actually gone is the observable proof the
-    /// cycle was not formed.
+    /// returning early. Returning drops the `JoinSet`, so every spawned task is
+    /// aborted where it stands: an in-flight target is never told to stop and
+    /// never gets to unwind — its child process is not taken through
+    /// `interrupt_child`'s SIGINT/grace/SIGKILL, and whatever cleanup its
+    /// destructors enqueue lands *after* `result` returned, outside the
+    /// `bg_pending` wait the caller uses to know the run is over.
+    ///
+    /// **The assertion moved, and the old one was vacuous.** This test used to
+    /// prove the drain indirectly: the un-polled futures the dropped `JoinSet`
+    /// left behind held an `Arc<RequestState>` back into the memoizer that owned
+    /// them, that cycle pinned `RequestStateData` forever, and so finding the
+    /// request deregistered proved the cycle was never formed. #241 removed the
+    /// cycle at the source — an abandoned memoizer cell now evicts itself and
+    /// drops its in-flight future — so the request is released either way.
+    /// Verified: with `result` restored to the pre-fix early return, the
+    /// registry assertion **passes**. It had stopped being able to catch the
+    /// regression, while still being able to fail spuriously on a loaded runner
+    /// (linux/arm64, CI run 30435613380), which is the worst of both.
+    ///
+    /// So the drain is now asserted where it happens, and as an **ordering**
+    /// rather than a count. `GateProvider::get` parks, waits for cancellation,
+    /// and then blocks on a semaphore this test holds shut. A `result` that is
+    /// draining is inside `join_next`, waiting on tasks it cannot get — so it
+    /// *cannot* return while the gate is shut. One that dropped its `JoinSet` has
+    /// nothing to wait for and returns anyway. A resumed-count alone would not
+    /// have been enough: the half-fixed shape that cancels the token and *then*
+    /// returns early wakes all three tasks, and on a multi-core runner they can
+    /// reach the counter before the abort lands.
+    ///
+    /// The registry check is kept as a bounded wait, downgraded to what it now
+    /// covers — that a request carrying real in-flight work is released rather
+    /// than leaked. It no longer discriminates this regression; the assertion
+    /// above does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_matcher_walk_drains_instead_of_dropping_the_joinset() -> anyhow::Result<()> {
         let root = tempdir()?;
@@ -5897,26 +5937,77 @@ mod tests {
             static_target("//pkg:c", &[], &[]),
         ];
         let expect_parked = targets.len();
+        assert!(
+            expect_parked > 0,
+            "the fixture must spawn something to drain"
+        );
         let parked = SArc::new(AtomicUsize::new(0));
+        let resumed = SArc::new(AtomicUsize::new(0));
+        // Starts shut. Every parked task blocks here after cancellation, so
+        // nothing can finish until this test says so.
+        let release = SArc::new(tokio::sync::Semaphore::new(0));
         let inner = pluginstatictarget::Provider::new(targets)?;
-        engine.register_provider(enclose!((parked) move |_| Box::new(GateProvider {
-            inner,
-            parked,
-            expect_parked,
-        })))?;
+        engine.register_provider(
+            enclose!((parked, resumed, release) move |_| Box::new(GateProvider {
+                inner,
+                parked,
+                expect_parked,
+                release,
+                resumed,
+            })),
+        )?;
         let engine = Arc::new(engine);
 
         let rs = engine.new_state();
 
-        let err = engine
-            .clone()
-            .result(
-                rs.clone(),
-                &Matcher::PackagePrefix(PkgBuf::from("")),
-                OutputMatcher::All,
-                &ResultOptions::default(),
-            )
+        // Driven from a task so the drain can be observed *while it is happening*
+        // rather than inferred afterwards.
+        let mut run = tokio::spawn(enclose!((engine, rs) async move {
+            engine
+                .result(
+                    rs,
+                    &Matcher::PackagePrefix(PkgBuf::from("")),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await
+        }));
+
+        // The gate in `list` only fails the walk once every target has parked, so
+        // reaching this means the walk has blown up (or is about to).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while parked.load(Ordering::SeqCst) < expect_parked {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "targets never parked, so the walk never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // **The drain, asserted as an ordering rather than a count.** Every
+        // spawned task is parked behind `release`, so a `result` that is draining
+        // *cannot* return: it is inside `join_next`, waiting for tasks this test
+        // is holding. One that dropped its `JoinSet` has nothing to wait for and
+        // returns immediately — including the half-fixed shape that cancels the
+        // token and *then* returns early, where a bare resumed-count would race
+        // the abort and could pass.
+        //
+        // No wall-clock dependence on the green path: correct code cannot finish
+        // in any window, so the timeout always elapses. The window only bounds how
+        // long a *broken* build gets, and a broken one returns in microseconds.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut run)
+                .await
+                .is_err(),
+            "`result` returned while every target it spawned was still parked: it \
+             dropped the JoinSet instead of draining it, so those targets were \
+             aborted mid-poll rather than told to stop and allowed to unwind"
+        );
+
+        release.add_permits(expect_parked);
+        let err = run
             .await
+            .expect("the result task must not panic")
             .err()
             .expect("a failed matcher walk must return Err");
         assert!(
@@ -5924,21 +6015,50 @@ mod tests {
             "the walk failure must be what surfaces, got: {err:#}"
         );
 
+        // Every parked task got to the far side of the gate under its own power.
+        // Reads 0 under both regression shapes; it would also read 0 if the
+        // memoizer wait ever gained a cancellation race that drops the provider
+        // `get` future mid-poll, so a failure here means *either* the JoinSet was
+        // dropped *or* that race was introduced.
+        let resumed = resumed.load(Ordering::SeqCst);
         assert_eq!(
-            parked.load(Ordering::SeqCst),
+            resumed,
             expect_parked,
-            "the gate must have opened because every target parked, not by timing out"
+            "{} of {expect_parked} parked targets never resumed, so `result` did \
+             not drain them",
+            expect_parked - resumed
         );
 
         drain_bg(rs).await;
 
-        assert!(
-            engine.requests.lock().expect("requests lock").is_empty(),
-            "the request outlived its own `result` call: dropping the JoinSet left \
-             un-polled futures in this request's memoizers, and those futures hold an \
-             Arc back into the RequestStateData that owns them, so its Drop — which \
-             cancels the token and deregisters the request — can never run"
-        );
+        // A weaker invariant than it looks, and deliberately kept anyway: **this
+        // no longer discriminates the drain regression** (see the doc comment —
+        // with `result` restored to the early return it passes). What it still
+        // freezes is that a request carrying real in-flight work — three spawned
+        // tasks, an aborted walk task, live memoizer cells — is released rather
+        // than leaked. Nothing else covers that; `test_request_state_tracking`
+        // drops a request that never ran anything.
+        //
+        // Bounded rather than instantaneous because deregistration is not
+        // synchronous with `result` returning: the matcher-walk task is `abort`ed
+        // and deliberately never awaited (its own comment says why — it may be
+        // deep inside a whole-package Starlark evaluation, and Ctrl-C must not
+        // wait it out), so the runtime releases the `Arc` that task captured at
+        // some later point of its choosing. Asserting otherwise is what made this
+        // test fail on a loaded linux/arm64 runner while the machinery was working
+        // correctly. A genuine leak is permanent, not slow, so the bound needs no
+        // tuning.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !engine.requests.lock().expect("requests lock").is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a RequestStateData was still registered 10s after the last external \
+                 Arc to it was released: something is still holding one — a captured \
+                 Arc<RequestState> in a task nobody joins, a hook, or a background \
+                 job that never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         Ok(())
     }
 
