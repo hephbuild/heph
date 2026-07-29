@@ -1,3 +1,8 @@
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
 mod common;
 
 use common::require_go;

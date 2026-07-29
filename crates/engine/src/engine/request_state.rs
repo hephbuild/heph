@@ -1058,6 +1058,10 @@ mod tests {
     /// The delay is widened well past the production 25ms first, so the margin is
     /// not something a loaded runner can close by accident.
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "`backstop_exclusive()` serializes whole tests against each other, so its guard is meant to outlive the awaits below; `#[tokio::test]` drives this body via `block_on` on the calling thread, so the `!Send` guard cannot migrate"
+    )]
     async fn the_exit_gate_is_held_across_the_trim_retry() -> anyhow::Result<()> {
         let _exclusive = crate::engine::gc::backstop_exclusive();
         let (_dir, engine) = test_engine()?;

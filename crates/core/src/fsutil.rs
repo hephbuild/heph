@@ -229,6 +229,10 @@ mod tests {
         // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
         // syscalls (`dup`) are invoked, and the error path uses
         // `Error::last_os_error` (`from_raw_os_error`), which does not allocate.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "`pre_exec` and the `dup` inside its closure cannot be split in place: the closure body inherits the enclosing unsafe context, so a nested `unsafe` around the `dup` is `unused_unsafe`. The SAFETY comment above covers both operations."
+        )]
         let mut child = unsafe {
             Command::new("/bin/sh")
                 .arg("-c")

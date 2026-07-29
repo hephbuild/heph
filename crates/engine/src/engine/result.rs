@@ -6896,13 +6896,11 @@ mod tests {
 
         let addrs = tokio::time::timeout(Duration::from_secs(20), walk)
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "discovery deadlocked: the fan-out held every permit while the \
-                     consumer's MatchShrug arm waited for one, and the holders were \
-                     only pollable by the consumer"
-                )
-            })??;
+            .context(
+                "discovery deadlocked: the fan-out held every permit while the \
+                 consumer's MatchShrug arm waited for one, and the holders were \
+                 only pollable by the consumer",
+            )??;
         // No target carries the label, so nothing matches — the point is that it
         // terminated.
         assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
@@ -8041,16 +8039,18 @@ mod tests {
     /// makes the driver hand back a sandbox-cleanup job that records the thread
     /// it ran on. `wrap_cache` wraps the engine's `LocalCache`, which is how a
     /// test observes the thread the post-write trim ran on.
+    /// Decorates the engine's `LocalCache` — how a test observes the thread the
+    /// post-write trim ran on.
+    type CacheWrapper<'a> = &'a dyn Fn(
+        SArc<dyn crate::engine::local_cache::LocalCache>,
+    ) -> SArc<dyn crate::engine::local_cache::LocalCache>;
+
     fn blocking_engine_full(
         exec_count: SArc<AtomicUsize>,
         outputs: Vec<(String, String)>,
         target_name: &str,
         cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
-        wrap_cache: Option<
-            &dyn Fn(
-                SArc<dyn crate::engine::local_cache::LocalCache>,
-            ) -> SArc<dyn crate::engine::local_cache::LocalCache>,
-        >,
+        wrap_cache: Option<CacheWrapper<'_>>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
         let dir = tempdir()?;
         let mut engine = Engine::new(Config {

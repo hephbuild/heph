@@ -426,7 +426,12 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The gate now check-builds every workspace member's libs *and* test targets,
+    # twice (default features, then --all-features), where it used to build the
+    # root package alone in ~1m35s. A fork PR gets no R2 sccache credentials and
+    # runs both passes stone cold. A timeout renders as a red `Lint`
+    # indistinguishable from a real lint failure, so the headroom is deliberate.
+    timeout-minutes: 30
     needs: gen
     steps:
       - name: Download repo

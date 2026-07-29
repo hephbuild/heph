@@ -71,10 +71,71 @@ in
     install-go-plugin
   '';
   # Lint default-feature code, then again with every feature enabled (so
-  # feature-gated code — the stabby host loader — is covered too), then fmt-check
-  # all hand-written crates (qualityCrates; generated gen/proto is excluded).
-  scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> clippy --all-features' && cargo clippy --all-targets --all-features --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
-  scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
+  # feature-gated code — the stabby host loader, the stabby guest serving — is
+  # covered too), then fmt-check all hand-written crates (qualityCrates;
+  # generated gen/proto is excluded).
+  #
+  # `--workspace --all-targets` is load-bearing. Do NOT shorten it. Both flags
+  # were verified by injecting a deliberate error and re-running, not assumed
+  # from the flag name:
+  #
+  #   - Without `--workspace`: the repo root is itself a package (`heph`), so
+  #     cargo's default selection is that package and *its dependency graph*.
+  #     Two things fall outside it. Every member that the root binary does not
+  #     depend on is never compiled at all — `plugin-go`, `plugin-gha`, the
+  #     cdylibs, `plugin-abi`/`sdk`/`stabby`, `testkit`, and the `e2e` crates.
+  #     And no member's **test** targets are built, in the graph or out. (A
+  #     member lib that *is* in the graph does get linted, because cargo passes
+  #     that package's `[lints]` to rustc regardless of primary status — so the
+  #     hole is "not compiled" and "tests not compiled", not "compiled without
+  #     lints".)
+  #   - Without `--all-targets`: `#[cfg(test)]` modules, `tests/`, `benches/`
+  #     and `examples/` are skipped. Most of this repo's test code lives in
+  #     `#[cfg(test)] mod tests` inside member crates.
+  #   - The `--all-features` pass is only meaningful *with* `--workspace`: the
+  #     root package's sole feature (`fuse-sandbox`) is already default, so on
+  #     the root package alone that second invocation was a 0.30s no-op that
+  #     never once compiled the feature-gated code its name promises.
+  #
+  # Together those hid 323 clippy errors, and let the gate pass on a tree that
+  # did not compile: a trait impl missing a method inside `crates/engine`'s
+  # `mod tests` is invisible to a run that never builds that target, so `Lint`
+  # went green while every `Test` job went red on the same commit.
+  #
+  # A bare `cargo clippy` here is green while CI is red, and vice versa. If you
+  # want a faster local loop, narrow with `-p <crate>` — never by dropping
+  # `--workspace`.
+  #
+  # `tests/lint_gate.rs` asserts both flags are still here, and that every
+  # workspace member inherits `[workspace.lints]` — a member that does not is
+  # linted with stock clippy only, which is the same silent hole one level down.
+  #
+  # Known gaps, so nobody has to rediscover them:
+  #   - The CI `Lint` job runs on `ubuntu-latest` only, so macOS-only code
+  #     (`proc/src/proc_exec/imp_macos.rs`, the Mach `sweep_threads` in
+  #     `src/diag.rs`, …) is compiled by `Test darwin/arm64` but never linted.
+  #     Running `lint` on a Mac can therefore disagree with CI in either
+  #     direction — `#[expect]` is fulfilled-or-error, and the crate-root test
+  #     exemptions are pinned to the lint set that fires on Linux.
+  #   - `--all-targets` does not include doctests.
+  #   - `--no-default-features` (i.e. `fuse-sandbox` off) is linted nowhere,
+  #     and built nowhere either.
+  scripts.lint.exec = ''
+    set -euo pipefail
+    echo '> clippy'
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    echo '> clippy --all-features'
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    echo '> fmt'
+    cargo fmt --check ${qualityCrates}
+  '';
+  # The write half of `lint`, and it must select the same code — a `fix` that
+  # only reaches the root package leaves the member lints `lint` reports with
+  # no automated fix at all. `clippy --fix` rather than `cargo fix`: it applies
+  # clippy's machine-applicable suggestions as well as rustc's, and clippy's are
+  # what `lint` fails on. `tests/lint_gate.rs` guards the `lint` invocation;
+  # keep this one in step with it by hand.
+  scripts.fix.exec = "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged && cargo fmt ${qualityCrates}";
   # Test everything. The default pass covers all crates with default features; the
   # targeted passes exercise the feature-gated transport code, off by default:
   # the stabby host loader/adapters (plugin-stabby `host`) and the stabby guest
