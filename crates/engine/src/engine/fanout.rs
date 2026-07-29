@@ -1,6 +1,38 @@
 use crate::engine::error::MultiError;
 use std::future::Future;
 
+/// In-flight cap for the discovery walks (`Engine::query`,
+/// `EngineProviderExecutor::query`, `states_under`).
+///
+/// Sized to [`hcore::blocking`]'s pool (`2 * cores`), because that pool is what
+/// the discovery work actually lands on: a package's `list` is a whole-package
+/// Starlark evaluation submitted there. This is an *orchestration* bound — the
+/// real admission control lives further down (`PKG_EVAL_SLOTS` caps concurrent
+/// package evaluations at the core count, in async-land, before queueing) — so
+/// its only job is to keep the set of live per-package futures, and the memory
+/// they pin, proportional to the machine rather than to the package count.
+///
+/// **The bound is per walk, and walks nest.** `Engine::query` buffers K
+/// packages; a package's `list` may call back through `ListRequest::executor`
+/// into `states_under` (plugin-go does, per module root) or
+/// `EngineProviderExecutor::query`, each opening its own `buffered(K)`. Live
+/// orchestration state is therefore K x depth, not K — on a 16-core machine the
+/// reachable two-level case is ~1024 concurrent probe futures rather than 32.
+/// What that does *not* multiply is the work: `PKG_EVAL_SLOTS` is a single
+/// global semaphore, so concurrent package evaluations stay capped at the core
+/// count no matter how deep the nesting. The cost of depth is pinned memory and
+/// scheduler pressure, not CPU oversubscription. Bounding the product would
+/// need this to become a process-wide semaphore rather than a per-stream cap.
+///
+/// Deliberately the same expression the engine's other stream-consuming walks
+/// use (`labels.rs`, `revdeps.rs`, `deppath.rs`).
+pub fn discovery_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_mul(2)
+}
+
 /// `try_join_all` equivalent that honors `fail_fast`.
 ///
 /// - `fail_fast = true`: identical to `futures::future::try_join_all` —

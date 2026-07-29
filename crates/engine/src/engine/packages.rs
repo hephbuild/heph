@@ -70,59 +70,96 @@ impl Engine {
     ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<String>> + Send>> {
         let prefix = narrowing_prefix(m);
 
+        // Each provider's `list_packages` is an independent workspace walk — the
+        // buildfile provider's recursive BUILD-file scan and the go provider's
+        // `collect_go_packages` cover the same tree and never touched the same
+        // state, yet ran one after the other. Overlap them: the walks are the
+        // producer for the whole pipeline, so their latency is on the critical
+        // path of every `query` / `validate` / `labels` / `revdeps`.
+        //
+        // `join_all`, not `try_join_all`: the walks are few (one per registered
+        // provider) and already running, so short-circuiting saves nothing — and
+        // `try_join_all` would return whichever walk failed *first in time*,
+        // making "which provider does heph blame" a race on a flaky mount. The
+        // serial loop always blamed the earliest-registered failing provider;
+        // taking the lowest-index error below keeps that.
+        let results: Vec<anyhow::Result<Arc<Vec<String>>>> =
+            futures::future::join_all(self.providers.iter().map(|provider| {
+                let req = ListPackagesRequest {
+                    prefix: prefix.clone(),
+                };
+                let key = format!("{}:{}", provider.name, prefix);
+
+                async move {
+                    rs.data
+                        .mem_packages
+                        .once(
+                            key,
+                            enclose!((provider, rs) move || async move {
+                                let it = provider
+                                    .provider
+                                    .list_packages(req, rs.ctoken())
+                                    .await?;
+                                let mut pkgs = Vec::new();
+                                for res in it {
+                                    pkgs.push(res?.pkg.to_string());
+                                }
+                                // Canonicalize the provider's block rather than
+                                // trusting it to be ordered — see this method's
+                                // docs for why the order matters and why the
+                                // sort is per provider. Inside the memoizer, so
+                                // it is paid once per (provider, prefix) per
+                                // request, not once per call.
+                                //
+                                // This is the canonical package ordering for the
+                                // whole engine, and it must stay a
+                                // byte-lexicographic `String` compare. A
+                                // collation-aware or case-folding comparator
+                                // would make `LC_COLLATE` an undeclared hash
+                                // input: two machines would order the same tree
+                                // differently and could never share a
+                                // remote-cache entry for a query-backed target.
+                                //
+                                // `dedup` is free once sorted (adjacent, no
+                                // hashing) and shrinks the `Arc<Vec<String>>`
+                                // shared for the rest of the request. The
+                                // cross-provider dedup below still needs its own
+                                // set: `Vec::dedup` only collapses adjacent
+                                // equals, and the blocks are memoized apart.
+                                //
+                                // The sort lives inside the per-provider
+                                // memoizer cell, which is also why overlapping
+                                // the walks cannot disturb it: each block is
+                                // canonicalized by its own future, and the merge
+                                // below re-imposes registration order.
+                                pkgs.sort_unstable();
+                                pkgs.dedup();
+                                Ok(Arc::new(pkgs))
+                            }),
+                        )
+                        .await
+                        .map_err(unwrap_arc_err)
+                }
+            }))
+            .await;
+
+        let mut per_provider: Vec<Arc<Vec<String>>> = Vec::with_capacity(results.len());
+        for res in results {
+            per_provider.push(res?);
+        }
+
         let mut all_packages = Vec::new();
         // Different providers can list the same package; dedup so callers
         // (e.g. `query`) don't scan a package more than once. A package listed
         // by two providers keeps the position of the first one that listed it.
+        //
+        // Overlapping the walks above must not be allowed to reorder this
+        // merge: the fold runs over `per_provider` in provider-registration
+        // order, exactly as the serial loop did, regardless of which walk
+        // finished first.
         let mut seen: FxHashSet<String> = FxHashSet::default();
 
-        for provider in &self.providers {
-            let req = ListPackagesRequest {
-                prefix: prefix.clone(),
-            };
-            let key = format!("{}:{}", provider.name, prefix);
-
-            let pkgs = rs
-                .data
-                .mem_packages
-                .once(
-                    key,
-                    enclose!((provider, rs) move || async move {
-                        let it = provider
-                            .provider
-                            .list_packages(req, rs.ctoken())
-                            .await?;
-                        let mut pkgs = Vec::new();
-                        for res in it {
-                            pkgs.push(res?.pkg.to_string());
-                        }
-                        // Canonicalize the provider's block rather than trusting
-                        // it to be ordered — see this method's docs for why the
-                        // order matters and why the sort is per provider.
-                        // Inside the memoizer, so it is paid once per
-                        // (provider, prefix) per request, not once per call.
-                        //
-                        // This is the canonical package ordering for the whole
-                        // engine, and it must stay a byte-lexicographic
-                        // `String` compare. A collation-aware or case-folding
-                        // comparator would make `LC_COLLATE` an undeclared hash
-                        // input: two machines would order the same tree
-                        // differently and could never share a remote-cache
-                        // entry for a query-backed target.
-                        //
-                        // `dedup` is free once sorted (adjacent, no hashing) and
-                        // shrinks the `Arc<Vec<String>>` shared for the rest of
-                        // the request. The cross-provider dedup below still
-                        // needs its own set: `Vec::dedup` only collapses
-                        // adjacent equals, and the blocks are memoized apart.
-                        pkgs.sort_unstable();
-                        pkgs.dedup();
-                        Ok(Arc::new(pkgs))
-                    }),
-                )
-                .await
-                .map_err(unwrap_arc_err)?;
-
+        for pkgs in &per_provider {
             for p in pkgs.iter() {
                 if seen.insert(p.clone()) {
                     all_packages.push(p.clone());
@@ -416,6 +453,165 @@ mod tests {
             5,
             "provider was not re-asked"
         );
+        Ok(())
+    }
+
+    /// A provider whose `list_packages` is a slow workspace walk. Records how
+    /// many walks were in flight at once, so a test can tell an overlapped fan-out
+    /// from a serial loop without relying on wall-clock alone.
+    struct SlowWalk {
+        name: &'static str,
+        pkgs: &'static [&'static str],
+        delay: std::time::Duration,
+        inflight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::engine::provider::Provider for SlowWalk {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: self.name.to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty())
+                    as Box<
+                        dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                    >)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            use std::sync::atomic::Ordering::SeqCst;
+            let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                .pkgs
+                .iter()
+                .map(|p| {
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from(*p),
+                    })
+                })
+                .collect();
+            let (delay, inflight, peak) = (
+                self.delay,
+                Arc::clone(&self.inflight),
+                Arc::clone(&self.peak),
+            );
+            Box::pin(async move {
+                let now = inflight.fetch_add(1, SeqCst) + 1;
+                peak.fetch_max(now, SeqCst);
+                tokio::time::sleep(delay).await;
+                inflight.fetch_sub(1, SeqCst);
+                Ok(Box::new(items.into_iter())
+                    as Box<
+                        dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                    >)
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            let pkg = req.package.clone();
+            let name = self.name.to_string();
+            Box::pin(async move {
+                Ok(ProbeResponse {
+                    states: vec![crate::engine::provider::State {
+                        package: pkg,
+                        provider: name,
+                        state: Default::default(),
+                    }],
+                })
+            })
+        }
+    }
+
+    /// Each provider's `list_packages` is an independent workspace walk (the
+    /// buildfile BUILD-file scan and the go `collect_go_packages` scan cover the
+    /// same tree). They used to run strictly one after another, so their
+    /// latencies added; now they overlap.
+    ///
+    /// Asserted on observed concurrency rather than only wall-clock: a serial
+    /// loop can never put two walks in flight at once, whatever the machine.
+    ///
+    /// The blocks are deliberately unsorted, so this also pins the composition
+    /// with #230's per-provider sort: the sort lives inside the memoizer cell
+    /// and must survive the fan-out, while the merge across blocks must stay in
+    /// registration order rather than becoming one global sort.
+    #[tokio::test]
+    async fn packages_overlaps_the_provider_walks() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let root = tempfile::tempdir()?;
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let delay = std::time::Duration::from_millis(120);
+
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        for (name, pkgs) in [
+            ("w1", &["zeta", "alpha"][..]),
+            ("w2", &["mid"][..]),
+            ("w3", &["beta"][..]),
+        ] {
+            engine.register_provider(enclose!((inflight, peak) move |_| Box::new(SlowWalk {
+                name,
+                pkgs,
+                delay,
+                inflight: Arc::clone(&inflight),
+                peak: Arc::clone(&peak),
+            })))?;
+        }
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let start = std::time::Instant::now();
+        let pkgs: Vec<String> = engine
+            .packages(&Matcher::PackagePrefix(pkg("")), &rs)
+            .await?
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            peak.load(SeqCst),
+            3,
+            "all three walks must be in flight at once; serial discovery peaks at 1"
+        );
+        assert!(
+            elapsed < delay * 3,
+            "three overlapped {delay:?} walks must beat three serial ones, took {elapsed:?}"
+        );
+        // Each block sorted (`alpha` before `zeta`, whichever walk finished
+        // first), blocks concatenated in registration order (`mid` and `beta`
+        // land *after* `zeta`, so this is not one global sort). That composite
+        // is the order that reaches a def hash.
+        assert_eq!(pkgs, vec!["@heph/fs", "alpha", "zeta", "mid", "beta"]);
         Ok(())
     }
 

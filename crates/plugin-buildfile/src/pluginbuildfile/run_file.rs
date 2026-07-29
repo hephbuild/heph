@@ -1079,10 +1079,10 @@ impl Provider {
                 key.clone(),
                 enclose!((key) move || async move {
                     // Bound the fan-out before queueing: see `PKG_EVAL_SLOTS`.
-                    // Taken here rather than inside the closure so the wait
+                    // Waited for here rather than inside the closure so the wait
                     // happens in async-land, not on a pool thread — parking a
                     // pool thread to wait for a pool thread is the deadlock.
-                    let _slot = PKG_EVAL_SLOTS
+                    let slot = PKG_EVAL_SLOTS
                         .acquire()
                         .await
                         .context("acquiring a package-evaluation slot")?;
@@ -1091,6 +1091,27 @@ impl Provider {
                     // worker it stops that worker polling anything at all — see
                     // `hcore::blocking`.
                     hcore::blocking::run(move || -> anyhow::Result<Arc<RunResult>> {
+                        // The permit rides *into* the job rather than being held
+                        // across the await. `PKG_EVAL_SLOTS` is a static, so the
+                        // guard is already `'static`, and this costs nothing.
+                        //
+                        // It matters because a permit held across an await is
+                        // released only by a poll of this future — and callers
+                        // exist that stop polling. The discovery fan-out in
+                        // `Engine::query` buffers K of these and its consumer
+                        // parks in the `MatchShrug` arm awaiting a *different*
+                        // package's spec, which needs a permit of its own: the
+                        // holders go unpollable exactly when the consumer needs
+                        // what they hold, and the semaphore is FIFO. That walk
+                        // spawns each package as a task so the runtime keeps
+                        // polling them, which breaks the cycle — but that is the
+                        // caller's discipline, and `list` here is reachable from
+                        // arbitrary provider code. Submitted jobs run to
+                        // completion even when the receiver is gone
+                        // (`hcore::blocking::run`), so releasing on the pool
+                        // thread makes the class impossible rather than merely
+                        // unreached.
+                        let _slot = slot;
                         let loader =
                             BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages, loads);
                         loader
