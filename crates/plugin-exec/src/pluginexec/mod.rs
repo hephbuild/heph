@@ -2622,12 +2622,12 @@ mod tests {
         name: &str,
         body: &str,
     ) -> anyhow::Result<std::path::PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}"))?;
-        let mut perms = std::fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms)?;
+        // These tools are exec'd by the driver while sibling tests spawn their own
+        // subprocesses; a fork racing the write inherits the writable fd and the
+        // exec fails with ETXTBSY. `write_executable` takes the barrier that
+        // writing by hand would skip.
+        hcore::fsutil::write_executable(&path, format!("#!/bin/sh\n{body}").as_bytes())?;
         Ok(path)
     }
 
