@@ -6991,6 +6991,18 @@ mod tests {
             ) -> anyhow::Result<Existence> {
                 self.inner.existence(addr, hashin, name)
             }
+            /// Mirrors this decorator's own `exists`: that one forwards, so the
+            /// committed-only answer forwards too. Required by the trait
+            /// precisely so a decorator cannot inherit a default that re-parks
+            /// the runtime on the backend's write-behind queue.
+            fn exists_committed(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<bool> {
+                self.inner.exists_committed(addr, hashin, name)
+            }
             fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
                 self.inner.delete(addr, hashin, name)
             }
