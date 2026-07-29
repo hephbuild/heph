@@ -185,6 +185,19 @@ impl LocalCache for LocalCacheTmp {
     fn list_target_entries(&self, addr: &Addr) -> Result<Vec<String>> {
         self.durable.list_target_entries(addr)
     }
+
+    /// An admitted entry lives only in `map` — there is no file anywhere, so
+    /// `None` is the answer, not a gap. Anything else spilled, and the durable
+    /// cache decides. Unlike the other read paths this checks residency to
+    /// *avoid* delegating: the durable answer for a resident key would be a
+    /// wasted `stat` on a path that by construction does not exist.
+    fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
+        let key = Self::key(addr, hashin, name);
+        if self.store.map.read().contains_key(&key) {
+            return None;
+        }
+        self.durable.file_path(addr, hashin, name)
+    }
 }
 
 /// Writer that buffers in memory and publishes on drop. It spills to the durable
@@ -370,6 +383,36 @@ mod tests {
         assert_eq!(read_all(&tmp, &a, "h_1", "out"), b"hello");
         assert!(tmp.exists(&a, "h_1", "out").unwrap());
         assert!(durable.store.read().is_empty());
+    }
+
+    /// An admitted entry lives only in the map — there is no file anywhere, so
+    /// `None` is its true answer, not a gap to be filled with an invented temp
+    /// file. A spilled one is an ordinary durable blob and must expose the
+    /// durable backend's path, or an uncacheable target's artifacts never take
+    /// the direct-open path however large they are.
+    #[test]
+    fn file_path_answers_only_for_spilled_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let durable = Arc::new(
+            crate::engine::local_cache_fs::LocalCacheFS::new(dir.path().join("blobs")).expect("fs"),
+        );
+        // per-entry cap of 8 bytes: the short entry stays in mem, the 64-byte
+        // one spills.
+        let tmp = LocalCacheTmp::new(durable, 8, 1024 * 1024);
+        let a = addr();
+
+        write_all(&tmp, &a, "h_m", "out", b"hi");
+        assert!(
+            tmp.file_path(&a, "h_m", "out").is_none(),
+            "mem-resident tmp entry has no file on disk"
+        );
+
+        let big = vec![7u8; 64];
+        write_all(&tmp, &a, "h_s", "out", &big);
+        let path = tmp
+            .file_path(&a, "h_s", "out")
+            .expect("spilled tmp entry is a durable file");
+        assert_eq!(std::fs::read(&path).expect("read"), big);
     }
 
     #[test]

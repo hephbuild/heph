@@ -219,8 +219,19 @@ impl LocalCache for LocalCacheFS {
         }
     }
 
+    /// Only for a blob that actually lives here. This backend is normally the
+    /// *blob* half of [`LocalCacheSpill`], holding only entries over the spill
+    /// threshold — everything smaller is a sqlite row and has no file at this
+    /// path. Answering `Some` unconditionally would hand every small artifact a
+    /// path to nothing, and `Content::file_path`'s callers open what they are
+    /// given without falling back to the stream, so that is a hard read error
+    /// rather than a missed optimization. One `stat(2)`, on the seam hand-off
+    /// path only.
+    ///
+    /// [`LocalCacheSpill`]: crate::engine::local_cache_spill::LocalCacheSpill
     fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<PathBuf> {
-        Some(self.get_path(addr, hashin, name))
+        let path = self.get_path(addr, hashin, name);
+        path.is_file().then_some(path)
     }
 }
 
@@ -327,6 +338,46 @@ mod tests {
         cache.delete(&addr, hashin, name)?;
         assert!(!cache.exists(&addr, hashin, name)?);
 
+        Ok(())
+    }
+
+    /// `file_path` describes what is on disk, not what could be. Under
+    /// [`LocalCacheSpill`] this backend is asked about every key, including the
+    /// small ones that live in sqlite and have no file here — and a consumer
+    /// handed a path opens it with no fallback to the byte stream, so a path to
+    /// a missing file is a read error, not a slower read.
+    ///
+    /// [`LocalCacheSpill`]: crate::engine::local_cache_spill::LocalCacheSpill
+    #[test]
+    fn file_path_is_none_until_the_blob_is_on_disk() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheFS::new(PathBuf::from(dir.path()))?;
+        let addr = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "t".to_string(),
+            Default::default(),
+        );
+
+        assert!(
+            cache.file_path(&addr, "h", "out.tar").is_none(),
+            "no blob written: must not name a path that does not exist"
+        );
+
+        let mut w = cache.writer(&addr, "h", "out.tar")?;
+        w.write_all(b"bytes")?;
+        drop(w);
+
+        let path = cache
+            .file_path(&addr, "h", "out.tar")
+            .expect("written blob has a path");
+        assert_eq!(std::fs::read(&path)?, b"bytes", "path names the blob");
+
+        // Reclaimed by GC: the path goes away with the bytes.
+        cache.delete(&addr, "h", "out.tar")?;
+        assert!(
+            cache.file_path(&addr, "h", "out.tar").is_none(),
+            "deleted blob must not keep answering with a path"
+        );
         Ok(())
     }
 

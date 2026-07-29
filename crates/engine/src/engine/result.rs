@@ -313,6 +313,23 @@ pub use hplugin::eresult::{ArtifactMeta, EResult};
 /// purely for RAII, so the cache entry cannot be overwritten/deleted while any
 /// handle to it (here, or cloned into a dependent's sandbox input) is alive. The
 /// lock releases when the last `Arc<dyn Content>` for the entry drops.
+///
+/// **Every method must be forwarded**, including the ones with a working
+/// default. This wrapper sits on *every* cacheable result artifact, so a method
+/// left to its default is that method's fast path switched off product-wide,
+/// with the inner artifact's implementation dead and nothing to see: `file_path`
+/// silently answered `None` for on-disk cache blobs (the stable-ABI seam then
+/// streamed them chunk-by-chunk instead of opening the file) and `entry_paths`
+/// silently fell back to a byte-reading `walk` instead of the tar header scan.
+///
+/// [`file_path`](Content::file_path) is safe to forward for the same reason it
+/// needs the guard: cache GC deletes a revision only under the per-addr *write*
+/// lock (`Engine::gc_apply`, `Engine::try_trim_after_write`), which cannot be
+/// taken while this read guard is alive — so the path stays valid for exactly as
+/// long as this artifact does, which is the contract `Content::file_path`
+/// states. Handing the bare `PathBuf` further out than the artifact would break
+/// that; the one consumer (`HostArtifactContent::path`) opens it while still
+/// holding the `Arc<dyn Content>`, and the open fd pins the inode thereafter.
 struct GuardedArtifact {
     inner: Arc<dyn Content>,
     _lock: Arc<ResultReadGuard>,
@@ -328,11 +345,17 @@ impl Content for GuardedArtifact {
     fn hashout(&self) -> anyhow::Result<String> {
         self.inner.hashout()
     }
+    fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        self.inner.entry_paths()
+    }
     fn seekable_reader(&self) -> anyhow::Result<Option<Box<dyn ReadSeek + Send>>> {
         self.inner.seekable_reader()
     }
     fn byte_size(&self) -> Option<u64> {
         self.inner.byte_size()
+    }
+    fn file_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.file_path()
     }
 }
 
@@ -3662,6 +3685,82 @@ mod tests {
         }
     }
 
+    /// A [`Content`] whose fast paths are answerable and *differ* from what the
+    /// trait defaults would produce: `entry_paths` reports a name `walk` never
+    /// yields, and `file_path` names a real file whose bytes `reader` refuses to
+    /// serve. Standing in for a `CacheArtifact`, whose overrides are exactly
+    /// these two.
+    struct FastPathContent {
+        path: std::path::PathBuf,
+    }
+
+    impl Content for FastPathContent {
+        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+            anyhow::bail!("must be read through file_path, not the stream")
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            Ok(Box::new(std::iter::once(Ok(WalkEntry {
+                path: std::path::PathBuf::from("from-walk"),
+                kind: WalkEntryKind::Symlink {
+                    target: std::path::PathBuf::from("t"),
+                },
+            }))))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok("fast".to_string())
+        }
+        fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+            Ok(vec![std::path::PathBuf::from("from-index")])
+        }
+        fn file_path(&self) -> Option<std::path::PathBuf> {
+            Some(self.path.clone())
+        }
+    }
+
+    /// `GuardedArtifact` wraps *every* cacheable result artifact, so a `Content`
+    /// method it leaves to the trait default is that method's fast path switched
+    /// off product-wide — the inner artifact's implementation unreachable, and
+    /// nothing failing to show it. Both defaults are silent: `file_path` reports
+    /// "not a file" for an on-disk cache blob (the stable-ABI seam then streams
+    /// it 64 KiB at a time instead of opening it), and `entry_paths` falls back
+    /// to a `walk` that reads every byte instead of the tar header scan.
+    ///
+    /// Asserted through `&dyn Content`, which is how every consumer sees it.
+    #[tokio::test]
+    async fn guarded_artifact_forwards_the_direct_open_fast_paths() {
+        let dir = tempdir().expect("tempdir");
+        let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
+        let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
+        let read = lock
+            .read(&addr, &StdCancellationToken::new())
+            .await
+            .expect("read");
+
+        let blob = dir.path().join("blob.tar");
+        std::fs::write(&blob, b"artifact bytes").expect("write blob");
+
+        let guarded: Arc<dyn Content> = Arc::new(GuardedArtifact {
+            inner: Arc::new(FastPathContent { path: blob.clone() }),
+            _lock: SArc::new(read),
+        });
+
+        // The direct-open path reaches the consumer: it gets the cache file, not
+        // `None`, and the bytes are readable without going near `reader()`.
+        let path = guarded
+            .file_path()
+            .expect("the wrapper must not hide the artifact's on-disk path");
+        assert_eq!(path, blob);
+        assert_eq!(std::fs::read(&path).expect("read"), b"artifact bytes");
+
+        // The header-scan enumeration reaches the consumer too — the walk-based
+        // default would answer `from-walk`.
+        assert_eq!(
+            guarded.entry_paths().expect("entry_paths"),
+            vec![std::path::PathBuf::from("from-index")],
+            "must use the inner artifact's index, not the byte-reading walk"
+        );
+    }
+
     /// The read lock travels with the artifact, not the `EResult`: it stays held
     /// as long as *any* handle to the artifact is alive — including a handle
     /// cloned into a dependent's sandbox input (or a group target's merged
@@ -6942,6 +7041,81 @@ mod tests {
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
+    }
+
+    /// The direct-open fast path, end to end through the real cache stack.
+    ///
+    /// Every tier has to answer for a consumer to get anything: the artifact is
+    /// a `GuardedArtifact` over a `CacheArtifact` over `Mem(Spill(SQLite, FS))`,
+    /// and a single tier defaulting to `None` — as all of them did — turns the
+    /// whole path off with nothing failing. The unit tests pin the tiers; this
+    /// pins that they compose, which is the property that was actually broken.
+    ///
+    /// The spill threshold is lowered to 64 bytes so the packed tar lands in the
+    /// FS blob store without the test writing megabytes. The mem tier is left at
+    /// its default — it is what production runs, and it is the tier sitting on
+    /// top of the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_artifact_exposes_its_blob_file_for_direct_open() {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            spill_threshold_bytes: 64,
+            ..Default::default()
+        })
+        .expect("engine");
+        engine
+            .register_driver(|_| {
+                Box::new(BlockingDriver {
+                    exec_count: SArc::new(AtomicUsize::new(0)),
+                    outputs: SArc::new(vec![("main".to_string(), "out_main".to_string())]),
+                    cleanup_thread: None,
+                })
+            })
+            .expect("driver");
+        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let spec = TargetSpec {
+            addr: addr.clone(),
+            driver: "blocking".to_string(),
+            ..Default::default()
+        };
+        engine
+            .register_provider(move |_| Box::new(OneTargetProvider { spec }))
+            .expect("provider");
+        let engine = Arc::new(engine);
+
+        let r = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("resolves");
+        assert_eq!(r.artifacts.len(), 1, "the single output is surfaced");
+
+        let path = r.artifacts[0]
+            .file_path()
+            .expect("a spilled cache blob must reach the consumer as a path");
+        let via_path = std::fs::read(&path).expect("open the cache blob directly");
+        assert!(!via_path.is_empty(), "the path must name the real blob");
+
+        // Same bytes either way — the fast path is a different route to the
+        // artifact, not a different artifact.
+        let mut via_stream = Vec::new();
+        std::io::Read::read_to_end(
+            &mut r.artifacts[0].reader().expect("reader"),
+            &mut via_stream,
+        )
+        .expect("stream the artifact");
+        assert_eq!(
+            via_path, via_stream,
+            "direct open and the byte stream must serve the same artifact"
+        );
     }
 
     /// P6.2: each background job class must reach its own lane.

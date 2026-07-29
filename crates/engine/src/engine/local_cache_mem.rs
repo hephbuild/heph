@@ -161,6 +161,18 @@ impl LocalCache for LocalCacheMem {
         // streaming consumers.
         self.inner.seekable_reader(addr, hashin, name)
     }
+
+    /// Delegated unconditionally: this tier only *fronts* reads — `writer`
+    /// forwards to the durable backend — so a resident entry is a copy of one
+    /// that is (or was) durable, never the only copy. Residency therefore says
+    /// nothing about whether a file exists, and the durable backend is the one
+    /// that can answer. In practice the two are disjoint anyway: entries here
+    /// are capped at `per_entry_bytes` (16 KiB by default) and only blobs over
+    /// the spill threshold (8 MiB) get a file, so a mem hit delegates to sqlite
+    /// and gets `None` without touching the disk.
+    fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
+        self.inner.file_path(addr, hashin, name)
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +311,33 @@ mod tests {
         let mut w = cache.writer(addr, "h1", name).expect("writer");
         w.write_all(data).expect("write");
         drop(w);
+    }
+
+    /// This tier sits at the top of the cacheable stack, so a method left to the
+    /// trait default here is that method switched off for every cached artifact
+    /// in the product. It only *fronts* reads — writes go straight through — so
+    /// whether a durable file exists is the durable backend's question, and
+    /// residency must not change the answer.
+    #[test]
+    fn file_path_delegates_to_the_durable_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Arc::new(
+            crate::engine::local_cache_fs::LocalCacheFS::new(dir.path().join("blobs")).expect("fs"),
+        );
+        let dec = LocalCacheMem::new(inner, 1024, 64 * 1024);
+        let addr = make_addr();
+
+        write_blob(&dec, &addr, "out.tar", b"blob bytes");
+        // Read once so the entry is mem-resident; the answer must not change.
+        assert_eq!(
+            drain(dec.reader(&addr, "h1", "out.tar").expect("read").reader),
+            b"blob bytes"
+        );
+
+        let path = dec
+            .file_path(&addr, "h1", "out.tar")
+            .expect("durable backend has a file for this blob");
+        assert_eq!(std::fs::read(&path).expect("read"), b"blob bytes");
     }
 
     #[test]

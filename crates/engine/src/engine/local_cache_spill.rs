@@ -166,6 +166,15 @@ impl LocalCache for LocalCacheSpill {
             other => other,
         }
     }
+
+    /// Only spilled blobs have a file. The primary is sqlite — its blobs live in
+    /// rows, so it answers `None` — and asking it first would cost a query to
+    /// learn that; go straight to the FS store, which answers `Some` only for a
+    /// path that exists. A `(addr, hashin, name)` lives in exactly one backend,
+    /// so a hit here is unambiguous.
+    fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
+        self.blobs.file_path(addr, hashin, name)
+    }
 }
 
 /// Streams a blob to the primary, promoting it to the FS store the moment its
@@ -351,6 +360,38 @@ mod tests {
         assert_eq!(read(&cache, &a, "large"), large);
         assert!(cache.exists(&a, "h", "small").expect("ex"));
         assert!(cache.exists(&a, "h", "large").expect("ex"));
+    }
+
+    /// The direct-open fast path tracks the routing: a spilled blob is a real
+    /// file and names it, a primary-resident one is a sqlite row and has no
+    /// path. Getting the second case wrong is worse than having no fast path at
+    /// all — a consumer opens what it is handed and never falls back to the
+    /// stream.
+    #[test]
+    fn file_path_answers_for_spilled_blobs_only() {
+        let dir = tempdir().expect("tempdir");
+        let (cache, _sqlite, _fs) = spill(dir.path(), 64);
+        let a = addr();
+
+        let large = vec![2u8; 256];
+        write(&cache, &a, "small", &vec![1u8; 32]);
+        write(&cache, &a, "large", &large);
+
+        assert!(
+            cache.file_path(&a, "h", "small").is_none(),
+            "sqlite-resident blob has no file"
+        );
+        let path = cache
+            .file_path(&a, "h", "large")
+            .expect("spilled blob is a real file");
+        assert_eq!(std::fs::read(&path).expect("read"), large);
+
+        // The manifest always stays in the primary, however big.
+        write(&cache, &a, MANIFEST_V1, &vec![9u8; 256]);
+        assert!(
+            cache.file_path(&a, "h", MANIFEST_V1).is_none(),
+            "manifest never spills, so it never has a path"
+        );
     }
 
     /// A blob written across many small chunks that *cumulatively* exceed the
