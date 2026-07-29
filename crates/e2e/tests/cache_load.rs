@@ -59,6 +59,15 @@
 //! doing CPU work". Use it to detect and to size a regression — then reach for
 //! the diag facilities (stall reports, the parked-futures dump) to name the
 //! call site. Inferring the culprit from these numbers alone is guesswork.
+#![expect(
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_sign_loss,
+    clippy::let_underscore_must_use,
+    reason = "restriction/style lints scoped to production code; this harness is \
+              entirely test code, and its plain helper fns sit outside the \
+              `allow-*-in-tests` clippy.toml exemptions"
+)]
 
 use heph::engine::{Config, Engine, OutputMatcher, RemoteCacheDef, ResultOptions};
 use heph::htaddr::parse_addr;

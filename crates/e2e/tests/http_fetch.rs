@@ -1,3 +1,9 @@
+#![expect(
+    clippy::panic_in_result_fn,
+    clippy::let_underscore_must_use,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
 mod common;
 
 use common::Workspace;

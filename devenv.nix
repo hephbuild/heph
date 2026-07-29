@@ -71,9 +71,43 @@ in
     install-go-plugin
   '';
   # Lint default-feature code, then again with every feature enabled (so
-  # feature-gated code — the stabby host loader — is covered too), then fmt-check
-  # all hand-written crates (qualityCrates; generated gen/proto is excluded).
-  scripts.lint.exec = "echo '> clippy' && cargo clippy --all-targets --locked -- -D warnings && echo '> clippy --all-features' && cargo clippy --all-targets --all-features --locked -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
+  # feature-gated code — the stabby host loader, the stabby guest serving — is
+  # covered too), then fmt-check all hand-written crates (qualityCrates;
+  # generated gen/proto is excluded).
+  #
+  # `--workspace --all-targets` is load-bearing. Do NOT shorten it.
+  #
+  #   - Without `--workspace`: the repo root is itself a package (`heph`), so
+  #     cargo's default selection is *that package only*. Members are built as
+  #     plain dependencies — clippy-driver only lints units cargo marks as
+  #     primary, so a member's lib is compiled with zero lints applied, and a
+  #     member's test targets are never built at all. That is not a partial
+  #     gate, it is an absent one: 290 errors were hiding behind it, and on
+  #     2026-07-29 `Lint` reported **pass** on a master commit whose
+  #     `engine (lib test)` did not even compile (missing `exists_committed`,
+  #     E0046) while all three `Test` jobs went red. A gate that greens on a
+  #     non-compiling tree is worse than no gate. See PR for the diagnosis —
+  #     it was never sccache and never a masked exit code.
+  #   - Without `--all-targets`: `#[cfg(test)]` modules, `tests/`, `benches/`
+  #     and `examples/` are skipped. Most of this repo's test code lives in
+  #     `#[cfg(test)] mod tests` inside member crates.
+  #   - The `--all-features` pass is only meaningful *with* `--workspace`: the
+  #     root package's sole feature (`fuse-sandbox`) is already default, so on
+  #     the root package alone that second invocation was a 0.30s no-op that
+  #     never once compiled the feature-gated code its name promises.
+  #
+  # A bare `cargo clippy` here is green while CI is red, and vice versa. If you
+  # want a faster local loop, narrow with `-p <crate>` — never by dropping
+  # `--workspace`.
+  scripts.lint.exec = ''
+    set -euo pipefail
+    echo '> clippy'
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    echo '> clippy --all-features'
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    echo '> fmt'
+    cargo fmt --check ${qualityCrates}
+  '';
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
   # Test everything. The default pass covers all crates with default features; the
   # targeted passes exercise the feature-gated transport code, off by default:

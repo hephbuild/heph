@@ -1861,7 +1861,9 @@ mod tests {
         std::thread::scope(|s| {
             for pkg in ["pa", "pb"] {
                 s.spawn(enclose!((provider, tx) move || {
-                    drop(tx.send(run_pkg_blocking(&provider, pkg).is_err()));
+                    // The receiver outlives the scope, so a send error is
+                    // impossible; ignore it rather than panicking in a thread.
+                    let _sent = tx.send(run_pkg_blocking(&provider, pkg).is_err());
                 }));
             }
             drop(tx);

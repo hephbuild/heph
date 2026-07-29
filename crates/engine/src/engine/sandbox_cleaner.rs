@@ -928,7 +928,7 @@ mod tests {
                 }
             }),
         );
-        let walker = std::thread::spawn(move || walk());
+        let walker = std::thread::spawn(walk);
         assert!(
             wait_for(&entered, Duration::from_secs(2)),
             "cleanup walk did not start"

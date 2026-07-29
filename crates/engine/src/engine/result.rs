@@ -8041,16 +8041,18 @@ mod tests {
     /// makes the driver hand back a sandbox-cleanup job that records the thread
     /// it ran on. `wrap_cache` wraps the engine's `LocalCache`, which is how a
     /// test observes the thread the post-write trim ran on.
+    /// Decorates the engine's `LocalCache` — how a test observes the thread the
+    /// post-write trim ran on.
+    type CacheWrapper<'a> = &'a dyn Fn(
+        SArc<dyn crate::engine::local_cache::LocalCache>,
+    ) -> SArc<dyn crate::engine::local_cache::LocalCache>;
+
     fn blocking_engine_full(
         exec_count: SArc<AtomicUsize>,
         outputs: Vec<(String, String)>,
         target_name: &str,
         cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
-        wrap_cache: Option<
-            &dyn Fn(
-                SArc<dyn crate::engine::local_cache::LocalCache>,
-            ) -> SArc<dyn crate::engine::local_cache::LocalCache>,
-        >,
+        wrap_cache: Option<CacheWrapper<'_>>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
         let dir = tempdir()?;
         let mut engine = Engine::new(Config {

@@ -4569,7 +4569,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .unwrap();
         assert_eq!(check.target_spec.driver, "go_format_check");
         assert!(
-            check.target_spec.config.get("out").is_none(),
+            !check.target_spec.config.contains_key("out"),
             "check gate declares no outputs"
         );
 
@@ -4588,7 +4588,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             _ => panic!("default source group missing"),
         }
         assert!(
-            fix.target_spec.config.get("out").is_some(),
+            fix.target_spec.config.contains_key("out"),
             "fix declares in_place outputs"
         );
     }

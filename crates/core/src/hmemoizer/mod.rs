@@ -2348,10 +2348,12 @@ mod tests {
     /// every task parked on it waited forever — one panicking target silently
     /// hanging all of its reverse-deps. The `tokio::time::timeout` here is the
     /// assertion: without the fix these awaits never return.
+    /// A memoizer over a fallible value, shared the way the engine shares one.
+    type FallibleMemo = Arc<Memoizer<String, Result<Arc<i32>, Arc<anyhow::Error>>>>;
+
     #[tokio::test]
     async fn panic_in_a_memoized_task_fails_every_waiter() {
-        let memo: Arc<Memoizer<String, Result<Arc<i32>, Arc<anyhow::Error>>>> =
-            Arc::new(Memoizer::new());
+        let memo: FallibleMemo = Arc::new(Memoizer::new());
         let key = "boom".to_string();
 
         // The first caller panics; three more join the same in-flight cell.

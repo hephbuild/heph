@@ -1083,8 +1083,8 @@ mod driver_tests {
             "import_paths must be sorted regardless of input order"
         );
         assert_eq!(
-            def_hash(&d_fwd),
-            def_hash(&d_rev),
+            def_hash(d_fwd),
+            def_hash(d_rev),
             "cache key must not depend on transitive_libs order"
         );
     }
