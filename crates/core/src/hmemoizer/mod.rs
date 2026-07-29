@@ -628,25 +628,50 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
     out
 }
 
-/// One sampling of everything [`render_full_report`] prints.
+/// One sampling of everything [`render_report`] prints.
 ///
 /// Rendering reads four independent process-wide sources ([`inventory`],
 /// [`void_wakes`], [`dump_wait_graph`], [`dump_phases`]), each of which moves
-/// while a build runs. Separating the sampling from the formatting means a
-/// caller that has to render the same picture more than once — into a dump and
-/// into a companion file, or into two representations being compared — renders
-/// *one* picture rather than two reads of a moving target.
+/// while a build runs. Sampling is split from formatting for the same reason
+/// [`inventory`] is split from [`render_inventory`] one screen up: so a value
+/// can be rendered more than once — by two writers being held against each
+/// other, or by one caller emitting both a capped and an uncapped view —
+/// without that being two reads of a moving target.
 ///
 /// It is a snapshot, not a consistent cut: the four sources are sampled in
 /// order under their own locks, so they can disagree with each other by however
 /// much moved in between. That is fine for a diagnostic and is not what the
-/// separation is for.
-#[derive(Debug, Clone)]
+/// split is for.
+#[derive(Debug)]
 pub struct ReportSnapshot {
     cells: Vec<StuckCell>,
     void_wakes: u64,
     wait_graph: String,
     phases: String,
+}
+
+impl ReportSnapshot {
+    /// Build a snapshot from values instead of from the live process, so
+    /// [`render_report`]'s output can be asserted against a controlled input.
+    ///
+    /// Without this the only way to exercise the format is to render whatever
+    /// the process registry happens to hold, which reduces every assertion to a
+    /// `contains` and leaves the branches that matter during an incident — an
+    /// empty inventory, an abandoned cell — uncovered. [`capture_report`] is the
+    /// live path.
+    pub fn from_parts(
+        cells: Vec<StuckCell>,
+        void_wakes: u64,
+        wait_graph: String,
+        phases: String,
+    ) -> Self {
+        Self {
+            cells,
+            void_wakes,
+            wait_graph,
+            phases,
+        }
+    }
 }
 
 /// Sample the in-flight state once, for [`render_report`].
@@ -659,11 +684,15 @@ pub fn capture_report() -> ReportSnapshot {
     }
 }
 
-/// Format a [`capture_report`] sampling.
+/// Format a [`capture_report`] sampling: the complete in-flight picture — every
+/// incomplete cell, the wait-for graph, and each invocation's next-await label.
 ///
 /// Uncapped, and rendered identically wherever it is written — the `SIGQUIT`
 /// dump and the stall watchdog's companion file are the same text, so a reader
-/// does not have to learn two formats or wonder which one is truncated.
+/// does not have to learn two formats or wonder which one is truncated. There
+/// is deliberately no "capture and render" convenience wrapper: a third entry
+/// point is a third thing a writer can pick, and the two writers agreeing is the
+/// property here.
 ///
 /// The gated sections self-describe when off rather than being absent, because
 /// a missing section reads as "nothing to report" when it means "not recorded".
@@ -680,13 +709,6 @@ pub fn render_report(snapshot: &ReportSnapshot) -> String {
         snapshot.wait_graph,
         snapshot.phases,
     )
-}
-
-/// The complete in-flight picture: every incomplete cell, the wait-for graph,
-/// and each invocation's next-await label. Samples and formats in one call —
-/// see [`capture_report`] when the same picture must be rendered twice.
-pub fn render_full_report() -> String {
-    render_report(&capture_report())
 }
 
 /// Monotone process-wide count of wakes that reached an incomplete cell and
@@ -2216,6 +2238,94 @@ mod tests {
             !text.contains("[spec] //c:d waiters=1 driver=true STRANDED"),
             "a driven cell must not be marked stranded: {text}"
         );
+    }
+
+    /// The full report over a *controlled* snapshot.
+    ///
+    /// Every other assertion on this text renders whatever the live process
+    /// registry happens to hold, so it can only ask whether a substring is
+    /// present. This one fixes the input, which is the only way to state that
+    /// the header count agrees with the lines below it, that the listing is
+    /// uncapped, and that the gated sections are echoed rather than rewritten.
+    #[test]
+    fn render_report_counts_what_it_lists_and_never_caps_it() {
+        let mut cells = vec![
+            StuckCell {
+                tag: "result",
+                key: "//a:stranded".to_string(),
+                waiters: Some(2),
+                has_driver: false,
+            },
+            StuckCell {
+                tag: "result",
+                key: "//a:abandoned".to_string(),
+                waiters: Some(0),
+                has_driver: false,
+            },
+        ];
+        // Enough to trip any cap a future edit might reintroduce.
+        cells.extend((0..40).map(|i| StuckCell {
+            tag: "spec",
+            key: format!("//p:{i}"),
+            waiters: Some(1),
+            has_driver: true,
+        }));
+
+        let text = render_report(&ReportSnapshot::from_parts(
+            cells,
+            7,
+            "  GRAPH-SECTION".to_string(),
+            "  PHASES-SECTION".to_string(),
+        ));
+
+        assert!(
+            text.contains("=== in-flight inventory (42 incomplete cells) ==="),
+            "the header counts every cell in the snapshot: {text}"
+        );
+        assert!(
+            !text.contains("… and "),
+            "the full report is uncapped — a truncated one is the thing this \
+             renderer exists to avoid: {text}"
+        );
+        assert!(
+            text.contains("[result] //a:stranded waiters=2 driver=false STRANDED"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[result] //a:abandoned waiters=0 driver=false ABANDONED"),
+            "{text}"
+        );
+        assert!(
+            text.contains("//p:39"),
+            "the last cell is listed too: {text}"
+        );
+        assert!(text.contains("void wakes   7 "), "{text}");
+        // The gated sections are pass-through: this renderer must not restate
+        // them, or "not recorded" turns into "nothing to report".
+        assert!(text.contains("  GRAPH-SECTION"), "{text}");
+        assert!(text.contains("  PHASES-SECTION"), "{text}");
+    }
+
+    /// The empty case has to say *why* it is empty. "No section" and "no cells"
+    /// read identically to someone opening this file during an incident.
+    #[test]
+    fn render_report_says_nothing_is_in_flight_rather_than_showing_nothing() {
+        let text = render_report(&ReportSnapshot::from_parts(
+            Vec::new(),
+            0,
+            "  (empty)".to_string(),
+            "  (none)".to_string(),
+        ));
+        assert!(
+            text.contains("=== in-flight inventory (0 incomplete cells) ==="),
+            "{text}"
+        );
+        assert!(
+            text.contains("none — no memoizer cell is incomplete"),
+            "{text}"
+        );
+        assert!(text.contains("memoizer wait-for graph"), "{text}");
+        assert!(text.contains("memoizer phases"), "{text}");
     }
 
     #[test]
