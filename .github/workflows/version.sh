@@ -3,16 +3,21 @@ set -e
 
 # Optional first argument: build number
 build_number="${1:-}"
+# Optional second argument: commit-ish to describe (default HEAD) — lets a
+# caller compute the version another commit built under, without checking it
+# out. Used to re-derive a past PR/push's version tag from its SHA + the
+# run_number of the CI run that built it (see the `perfbench` job).
+ref="${2:-HEAD}"
 
 # Get the full description of current commit relative to last tag
 # --long ensures we always get the commit count and hash
 # --always returns hash even if no tags exist
-describe=$(git describe --tags --long --always)
+describe=$(git describe --tags --long --always "$ref")
 
 # If we're exactly on a tag, just output the tag
-if git describe --tags --exact-match 2>/dev/null >/dev/null; then
+if git describe --tags --exact-match "$ref" 2>/dev/null >/dev/null; then
     # Get the most recent tag
-    git describe --tags --abbrev=0
+    git describe --tags --abbrev=0 "$ref"
 else
     # Parse the describe output
     # Format is like: 1.2.3-5-g36e65
