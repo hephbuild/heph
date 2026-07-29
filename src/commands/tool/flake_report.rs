@@ -98,17 +98,22 @@ fn parse_run(text: &str) -> Vec<(String, Status)> {
             }
             continue;
         }
+        // `   Doc-tests <crate>` has no `Running ` line of its own — without
+        // this, every doctest result would be misattributed to whichever
+        // regular test binary happened to run last.
+        if let Some(krate) = trimmed.strip_prefix("Doc-tests ") {
+            current_binary = format!("doctest:{}", krate.trim());
+            continue;
+        }
         let Some(rest) = trimmed.strip_prefix("test ") else {
             continue;
         };
+        // Cargo's periodic liveness line reuses the `test ` prefix but has no
+        // ` ... <status>` suffix (`test foo::bar has been running for over 60
+        // seconds`), so it's already excluded by the `rsplit_once` below.
         let Some((name, status)) = rest.rsplit_once(" ... ") else {
             continue;
         };
-        // Skip cargo's periodic liveness line, which reuses the `test `
-        // prefix: `test foo::bar has been running for over 60 seconds`.
-        if name.contains("has been running for over") {
-            continue;
-        }
         let status = if status == "ok" {
             Status::Ok
         } else if status == "FAILED" {
@@ -230,6 +235,21 @@ impl TestOutcome {
     fn is_flaky(&self) -> bool {
         self.failed > 0 && self.failed < self.seen
     }
+
+    /// Failed in every run it appeared in, *and* appeared in every run —
+    /// i.e. actually broken, not just unlucky about which runs it survived
+    /// to reach. `total_runs` is [`Report::runs`].
+    fn is_consistently_failing(&self, total_runs: usize) -> bool {
+        self.seen > 0 && self.failed == self.seen && self.seen as usize == total_runs
+    }
+
+    /// This test's binary didn't reach it in every run (e.g. an earlier test
+    /// crashed the process), so `failed`/`seen` undercounts the true
+    /// picture — a 100% failure rate here is not the same confidence as one
+    /// backed by every run.
+    fn has_reduced_visibility(&self, total_runs: usize) -> bool {
+        (self.seen as usize) < total_runs
+    }
 }
 
 #[derive(Serialize)]
@@ -245,7 +265,12 @@ impl Report {
         let always_failing: Vec<&TestOutcome> = self
             .tests
             .iter()
-            .filter(|t| t.seen > 0 && t.failed == t.seen)
+            .filter(|t| t.is_consistently_failing(self.runs))
+            .collect();
+        let reduced_visibility: Vec<&TestOutcome> = self
+            .tests
+            .iter()
+            .filter(|t| t.has_reduced_visibility(self.runs))
             .collect();
 
         const WRITE_TO_STRING_CANNOT_FAIL: &str = "writeln! to a String cannot fail";
@@ -261,9 +286,10 @@ impl Report {
         .expect(WRITE_TO_STRING_CANNOT_FAIL);
         writeln!(
             out,
-            "\n{} flaky, {} consistently failing.\n",
+            "\n{} flaky, {} consistently failing, {} with reduced visibility.\n",
             flaky.len(),
-            always_failing.len()
+            always_failing.len(),
+            reduced_visibility.len()
         )
         .expect(WRITE_TO_STRING_CANNOT_FAIL);
 
@@ -288,6 +314,17 @@ impl Report {
             out.push_str("\nConsistently failing (not flaky — broken every run):\n");
             for t in &always_failing {
                 writeln!(out, "- {} ({}/{})", t.key, t.failed, t.seen)
+                    .expect(WRITE_TO_STRING_CANNOT_FAIL);
+            }
+        }
+
+        if !reduced_visibility.is_empty() {
+            out.push_str(
+                "\nReduced visibility (binary likely aborted before reaching these in some \
+                 runs — failure counts below are undercounts, not full confidence):\n",
+            );
+            for t in &reduced_visibility {
+                writeln!(out, "- {} (seen {}/{} runs)", t.key, t.seen, self.runs)
                     .expect(WRITE_TO_STRING_CANNOT_FAIL);
             }
         }
@@ -472,5 +509,175 @@ test rarely_fails ... FAILED
             flaky_idx < failing_idx,
             "flaky table should render before the consistently-failing list"
         );
+    }
+
+    #[test]
+    fn doctest_results_are_attributed_to_the_doctest_crate_not_the_last_binary() {
+        // Real `cargo test` section order: unit tests, then integration test
+        // binaries, then doctests — with no `Running ` line of their own.
+        let text = "\
+     Running unittests src/lib.rs (target/debug/deps/heph-6f1c18785b1a867e)
+test a::unit_test ... ok
+
+     Running tests/supervisor.rs (target/debug/deps/supervisor-ef8fc1ebcf07feca)
+test integration_test ... ok
+
+   Doc-tests heph
+test src/lib.rs - foo (line 12) ... FAILED
+";
+        let parsed = parse_run(text);
+        assert_eq!(
+            parsed,
+            vec![
+                ("heph::a::unit_test".to_string(), Status::Ok),
+                ("supervisor::integration_test".to_string(), Status::Ok),
+                (
+                    "doctest:heph::src/lib.rs - foo (line 12)".to_string(),
+                    Status::Failed
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_binaries_with_an_identically_named_test_do_not_collide() {
+        let text = "\
+     Running unittests src/lib.rs (target/debug/deps/foo-c48417a792d7e9e5)
+test shared_name ... FAILED
+
+     Running unittests src/lib.rs (target/debug/deps/bar-3e33b7047d1b4596)
+test shared_name ... ok
+";
+        let parsed = parse_run(text);
+        assert_eq!(
+            parsed,
+            vec![
+                ("foo::shared_name".to_string(), Status::Failed),
+                ("bar::shared_name".to_string(), Status::Ok),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_test_missing_from_some_runs_has_reduced_visibility_not_full_confidence() {
+        // Simulates a binary that aborted before reaching `late_test` in 1 of
+        // 3 runs: two runs report it FAILED, one run's text never mentions it
+        // at all (as if the process crashed before printing that line).
+        let full_run = "\
+     Running unittests src/lib.rs (target/debug/deps/core-c48417a792d7e9e5)
+test late_test ... FAILED
+";
+        let crashed_run = "\
+     Running unittests src/lib.rs (target/debug/deps/core-c48417a792d7e9e5)
+";
+        let mut agg = Aggregator::default();
+        agg.add_run(full_run);
+        agg.add_run(full_run);
+        agg.add_run(crashed_run);
+        let report = agg.finish(vec!["a".into(), "b".into(), "c".into()]);
+
+        let t = report
+            .tests
+            .iter()
+            .find(|t| t.key == "core::late_test")
+            .expect("test present");
+        assert_eq!(t.failed, 2);
+        assert_eq!(t.seen, 2);
+        assert!(t.has_reduced_visibility(report.runs));
+        // 2/2 observed runs failed, but it was only observed in 2 of 3 total
+        // runs — must NOT be reported as "consistently failing" (which
+        // claims every run), even though failed == seen.
+        assert!(!t.is_consistently_failing(report.runs));
+
+        let md = report.to_markdown();
+        assert!(
+            !md.contains("Consistently failing"),
+            "a test seen in only 2/3 runs must not be labelled consistently failing:\n{md}"
+        );
+        assert!(md.contains("Reduced visibility"));
+        assert!(md.contains("core::late_test (seen 2/3 runs)"));
+    }
+
+    #[test]
+    fn execute_on_an_empty_logs_dir_returns_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = Args {
+            logs_dir: dir.path().to_path_buf(),
+            json_out: None,
+            fail_on_flake: false,
+        };
+        let err = execute(&args).expect_err("an empty logs dir has nothing to aggregate");
+        assert!(err.to_string().contains("no run logs found"));
+    }
+
+    #[test]
+    fn execute_ignores_subdirectories_and_writes_the_json_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("run-1.log"), RUN_ALL_PASS).expect("write run log");
+        std::fs::create_dir(dir.path().join("not-a-run")).expect("create subdir");
+        std::fs::write(
+            dir.path().join("not-a-run").join("run-2.log"),
+            RUN_ONE_FAILS,
+        )
+        .expect("write nested log (must be ignored)");
+
+        let json_out = dir.path().join("report.json");
+        let args = Args {
+            logs_dir: dir.path().to_path_buf(),
+            json_out: Some(json_out.clone()),
+            fail_on_flake: false,
+        };
+        execute(&args).expect("subdirectories are skipped, not read as a run");
+
+        let json = std::fs::read_to_string(&json_out).expect("json report written");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        // Only run-1.log (RUN_ALL_PASS) should have been aggregated — proves
+        // the subdirectory and its nested log were not read as a run.
+        assert_eq!(value["runs"], 1);
+        let tests = value["tests"].as_array().expect("tests array");
+        assert!(
+            tests.iter().all(|t| t["failed"].as_u64() == Some(0)),
+            "only the all-pass run should have been aggregated: {value}"
+        );
+    }
+
+    #[test]
+    fn execute_fail_on_flake_gates_on_flakiness_not_on_any_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("run-1.log"), RUN_ALL_PASS).expect("write run log");
+        std::fs::write(dir.path().join("run-2.log"), RUN_ONE_FAILS).expect("write run log");
+
+        let not_gated = Args {
+            logs_dir: dir.path().to_path_buf(),
+            json_out: None,
+            fail_on_flake: false,
+        };
+        execute(&not_gated).expect("fail_on_flake=false must succeed despite a flaky test");
+
+        let gated = Args {
+            logs_dir: dir.path().to_path_buf(),
+            json_out: None,
+            fail_on_flake: true,
+        };
+        let err = execute(&gated).expect_err("fail_on_flake=true must fail on a flaky test");
+        assert!(err.to_string().contains("flaky"));
+    }
+
+    #[test]
+    fn json_report_uses_the_field_names_the_workflow_greps_for_with_jq() {
+        // .github/workflows/flake-detect.yml does
+        // `jq -r '.tests[] | select(.failed > 0) | .key'` against this JSON —
+        // a silent field rename here would pass every Rust test while
+        // breaking that CI step with no red build to catch it.
+        let mut agg = Aggregator::default();
+        agg.add_run(RUN_ONE_FAILS);
+        let report = agg.finish(vec!["a".into()]);
+
+        let value = serde_json::to_value(&report).expect("serializable");
+        assert!(value["runs"].is_number());
+        let test = &value["tests"][0];
+        assert!(test["key"].is_string());
+        assert!(test["failed"].is_number());
+        assert!(test["seen"].is_number());
     }
 }

@@ -2,10 +2,11 @@ name: Flake detection
 
 # Nightly: run the test suite N times and report per-test failure rates, so a
 # flaky test is a number in a table instead of "someone thinks this is
-# flaky." Also runs the suite once serially (`--test-threads=1`) alongside
-# one of the parallel runs — a test that only fails in parallel is coupled to
-# process-wide global state, which historically caused misattributed flakes
-# (an agent burning time proving someone else's flake wasn't theirs).
+# flaky." Also runs the suite once serially (`--test-threads=1`) and diffs it
+# against the N-run parallel aggregate — a test that fails under parallel
+# execution but never serially is coupled to process-wide global state, which
+# historically caused misattributed flakes (an agent burning time proving
+# someone else's flake wasn't theirs).
 #
 # Advisory by default: it reports, it does not gate `master`. Pass
 # `fail_on_flake: true` on a manual dispatch to have it fail instead.
@@ -41,8 +42,6 @@ jobs:
     name: Codegen
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      repo_artifact_id: ${{ steps.upload_repo.outputs.artifact-id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -54,8 +53,10 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: gen
 
+      # Scratch hop to the flake-detect job below, not a durable artifact —
+      # short retention keeps nightly runs from accumulating full repo
+      # checkouts at the default (much longer) retention.
       - name: Upload repo
-        id: upload_repo
         uses: actions/upload-artifact@v6
         with:
           name: repo
@@ -63,6 +64,7 @@ jobs:
             .
             !.devenv/
           include-hidden-files: true
+          retention-days: 1
 
   flake-detect:
     name: Flake detect ${{ matrix.os }}/${{ matrix.arch }}
@@ -75,6 +77,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # linux/arm64 (ubuntu-24.04-arm) is a third target heph.yml tests
+        # natively but is deliberately excluded here: this job already
+        # multiplies cost by ~20x per platform, and the two flake classes it
+        # exists to catch (process-wide global state, macOS-specific timing)
+        # don't need a third arch to surface. A silent gap, stated: rerun
+        # manually via workflow_dispatch on that runner if arm64-specific
+        # flakiness is ever suspected.
         include:
           - os: linux
             arch: amd64
@@ -96,13 +105,17 @@ jobs:
         with:
           cargo-target: ${{ matrix.target }}
           cache-suffix: "-flake"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
 
-      # Built once; every run below re-executes the already-built test
-      # binaries (cargo no-ops the compile step when nothing changed), so the
-      # N-run loop's cost is dominated by actual test execution, not rebuilds.
+      # Prebuilds the heph binary and every test binary once; each run in the
+      # loop below re-executes these same binaries (cargo no-ops the compile
+      # step when nothing changed), so the N-run loop's cost is dominated by
+      # actual test execution, not rebuilds.
       - name: Build heph + test binaries
         shell: devenv shell bash -- -e {0}
-        run: cargo build --locked -p heph --bin heph
+        run: |
+          cargo build --locked -p heph --bin heph
+          cargo test --locked --workspace --exclude bin-e2e --no-run
 
       # The two feature-gated `tst` passes (plugin-stabby --features host,
       # plugin-sdk --features stabby) are deliberately excluded from the
@@ -117,13 +130,16 @@ jobs:
           mkdir -p flake-logs
           for i in $(seq 1 "$runs"); do
             echo "=== parallel run $i/$runs ==="
+            # Zero-padded so `flake-logs/run-*.log` sorts numerically past 9
+            # runs (plain `run-$i.log` would put run-10 before run-2).
+            printf -v padded '%03d' "$i"
             cargo test --locked --workspace --exclude bin-e2e \
-              > "flake-logs/run-$i.log" 2>&1 || true
+              > "flake-logs/run-$padded.log" 2>&1 || true
           done
 
-      # One serial run to compare against the first parallel run: a test that
-      # fails in parallel but passes with --test-threads=1 is coupled to
-      # process-wide global state rather than genuinely flaky.
+      # One serial run to compare against the N-run parallel aggregate: a
+      # test that fails in parallel but passes with --test-threads=1 is
+      # coupled to process-wide global state rather than genuinely flaky.
       - name: Run suite once serially
         shell: devenv shell bash -- -e {0}
         env:
@@ -137,6 +153,11 @@ jobs:
         id: report
         shell: devenv shell bash -- -e {0}
         run: |
+          # `-e` alone doesn't propagate a failing left-hand side through a
+          # pipe (the pipeline's exit status is `tee`'s) — without
+          # `pipefail`, --fail-on-flake's non-zero exit is swallowed here and
+          # the job stays green regardless.
+          set -o pipefail
           bin="$CARGO_TARGET_DIR/debug/heph"
           extra_args=()
           if [ "${{ inputs.fail_on_flake || false }}" = "true" ]; then
@@ -149,13 +170,16 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: |
           bin="$CARGO_TARGET_DIR/debug/heph"
-          mkdir -p compare/parallel compare/serial
-          cp flake-logs/run-1.log compare/parallel/
-          cp flake-logs-serial/run-1.log compare/serial/
-          "$bin" tool flake-report --logs-dir compare/parallel --json-out compare/parallel.json > /dev/null
-          "$bin" tool flake-report --logs-dir compare/serial --json-out compare/serial.json > /dev/null
+          mkdir -p compare
+          "$bin" tool flake-report --logs-dir flake-logs-serial --json-out compare/serial.json > /dev/null
 
-          jq -r '.tests[] | select(.failed > 0) | .key' compare/parallel.json | sort > compare/parallel_failed.txt
+          # The parallel side reuses the 20-run aggregate from the previous
+          # step instead of a single parallel log: a test that only fails
+          # intermittently under parallel execution (say, 1 run in 5) has a
+          # good chance of passing in any one sampled run, which would make a
+          # single-run comparison miss exactly the divergence this check
+          # exists to catch.
+          jq -r '.tests[] | select(.failed > 0) | .key' flake-report.json | sort > compare/parallel_failed.txt
           jq -r '.tests[] | select(.failed > 0) | .key' compare/serial.json | sort > compare/serial_failed.txt
 
           # Fails in the parallel run but not serially: coupled to global state.
@@ -187,9 +211,11 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: flake-report-${{ matrix.os }}-${{ matrix.arch }}
+          # Superseded by the next nightly run — not worth the default
+          # (much longer) retention.
+          retention-days: 14
           path: |
             flake-logs/
             flake-logs-serial/
             flake-report.json
-            compare/parallel.json
             compare/serial.json
