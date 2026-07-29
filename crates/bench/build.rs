@@ -1,0 +1,14 @@
+//! Weak-link libfuse on macOS (see the workspace-root `build.rs` for the full
+//! rationale). This crate's `heph-bench` binary transitively links `fuser` →
+//! libfuse through its `heph` dependency (default `fuse-sandbox` feature).
+//! Without the flag it would hard-link `/usr/local/lib/libfuse.2.dylib` and
+//! abort at launch on machines without macFUSE — including CI runners and the
+//! `perfbench` job's release-fetched dist. The flag makes the dylib an
+//! optional weak load; libfuse symbols are only reached behind heph's runtime
+//! `support_check` gate.
+fn main() {
+    println!("cargo::rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo::rustc-link-arg=-weak-lfuse");
+    }
+}
