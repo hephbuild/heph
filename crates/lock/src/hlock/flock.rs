@@ -338,6 +338,15 @@ impl FLockState {
         self.fd.lock().force_stale = n;
     }
 
+    /// Whether the exhaustion warning is currently latched. The latch decides
+    /// `warn!` vs `debug!` only, so a test cannot observe it through behaviour
+    /// without installing a subscriber; asserting the state machine directly
+    /// keeps the reset-on-success arm from being dead code nobody would notice.
+    #[cfg(test)]
+    fn stale_warned(&self) -> bool {
+        self.fd.lock().stale_warned
+    }
+
     /// Injections not yet consumed — how many of the forced-stale iterations the
     /// acquire actually performed.
     #[cfg(test)]
@@ -863,6 +872,10 @@ mod tests {
             .unwrap()
             .expect("one fewer than the budget still acquires");
         assert_eq!(survives.state.pending_stale(), 0, "all retries consumed");
+        assert!(
+            !survives.state.stale_warned(),
+            "an acquire that succeeded never exhausted anything"
+        );
         drop(g);
 
         let exhausts = FLock::new(&path);
@@ -872,6 +885,10 @@ mod tests {
             "the full budget gives up"
         );
         assert_eq!(exhausts.state.pending_stale(), 0, "all retries consumed");
+        assert!(
+            exhausts.state.stale_warned(),
+            "exhaustion latches, so the next round logs at debug instead of warn"
+        );
         let (readers, writer, fd_open) = exhausts.state.counts();
         assert_eq!(
             (readers, writer, fd_open),
@@ -880,11 +897,18 @@ mod tests {
         );
 
         // Would-block, not failure: once the condition clears the same instance
-        // acquires.
-        exhausts
+        // acquires — and that clears the latch, so a *later* bout of staleness
+        // is reported afresh rather than silently downgraded for the rest of the
+        // process's life.
+        let g = exhausts
             .try_lock()
             .unwrap()
             .expect("acquires once it clears");
+        assert!(
+            !exhausts.state.stale_warned(),
+            "a successful acquire re-arms the warning"
+        );
+        drop(g);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
