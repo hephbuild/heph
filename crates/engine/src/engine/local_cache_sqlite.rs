@@ -940,12 +940,29 @@ impl LocalCache for LocalCacheSQLite {
 
 /// Owns both a pooled sqlite connection and a `Blob` opened against it.
 ///
-/// `rusqlite::blob::Blob<'conn>` borrows its connection; lifetime extension
-/// to `'static` is sound because the blob is dropped before `_conn` (Rust
-/// drops struct fields in declaration order).
+/// `rusqlite::blob::Blob<'conn>` borrows its connection, and we extend that
+/// borrow to `'static` to store the two together. Two things make it sound, and
+/// **both** are required:
+///
+/// 1. *Drop order* — `blob` is declared before `_conn`, and Rust drops fields in
+///    declaration order, so the blob is finalized while its connection is alive.
+/// 2. *A stable address* — the connection is behind a `Box`, so the
+///    `&Connection` the blob captured stays valid when this struct is moved.
+///
+/// The `Box` is the subtle one and is **not** an allocation to optimize away.
+/// [`r2d2::PooledConnection`] stores its `Connection` inline, so without the
+/// indirection the borrow would be taken from a local that is then *moved* into
+/// the returned struct (and moved again by every `Box::new`/return after it),
+/// leaving the blob pointing at a dead stack slot. Reads then go through a
+/// dangling pointer, which surfaces as sqlite's `RefCell` appearing already
+/// mutably borrowed — a panic inside `Blob::read`, followed by a second panic in
+/// this struct's own drop, i.e. a non-unwinding abort of the whole process.
+/// Boxing first is what makes the address the blob captured outlive the moves.
 struct OwnedBlob {
     blob: rusqlite::blob::Blob<'static>,
-    _conn: r2d2::PooledConnection<SqliteConnectionManager>,
+    /// Boxed for address stability — see the type doc. Never dereferenced here;
+    /// it exists to keep the connection alive and pinned for `blob`.
+    _conn: Box<r2d2::PooledConnection<SqliteConnectionManager>>,
 }
 
 // SAFETY: rusqlite::Connection is Send. The blob holds a raw sqlite3
@@ -956,13 +973,17 @@ unsafe impl Send for OwnedBlob {}
 
 impl OwnedBlob {
     fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>, row_id: i64) -> Result<Self> {
+        // Box BEFORE borrowing: the blob captures an address that must survive
+        // this struct being moved out of `new`. See the type doc.
+        let conn = Box::new(conn);
         let conn_ref: &Connection = &conn;
         let blob = conn_ref
             .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
             .context("opening seekable sqlite blob")?;
-        // SAFETY: `blob` borrows from `conn` which is owned alongside it in
-        // the returned struct; struct field drop order (blob before _conn)
-        // guarantees the borrow outlives no longer than the connection.
+        // SAFETY: `blob` borrows the `Connection` inside the heap allocation
+        // `conn` owns, which this struct keeps alive and never moves (moving the
+        // `Box` moves the pointer, not the pointee). Field order drops `blob`
+        // first, so the borrow never outlives the connection.
         let blob_static: rusqlite::blob::Blob<'static> = unsafe { std::mem::transmute(blob) };
         Ok(Self {
             blob: blob_static,
@@ -1600,6 +1621,80 @@ mod tests {
         queued_write(&cache, &addr, "blob", b"bytes");
         assert!(cache.exists(&addr, "h", "blob")?); // barrier: commit has landed
         assert!(committed(cache.existence(&addr, "h", "blob")?));
+        Ok(())
+    }
+
+    /// Scribble over a few KiB of stack below the current frame.
+    ///
+    /// Only meaningful for the test above: it turns "the blob may point at a
+    /// popped frame" from a platform-dependent maybe into a deterministic
+    /// corruption. `black_box` keeps the writes from being optimized out.
+    #[inline(never)]
+    fn clobber_stack() {
+        let mut scratch = [0xAAu8; 8192];
+        std::hint::black_box(&mut scratch);
+    }
+
+    /// A seekable blob reader must survive being returned, boxed and moved.
+    ///
+    /// `OwnedBlob` extends the blob's borrow of its connection to `'static`. That
+    /// is only sound while the `Connection` the blob captured stays put — and
+    /// `PooledConnection` stores it inline, so taking the borrow *before* moving
+    /// the connection into the struct leaves the blob pointing at a dead stack
+    /// slot. The reader still constructs fine; it is the reads afterwards that go
+    /// through a dangling pointer, which is why nothing catches it at the seam.
+    ///
+    /// This drives the shape `TarIndex::build` uses — interleaved seeks and short
+    /// reads, well past the first buffer — across the move boundary, and checks
+    /// the bytes rather than merely that it did not crash. Corrupt reads from a
+    /// reused stack slot fail the comparison even when they do not panic.
+    #[test]
+    fn a_seekable_blob_reads_correctly_after_the_reader_is_moved() -> Result<()> {
+        use std::io::Seek;
+
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "seekable");
+
+        // Distinctive, position-dependent bytes: a wrong offset or a garbage read
+        // cannot coincidentally match.
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        queued_write(&cache, &addr, "blob", &payload);
+        assert!(cache.exists(&addr, "h", "blob")?); // barrier
+
+        // Returned boxed from `seekable_reader`, then moved again into this local.
+        let mut reader = cache
+            .seekable_reader(&addr, "h", "blob")?
+            .expect("sqlite serves a seekable reader");
+
+        // Overwrite the stack region `OwnedBlob::new` and its callers used. If the
+        // blob captured an address in a frame that has since been popped, this is
+        // what a later caller doing ordinary work would do to it — made explicit
+        // and immediate so the failure is deterministic here instead of appearing
+        // as an abort somewhere downstream on one platform.
+        clobber_stack();
+
+        let mut whole = Vec::new();
+        reader.read_to_end(&mut whole)?;
+        assert_eq!(whole, payload, "sequential read must match");
+
+        // Seek back and re-read at several offsets, the way a tar header scan
+        // walks an archive.
+        for off in [0u64, 511, 1024, 40_000, 63_000] {
+            reader.seek(std::io::SeekFrom::Start(off))?;
+            let mut chunk = [0u8; 512];
+            let n = reader.read(&mut chunk)?;
+            let start = off as usize;
+            assert_eq!(
+                &chunk[..n],
+                &payload[start..start + n],
+                "read at offset {off} must match"
+            );
+        }
         Ok(())
     }
 
