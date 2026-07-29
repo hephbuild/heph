@@ -145,6 +145,16 @@ impl LocalCache for LocalCacheTmp {
         self.durable.existence(addr, hashin, name)
     }
 
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+        let key = Self::key(addr, hashin, name);
+        // Mirrors `exists`. Unlike the mem tier this map has no eviction, so an
+        // admitted entry stays readable from here for the process's life.
+        if self.store.map.read().contains_key(&key) {
+            return Ok(true);
+        }
+        self.durable.exists_committed(addr, hashin, name)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let key = Self::key(addr, hashin, name);
         if let Some(v) = self.store.map.write().remove(&key) {
@@ -308,6 +318,10 @@ mod tests {
         // In-memory map, committed the instant the writer drops.
         fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
             Ok(Existence::Committed(self.exists(addr, hashin, name)?))
+        }
+        fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+            // Commits inline: nothing to distinguish from `exists`.
+            self.exists(addr, hashin, name)
         }
         fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
             let key = (addr.format(), hashin.to_string(), name.to_string());

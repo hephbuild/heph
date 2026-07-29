@@ -150,6 +150,11 @@ impl LocalCache for LocalCacheFS {
         Ok(Existence::Committed(self.exists(addr, hashin, name)?))
     }
 
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+        // No queue, so every answer this backend can give is committed.
+        self.exists(addr, hashin, name)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let path = self.get_path(addr, hashin, name);
         if path.exists() {

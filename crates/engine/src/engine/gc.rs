@@ -640,6 +640,12 @@ mod tests {
             // trait's contract — never re-derived from `exists`.
             self.inner.existence(addr, hashin, name)
         }
+        fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
+            // Likewise forwarded: only the queue's owner knows what is committed.
+            // Not counted — `barrier_reads` tracks the manifest barrier probe,
+            // which goes through `exists`.
+            self.inner.exists_committed(addr, hashin, name)
+        }
         fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
             self.inner.delete(addr, hashin, name)
         }

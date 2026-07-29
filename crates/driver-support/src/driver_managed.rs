@@ -442,6 +442,9 @@ pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {
 /// a collision fails fast with both producers named rather than silently
 /// last-write-wins in the sandbox (regular deps `File::create`-truncate; FUSE
 /// layers shadow by registration order — neither surfaces the conflict).
+///
+/// Synchronous and I/O-bound: call it from
+/// [`detect_output_collisions_blocking`] rather than directly from an `async fn`.
 pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> anyhow::Result<()> {
     // Absolute sandbox path -> the target that claimed it.
     let mut owners: HashMap<PathBuf, Addr> = HashMap::new();
@@ -494,6 +497,58 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
         }
     }
     Ok(())
+}
+
+/// [`hartifactcontent::unpack::unpack`] on the blocking pool.
+///
+/// Unpacking reads every byte of the artifact out of the cache and writes the
+/// whole tree to disk. Inline in an `async fn` it holds a runtime worker for the
+/// entire materialization — and the cache read underneath it additionally parks
+/// that thread on any queued sqlite write to the same key
+/// (`LocalCacheSQLite::reader`). With `2 * ncpu` execute permits against `ncpu`
+/// workers, enough targets in this window park every one of them and the
+/// reactor, the timer wheel and the TUI stop with them.
+///
+/// The captures are an `Arc` bump, two paths and the (usually empty) filter
+/// list. Shared by both sandbox runners and by [`crate::stage`] so the discipline
+/// has one definition — and one test — rather than three copies, only some of
+/// which run on a host with a FUSE mount.
+pub async fn unpack_blocking(
+    content: Arc<dyn hartifactcontent::Content>,
+    dst: PathBuf,
+    list_path: Option<PathBuf>,
+    filters: Vec<String>,
+) -> anyhow::Result<()> {
+    hcore::blocking::run(move || {
+        let pred = |rel: &Path| filters.iter().any(|f| Path::new(f) == rel);
+        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
+            None
+        } else {
+            Some(&pred)
+        };
+        hartifactcontent::unpack::unpack(content.as_ref(), &dst, list_path.as_deref(), predicate)
+    })
+    .await
+}
+
+/// [`detect_output_collisions`] on the blocking pool, taking and returning the
+/// groups so the job can own them.
+///
+/// The check is not the cheap map walk it looks like: `entry_paths()` on a
+/// cache-backed input is a header scan over a sqlite blob, and it goes through
+/// `LocalCacheSQLite::seekable_reader`, which parks the calling thread until any
+/// queued write to that key has been committed by the single writer thread.
+/// Inline in an `async fn` that is exactly the runtime-worker stall
+/// `hcore::blocking` exists to remove; on a pool thread the park is the
+/// backend's documented contract.
+pub async fn detect_output_collisions_blocking(
+    groups: BTreeMap<PathBuf, Vec<RunInput>>,
+) -> anyhow::Result<BTreeMap<PathBuf, Vec<RunInput>>> {
+    hcore::blocking::run(move || {
+        detect_output_collisions(&groups)?;
+        anyhow::Ok(groups)
+    })
+    .await
 }
 
 /// The fs provider's package. Its `file`/`glob` targets only expose existing
@@ -944,6 +999,71 @@ mod source_map_tests {
         detect_output_collisions(&groups).expect("filtered-out path must not collide");
     }
 
+    /// Records the thread its bytes were read on, then behaves like `TarBytes`.
+    ///
+    /// The witness for every "runs off the runtime workers" test in this module:
+    /// `entry_paths` (the default) and `unpack` both go through `walk`, so one
+    /// recorder covers path enumeration and full materialization alike.
+    struct ThreadRecordingTar {
+        inner: TarBytes,
+        thread: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl Content for ThreadRecordingTar {
+        fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+            self.inner.reader()
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            record_current_thread(&self.thread);
+            self.inner.walk()
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            self.inner.hashout()
+        }
+    }
+
+    /// Record the name of the thread this runs on into `slot`.
+    ///
+    /// A free function returning `()` rather than a lock inside `walk`: `walk`
+    /// returns a `Result`, and `clippy::unwrap_in_result` (denied in this crate)
+    /// rejects an `expect` there. Poisoning is ignored — the `Option` is still
+    /// consistent, and a poisoned slot would only hide the assertion.
+    fn record_current_thread(slot: &std::sync::Mutex<Option<String>>) {
+        let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+        *g = std::thread::current()
+            .name()
+            .map(std::borrow::ToOwned::to_owned);
+    }
+
+    /// A `ThreadRecordingTar` over `files`, plus the slot it reports into.
+    fn recording_content(
+        files: &[(&str, &str)],
+    ) -> (Arc<dyn Content>, Arc<std::sync::Mutex<Option<String>>>) {
+        let thread = Arc::new(std::sync::Mutex::new(None));
+        let content = Arc::new(ThreadRecordingTar {
+            inner: TarBytes(pack_files(files)),
+            thread: Arc::clone(&thread),
+        });
+        (content, thread)
+    }
+
+    /// The witness itself: `hcore::blocking`'s pool threads are the only ones
+    /// named `heph-blocking-*`, so the name separates them from a runtime worker
+    /// (`tokio-runtime-worker`) and from the test thread.
+    ///
+    /// Positive rather than negative on purpose — asserting `!= "tokio-runtime-
+    /// worker"` passes vacuously under `#[tokio::test]`, whose current-thread
+    /// flavor runs the body on the test thread.
+    fn assert_ran_on_blocking_pool(thread: &Arc<std::sync::Mutex<Option<String>>>, what: &str) {
+        let ran_on = thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            ran_on
+                .as_deref()
+                .is_some_and(|n| n.starts_with("heph-blocking")),
+            "{what} must run on the blocking pool, ran on {ran_on:?}"
+        );
+    }
+
     /// Sandbox materialization must not run on a tokio worker.
     ///
     /// `build_source_map` calls `entry_paths()` per opted-in input, which for
@@ -956,42 +1076,14 @@ mod source_map_tests {
     /// only ones named `heph-blocking-*`, so the name is the witness.
     #[tokio::test]
     async fn source_map_generation_runs_off_the_runtime_workers() {
-        /// Records the thread its enumeration ran on, then behaves like `TarBytes`.
-        struct ThreadRecordingTar {
-            inner: TarBytes,
-            thread: Arc<std::sync::Mutex<Option<String>>>,
-        }
-
-        impl Content for ThreadRecordingTar {
-            fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
-                self.inner.reader()
-            }
-            fn walk(
-                &self,
-            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
-            {
-                *self.thread.lock().expect("thread slot") = std::thread::current()
-                    .name()
-                    .map(std::borrow::ToOwned::to_owned);
-                self.inner.walk()
-            }
-            fn hashout(&self) -> anyhow::Result<String> {
-                self.inner.hashout()
-            }
-        }
-
         let dir = tempfile::tempdir().expect("tempdir");
         let ws_dir = dir.path().join("ws");
         let pkg_dir = dir.path().join("ws/pkg");
         fs::create_dir_all(&pkg_dir).expect("mkdir");
 
-        let thread = Arc::new(std::sync::Mutex::new(None));
+        let (content, thread) = recording_content(&[("pkg/x.txt", "1")]);
         let mut input = make_input("dep|a|0", "//pkg:_a", &[("pkg/x.txt", "1")]);
-        let tar = pack_files(&[("pkg/x.txt", "1")]);
-        input.input.artifact.content = Arc::new(ThreadRecordingTar {
-            inner: TarBytes(tar),
-            thread: Arc::clone(&thread),
-        });
+        input.input.artifact.content = content;
         input.unpack_root = ws_dir.clone();
 
         let inputs = write_source_map_blocking(vec![input], &ws_dir, &pkg_dir)
@@ -1003,12 +1095,52 @@ mod source_map_tests {
             pkg_dir.join("source_map.json").exists(),
             "the map itself must still be written"
         );
-        let ran_on = thread.lock().expect("thread slot").clone();
-        assert!(
-            ran_on
-                .as_deref()
-                .is_some_and(|n| n.starts_with("heph-blocking")),
-            "source map generation must run on the blocking pool, ran on {ran_on:?}"
+        assert_ran_on_blocking_pool(&thread, "source map generation");
+    }
+
+    /// The output-collision check must not run on a tokio worker either.
+    ///
+    /// It looks like a map walk, but `entry_paths()` per input is a header scan
+    /// over the artifact's bytes — for a cache-backed input, over a sqlite blob,
+    /// through `seekable_reader`, which additionally parks the calling thread
+    /// until any queued write to that key has been committed. Both sandbox
+    /// runners call it before materializing anything, on every cache miss.
+    #[tokio::test]
+    async fn output_collision_check_runs_off_the_runtime_workers() {
+        let (content, thread) = recording_content(&[("pkg/x.txt", "1")]);
+        let mut input = make_input("dep|a|0", "//pkg:_a", &[("pkg/x.txt", "1")]);
+        input.input.artifact.content = content;
+
+        let groups = detect_output_collisions_blocking(group(vec![input]))
+            .await
+            .expect("no collision");
+
+        assert_eq!(groups.len(), 1, "the groups must come back to the caller");
+        assert_ran_on_blocking_pool(&thread, "the output-collision check");
+    }
+
+    /// Unpacking an input must not run on a tokio worker.
+    ///
+    /// This is the heaviest of the three: every byte of the artifact is read out
+    /// of the cache and written to disk. Both sandbox runners and
+    /// [`crate::stage`] route through this one helper so the discipline has a
+    /// single definition — and this single test.
+    #[tokio::test]
+    async fn unpacking_an_input_runs_off_the_runtime_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dst = dir.path().join("ws");
+        fs::create_dir_all(&dst).expect("mkdir");
+        let (content, thread) = recording_content(&[("pkg/x.txt", "hello")]);
+
+        unpack_blocking(content, dst.clone(), None, Vec::new())
+            .await
+            .expect("unpack");
+
+        assert_eq!(
+            fs::read_to_string(dst.join("pkg/x.txt")).expect("unpacked file"),
+            "hello",
+            "the tree must still be materialized"
         );
+        assert_ran_on_blocking_pool(&thread, "unpacking an input");
     }
 }

@@ -130,6 +130,13 @@ impl LocalCache for LocalCacheSpill {
         }
     }
 
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+        // Mirrors `exists`: a blob lives in exactly one backend and the caller
+        // does not know which, so both are asked. Neither wait on a queue.
+        Ok(self.primary.exists_committed(addr, hashin, name)?
+            || self.blobs.exists_committed(addr, hashin, name)?)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         // A blob lives in exactly one backend, but the deleter (GC) doesn't know
         // which — both deletes are no-ops on the absent side. The FS delete also

@@ -2346,6 +2346,9 @@ impl Engine {
     ///   semantics). `Copy` (net-new) groups additionally stamp every written
     ///   file with the codegen xattr so a later fs glob excludes them; `InPlace`
     ///   groups are not stamped (they overwrite tracked source files).
+    ///
+    /// The gates are cheap and stay here; everything past them runs on
+    /// `hcore::blocking` (see [`Self::materialize_codegen_tree`]).
     async fn materialize_codegen(
         &self,
         is_top: bool,
@@ -2369,13 +2372,48 @@ impl Engine {
             return Ok(false);
         }
 
+        // Past the gates this walks every generated file, reads its bytes out of
+        // the cache, reads the tree file back and (when frozen) diffs the two —
+        // the heaviest synchronous read on the result path, and one that parks
+        // on any queued sqlite write to the artifact it is walking. It does not
+        // belong on a runtime worker. Cloned rather than borrowed because a pool
+        // job outlives a dropped caller future: an `Arc<TargetDef>` bump and a
+        // `Vec` of `ResultArtifact` (an `Arc` plus two short strings each).
+        //
+        // Outliving the caller is the accepted cost here. A run cancelled mid
+        // write-back reports cancelled while the job finishes rewriting the
+        // tree, where before it could only be interrupted by a signal. Stopping
+        // half way would be worse: the write-back is per-file and the tree is
+        // the user's source, so an abandoned job leaves a *partial* codegen tree
+        // either way, and letting it finish at least leaves a consistent one.
+        let (target, cached, root) = (
+            Arc::clone(&def.target),
+            cached.to_vec(),
+            self.cfg.root.clone(),
+        );
+        hcore::blocking::run(move || {
+            Self::materialize_codegen_tree(&target, &cached, &root, frozen)
+        })
+        .await
+    }
+
+    /// The body of [`Self::materialize_codegen`], past its gates.
+    ///
+    /// Synchronous and byte-moving: called only through `hcore::blocking::run`.
+    fn materialize_codegen_tree(
+        target: &crate::engine::driver::targetdef::TargetDef,
+        cached: &[ResultArtifact],
+        root: &std::path::Path,
+        frozen: bool,
+    ) -> anyhow::Result<bool> {
+        use crate::engine::driver::targetdef::path::CodegenMode;
+
         // Whether anything about the tree actually moved. Content writes, exec-bit
         // reconciles and symlink recreates all count; the codegen xattr does not
         // (it is metadata, outside the `@heph/fs` content+exec-bit hash). `false`
         // therefore means the tree still hashes exactly as it did before this
         // call — which is what lets the caller skip the fixpoint recompute.
         let mut wrote = false;
-        let root = &self.cfg.root;
         let mut frozen_diff = String::new();
 
         // Map each codegen output group to its declared mode (first non-None
@@ -2385,7 +2423,7 @@ impl Engine {
         // artifact, and exactly once.
         let mut group_mode: std::collections::HashMap<&str, &CodegenMode> =
             std::collections::HashMap::new();
-        for output in &def.target.outputs {
+        for output in &target.outputs {
             if let Some(mode) = output
                 .paths
                 .iter()
@@ -2495,7 +2533,7 @@ impl Engine {
                 // target hits the fixpoint cache instead of re-executing.
                 // Skipping identical writes also avoids needless source-control
                 // churn and pointless mtime bumps.
-                let stamp = def.target.addr.format();
+                let stamp = target.addr.format();
                 let walker = artifact
                     .content
                     .walk()
@@ -2610,7 +2648,7 @@ impl Engine {
 
         if frozen && !frozen_diff.is_empty() {
             return Err(anyhow::Error::new(crate::engine::error::FrozenCheckError {
-                addr: def.target.addr.clone(),
+                addr: target.addr.clone(),
                 diff: frozen_diff,
             }));
         }
@@ -7110,6 +7148,16 @@ mod tests {
             ) -> anyhow::Result<Existence> {
                 self.inner.existence(addr, hashin, name)
             }
+            // Forwarded for the same reason: only the layer that owns the write
+            // queue can answer "committed" without waiting on it.
+            fn exists_committed(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> anyhow::Result<bool> {
+                self.inner.exists_committed(addr, hashin, name)
+            }
             fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
                 self.inner.delete(addr, hashin, name)
             }
@@ -8858,6 +8906,113 @@ mod tests {
             "--shell on a cached alias still shells into the member",
         );
         assert_eq!(h.probe.calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// The codegen write-back must not run on a tokio worker.
+    ///
+    /// It is the heaviest synchronous read on the result path: it walks every
+    /// generated file, pulls its bytes out of the cache, reads the tree file back
+    /// and (when frozen) diffs the two. The cache read underneath additionally
+    /// parks the calling thread until any queued sqlite write to that artifact
+    /// has been committed — and the artifacts it walks come straight from
+    /// `cache_locally`, which queues them.
+    ///
+    /// The content records the thread it was walked on. `hcore::blocking`'s pool
+    /// threads are the only ones named `heph-blocking-*`, so the name is the
+    /// witness. Asserted positively: `!= "tokio-runtime-worker"` would pass
+    /// vacuously, since `#[tokio::test]` runs the body on the test thread.
+    #[tokio::test]
+    async fn codegen_write_back_runs_off_the_runtime_workers() -> anyhow::Result<()> {
+        use crate::engine::driver::targetdef::path;
+
+        /// A one-file tar that records the thread its walk ran on.
+        struct ThreadRecordingTar {
+            bytes: Vec<u8>,
+            thread: Arc<std::sync::Mutex<Option<String>>>,
+        }
+
+        impl Content for ThreadRecordingTar {
+            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+                Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
+                *self.thread.lock().expect("thread slot") = std::thread::current()
+                    .name()
+                    .map(std::borrow::ToOwned::to_owned);
+                Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
+                    std::io::Cursor::new(self.bytes.clone()),
+                )?))
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                Ok("HO".to_string())
+            }
+        }
+
+        let root = tempdir()?;
+        let engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+
+        let mut packer = hcore::hartifactcontent::tar::TarPacker::new();
+        packer.create_raw(b"generated\n".to_vec(), "gen.txt", false);
+        let mut bytes = Vec::new();
+        packer.pack(&mut bytes)?;
+        let thread = Arc::new(std::sync::Mutex::new(None));
+
+        let def = LinkedTargetDef {
+            target: Arc::new(TargetDef {
+                addr: hmodel::htaddr::parse_addr("//pkg:gen")?,
+                labels: Vec::new(),
+                raw_def: Arc::new(()),
+                inputs: Vec::new(),
+                outputs: vec![crate::engine::driver::targetdef::Output {
+                    group: "out".to_string(),
+                    paths: vec![path::Path {
+                        content: path::Content::FilePath("gen.txt".to_string()),
+                        codegen_tree: path::CodegenMode::Copy,
+                        collect: false,
+                    }],
+                }],
+                support_files: Vec::new(),
+                cache: crate::engine::driver::targetdef::CacheConfig::on(false),
+                pty: false,
+                hash: Vec::new(),
+                transparent: false,
+            }),
+            inputs: Vec::new(),
+        };
+        let cached = vec![ResultArtifact {
+            content: Arc::new(ThreadRecordingTar {
+                bytes,
+                thread: Arc::clone(&thread),
+            }),
+            group: "out".to_string(),
+            r#type: ManifestArtifactType::Output,
+        }];
+
+        let wrote = engine
+            .materialize_codegen(true, &def, &cached, false)
+            .await?;
+
+        assert!(wrote, "the tree must actually be written back");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gen.txt"))?,
+            "generated\n",
+        );
+        let ran_on = thread.lock().expect("thread slot").clone();
+        assert!(
+            ran_on
+                .as_deref()
+                .is_some_and(|n| n.starts_with("heph-blocking")),
+            "the codegen write-back must run on the blocking pool, ran on {ran_on:?}"
+        );
         Ok(())
     }
 }
