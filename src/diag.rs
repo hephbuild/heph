@@ -192,10 +192,16 @@ fn sweep() {
 /// frames — never inside the signal handler, and never with a blocking lock (see
 /// `hmemoizer::inventory`).
 fn inventory_report() -> String {
+    inventory_report_from(&hcore::hmemoizer::capture_report())
+}
+
+/// [`inventory_report`] over an already-sampled picture, so the same in-flight
+/// state can be rendered twice without re-reading globals that move in between.
+fn inventory_report_from(snapshot: &hcore::hmemoizer::ReportSnapshot) -> String {
     // Same renderer the stall watchdog writes to its companion file, so the two
     // are byte-identical and neither is the "truncated" one. No cap: this is
     // read once, on a build that has already gone wrong.
-    format!("\n{}", hcore::hmemoizer::render_full_report())
+    format!("\n{}", hcore::hmemoizer::render_report(snapshot))
 }
 
 fn write_inventory(fd: libc::c_int) {
@@ -383,11 +389,19 @@ mod tests {
     /// text. Two formats for one thing means a reader has to work out which of
     /// them is the truncated one, during an incident, which is exactly when
     /// nobody should be reverse-engineering a diagnostic.
+    ///
+    /// Both sides render *one* snapshot. Calling the two renderers back to back
+    /// compared two separate reads of process-wide memoizer state instead, and
+    /// any other test in this binary building a request between them changed one
+    /// read and not the other — a ~10%-per-run failure that had nothing to do
+    /// with the formats being compared. Sampling once removes the only variable
+    /// this test was never about; a divergence in either renderer still fails it.
     #[test]
     fn the_dump_and_the_watchdog_companion_file_render_identically() {
+        let snapshot = hcore::hmemoizer::capture_report();
         assert_eq!(
-            inventory_report().trim(),
-            hcore::hmemoizer::render_full_report().trim()
+            inventory_report_from(&snapshot).trim(),
+            hcore::hmemoizer::render_report(&snapshot).trim()
         );
     }
 }

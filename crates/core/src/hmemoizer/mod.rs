@@ -628,8 +628,38 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
     out
 }
 
-/// The complete in-flight picture: every incomplete cell, the wait-for graph,
-/// and each invocation's next-await label.
+/// One sampling of everything [`render_full_report`] prints.
+///
+/// Rendering reads four independent process-wide sources ([`inventory`],
+/// [`void_wakes`], [`dump_wait_graph`], [`dump_phases`]), each of which moves
+/// while a build runs. Separating the sampling from the formatting means a
+/// caller that has to render the same picture more than once — into a dump and
+/// into a companion file, or into two representations being compared — renders
+/// *one* picture rather than two reads of a moving target.
+///
+/// It is a snapshot, not a consistent cut: the four sources are sampled in
+/// order under their own locks, so they can disagree with each other by however
+/// much moved in between. That is fine for a diagnostic and is not what the
+/// separation is for.
+#[derive(Debug, Clone)]
+pub struct ReportSnapshot {
+    cells: Vec<StuckCell>,
+    void_wakes: u64,
+    wait_graph: String,
+    phases: String,
+}
+
+/// Sample the in-flight state once, for [`render_report`].
+pub fn capture_report() -> ReportSnapshot {
+    ReportSnapshot {
+        cells: inventory(),
+        void_wakes: void_wakes(),
+        wait_graph: dump_wait_graph(),
+        phases: dump_phases(),
+    }
+}
+
+/// Format a [`capture_report`] sampling.
 ///
 /// Uncapped, and rendered identically wherever it is written — the `SIGQUIT`
 /// dump and the stall watchdog's companion file are the same text, so a reader
@@ -637,20 +667,26 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
 ///
 /// The gated sections self-describe when off rather than being absent, because
 /// a missing section reads as "nothing to report" when it means "not recorded".
-pub fn render_full_report() -> String {
-    let cells = inventory();
+pub fn render_report(snapshot: &ReportSnapshot) -> String {
     format!(
         "=== in-flight inventory ({} incomplete cells) ===\n{}  \
          void wakes   {} (wakes that reached an incomplete cell and found nobody; \
          a count still climbing while nothing progresses is a lost-wake regression)\n\
          === memoizer wait-for graph ===\n{}\n\
          === memoizer phases (invocation -> next await) ===\n{}\n",
-        cells.len(),
-        render_inventory(&cells, usize::MAX),
-        void_wakes(),
-        dump_wait_graph(),
-        dump_phases(),
+        snapshot.cells.len(),
+        render_inventory(&snapshot.cells, usize::MAX),
+        snapshot.void_wakes,
+        snapshot.wait_graph,
+        snapshot.phases,
     )
+}
+
+/// The complete in-flight picture: every incomplete cell, the wait-for graph,
+/// and each invocation's next-await label. Samples and formats in one call —
+/// see [`capture_report`] when the same picture must be rendered twice.
+pub fn render_full_report() -> String {
+    render_report(&capture_report())
 }
 
 /// Monotone process-wide count of wakes that reached an incomplete cell and
