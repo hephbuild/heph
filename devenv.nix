@@ -70,10 +70,12 @@ in
     gen-go-large
     install-go-plugin
   '';
-  # Lint default-feature code, then again with every feature enabled (so
-  # feature-gated code — the stabby host loader, the stabby guest serving — is
-  # covered too), then fmt-check all hand-written crates (qualityCrates;
-  # generated gen/proto is excluded).
+  # Three clippy passes — default features, `--all-features`, and
+  # `--no-default-features` — then fmt-check all hand-written crates
+  # (qualityCrates; generated gen/proto is excluded). What each pass is actually
+  # worth is measured below rather than assumed from its name: the
+  # `--all-features` one covers almost nothing here, and the
+  # `--no-default-features` one only works with the exclusions it carries.
   #
   # `--workspace --all-targets` is load-bearing. Do NOT shorten it. Both flags
   # were verified by injecting a deliberate error and re-running, not assumed
@@ -92,10 +94,17 @@ in
   #   - Without `--all-targets`: `#[cfg(test)]` modules, `tests/`, `benches/`
   #     and `examples/` are skipped. Most of this repo's test code lives in
   #     `#[cfg(test)] mod tests` inside member crates.
-  #   - The `--all-features` pass is only meaningful *with* `--workspace`: the
-  #     root package's sole feature (`fuse-sandbox`) is already default, so on
-  #     the root package alone that second invocation was a 0.30s no-op that
-  #     never once compiled the feature-gated code its name promises.
+  #   - Without `--workspace` the `--all-features` pass was a 0.30s no-op: the
+  #     root package's sole feature (`fuse-sandbox`) is already default, and the
+  #     feature-gated code it promises to cover lives in members that were not
+  #     selected. Measured honestly, it is *still* close to a no-op with
+  #     `--workspace` (2.31s, zero units recompiled after the default pass):
+  #     only four members declare features, and `--workspace` already unifies
+  #     every one of them on — the cdylibs pull `plugin-sdk/stabby` →
+  #     `plugin-stabby/host` → `plugin-abi`, and the root's default pulls
+  #     `sandboxfuse/fuse-sandbox`. It is kept as cheap insurance against a
+  #     future feature nothing else references, not because it covers anything
+  #     today. The pass that does add coverage is `--no-default-features`.
   #
   # Together those hid 323 clippy errors, and let the gate pass on a tree that
   # did not compile: a trait impl missing a method inside `crates/engine`'s
@@ -106,26 +115,82 @@ in
   # want a faster local loop, narrow with `-p <crate>` — never by dropping
   # `--workspace`.
   #
-  # `tests/lint_gate.rs` asserts both flags are still here, and that every
+  # `tests/lint_gate.rs` asserts these flags are still here, and that every
   # workspace member inherits `[workspace.lints]` — a member that does not is
   # linted with stock clippy only, which is the same silent hole one level down.
   #
-  # Known gaps, so nobody has to rediscover them:
-  #   - The CI `Lint` job runs on `ubuntu-latest` only, so macOS-only code
-  #     (`proc/src/proc_exec/imp_macos.rs`, the Mach `sweep_threads` in
-  #     `src/diag.rs`, …) is compiled by `Test darwin/arm64` but never linted.
-  #     Running `lint` on a Mac can therefore disagree with CI in either
-  #     direction — `#[expect]` is fulfilled-or-error, and the crate-root test
-  #     exemptions are pinned to the lint set that fires on Linux.
-  #   - `--all-targets` does not include doctests.
-  #   - `--no-default-features` (i.e. `fuse-sandbox` off) is linted nowhere,
-  #     and built nowhere either.
+  # The third pass covers `fuse-sandbox` **off**, and its selection is the
+  # subtle one. `--workspace --no-default-features` looks like it turns the
+  # feature off and does not: `crates/e2e`, `crates/plugingo-e2e` and
+  # `crates/testkit` depend on the root `heph` package with default features on,
+  # and cargo unifies features across the whole selection, so that edge switches
+  # `fuse-sandbox` straight back on. Verified, not reasoned: with an
+  # `indexing_slicing` error injected into `crates/sandboxfuse/src/stub.rs` — the
+  # file that is compiled *only* when the feature is off — the naive invocation
+  # exits 0 and the excluded one exits 101.
+  #
+  # Because that is invisible when it regresses (a new member with
+  # `heph = { path = ".." }` silently re-enables it, and the pass keeps
+  # reporting green while linting the wrong arm), the script *asserts* the
+  # feature is off before linting rather than trusting the flag. `cargo tree -i`
+  # exits non-zero when the package is absent from the resolved graph, which is
+  # the state we want.
+  #
+  # Remaining gaps, so nobody has to rediscover them:
+  #   - `--all-targets` does not include doctests (10 blocks).
+  #   - `cargo test --no-default-features` is not run — the feature-off arm is
+  #     compiled and linted, never executed. `crates/sandboxfuse`'s
+  #     `fuse_sandbox_is_a_default_feature` asserts the feature *is* on, so a
+  #     test leg would need that test `#[cfg]`-split first.
+  #   - CI lints `linux/amd64` and `darwin/arm64`, so the OS axis is covered but
+  #     the arch axis is confounded: `aarch64` is only ever linted together with
+  #     macOS, and there is no `Lint linux/arm64`. An `#[expect(clippy::…)]`
+  #     that is unfulfilled only on `aarch64-unknown-linux-gnu` would be
+  #     invisible — plain rustc reports `unfulfilled_lint_expectations` for its
+  #     own lints, but silently ignores an unfulfilled expectation on a *tool*
+  #     lint it does not know, so `Test linux/arm64` cannot stand in for a lint
+  #     job. Either keep lint exemptions free of `target_arch` conditions, or
+  #     add the third leg.
+  #
+  # The flags are written out literally in both scripts rather than factored
+  # into a shared Nix variable on purpose: `tests/lint_gate.rs` guards them by
+  # reading this file, and a guard that reads back an interpolation hole rather
+  # than the flags guards nothing.
   scripts.lint.exec = ''
     set -euo pipefail
     echo '> clippy'
     cargo clippy --workspace --all-targets --locked -- -D warnings
     echo '> clippy --all-features'
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    # Assert the feature is genuinely off before linting it. A *successful*
+    # `cargo tree -i fuser` means `fuser` is still in the resolved graph, i.e.
+    # the pass below would lint the fuse-sandbox=on arm while announcing the
+    # opposite. Absence is specifically "did not match any packages" — matching
+    # on the exit code alone would read *any* cargo failure (an ambiguous
+    # `fuser` after a transitive version bump, a resolver error) as "feature
+    # off" and wave the wrong arm through, which is the silent-green failure
+    # this whole gate exists to remove.
+    echo '> checking --no-default-features really disables fuse-sandbox'
+    if fuser_tree=$(cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --no-default-features --locked -i fuser 2>&1); then
+      echo "error: --no-default-features left 'fuser' in the dependency graph, so the pass below would lint the fuse-sandbox=on arm and the feature-off code is still covered by nothing." >&2
+      echo "       Some selected package pulls the root 'heph' package (or 'sandboxfuse') with default features on; exclude it here and in 'fix'." >&2
+      printf '%s\n' "$fuser_tree" >&2
+      exit 1
+    elif ! printf '%s' "$fuser_tree" | grep -q 'did not match any packages'; then
+      echo "error: cargo tree failed for a reason other than 'fuser' being absent, so this check proved nothing:" >&2
+      printf '%s\n' "$fuser_tree" >&2
+      exit 1
+    fi
+    # Positive control. Without it, `fuser` leaving the graph for an unrelated
+    # reason — renamed, or the FUSE backend swapped — makes the check above pass
+    # forever while proving nothing, because "absent when off" and "absent
+    # always" look identical from one direction.
+    if ! cargo tree --workspace --locked -i fuser >/dev/null 2>&1; then
+      echo "error: 'fuser' is not in the graph even with fuse-sandbox on, so the check above cannot tell 'feature off' from 'package gone'. Point this probe at whatever the feature now pulls in." >&2
+      exit 1
+    fi
+    echo '> clippy --no-default-features'
+    cargo clippy --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --all-targets --no-default-features --locked -- -D warnings
     echo '> fmt'
     cargo fmt --check ${qualityCrates}
   '';
@@ -133,9 +198,16 @@ in
   # only reaches the root package leaves the member lints `lint` reports with
   # no automated fix at all. `clippy --fix` rather than `cargo fix`: it applies
   # clippy's machine-applicable suggestions as well as rustc's, and clippy's are
-  # what `lint` fails on. `tests/lint_gate.rs` guards the `lint` invocation;
-  # keep this one in step with it by hand.
-  scripts.fix.exec = "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged && cargo fmt ${qualityCrates}";
+  # what `lint` fails on. The `--no-default-features` line carries the same
+  # exclusions for the same reason as in `lint`; without it CI reports a lint in
+  # `stub.rs` that `fix` cannot reach. `tests/lint_gate.rs` asserts the two
+  # scripts select the same code.
+  scripts.fix.exec = ''
+    set -euo pipefail
+    cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
+    cargo clippy --fix --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --all-targets --no-default-features --allow-dirty --allow-staged
+    cargo fmt ${qualityCrates}
+  '';
   # Test everything. The default pass covers all crates with default features; the
   # targeted passes exercise the feature-gated transport code, off by default:
   # the stabby host loader/adapters (plugin-stabby `host`) and the stabby guest

@@ -423,16 +423,56 @@ jobs:
       - name: Check plugin ABI version
         run: scripts/abi-check.sh "origin/${{ github.base_ref }}"
 
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    # The gate now check-builds every workspace member's libs *and* test targets,
-    # twice (default features, then --all-features), where it used to build the
-    # root package alone in ~1m35s. A fork PR gets no R2 sccache credentials and
-    # runs both passes stone cold. A timeout renders as a red `Lint`
-    # indistinguishable from a real lint failure, so the headroom is deliberate.
+  # The gate check-builds every workspace member's libs *and* test targets,
+  # three times (default features, --all-features, --no-default-features),
+  # where it used to build the root package alone in ~1m35s. A fork PR gets no
+  # R2 sccache credentials and runs every pass stone cold — and clippy's work is
+  # not sccache-cacheable at all (`sccache` does not cache `clippy-driver`,
+  # which is why these jobs' own stats report ~200 "non-cacheable calls"), so a
+  # warm cache only saves the dependency compiles. A timeout renders as a red
+  # lint leg indistinguishable from a real lint failure, so the 30min headroom
+  # is deliberate.
+  #
+  # Both platforms, because macOS-only code was clippy-linted nowhere.
+  # `Test darwin/arm64` compiles it, but nothing there passes `-D warnings`, so
+  # the Mach `sweep_threads` block in `src/diag.rs` — the largest unsafe region
+  # in the tree — plus `crates/proc/src/proc_exec/imp_macos.rs` and
+  # `process_watcher/kqueue_macos.rs` had never been through
+  # `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`,
+  # `indexing_slicing` or `unwrap_used`.
+  #
+  # Every leg runs the *same* `lint` script — no per-OS variant. The failure
+  # being closed is a Mac developer's local `lint` disagreeing with CI in either
+  # direction (`#[expect]` is fulfilled-or-error, so a lint that fires on one OS
+  # and not the other is a hard error on the other), and that only stays closed
+  # if every leg runs the same command as the developer does.
+  lint_matrix:
+    name: Lint ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
     needs: gen
+    strategy:
+      # Both legs always report. With fail-fast the second is cancelled the
+      # moment the first goes red, and `cancelled` is exactly the state that
+      # tells you nothing about the platform you did not see.
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          # macos-latest is Apple Silicon. There is no `Lint linux/arm64` leg:
+          # aarch64 is covered here on the OS axis, and an `#[expect]` that is
+          # unfulfilled only on aarch64-linux would be invisible anyway — plain
+          # rustc silently ignores an unfulfilled expectation on a *tool* lint
+          # it does not know, so `Test linux/arm64` cannot stand in for one.
+          # See the note in devenv.nix.
+          - os: darwin
+            arch: arm64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
     steps:
       - name: Download repo
         uses: actions/download-artifact@v7
@@ -443,9 +483,10 @@ jobs:
       - name: Setup Nix + devenv
         uses: ./.github/actions/setup-nix
         with:
-          cargo-target: x86_64-unknown-linux-gnu
-          # Distinct from the linux/amd64 build job, which uses the same target
-          # triple: sharing a cargo cache key means whichever job saves first
+          cargo-target: ${{ matrix.target }}
+          # Distinct from the build and test jobs, which use the same target
+          # triples: actions/cache skips the save when the exact key already
+          # exists, so two jobs sharing a key means whichever saves first
           # freezes the entry and the other's crate downloads never persist.
           cache-suffix: "-lint"
           r2-secret: ${{ secrets.CF_SSCACHE }}
@@ -458,6 +499,49 @@ jobs:
         if: always()
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
+
+  # Aggregator. Does no work; it exists so the status context stays named
+  # exactly `Lint`.
+  #
+  # The branch ruleset requires a context named literally `Lint`. A bare matrix
+  # publishes one context per leg and never that name again, so every open PR
+  # would block forever on a required check that can no longer appear — a worse
+  # failure than the one being fixed, and the workflow edit and the ruleset edit
+  # cannot land atomically. Matrixing the work and keeping this fan-in gives
+  # per-platform legs with their own logs *and* an unchanged required context,
+  # so this lands with **no branch-protection change at all**.
+  #
+  # `if: always()` is what makes it able to report when a leg fails — without it
+  # a failed leg would *skip* this job, and a skipped required check is not a
+  # red one. That inverts the danger: `always()` alone would let it succeed on a
+  # failed leg, since a job whose steps all pass is green regardless of why its
+  # dependencies ended. Hence the explicit `result` check below. `needs` alone
+  # decides *ordering* here, not outcome.
+  #
+  # `needs.lint_matrix.result` is the aggregate over every leg: `success` only
+  # when all of them succeeded, otherwise `failure` / `cancelled` / `skipped`.
+  # Comparing against `success` therefore fails closed for a new leg too — add a
+  # third platform and it is covered without touching this job.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: lint_matrix
+    if: always()
+    steps:
+      - name: Require every lint leg to have succeeded
+        env:
+          # Read through env rather than interpolated into the script body, so
+          # the value can never be parsed as shell.
+          LINT_MATRIX_RESULT: ${{ needs.lint_matrix.result }}
+        run: |
+          set -euo pipefail
+          echo "lint_matrix: $LINT_MATRIX_RESULT"
+          if [ "$LINT_MATRIX_RESULT" != "success" ]; then
+            echo "::error title=Lint::lint_matrix did not succeed (result: $LINT_MATRIX_RESULT). Open the 'Lint linux/amd64' and 'Lint darwin/arm64' jobs for the failing leg. A 'skipped' or 'cancelled' result counts as a failure here on purpose: it means a platform was never linted."
+            exit 1
+          fi
+          echo "every lint leg succeeded"
 
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}

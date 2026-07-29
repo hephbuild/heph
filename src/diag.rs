@@ -240,11 +240,6 @@ fn sweep_threads() -> usize {
     n
 }
 
-/// Our own Mach task port.
-///
-/// `libc::mach_task_self()` is deprecated in favour of the `mach2` crate; this
-/// reads the same underlying static rather than pulling in a dependency for one
-/// port lookup.
 /// macOS has no `tgkill`; the Mach layer is the way in.
 ///
 /// `task_threads` hands back a port for every thread in the task,
@@ -257,8 +252,6 @@ fn sweep_threads() -> usize {
     let mut ports: mach2::mach_types::thread_act_array_t = std::ptr::null_mut();
     let mut count: mach2::message::mach_msg_type_number_t = 0;
 
-    // SAFETY: `task_threads` fills `ports`/`count` on success; both are valid
-    // out-params, and `mach_task_self()` names our own task.
     // SAFETY: names our own task.
     let task = unsafe { mach2::traps::mach_task_self() };
     // SAFETY: `ports`/`count` are valid out-params; `task_threads` fills them.
