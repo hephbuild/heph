@@ -49,6 +49,200 @@ fn windowed(
     (window, scroll)
 }
 
+/// One row of a list-view body before it is rendered: the addr, the colour it
+/// paints in, and an optional dim trailing detail (a failure message).
+///
+/// Rows borrow out of [`BuildState`], so a list can be counted, measured and
+/// windowed without building a `Line` for every entry. The viewport shows ~20
+/// rows; at 100k targets the other 99,980 `format!`s were pure waste.
+#[derive(Debug, Clone, Copy)]
+struct BodyRow<'a> {
+    addr: &'a str,
+    color: Color,
+    /// Rendered dim after the addr. `None` for the addr-only lists.
+    detail: Option<&'a str>,
+}
+
+impl BodyRow<'_> {
+    /// Visible column count of this row's line, without rendering it. Must track
+    /// [`BodyRow::render`] exactly: the horizontal pan clamps against the widest
+    /// row in the whole list, so a mismatch would shift the viewport.
+    fn width(&self) -> usize {
+        // The leading indent, plus the same two-space gap before any detail.
+        2 + self.addr.chars().count() + self.detail.map_or(0, |d| 2 + d.chars().count())
+    }
+
+    fn render(&self) -> Line<'static> {
+        let addr = Span::styled(format!("  {}", self.addr), Style::default().fg(self.color));
+        match self.detail {
+            None => Line::from(addr),
+            Some(detail) => Line::from(vec![
+                addr,
+                Span::styled(
+                    format!("  {detail}"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]),
+        }
+    }
+}
+
+/// The rows of one list view, plus whether they still need ordering. Building
+/// one costs a single allocation whatever the list length; only the rows the
+/// viewport actually shows become `Line`s.
+struct BodyRows<'a> {
+    rows: Vec<BodyRow<'a>>,
+    /// Set when the rows came out of a `HashSet` and must be ordered by addr
+    /// before windowing. The arrival-ordered lists leave it clear — they already
+    /// render in the order they were folded.
+    sort_by_addr: bool,
+}
+
+impl<'a> BodyRows<'a> {
+    /// Rows that render in the order given.
+    fn in_order(rows: Vec<BodyRow<'a>>) -> Self {
+        Self {
+            rows,
+            sort_by_addr: false,
+        }
+    }
+
+    /// Rows that render ordered by addr. Only the visible window is ever
+    /// actually ordered — see [`BodyRows::window`].
+    fn by_addr(rows: Vec<BodyRow<'a>>) -> Self {
+        Self {
+            rows,
+            sort_by_addr: true,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The widest row in visible columns — the clamp for the horizontal pan.
+    fn max_width(&self) -> usize {
+        self.rows.iter().map(BodyRow::width).max().unwrap_or(0)
+    }
+
+    /// Render the `rows`-tall window at `scroll`, returning it and the clamped
+    /// offset. Clamps like [`windowed`]: the window never runs off the end. An
+    /// addr-ordered list is placed by [`place_window`], never sorted whole.
+    fn window(mut self, rows: usize, scroll: usize) -> (Vec<Line<'static>>, usize) {
+        let total = self.rows.len();
+        if rows == 0 {
+            return (Vec::new(), 0);
+        }
+        let start = if total <= rows {
+            0
+        } else {
+            scroll.min(total - rows)
+        };
+        let end = start.saturating_add(rows).min(total);
+        if self.sort_by_addr {
+            // Addrs are unique within every list `by_addr` backs — they come out
+            // of `BuildState`'s `matched` / `cache_hit`, both keyed by addr — so
+            // the order is total and the unstable partition is unambiguous.
+            place_window(&mut self.rows, start, end, |a, b| a.addr.cmp(b.addr));
+        }
+        let window = self
+            .rows
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .map(BodyRow::render)
+            .collect();
+        (window, start)
+    }
+}
+
+/// A row buffer sized for a list of `len` rows that `filter` will thin out.
+///
+/// Unfiltered, the whole list lands in it, so one reservation beats `collect`'s
+/// geometric growth and its repeated copies. Filtered, the match count is not
+/// known ahead and can be a handful out of 100k, so reserving the full length
+/// every frame would ask the allocator for megabytes to hold three rows.
+fn row_buffer<T>(len: usize, filter: &str) -> Vec<T> {
+    if filter.is_empty() {
+        Vec::with_capacity(len)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Move the elements that belong at `[start, end)` in `cmp` order into that
+/// range, leaving the rest of `rows` in no particular order.
+///
+/// This is the sort the viewport does *not* do. Two `select_nth_unstable_by`
+/// partitions place the range in `O(n)` — first splitting off everything that
+/// sorts after the window, then everything before it — and only the window
+/// itself, `end - start` long, is sorted. A full sort would be `O(n log n)`
+/// to then throw all but a screenful away.
+///
+/// `start <= end <= rows.len()`. Callers must order on a key that is unique
+/// across `rows`: the partitions are unstable, so with duplicate keys the
+/// window could hold a different pick than a stable full sort would.
+fn place_window<T>(
+    rows: &mut [T],
+    start: usize,
+    end: usize,
+    mut cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) {
+    if end < rows.len() {
+        // Ranks `[0, end)` move to the front; the tail is left unordered.
+        rows.select_nth_unstable_by(end, &mut cmp);
+    }
+    // `end <= rows.len()`, so the split is in bounds.
+    let (head, _) = rows.split_at_mut(end);
+    if start > 0 {
+        // Ranks `[0, start)` move to the front of that prefix, leaving exactly
+        // the window's elements behind them.
+        head.select_nth_unstable_by(start, &mut cmp);
+    }
+    // `start <= end == head.len()`, so this split is in bounds too.
+    let (_, window) = head.split_at_mut(start);
+    window.sort_unstable_by(&mut cmp);
+}
+
+/// One frame's body: the live view's already-rendered lines, or a list tab's
+/// deferred rows. The live body is bounded by what is in flight; a list tab is
+/// bounded only by the run, which is why it defers.
+enum Body<'a> {
+    Lines(Vec<Line<'static>>),
+    Rows(BodyRows<'a>),
+}
+
+impl Body<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Lines(lines) => lines.len(),
+            Self::Rows(rows) => rows.len(),
+        }
+    }
+
+    /// The widest row in visible columns — the clamp for the horizontal pan.
+    fn max_width(&self) -> usize {
+        match self {
+            Self::Lines(lines) => lines
+                .iter()
+                .map(|l| spans_width(&l.spans))
+                .max()
+                .unwrap_or(0),
+            Self::Rows(rows) => rows.max_width(),
+        }
+    }
+
+    /// The `rows`-tall window at `scroll`, plus the clamped offset.
+    fn window(self, rows: usize, scroll: usize) -> (Vec<Line<'static>>, usize) {
+        match self {
+            Self::Lines(lines) => windowed(lines, rows, scroll),
+            Self::Rows(r) => r.window(rows, scroll),
+        }
+    }
+}
+
 /// Columns shifted per Left/Right key press when panning a wide body.
 pub const HSCROLL_STEP: usize = 4;
 
@@ -262,12 +456,20 @@ pub enum ViewMode {
 
 /// Case-insensitive substring test for the `/` filter on the `Done`/`Failed`
 /// bodies. An empty filter matches everything (the unfiltered list).
+///
+/// Compares in place. Lower-casing both sides allocated two `String`s per row,
+/// and the filter has to be tried against *every* row to know how many matched —
+/// so at 100k targets that was 200k allocations on every frame.
 fn addr_matches(addr: &str, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
     }
-    addr.to_ascii_lowercase()
-        .contains(&filter.to_ascii_lowercase())
+    // ASCII-only folding, matching what the two `to_ascii_lowercase` calls did.
+    // `windows` yields nothing when the filter is longer than the addr, and the
+    // empty filter is handled above, so the width is always non-zero.
+    addr.as_bytes()
+        .windows(filter.len())
+        .any(|w| w.eq_ignore_ascii_case(filter.as_bytes()))
 }
 
 /// Which target set the header counters are scoped to. `Matched` (the default)
@@ -466,6 +668,15 @@ pub struct BuildState {
     /// Entries persist for the request (completed durations are kept so a finished
     /// op still shows in the breakdown while a later op is active).
     ops: HashMap<String, OpTimeline>,
+    /// The addrs in `ops` whose timeline has an op open right now — the live
+    /// subset the render path cares about.
+    ///
+    /// `ops` is never pruned, so it grows to every target the run touched;
+    /// walking it to find the few with an open op cost ~2 ms in the worker
+    /// braille and ~3 ms in the slow rows on *every* frame at 100k targets.
+    /// This set is bounded by what is in flight instead. Maintained at the one
+    /// place `OpTimeline::active` changes, so it cannot drift from it.
+    open_ops: HashSet<String>,
     /// The matched top-level target set, accumulated as the matcher streams.
     matched: HashSet<String>,
     /// Whether any `Matched` event has been seen (gates display of the line).
@@ -603,6 +814,16 @@ impl BuildState {
                         tl.active = None;
                     }
                 }
+            }
+            // Mirror the transition into the live index the frame path walks. Kept
+            // here, at the sole writer of `active`, so the two cannot disagree.
+            let open = tl.active.is_some();
+            if open {
+                if !self.open_ops.contains(addr) {
+                    self.open_ops.insert(addr.to_string());
+                }
+            } else {
+                self.open_ops.remove(addr);
             }
         }
         match &ev.kind {
@@ -754,10 +975,14 @@ impl BuildState {
     /// active op, each at least one second, ordered by [`Op::order`]. A target
     /// with no active op is never slow (it dropped off when its last op ended).
     fn long_running(&self, now_ms: u64, threshold_ms: u64) -> Vec<SlowTarget> {
+        // Walks only the targets with an op open, not every target the run has
+        // touched — see [`BuildState::open_ops`]. This runs on every frame of the
+        // live view.
         let mut out: Vec<SlowTarget> = self
-            .ops
+            .open_ops
             .iter()
-            .filter_map(|(addr, tl)| {
+            .filter_map(|addr| {
+                let tl = self.ops.get(addr)?;
                 let (active_op, active_start) = tl.active?;
                 let active_elapsed = now_ms.saturating_sub(active_start);
                 if active_elapsed <= threshold_ms {
@@ -857,107 +1082,94 @@ impl BuildState {
         format!("{done} · {cached} · {failed}")
     }
 
-    /// Body rows for the [`ViewMode::Failed`] view: one line per failed target,
-    /// addr in red followed by its error message (when one was reported).
-    /// Empty when nothing has failed.
-    pub fn failed_lines(&self, filter: &str) -> Vec<Line<'static>> {
-        self.failed
-            .iter()
-            .filter(|(addr, _)| addr_matches(addr, filter))
-            .map(|(addr, err)| {
-                let mut spans = vec![Span::styled(
-                    format!("  {addr}"),
-                    Style::default().fg(Color::Red),
-                )];
-                if let Some(err) = err {
+    /// Body rows for the [`ViewMode::Failed`] view: one row per failed target,
+    /// addr in red followed by its error message (when one was reported), in
+    /// failure order. Empty when nothing has failed.
+    fn failed_rows(&self, filter: &str) -> BodyRows<'_> {
+        let mut rows = row_buffer(self.failed.len(), filter);
+        rows.extend(
+            self.failed
+                .iter()
+                .filter(|(addr, _)| addr_matches(addr, filter))
+                .map(|(addr, err)| BodyRow {
+                    addr,
+                    color: Color::Red,
                     // Keep the message on one line; the viewport clips overflow.
-                    let msg = err.lines().next().unwrap_or(err);
-                    spans.push(Span::styled(
-                        format!("  {msg}"),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ));
-                }
-                Line::from(spans)
-            })
-            .collect()
+                    detail: err.as_deref().map(|e| e.lines().next().unwrap_or(e)),
+                }),
+        );
+        BodyRows::in_order(rows)
     }
 
-    /// Body rows for the [`ViewMode::Done`] view: one line per completed target,
+    /// Body rows for the [`ViewMode::Done`] view: one row per completed target,
     /// addr in green, in completion order. Scoped by `scope`: `Matched` keeps only
     /// addrs in the matched top-level set, `All` lists every completed target
     /// (transitive deps included). Empty when nothing has finished.
-    pub fn done_lines(&self, scope: CountScope, filter: &str) -> Vec<Line<'static>> {
-        self.done
-            .iter()
-            .filter(|addr| match scope {
-                CountScope::All => true,
-                CountScope::Matched => self.matched.contains(*addr),
-            })
-            .filter(|addr| addr_matches(addr, filter))
-            .map(|addr| {
-                Line::from(Span::styled(
-                    format!("  {addr}"),
-                    Style::default().fg(Color::Green),
-                ))
-            })
-            .collect()
+    fn done_rows(&self, scope: CountScope, filter: &str) -> BodyRows<'_> {
+        let mut rows = row_buffer(self.done.len(), filter);
+        rows.extend(
+            self.done
+                .iter()
+                .filter(|addr| match scope {
+                    CountScope::All => true,
+                    CountScope::Matched => self.matched.contains(*addr),
+                })
+                .filter(|addr| addr_matches(addr, filter))
+                .map(|addr| BodyRow {
+                    addr,
+                    color: Color::Green,
+                    detail: None,
+                }),
+        );
+        BodyRows::in_order(rows)
     }
 
     /// Body rows for the [`ViewMode::Matched`] view: every matched top-level
-    /// target, sorted for a stable order (the matched set is a `HashSet`).
-    /// Finished targets render green, still-pending ones default-white. Empty
-    /// before any `Matched` event arrives.
-    pub fn matched_lines(&self, filter: &str) -> Vec<Line<'static>> {
-        let mut addrs: Vec<&String> = self
-            .matched
-            .iter()
-            .filter(|a| addr_matches(a, filter))
-            .collect();
-        addrs.sort();
-        addrs
-            .into_iter()
-            .map(|addr| {
-                let color = if self.finished.contains(addr) {
-                    Color::Green
-                } else {
-                    Color::White
-                };
-                Line::from(Span::styled(
-                    format!("  {addr}"),
-                    Style::default().fg(color),
-                ))
-            })
-            .collect()
+    /// target, ordered by addr for a stable list (the matched set is a
+    /// `HashSet`). Finished targets render green, still-pending ones
+    /// default-white. Empty before any `Matched` event arrives.
+    fn matched_rows(&self, filter: &str) -> BodyRows<'_> {
+        let mut rows = row_buffer(self.matched.len(), filter);
+        rows.extend(
+            self.matched
+                .iter()
+                .filter(|a| addr_matches(a, filter))
+                .map(|addr| BodyRow {
+                    addr,
+                    color: if self.finished.contains(addr) {
+                        Color::Green
+                    } else {
+                        Color::White
+                    },
+                    detail: None,
+                }),
+        );
+        BodyRows::by_addr(rows)
     }
 
     /// Body rows for the [`ViewMode::Cached`] view: every target that hit cache
     /// (local or remote), scoped like the header's cached count — `Matched` keeps
     /// only matched top-level targets (all cache hits before any `Matched` event),
-    /// `All` lists every cached target. Sorted for a stable order (cache hits are
-    /// a `HashSet`). Empty when nothing has hit cache.
-    pub fn cached_lines(&self, scope: CountScope, filter: &str) -> Vec<Line<'static>> {
-        let mut addrs: Vec<&String> = self
-            .cache_hit
-            .keys()
-            .filter(|a| match scope {
-                CountScope::All => true,
-                CountScope::Matched if self.matched_seen => self.matched.contains(*a),
-                CountScope::Matched => true,
-            })
-            .filter(|a| addr_matches(a, filter))
-            .collect();
-        addrs.sort();
-        addrs
-            .into_iter()
-            .map(|addr| {
-                Line::from(Span::styled(
-                    format!("  {addr}"),
-                    Style::default().fg(Color::Cyan),
-                ))
-            })
-            .collect()
+    /// `All` lists every cached target. Ordered by addr for a stable list (cache
+    /// hits are keyed by addr). Empty when nothing has hit cache.
+    fn cached_rows(&self, scope: CountScope, filter: &str) -> BodyRows<'_> {
+        let mut rows = row_buffer(self.cache_hit.len(), filter);
+        rows.extend(
+            self.cache_hit
+                .keys()
+                .filter(|a| match scope {
+                    CountScope::All => true,
+                    CountScope::Matched if self.matched_seen => self.matched.contains(*a),
+                    CountScope::Matched => true,
+                })
+                .filter(|a| addr_matches(a, filter))
+                .map(|addr| BodyRow {
+                    addr,
+                    color: Color::Cyan,
+                    detail: None,
+                }),
+        );
+        BodyRows::by_addr(rows)
     }
 
     /// The header's cached count: matched targets that hit cache
@@ -987,10 +1199,27 @@ impl BuildState {
     /// Workers currently holding an execute slot (targets whose active op is
     /// `Execute`). This is the semaphore-bound busy count, not `running` (which
     /// includes targets blocked on deps without a permit).
+    ///
+    /// Bounded by what is in flight, not by the run: it walks [`Self::open_ops`],
+    /// not every target that has ever run an op. The header calls this on every
+    /// frame in every view.
     pub fn busy_workers(&self) -> usize {
-        self.ops
-            .values()
-            .filter(|tl| matches!(tl.active, Some((Op::Execute, _))))
+        // A stale entry here would be silently skipped by this filter and by
+        // `long_running`'s `?`, under-reporting the worker count rather than
+        // failing. `O(in-flight)`, and free in release.
+        debug_assert!(
+            self.open_ops
+                .iter()
+                .all(|addr| self.ops.get(addr).is_some_and(|tl| tl.active.is_some())),
+            "open_ops holds an addr whose timeline has no op open",
+        );
+        self.open_ops
+            .iter()
+            .filter(|addr| {
+                self.ops
+                    .get(*addr)
+                    .is_some_and(|tl| matches!(tl.active, Some((Op::Execute, _))))
+            })
             .count()
     }
 
@@ -1791,16 +2020,16 @@ impl TUIAppView for TuiProgressView {
             ViewMode::Default => {
                 let mut b = self.approval_lines();
                 b.extend(self.state.body_lines(now_ms));
-                b
+                Body::Lines(b)
             }
-            ViewMode::Done => self.state.done_lines(self.scope.get(), filter),
-            ViewMode::Matched => self.state.matched_lines(filter),
-            ViewMode::Cached => self.state.cached_lines(self.scope.get(), filter),
-            ViewMode::Failed => self.state.failed_lines(filter),
+            ViewMode::Done => Body::Rows(self.state.done_rows(self.scope.get(), filter)),
+            ViewMode::Matched => Body::Rows(self.state.matched_rows(filter)),
+            ViewMode::Cached => Body::Rows(self.state.cached_rows(self.scope.get(), filter)),
+            ViewMode::Failed => Body::Rows(self.state.failed_rows(filter)),
         };
         let total = body.len();
         let filtering = !filter.is_empty();
-        if body.is_empty() {
+        if total == 0 {
             self.scroll.set(0);
             self.hscroll.set(0);
             match view {
@@ -1846,17 +2075,21 @@ impl TUIAppView for TuiProgressView {
             }
         } else {
             // Clamp the horizontal pan against the widest body line so panning
-            // stops once the longest line's tail reaches the right edge.
-            let avail = usize::from(width.max(1));
-            let max_w = body
-                .iter()
-                .map(|l| spans_width(&l.spans))
-                .max()
-                .unwrap_or(0);
-            let hscroll = self.hscroll.get().min(max_w.saturating_sub(avail));
+            // stops once the longest line's tail reaches the right edge. Measured
+            // over the whole list, not just the window, so the clamp does not
+            // shift as you scroll — which means measuring every row. An unpanned
+            // body clamps to 0 whatever the widest row is, so skip the walk
+            // entirely in that case; it is every frame the user has not panned.
+            let hscroll = match self.hscroll.get() {
+                0 => 0,
+                pan => {
+                    let avail = usize::from(width.max(1));
+                    pan.min(body.max_width().saturating_sub(avail))
+                }
+            };
             self.hscroll.set(hscroll);
 
-            let (window, scroll) = windowed(body, body_rows, self.scroll.get());
+            let (window, scroll) = body.window(body_rows, self.scroll.get());
             self.scroll.set(scroll);
             lines.extend(window.into_iter().map(|l| hscroll_line(l, hscroll)));
         }
@@ -1991,6 +2224,13 @@ mod tests {
 
     fn ev(at_unix_ms: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent { at_unix_ms, kind }
+    }
+
+    /// Every row of a list body, rendered in order — what the viewport would
+    /// show if it had unlimited rows. The reference the windowed renders are
+    /// checked against.
+    fn all_lines(rows: BodyRows<'_>) -> Vec<Line<'static>> {
+        rows.window(usize::MAX, 0).0
     }
 
     /// Flatten a header model's items into their concatenated text.
@@ -3071,7 +3311,7 @@ mod tests {
         s.apply(&ev(4, result_start("//a:bad2")));
         s.apply(&ev(5, result_end("//a:bad2", Some("kaput".into()))));
 
-        let lines = s.failed_lines("");
+        let lines = all_lines(s.failed_rows(""));
         // Only the two errored targets appear, in failure order.
         assert_eq!(lines.len(), 2);
         let l0 = format!("{}", lines[0]);
@@ -3166,15 +3406,15 @@ mod tests {
             |ls: Vec<Line<'static>>| -> String { ls.iter().map(|l| format!("{l}")).collect() };
 
         // Empty filter keeps everything.
-        assert_eq!(s.done_lines(CountScope::All, "").len(), 2);
-        assert_eq!(s.failed_lines("").len(), 2);
+        assert_eq!(all_lines(s.done_rows(CountScope::All, "")).len(), 2);
+        assert_eq!(all_lines(s.failed_rows("")).len(), 2);
 
         // Substring filter, case-insensitive, matches only the package prefix.
-        let done = join(s.done_lines(CountScope::All, "WEB"));
+        let done = join(all_lines(s.done_rows(CountScope::All, "WEB")));
         assert!(done.contains("//web:server"), "{done}");
         assert!(!done.contains("//api:server"), "{done}");
 
-        let failed = join(s.failed_lines("api"));
+        let failed = join(all_lines(s.failed_rows("api")));
         assert!(failed.contains("//api:bad"), "{failed}");
         assert!(!failed.contains("//web:bad"), "{failed}");
     }
@@ -3447,24 +3687,22 @@ mod tests {
         s.apply(&ev(6, result_end("//a:bad", Some("boom".into()))));
 
         // Matched scope: only the matched top-level target.
-        let matched_lines: String = s
-            .done_lines(CountScope::Matched, "")
+        let matched_scope: String = all_lines(s.done_rows(CountScope::Matched, ""))
             .iter()
             .map(|l| format!("{l}"))
             .collect();
-        assert!(matched_lines.contains("//a:top"), "{matched_lines}");
-        assert!(!matched_lines.contains("//dep:lib"), "{matched_lines}");
-        assert!(!matched_lines.contains("//a:bad"), "{matched_lines}");
+        assert!(matched_scope.contains("//a:top"), "{matched_scope}");
+        assert!(!matched_scope.contains("//dep:lib"), "{matched_scope}");
+        assert!(!matched_scope.contains("//a:bad"), "{matched_scope}");
 
         // All scope: every completed target, deps included, still no failures.
-        let all_lines: String = s
-            .done_lines(CountScope::All, "")
+        let all_scope: String = all_lines(s.done_rows(CountScope::All, ""))
             .iter()
             .map(|l| format!("{l}"))
             .collect();
-        assert!(all_lines.contains("//a:top"), "{all_lines}");
-        assert!(all_lines.contains("//dep:lib"), "{all_lines}");
-        assert!(!all_lines.contains("//a:bad"), "{all_lines}");
+        assert!(all_scope.contains("//a:top"), "{all_scope}");
+        assert!(all_scope.contains("//dep:lib"), "{all_scope}");
+        assert!(!all_scope.contains("//a:bad"), "{all_scope}");
     }
 
     #[test]
@@ -3559,14 +3797,14 @@ mod tests {
         s.apply(&ev(2, result_end("//a:done", None)));
 
         // Both the finished and the still-pending matched target are listed.
-        let lines = s.matched_lines("");
+        let lines = all_lines(s.matched_rows(""));
         assert_eq!(lines.len(), 2);
         let joined: String = lines.iter().map(|l| format!("{l}")).collect();
         assert!(joined.contains("//a:done"), "{joined}");
         assert!(joined.contains("//a:pending"), "{joined}");
 
         // Filter narrows to the matching addr.
-        let filtered = s.matched_lines("pending");
+        let filtered = all_lines(s.matched_rows("pending"));
         assert_eq!(filtered.len(), 1);
         assert!(format!("{}", filtered[0]).contains("//a:pending"));
     }
@@ -3611,16 +3849,14 @@ mod tests {
         s.apply(&ev(1, local_cache_hit("//a:top")));
         s.apply(&ev(2, local_cache_hit("//dep:lib")));
 
-        let m: String = s
-            .cached_lines(CountScope::Matched, "")
+        let m: String = all_lines(s.cached_rows(CountScope::Matched, ""))
             .iter()
             .map(|l| format!("{l}"))
             .collect();
         assert!(m.contains("//a:top"), "{m}");
         assert!(!m.contains("//dep:lib"), "{m}");
 
-        let a: String = s
-            .cached_lines(CountScope::All, "")
+        let a: String = all_lines(s.cached_rows(CountScope::All, ""))
             .iter()
             .map(|l| format!("{l}"))
             .collect();
@@ -3648,5 +3884,434 @@ mod tests {
         assert!(!v.has_active_filter());
         assert!(!v.is_searching());
         assert_eq!(v.scroll.get(), 0);
+    }
+
+    #[test]
+    fn addr_filter_folds_ascii_case_without_allocating() {
+        assert!(addr_matches("//WEB:Server", "web"));
+        assert!(addr_matches("//web:server", "WEB:SERVER"));
+        assert!(addr_matches("//web:server", "//web:server"));
+        assert!(!addr_matches("//web:server", "api"));
+        // A filter longer than the addr can never match.
+        assert!(!addr_matches("//a:b", "//a:b:c"));
+        // The empty filter is the unfiltered list.
+        assert!(addr_matches("//a:b", ""));
+        // Non-ASCII bytes compare as-is — exactly what ASCII lower-casing did.
+        assert!(addr_matches("//pkg/ünï:t", "ünï"));
+        assert!(!addr_matches("//pkg/ünï:t", "ÜNÏ"));
+    }
+
+    #[test]
+    fn body_row_width_matches_the_rendered_line() {
+        // `width` drives the horizontal-pan clamp, `render` drives the pixels.
+        // They are computed two different ways and must not drift.
+        for row in [
+            BodyRow {
+                addr: "//a:b",
+                color: Color::Green,
+                detail: None,
+            },
+            BodyRow {
+                addr: "//pkg/ünïcødé:tgt",
+                color: Color::White,
+                detail: None,
+            },
+            BodyRow {
+                addr: "//a:b",
+                color: Color::Red,
+                detail: Some("boom: exit status 1"),
+            },
+            // An empty message still renders its (empty) detail span.
+            BodyRow {
+                addr: "//a:b",
+                color: Color::Red,
+                detail: Some(""),
+            },
+        ] {
+            assert_eq!(row.width(), spans_width(&row.render().spans), "{row:?}");
+        }
+    }
+
+    /// `n` matched targets that all finished and hit cache, plus `n` failed
+    /// ones — so every list tab has exactly `n` rows. Addrs are zero-padded so
+    /// their sort order is not their insertion order, which is what makes the
+    /// partial selection observable.
+    fn list_state(n: usize) -> BuildState {
+        let mut s = BuildState::new();
+        let ok: Vec<String> = (0..n).map(|i| format!("//ok/p{i:06}:t{i}")).collect();
+        s.apply(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: ok.clone(),
+                complete: true,
+            },
+        ));
+        for addr in &ok {
+            s.apply(&ev(1, result_start(addr)));
+            s.apply(&ev(2, result_end(addr, None)));
+            s.apply(&ev(3, local_cache_hit(addr)));
+        }
+        for i in 0..n {
+            let addr = format!("//bad/p{i:06}:t{i}");
+            s.apply(&ev(4, result_start(&addr)));
+            s.apply(&ev(5, result_end(&addr, Some(format!("boom {i}")))));
+        }
+        s
+    }
+
+    /// Builds one list tab's rows off a state. A fn pointer so each tab can be
+    /// called twice — once for the reference list, once for the windowed one.
+    type TabRows = for<'a> fn(&'a BuildState) -> BodyRows<'a>;
+
+    const LIST_TABS: [(&str, TabRows); 4] = [
+        ("done", |s| s.done_rows(CountScope::All, "")),
+        ("matched", |s| s.matched_rows("")),
+        ("cached", |s| s.cached_rows(CountScope::All, "")),
+        ("failed", |s| s.failed_rows("")),
+    ];
+
+    #[test]
+    fn windowing_a_list_matches_the_fully_ordered_list_at_every_offset() {
+        // The correctness bar for clipping before rendering: at any viewport
+        // position, the rows shown must be exactly the ones the full-list build
+        // would have put there, and the clamped scroll offset must agree.
+        // Empty and single-row lists are in here because they are the sizes the
+        // two partitions have to decline to run at all.
+        for n in [0usize, 1, 137] {
+            let s = list_state(n);
+            for (name, build) in LIST_TABS {
+                let reference = all_lines(build(&s));
+                assert_eq!(reference.len(), n, "{name}");
+                for rows in [0usize, 1, 7, 20, 136, 137, 200] {
+                    for scroll in 0..=(reference.len() + 5) {
+                        let (want, want_off) = windowed(reference.clone(), rows, scroll);
+                        let (got, got_off) = build(&s).window(rows, scroll);
+                        assert_eq!(
+                            got_off, want_off,
+                            "{name} n={n} rows={rows} scroll={scroll}"
+                        );
+                        assert_eq!(got, want, "{name} n={n} rows={rows} scroll={scroll}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn placing_a_window_selects_rather_than_sorting_the_whole_list() {
+        // The headline of this change is that the ordered tabs stop sorting a
+        // list they are about to throw away. That is invisible in the rendered
+        // output and allocates nothing, so nothing else here would notice it
+        // being undone — count the comparisons instead. A full sort of n
+        // elements costs about n·log2(n); the two partitions plus a 20-row sort
+        // are linear. At n = 50k that is ~780k against ~150k, so a bound of 8n
+        // separates them with room to spare and never needs a clock.
+        let n = 50_000usize;
+        // Scrambled, not reversed: pdqsort spots a reversed run and flips it in
+        // O(n), which would let a full sort slip under the bound.
+        let mut rows: Vec<u32> = (0..n as u32)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .collect();
+        let mut want = rows.clone();
+        want.sort_unstable();
+
+        let calls = Cell::new(0usize);
+        place_window(&mut rows, 25_000, 25_020, |a, b| {
+            calls.set(calls.get() + 1);
+            a.cmp(b)
+        });
+
+        assert_eq!(
+            &rows[25_000..25_020],
+            &want[25_000..25_020],
+            "the window must hold the same rows a full sort would put there",
+        );
+        assert!(
+            calls.get() < 8 * n,
+            "{} comparisons to place a 20-row window in {n} rows — that is a \
+             full sort, not a selection",
+            calls.get(),
+        );
+    }
+
+    #[test]
+    fn panning_a_list_tab_clamps_against_the_whole_list() {
+        // The pan clamp is deliberately measured over every row, not just the
+        // visible ones, so it does not shift as you scroll. This is also the
+        // only path that reads `Body::max_width` on a list tab.
+        let mut v = TuiProgressView::new("L");
+        // One row far wider than the viewport, then a screenful of short ones.
+        let wide = format!("//wide:{}", "x".repeat(300));
+        v.apply(&ev(0, result_start(&wide)));
+        v.apply(&ev(1, result_end(&wide, Some("boom".into()))));
+        for i in 0..50 {
+            let addr = format!("//s:{i:02}");
+            v.apply(&ev(2, result_start(&addr)));
+            v.apply(&ev(3, result_end(&addr, Some("boom".into()))));
+        }
+        v.view.set(ViewMode::Failed);
+
+        // Pan far right: it clamps at the widest row's tail, not at zero.
+        v.hscroll(100_000);
+        let lines = v.render("⠋", 0, 40, 9);
+        let pan = v.hscroll.get();
+        assert!(pan > 0, "a list tab must be pannable");
+        let row0 = format!("{}", lines[1]);
+        assert!(
+            !row0.contains("//wide"),
+            "pan did not drop the head: {row0}"
+        );
+
+        // Scroll the wide row out of the window. The clamp must not move — if it
+        // were measured over the visible rows it would collapse to zero here.
+        v.scroll(20);
+        drop(v.render("⠋", 0, 40, 9));
+        assert_eq!(
+            v.hscroll.get(),
+            pan,
+            "the pan clamp shifted when the widest row scrolled out of view",
+        );
+    }
+
+    #[test]
+    fn a_failed_row_keeps_its_error_on_one_line() {
+        // A `\n` inside a `Span` does not wrap in ratatui, it corrupts the box
+        // the whole viewport is laid out in — and multi-line stderr is exactly
+        // what lands on this tab.
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, result_start("//a:bad")));
+        v.apply(&ev(
+            1,
+            result_end("//a:bad", Some("first line\nsecond line".into())),
+        ));
+        v.view.set(ViewMode::Failed);
+
+        let lines = v.render("⠋", 0, 120, 8);
+        assert_eq!(lines.len(), 8, "a multi-line error must not grow the box");
+        let row = format!("{}", lines[1]);
+        assert!(row.contains("first line"), "{row}");
+        assert!(!row.contains("second line"), "{row}");
+    }
+
+    #[test]
+    fn list_max_width_matches_the_widest_rendered_row() {
+        // The pan clamp is measured off the whole list without rendering it.
+        let s = list_state(50);
+        for (name, build) in LIST_TABS {
+            let want = all_lines(build(&s))
+                .iter()
+                .map(|l| spans_width(&l.spans))
+                .max()
+                .unwrap_or(0);
+            assert_eq!(build(&s).max_width(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn scrolled_matched_tab_renders_the_ordered_slice() {
+        // End to end through `render`: a scrolled sorted list shows the addrs a
+        // full sort would have placed at those rows, and the border indicator
+        // agrees with them.
+        let mut v = TuiProgressView::new("L");
+        let addrs: Vec<String> = (0..40).map(|i| format!("//p:t{i:02}")).collect();
+        v.apply(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: addrs.clone(),
+                complete: true,
+            },
+        ));
+        v.view.set(ViewMode::Matched);
+        v.scroll(12);
+
+        // height 9 ⇒ 1 header + 6 body rows + border + help.
+        let lines = v.render("⠋", 0, 80, 9);
+        let body: Vec<String> = lines[1..7]
+            .iter()
+            .map(|l| format!("{l}").trim().to_string())
+            .collect();
+        let mut sorted = addrs.clone();
+        sorted.sort();
+        assert_eq!(body, sorted[12..18], "rows 13–18 of the ordered list");
+
+        let bottom = format!("{}", lines[lines.len() - 2]);
+        assert!(bottom.contains("↑ 13–18 of 40 ↓"), "{bottom}");
+    }
+
+    #[test]
+    fn the_live_op_index_holds_only_open_ops_not_the_whole_run() {
+        // `ops` keeps every target the run touched; the frame path used to walk
+        // it on every frame. The index it walks instead stays in-flight-sized.
+        let mut s = BuildState::new();
+        for i in 0..2_000 {
+            let addr = format!("//pkg{i}:t");
+            s.apply(&ev(0, execute_start(&addr)));
+            s.apply(&ev(1, execute_end(&addr)));
+        }
+        // Three targets left mid-flight: two executing, one writing to cache.
+        s.apply(&ev(2, execute_start("//live:a")));
+        s.apply(&ev(2, execute_start("//live:b")));
+        s.apply(&ev(2, local_write_start("//live:c")));
+
+        assert_eq!(s.ops.len(), 2_003, "history keeps every target");
+        assert_eq!(
+            s.open_ops.len(),
+            3,
+            "the frame path only walks the live ops"
+        );
+        assert_eq!(s.busy_workers(), 2, "only Execute holds a worker slot");
+        // The slow-row scan reads the same index, so it sees all three.
+        assert_eq!(s.body_lines(LONG_RUNNING_THRESHOLD_MS + 3).len(), 3);
+    }
+
+    #[test]
+    fn open_op_index_survives_duplicate_and_mismatched_boundaries() {
+        // The index is maintained beside `OpTimeline::active`; every event order
+        // the fold tolerates must leave the two agreeing.
+        let rescan = |s: &BuildState| {
+            s.ops
+                .values()
+                .filter(|tl| matches!(tl.active, Some((Op::Execute, _))))
+                .count()
+        };
+        let mut s = BuildState::new();
+        let steps = [
+            execute_start("//a:1"),
+            execute_start("//a:2"),
+            // A second start on an open target: the overlap guard closes the
+            // first span and reopens — still one slot held.
+            execute_start("//a:1"),
+            // A mismatched close is ignored: //a:1 is executing, not writing.
+            local_write_end("//a:1"),
+            // Execute → LocalCacheWrite on //a:2 releases its worker slot but
+            // leaves the target open.
+            local_write_start("//a:2"),
+            execute_end("//a:1"),
+            // A duplicate close is a no-op.
+            execute_end("//a:1"),
+            local_write_end("//a:2"),
+        ];
+        for (i, kind) in steps.into_iter().enumerate() {
+            s.apply(&ev(i as u64, kind));
+            assert_eq!(s.busy_workers(), rescan(&s), "after step {i}");
+            assert_eq!(
+                s.open_ops.len(),
+                s.ops.values().filter(|tl| tl.active.is_some()).count(),
+                "index drifted from the timelines after step {i}",
+            );
+        }
+        assert_eq!(s.busy_workers(), 0);
+        assert!(s.open_ops.is_empty(), "nothing left open");
+        assert_eq!(s.ops.len(), 2, "both targets stay in the history");
+    }
+
+    /// `System` with a per-thread allocation counter. Test binary only — the
+    /// shipped allocator is untouched.
+    struct CountingAlloc;
+
+    thread_local! {
+        /// Allocations made by this thread. A `Cell` with a const initializer:
+        /// no allocation and no destructor, so the allocator can bump it without
+        /// re-entering itself.
+        static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    // SAFETY: every method forwards to `System`, which upholds the `GlobalAlloc`
+    // contract; the wrapper adds no assumptions of its own. The counter is a
+    // const-initialised thread-local `Cell<usize>` — it never allocates and has
+    // no destructor, so bumping it cannot re-enter the allocator.
+    unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            // SAFETY: `layout` is forwarded unchanged from the caller.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            // SAFETY: `layout` is forwarded unchanged from the caller.
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            // SAFETY: `ptr`, `layout` and `new_size` are forwarded unchanged.
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: `ptr` and `layout` are forwarded unchanged from the caller.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAlloc = CountingAlloc;
+
+    /// Allocations `f` makes on this thread.
+    fn allocs_during(f: impl FnOnce()) -> usize {
+        let before = ALLOCS.with(Cell::get);
+        f();
+        ALLOCS.with(Cell::get).saturating_sub(before)
+    }
+
+    #[test]
+    fn a_list_frame_allocates_the_same_at_1k_and_20k_targets() {
+        // The viewport shows ~20 rows, so one frame must allocate the same
+        // whether the list behind it holds 1k or 20k targets: every row used to
+        // be formatted into a `Line` (two allocations) that the window then
+        // discarded, and a filter lower-cased two `String`s per row on top.
+        //
+        // Allocation *count*, not bytes — the row buffer is still one
+        // allocation of `O(n)` bytes, and the selection still touches all of it.
+        // What must not come back is a heap allocation per row.
+        let mut small_view = TuiProgressView::new("bench");
+        small_view.state = list_state(1_000);
+        let mut big_view = TuiProgressView::new("bench");
+        big_view.state = list_state(20_000);
+
+        let frame_allocs = |v: &TuiProgressView, mode: ViewMode, filter: &str| -> usize {
+            v.view.set(mode);
+            v.scroll.set(0);
+            v.hscroll.set(0);
+            filter.clone_into(&mut v.search_query.borrow_mut());
+            // The first frame settles the scroll/pan clamps; measure a steady one.
+            let settled = v.render("⠋", 0, 120, 24);
+            // Guard against measuring the "nothing here" placeholder: the border
+            // only carries a scroll indicator when the list overflows the
+            // viewport, which is the whole premise of the measurement.
+            let border = format!("{}", settled[settled.len() - 2]);
+            assert!(
+                border.contains(" of "),
+                "the measured frame does not overflow its viewport: {border}",
+            );
+            drop(settled);
+            allocs_during(|| drop(v.render("⠋", 0, 120, 24)))
+        };
+
+        for (name, mode) in [
+            ("done", ViewMode::Done),
+            ("matched", ViewMode::Matched),
+            ("cached", ViewMode::Cached),
+            ("failed", ViewMode::Failed),
+        ] {
+            // Unfiltered, then filtered — the filter has to be tried against
+            // every row, so it is its own scaling risk.
+            for filter in ["", "t7"] {
+                let small = frame_allocs(&small_view, mode, filter);
+                let big = frame_allocs(&big_view, mode, filter);
+                assert!(
+                    big <= small + 64,
+                    "{name} tab (filter {filter:?}): {small} allocations for a frame \
+                     over 1k targets but {big} over 20k — per-frame cost still \
+                     scales with the list length",
+                );
+            }
+        }
     }
 }
