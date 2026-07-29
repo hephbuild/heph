@@ -1,0 +1,195 @@
+name: Flake detection
+
+# Nightly: run the test suite N times and report per-test failure rates, so a
+# flaky test is a number in a table instead of "someone thinks this is
+# flaky." Also runs the suite once serially (`--test-threads=1`) alongside
+# one of the parallel runs — a test that only fails in parallel is coupled to
+# process-wide global state, which historically caused misattributed flakes
+# (an agent burning time proving someone else's flake wasn't theirs).
+#
+# Advisory by default: it reports, it does not gate `master`. Pass
+# `fail_on_flake: true` on a manual dispatch to have it fail instead.
+on:
+  schedule:
+    - cron: "13 4 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Number of parallel test-suite runs to aggregate"
+        required: false
+        default: "20"
+      fail_on_flake:
+        description: "Fail the job if a flaky test is found"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: flake-detect
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  SCCACHE_CACHE_SIZE: "2G"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  gen:
+    name: Codegen
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      repo_artifact_id: ${{ steps.upload_repo.outputs.artifact-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+
+      - name: Gen
+        shell: devenv shell bash -- -e {0}
+        run: gen
+
+      - name: Upload repo
+        id: upload_repo
+        uses: actions/upload-artifact@v6
+        with:
+          name: repo
+          path: |
+            .
+            !.devenv/
+          include-hidden-files: true
+
+  flake-detect:
+    name: Flake detect ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    # 20 full-suite reruns plus a serial run is a lot more wall-clock than a
+    # single `tst` pass (30 min there). This is nightly, not on the PR path,
+    # so it can afford to be generous.
+    timeout-minutes: 180
+    needs: gen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: darwin
+            arch: arm64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v7
+        with:
+          name: repo
+          path: .
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: ${{ matrix.target }}
+          cache-suffix: "-flake"
+
+      # Built once; every run below re-executes the already-built test
+      # binaries (cargo no-ops the compile step when nothing changed), so the
+      # N-run loop's cost is dominated by actual test execution, not rebuilds.
+      - name: Build heph + test binaries
+        shell: devenv shell bash -- -e {0}
+        run: cargo build --locked -p heph --bin heph
+
+      # The two feature-gated `tst` passes (plugin-stabby --features host,
+      # plugin-sdk --features stabby) are deliberately excluded from the
+      # repeated loop to bound nightly cost — this covers the main suite,
+      # where all five flakes attributed in one day actually surfaced.
+      - name: Run suite N times (parallel)
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          runs="${{ inputs.runs || 20 }}"
+          mkdir -p flake-logs
+          for i in $(seq 1 "$runs"); do
+            echo "=== parallel run $i/$runs ==="
+            cargo test --locked --workspace --exclude bin-e2e \
+              > "flake-logs/run-$i.log" 2>&1 || true
+          done
+
+      # One serial run to compare against the first parallel run: a test that
+      # fails in parallel but passes with --test-threads=1 is coupled to
+      # process-wide global state rather than genuinely flaky.
+      - name: Run suite once serially
+        shell: devenv shell bash -- -e {0}
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          mkdir -p flake-logs-serial
+          cargo test --locked --workspace --exclude bin-e2e -- --test-threads=1 \
+            > flake-logs-serial/run-1.log 2>&1 || true
+
+      - name: Aggregate flake report
+        id: report
+        shell: devenv shell bash -- -e {0}
+        run: |
+          bin="$CARGO_TARGET_DIR/debug/heph"
+          extra_args=()
+          if [ "${{ inputs.fail_on_flake || false }}" = "true" ]; then
+            extra_args+=(--fail-on-flake)
+          fi
+          "$bin" tool flake-report --logs-dir flake-logs --json-out flake-report.json "${extra_args[@]}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Serial-vs-parallel divergence
+        shell: devenv shell bash -- -e {0}
+        run: |
+          bin="$CARGO_TARGET_DIR/debug/heph"
+          mkdir -p compare/parallel compare/serial
+          cp flake-logs/run-1.log compare/parallel/
+          cp flake-logs-serial/run-1.log compare/serial/
+          "$bin" tool flake-report --logs-dir compare/parallel --json-out compare/parallel.json > /dev/null
+          "$bin" tool flake-report --logs-dir compare/serial --json-out compare/serial.json > /dev/null
+
+          jq -r '.tests[] | select(.failed > 0) | .key' compare/parallel.json | sort > compare/parallel_failed.txt
+          jq -r '.tests[] | select(.failed > 0) | .key' compare/serial.json | sort > compare/serial_failed.txt
+
+          # Fails in the parallel run but not serially: coupled to global state.
+          only_parallel="$(comm -23 compare/parallel_failed.txt compare/serial_failed.txt)"
+          {
+            echo
+            echo "## Serial vs parallel divergence"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$only_parallel" ]; then
+            n=$(echo "$only_parallel" | wc -l | tr -d ' ')
+            {
+              echo "$n test(s) fail in parallel but pass with --test-threads=1 (coupled to process-wide global state):"
+              echo '```'
+              echo "$only_parallel"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Serial/parallel divergence::$n test(s) pass only serially — see step summary"
+          else
+            echo "None." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: sccache stats
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: sccache --show-stats
+
+      - name: Upload flake report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: flake-report-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            flake-logs/
+            flake-logs-serial/
+            flake-report.json
+            compare/parallel.json
+            compare/serial.json

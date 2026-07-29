@@ -2,6 +2,7 @@ mod build_fmt;
 mod build_lsp;
 mod cache;
 mod completions;
+mod flake_report;
 pub mod gc;
 mod gen_gitignore;
 mod resolve_plugins;
@@ -73,6 +74,17 @@ pub enum ToolCommands {
     /// Example: `heph tool resolve-plugins --force`
     #[command(name = "resolve-plugins")]
     ResolvePlugins(resolve_plugins::Args),
+    /// Aggregate repeated `cargo test` runs into a per-test failure-rate report
+    ///
+    /// Point it at a directory holding one stdout capture per run (e.g. from
+    /// the nightly flake-detection job running the suite N times). Parses the
+    /// standard `cargo test` text output and reports, per test, how many runs
+    /// it failed — a flaky test failed in some runs but not all; one that
+    /// fails every run is broken, not flaky.
+    ///
+    /// Example: `heph tool flake-report --logs-dir ./flake-logs`
+    #[command(name = "flake-report")]
+    FlakeReport(flake_report::Args),
 }
 
 impl ToolArgs {
@@ -95,6 +107,7 @@ impl ToolCommands {
             ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, global),
             ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),
             ToolCommands::ResolvePlugins(args) => resolve_plugins::execute(args, sink, global),
+            ToolCommands::FlakeReport(args) => flake_report::execute(args),
         }
     }
 }
