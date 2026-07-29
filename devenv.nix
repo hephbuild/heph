@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p walk -p proc -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-http -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p telemetry -p tui -p lock -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
 {
   # https://devenv.sh/basics/
@@ -171,7 +171,7 @@ in
     # off" and wave the wrong arm through, which is the silent-green failure
     # this whole gate exists to remove.
     echo '> checking --no-default-features really disables fuse-sandbox'
-    if fuser_tree=$(cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --no-default-features --locked -i fuser 2>&1); then
+    if fuser_tree=$(cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --no-default-features --locked -i fuser 2>&1); then
       echo "error: --no-default-features left 'fuser' in the dependency graph, so the pass below would lint the fuse-sandbox=on arm and the feature-off code is still covered by nothing." >&2
       echo "       Some selected package pulls the root 'heph' package (or 'sandboxfuse') with default features on; exclude it here and in 'fix'." >&2
       printf '%s\n' "$fuser_tree" >&2
@@ -190,7 +190,7 @@ in
       exit 1
     fi
     echo '> clippy --no-default-features'
-    cargo clippy --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --all-targets --no-default-features --locked -- -D warnings
+    cargo clippy --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --all-targets --no-default-features --locked -- -D warnings
     echo '> fmt'
     cargo fmt --check ${qualityCrates}
   '';
@@ -205,7 +205,7 @@ in
   scripts.fix.exec = ''
     set -euo pipefail
     cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
-    cargo clippy --fix --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --all-targets --no-default-features --allow-dirty --allow-staged
+    cargo clippy --fix --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --all-targets --no-default-features --allow-dirty --allow-staged
     cargo fmt ${qualityCrates}
   '';
   # Test everything. The default pass covers all crates with default features; the
