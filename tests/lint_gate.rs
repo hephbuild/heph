@@ -7,11 +7,15 @@
 //! behind it, and on 2026-07-29 the `Lint` job reported pass on a master commit
 //! whose `engine (lib test)` did not compile.
 //!
-//! Both tests below assert a *selection* invariant — which code the gate is
+//! Every test below asserts a *selection* invariant — which code the gate is
 //! pointed at — because that is the class of failure that is silent. A lint the
-//! gate can see fails loudly; a crate the gate cannot see fails never.
+//! gate can see fails loudly; a crate the gate cannot see fails never. The
+//! selection has four axes and each one has already gone wrong or been left
+//! open: which packages (`--workspace`), which targets (`--all-targets`), which
+//! feature set (`--no-default-features`, whose obvious spelling is a no-op
+//! here), and which platform (macOS was linted nowhere).
 //!
-//! Cheap on purpose: two file reads and some string work, no build.
+//! Cheap on purpose: a few file reads and some string work, no build.
 
 use std::path::{Path, PathBuf};
 
@@ -105,6 +109,50 @@ fn every_workspace_member_inherits_the_workspace_lints() {
     );
 }
 
+/// The body of a `scripts.<name>.exec = ''…'';` block in `devenv.nix`.
+///
+/// Split per script rather than scanning the whole file: `lint` and `fix` both
+/// contain `cargo clippy` lines, and the invariant below is that they *agree* —
+/// which cannot be checked if the two are read as one pile.
+///
+/// `expect`, not `panic!`: `clippy.toml`'s `allow-panic-in-tests` only covers
+/// `#[test]` bodies, and this is a free function.
+#[track_caller]
+fn devenv_script(devenv: &str, name: &str) -> String {
+    let marker = format!("scripts.{name}.exec = ''");
+    // Built up front rather than inside `expect`, which would be
+    // `expect_fun_call`.
+    let opened = format!("devenv.nix defines `scripts.{name}.exec` as a '' block");
+    let closed = format!("`scripts.{name}.exec` block is closed");
+    let (_, rest) = devenv.split_once(&marker).expect(&opened);
+    let (body, _) = rest.split_once("'';").expect(&closed);
+    body.to_string()
+}
+
+/// The `cargo clippy` invocations inside one script body, trimmed.
+fn clippy_lines(script: &str) -> Vec<&str> {
+    script
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("cargo clippy"))
+        .collect()
+}
+
+/// The `--exclude <name>` arguments on a single invocation.
+fn excludes(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "--exclude"
+            && let Some(name) = words.next()
+        {
+            out.push(name);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// The `lint` script must point clippy at the whole workspace, every target.
 ///
 /// This restates the implementation on purpose: the literal regression was
@@ -113,19 +161,15 @@ fn every_workspace_member_inherits_the_workspace_lints() {
 #[test]
 fn the_lint_script_selects_the_whole_workspace() {
     let devenv = std::fs::read_to_string(repo_root().join("devenv.nix")).expect("read devenv.nix");
-    let clippy_lines: Vec<&str> = devenv
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("cargo clippy"))
-        .collect();
+    let lint = devenv_script(&devenv, "lint");
+    let lines = clippy_lines(&lint);
 
-    assert_eq!(
-        clippy_lines.len(),
-        2,
-        "expected exactly two clippy invocations in devenv.nix (default features \
-         and --all-features); found {clippy_lines:?}"
+    assert!(
+        lines.len() >= 3,
+        "expected at least three clippy invocations in `lint` (default features, \
+         --all-features, --no-default-features); found {lines:?}"
     );
-    for line in clippy_lines {
+    for line in &lines {
         assert!(
             line.contains("--workspace"),
             "`{line}` omits --workspace. The repo root is itself a package, so \
@@ -138,4 +182,181 @@ fn the_lint_script_selects_the_whole_workspace() {
              `tests/` are skipped — where most of this repo's test code lives."
         );
     }
+
+    let feature_off: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.contains("--no-default-features"))
+        .collect();
+    assert_eq!(
+        feature_off.len(),
+        1,
+        "`lint` must carry exactly one --no-default-features pass. With \
+         `fuse-sandbox` on — the default — `crates/sandboxfuse/src/stub.rs` is \
+         compiled by nothing at all, on any platform, and must still satisfy \
+         its callers in `crates/engine` and `crates/driver-bridge`. Found \
+         {feature_off:?}"
+    );
+}
+
+/// The `--no-default-features` pass must exclude every member that switches
+/// `fuse-sandbox` back on, or it silently lints the wrong arm.
+///
+/// Cargo unifies features across the whole selected set. `crates/e2e`,
+/// `crates/plugingo-e2e` and `crates/testkit` depend on the root `heph` package
+/// with default features on, so a plain `--workspace --no-default-features`
+/// re-enables `fuse-sandbox` through that edge and the pass becomes a no-op
+/// that still reports green — the same silent-selection failure the rest of
+/// this file exists to catch, one axis over.
+///
+/// Derived from the manifests, never copied: a *new* member with a default-
+/// featured `heph` edge is exactly the case a hardcoded list would miss.
+/// `lint` also asserts this at run time with `cargo tree -i fuser`; this test
+/// is the version that costs no build.
+#[test]
+fn the_feature_off_pass_excludes_every_member_that_re_enables_fuse_sandbox() {
+    let root = repo_root();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+    let members = workspace_members(&manifest);
+
+    let mut re_enablers: Vec<String> = members
+        .iter()
+        .filter(|member| {
+            let path = root.join(member).join("Cargo.toml");
+            let member_manifest = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            member_manifest.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("heph = ") && !line.contains("default-features = false")
+            })
+        })
+        // The package name is the last path component for every member here.
+        .map(|member| {
+            member
+                .rsplit('/')
+                .next()
+                .unwrap_or(member.as_str())
+                .to_string()
+        })
+        .collect();
+    re_enablers.sort();
+    assert!(
+        !re_enablers.is_empty(),
+        "no member was found depending on the root `heph` package — this test \
+         is no longer reading the manifests it thinks it is"
+    );
+
+    let devenv = std::fs::read_to_string(root.join("devenv.nix")).expect("read devenv.nix");
+    for script in ["lint", "fix"] {
+        let body = devenv_script(&devenv, script);
+        let line = clippy_lines(&body)
+            .into_iter()
+            .find(|line| line.contains("--no-default-features"))
+            .unwrap_or_else(|| panic!("`{script}` has a --no-default-features clippy invocation"));
+        let excluded = excludes(line);
+        let missing: Vec<&String> = re_enablers
+            .iter()
+            .filter(|name| !excluded.contains(&name.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`{script}`'s --no-default-features pass does not exclude {missing:?}. \
+             Those members depend on the root `heph` package with default \
+             features on, and cargo unifies features across the selection, so \
+             `fuse-sandbox` is switched back on and the pass lints the feature-\
+             *on* arm while reporting that it covered the off one.\n\
+             Add `--exclude <name>` for each, or give the member's `heph` \
+             dependency `default-features = false`."
+        );
+    }
+}
+
+/// `fix` must select the same code as `lint`.
+///
+/// A `fix` that reaches less than `lint` leaves CI reporting lints with no
+/// automated fix — and the person who hits it has to work out which of three
+/// invocations produced the error before they can reproduce it.
+#[test]
+fn fix_selects_the_same_code_as_lint() {
+    let devenv = std::fs::read_to_string(repo_root().join("devenv.nix")).expect("read devenv.nix");
+    let fix = devenv_script(&devenv, "fix");
+    let fix_lines = clippy_lines(&fix);
+
+    for line in &fix_lines {
+        assert!(
+            line.contains("--fix"),
+            "`{line}` is a bare clippy invocation inside `fix`; it must be \
+             `cargo clippy --fix`"
+        );
+        assert!(
+            line.contains("--workspace") && line.contains("--all-targets"),
+            "`{line}` does not select the whole workspace and every target, so \
+             `fix` cannot reach the code `lint` fails on"
+        );
+    }
+
+    // Every feature selection `lint` checks must have a `fix` counterpart, or
+    // CI reports a lint in code `fix` cannot reach. `--all-features` is the one
+    // exemption: it selects no code that the default pass does not already
+    // select in this workspace (every member feature is unified on by
+    // `--workspace`), so a fourth rewriting pass would buy nothing.
+    let lint = devenv_script(&devenv, "lint");
+    for selection in clippy_lines(&lint)
+        .iter()
+        .filter(|line| line.contains("--no-default-features"))
+        .map(|_| "--no-default-features")
+    {
+        assert!(
+            fix_lines.iter().any(|line| line.contains(selection)),
+            "`lint` has a `{selection}` pass but `fix` does not, so CI reports \
+             lints in that arm with no automated fix at all. Found {fix_lines:?}"
+        );
+    }
+}
+
+/// The gate must run on macOS as well as Linux.
+///
+/// macOS-only code — the Mach `sweep_threads` block in `src/diag.rs`,
+/// `crates/proc/src/proc_exec/imp_macos.rs`, `kqueue_macos.rs` — is compiled by
+/// `Test darwin/arm64`, but nothing there passes `-D warnings`, so before the
+/// `Lint darwin/arm64` job it was clippy-linted nowhere.
+///
+/// It is also the half that cannot fail loudly on its own: `#[expect]` is
+/// fulfilled-or-error, so the crate-root test exemptions are pinned to whatever
+/// lint set the gate actually runs. Delete the darwin job and nothing goes red —
+/// the macOS half of every `#[expect]` simply stops being checked. Hence a test.
+#[test]
+fn the_lint_gate_runs_on_macos_as_well_as_linux() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
+        .expect("read .github/workflows/heph.yml");
+
+    // A job id is a two-space-indented `<name>:` at the end of its line; a job's
+    // body runs until the next one. Walk the file once and keep the `runs-on:`
+    // of every job whose id starts with `lint`.
+    let mut runners: Vec<&str> = Vec::new();
+    let mut in_lint_job = false;
+    for line in workflow.lines() {
+        if let Some(rest) = line.strip_prefix("  ")
+            && !rest.starts_with([' ', '#', '-'])
+            && let Some(id) = rest.strip_suffix(':')
+        {
+            in_lint_job = id.starts_with("lint");
+            continue;
+        }
+        if in_lint_job && let Some(runner) = line.trim().strip_prefix("runs-on:") {
+            runners.push(runner.trim());
+        }
+    }
+
+    assert!(
+        runners.iter().any(|r| r.contains("ubuntu")),
+        "no lint job runs on a Linux runner; found {runners:?}"
+    );
+    assert!(
+        runners.iter().any(|r| r.contains("macos")),
+        "no lint job runs on a macOS runner, so macOS-only code — including the \
+         Mach `sweep_threads` block in `src/diag.rs`, the largest unsafe region \
+         in the tree — is clippy-linted nowhere, and the crate-root `#[expect]` \
+         headers are only ever checked against the lints that fire on Linux. \
+         Found {runners:?}"
+    );
 }
