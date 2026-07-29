@@ -749,7 +749,16 @@ fn spawn_drain_thread<R: io::Read + Send + 'static>(
                     Ok(n) => n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
+                        // Bracket this send exactly like the chunk path below:
+                        // on a full bounded channel it blocks on *our*
+                        // consumer, not on the child, and `waiting_on_pipe`
+                        // must not misread that as a stray descendant still
+                        // holding the read end — that misread escalates to
+                        // `killpg` on a pid the watcher may have already
+                        // reaped and macOS may have already recycled.
+                        sending_for_thread.store(true, Ordering::Release);
                         _ = tx.send(DrainMsg::Err(id, e));
+                        sending_for_thread.store(false, Ordering::Release);
                         break;
                     }
                 };

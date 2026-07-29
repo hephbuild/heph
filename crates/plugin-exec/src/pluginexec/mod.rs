@@ -585,13 +585,16 @@ async fn pump_stdin_pty(
 /// unaffected either way — its pump is a genuine `AsyncWrite` — but it runs
 /// the same code so the two backends keep one shape.
 ///
-/// **Untested, and knowingly so.** The reasoning above is from the code, not
-/// from a reproducer: an attempt to build one — 512 KiB of stdin into a child
-/// that only writes 4 MiB of output — did *not* wedge even with the writer
-/// forced back onto this task, so something upstream ends the write before the
-/// pipe fills and the exact trigger is not pinned down. The spawn is kept as
-/// cheap insurance rather than as a fix with coverage behind it; if this needs
-/// to change, find the reproducer first.
+/// Reproduced and covered by
+/// `tests::test_run_slow_sink_does_not_deadlock_with_concurrent_stdin`: a
+/// child that writes past the drain bound before reading stdin, against a
+/// sink paced slower than it can drain, hangs indefinitely with the write
+/// inlined on this task and completes once it is spawned. An earlier attempt
+/// to build this reproducer (512 KiB of stdin into a child writing 4 MiB of
+/// output, no artificial sink delay) did not wedge — the missing ingredient
+/// was a consumer slow enough to leave the drain channel genuinely full,
+/// which a real terminal or a loaded TUI can be and an in-memory `Vec` sink
+/// never is.
 async fn pump_stdin(
     src: &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin),
     mut sink: proc_exec::StdinPump,
@@ -2503,6 +2506,200 @@ mod tests {
 
         assert_eq!(stdout.len(), PER_STREAM, "stdout truncated");
         assert_eq!(stderr.len(), PER_STREAM, "stderr truncated");
+        Ok(())
+    }
+
+    /// An `AsyncWrite` that inserts a fixed delay before each write lands —
+    /// stands in for a human-paced consumer (a TUI repaint, a slow terminal)
+    /// draining `tee_output` slower than the child can produce.
+    ///
+    /// The in-flight `Sleep` is held across polls rather than recreated each
+    /// time: a fresh timer on every `poll_write` call would reset its own
+    /// deadline on every wake and never elapse.
+    struct PacedSink {
+        delay: std::time::Duration,
+        sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        bytes: Vec<u8>,
+    }
+
+    impl PacedSink {
+        fn new(delay: std::time::Duration) -> Self {
+            Self {
+                delay,
+                sleep: None,
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PacedSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let sleep = this
+                .sleep
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.delay)));
+            match std::future::Future::poll(sleep.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Pending,
+                std::task::Poll::Ready(()) => {
+                    this.sleep = None;
+                    this.bytes.extend_from_slice(buf);
+                    std::task::Poll::Ready(Ok(buf.len()))
+                }
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Regression for the cycle `pump_stdin`'s doc comment warns about: a
+    /// child that is simultaneously blocked in `write(2)` on its *output*
+    /// (because the consumer is slower than it is) and waiting to be read
+    /// from on its *input* must still finish, because the stdin write and the
+    /// output drain are on independent tasks.
+    ///
+    /// The script writes far more than the drain bound before it ever reads
+    /// stdin, and the sink is deliberately paced slower than the child can
+    /// produce — so by the time the child would read stdin, it is already
+    /// parked in `write(2)` on stdout. Concurrently, more stdin is queued
+    /// than the child's pipe (64 KiB) can hold, so `StdinPump::write_all`
+    /// blocks too. If that write ran on `tee_output`'s task (the pre-fix
+    /// shape — see `pump_stdin`), neither side could ever unblock the other:
+    /// the tee stops draining, the drain channel fills, the child's stdout
+    /// write never returns, and it never reaches the `cat` that would read
+    /// the input the write is blocked on. With the write on its own task,
+    /// `tee_output` keeps draining regardless, the child eventually finishes
+    /// writing, reads stdin, and the run completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_slow_sink_does_not_deadlock_with_concurrent_stdin() -> anyhow::Result<()> {
+        // Comfortably past STREAM_DRAIN_CHUNKS * CHUNK_SIZE (512 KiB) plus the
+        // 64 KiB pipe, so the child is guaranteed to still be blocked writing
+        // stdout when it would otherwise have moved on to `cat`.
+        const OUT_BYTES: usize = 900 * 1024;
+        // Comfortably past the child's 64 KiB stdin pipe, so `StdinPump`'s
+        // writer blocks on the real fd rather than finishing in one write.
+        const STDIN_BYTES: usize = 200 * 1024;
+        // Slow enough that the sink cannot drain OUT_BYTES before the stdin
+        // write would need to block too (a handful of ms per 8 KiB chunk is
+        // already far above human typing speed; this pushes past it to make
+        // the overlap deterministic rather than a race).
+        const SINK_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                // `wc -c`'s count goes to a *file*, not stdout: stdout is
+                // deliberately paced slower than the child can produce (see
+                // `PacedSink` below) so its trailing bytes are subject to a
+                // separate, pre-existing loss window on process exit (see the
+                // comment further down) — routing the proof-of-stdin through
+                // the same channel would make this assertion flaky for a
+                // reason unrelated to what this test checks.
+                run: vec![format!(
+                    "head -c {OUT_BYTES} /dev/zero; wc -c > stdin_byte_count.txt"
+                )],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let mut stdin = std::io::Cursor::new(vec![b'x'; STDIN_BYTES]);
+        let mut stdout = PacedSink::new(SINK_DELAY);
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: Some(&mut stdin),
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            driver.run(make_req(req), &ctoken),
+        )
+        .await
+        .context(
+            "driver.run deadlocked: the stdin write and the output drain blocked on each other",
+        )??;
+
+        // `head`'s zero bytes land on stdout, paced through the slow sink. A
+        // sanity floor, not a byte-exact count: proves the output actually
+        // streamed through the bounded channel under backpressure (not "zero
+        // bytes arrived, something short-circuited upstream"), without
+        // pinning down an exact loss margin — see the note below on why the
+        // tail is expected to be short here, and why the real proof this test
+        // cares about (did the child see all of stdin) is read from a file
+        // instead of stdout.
+        let zero_count = stdout.bytes.iter().filter(|&&b| b == 0).count();
+        assert!(
+            zero_count > OUT_BYTES / 3,
+            "only {zero_count} of {OUT_BYTES} output bytes arrived — that's far more loss than \
+             the known post-exit grace window accounts for, which points at something else",
+        );
+        // Not asserted above, but worth recording: `driver.run`'s post-wait IO
+        // drain (`pluginexec::mod::Driver::run_inner`, the
+        // `pluginexec:post_wait_io_drain` phase) gives a consumer that is
+        // still behind only a fixed 50ms after the child exits before giving
+        // up on it — pre-existing, not introduced by this PR. Against a sink
+        // this slow (5ms/chunk), that window can't drain a full backlog
+        // (`STREAM_DRAIN_CHUNKS` chunks take ~320ms at this pace), so stdout's
+        // tail — and in one observed run, `wc -c`'s entire count — did not
+        // survive to the sink. #245 bounds *how much* can ever be in flight
+        // (at most one channel's worth, ~576 KiB) where the prior unbounded
+        // drain had no such bound — a real improvement — but the loss itself
+        // is not new, and it is why the byte count below is read from a file
+        // the child wrote directly rather than from this same stdout.
+        let wc_path = tmp.path().join("stdin_byte_count.txt");
+        let wc_str = std::fs::read_to_string(&wc_path)
+            .with_context(|| format!("read {}", wc_path.display()))?;
+        let wc: usize = wc_str
+            .trim()
+            .parse()
+            .with_context(|| format!("wc -c output not a number: {wc_str:?}"))?;
+        assert_eq!(
+            wc, STDIN_BYTES,
+            "child did not see all of stdin — wc -c reported {wc}, expected {STDIN_BYTES}"
+        );
+
         Ok(())
     }
 
