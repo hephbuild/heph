@@ -8,12 +8,19 @@
 //! whose `engine (lib test)` did not compile.
 //!
 //! Every test below asserts a *selection* invariant — which code the gate is
-//! pointed at — because that is the class of failure that is silent. A lint the
-//! gate can see fails loudly; a crate the gate cannot see fails never. The
-//! selection has four axes and each one has already gone wrong or been left
-//! open: which packages (`--workspace`), which targets (`--all-targets`), which
-//! feature set (`--no-default-features`, whose obvious spelling is a no-op
-//! here), and which platform (macOS was linted nowhere).
+//! pointed at, and whether what it finds can actually turn a check red —
+//! because that is the class of failure that is silent. A lint the gate can see
+//! fails loudly; a crate the gate cannot see fails never. Five axes, each of
+//! which has already gone wrong or been left open:
+//!
+//!   - which packages — `--workspace`;
+//!   - which targets — `--all-targets`;
+//!   - which feature set — `--no-default-features`, whose obvious spelling is a
+//!     silent no-op in this workspace;
+//!   - which platform — macOS was linted nowhere;
+//!   - whether a red leg reaches the required status context at all — the
+//!     `Lint` aggregator, which can be wired to report green over a failed
+//!     matrix leg.
 //!
 //! Cheap on purpose: a few file reads and some string work, no build.
 
@@ -451,118 +458,279 @@ fn the_fmt_pass_covers_every_workspace_member() {
     );
 }
 
+/// A job id and the text of its body, for every job in the workflow.
+///
+/// A job id is a two-space-indented `<id>:` alone on its line, below the
+/// top-level `jobs:` key. Anchored on `jobs:` rather than matched everywhere,
+/// because `on:` has `push:` and `pull_request:` at the same indent and they
+/// are not jobs.
+fn workflow_jobs(workflow: &str) -> Vec<(&str, String)> {
+    let (_, body) = workflow
+        .split_once("\njobs:\n")
+        .expect("the workflow has a top-level `jobs:` key");
+
+    let mut jobs: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in body.lines() {
+        let header = line
+            .strip_prefix("  ")
+            .filter(|rest| !rest.starts_with([' ', '#', '-']))
+            .and_then(|rest| rest.strip_suffix(':'))
+            .filter(|id| {
+                !id.is_empty()
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            });
+        match header {
+            Some(id) => jobs.push((id, Vec::new())),
+            None => {
+                if let Some((_, lines)) = jobs.last_mut() {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    jobs.into_iter()
+        .map(|(id, lines)| (id, lines.join("\n")))
+        .collect()
+}
+
+/// The `needs:` of a job body, tokenised.
+///
+/// Tokenised rather than substring-matched: `lint` is a prefix of
+/// `lint_matrix`, so a `contains` check reports `lint` present when only
+/// `lint_matrix` is.
+fn job_needs(body: &str) -> Vec<&str> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("needs:"))
+        .map(|line| {
+            line.trim_start_matches("needs:")
+                .trim()
+                .trim_matches(['[', ']'])
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `run:` step commands in a job body.
+fn job_run_steps(body: &str) -> Vec<&str> {
+    body.lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("run:"))
+        .map(str::trim)
+        .collect()
+}
+
+/// The concrete `runs-on:` labels in a job body.
+///
+/// Skips `${{ matrix.runs-on }}` and friends: on a matrix job the job-level
+/// `runs-on` is an expression and the real labels live in `matrix.include`.
+fn job_runners(body: &str) -> Vec<&str> {
+    body.lines()
+        .map(str::trim)
+        .filter_map(|line| line.trim_start_matches("- ").strip_prefix("runs-on:"))
+        .map(str::trim)
+        .filter(|label| !label.contains("${{"))
+        .collect()
+}
+
+/// Job ids that actually run the `lint` script.
+///
+/// Derived from the `run:` steps rather than from the job name: a job that
+/// keeps the name and the runner while running something narrower is the
+/// regression, not the thing to trust.
+fn lint_legs<'a>(jobs: &[(&'a str, String)]) -> Vec<&'a str> {
+    jobs.iter()
+        .filter(|(_, body)| job_run_steps(body).contains(&"lint"))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The job named exactly `Lint` — the required status context.
+fn lint_aggregator<'a>(jobs: &'a [(&'a str, String)]) -> Option<(&'a str, &'a String)> {
+    jobs.iter()
+        .find(|(_, body)| body.lines().map(str::trim).any(|line| line == "name: Lint"))
+        .map(|(id, body)| (*id, body))
+}
+
 /// The gate must run on macOS as well as Linux.
 ///
 /// macOS-only code — the Mach `sweep_threads` block in `src/diag.rs`,
 /// `crates/proc/src/proc_exec/imp_macos.rs`, `kqueue_macos.rs` — is compiled by
 /// `Test darwin/arm64`, but nothing there passes `-D warnings`, so before the
-/// `Lint darwin/arm64` job it was clippy-linted nowhere.
+/// darwin lint leg it was clippy-linted nowhere.
 ///
 /// It is also the half that cannot fail loudly on its own: `#[expect]` is
 /// fulfilled-or-error, so the crate-root test exemptions are pinned to whatever
-/// lint set the gate actually runs. Delete the darwin job and nothing goes red —
+/// lint set the gate actually runs. Drop the darwin leg and nothing goes red —
 /// the macOS half of every `#[expect]` simply stops being checked. Hence a test.
 #[test]
 fn the_lint_gate_runs_on_macos_as_well_as_linux() {
     let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
         .expect("read .github/workflows/heph.yml");
-
-    // A job id is a two-space-indented `<name>:` at the end of its line; a job's
-    // body runs until the next one. Walk the file once and collect, for every
-    // job whose id starts with `lint`, its `runs-on:` and its `run:` steps.
-    //
-    // The `run:` half matters as much as the runner: asserting only the label
-    // lets someone point the darwin job at `cargo fmt --check`, or drop its
-    // Lint step, and stay green while macOS clippy coverage disappears — which
-    // is the whole reason the job exists.
-    let mut runners: Vec<&str> = Vec::new();
-    let mut commands: Vec<&str> = Vec::new();
-    let mut in_lint_job = false;
-    for line in workflow.lines() {
-        if let Some(rest) = line.strip_prefix("  ")
-            && !rest.starts_with([' ', '#', '-'])
-            && let Some(id) = rest.strip_suffix(':')
-        {
-            in_lint_job = id.starts_with("lint");
-            continue;
-        }
-        if !in_lint_job {
-            continue;
-        }
-        if let Some(runner) = line.trim().strip_prefix("runs-on:") {
-            runners.push(runner.trim());
-        }
-        if let Some(cmd) = line.trim().strip_prefix("run:") {
-            commands.push(cmd.trim());
-        }
-    }
+    let jobs = workflow_jobs(&workflow);
+    let legs = lint_legs(&jobs);
 
     assert!(
-        runners.iter().any(|r| r.contains("ubuntu")),
-        "no lint job runs on a Linux runner; found {runners:?}"
+        !legs.is_empty(),
+        "no job in the workflow runs the `lint` script at all"
+    );
+
+    let runners: Vec<&str> = jobs
+        .iter()
+        .filter(|(id, _)| legs.contains(id))
+        .flat_map(|(_, body)| job_runners(body))
+        .collect();
+
+    assert!(
+        runners.iter().any(|label| label.contains("ubuntu")),
+        "no lint leg runs on a Linux runner; found {runners:?}"
     );
     assert!(
-        runners.iter().any(|r| r.contains("macos")),
-        "no lint job runs on a macOS runner, so macOS-only code — including the \
+        runners.iter().any(|label| label.contains("macos")),
+        "no lint leg runs on a macOS runner, so macOS-only code — including the \
          Mach `sweep_threads` block in `src/diag.rs`, the largest unsafe region \
          in the tree — is clippy-linted nowhere, and the crate-root `#[expect]` \
          headers are only ever checked against the lints that fire on Linux. \
          Found {runners:?}"
     );
+}
+
+/// The required status context must survive, and it must be able to go red.
+///
+/// The branch ruleset requires a context named literally `Lint`. A bare matrix
+/// publishes one context per leg (`Lint (ubuntu-latest)`, …) and never that
+/// name again, so every open PR would block forever on a required check that
+/// can no longer appear — strictly worse than the gap being closed, and the
+/// workflow edit and the ruleset edit cannot land atomically. The fix is to
+/// matrix the work and fan back in to an aggregator still named `Lint`.
+///
+/// That aggregator is load-bearing *and* silent when wrong, which is this
+/// file's whole subject. Two ways to get it backwards, both of which look fine
+/// in review:
+///
+///   - no `if: always()` — a failed leg *skips* the aggregator, and a skipped
+///     required check is not a red one, so the PR is merely un-mergeable rather
+///     than reported as failing;
+///   - `if: always()` with no result check — the aggregator's own steps all
+///     pass, so it reports **green on a failed leg**. That is the silent-pass
+///     class this entire branch exists to eliminate, reintroduced at the top
+///     of it.
+#[test]
+fn the_lint_aggregator_keeps_the_required_context_and_can_fail() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
+        .expect("read .github/workflows/heph.yml");
+    let jobs = workflow_jobs(&workflow);
+    let legs = lint_legs(&jobs);
+
+    let named_lint: Vec<&str> = jobs
+        .iter()
+        .filter(|(_, body)| body.lines().map(str::trim).any(|line| line == "name: Lint"))
+        .map(|(id, _)| *id)
+        .collect();
     assert_eq!(
-        commands.iter().filter(|c| **c == "lint").count(),
-        runners.len(),
-        "every lint job must actually run the `lint` script — one per runner. A \
-         job that runs something narrower keeps the check name and the runner \
-         while quietly covering less. runners: {runners:?}, run steps: \
-         {commands:?}"
+        named_lint.len(),
+        1,
+        "exactly one job must be named `Lint` — that string is the required \
+         status context in the branch ruleset, and it is what lets this land \
+         with no branch-protection change. Found {named_lint:?}"
     );
+    let (aggregator_id, aggregator) = lint_aggregator(&jobs).expect("a job is named `Lint`");
 
-    // Every lint job must gate something. `Lint darwin/arm64` is not in the
-    // branch ruleset, so its entries in `release.needs` / `cleanup.needs` are
-    // its only teeth: drop them and it can go red on every run forever with
-    // nothing blocked and nothing red downstream.
-    let mut lint_job_ids: Vec<&str> = Vec::new();
-    for line in workflow.lines() {
-        if let Some(rest) = line.strip_prefix("  ")
-            && !rest.starts_with([' ', '#', '-'])
-            && let Some(id) = rest.strip_suffix(':')
-            && id.starts_with("lint")
-        {
-            lint_job_ids.push(id);
-        }
-    }
+    // A matrix job's check name gets the matrix values appended, so the context
+    // would become `Lint (…)` and `Lint` would never report again. This is the
+    // literal regression the aggregator exists to prevent.
     assert!(
-        lint_job_ids.len() >= 2,
-        "expected at least two lint jobs (one per OS); found {lint_job_ids:?}"
+        !aggregator.lines().any(|line| line.trim() == "strategy:"),
+        "the job named `Lint` (`{aggregator_id}`) has a `strategy:` — a matrix \
+         job publishes one context per leg and never the bare name, so the \
+         required `Lint` context would stop appearing and every open PR would \
+         block on a check that can no longer report. Matrix the work in a \
+         separate job and keep this one as the fan-in."
     );
 
-    for gate in ["release", "cleanup"] {
-        let marker = format!("\n  {gate}:\n");
-        let (_, body) = workflow
-            .split_once(&marker)
-            .unwrap_or_else(|| panic!("the workflow defines a `{gate}` job"));
-        let needs = body
+    // It must do no work itself: the aggregator cannot be the thing whose
+    // failure it exists to report.
+    assert!(
+        !legs.contains(&aggregator_id),
+        "`{aggregator_id}` is named `Lint` and also runs the lint script; the \
+         aggregator must be a separate fan-in job"
+    );
+
+    let needs = job_needs(aggregator);
+    for leg in &legs {
+        assert!(
+            needs.contains(leg),
+            "the `Lint` aggregator does not `needs:` the `{leg}` lint leg, so \
+             that leg gates nothing and `Lint` can report green while it is \
+             red. needs: {needs:?}, legs: {legs:?}"
+        );
+    }
+
+    assert!(
+        aggregator
             .lines()
             .map(str::trim)
-            .find(|line| line.starts_with("needs:"))
-            .unwrap_or_else(|| panic!("`{gate}` declares `needs:`"));
-        // Tokenised, not substring-matched: `lint` is a prefix of `lint_darwin`,
-        // so a `contains` check would report `lint` present when only
-        // `lint_darwin` is.
-        let listed: Vec<&str> = needs
-            .trim_start_matches("needs:")
-            .trim()
-            .trim_matches(['[', ']'])
-            .split(',')
-            .map(str::trim)
-            .collect();
-        for id in &lint_job_ids {
-            assert!(
-                listed.contains(id),
-                "`{gate}` does not depend on the `{id}` job, so a red `{id}` \
-                 blocks nothing at all. Found `{needs}`."
-            );
-        }
+            .any(|line| line.starts_with("if:") && line.contains("always()")),
+        "the `Lint` aggregator has no `if: always()`, so a failed leg *skips* \
+         it rather than failing it — and a skipped required check is not a red \
+         one. needs: {needs:?}"
+    );
+
+    // `if: always()` alone is the dangerous half: the job then runs, its own
+    // steps pass, and it reports success no matter how its dependencies ended.
+    // Something must actually inspect each dependency's result and exit
+    // non-zero. Checked per dependency, so adding a leg without extending the
+    // check fails here rather than in production.
+    for dep in &needs {
+        assert!(
+            aggregator.contains(&format!("needs.{dep}.result")),
+            "the `Lint` aggregator runs with `if: always()` but never reads \
+             `needs.{dep}.result`, so it reports green when `{dep}` fails, is \
+             cancelled, or is skipped. `needs` decides ordering here, not \
+             outcome."
+        );
+    }
+    assert!(
+        aggregator.contains("exit 1"),
+        "the `Lint` aggregator reads its dependencies' results but never exits \
+         non-zero, so nothing it discovers can turn the check red"
+    );
+}
+
+/// Whatever represents "lint passed" must gate `release` and `cleanup`.
+///
+/// Only the `Lint` aggregator is in the branch ruleset, so for the legs these
+/// two `needs:` entries are their only other teeth. Drop them and a red lint
+/// blocks nothing downstream at all.
+#[test]
+fn lint_gates_release_and_cleanup() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
+        .expect("read .github/workflows/heph.yml");
+    let jobs = workflow_jobs(&workflow);
+    let legs = lint_legs(&jobs);
+    let (aggregator_id, _) = lint_aggregator(&jobs).expect("a job is named `Lint`");
+
+    for gate in ["release", "cleanup"] {
+        let (_, body) = jobs
+            .iter()
+            .find(|(id, _)| *id == gate)
+            .unwrap_or_else(|| panic!("the workflow defines a `{gate}` job"));
+        let needs = job_needs(body);
+
+        // Either the aggregator — which transitively requires every leg — or
+        // each leg directly. Accepting both spellings keeps this from
+        // dictating the wiring while still refusing the one that gates nothing.
+        let covered = needs.contains(&aggregator_id) || legs.iter().all(|leg| needs.contains(leg));
+        assert!(
+            covered,
+            "`{gate}` depends on neither the `{aggregator_id}` aggregator nor \
+             every lint leg ({legs:?}), so a red lint blocks nothing \
+             downstream. Found needs: {needs:?}"
+        );
     }
 }
