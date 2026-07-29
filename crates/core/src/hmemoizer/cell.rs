@@ -77,7 +77,7 @@ use futures::future::BoxFuture;
 use futures::task::{ArcWake, waker_ref};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -85,6 +85,28 @@ use std::time::{Duration, Instant};
 
 /// [`Cell::driver`] when no awaiter is currently on the hook for re-polling.
 const NO_DRIVER: usize = usize::MAX;
+
+/// Wakes that reached an incomplete cell and found nobody — no driver and not a
+/// single registered waker — so the fallback broadcast woke zero tasks.
+///
+/// With cancel-on-abandonment this is *almost* always benign: a straggler wake
+/// racing the eviction window (interest already zero, future being taken and
+/// dropped) lands here, and so does a leaf completing just as its last awaiter
+/// is torn down. Those are bounded by the number of cancellations. What this
+/// counter exists for is the pathological shape it replaced: an abandoned cell
+/// whose future was *retained*, being re-woken every 250ms by the blocking
+/// backstop with every wake evaporating — ~1000 ticks over 269s in the
+/// production wedge. A count that keeps climbing while a build makes no
+/// progress is that regression announcing itself; it is rendered in
+/// `render_full_report`, so it lands in the `SIGQUIT` dump and the stall
+/// watchdog file. Not a `debug_assert!`: the benign cases above are reachable
+/// in correct executions.
+static VOID_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// Monotone count of wakes delivered to an incomplete cell that reached no one.
+pub(crate) fn void_wakes() -> u64 {
+    VOID_WAKES.load(Ordering::Relaxed)
+}
 
 /// Waker set, keyed by a stable index each awaiter holds for its lifetime.
 ///
@@ -174,6 +196,22 @@ pub(crate) struct Cell<V> {
     /// Slab key of the awaiter that last polled the inner future, or
     /// [`NO_DRIVER`]. An inner wake is routed here and nowhere else.
     driver: AtomicUsize,
+    /// How many callers still want this value.
+    ///
+    /// Incremented by [`Memoizer::process`](super::Memoizer::process) under the
+    /// cache lock as it hands the cell out, decremented when that caller is
+    /// done or gone. Zero means the computation is abandoned and can be
+    /// cancelled.
+    ///
+    /// It cannot be inferred from `Arc::strong_count`: the cell **is** its own
+    /// waker (`waker_ref(cell)` in [`Await::poll`]), so every clone of that
+    /// waker is a strong clone of the cell. A parked `oneshot`, a queued
+    /// semaphore acquire, a `hcore::blocking` backstop registration, and every
+    /// child cell's waker slab all hold one — which is to say every computation
+    /// that has actually parked, which is every computation that matters here.
+    /// Counting Arcs would see those as interested callers and never cancel
+    /// anything.
+    interest: AtomicUsize,
 }
 
 impl<V> Cell<V> {
@@ -183,7 +221,37 @@ impl<V> Cell<V> {
             slot: Mutex::new(Some(fut)),
             wakers: Mutex::new(Wakers::default()),
             driver: AtomicUsize::new(NO_DRIVER),
+            interest: AtomicUsize::new(0),
         })
+    }
+
+    /// Register a caller that wants this value. Called under the memoizer's
+    /// cache lock — a cancellation deciding under that same lock therefore
+    /// either sees this interest and stands down, or has already evicted the
+    /// entry, in which case the joiner never found this cell to begin with.
+    pub(crate) fn acquire_interest(&self) {
+        self.interest.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Drop a caller's interest, returning how many remain.
+    ///
+    /// `AcqRel` is load-bearing: a frame that *completed* the cell stores the
+    /// value (`done.set`, a release store) strictly before its own release here.
+    /// All `fetch_sub`s on one atomic form a release sequence, so a guard whose
+    /// decrement observes `remaining == 0` synchronizes-with every earlier
+    /// release — and its subsequent `is_done()` (an acquire load) is then
+    /// guaranteed to see that completion. That is what makes "remaining == 0 and
+    /// not done" mean *abandoned*, never *completed-but-not-yet-visible*.
+    pub(crate) fn release_interest(&self) -> usize {
+        let prev = self.interest.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "interest release without a matching acquire");
+        prev - 1
+    }
+
+    /// Callers currently interested. Re-read under the cache lock before
+    /// cancelling, so a joiner that arrived after the decrement is seen.
+    pub(crate) fn interest(&self) -> usize {
+        self.interest.load(Ordering::Acquire)
     }
 
     /// The completed value, if there is one. No locking.
@@ -212,6 +280,48 @@ impl<V> Cell<V> {
     /// Whether the value has been published.
     pub(crate) fn is_done(&self) -> bool {
         self.done.get().is_some()
+    }
+
+    /// Take the in-flight future out of the cell, so the caller can drop it.
+    ///
+    /// For a cell nobody awaits any more. Retaining the future is deliberate
+    /// while awaiters come and go — one dropped between polls must be
+    /// replaceable by another — but when the last one goes for good there is no
+    /// successor, and what is left is a future nobody will ever poll again.
+    ///
+    /// It is not inert. It holds everything it captured, and keeps its place in
+    /// every queue it was waiting on: a worker permit acquired and never
+    /// released, a `oneshot` whose result nobody reads, a backstop registration
+    /// re-woken every 250ms into a graph that discards the wake. Twelve of those
+    /// held every permit in the pool while the build sat idle.
+    ///
+    /// Returned rather than dropped here so the caller drops it with no lock
+    /// held — the drop cascades through a large state machine and runs arbitrary
+    /// user destructors.
+    pub(crate) fn take_future(&self) -> Option<BoxFuture<'static, V>> {
+        if self.done.get().is_some() {
+            return None;
+        }
+        // A blocking `lock`, deliberately, even though a *poll* can never hold
+        // this slot here: interest reaching zero means no live `Await`, and no
+        // `Await` means nobody is polling.
+        //
+        // The contender is the other canceller. `cancel_abandoned` documents the
+        // two-cancellations interleaving — both frames observe their own zero
+        // crossing, both reach here, and both call this with no lock held
+        // (mandated, so the cache lock is never held across `slot`). They race
+        // on the mutex rather than serializing on the cache lock.
+        //
+        // An earlier version used `try_lock` and asserted the `WouldBlock` arm
+        // unreachable. It is reachable by exactly that path, and the assert
+        // fires inside `Drop` glue — which aborts outright if the drop is itself
+        // unwinding. Blocking is safe: the only holder is another `take_future`,
+        // which owns the guard for a single `Option::take` and acquires nothing
+        // else, so there is no cycle to deadlock on. The loser then correctly
+        // gets `None`, which is the whole point — exactly one canceller drops
+        // the future.
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.take()
     }
 
     /// How many awaiters are attached to this cell, or `None` if the waker set
@@ -283,6 +393,11 @@ impl<V: Send + Sync + 'static> ArcWake for Cell<V> {
         // to rescue it.
         let all = wakers.take_all();
         drop(wakers);
+        if all.is_empty() && !cell.is_done() {
+            // The wake reached nobody at all. See [`VOID_WAKES`] for why this is
+            // counted rather than asserted.
+            VOID_WAKES.fetch_add(1, Ordering::Relaxed);
+        }
         for waker in all {
             waker.wake();
         }
@@ -298,7 +413,19 @@ pub(crate) struct Await<V> {
 }
 
 impl<V> Await<V> {
+    /// Contract: the caller holds a registered interest
+    /// ([`Cell::acquire_interest`]) for this cell, and releases it only after
+    /// this `Await` is dropped. `Memoizer::process` is the single construction
+    /// site and enforces the pairing with an RAII guard; the assertion exists so
+    /// any future second construction site that forgets fails its first test
+    /// run instead of re-introducing a permit leak (interest at zero cancels the
+    /// computation out from under the awaiter).
     pub(crate) fn new(cell: Arc<Cell<V>>) -> Self {
+        debug_assert!(
+            cell.interest() > 0,
+            "Await created on a cell with no registered interest — \
+             cancel-on-abandonment would tear this computation down mid-await"
+        );
         Self { cell, key: None }
     }
 }
@@ -429,7 +556,12 @@ mod tests {
             ready: Arc::clone(&ready),
             value,
         };
-        (Cell::new(Box::pin(fut)), stashed, ready)
+        let cell = Cell::new(Box::pin(fut));
+        // These tests drive `Await`s by hand, standing in for `process` frames
+        // that would each hold an interest. One registration satisfies the
+        // `Await::new` contract for the whole test.
+        cell.acquire_interest();
+        (cell, stashed, ready)
     }
 
     fn poll_with(waiter: &mut Await<u32>, waker: &Waker) -> Poll<u32> {
@@ -604,6 +736,52 @@ mod tests {
         );
     }
 
+    /// A wake that reaches no one on an *incomplete* cell is counted; the same
+    /// wake on a completed cell is routine and is not.
+    ///
+    /// The counter is the tripwire for the production wedge's signature — the
+    /// blocking backstop re-waking an abandoned cell every 250ms with every
+    /// wake evaporating. It must not fire for the post-completion straggler,
+    /// or every build would end with a pile of false positives in the dump.
+    #[test]
+    fn a_wake_that_reaches_nobody_is_counted_only_while_incomplete() {
+        let (cell, stashed, ready) = stash_cell(5);
+
+        let (_dc, dw) = counting();
+        let mut driver = Await::new(Arc::clone(&cell));
+        assert!(poll_with(&mut driver, &dw).is_pending());
+        let inner = stashed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("inner future must have stashed the cell's waker");
+
+        // The last awaiter goes away; the leaf then completes and wakes. This is
+        // the cancellation-race straggler: with the future still in the slot and
+        // nobody registered, the wake reaches no one.
+        drop(driver);
+        let before = void_wakes();
+        inner.wake_by_ref();
+        assert!(
+            void_wakes() > before,
+            "a wake into an incomplete cell with no receivers must be counted"
+        );
+
+        // Complete the cell; a straggler wake after completion reaches no one
+        // *by design* and must not count.
+        ready.store(true, Ordering::SeqCst);
+        let (_lc, lw) = counting();
+        let mut late = Await::new(Arc::clone(&cell));
+        assert!(poll_with(&mut late, &lw).is_ready());
+        let before = void_wakes();
+        inner.wake_by_ref();
+        assert_eq!(
+            void_wakes(),
+            before,
+            "a post-completion straggler wake is routine, not a lost wake"
+        );
+    }
+
     /// **The regression this module's clone-don't-take exists for.**
     ///
     /// A second wake arriving before the driver has re-polled must still be
@@ -695,7 +873,6 @@ mod tests {
         let mut latecomer = Await::new(Arc::clone(&cell));
         assert_eq!(poll_with(&mut latecomer, &lw), Poll::Ready(3));
     }
-
     /// Completion must drop the shared future immediately.
     ///
     /// `result_addr_impl` is `#[async_recursion]` and its state machine is large
@@ -717,6 +894,7 @@ mod tests {
             let _held = flag;
             5u32
         }));
+        cell.acquire_interest();
 
         let (_c, w) = counting();
         let mut waiter = Await::new(Arc::clone(&cell));
@@ -781,6 +959,7 @@ mod tests {
                 ready,
                 value: 42,
             }));
+            cell.acquire_interest();
 
             let completer = Arc::clone(&cell);
             let handle = std::thread::spawn(move || {

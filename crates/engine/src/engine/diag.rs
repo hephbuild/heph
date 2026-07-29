@@ -881,7 +881,15 @@ fn human_bytes(b: u64) -> String {
 /// what the machine-readable surface is for.
 pub fn render_stall(r: &StallReport) -> String {
     let mut out = String::new();
-    out.push_str(&format!("\nheph: no progress for {}\n", secs(r.quiet_for)));
+    // The build, on the first line, always. Every one of these reports is read
+    // after the fact, against a tree that has moved on — and "which binary was
+    // this?" has to be answered before a single number below can be trusted. It
+    // cost a round trip on exactly the incident this paragraph exists for.
+    out.push_str(&format!(
+        "\nheph {}: no progress for {}\n",
+        hcore::version::VERSION,
+        secs(r.quiet_for)
+    ));
 
     if r.open.is_empty() {
         // Wedged before any span opened — matching, or walking packages. A real
@@ -1775,6 +1783,25 @@ mod tests {
         );
         let text = render_stall(&r);
         assert!(text.contains("workers saturated for"), "{text}");
+    }
+
+    /// Every report names the build that produced it.
+    ///
+    /// These are read after the fact, against a tree that has moved on, and
+    /// often by someone who did not start the build. Which binary it was decides
+    /// whether a given fix is already in — so it has to be answerable from the
+    /// file rather than by asking, which is a round trip that has already cost a
+    /// diagnosis cycle.
+    #[test]
+    fn the_paragraph_names_the_build() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let text = render_stall(&s.evaluate(61_000, T).expect("stalled"));
+        assert!(
+            text.contains(hcore::version::VERSION),
+            "the report must name its build: {text}"
+        );
+        assert!(text.contains("no progress for"), "{text}");
     }
 
     /// A frozen TUI swallows Ctrl-C (raw mode clears ISIG), so the paragraph must
