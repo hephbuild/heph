@@ -665,17 +665,20 @@ pub struct BuildState {
     in_flight_results: HashSet<String>,
     /// addr → per-target operation timeline. Drives the worker braille (count of
     /// targets whose active op is `Execute`) and the slow-target breakdown rows.
-    /// Entries persist for the request (completed durations are kept so a finished
-    /// op still shows in the breakdown while a later op is active).
+    /// An entry persists only while its target can still be "slow": completed
+    /// durations are kept alongside a later active op so the breakdown stays
+    /// right, but the whole entry is dropped once the target's `ResultEnd`
+    /// arrives (see the `ResultEnd` arm of [`BuildState::apply`]) — by then every
+    /// op has closed and nothing will ever read it again, so keeping it would be
+    /// a per-target allocation for the rest of the request at 100k-target scale.
     ops: HashMap<String, OpTimeline>,
     /// The addrs in `ops` whose timeline has an op open right now — the live
     /// subset the render path cares about.
     ///
-    /// `ops` is never pruned, so it grows to every target the run touched;
-    /// walking it to find the few with an open op cost ~2 ms in the worker
-    /// braille and ~3 ms in the slow rows on *every* frame at 100k targets.
-    /// This set is bounded by what is in flight instead. Maintained at the one
-    /// place `OpTimeline::active` changes, so it cannot drift from it.
+    /// Walking all of `ops` to find the few with an open op cost ~2 ms in the
+    /// worker braille and ~3 ms in the slow rows on *every* frame at 100k
+    /// targets. This set is bounded by what is in flight instead. Maintained at
+    /// the one place `OpTimeline::active` changes, so it cannot drift from it.
     open_ops: HashSet<String>,
     /// The matched top-level target set, accumulated as the matcher streams.
     matched: HashSet<String>,
@@ -872,6 +875,18 @@ impl BuildState {
                 if self.finished.insert(addr.clone()) && self.matched.contains(addr) {
                     self.matched_finished += 1;
                 }
+                // Retention: `ResultEnd` is emitted by the drop guard wrapping the
+                // whole `inner_result_addr` scope, strictly after every op
+                // (Execute/LocalCacheWrite/RemoteCacheWrite/RemoteCacheRead) has
+                // closed for this addr — no later event can reopen its timeline.
+                // Neither reader walks a closed entry (`open_ops` already dropped
+                // it when its last op ended), so keeping it around is unbounded
+                // per-target memory for the rest of the run. `open_ops.remove` is
+                // normally a no-op here (the entry left it already) but guards
+                // against ever leaving a dangling index entry if `active` were
+                // somehow still open at this point.
+                self.ops.remove(addr);
+                self.open_ops.remove(addr);
             }
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `built` counter side effect on a successful end.
@@ -2398,6 +2413,32 @@ mod tests {
         assert!(
             !s.ops.contains_key("//a:b"),
             "ops must drop a target's timeline once its ResultEnd arrives"
+        );
+    }
+
+    #[test]
+    fn ops_map_does_not_grow_unbounded_over_a_large_run() {
+        // The retention regression guard at the scale the field doc calls out:
+        // before this fix `ops` gained one `OpTimeline` per target for the life
+        // of the request, so a 100k-target run held 100k never-freed entries
+        // (each carrying its own `completed: HashMap<Op, u64>`). A wall-clock
+        // measurement of that is noisy under load on this box; the retained
+        // entry count is not — every target below fully completes, so the
+        // post-run count is the deterministic before/after number: unbounded
+        // (100_000) without the fix, 0 with it.
+        let mut s = BuildState::new();
+        for i in 0..100_000 {
+            let addr = format!("//pkg{i}:t");
+            s.apply(&ev(0, result_start(&addr)));
+            s.apply(&ev(0, execute_start(&addr)));
+            s.apply(&ev(1, execute_end(&addr)));
+            s.apply(&ev(1, result_end(&addr, None)));
+        }
+        assert_eq!(s.completed, 100_000);
+        assert_eq!(
+            s.ops.len(),
+            0,
+            "ops retained every finished target instead of freeing them"
         );
     }
 
@@ -4161,8 +4202,9 @@ mod tests {
 
     #[test]
     fn the_live_op_index_holds_only_open_ops_not_the_whole_run() {
-        // `ops` keeps every target the run touched; the frame path used to walk
-        // it on every frame. The index it walks instead stays in-flight-sized.
+        // `ops` keeps a target's timeline until its `ResultEnd` (none of these
+        // 2,000 targets get one here); the frame path used to walk `ops` itself
+        // on every frame. The index it walks instead stays in-flight-sized.
         let mut s = BuildState::new();
         for i in 0..2_000 {
             let addr = format!("//pkg{i}:t");
@@ -4174,7 +4216,7 @@ mod tests {
         s.apply(&ev(2, execute_start("//live:b")));
         s.apply(&ev(2, local_write_start("//live:c")));
 
-        assert_eq!(s.ops.len(), 2_003, "history keeps every target");
+        assert_eq!(s.ops.len(), 2_003, "no ResultEnd fired, so nothing is retired");
         assert_eq!(
             s.open_ops.len(),
             3,
