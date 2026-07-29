@@ -2387,16 +2387,14 @@ mod tests {
     #[test]
     fn format_phases_recovers_from_a_poisoned_lock() {
         let m: Mutex<HashMap<u64, &'static str>> = Mutex::new(HashMap::new());
-        drop(
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        let _guard = m.lock().expect("lock for poisoning");
-                        panic!("intentional poison for format_phases_recovers_from_a_poisoned_lock");
-                    })
-                    .join()
-            }),
-        );
+        drop(std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = m.lock().expect("lock for poisoning");
+                    panic!("intentional poison for format_phases_recovers_from_a_poisoned_lock");
+                })
+                .join()
+        }));
 
         // Before the fix, this line panics with "phases mutex poisoned"
         // instead of returning.
@@ -2409,23 +2407,24 @@ mod tests {
     #[test]
     fn format_wait_graph_recovers_from_a_poisoned_lock() {
         let m: Mutex<WaitGraph> = Mutex::new(WaitGraph::new());
-        drop(
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        let _guard = m.lock().expect("lock for poisoning");
-                        panic!(
-                            "intentional poison for format_wait_graph_recovers_from_a_poisoned_lock"
-                        );
-                    })
-                    .join()
-            }),
-        );
+        drop(std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = m.lock().expect("lock for poisoning");
+                    panic!(
+                        "intentional poison for format_wait_graph_recovers_from_a_poisoned_lock"
+                    );
+                })
+                .join()
+        }));
 
         // Before the fix, this line panics with "wait_graph poisoned" instead
         // of returning.
         let text = format_wait_graph_from(&m);
-        assert!(text.contains("(empty)") || text.contains("cells (owned)"), "{text}");
+        assert!(
+            text.contains("(empty)") || text.contains("cells (owned)"),
+            "{text}"
+        );
     }
 
     #[test]

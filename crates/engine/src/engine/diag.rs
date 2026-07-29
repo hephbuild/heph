@@ -1363,7 +1363,8 @@ mod tests {
             "the paragraph's cell list must be the snapshot's cell list"
         );
         assert_eq!(
-            report.stuck[0].key, snapshot.cells()[0].key,
+            report.stuck[0].key,
+            snapshot.cells()[0].key,
             "…not just the same length by coincidence — the same cells"
         );
     }
