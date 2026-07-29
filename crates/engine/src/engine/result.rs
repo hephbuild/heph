@@ -1218,7 +1218,7 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<Arc<EResult>> {
         if opts.shell && opts.interactive.is_none() {
-            anyhow::bail!("cannot use --shell in non-interactive mode");
+            return Err(ShellNeedsSingleTarget::NotInteractive { addr: addr.clone() }.into());
         }
 
         // Stop the moment the request is cancelled (Ctrl-C). Every queued
@@ -10350,6 +10350,46 @@ mod tests {
         assert!(
             !msg.contains("non-interactive mode"),
             "the user is on a terminal; do not claim otherwise: {msg}",
+        );
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            0,
+            "nothing may run once --shell is refused",
+        );
+        Ok(())
+    }
+
+    /// `--shell` on a single target with no terminal attached is refused with
+    /// a typed error naming the addr and the next action — not a bare
+    /// `anyhow::bail!` string with neither.
+    #[tokio::test]
+    async fn shell_without_a_terminal_names_the_addr_and_the_next_step() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![leaf_spec("//pkg:a", false)?])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let opts = ResultOptions {
+            shell: true,
+            interactive: None,
+            ..Default::default()
+        };
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &opts)
+            .await
+            .err()
+            .expect("--shell with no terminal must fail");
+
+        let typed = downcast_chain_ref::<ShellNeedsSingleTarget>(&err)
+            .expect("must be the typed shell error, not a bare anyhow string");
+        assert!(
+            matches!(typed, ShellNeedsSingleTarget::NotInteractive { addr } if addr.format() == "//pkg:a"),
+            "the error must carry the addr that was refused: {err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("//pkg:a"), "msg: {msg}");
+        assert!(
+            msg.contains("try: run `heph run --shell //pkg:a`"),
+            "an actionable message must name the next command: {msg}"
         );
         assert_eq!(
             h.runs.load(Ordering::SeqCst),
