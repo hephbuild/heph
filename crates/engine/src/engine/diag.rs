@@ -1127,6 +1127,17 @@ impl InflightLog {
         &self.path
     }
 
+    /// The text this log carries, from an already-sampled picture.
+    ///
+    /// Named, rather than left as an expression at the watchdog's call site, so
+    /// that "the companion file and the `SIGQUIT` dump are the same renderer" is
+    /// a statement about two functions a test can hold side by side. While the
+    /// choice of renderer lived inline in `heph run`, nothing linked the two and
+    /// they could drift with every test still green.
+    pub fn render(snapshot: &hcore::hmemoizer::ReportSnapshot) -> String {
+        hcore::hmemoizer::render_report(snapshot)
+    }
+
     /// Replace the file with the current in-flight report.
     pub fn write(&self, text: &str) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
@@ -1671,7 +1682,7 @@ mod tests {
     /// during an incident.
     #[test]
     fn the_inflight_report_carries_every_section() {
-        let text = hcore::hmemoizer::render_full_report();
+        let text = InflightLog::render(&hcore::hmemoizer::capture_report());
         assert!(text.contains("in-flight inventory"), "{text}");
         assert!(text.contains("memoizer wait-for graph"), "{text}");
         assert!(text.contains("memoizer phases"), "{text}");

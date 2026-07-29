@@ -98,7 +98,7 @@ const NO_DRIVER: usize = usize::MAX;
 /// backstop with every wake evaporating — ~1000 ticks over 269s in the
 /// production wedge. A count that keeps climbing while a build makes no
 /// progress is that regression announcing itself; it is rendered in
-/// `render_full_report`, so it lands in the `SIGQUIT` dump and the stall
+/// `render_report`, so it lands in the `SIGQUIT` dump and the stall
 /// watchdog file. Not a `debug_assert!`: the benign cases above are reachable
 /// in correct executions.
 static VOID_WAKES: AtomicU64 = AtomicU64::new(0);
