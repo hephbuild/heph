@@ -43,21 +43,30 @@ impl ForwardingCache {
 
     /// Run `f` before every `reader` call, then forward regardless of what it
     /// does.
-    pub(crate) fn on_reader(mut self, f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static) -> Self {
+    pub(crate) fn on_reader(
+        mut self,
+        f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static,
+    ) -> Self {
         self.on_reader = Box::new(f);
         self
     }
 
     /// Run `f` before every `exists` call, then forward regardless of what it
     /// does.
-    pub(crate) fn on_exists(mut self, f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static) -> Self {
+    pub(crate) fn on_exists(
+        mut self,
+        f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static,
+    ) -> Self {
         self.on_exists = Box::new(f);
         self
     }
 
     /// Run `f` before every `list_target_entries` call, then forward
     /// regardless of what it does.
-    pub(crate) fn on_list_target_entries(mut self, f: impl Fn(&Addr) + Send + Sync + 'static) -> Self {
+    pub(crate) fn on_list_target_entries(
+        mut self,
+        f: impl Fn(&Addr) + Send + Sync + 'static,
+    ) -> Self {
         self.on_list_target_entries = Box::new(f);
         self
     }
@@ -169,21 +178,49 @@ mod tests {
         w.write_all(b"data").expect("write");
         drop(w);
 
-        assert_eq!(reader_calls.load(Ordering::SeqCst), 0, "writer must not fire the reader hook");
-        assert_eq!(exists_calls.load(Ordering::SeqCst), 0, "writer must not fire the exists hook");
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst),
+            0,
+            "writer must not fire the reader hook"
+        );
+        assert_eq!(
+            exists_calls.load(Ordering::SeqCst),
+            0,
+            "writer must not fire the exists hook"
+        );
 
         assert!(cache.exists(&a, "h", "out").expect("exists"));
-        assert_eq!(exists_calls.load(Ordering::SeqCst), 1, "exists hook must fire on exists");
-        assert_eq!(reader_calls.load(Ordering::SeqCst), 0, "exists must not fire the reader hook");
+        assert_eq!(
+            exists_calls.load(Ordering::SeqCst),
+            1,
+            "exists hook must fire on exists"
+        );
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst),
+            0,
+            "exists must not fire the reader hook"
+        );
 
         let sized = cache.reader(&a, "h", "out").expect("reader");
         drop(sized);
-        assert_eq!(reader_calls.load(Ordering::SeqCst), 1, "reader hook must fire on reader");
-        assert_eq!(exists_calls.load(Ordering::SeqCst), 1, "reader must not re-fire the exists hook");
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst),
+            1,
+            "reader hook must fire on reader"
+        );
+        assert_eq!(
+            exists_calls.load(Ordering::SeqCst),
+            1,
+            "reader must not re-fire the exists hook"
+        );
 
         // Unset hook: call must still forward correctly and must not panic on
         // the no-op default.
         let entries = cache.list_target_entries(&a).expect("list_target_entries");
-        assert_eq!(entries, vec!["h".to_string()], "call still forwards with no hook installed");
+        assert_eq!(
+            entries,
+            vec!["h".to_string()],
+            "call still forwards with no hook installed"
+        );
     }
 }

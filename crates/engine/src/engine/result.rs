@@ -8554,14 +8554,15 @@ mod tests {
         })
         .expect("engine");
         let manifest_reads = SArc::new(AtomicUsize::new(0));
-        engine.local_cache = SArc::new(ForwardingCache::new(engine.local_cache.clone()).on_reader({
-            let manifest_reads = SArc::clone(&manifest_reads);
-            move |_, _, name| {
-                if name == MANIFEST_V1 {
-                    manifest_reads.fetch_add(1, Ordering::SeqCst);
+        engine.local_cache =
+            SArc::new(ForwardingCache::new(engine.local_cache.clone()).on_reader({
+                let manifest_reads = SArc::clone(&manifest_reads);
+                move |_, _, name| {
+                    if name == MANIFEST_V1 {
+                        manifest_reads.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
-            }
-        }));
+            }));
         let exec_count = SArc::new(AtomicUsize::new(0));
         engine
             .register_driver(enclose!(
