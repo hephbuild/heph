@@ -78,10 +78,16 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
                 heph::hartifactcontent::WalkEntryKind::File { mut data, x } => {
                     let mut buf = Vec::new();
                     data.read_to_end(&mut buf)?;
-                    std::fs::write(&dest, &buf)?;
                     if x {
-                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+                        // Writing the binary by hand skips `unpack`, which is where
+                        // the rest of the tree gets the writable-fd barrier. This
+                        // suite runs many Go builds concurrently, each forking
+                        // subprocesses, so a fork racing the write inherits the
+                        // writable fd and the exec below fails with ETXTBSY.
+                        hcore::fsutil::write_executable(&dest, &buf)?;
                         binary_path = Some(dest);
+                    } else {
+                        std::fs::write(&dest, &buf)?;
                     }
                 }
                 heph::hartifactcontent::WalkEntryKind::Symlink { .. } => {}

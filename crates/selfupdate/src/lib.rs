@@ -210,7 +210,6 @@ mod imp {
     use super::{UPGRADED_ENV, binary_name, download_url, host_os_arch};
     use anyhow::{Context, anyhow};
     use std::io::{IsTerminal, Read, Write};
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -381,16 +380,12 @@ mod imp {
     /// Write `bytes` to a temp file, mark it executable, then rename into place so
     /// a partial download is never seen as a usable binary by a concurrent run.
     fn install_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-        use std::io::Write;
         let tmp = dir.join(".heph.download");
-        {
-            let mut f =
-                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-            f.write_all(bytes)?;
-            f.flush()?;
-        }
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("chmod {}", tmp.display()))?;
+        // `exec_into` execve's this binary moments later, so it must be written
+        // with the writable-fd barrier: a thread forking during the write leaves
+        // an inherited writable fd in the child until it reaches its own execve,
+        // and an exec of a binary with a live writable fd fails with ETXTBSY.
+        hcore::fsutil::write_executable(&tmp, bytes)?;
         std::fs::rename(&tmp, dest)
             .with_context(|| format!("install heph to {}", dest.display()))?;
         Ok(())
@@ -442,7 +437,57 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{fmt_bytes, progress_line};
+        use super::{fmt_bytes, install_atomic, progress_line};
+
+        /// `install_atomic` is the last step before `exec_into` replaces the
+        /// process image, and its errors are fatal (`main` turns them into
+        /// `ExitCode::FAILURE`), so every command in a pinned workspace depends
+        /// on it. Pin the contract end to end: the bytes land, the exec bit is
+        /// set, the installed file actually runs, and no partial download is
+        /// left behind for a concurrent run to mistake for a usable binary.
+        #[test]
+        fn install_atomic_writes_a_runnable_binary_and_leaves_no_partial() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dest = dir.path().join("heph");
+
+            install_atomic(dir.path(), &dest, b"#!/bin/sh\necho ok\n").expect("install");
+
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&dest).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "installed binary must be executable");
+
+            let out = std::process::Command::new(&dest).output().expect("exec");
+            assert!(out.status.success(), "installed binary failed: {out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+
+            assert!(
+                !dir.path().join(".heph.download").exists(),
+                "the temp download must be renamed away, not left beside the binary"
+            );
+        }
+
+        /// A failed install must say which step failed and must not leave a
+        /// half-installed binary at `dest` — the next run would exec it.
+        #[test]
+        fn install_atomic_reports_the_failing_step_and_installs_nothing() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // `dest` is a non-empty directory: the rename cannot succeed.
+            let dest = dir.path().join("occupied");
+            std::fs::create_dir(&dest).expect("mkdir dest");
+            std::fs::write(dest.join("child"), b"x").expect("occupy");
+
+            let err = install_atomic(dir.path(), &dest, b"#!/bin/sh\necho ok\n")
+                .expect_err("rename over a non-empty dir must fail");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("install heph to"),
+                "error must name the step that failed, got: {msg}"
+            );
+            assert!(
+                dest.is_dir(),
+                "a failed install must not replace what was there"
+            );
+        }
 
         #[test]
         fn fmt_bytes_scales_by_unit() {
