@@ -9,6 +9,8 @@ use futures::TryStreamExt;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::engine::error::{MultiError, TargetNotFoundError};
+use crate::engine::event::EventSender;
+use crate::engine::request_state::RequestState;
 use crate::engine::{Engine, get_cwp, get_root, gitignore};
 use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::Addr;
@@ -56,7 +58,8 @@ impl App for ValidateApp {
             root,
             fail_fast,
         } = self;
-        let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
+        let (rs, overlap_rs, gitignore_rs) =
+            independent_check_states(&engine, fail_fast, ctx.event_sender());
 
         // Overlap detection scopes to the user matcher when scoped, else uses the
         // codegen-tree selector (same one the gitignore enumeration uses).
@@ -106,14 +109,14 @@ impl App for ValidateApp {
             });
 
             // 2. Detect overlapping `codegen = copy` outputs.
-            let overlap_fut = enclose!((engine, rs) async move {
+            let overlap_fut = enclose!((engine, overlap_rs => rs) async move {
                 Arc::clone(&engine)
                     .codegen_copy_overlaps(rs.clone(), &overlap_matcher)
                     .await
             });
 
             // 3. Verify `.gitignore` is up to date (whole-workspace runs only).
-            let gitignore_fut = enclose!((engine, rs) async move {
+            let gitignore_fut = enclose!((engine, gitignore_rs => rs) async move {
                 if scoped {
                     return Ok::<bool, anyhow::Error>(false);
                 }
@@ -180,6 +183,33 @@ impl App for ValidateApp {
     }
 }
 
+/// One `RequestState` per concurrent check, never shared.
+///
+/// `link_fut`, `overlap_fut` and `gitignore_fut` run concurrently via
+/// `tokio::join!`, and `overlap_fut`/`gitignore_fut` walk with
+/// `Matcher::TreeOutputTo`, which hits the `MatchShrug` arm for every
+/// candidate. `mem_spec`/`mem_def` live on `RequestState::data`, so two
+/// concurrent walks sharing one `RequestState` race the same addr's `mem_spec`
+/// cell. Speculative cycle detection is a per-chain breadcrumb, not the shared
+/// `DepDag` (see `Engine::query`'s doc comment), so a losing chain's spurious
+/// `CycleError` can make the *other* chain's provider resolution win the
+/// memoized cell — and `def.driver` folds into `hashin`. Giving each
+/// concurrent walk its own `RequestState` restores the "one chain per walk"
+/// guarantee the speculative check already assumes, at the cost of
+/// re-resolving spec/def independently per check instead of sharing memoized
+/// work across them.
+fn independent_check_states(
+    engine: &Arc<Engine>,
+    fail_fast: bool,
+    events: Option<EventSender>,
+) -> (Arc<RequestState>, Arc<RequestState>, Arc<RequestState>) {
+    (
+        engine.new_state_with_events(fail_fast, events.clone()),
+        engine.new_state_with_events(fail_fast, events.clone()),
+        engine.new_state_with_events(fail_fast, events),
+    )
+}
+
 /// Fold the outcome of every validate check into a single result. Each check
 /// contributes either a list of human-readable problem strings (`Ok`) or a hard
 /// error (`Err`); a check's `Err` that is itself a [`MultiError`] is flattened
@@ -232,12 +262,55 @@ async fn execute_async(
 
 #[cfg(test)]
 mod tests {
-    use super::finish;
+    use super::{finish, independent_check_states};
     use crate::engine::error::MultiError;
+    use crate::engine::{Config, Engine};
 
     #[test]
     fn all_checks_ok_is_ok() {
         assert!(finish(vec![Ok(vec![]), Ok(vec![]), Ok(vec![])]).is_ok());
+    }
+
+    /// Regression guard for the concurrent-chain race documented on
+    /// `independent_check_states`: `link_fut`, `overlap_fut` and
+    /// `gitignore_fut` must never share a `RequestState`, or their concurrent
+    /// `Matcher::TreeOutputTo` walks can race the same addr's `mem_spec` cell
+    /// and let scheduling decide which provider's `driver` feeds `hashin`.
+    /// Each `RequestState` carries a fresh, unique `request_id` (see
+    /// `Engine::new_state_inner`), which is exactly the identity `mem_spec`/
+    /// `mem_def` are keyed under — so distinct ids here is what proves the
+    /// three checks cannot share that memoization.
+    #[test]
+    fn check_states_are_never_shared() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: root.path().join(".heph3"),
+            parallelism: None,
+            ..Default::default()
+        })
+        .expect("engine");
+        let engine = std::sync::Arc::new(engine);
+
+        let (rs, overlap_rs, gitignore_rs) = independent_check_states(&engine, true, None);
+
+        let ids = [
+            rs.request_id(),
+            overlap_rs.request_id(),
+            gitignore_rs.request_id(),
+        ];
+        assert_ne!(
+            ids[0], ids[1],
+            "link and overlap checks share a RequestState"
+        );
+        assert_ne!(
+            ids[0], ids[2],
+            "link and gitignore checks share a RequestState"
+        );
+        assert_ne!(
+            ids[1], ids[2],
+            "overlap and gitignore checks share a RequestState"
+        );
     }
 
     #[test]
