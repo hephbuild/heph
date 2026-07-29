@@ -8,7 +8,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -232,7 +232,19 @@ pub fn dump_phases() -> String {
     if !phase_trace_enabled() {
         return format!("  (phase trace disabled — set {PHASE_TRACE_VAR}=1)");
     }
-    let map = phases().lock().expect("phases mutex poisoned");
+    format_phases()
+}
+
+/// The lock-and-format half of [`dump_phases`], split out so a poisoned-lock
+/// recovery can be exercised directly — `phase_trace_enabled` caches its
+/// answer for the process, so a test cannot reliably force this past the gate
+/// above once any other test in the binary has read the flag first.
+fn format_phases() -> String {
+    // A panic while some other caller held this lock (mid `set_phase` or
+    // `clear_phase`) must not turn this diagnostic dump into a second panic —
+    // recover the guard rather than propagating the poison, same as
+    // `ApprovalCenter::lock`.
+    let map = phases().lock().unwrap_or_else(PoisonError::into_inner);
     if map.is_empty() {
         return "  (none)".to_string();
     }
@@ -672,6 +684,13 @@ impl ReportSnapshot {
             phases,
         }
     }
+
+    /// The sampled cells, for a caller that needs to hand the *same* sample to
+    /// more than one renderer (see the stall watchdog's `sample_once`) instead
+    /// of taking a second, independent live read.
+    pub fn cells(&self) -> &[StuckCell] {
+        &self.cells
+    }
 }
 
 /// Sample the in-flight state once, for [`render_report`].
@@ -1095,7 +1114,16 @@ pub fn dump_wait_graph() -> String {
     if !cycle_detection_enabled() {
         return "  (cycle detection disabled — set HEPH_DEBUG_MEMOIZER_CYCLE=1)".to_string();
     }
-    let wg = wait_graph().lock().expect("wait_graph poisoned");
+    format_wait_graph()
+}
+
+/// The lock-and-format half of [`dump_wait_graph`], split out for the same
+/// reason as [`format_phases`]: `cycle_detection_enabled` is a process-cached
+/// flag, so a test cannot force this past the gate above on demand.
+fn format_wait_graph() -> String {
+    // Recover a poisoned guard instead of panicking a second time — see
+    // `format_phases`.
+    let wg = wait_graph().lock().unwrap_or_else(PoisonError::into_inner);
     let mut out = String::new();
     if wg.cells.is_empty() && wg.waiting.is_empty() {
         out.push_str("  (empty)");
@@ -2326,6 +2354,49 @@ mod tests {
         );
         assert!(text.contains("memoizer wait-for graph"), "{text}");
         assert!(text.contains("memoizer phases"), "{text}");
+    }
+
+    /// A panic while some other caller held the `phases` lock must not turn
+    /// `dump_phases`'s dump into a second panic — it should recover the
+    /// poisoned guard and still render, same as `ApprovalCenter::lock`.
+    ///
+    /// Goes through `format_phases` directly rather than `dump_phases`:
+    /// `phase_trace_enabled` caches its answer for the whole process the
+    /// first time anything reads it, so a test cannot reliably force
+    /// `dump_phases` past its disabled-gate once some other test in this
+    /// binary has already read the flag as `false`.
+    #[test]
+    fn format_phases_recovers_from_a_poisoned_lock() {
+        drop(
+            std::thread::spawn(|| {
+                let _guard = phases().lock().expect("lock for poisoning");
+                panic!("intentional poison for format_phases_recovers_from_a_poisoned_lock");
+            })
+            .join(),
+        );
+
+        // Before the fix, this line panics with "phases mutex poisoned"
+        // instead of returning.
+        let text = format_phases();
+        assert!(text.contains("(none)") || text.contains("inv "), "{text}");
+    }
+
+    /// Same as `format_phases_recovers_from_a_poisoned_lock`, for the
+    /// wait-for-graph lock.
+    #[test]
+    fn format_wait_graph_recovers_from_a_poisoned_lock() {
+        drop(
+            std::thread::spawn(|| {
+                let _guard = wait_graph().lock().expect("lock for poisoning");
+                panic!("intentional poison for format_wait_graph_recovers_from_a_poisoned_lock");
+            })
+            .join(),
+        );
+
+        // Before the fix, this line panics with "wait_graph poisoned" instead
+        // of returning.
+        let text = format_wait_graph();
+        assert!(text.contains("(empty)") || text.contains("cells (owned)"), "{text}");
     }
 
     #[test]

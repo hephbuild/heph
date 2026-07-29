@@ -1198,11 +1198,33 @@ pub struct Watchdog {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Sample the in-flight state exactly once for a firing `report`, via
+/// `capture`, and stamp `report.stuck` from that same sample.
+///
+/// The capped paragraph (`report.stuck`, rendered by [`render_stall`]) and the
+/// uncapped companion file (the returned snapshot, rendered by
+/// [`InflightLog::render`]) used to each call the live global registry on
+/// their own — one via `hcore::hmemoizer::inventory()` here, the other via
+/// `hcore::hmemoizer::capture_report()` at the call site in `heph run`. Two
+/// reads of state that moves while a build runs can disagree, so a reader
+/// diffing the two files for a hang could see the paragraph name a cell the
+/// companion file's listing does not contain. Splitting the sample from the
+/// two renders — same shape as `capture_report`/`render_report` — makes
+/// "one sample feeds both" a property `emit`'s caller cannot opt out of.
+fn sample_once(
+    mut report: StallReport,
+    capture: impl FnOnce() -> hcore::hmemoizer::ReportSnapshot,
+) -> (StallReport, hcore::hmemoizer::ReportSnapshot) {
+    let snapshot = capture();
+    report.stuck = snapshot.cells().to_vec();
+    (report, snapshot)
+}
+
 impl Watchdog {
     pub fn spawn(
         state: std::sync::Arc<DiagState>,
         threshold: Duration,
-        emit: impl Fn(&StallReport) + Send + 'static,
+        emit: impl Fn(&StallReport, &hcore::hmemoizer::ReportSnapshot) + Send + 'static,
     ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_thread = std::sync::Arc::clone(&stop);
@@ -1248,8 +1270,9 @@ impl Watchdog {
                         // pure and testable by passing a time: this walks live
                         // maps and formats keys, which is affordable once a stall
                         // is already confirmed and not on every tick.
-                        report.stuck = hcore::hmemoizer::inventory();
-                        emit(&report);
+                        let (report, snapshot) =
+                            sample_once(report, hcore::hmemoizer::capture_report);
+                        emit(&report, &snapshot);
                         last_fired = Some(now);
                         last_seen = Some((done, open, now));
                     }
@@ -1289,6 +1312,60 @@ mod tests {
             kind,
             at_unix_ms: 0,
         }
+    }
+
+    /// `sample_once` must call `capture` exactly once per fire and stamp
+    /// `report.stuck` from that same call's cells — not from a second,
+    /// independent read.
+    ///
+    /// Before the fix, the watchdog filled `report.stuck` from a live
+    /// `hcore::hmemoizer::inventory()` call, and the `heph run` call site
+    /// separately called `hcore::hmemoizer::capture_report()` for the
+    /// companion file. Two live reads of state that moves while a build runs
+    /// can disagree, but a test that just calls the real global registry
+    /// twice would not reliably catch that (a quiet test process usually
+    /// returns the same thing both times). So this fakes the capture with a
+    /// closure that returns a *different* sample per call — mirroring what a
+    /// live registry does under concurrent mutation — and asserts both the
+    /// call count and that the paragraph and the snapshot agree.
+    #[test]
+    fn sample_once_captures_the_live_state_exactly_once() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let report = s.evaluate(61_000, T).expect("stalled");
+
+        let calls = std::cell::Cell::new(0);
+        let (report, snapshot) = sample_once(report, || {
+            calls.set(calls.get() + 1);
+            hcore::hmemoizer::ReportSnapshot::from_parts(
+                vec![hcore::hmemoizer::StuckCell {
+                    tag: "result",
+                    key: format!("//call:{}", calls.get()),
+                    waiters: Some(1),
+                    has_driver: false,
+                }],
+                0,
+                String::new(),
+                String::new(),
+            )
+        });
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the live state must be sampled exactly once per fire, or the \
+             paragraph and the companion file can read it at two different \
+             instants and disagree"
+        );
+        assert_eq!(
+            report.stuck.len(),
+            snapshot.cells().len(),
+            "the paragraph's cell list must be the snapshot's cell list"
+        );
+        assert_eq!(
+            report.stuck[0].key, snapshot.cells()[0].key,
+            "…not just the same length by coincidence — the same cells"
+        );
     }
 
     /// A lone quiet subprocess is not a stall at the ordinary threshold.
