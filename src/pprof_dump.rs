@@ -256,24 +256,59 @@ mod tests {
     /// that interrupts it has a leaf PC no [`UNWIND_BLOCKLIST`] entry can match.
     ///
     /// `black_box` on the accumulator and the loop variable keeps the whole thing
-    /// from being folded to a constant; `#[inline(never)]` gives it a frame of its
-    /// own, so `burn`'s caller can assert on it by name rather than on a count.
+    /// from being folded to a constant, so `burn`'s caller can assert on it by
+    /// name rather than on a count.
+    ///
+    /// Split into a loop and a per-round callee, both `#[inline(never)]`, on
+    /// purpose. One `#[inline(never)]` leaf is not enough: optimized, the
+    /// interrupted leaf can be frameless and the unwinder attributes the sample
+    /// to whatever called it — measured, an `opt-level=3` build of this very test
+    /// binary named `cpu_only` in **zero** samples and failed 10/10. With the
+    /// round in a callee, `cpu_only` is a *caller* — recovered from a return
+    /// address on the stack, not from leaf attribution — and either name
+    /// satisfies [`CPU_NEEDLE`]. The call is what makes the frame observable, so
+    /// it is not an inlining hint to be removed.
+    #[inline(never)]
+    fn cpu_only_round(acc: u64, i: u64) -> u64 {
+        let acc = acc
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(std::hint::black_box(i) | 1);
+        std::hint::black_box(acc ^ (acc >> 29))
+    }
+
     #[inline(never)]
     fn cpu_only(rounds: u64) -> u64 {
         let mut acc = std::hint::black_box(0x9E37_79B9_7F4A_7C15_u64);
         for i in 0..rounds {
-            acc = acc
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(std::hint::black_box(i) | 1);
-            acc ^= acc >> 29;
+            acc = cpu_only_round(acc, i);
         }
         std::hint::black_box(acc)
     }
 
-    /// Rounds of [`cpu_only`] per `burn` iteration — enough that the in-binary
-    /// half is comparable to the libc half rather than a rounding error on it.
-    /// Sized by measurement, not by feel: see the sample counts in `burn`'s docs.
-    const CPU_ROUNDS: u64 = 50_000;
+    /// Rounds of [`cpu_only`] per `burn` iteration.
+    ///
+    /// A trade, and both sides were measured rather than guessed — 8 runs per
+    /// cell, darwin/arm64, `burn(4, 500ms)`, counting stacks naming
+    /// [`CPU_NEEDLE`] and `cpu_only`'s share of the ~2.0s burn window:
+    ///
+    /// | rounds | opt0 hits | opt0 cpu share | opt3 hits |
+    /// |---|---|---|---|
+    /// | 10_000 | 17-34 | 22-36% | 2-4 |
+    /// | **25_000** | **21-45** | **39-60%** | **4** |
+    /// | 50_000 | 35-42 | 50-72% | 4 |
+    ///
+    /// Up buys margin on the assertion; down leaves more of the window inside
+    /// libc, which is the only part that exposes the sampler to the frames
+    /// `UNWIND_BLOCKLIST` exists for. 25_000 keeps a ~20x margin on an assertion
+    /// that needs 1, at a roughly even split, with 2000-5000 full libc-churn
+    /// iterations still running per run. Re-measure before moving it; the split
+    /// depends on the allocator, so it will not be the same on the Linux targets.
+    const CPU_ROUNDS: u64 = 25_000;
+
+    /// Substring identifying an in-binary frame: matches both [`cpu_only`] and
+    /// [`cpu_only_round`], because which of the two a given build surfaces
+    /// depends on the optimization level (see [`cpu_only`]).
+    const CPU_NEEDLE: &str = "cpu_only";
 
     /// Keep `threads` threads busy for `at_least`, in two deliberately different
     /// places: **inside libc** (allocator churn, syscalls, thread create/join) and
@@ -281,10 +316,16 @@ mod tests {
     ///
     /// Both halves are load-bearing, and for opposite assertions:
     ///
-    /// - The libc churn is what the *crash* regression needs. The unwinder faults
-    ///   when it interrupts a thread already inside `malloc`, the dynamic loader
-    ///   or a syscall stub, so a pure integer loop — shallow stack, leaf PC in
-    ///   this binary — exercises precisely the case that never crashed.
+    /// - The libc churn is the half that puts the sampler in front of the frames
+    ///   the blocklist exists for. The unwinder faults when it interrupts a thread
+    ///   already inside `malloc`, the dynamic loader or a syscall stub, so a pure
+    ///   integer loop — shallow stack, leaf PC in this binary — exercises
+    ///   precisely the case that never crashed. Note what this does *not* claim:
+    ///   the original segfault has not been shown to reproduce here on any
+    ///   supported target (blocklist off, it does not fire on darwin/arm64), so
+    ///   the first half of this test is "the process survives being profiled",
+    ///   not a reproduction of the fault. That is why the churn is kept large
+    ///   rather than trimmed to whatever the second assertion needs.
     /// - [`cpu_only`] is what the *profile has heph frames in it* assertion needs,
     ///   and it is not decoration. `pprof` drops a sample whose leaf PC is
     ///   blocklisted **by design**, so a workload built only from the first half
@@ -338,14 +379,18 @@ mod tests {
         }
     }
 
-    /// How many of `profile`'s samples name a function containing `needle`
-    /// anywhere in their stack.
+    /// How many of `profile`'s **sample entries** name a function containing
+    /// `needle` anywhere in their stack.
+    ///
+    /// Entries, not sampling events: pprof collapses identical stacks into one
+    /// `Sample` carrying a count, so this is a count of *distinct stacks* and the
+    /// number of `SIGPROF` deliveries behind it is larger.
     ///
     /// Walks pprof's id indirection (sample → location → line → function → string
     /// table) rather than indexing by position: ids are not promised to be their
     /// index plus one, and a profile that renumbered them would otherwise make
     /// this silently answer zero.
-    fn samples_naming(profile: &pprof::protos::Profile, needle: &str) -> usize {
+    fn stacks_naming(profile: &pprof::protos::Profile, needle: &str) -> usize {
         use std::collections::{HashMap, HashSet};
         let names: HashMap<u64, &str> = profile
             .function
@@ -513,7 +558,9 @@ mod tests {
     /// to drop, so the profile came back empty on 4 of 50 darwin/arm64 runs — and
     /// on master's own CI. Naming a frame the blocklist must never match turns a
     /// statistical claim into a structural one, and says the thing the count was
-    /// only standing in for: heph's own frames survive the blocklist.
+    /// only standing in for: heph's own frames survive the blocklist. It is also
+    /// strictly stronger — a lone libc straggler satisfies "non-empty" while every
+    /// heph frame is being dropped, which is the failure it claimed to guard.
     ///
     /// **Only one test in this binary may call [`start`].** pprof's `PROFILER` is
     /// a process singleton: a concurrent second `start` fails with
@@ -552,15 +599,29 @@ mod tests {
         let snapshot = snapshot.unwrap_or_else(|| panic!("no profile at {}", path.display()));
         let profile = pprof::protos::Profile::decode(snapshot.as_slice())
             .expect("on-demand dump must be a decodable pprof profile — never a partial write");
-        let in_binary = samples_naming(&profile, "cpu_only");
+        // Diagnosis is branched on whether *anything* was sampled, because the two
+        // states have disjoint causes and a message naming the wrong one sends the
+        // reader after a bug that is not there.
+        let in_binary = stacks_naming(&profile, CPU_NEEDLE);
         assert!(
             in_binary > 0,
-            "no sample reached `cpu_only`, which burned a large share of this \
-             process's CPU inside the main binary for the whole sampling window: \
-             either UNWIND_BLOCKLIST now matches the main binary and every heph \
-             frame is being dropped, or the sampler collected nothing at all \
-             ({} sample(s) in total)",
-            profile.sample.len()
+            "no stack named `{}`, though it burned a large share of this process's \
+             CPU inside the main binary for the whole sampling window. {}",
+            CPU_NEEDLE,
+            if profile.sample.is_empty() {
+                "The profile is empty: either UNWIND_BLOCKLIST now matches the main \
+                 binary and every heph frame is being dropped, or the sampler \
+                 collected nothing at all."
+                    .to_string()
+            } else {
+                format!(
+                    "The profile has {} distinct stack(s), so the sampler is \
+                     working — the frames did not symbolize (a stripped build), or \
+                     `cpu_only`/`cpu_only_round` was renamed without updating \
+                     CPU_NEEDLE, or this build folded both frames away.",
+                    profile.sample.len()
+                )
+            }
         );
 
         // `shutdown` writes the filtered exit-time report — the profile the flag
