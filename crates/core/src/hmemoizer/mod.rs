@@ -461,6 +461,23 @@ impl StuckCell {
     pub fn is_stranded(&self) -> bool {
         !self.has_driver && self.waiters.is_some_and(|n| n > 0)
     }
+
+    /// Nobody is awaiting this cell at all, and it never finished.
+    ///
+    /// The cell still *holds* its in-flight future — that is deliberate, so an
+    /// awaiter dropped between polls can be replaced by another. But when the
+    /// last awaiter goes for good (fail-fast drops every sibling on the first
+    /// error; Ctrl-C drops them wholesale) there is no replacement coming, and
+    /// nothing will ever poll that future again.
+    ///
+    /// It is not inert while it sits there. A parked future keeps whatever it
+    /// was holding, and keeps its place in whatever queue it was waiting on — so
+    /// an abandoned computation can still be handed a worker permit it will
+    /// never use and never give back. Counting these is how that becomes
+    /// visible instead of inferred.
+    pub fn is_abandoned(&self) -> bool {
+        !self.has_driver && self.waiters == Some(0)
+    }
 }
 
 /// Type-erased handle on one live `Memoizer`'s cache.
@@ -542,6 +559,7 @@ pub fn inventory() -> Vec<StuckCell> {
     out.sort_by(|a, b| {
         b.is_stranded()
             .cmp(&a.is_stranded())
+            .then(b.is_abandoned().cmp(&a.is_abandoned()))
             .then(b.waiters.unwrap_or(0).cmp(&a.waiters.unwrap_or(0)))
             .then(a.tag.cmp(b.tag))
             .then(a.key.cmp(&b.key))
@@ -578,12 +596,27 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
         ));
     }
 
+    let abandoned = cells.iter().filter(|c| c.is_abandoned()).count();
+    if abandoned > 0 {
+        out.push_str(&format!(
+            "  abandoned    {abandoned} cell(s) have no awaiters left — their futures are parked\n  \
+             {} for good, still holding whatever they had\n",
+            " ".repeat(11)
+        ));
+    }
+
     for cell in cells.iter().take(limit) {
         let waiters = match cell.waiters {
             Some(n) => n.to_string(),
             None => "?".to_string(),
         };
-        let mark = if cell.is_stranded() { " STRANDED" } else { "" };
+        let mark = if cell.is_stranded() {
+            " STRANDED"
+        } else if cell.is_abandoned() {
+            " ABANDONED"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "    [{}] {} waiters={waiters} driver={}{mark}\n",
             cell.tag, cell.key, cell.has_driver

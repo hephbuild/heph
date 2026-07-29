@@ -189,6 +189,16 @@ pub struct Limiter {
     pub name: &'static str,
     /// Millis at which this limiter last went from "has permits" to "none", or 0.
     saturated_since_ms: AtomicU64,
+    /// Reads the limiter's *current* free permits, when one has been attached.
+    ///
+    /// Without it a limiter is only ever sampled from its own acquire path, so
+    /// the reading freezes the moment nothing acquires any more — which is
+    /// exactly when the stall watchdog fires. A wedged build then reported
+    /// "workers saturated for 90s" from a stamp left by the last acquire
+    /// attempt, indistinguishable from a pool that is still fully held.
+    /// Telling those two apart is the whole question at a stall: permits held
+    /// means deadlocked on the pool, permits free means wedged elsewhere.
+    gauge: std::sync::OnceLock<Box<dyn Fn() -> usize + Send + Sync>>,
 }
 
 impl Limiter {
@@ -196,6 +206,24 @@ impl Limiter {
         Self {
             name,
             saturated_since_ms: AtomicU64::new(0),
+            gauge: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Attach a live reader of this limiter's free permits.
+    ///
+    /// Idempotent: the first attachment wins and later ones are dropped, so a
+    /// call site on a hot path can arm it without a separate one-time hook.
+    /// Only read when a report is being rendered, never on the acquire path.
+    pub fn attach_gauge(&self, gauge: impl Fn() -> usize + Send + Sync + 'static) {
+        drop(self.gauge.set(Box::new(gauge)));
+    }
+
+    /// Re-read the live gauge, if there is one, so a report reflects the present
+    /// rather than the last acquire.
+    fn refresh(&self, now_ms: u64) {
+        if let Some(gauge) = self.gauge.get() {
+            self.observe(gauge(), now_ms);
         }
     }
 
@@ -250,6 +278,71 @@ pub struct DiagState {
     /// Pid believed to hold the lock at the most recent blocked acquisition;
     /// `0` for none/unknown. Last-writer-wins — a diagnostic hint, not a census.
     lock_holder_pid: AtomicU64,
+    /// Worker permits currently held by a target that is actually running —
+    /// incremented once `acquire()` has *returned*, decremented when the permit
+    /// drops.
+    ///
+    /// The point is the arithmetic against the pool's own free count. A tokio
+    /// `Semaphore` hands a released permit to the first queued waiter and wakes
+    /// it, so a permit can be *granted* to an `Acquire` future that is never
+    /// polled again — spent, but held by nobody. That permit is invisible from
+    /// both ends: the pool reports it as taken, and no target reports running.
+    ///
+    /// `capacity - free - running` names exactly that population, which is the
+    /// difference between "the pool is busy" and "the pool has been leaked away"
+    /// — and those two want opposite investigations.
+    workers_running: AtomicI64,
+    /// The pool's permit count, or 0 before the engine has registered it.
+    workers_capacity: AtomicU64,
+    /// Reads the pool's *current* free permits. Sampled while a report is being
+    /// rendered, never on the acquire path.
+    workers_free: std::sync::OnceLock<Box<dyn Fn() -> usize + Send + Sync>>,
+}
+
+/// Marks a worker permit as held by a *running* target for as long as it lives.
+///
+/// Tied to the permit's own scope, so cancellation releases it on the same path
+/// the permit itself is released on — a count that could drift would be worse
+/// than no count, since the whole value here is the arithmetic.
+pub struct RunningPermit(std::sync::Arc<DiagState>);
+
+impl RunningPermit {
+    #[expect(clippy::new_without_default, reason = "a guard, not a value")]
+    pub fn new() -> Self {
+        Self::on(std::sync::Arc::clone(global()))
+    }
+
+    /// Count against a specific table rather than the process-wide one. Lets the
+    /// accounting be asserted without every test sharing one counter.
+    pub fn on(state: std::sync::Arc<DiagState>) -> Self {
+        state.worker_permit_acquired();
+        Self(state)
+    }
+}
+
+impl Drop for RunningPermit {
+    fn drop(&mut self) {
+        self.0.worker_permit_released();
+    }
+}
+
+/// Worker-permit accounting, as of one report.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerPermits {
+    pub capacity: u64,
+    pub free: u64,
+    /// Held by a target that is actually running.
+    pub running: u64,
+}
+
+impl WorkerPermits {
+    /// Permits the pool considers taken that no running target holds — granted
+    /// to a waiter that is not being polled, and therefore never coming back.
+    pub fn unaccounted(&self) -> u64 {
+        self.capacity
+            .saturating_sub(self.free)
+            .saturating_sub(self.running)
+    }
 }
 
 impl DiagState {
@@ -269,7 +362,47 @@ impl DiagState {
             failed: AtomicU64::new(0),
             lock_wait: OpState::new(),
             lock_holder_pid: AtomicU64::new(0),
+            workers_running: AtomicI64::new(0),
+            workers_capacity: AtomicU64::new(0),
+            workers_free: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Register the worker pool: its permit count, and a live reader of its free
+    /// permits. Idempotent; the first registration wins.
+    pub fn register_worker_pool(
+        &self,
+        capacity: usize,
+        free: impl Fn() -> usize + Send + Sync + 'static,
+    ) {
+        self.workers_capacity
+            .store(capacity as u64, Ordering::Relaxed);
+        drop(self.workers_free.set(Box::new(free)));
+    }
+
+    /// A worker permit has been acquired and the target is now running. Paired
+    /// with [`worker_permit_released`](Self::worker_permit_released).
+    pub fn worker_permit_acquired(&self) {
+        self.workers_running.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn worker_permit_released(&self) {
+        self.workers_running.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Worker-permit accounting, or `None` before the pool has been registered.
+    pub fn worker_permits(&self) -> Option<WorkerPermits> {
+        let free = self.workers_free.get()?;
+        let capacity = self.workers_capacity.load(Ordering::Relaxed);
+        if capacity == 0 {
+            return None;
+        }
+        Some(WorkerPermits {
+            capacity,
+            free: free() as u64,
+            running: u64::try_from(self.workers_running.load(Ordering::Relaxed).max(0))
+                .unwrap_or(0),
+        })
     }
 
     /// Record the start of a blocked result-lock acquisition.
@@ -459,7 +592,13 @@ impl DiagState {
         let mut v: Vec<_> = self
             .limiters
             .iter()
-            .filter_map(|l| l.saturated_for(now_ms).map(|d| (l.name, d)))
+            .filter_map(|l| {
+                // Sample now, not at the last acquire. A stall report is rendered
+                // precisely when nothing is acquiring, so an acquire-only reading
+                // is frozen at whatever it was when work stopped.
+                l.refresh(now_ms);
+                l.saturated_for(now_ms).map(|d| (l.name, d))
+            })
             .collect();
         v.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
         v
@@ -517,6 +656,7 @@ impl DiagState {
             done: self.done(),
             failed: self.failed(),
             lock_waits: self.lock_waits(now_ms),
+            workers: self.worker_permits(),
             delta: None,
             stuck: Vec::new(),
         })
@@ -555,6 +695,8 @@ pub struct StallReport {
     pub lock_waits: Option<(u64, Option<Duration>, Option<u32>)>,
     /// Change since the previous fire; `None` on the first.
     pub delta: Option<StallDelta>,
+    /// Worker-permit accounting, when the pool has been registered.
+    pub workers: Option<WorkerPermits>,
     /// Incomplete memoizer cells. Filled in by [`Watchdog`] after `evaluate`,
     /// which stays pure — see its docs.
     pub stuck: Vec<hcore::hmemoizer::StuckCell>,
@@ -775,6 +917,19 @@ pub fn render_stall(r: &StallReport) -> String {
 
     // Cross-process contention: the holder may be another heph on this machine,
     // which nothing else in this report could ever surface.
+    // The arithmetic, not just the age: "saturated" says the pool is full, and
+    // this says whether anything is actually using it.
+    if let Some(w) = r.workers {
+        out.push_str(&format!(
+            "  workers      {} max, {} free, {} running",
+            w.capacity, w.free, w.running
+        ));
+        if w.unaccounted() > 0 {
+            out.push_str(&format!(", {} unaccounted", w.unaccounted()));
+        }
+        out.push('\n');
+    }
+
     if let Some((n, oldest, pid)) = r.lock_waits {
         let age = match oldest {
             Some(a) => format!(", oldest {}", secs(a)),
@@ -1516,6 +1671,89 @@ mod tests {
         assert!(text.contains("HEPH_PHASE_TRACE"), "{text}");
     }
 
+    /// The measurement this exists for: permits the pool considers taken that no
+    /// running target holds.
+    ///
+    /// A wedged build showed every worker permit gone, 107 targets queued on the
+    /// semaphore, and *nothing executing* — no open execute span, no subprocess
+    /// on any thread. Those two readings are only reconcilable one way: tokio
+    /// hands a released permit to the first queued waiter and wakes it, so a
+    /// permit granted to a future that is never polled again is spent and held
+    /// by nobody. "Busy" and "leaked away" look identical without this line, and
+    /// they want opposite investigations.
+    #[test]
+    fn unaccounted_permits_are_named() {
+        let free = std::sync::Arc::new(AtomicU64::new(0));
+        let s = state();
+        s.register_worker_pool(12, {
+            let free = std::sync::Arc::clone(&free);
+            move || usize::try_from(free.load(Ordering::Relaxed)).unwrap_or(0)
+        });
+        s.op_start(Op::Result, "//a:b", 0);
+
+        // Three targets running, nine permits gone with nobody holding them.
+        let _running: Vec<RunningPermit> = (0..3)
+            .map(|_| RunningPermit::on(std::sync::Arc::clone(&s)))
+            .collect();
+
+        let r = s.evaluate(61_000, T).expect("stalled");
+        let w = r.workers.expect("the pool is registered");
+        assert_eq!((w.capacity, w.free, w.running), (12, 0, 3));
+        assert_eq!(w.unaccounted(), 9);
+
+        let text = render_stall(&r);
+        assert!(
+            text.contains("workers      12 max, 0 free, 3 running, 9 unaccounted"),
+            "{text}"
+        );
+    }
+
+    /// A healthy busy pool must not be described as leaking: every taken permit
+    /// is accounted for by a running target, so the line stays quiet about it.
+    #[test]
+    fn a_fully_busy_pool_reports_no_unaccounted_permits() {
+        let s = state();
+        s.register_worker_pool(4, || 0);
+        s.op_start(Op::Result, "//a:b", 0);
+        let _running: Vec<RunningPermit> = (0..4)
+            .map(|_| RunningPermit::on(std::sync::Arc::clone(&s)))
+            .collect();
+
+        let r = s.evaluate(61_000, T).expect("stalled");
+        assert_eq!(r.workers.expect("registered").unaccounted(), 0);
+        let text = render_stall(&r);
+        assert!(text.contains("4 max, 0 free, 4 running"), "{text}");
+        assert!(!text.contains("unaccounted"), "{text}");
+    }
+
+    /// The guard is tied to the permit's scope, so a released permit stops being
+    /// counted — a counter that drifted would make the arithmetic worthless.
+    #[test]
+    fn a_released_permit_stops_being_counted() {
+        let s = state();
+        s.register_worker_pool(2, || 2);
+        {
+            let _running = RunningPermit::on(std::sync::Arc::clone(&s));
+            assert_eq!(s.worker_permits().expect("registered").running, 1);
+        }
+        assert_eq!(s.worker_permits().expect("registered").running, 0);
+    }
+
+    /// Before the engine registers its pool there is nothing to report, and the
+    /// paragraph must not invent a line about it.
+    #[test]
+    fn an_unregistered_pool_reports_nothing() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        let r = s.evaluate(61_000, T).expect("stalled");
+        assert!(r.workers.is_none());
+        assert!(
+            !render_stall(&r).contains("workers  "),
+            "{}",
+            render_stall(&r)
+        );
+    }
+
     /// The `workers` limiter is declared by `global()` and, until now, fed by
     /// nothing — so `saturated_for` was permanently `None` and an exhausted
     /// worker pool could not appear in the paragraph at any threshold. The
@@ -1705,6 +1943,85 @@ mod tests {
         );
         l.observe(3, 50_000);
         assert!(s.saturated(60_000).is_empty());
+    }
+
+    /// A limiter sampled only from its own acquire path freezes exactly when it
+    /// matters.
+    ///
+    /// A stall report is rendered *because* nothing is acquiring any more, so
+    /// the last acquire-time reading is by definition stale. A real wedge
+    /// reported "workers saturated for 90s" from a stamp left behind when work
+    /// stopped, while zero `execute` spans were open — the pool was in fact
+    /// free, and the paragraph could not say so. Permits held means deadlocked
+    /// on the pool; permits free means wedged elsewhere. That is the whole
+    /// question at a stall, and the two must not look identical.
+    #[test]
+    fn a_live_gauge_reports_the_present_not_the_last_acquire() {
+        let s = state();
+        let l = &s.limiters()[0];
+        let free = std::sync::Arc::new(AtomicU64::new(0));
+
+        l.attach_gauge({
+            let free = std::sync::Arc::clone(&free);
+            move || usize::try_from(free.load(Ordering::Relaxed)).unwrap_or(0)
+        });
+
+        // Exhausted, and nothing has acquired since.
+        l.observe(0, 1_000);
+        assert_eq!(
+            s.saturated(48_000),
+            vec![("workers", Duration::from_millis(47_000))]
+        );
+
+        // Permits come back with no acquire to notice — the frozen reading would
+        // still claim saturation here.
+        free.store(4, Ordering::Relaxed);
+        assert!(
+            s.saturated(60_000).is_empty(),
+            "a live gauge must retract a stale saturation claim"
+        );
+
+        // And the reverse: it can go saturated between reports, without an
+        // acquire, and still be reported.
+        free.store(0, Ordering::Relaxed);
+        assert_eq!(
+            s.saturated(61_000)
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
+            vec!["workers"]
+        );
+    }
+
+    /// Without a gauge the old acquire-only behaviour is untouched, so a limiter
+    /// nobody has wired up cannot start reporting phantom saturation.
+    #[test]
+    fn a_limiter_without_a_gauge_keeps_its_acquire_only_reading() {
+        let s = state();
+        let l = &s.limiters()[0];
+        l.observe(0, 1_000);
+        assert_eq!(
+            s.saturated(5_000),
+            vec![("workers", Duration::from_millis(4_000))]
+        );
+    }
+
+    /// First attachment wins, so arming it from a hot path is safe.
+    #[test]
+    fn attaching_a_gauge_twice_keeps_the_first() {
+        let s = state();
+        let l = &s.limiters()[0];
+        l.attach_gauge(|| 0);
+        l.attach_gauge(|| 7);
+        l.observe(9, 1_000);
+        assert_eq!(
+            s.saturated(2_000)
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
+            vec!["workers"],
+            "the first gauge (0 permits) must still be the one consulted"
+        );
     }
 
     /// The paragraph must name the subsystem, the count and the age, and must not
