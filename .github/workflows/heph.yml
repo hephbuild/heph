@@ -819,7 +819,12 @@ jobs:
       PERFBENCH_LAYERS: "10"
       PERFBENCH_FAN_OUT: "4"
       PERFBENCH_GO_PACKAGES: "60"
-      PERFBENCH_REPS: "3"
+      # 3 was too few to tell signal from CI-runner noise (the first live
+      # runs showed exactly that). Interleaving (see the run steps below)
+      # fixes systematic drift between candidate/baseline; more reps is what
+      # narrows the noise floor itself. Bumped for now — a real number should
+      # come from watching `noise_band_pct` in actual runs, not a guess.
+      PERFBENCH_REPS: "7"
     strategy:
       fail-fast: false
       matrix:
@@ -958,26 +963,54 @@ jobs:
             --go-packages "$PERFBENCH_GO_PACKAGES" \
             --out bench-corpus
 
+      # Candidate and baseline are interleaved rep-by-rep, not run to
+      # completion one side at a time: `run ... --reps N` in one shot would
+      # let a systematic drift on the runner (thermal state ramping up, a
+      # noisy neighbor arriving mid-job) land entirely on whichever side
+      # happened to run second, biasing the comparison rather than adding
+      # symmetric noise to both. `--warmup 1 --reps 0` primes the shared
+      # cache state once per side (a no-op for `cold`, which has none); each
+      # `--reps 1 --skip-prepare --append` round after that measures one more
+      # rep per side and merges it into the same output file, alternating.
       - name: Time Tier A (inprocess) scenarios
         if: steps.baseline_fetch.outputs.bench_ok == 'true'
         continue-on-error: true
         run: |
           for scenario in cold full-hit incremental; do
+            cand_out="candidate_inproc_${scenario}.json"
+            base_out="baseline_inproc_${scenario}.json"
             ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "candidate_inproc_${scenario}.json"
+              --warmup 1 --reps 0 --out /dev/null
             ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "baseline_inproc_${scenario}.json"
+              --warmup 1 --reps 0 --out /dev/null
+            rm -f "$cand_out" "$base_out"
+            for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
+              ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
+              ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
+            done
           done
 
       - name: Time Tier B (dist) scenarios
         if: steps.baseline_fetch.outputs.ok == 'true'
         continue-on-error: true
         run: |
+          BENCH=./candidate-dist/heph-bench
           for scenario in cold full-hit incremental; do
-            ./candidate-dist/heph-bench run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "candidate_dist_${scenario}.json"
-            ./candidate-dist/heph-bench run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "baseline_dist_${scenario}.json"
+            cand_out="candidate_dist_${scenario}.json"
+            base_out="baseline_dist_${scenario}.json"
+            "$BENCH" run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
+              --warmup 1 --reps 0 --out /dev/null
+            "$BENCH" run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
+              --warmup 1 --reps 0 --out /dev/null
+            rm -f "$cand_out" "$base_out"
+            for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
+              "$BENCH" run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
+              "$BENCH" run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
+            done
           done
 
       # Every scenario/tier combination is always attempted and reported —
@@ -987,6 +1020,12 @@ jobs:
       # rendered table for "REGRESSION" (the verdict `compare --allow-
       # regression` still prints even though it won't fail on it) and fails
       # for real if anything regressed, on both `pull_request` and `push`.
+      #
+      # One `compare` call per TIER, not per scenario: each `run` invocation
+      # writes a single-scenario RunResults, so the 3 scenario files per side
+      # are merged into one multi-scenario RunResults first (`jq -s`) — a
+      # `compare` call per scenario would render its own header each time,
+      # repeating the table 3x instead of one table with 3 rows.
       #
       # The assembled report is captured to `perf-report.md` as well as the
       # step summary — "File regression issue" reads that file back so the
@@ -1010,18 +1049,26 @@ jobs:
                   echo "_skipped: baseline release predates publishing \`heph-bench\`_"
                   continue
                 fi
+                base_files=()
+                cand_files=()
                 for scenario in cold full-hit incremental; do
-                  base="baseline_${tier}_${scenario}.json"
-                  cand="candidate_${tier}_${scenario}.json"
-                  if [ -f "$base" ] && [ -f "$cand" ]; then
-                    "$BENCH" compare --baseline "$base" --candidate "$cand" \
-                      --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
-                      --json "verdicts/${tier}_${scenario}.json" \
-                      --allow-regression
-                  else
-                    echo "_${scenario}: no results (run step failed — see logs)_"
+                  b="baseline_${tier}_${scenario}.json"
+                  c="candidate_${tier}_${scenario}.json"
+                  if [ -f "$b" ] && [ -f "$c" ]; then
+                    base_files+=("$b")
+                    cand_files+=("$c")
                   fi
                 done
+                if [ ${#base_files[@]} -eq 0 ]; then
+                  echo "_no results (run step failed — see logs)_"
+                  continue
+                fi
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${base_files[@]}" > "merged_baseline_${tier}.json"
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${cand_files[@]}" > "merged_candidate_${tier}.json"
+                "$BENCH" compare --baseline "merged_baseline_${tier}.json" --candidate "merged_candidate_${tier}.json" \
+                  --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
+                  --json "verdicts/${tier}.json" \
+                  --allow-regression
               done
             fi
           )
@@ -1051,10 +1098,10 @@ jobs:
           events="[]"
           for f in verdicts/*.json; do
             [ -f "$f" ] || continue
-            base=$(basename "$f" .json)
-            tier="${base%_*}"
-            scenario="${base#*_}"
-            batch=$(jq --arg tier "$tier" --arg scenario "$scenario" \
+            # One file per tier (inproc/dist), each an array of per-scenario
+            # verdicts — `scenario` already lives inside each entry.
+            tier=$(basename "$f" .json)
+            batch=$(jq --arg tier "$tier" \
               --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" \
               --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.base.outputs.sha }}" \
               --arg event_type "${{ github.event_name }}" \
@@ -1064,7 +1111,7 @@ jobs:
                 event: "perf_benchmark",
                 distinct_id: "perfbench",
                 properties: (. + {
-                  tier: $tier, scenario: $scenario, os: $os, arch: $arch,
+                  tier: $tier, os: $os, arch: $arch,
                   sha: $sha, base_sha: $base_sha, event_type: $event_type,
                   run_id: $run_id, run_url: $run_url
                 })

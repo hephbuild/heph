@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use bench_corpus::CorpusParams;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use timing::RunOptions;
 
 /// Perf-regression harness: generate a deterministic synthetic corpus, time
 /// `heph` scenarios against it (in-process or the real prebuilt binary +
@@ -68,6 +69,21 @@ struct InprocessArgs {
     warmup: usize,
     #[arg(long, default_value_t = 5)]
     reps: usize,
+    /// Skip the scenario's wipe/warm preamble — assumes a prior invocation
+    /// already did it. Lets a caller interleave candidate/baseline rep by
+    /// rep: one `--skip-prepare=false` call to prepare, then alternating
+    /// `--reps 1 --skip-prepare --append` calls per side per round.
+    #[arg(long)]
+    skip_prepare: bool,
+    /// Seed offset for `incremental`'s per-rep mutation. Required to be
+    /// distinct across separate `--reps 1` invocations of the same
+    /// scenario/corpus, or each call mutates the same files again.
+    #[arg(long, default_value_t = 0)]
+    rep_offset: usize,
+    /// Merge into an existing `--out` file's matching scenario instead of
+    /// overwriting it — the other half of interleaving one rep at a time.
+    #[arg(long)]
+    append: bool,
     #[arg(long)]
     out: PathBuf,
 }
@@ -86,6 +102,15 @@ struct DistArgs {
     warmup: usize,
     #[arg(long, default_value_t = 3)]
     reps: usize,
+    /// See `run inprocess --skip-prepare` — identical contract here.
+    #[arg(long)]
+    skip_prepare: bool,
+    /// See `run inprocess --rep-offset` — identical contract here.
+    #[arg(long, default_value_t = 0)]
+    rep_offset: usize,
+    /// See `run inprocess --append` — identical contract here.
+    #[arg(long)]
+    append: bool,
     #[arg(long)]
     out: PathBuf,
 }
@@ -164,38 +189,65 @@ async fn run_run(cmd: RunCmd) -> Result<()> {
         RunCmd::Inprocess(args) => {
             let manifest = bench_corpus::load_manifest(&args.corpus)
                 .context("load corpus manifest (run `corpus` first)")?;
-            let results = inprocess::run(
-                &args.corpus,
-                &manifest,
-                args.scenario,
-                args.warmup,
-                args.reps,
-            )
-            .await
-            .context("run inprocess scenario")?;
-            write_results(&args.out, &results)
+            let opts = RunOptions {
+                warmup: args.warmup,
+                reps: args.reps,
+                skip_prepare: args.skip_prepare,
+                rep_offset: args.rep_offset,
+            };
+            let results = inprocess::run(&args.corpus, &manifest, args.scenario, &opts)
+                .await
+                .context("run inprocess scenario")?;
+            write_results(&args.out, &results, args.append)
         }
         RunCmd::Dist(args) => {
             let manifest = bench_corpus::load_manifest(&args.corpus)
                 .context("load corpus manifest (run `corpus` first)")?;
-            let results = dist::run(
-                &args.dist,
-                &args.corpus,
-                &manifest,
-                args.scenario,
-                args.warmup,
-                args.reps,
-            )
-            .context("run dist scenario")?;
-            write_results(&args.out, &results)
+            let opts = RunOptions {
+                warmup: args.warmup,
+                reps: args.reps,
+                skip_prepare: args.skip_prepare,
+                rep_offset: args.rep_offset,
+            };
+            let results = dist::run(&args.dist, &args.corpus, &manifest, args.scenario, &opts)
+                .context("run dist scenario")?;
+            write_results(&args.out, &results, args.append)
         }
     }
 }
 
-fn write_results(out: &std::path::Path, results: &timing::RunResults) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(results).context("encode results")?;
+/// `append`: merge `results`' scenarios into whatever's already at `out`
+/// (extending a matching scenario's `wall_ms` rather than replacing it),
+/// instead of overwriting — how interleaved single-rep invocations
+/// accumulate into one file across separate process runs.
+fn write_results(out: &std::path::Path, results: &timing::RunResults, append: bool) -> Result<()> {
+    let merged = if append && out.exists() {
+        let existing_bytes =
+            std::fs::read(out).with_context(|| format!("read {}", out.display()))?;
+        let mut existing: timing::RunResults = serde_json::from_slice(&existing_bytes)
+            .with_context(|| format!("parse {}", out.display()))?;
+        for new_scenario in &results.scenarios {
+            match existing
+                .scenarios
+                .iter_mut()
+                .find(|s| s.scenario == new_scenario.scenario)
+            {
+                Some(existing_scenario) => {
+                    existing_scenario
+                        .wall_ms
+                        .extend(new_scenario.wall_ms.iter().copied());
+                }
+                None => existing.scenarios.push(new_scenario.clone()),
+            }
+        }
+        existing
+    } else {
+        results.clone()
+    };
+
+    let bytes = serde_json::to_vec_pretty(&merged).context("encode results")?;
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
-    for s in &results.scenarios {
+    for s in &merged.scenarios {
         println!(
             "{}: {} reps, {:.1}ms mean",
             s.scenario,
