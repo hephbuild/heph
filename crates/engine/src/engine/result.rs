@@ -6896,13 +6896,11 @@ mod tests {
 
         let addrs = tokio::time::timeout(Duration::from_secs(20), walk)
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "discovery deadlocked: the fan-out held every permit while the \
-                     consumer's MatchShrug arm waited for one, and the holders were \
-                     only pollable by the consumer"
-                )
-            })??;
+            .context(
+                "discovery deadlocked: the fan-out held every permit while the \
+                 consumer's MatchShrug arm waited for one, and the holders were \
+                 only pollable by the consumer",
+            )??;
         // No target carries the label, so nothing matches — the point is that it
         // terminated.
         assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
