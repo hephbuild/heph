@@ -274,14 +274,26 @@ pub fn load_manifest(root: &Path) -> Result<CorpusManifest> {
 fn generate_go_tree(params: &CorpusParams, root: &Path) -> Result<()> {
     let go_root = root.join("go");
     std::fs::create_dir_all(&go_root).context("create go/")?;
+    // Absolute: the invocation below runs with cwd = gorepogen_dir (so `go
+    // run` finds gorepogen's own go.mod, see the comment there), which would
+    // otherwise resolve a relative `-out` against the wrong directory.
+    let go_root_abs = go_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", go_root.display()))?;
 
+    // `go run <dir>` does NOT make `<dir>` the module context — Go still
+    // resolves the main module by walking up from the process's cwd, so
+    // running this from the corpus root (no go.mod there) fails with "cannot
+    // find main module". Run with cwd = gorepogen_dir instead, so `.`
+    // resolves gorepogen's own go.mod.
     let status = std::process::Command::new("go")
+        .current_dir(&params.gorepogen_dir)
         .arg("run")
-        .arg(&params.gorepogen_dir)
+        .arg(".")
         .arg("-seed")
         .arg(params.seed.to_string())
         .arg("-out")
-        .arg(&go_root)
+        .arg(&go_root_abs)
         .arg("-module")
         .arg("heph.bench/corpus")
         .arg("-pkgs")
