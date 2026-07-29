@@ -15,6 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 type ArcErr = Arc<anyhow::Error>;
 type ExecuteCacheResult = Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>), ArcErr>;
@@ -385,6 +386,15 @@ struct DeferredTrims {
     /// of the two got there first, and surface a contended-lock notice naming
     /// this very process as the holder.
     suppressed: std::sync::atomic::AtomicBool,
+    /// The batch's retry delay, in nanoseconds.
+    ///
+    /// A field rather than the constant read straight from `gc` so a test can
+    /// widen it. `the_exit_gate_is_held_across_the_trim_retry` is the only thing
+    /// pinning that the retry runs *inside* the cleaner job — i.e. under the
+    /// counter that gates process exit — and it proves it by timing the drain.
+    /// Against the 25ms production value that check is one loaded runner away
+    /// from passing for the wrong reason; against a second it is unambiguous.
+    retry_delay_nanos: std::sync::atomic::AtomicU64,
 }
 
 impl DeferredTrims {
@@ -411,17 +421,23 @@ impl Drop for DeferredTrims {
             );
             return;
         };
-        // Hand back the blocking pool's stale backstop registrations first.
-        // Each one is a `Waker` that still owns its (finished) task, and one of
-        // those tasks is this request's `mem_locked_result` cell — which holds
-        // the addr's riding cache read. Left alone it is released on the
-        // backstop's next tick, up to 250ms from now, and every trim below would
-        // find its target contended and skip. See `hcore::blocking::backstop`.
+        // Hand back the blocking pool's backstop registrations first. Each is a
+        // `Waker` that owns whatever its task holds, and one of those tasks is
+        // this request's `mem_locked_result` cell — whose memoized value *is* the
+        // addr's riding cache read. `flush_backstop` releases them, not just
+        // wakes them, which is what unpins the guard the trims below need. See
+        // `hcore::blocking::flush_backstop`.
+        //
+        // This one is on the dropping thread, so it covers what is armed *now*;
+        // the batch flushes again on the cleaner thread, where it can also see
+        // whatever armed in between.
         hcore::blocking::flush_backstop();
 
         // One job for the batch: `try_trim_after_write` is non-blocking and
         // short, and a job per target would allocate a boxed closure per
-        // written revision — which is exactly what this replaces.
+        // written revision — which is exactly what this replaces. One job is
+        // also what lets the batch charge its one wait once rather than per
+        // target.
         //
         // Bookkeeping lane, never the reclaim one. This lands at request-state
         // drop, which is exactly when the reclaim backlog is deepest — every
@@ -430,22 +446,59 @@ impl Drop for DeferredTrims {
         // `cache.history` would only be enforced after the last 5k-50k-inode
         // removal, and process exit (gated on `bg_pending`, which both lanes
         // feed) would pay the rmdir drain *plus* the trim instead of the max of
-        // the two.
+        // the two. The retry's one sleep rides in the bookkeeping lane too, so it
+        // never delays a reclaim.
+        //
+        // The retries run *inside* this job, so the `bg_pending` slot taken by
+        // `enqueue` is still held across them and the process cannot exit
+        // mid-retry. Moving them onto a thread of their own would release the
+        // slot after the first pass and silently reintroduce that.
+        let delay = Duration::from_nanos(
+            self.retry_delay_nanos
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         crate::engine::sandbox_cleaner::enqueue(
             crate::engine::sandbox_cleaner::Lane::Bookkeeping,
             format!("gc trim {} target(s)", trims.len()),
             Box::new(move || {
-                for (addr, trim) in trims {
-                    // Per target, not per batch: the cleaner's own `catch_unwind`
-                    // wraps the whole job, so one panicking target would discard
-                    // every trim after it with nothing to say which one it was.
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        engine.try_trim_after_write(&addr, trim.keep, &trim.hashin);
-                    }))
-                    .is_err()
-                    {
-                        tracing::error!(%addr, "post-write gc trim panicked, continuing");
-                    }
+                let report = engine.run_trim_batch_with_delay(
+                    trims.into_iter().map(|(addr, t)| (addr, t.keep, t.hashin)),
+                    delay,
+                );
+                // Say what the batch did. A drain that reports nothing cannot be
+                // told from a drain that enforced nothing, which is the shape the
+                // original bug hid in.
+                tracing::debug!(
+                    batch = report.batch,
+                    retried = report.retried,
+                    delayed = report.delayed,
+                    still_contended = report.still_contended,
+                    failed = report.failed,
+                    removed = report.removed,
+                    bytes = report.bytes,
+                    flushed = report.flushed,
+                    "deferred cache-history trims drained",
+                );
+                // Losing *every* target is not ordinary contention, it is the
+                // signature of the read guards never being released at all — a
+                // `deferred_trims` that stopped being the last field of
+                // `RequestStateData`, or a new memoizer that retains one. That is
+                // the original bug returning, and at `debug` it would come back
+                // exactly as quietly as it went unnoticed the first time.
+                if report.batch > 0 && report.still_contended == report.batch {
+                    tracing::warn!(
+                        batch = report.batch,
+                        flushed = report.flushed,
+                        "every deferred cache-history trim lost its lock; \
+                         cache.history was not enforced by this run",
+                    );
+                }
+                if report.failed > 0 {
+                    tracing::warn!(
+                        failed = report.failed,
+                        batch = report.batch,
+                        "deferred cache-history trims failed; those targets keep their stale revisions",
+                    );
                 }
                 Ok(())
             }),
@@ -542,6 +595,16 @@ impl RequestState {
             .deferred_trims
             .suppressed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Widen this request's deferred-trim retry delay. Tests only — see
+    /// [`DeferredTrims::retry_delay_nanos`].
+    #[cfg(test)]
+    pub(crate) fn set_trim_retry_delay(&self, delay: Duration) {
+        self.data.deferred_trims.retry_delay_nanos.store(
+            delay.as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// True when this request may hash, probe and read but must never take the
@@ -870,6 +933,9 @@ impl Engine {
                 bg_pending,
                 trims: Mutex::new(FxHashMap::default()),
                 suppressed: std::sync::atomic::AtomicBool::new(false),
+                retry_delay_nanos: std::sync::atomic::AtomicU64::new(
+                    crate::engine::gc::TRIM_RETRY_DELAY.as_nanos() as u64,
+                ),
             },
         });
 
@@ -975,6 +1041,76 @@ mod tests {
         drop(rs);
         // Submitted on drop, released by the cleaner once it has run.
         wait_drained(&bg).await;
+        Ok(())
+    }
+
+    /// The background slot must be held across the trim batch's *delayed*
+    /// attempt, not just its first pass.
+    ///
+    /// `bg_pending` is what keeps the TUI open and the process alive. Moving the
+    /// retries off this job — onto a spawned sleeper, the tempting way to keep
+    /// the cleaner lane free — would release the slot after the first pass and
+    /// let the process exit mid-retry, invisibly: every other test here only
+    /// asserts the counter eventually reaches zero, which it still would.
+    ///
+    /// Measured as "the drain could not have finished sooner than one delay",
+    /// which has no upper bound to overshoot and so cannot flake the other way.
+    /// The delay is widened well past the production 25ms first, so the margin is
+    /// not something a loaded runner can close by accident.
+    #[tokio::test]
+    async fn the_exit_gate_is_held_across_the_trim_retry() -> anyhow::Result<()> {
+        let _exclusive = crate::engine::gc::backstop_exclusive();
+        let (_dir, engine) = test_engine()?;
+        let (bg, rs) = bg_state(&engine);
+        let a = addr("t");
+
+        // Two cache entries, so the trim is genuinely over its `keep = 1` budget
+        // and reaches the lock at all — the unlocked pre-count returns early for
+        // a target with nothing to delete, and would never contend.
+        //
+        // Barriered, not just written: `writer` hands the bytes to the sqlite
+        // write-behind queue, and the batch enumerates on a read connection that
+        // does not wait for it. An unbarriered write is seen as a target with
+        // *one* revision, which is within budget — the batch then settles without
+        // ever asking for the lock, drains in single-digit ms, and this test fails
+        // for a reason that has nothing to do with what it is checking.
+        for hashin in ["h1", "h2"] {
+            let mut w = engine
+                .local_cache
+                .writer(&a, hashin, crate::engine::local_cache::MANIFEST_V1)
+                .expect("manifest writer");
+            std::io::Write::write_all(&mut w, b"x").expect("write");
+            drop(w);
+            assert!(
+                engine
+                    .local_cache
+                    .exists(&a, hashin, crate::engine::local_cache::MANIFEST_V1)
+                    .expect("exists"),
+                "revision {hashin} must have landed before the batch enumerates",
+            );
+        }
+
+        // Held for the whole batch: every pass finds it contended, so the batch
+        // is guaranteed to reach — and finish — its one delay.
+        let _held = engine
+            .result_lock()
+            .try_write(&a)
+            .expect("try_write")
+            .expect("lock free");
+
+        let delay = Duration::from_millis(500);
+        rs.set_trim_retry_delay(delay);
+        rs.defer_trim(&a, 1, "h2".to_string());
+
+        let started = std::time::Instant::now();
+        drop(rs);
+        wait_drained(&bg).await;
+
+        assert!(
+            started.elapsed() >= delay,
+            "the slot was released before the delayed attempt could have run: {:?}",
+            started.elapsed(),
+        );
         Ok(())
     }
 
