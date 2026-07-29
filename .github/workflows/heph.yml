@@ -996,6 +996,7 @@ jobs:
         run: |
           BENCH=./candidate-dist/heph-bench
           any_regression=false
+          mkdir -p verdicts
           report=$(
             echo "# Perf: ${{ matrix.os }}/${{ matrix.arch }}"
             if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
@@ -1015,6 +1016,7 @@ jobs:
                   if [ -f "$base" ] && [ -f "$cand" ]; then
                     "$BENCH" compare --baseline "$base" --candidate "$cand" \
                       --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
+                      --json "verdicts/${tier}_${scenario}.json" \
                       --allow-regression
                   else
                     echo "_${scenario}: no results (run step failed — see logs)_"
@@ -1033,6 +1035,52 @@ jobs:
             echo "regression detected — see the job summary for the table" >&2
             exit 1
           fi
+
+      # `always()`: the step above now genuinely exits non-zero on a real
+      # regression, and the numbers are worth having in PostHog regardless of
+      # whether this run passed or failed the gate. `event_type` (pull_request
+      # vs push) rides along as a property rather than gating which runs get
+      # sent — a trend chart can filter to `push` for the "master over time"
+      # view; nothing here decides that policy for it. Best-effort: PostHog
+      # being briefly unreachable must never fail this job over telemetry.
+      - name: Push metrics to PostHog
+        if: always() && steps.baseline_fetch.outputs.ok == 'true'
+        env:
+          POSTHOG_CI_KEY: ${{ secrets.POSTHOG_CI_KEY }}
+        run: |
+          events="[]"
+          for f in verdicts/*.json; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f" .json)
+            tier="${base%_*}"
+            scenario="${base#*_}"
+            batch=$(jq --arg tier "$tier" --arg scenario "$scenario" \
+              --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" \
+              --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.base.outputs.sha }}" \
+              --arg event_type "${{ github.event_name }}" \
+              --arg run_id "${{ github.run_id }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '[.[] | {
+                event: "perf_benchmark",
+                distinct_id: "perfbench",
+                properties: (. + {
+                  tier: $tier, scenario: $scenario, os: $os, arch: $arch,
+                  sha: $sha, base_sha: $base_sha, event_type: $event_type,
+                  run_id: $run_id, run_url: $run_url
+                })
+              }]' "$f")
+            events=$(printf '%s' "$events" | jq --argjson add "$batch" '. + $add')
+          done
+          count=$(printf '%s' "$events" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "no verdicts to push"
+            exit 0
+          fi
+          echo "pushing $count perf_benchmark event(s) to PostHog"
+          payload=$(jq -n --arg key "$POSTHOG_CI_KEY" --argjson batch "$events" '{api_key: $key, batch: $batch}')
+          curl -sS --max-time 15 -X POST "https://eu.i.posthog.com/batch/" \
+            -H "Content-Type: application/json" \
+            -d "$payload" || echo "PostHog push failed — not failing the job over telemetry"
 
       # Push-only: a PR failing this check already blocks the merge, so
       # there's nothing further to escalate there. On `master` the merge

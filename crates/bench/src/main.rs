@@ -108,6 +108,12 @@ struct CompareArgs {
     noise_k: f64,
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Write the per-scenario verdicts as JSON — machine-readable numbers
+    /// (mean_ms, delta_pct, threshold_pct, regression) for a caller that
+    /// wants to push them somewhere (a metrics backend, a dashboard) rather
+    /// than parse the markdown table.
+    #[arg(long)]
+    json: Option<PathBuf>,
     /// Print the verdict but always exit 0 — the local escape hatch. In CI
     /// the equivalent is the repo admin's existing bypass on required
     /// checks, not a flag baked into the job.
@@ -217,6 +223,10 @@ fn run_compare(args: CompareArgs) -> Result<()> {
     print!("{report}");
     if let Some(out) = &args.out {
         std::fs::write(out, &report).with_context(|| format!("write {}", out.display()))?;
+    }
+    if let Some(json) = &args.json {
+        let bytes = serde_json::to_vec_pretty(&verdicts).context("encode verdicts")?;
+        std::fs::write(json, bytes).with_context(|| format!("write {}", json.display()))?;
     }
 
     let any_regression = verdicts.iter().any(|v| v.regression);
