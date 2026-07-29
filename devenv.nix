@@ -70,10 +70,12 @@ in
     gen-go-large
     install-go-plugin
   '';
-  # Lint default-feature code, then again with every feature enabled (so
-  # feature-gated code — the stabby host loader, the stabby guest serving — is
-  # covered too), then fmt-check all hand-written crates (qualityCrates;
-  # generated gen/proto is excluded).
+  # Three clippy passes — default features, `--all-features`, and
+  # `--no-default-features` — then fmt-check all hand-written crates
+  # (qualityCrates; generated gen/proto is excluded). What each pass is actually
+  # worth is measured below rather than assumed from its name: the
+  # `--all-features` one covers almost nothing here, and the
+  # `--no-default-features` one only works with the exclusions it carries.
   #
   # `--workspace --all-targets` is load-bearing. Do NOT shorten it. Both flags
   # were verified by injecting a deliberate error and re-running, not assumed
@@ -160,12 +162,34 @@ in
     cargo clippy --workspace --all-targets --locked -- -D warnings
     echo '> clippy --all-features'
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-    echo '> clippy --no-default-features'
-    if cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --no-default-features -i fuser >/dev/null 2>&1; then
-      echo "error: --no-default-features left 'fuser' in the dependency graph, so this pass is linting the fuse-sandbox=on arm and the feature-off code is still covered by nothing." >&2
+    # Assert the feature is genuinely off before linting it. A *successful*
+    # `cargo tree -i fuser` means `fuser` is still in the resolved graph, i.e.
+    # the pass below would lint the fuse-sandbox=on arm while announcing the
+    # opposite. Absence is specifically "did not match any packages" — matching
+    # on the exit code alone would read *any* cargo failure (an ambiguous
+    # `fuser` after a transitive version bump, a resolver error) as "feature
+    # off" and wave the wrong arm through, which is the silent-green failure
+    # this whole gate exists to remove.
+    echo '> checking --no-default-features really disables fuse-sandbox'
+    if fuser_tree=$(cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --no-default-features --locked -i fuser 2>&1); then
+      echo "error: --no-default-features left 'fuser' in the dependency graph, so the pass below would lint the fuse-sandbox=on arm and the feature-off code is still covered by nothing." >&2
       echo "       Some selected package pulls the root 'heph' package (or 'sandboxfuse') with default features on; exclude it here and in 'fix'." >&2
+      printf '%s\n' "$fuser_tree" >&2
+      exit 1
+    elif ! printf '%s' "$fuser_tree" | grep -q 'did not match any packages'; then
+      echo "error: cargo tree failed for a reason other than 'fuser' being absent, so this check proved nothing:" >&2
+      printf '%s\n' "$fuser_tree" >&2
       exit 1
     fi
+    # Positive control. Without it, `fuser` leaving the graph for an unrelated
+    # reason — renamed, or the FUSE backend swapped — makes the check above pass
+    # forever while proving nothing, because "absent when off" and "absent
+    # always" look identical from one direction.
+    if ! cargo tree --workspace --locked -i fuser >/dev/null 2>&1; then
+      echo "error: 'fuser' is not in the graph even with fuse-sandbox on, so the check above cannot tell 'feature off' from 'package gone'. Point this probe at whatever the feature now pulls in." >&2
+      exit 1
+    fi
+    echo '> clippy --no-default-features'
     cargo clippy --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --all-targets --no-default-features --locked -- -D warnings
     echo '> fmt'
     cargo fmt --check ${qualityCrates}

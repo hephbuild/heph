@@ -139,17 +139,22 @@ fn clippy_lines(script: &str) -> Vec<&str> {
 }
 
 /// The `--exclude <name>` arguments on a single invocation.
+///
+/// Both spellings cargo accepts, `--exclude name` and `--exclude=name`: reading
+/// only the first would turn a legal rewrite of the script into a spurious
+/// failure.
 fn excludes(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut words = line.split_whitespace();
     while let Some(word) = words.next() {
-        if word == "--exclude"
+        if let Some(name) = word.strip_prefix("--exclude=") {
+            out.push(name);
+        } else if word == "--exclude"
             && let Some(name) = words.next()
         {
             out.push(name);
         }
     }
-    out.sort_unstable();
     out
 }
 
@@ -196,6 +201,34 @@ fn the_lint_script_selects_the_whole_workspace() {
          its callers in `crates/engine` and `crates/driver-bridge`. Found \
          {feature_off:?}"
     );
+
+    // The guard that proves the pass above is pointed at the feature-*off* arm
+    // must itself exist, and must select the same packages. Without this, the
+    // guard can be deleted the first time it is inconvenient and the third pass
+    // silently reverts to re-linting the arm pass 1 already covered — with the
+    // script still printing `> clippy --no-default-features`.
+    let probe = lint
+        .lines()
+        .map(str::trim)
+        // `!starts_with('#')`: the block is commented, and a comment mentioning
+        // the probe is not the probe.
+        .find(|line| {
+            !line.starts_with('#') && line.contains("cargo tree") && line.contains("-i fuser")
+        })
+        .expect(
+            "`lint` must assert `fuse-sandbox` is actually off before linting it, \
+             with a `cargo tree … -i fuser` probe. `--no-default-features` alone \
+             does not disable it: e2e/plugingo-e2e/testkit pull the root `heph` \
+             package with default features and cargo unifies across the selection.",
+        );
+    assert_eq!(
+        excludes(probe),
+        excludes(feature_off[0]),
+        "the `cargo tree -i fuser` probe and the --no-default-features clippy \
+         pass select different packages, so the probe is not checking the \
+         selection that gets linted.\nprobe: {probe}\npass:  {}",
+        feature_off[0]
+    );
 }
 
 /// The `--no-default-features` pass must exclude every member that switches
@@ -210,8 +243,15 @@ fn the_lint_script_selects_the_whole_workspace() {
 ///
 /// Derived from the manifests, never copied: a *new* member with a default-
 /// featured `heph` edge is exactly the case a hardcoded list would miss.
-/// `lint` also asserts this at run time with `cargo tree -i fuser`; this test
-/// is the version that costs no build.
+///
+/// **Scope, stated so it is not over-trusted.** This reads one line per
+/// manifest, so it sees a *direct*, single-line `heph = { … }` edge and nothing
+/// else — not a `[dependencies.heph]` table, not a multi-line inline table, and
+/// not a transitive re-enable (a new member dev-depending on `htestkit`, which
+/// itself pulls `heph` with default features, gets the feature back without
+/// appearing here). The authority is the `cargo tree -i fuser` assertion inside
+/// `lint`, which sees the fully resolved graph; this test is the cheap early
+/// warning that costs no build, not a replacement for it.
 #[test]
 fn the_feature_off_pass_excludes_every_member_that_re_enables_fuse_sandbox() {
     let root = repo_root();
@@ -252,7 +292,9 @@ fn the_feature_off_pass_excludes_every_member_that_re_enables_fuse_sandbox() {
             .into_iter()
             .find(|line| line.contains("--no-default-features"))
             .unwrap_or_else(|| panic!("`{script}` has a --no-default-features clippy invocation"));
-        let excluded = excludes(line);
+        let mut excluded = excludes(line);
+        excluded.sort_unstable();
+
         let missing: Vec<&String> = re_enablers
             .iter()
             .filter(|name| !excluded.contains(&name.as_str()))
@@ -266,6 +308,28 @@ fn the_feature_off_pass_excludes_every_member_that_re_enables_fuse_sandbox() {
              *on* arm while reporting that it covered the off one.\n\
              Add `--exclude <name>` for each, or give the member's `heph` \
              dependency `default-features = false`."
+        );
+
+        // Equality, not just containment. An *extra* exclusion is the more
+        // dangerous direction and a subset check waves it through: `--exclude
+        // engine` or `--exclude driver-bridge` drops the two callers `stub.rs`
+        // has to satisfy, and `--exclude sandboxfuse` drops the only package
+        // the feature changes at all. Each turns the pass into a no-op that
+        // still reports green, and none of them puts `fuser` back in the graph,
+        // so the `cargo tree` guard in `lint` cannot see it either.
+        let extra: Vec<&&str> = excluded
+            .iter()
+            .filter(|name| !re_enablers.iter().any(|r| r == *name))
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "`{script}`'s --no-default-features pass excludes {extra:?}, which \
+             do not re-enable `fuse-sandbox`. Excluding a package that is not a \
+             re-enabler only shrinks what the pass lints — `engine` and \
+             `driver-bridge` are the callers `crates/sandboxfuse/src/stub.rs` \
+             must satisfy, and `sandboxfuse` is the only package the feature \
+             changes — and neither the `cargo tree` guard nor the check above \
+             can see the loss. Expected exactly {re_enablers:?}."
         );
     }
 }
@@ -299,18 +363,92 @@ fn fix_selects_the_same_code_as_lint() {
     // exemption: it selects no code that the default pass does not already
     // select in this workspace (every member feature is unified on by
     // `--workspace`), so a fourth rewriting pass would buy nothing.
+    //
+    // Both halves are asserted, not just the feature-off one. Checking only the
+    // `--no-default-features` axis let `fix` lose its *default* pass entirely
+    // and still pass every assertion above — the remaining feature-off line
+    // carries `--fix`, `--workspace` and `--all-targets`, so nothing went red
+    // while `fix` could no longer touch anything the first `lint` pass reports.
     let lint = devenv_script(&devenv, "lint");
-    for selection in clippy_lines(&lint)
+    let lint_lines = clippy_lines(&lint);
+
+    assert!(
+        fix_lines
+            .iter()
+            .any(|line| !line.contains("--all-features")
+                && !line.contains("--no-default-features")),
+        "`fix` has no default-feature pass, so it cannot fix anything `lint`'s \
+         first and largest pass reports. Found {fix_lines:?}"
+    );
+
+    if lint_lines
         .iter()
-        .filter(|line| line.contains("--no-default-features"))
-        .map(|_| "--no-default-features")
+        .any(|line| line.contains("--no-default-features"))
     {
         assert!(
-            fix_lines.iter().any(|line| line.contains(selection)),
-            "`lint` has a `{selection}` pass but `fix` does not, so CI reports \
-             lints in that arm with no automated fix at all. Found {fix_lines:?}"
+            fix_lines
+                .iter()
+                .any(|line| line.contains("--no-default-features")),
+            "`lint` has a --no-default-features pass but `fix` does not, so CI \
+             reports lints in that arm with no automated fix at all. Found \
+             {fix_lines:?}"
         );
     }
+
+    // One `fix` pass per `lint` pass, less the `--all-features` exemption.
+    assert!(
+        fix_lines.len() >= lint_lines.len().saturating_sub(1),
+        "`lint` runs {} clippy passes and `fix` only {}. At most one (\
+         --all-features) may be skipped; anything more leaves a selection \
+         `lint` fails on that `fix` cannot reach.\nlint: {lint_lines:?}\nfix: \
+         {fix_lines:?}",
+        lint_lines.len(),
+        fix_lines.len(),
+    );
+}
+
+/// `cargo fmt --check` must cover every member too.
+///
+/// The fourth selection axis, and the last one still hand-maintained: the fmt
+/// pass takes an explicit 34-entry `-p` list (`qualityCrates` in `devenv.nix`)
+/// rather than `--all`. Add a member and forget the `-p`, and `lint` reports
+/// green on an unformatted crate forever — the same silent hole as a member
+/// that never gets clippy'd, one tool over.
+#[test]
+fn the_fmt_pass_covers_every_workspace_member() {
+    let root = repo_root();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+    let members = workspace_members(&manifest);
+    let devenv = std::fs::read_to_string(root.join("devenv.nix")).expect("read devenv.nix");
+
+    // Scoped to the `qualityCrates = "…"` value, not searched across the whole
+    // file: `scripts.tst.exec` also carries `-p plugin-stabby` and `-p
+    // plugin-sdk`, so a whole-file search stays green when either is deleted
+    // from `qualityCrates` — satisfied by the `tst` line while `cargo fmt
+    // --check` quietly stops looking at the crate.
+    let (_, after) = devenv
+        .split_once("qualityCrates = \"")
+        .expect("devenv.nix defines qualityCrates");
+    let (quality_crates, _) = after
+        .split_once('"')
+        .expect("the qualityCrates string is closed");
+    let selected: Vec<&str> = quality_crates.split_whitespace().collect();
+
+    // The package name is the last path component for every member here; the
+    // root package (`heph`) is not in `members` and is listed separately.
+    let missing: Vec<&str> = members
+        .iter()
+        .filter(|member| !LINTS_EXEMPT.contains(&member.as_str()))
+        .map(|member| member.rsplit('/').next().unwrap_or(member.as_str()))
+        .filter(|name| !selected.contains(name))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these workspace members are not in `qualityCrates`, so `cargo fmt \
+         --check` never looks at them and `lint` reports green on unformatted \
+         code: {missing:?}"
+    );
 }
 
 /// The gate must run on macOS as well as Linux.
@@ -330,9 +468,15 @@ fn the_lint_gate_runs_on_macos_as_well_as_linux() {
         .expect("read .github/workflows/heph.yml");
 
     // A job id is a two-space-indented `<name>:` at the end of its line; a job's
-    // body runs until the next one. Walk the file once and keep the `runs-on:`
-    // of every job whose id starts with `lint`.
+    // body runs until the next one. Walk the file once and collect, for every
+    // job whose id starts with `lint`, its `runs-on:` and its `run:` steps.
+    //
+    // The `run:` half matters as much as the runner: asserting only the label
+    // lets someone point the darwin job at `cargo fmt --check`, or drop its
+    // Lint step, and stay green while macOS clippy coverage disappears — which
+    // is the whole reason the job exists.
     let mut runners: Vec<&str> = Vec::new();
+    let mut commands: Vec<&str> = Vec::new();
     let mut in_lint_job = false;
     for line in workflow.lines() {
         if let Some(rest) = line.strip_prefix("  ")
@@ -342,8 +486,14 @@ fn the_lint_gate_runs_on_macos_as_well_as_linux() {
             in_lint_job = id.starts_with("lint");
             continue;
         }
-        if in_lint_job && let Some(runner) = line.trim().strip_prefix("runs-on:") {
+        if !in_lint_job {
+            continue;
+        }
+        if let Some(runner) = line.trim().strip_prefix("runs-on:") {
             runners.push(runner.trim());
+        }
+        if let Some(cmd) = line.trim().strip_prefix("run:") {
+            commands.push(cmd.trim());
         }
     }
 
@@ -359,4 +509,60 @@ fn the_lint_gate_runs_on_macos_as_well_as_linux() {
          headers are only ever checked against the lints that fire on Linux. \
          Found {runners:?}"
     );
+    assert_eq!(
+        commands.iter().filter(|c| **c == "lint").count(),
+        runners.len(),
+        "every lint job must actually run the `lint` script — one per runner. A \
+         job that runs something narrower keeps the check name and the runner \
+         while quietly covering less. runners: {runners:?}, run steps: \
+         {commands:?}"
+    );
+
+    // Every lint job must gate something. `Lint darwin/arm64` is not in the
+    // branch ruleset, so its entries in `release.needs` / `cleanup.needs` are
+    // its only teeth: drop them and it can go red on every run forever with
+    // nothing blocked and nothing red downstream.
+    let mut lint_job_ids: Vec<&str> = Vec::new();
+    for line in workflow.lines() {
+        if let Some(rest) = line.strip_prefix("  ")
+            && !rest.starts_with([' ', '#', '-'])
+            && let Some(id) = rest.strip_suffix(':')
+            && id.starts_with("lint")
+        {
+            lint_job_ids.push(id);
+        }
+    }
+    assert!(
+        lint_job_ids.len() >= 2,
+        "expected at least two lint jobs (one per OS); found {lint_job_ids:?}"
+    );
+
+    for gate in ["release", "cleanup"] {
+        let marker = format!("\n  {gate}:\n");
+        let (_, body) = workflow
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("the workflow defines a `{gate}` job"));
+        let needs = body
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("needs:"))
+            .unwrap_or_else(|| panic!("`{gate}` declares `needs:`"));
+        // Tokenised, not substring-matched: `lint` is a prefix of `lint_darwin`,
+        // so a `contains` check would report `lint` present when only
+        // `lint_darwin` is.
+        let listed: Vec<&str> = needs
+            .trim_start_matches("needs:")
+            .trim()
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(str::trim)
+            .collect();
+        for id in &lint_job_ids {
+            assert!(
+                listed.contains(id),
+                "`{gate}` does not depend on the `{id}` job, so a red `{id}` \
+                 blocks nothing at all. Found `{needs}`."
+            );
+        }
+    }
 }
