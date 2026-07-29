@@ -18,9 +18,16 @@
 //!   - which feature set — `--no-default-features`, whose obvious spelling is a
 //!     silent no-op in this workspace;
 //!   - which platform — macOS was linted nowhere;
-//!   - whether a red leg reaches the required status context at all — the
-//!     `Lint` aggregator, which can be wired to report green over a failed
-//!     matrix leg.
+//!   - whether a red leg has any consequence at all — a leg can be made to
+//!     conclude `success` without clippy ever running, and the `needs:` wiring
+//!     that makes a red lint stop a release can simply be deleted.
+//!
+//! What these tests **cannot** cover: the lint job is a matrix, so its status
+//! contexts are the rendered per-leg names (`Lint linux/amd64`,
+//! `Lint darwin/arm64`). Whether those are *required* lives in the repo's
+//! branch protection, outside this tree — so nothing here can assert that a red
+//! lint blocks a merge. `lint_gates_release_and_cleanup` guards the only part
+//! the workflow owns.
 //!
 //! Cheap on purpose: a few file reads and some string work, no build.
 
@@ -505,7 +512,8 @@ fn job_needs(body: &str) -> Vec<&str> {
         .map(str::trim)
         .find(|line| line.starts_with("needs:"))
         .map(|line| {
-            line.trim_start_matches("needs:")
+            line.strip_prefix("needs:")
+                .unwrap_or(line)
                 .trim()
                 .trim_matches(['[', ']'])
                 .split(',')
@@ -532,7 +540,11 @@ fn job_run_steps(body: &str) -> Vec<&str> {
 fn job_runners(body: &str) -> Vec<&str> {
     body.lines()
         .map(str::trim)
-        .filter_map(|line| line.trim_start_matches("- ").strip_prefix("runs-on:"))
+        .filter_map(|line| {
+            line.strip_prefix("- ")
+                .unwrap_or(line)
+                .strip_prefix("runs-on:")
+        })
         .map(str::trim)
         .filter(|label| !label.contains("${{"))
         .collect()
@@ -550,11 +562,82 @@ fn lint_legs<'a>(jobs: &[(&'a str, String)]) -> Vec<&'a str> {
         .collect()
 }
 
-/// The job named exactly `Lint` — the required status context.
-fn lint_aggregator<'a>(jobs: &'a [(&'a str, String)]) -> Option<(&'a str, &'a String)> {
-    jobs.iter()
-        .find(|(_, body)| body.lines().map(str::trim).any(|line| line == "name: Lint"))
-        .map(|(id, body)| (*id, body))
+/// The `matrix.include` entries of a job body, as `<key>: <value>` maps.
+///
+/// Parsed rather than pattern-matched on `os:`/`arch:` so the platform
+/// assertions read the same coordinates the workflow does.
+fn matrix_include(body: &str) -> Vec<Vec<(String, String)>> {
+    let mut entries: Vec<Vec<(String, String)>> = Vec::new();
+    let mut in_include = false;
+    for line in body.lines() {
+        if line.trim() == "include:" {
+            in_include = true;
+            continue;
+        }
+        if !in_include {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // A new entry starts at `- key: value`; `steps:` ends the block.
+        let (starts_entry, pair) = match trimmed.strip_prefix("- ") {
+            Some(rest) => (true, rest),
+            None => (false, trimmed),
+        };
+        if starts_entry {
+            entries.push(Vec::new());
+        } else if entries.is_empty() || !line.starts_with("            ") {
+            break;
+        }
+        if let Some((key, value)) = pair.split_once(':')
+            && let Some(last) = entries.last_mut()
+        {
+            last.push((key.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    entries
+}
+
+/// The step blocks of a job body, each starting at a `      - ` line.
+///
+/// Some invariants are per *step*, not per job: the `sccache stats` step
+/// legitimately carries `if: always()`, so "the Lint step has no `if:`" cannot
+/// be checked by scanning the whole job.
+fn job_steps(body: &str) -> Vec<String> {
+    let mut steps: Vec<Vec<&str>> = Vec::new();
+    let mut in_steps = false;
+    for line in body.lines() {
+        if line.trim() == "steps:" {
+            in_steps = true;
+            continue;
+        }
+        if !in_steps {
+            continue;
+        }
+        if line.starts_with("      - ") {
+            steps.push(vec![line]);
+        } else if let Some(last) = steps.last_mut() {
+            last.push(line);
+        }
+    }
+    steps.into_iter().map(|lines| lines.join("\n")).collect()
+}
+
+/// `text` with whole-line YAML comments removed.
+///
+/// A content assertion must not be satisfiable by prose. `workflow_jobs`
+/// attributes a job's *leading* comment block to the job above it, so a
+/// comment that merely mentions `needs.<dep>.result` would otherwise satisfy
+/// the assertion that the aggregator checks it — reordering the two jobs is
+/// enough to hand the aggregator that block and let it pass with its script
+/// gutted.
+fn without_comments(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The gate must run on macOS as well as Linux.
@@ -600,120 +683,164 @@ fn the_lint_gate_runs_on_macos_as_well_as_linux() {
     );
 }
 
-/// The required status context must survive, and it must be able to go red.
+/// A lint leg must not be able to conclude `success` without linting.
 ///
-/// The branch ruleset requires a context named literally `Lint`. A bare matrix
-/// publishes one context per leg (`Lint (ubuntu-latest)`, …) and never that
-/// name again, so every open PR would block forever on a required check that
-/// can no longer appear — strictly worse than the gap being closed, and the
-/// workflow edit and the ruleset edit cannot land atomically. The fix is to
-/// matrix the work and fan back in to an aggregator still named `Lint`.
-///
-/// That aggregator is load-bearing *and* silent when wrong, which is this
-/// file's whole subject. Two ways to get it backwards, both of which look fine
-/// in review:
-///
-///   - no `if: always()` — a failed leg *skips* the aggregator, and a skipped
-///     required check is not a red one, so the PR is merely un-mergeable rather
-///     than reported as failing;
-///   - `if: always()` with no result check — the aggregator's own steps all
-///     pass, so it reports **green on a failed leg**. That is the silent-pass
-///     class this entire branch exists to eliminate, reintroduced at the top
-///     of it.
+/// The aggregator can only be as good as the legs' own conclusions, and there
+/// are two one-line ways to make a leg green while clippy never ran:
+/// `continue-on-error: true`, which converts a failure into a success, and an
+/// `if:` on the Lint step, which can skip it entirely. Either makes
+/// `needs.lint_matrix.result` `success` and the required `Lint` check green
+/// over a platform that was not linted — the last remaining route to a silent
+/// pass here, and invisible to every other test in this file.
 #[test]
-fn the_lint_aggregator_keeps_the_required_context_and_can_fail() {
+fn a_lint_leg_cannot_report_success_without_running_the_lint() {
     let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
         .expect("read .github/workflows/heph.yml");
     let jobs = workflow_jobs(&workflow);
     let legs = lint_legs(&jobs);
+    assert!(
+        !legs.is_empty(),
+        "no job in the workflow runs the `lint` script at all"
+    );
 
-    let named_lint: Vec<&str> = jobs
-        .iter()
-        .filter(|(_, body)| body.lines().map(str::trim).any(|line| line == "name: Lint"))
-        .map(|(id, _)| *id)
-        .collect();
+    for (id, body) in jobs.iter().filter(|(id, _)| legs.contains(id)) {
+        let body = without_comments(body);
+
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.trim().starts_with("continue-on-error:")),
+            "the `{id}` lint leg has a `continue-on-error:`. That turns a \
+             clippy failure into a job that concludes `success`, so the leg's \
+             own check goes green and `release` proceeds over a platform whose \
+             lint failed."
+        );
+
+        let lint_step = job_steps(&body)
+            .into_iter()
+            .find(|step| job_run_steps(step).contains(&"lint"))
+            .unwrap_or_else(|| panic!("`{id}` has a step running the `lint` script"));
+
+        // Scoped to this step: `sccache stats` legitimately has `if: always()`.
+        assert!(
+            !lint_step.lines().any(|line| line.trim().starts_with("if:")),
+            "the Lint step of the `{id}` leg carries an `if:`. A skipped step \
+             does not fail its job, so the leg would conclude `success` with \
+             clippy never having run, and its check would go green over an \
+             unlinted platform.\n{lint_step}"
+        );
+    }
+}
+
+/// The lint job must be a matrix, and it must carry both supported OSes.
+///
+/// The legs *are* the status contexts now — there is no aggregator and no
+/// context named plain `Lint` — so the matrix's shape is the gate's shape.
+/// Three things are asserted because each fails silently:
+///
+///   - both platforms present, or a whole OS goes unlinted while the remaining
+///     leg reports green (the macOS half is the one that was missing);
+///   - `fail-fast: false`, or the first red leg *cancels* the other and the
+///     platform you did not see reports `cancelled` rather than a result. On
+///     the pass that matters — a lint that fires on one OS only — fail-fast
+///     hides exactly the half you need;
+///   - one leg per platform, so a duplicated coordinate cannot masquerade as
+///     coverage of a second OS.
+#[test]
+fn the_lint_job_is_a_matrix_over_both_supported_oses() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
+        .expect("read .github/workflows/heph.yml");
+    let jobs = workflow_jobs(&workflow);
+    let legs = lint_legs(&jobs);
     assert_eq!(
-        named_lint.len(),
+        legs.len(),
         1,
-        "exactly one job must be named `Lint` — that string is the required \
-         status context in the branch ruleset, and it is what lets this land \
-         with no branch-protection change. Found {named_lint:?}"
-    );
-    let (aggregator_id, aggregator) = lint_aggregator(&jobs).expect("a job is named `Lint`");
-
-    // A matrix job's check name gets the matrix values appended, so the context
-    // would become `Lint (…)` and `Lint` would never report again. This is the
-    // literal regression the aggregator exists to prevent.
-    assert!(
-        !aggregator.lines().any(|line| line.trim() == "strategy:"),
-        "the job named `Lint` (`{aggregator_id}`) has a `strategy:` — a matrix \
-         job publishes one context per leg and never the bare name, so the \
-         required `Lint` context would stop appearing and every open PR would \
-         block on a check that can no longer report. Matrix the work in a \
-         separate job and keep this one as the fan-in."
+        "expected exactly one job to run the `lint` script — the matrix. Found \
+         {legs:?}"
     );
 
-    // It must do no work itself: the aggregator cannot be the thing whose
-    // failure it exists to report.
+    let (id, body) = jobs
+        .iter()
+        .find(|(id, _)| legs.contains(id))
+        .expect("the lint leg is a job");
+    let body = without_comments(body);
+
     assert!(
-        !legs.contains(&aggregator_id),
-        "`{aggregator_id}` is named `Lint` and also runs the lint script; the \
-         aggregator must be a separate fan-in job"
+        body.lines()
+            .any(|line| line.trim().starts_with("strategy:")),
+        "the `{id}` job has no `strategy:`, so it is not a matrix and cannot \
+         cover more than one platform"
+    );
+    assert!(
+        body.lines()
+            .any(|line| line.replace(' ', "") == "fail-fast:false"),
+        "the `{id}` matrix does not set `fail-fast: false`. With fail-fast on, \
+         the first red leg cancels the other, so the platform you did not see \
+         reports `cancelled` instead of a result — and a lint that fires on one \
+         OS only is exactly the case that hides."
     );
 
-    let needs = job_needs(aggregator);
-    for leg in &legs {
-        assert!(
-            needs.contains(leg),
-            "the `Lint` aggregator does not `needs:` the `{leg}` lint leg, so \
-             that leg gates nothing and `Lint` can report green while it is \
-             red. needs: {needs:?}, legs: {legs:?}"
-        );
-    }
+    let coords: Vec<String> = matrix_include(&body)
+        .iter()
+        .filter_map(|entry| {
+            let get = |k: &str| {
+                entry
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, value)| value.clone())
+            };
+            Some(format!("{}/{}", get("os")?, get("arch")?))
+        })
+        .collect();
 
     assert!(
-        aggregator
-            .lines()
-            .map(str::trim)
-            .any(|line| line.starts_with("if:") && line.contains("always()")),
-        "the `Lint` aggregator has no `if: always()`, so a failed leg *skips* \
-         it rather than failing it — and a skipped required check is not a red \
-         one. needs: {needs:?}"
+        coords.iter().any(|c| c.starts_with("linux/")),
+        "the `{id}` matrix has no linux leg; found {coords:?}"
+    );
+    assert!(
+        coords.iter().any(|c| c.starts_with("darwin/")),
+        "the `{id}` matrix has no darwin leg, so macOS-only code — including \
+         the Mach `sweep_threads` block in `src/diag.rs`, the largest unsafe \
+         region in the tree — is clippy-linted nowhere, and the crate-root \
+         `#[expect]` headers are only ever checked against the lints that fire \
+         on Linux. Found {coords:?}"
     );
 
-    // `if: always()` alone is the dangerous half: the job then runs, its own
-    // steps pass, and it reports success no matter how its dependencies ended.
-    // Something must actually inspect each dependency's result and exit
-    // non-zero. Checked per dependency, so adding a leg without extending the
-    // check fails here rather than in production.
-    for dep in &needs {
-        assert!(
-            aggregator.contains(&format!("needs.{dep}.result")),
-            "the `Lint` aggregator runs with `if: always()` but never reads \
-             `needs.{dep}.result`, so it reports green when `{dep}` fails, is \
-             cancelled, or is skipped. `needs` decides ordering here, not \
-             outcome."
-        );
-    }
-    assert!(
-        aggregator.contains("exit 1"),
-        "the `Lint` aggregator reads its dependencies' results but never exits \
-         non-zero, so nothing it discovers can turn the check red"
+    let mut unique = coords.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        coords.len(),
+        "the `{id}` matrix has a duplicated os/arch coordinate, so it looks \
+         like it covers more platforms than it does: {coords:?}"
     );
 }
 
-/// Whatever represents "lint passed" must gate `release` and `cleanup`.
+/// The lint job must gate `release` and `cleanup`.
 ///
-/// Only the `Lint` aggregator is in the branch ruleset, so for the legs these
-/// two `needs:` entries are their only other teeth. Drop them and a red lint
-/// blocks nothing downstream at all.
+/// This is the *only* automatic consequence of a red lint that lives in the
+/// repo. The status contexts are named per leg (`Lint linux/amd64`,
+/// `Lint darwin/arm64`) and branch protection is configured outside the tree,
+/// so nothing here can assert that a red lint blocks a merge — these two
+/// `needs:` entries are the whole of what the workflow itself enforces. Drop
+/// them and a red lint blocks nothing at all.
+///
+/// `needs:` on a matrix job waits for every leg and is satisfied only if all of
+/// them succeeded — verified against a real run rather than assumed:
+/// `bin_e2e` (`needs: [gen, build, …]`) started 4s after the *last* `build` leg
+/// finished, not the first.
 #[test]
 fn lint_gates_release_and_cleanup() {
     let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/heph.yml"))
         .expect("read .github/workflows/heph.yml");
     let jobs = workflow_jobs(&workflow);
     let legs = lint_legs(&jobs);
-    let (aggregator_id, _) = lint_aggregator(&jobs).expect("a job is named `Lint`");
+    assert!(
+        !legs.is_empty(),
+        "no job in the workflow runs the `lint` script at all, so the check \
+         below would pass over an empty set"
+    );
 
     for gate in ["release", "cleanup"] {
         let (_, body) = jobs
@@ -722,15 +849,11 @@ fn lint_gates_release_and_cleanup() {
             .unwrap_or_else(|| panic!("the workflow defines a `{gate}` job"));
         let needs = job_needs(body);
 
-        // Either the aggregator — which transitively requires every leg — or
-        // each leg directly. Accepting both spellings keeps this from
-        // dictating the wiring while still refusing the one that gates nothing.
-        let covered = needs.contains(&aggregator_id) || legs.iter().all(|leg| needs.contains(leg));
+        let missing: Vec<&&str> = legs.iter().filter(|leg| !needs.contains(leg)).collect();
         assert!(
-            covered,
-            "`{gate}` depends on neither the `{aggregator_id}` aggregator nor \
-             every lint leg ({legs:?}), so a red lint blocks nothing \
-             downstream. Found needs: {needs:?}"
+            missing.is_empty(),
+            "`{gate}` does not depend on the lint job(s) {missing:?}, so a red \
+             lint blocks nothing downstream. Found needs: {needs:?}"
         );
     }
 }
