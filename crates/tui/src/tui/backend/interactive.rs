@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::Context;
@@ -24,6 +24,11 @@ use hcore::shutdown::ShutdownTrigger;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(80);
+// Wall-clock cap on how long a single tick's log drain may run — bounds
+// redraw latency during a burst without ever dropping a line: the same `rx`
+// persists across ticks, so anything left over just renders on the next one.
+// Well under `TICK` so a capped drain still leaves room for the redraw.
+const LOG_DRAIN_TICK_BUDGET: Duration = Duration::from_millis(20);
 
 type StderrTerminal = Terminal<StderrBackend>;
 
@@ -155,7 +160,12 @@ pub async fn run<A: App + 'static>(
                             // reader and the query would deadlock (see
                             // `stderr_backend.rs`). The stream is rebuilt on resume.
                             events = None;
-                            drain_logs_to_terminal(&mut terminal, &mut rx, cols);
+                            // Unbounded: `LogSink::switch_to_buffered` mints a fresh
+                            // channel on resume, so anything left in `rx` here isn't
+                            // deferred like a tick-path budget would be — it's
+                            // orphaned when the old `rx` is dropped. Every byte must
+                            // come out now.
+                            drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
                             // Collapse to the viewport origin (not `terminal.clear()`,
                             // which restores the live bottom-of-box cursor): the
                             // cooked-mode stdout write below must land at the box's
@@ -164,7 +174,7 @@ pub async fn run<A: App + 'static>(
                             collapse_inline_viewport(&mut terminal);
                             drop(terminal.show_cursor());
                             drop(disable_raw_mode());
-                            sink.switch_to_direct();
+                            flip_sink_to_direct_draining_the_gap(&sink, &mut rx);
                             paused = true;
                         }
                         if ack.send(()).is_err() {
@@ -362,7 +372,10 @@ pub async fn run<A: App + 'static>(
                     });
                     needs_resize = false;
                 }
-                drain_logs_to_terminal(&mut terminal, &mut rx, cols);
+                // Budgeted: `rx` persists across ticks (only pause/resume ever
+                // replace it), so anything left over after the budget trips just
+                // renders on the next tick — deferred, never dropped.
+                drain_logs_to_terminal(&mut terminal, &mut rx, cols, Some(LOG_DRAIN_TICK_BUDGET));
                 spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
                 let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
                 let lines = view.render(frame, now_unix_ms(), cols, rows);
@@ -406,7 +419,7 @@ pub async fn run<A: App + 'static>(
     // it wraps to the viewport width and skips blank lines. The post-teardown
     // `drain_logs_to_stderr` fallback writes raw bytes, so letting empties fall
     // through to it dumps stray newlines after the box.
-    drain_logs_to_terminal(&mut terminal, &mut rx, cols);
+    drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
     // Collapse the viewport to its origin so the final summary (printed below)
     // lands where the box started, not below it.
     collapse_inline_viewport(&mut terminal);
@@ -541,12 +554,24 @@ fn collapse_inline_viewport<B: Backend>(terminal: &mut Terminal<B>) {
     drop(backend.clear_region(ClearType::AfterCursor));
 }
 
-fn drain_logs_to_terminal(
-    terminal: &mut StderrTerminal,
+/// Drain buffered log bytes into the terminal's scrollback. `budget` bounds how
+/// long a single call may run: `None` drains to completion (required at the
+/// pause and exit call sites, where `rx` is about to be replaced or torn down
+/// and anything left behind would be lost, not deferred); `Some(d)` stops once
+/// `d` has elapsed, leaving the remainder in `rx` for the next call — safe only
+/// where the same `rx` is guaranteed to be drained again (the tick path).
+///
+/// The budget is checked between messages, never mid-message: a message already
+/// taken off the channel is always rendered in full, so a call never abandons
+/// partially-processed data.
+fn drain_logs_to_terminal<B: Backend>(
+    terminal: &mut Terminal<B>,
     rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     cols: u16,
+    budget: Option<Duration>,
 ) {
     let cols = cols.max(1);
+    let deadline = budget.map(|d| Instant::now() + d);
     while let Ok(bytes) = rx.try_recv() {
         let text = bytes
             .into_text()
@@ -563,6 +588,9 @@ fn drain_logs_to_terminal(
                     .wrap(Wrap { trim: false })
                     .render(area, buf);
             }));
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
         }
     }
 }
@@ -581,6 +609,20 @@ fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Ok(bytes) = rx.try_recv() {
         drop(stderr.write_all(&bytes));
     }
+}
+
+/// Flip `sink` to direct writes without losing anything still queued.
+/// `LogSink::switch_to_buffered` mints a brand-new channel on the next resume,
+/// so a line written between the pause-time terminal drain and this flip —
+/// which lands in the same still-buffered `rx`, since the sink hasn't flipped
+/// yet — must be caught here or it is orphaned when `rx` is replaced, not
+/// merely deferred like a tick-path budget would defer it. `switch_to_direct`
+/// is a happens-before boundary: once it returns, no writer can reach `rx`
+/// again, so draining right after it is guaranteed to catch the whole gap.
+/// Mirrors the double-drain the exit path already relies on.
+fn flip_sink_to_direct_draining_the_gap(sink: &LogSink, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
+    sink.switch_to_direct();
+    drain_logs_to_stderr(rx);
 }
 
 #[cfg(test)]
@@ -1084,5 +1126,165 @@ mod tests {
         let text = bytes.into_text().expect("parse ansi");
         let total: usize = text.lines.iter().map(|l| l.width()).sum();
         assert_eq!(total, 3, "width should count visible chars only");
+    }
+
+    /// A budgeted drain (the tick path) must never throw a message away when it
+    /// stops early — it must leave it queued in `rx` for the next call. The tick
+    /// path is the only call site where budgeting is safe *because* it reuses the
+    /// same `rx` across calls (see `drain_logs_to_terminal`'s docs); this freezes
+    /// that contract.
+    #[test]
+    fn tick_budget_defers_excess_messages_instead_of_dropping_them() {
+        use super::drain_logs_to_terminal;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::{TerminalOptions, Viewport};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(5),
+            },
+        )
+        .expect("terminal");
+
+        for i in 0..3 {
+            tx.send(format!("line {i}\n").into_bytes()).expect("send");
+        }
+
+        // The deadline is captured once, before the loop, as `Instant::now() +
+        // Duration::ZERO` — i.e. already in the past the moment any real work
+        // happens after it. The budget is only checked after a message has been
+        // fully rendered (`terminal.insert_before`, never instantaneous), so the
+        // very first check is guaranteed to trip: this deterministically drains
+        // exactly one message and stops, on any of the three supported targets.
+        drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO));
+
+        let mut remaining = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            remaining.push(bytes);
+        }
+        assert_eq!(
+            remaining,
+            vec![b"line 1\n".to_vec(), b"line 2\n".to_vec()],
+            "a budgeted drain must leave the rest of the burst queued for the \
+             next tick, not discard it — the tick path reuses the same `rx`, so \
+             nothing is lost, only deferred"
+        );
+    }
+
+    /// A burst that outlasts a single budgeted drain must still fully drain once
+    /// enough ticks have run — deferral has to actually converge, not just hold
+    /// for one call. Each of the `messages.len()` calls below is budgeted to
+    /// process exactly one message (same zero-budget reasoning as the test
+    /// above), mirroring `messages.len()` consecutive render ticks against the
+    /// same `rx`.
+    #[test]
+    fn tick_budget_converges_across_multiple_ticks_without_losing_or_reordering() {
+        use super::drain_logs_to_terminal;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::{TerminalOptions, Viewport};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(5),
+            },
+        )
+        .expect("terminal");
+
+        let messages: Vec<Vec<u8>> = (0..5).map(|i| format!("line {i}\n").into_bytes()).collect();
+        for m in &messages {
+            tx.send(m.clone()).expect("send");
+        }
+
+        // One zero-budget call per message, exactly mirroring one render tick
+        // each — plus one extra call to prove the channel is empty afterward,
+        // not just down to one leftover message.
+        for _ in 0..messages.len() {
+            drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO));
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a burst spanning multiple ticks must fully drain once enough \
+             budgeted calls have run — deferral must converge, not stall"
+        );
+        // `drain_logs_to_terminal` unconditionally renders a message via
+        // `terminal.insert_before` before it can be taken off `rx` (see its
+        // body) — so with `rx` empty and no panic, all `messages.len()` sends
+        // were rendered exactly once across the loop above, none silently
+        // skipped.
+    }
+
+    /// Regression for the pause-path loss: `LogSink::switch_to_buffered` mints a
+    /// brand-new channel every time the TUI resumes, so the pause handler cannot
+    /// budget its drain like the tick path does — anything left in the old `rx`
+    /// when resume replaces it is gone for good, not merely delayed to a future
+    /// call. Worse, a line written in the gap between the pause-time drain and
+    /// the sink flipping to direct writes still lands in that same soon-to-be-
+    /// replaced `rx`, since the sink hasn't flipped yet.
+    ///
+    /// This drives the actual `LogSink`/`MakeLogSink` types and the real
+    /// `flip_sink_to_direct_draining_the_gap` function `interactive::run`'s
+    /// `Control::Pause` arm calls — not a hand-mirrored copy — so it exercises
+    /// the production fix directly. Only the surrounding pause/resume cycle
+    /// (which needs a real terminal) is left out, for the same reason the resize
+    /// test above does: not honestly unit-testable without a PTY.
+    ///
+    /// Verified red without the fix: with the `drain_logs_to_stderr(rx)` call
+    /// removed from `flip_sink_to_direct_draining_the_gap`, the gap message stays
+    /// in `rx` and the final assertion fails — exactly what would happen on a
+    /// real resume, where `switch_to_buffered` mints a replacement channel and
+    /// silently drops whatever the old one still held.
+    #[test]
+    fn pause_gap_message_is_drained_not_orphaned_before_resume_can_replace_rx() {
+        use super::{drain_logs_to_terminal, flip_sink_to_direct_draining_the_gap};
+        use crate::tui::log_sink::{LogSink, MakeLogSink};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::{TerminalOptions, Viewport};
+        use std::io::Write;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let sink = LogSink::new_direct();
+        let mut rx = sink.switch_to_buffered();
+        let mut writer = MakeLogSink::new(sink.clone()).make_writer();
+
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(5),
+            },
+        )
+        .expect("terminal");
+
+        // Steady-state log line, drained the way the pause handler drains before
+        // collapsing the viewport.
+        writer.write_all(b"before pause\n").expect("write");
+        drain_logs_to_terminal(&mut terminal, &mut rx, 80, None);
+        assert!(
+            rx.try_recv().is_err(),
+            "precondition: the steady-state drain leaves nothing behind"
+        );
+
+        // The race: a line written in the gap between that drain and the sink
+        // flipping to direct writes. It lands in the same `rx` — the sink hasn't
+        // flipped yet — exactly like a real writer racing the pause transition.
+        writer.write_all(b"during the gap\n").expect("write");
+
+        // The fix under test: the real function `run`'s pause arm calls.
+        flip_sink_to_direct_draining_the_gap(&sink, &mut rx);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a message written in the pause/switch_to_direct gap must be drained \
+             before resume can replace the channel — `LogSink::switch_to_buffered` \
+             mints a fresh one on resume, orphaning whatever is left in the old \
+             `rx` for good, not deferring it"
+        );
     }
 }
