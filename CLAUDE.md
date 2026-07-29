@@ -45,6 +45,12 @@ It builds `--release`, so it is slow and disk-hungry on a cold tree. Don't run i
 
 `tst` excludes `bin-e2e` deliberately: those tests need staged artifacts and hard-fail without `HEPH_E2E_DIST`, so a suite that never ran can't read as a suite that passed. See `.claude/testing.md` for what belongs there versus `crates/e2e`.
 
+### `heph-bench` — perf-regression harness
+
+`crates/bench-corpus` (deterministic synthetic corpus generator) + `crates/bench` (`heph-bench` binary: `corpus`/`run inprocess`/`run dist`/`compare`). Times `heph` scenarios in-process (Tier A, no process spawn, no plugin cdylib) or against the real prebuilt binary + plugin cdylib (Tier B, the seam only a real `dlopen` can exercise), then decides regression from a baseline-vs-candidate comparison.
+
+**Don't run it locally by default — let CI do it.** It exists to catch regressions across a baseline (N-1) and a candidate (N) build under controlled, repeatable conditions; a single local run competes with everything else on the machine and its noise floor makes one-off numbers unreliable next to CI's comparison. Run it locally only when absolutely necessary — reproducing a CI-reported regression, or developing the harness itself — or when explicitly asked to.
+
 ## Workflow
 
 Don't run the full test suite locally — CI runs `tst` on every push, so running it first only delays the push.

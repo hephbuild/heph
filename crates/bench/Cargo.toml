@@ -1,0 +1,30 @@
+[package]
+name = "bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "heph-bench"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bench-corpus = { path = "../bench-corpus" }
+# Links the engine in-process for Tier A (`run inprocess`) — the same
+# not-a-real-process linkage `crates/e2e` uses. Tier B (`run dist`) never
+# calls into this: it only spawns the prebuilt binary located on disk.
+heph = { path = "../.." }
+htestkit = { package = "testkit", path = "../testkit" }
+anyhow = "1"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]

@@ -646,6 +646,236 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
 
+  # Perf-regression gate: generates one synthetic corpus, times a fixed
+  # scenario set against N (this PR's head) and N-1 (its merge-base with the
+  # PR's target branch), and reports a regression verdict. PR-only — there is
+  # nothing to compare a baseline against on a plain `push`.
+  #
+  # Two tiers per platform, matching `crates/e2e` vs `crates/bin-e2e`'s split
+  # (see `.claude/testing.md`):
+  #   - inprocess (Tier A): the engine linked directly, no process spawn, no
+  #     plugin cdylib. Isolates engine-internals cost (cache, hashing, DAG
+  #     resolution) from process-startup/dlopen noise. Needs a `heph-bench`
+  #     binary built from EACH side's own source (the engine under test has
+  #     to actually be the commit's own code) — see the baseline step.
+  #   - dist (Tier B): the real prebuilt `heph` binary + real `go` plugin
+  #     cdylib, dlopened for real — the only way to measure ABI-crossing and
+  #     plugin-load cost. Uses HEAD's `heph-bench` to drive both sides (the
+  #     orchestrator doesn't need to match the binary under test), so N's
+  #     artifacts come straight from the `build` job and N-1's from the
+  #     baseline build below — neither needs its own harness binary.
+  #
+  # N-1 is expensive to produce (a full release build) and identical for
+  # every PR sharing the same merge-base, so it's cached by that SHA rather
+  # than rebuilt per push: the first PR after a `master` merge pays the
+  # build, every PR after it (until the next merge) hits the cache.
+  #
+  # Bootstrap note: this job is introduced by the same PR that adds
+  # `crates/bench`. Until it merges, every PR's merge-base predates the
+  # harness, so the baseline step can't build a baseline `heph-bench` and
+  # Tier A is skipped with a note rather than failing outright. Tier B is
+  # unaffected (it only needs the baseline's `heph` + go plugin, which always
+  # exist). Both tiers compare normally from the next PR onward.
+  #
+  # Report-only for now: `continue-on-error` on the run/compare steps means a
+  # detected regression (or a harness bug) shows as a yellow warning, not a
+  # red required check. Once the thresholds in `.github/perfbench-thresholds.json`
+  # have been sanity-checked against a couple weeks of real PRs, drop
+  # `continue-on-error` and add "Perf" as a required status check in branch
+  # protection. That also gives the override this needs ("overridable by
+  # me"): a repo admin already bypasses required checks on merge — no extra
+  # plumbing to build.
+  perfbench:
+    name: Perf ${{ matrix.os }}/${{ matrix.arch }}
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    needs: [build]
+    env:
+      # Tunable without touching the steps below. Sized for a few minutes'
+      # wall time per leg; raise toward the thousands-of-targets scale heph
+      # actually runs at once this job's real-world timing is known from a
+      # few live runs.
+      PERFBENCH_TARGETS: "4000"
+      PERFBENCH_PACKAGES: "200"
+      PERFBENCH_LAYERS: "10"
+      PERFBENCH_FAN_OUT: "4"
+      PERFBENCH_GO_PACKAGES: "60"
+      PERFBENCH_REPS: "3"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: darwin
+            arch: arm64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      # Fresh checkout (not the `repo` artifact `build`/`test`/`lint` reuse):
+      # this job needs real git history to resolve the merge-base, the same
+      # requirement the `abi` job already has — mirroring its proven
+      # `fetch-depth: 0` checkout instead of assuming the uploaded artifact's
+      # `.git` is equally usable.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Nix + devenv
+        uses: ./.github/actions/setup-nix
+        with:
+          cargo-target: ${{ matrix.target }}
+          cache-suffix: "-bench"
+          r2-secret: ${{ secrets.CF_SSCACHE }}
+
+      # Corpus generation's go/ subtree (`tools/gorepogen` + `go mod tidy`)
+      # needs a host Go toolchain — separate from the hermetic one the `go`
+      # plugin downloads at target-build time.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Resolve merge-base
+        id: base
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          echo "sha=$(git merge-base "origin/${{ github.base_ref }}" HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Gen (HEAD)
+        shell: devenv shell bash -- -e {0}
+        run: gen
+
+      - name: Build heph-bench (HEAD)
+        shell: devenv shell bash -- -e {0}
+        run: cargo build -p bench
+
+      - name: Generate corpus
+        shell: devenv shell bash -- -e {0}
+        run: |
+          ./target/debug/heph-bench corpus \
+            --seed 1 \
+            --targets "$PERFBENCH_TARGETS" --packages "$PERFBENCH_PACKAGES" \
+            --layers "$PERFBENCH_LAYERS" --fan-out "$PERFBENCH_FAN_OUT" \
+            --go-packages "$PERFBENCH_GO_PACKAGES" \
+            --out bench-corpus
+
+      - name: Download candidate (N) artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: heph*_${{ matrix.os }}_${{ matrix.arch }}*
+          path: candidate-dist-raw
+          merge-multiple: true
+
+      - name: Normalize candidate dist layout
+        run: |
+          ext=so; [ "${{ matrix.os }}" = "darwin" ] && ext=dylib
+          mkdir -p candidate-dist
+          cp "candidate-dist-raw/heph_${{ matrix.os }}_${{ matrix.arch }}" candidate-dist/heph
+          cp "candidate-dist-raw/heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" "candidate-dist/heph-go-plugin.$ext"
+          chmod +x candidate-dist/heph
+
+      - name: Cache baseline (N-1) build
+        id: cache_baseline
+        uses: actions/cache@v4
+        with:
+          path: baseline-dist
+          key: perfbench-baseline-v1-${{ matrix.os }}-${{ matrix.arch }}-${{ steps.base.outputs.sha }}
+
+      - name: Add baseline worktree
+        if: steps.cache_baseline.outputs.cache-hit != 'true'
+        run: git worktree add ../baseline-src "${{ steps.base.outputs.sha }}"
+
+      # Builds with the baseline commit's OWN devenv (its own toolchain
+      # pins) — the correct comparison is "this commit built the way it was
+      # actually built", not head's toolchain applied retroactively. `heph`
+      # + the go plugin cdylib always exist; `heph-bench` only exists once
+      # this PR (which introduces `crates/bench`) has merged — see the
+      # bootstrap note on the job.
+      - name: Gen + build baseline (N-1)
+        if: steps.cache_baseline.outputs.cache-hit != 'true'
+        shell: devenv shell bash -- -e {0}
+        working-directory: ../baseline-src
+        env:
+          CARGO_TARGET_DIR: "target-baseline"
+        run: |
+          gen
+          cargo build --release --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib
+          ext=so; [ "${{ matrix.os }}" = "darwin" ] && ext=dylib
+          mkdir -p "$GITHUB_WORKSPACE/baseline-dist"
+          cp target-baseline/release/heph "$GITHUB_WORKSPACE/baseline-dist/heph"
+          cp "target-baseline/release/libplugin_go_cdylib.$ext" "$GITHUB_WORKSPACE/baseline-dist/heph-go-plugin.$ext"
+          chmod +x "$GITHUB_WORKSPACE/baseline-dist/heph"
+          if [ -d crates/bench ]; then
+            cargo build --release -p bench
+            cp target-baseline/release/heph-bench "$GITHUB_WORKSPACE/baseline-dist/heph-bench"
+            chmod +x "$GITHUB_WORKSPACE/baseline-dist/heph-bench"
+          fi
+
+      - name: Time Tier A (inprocess) scenarios
+        continue-on-error: true
+        shell: devenv shell bash -- -e {0}
+        run: |
+          HEAD_BENCH=./target/debug/heph-bench
+          for scenario in cold full-hit incremental; do
+            $HEAD_BENCH run inprocess --corpus bench-corpus --scenario "$scenario" \
+              --warmup 1 --reps "$PERFBENCH_REPS" --out "candidate_inproc_${scenario}.json"
+            if [ -x baseline-dist/heph-bench ]; then
+              baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                --warmup 1 --reps "$PERFBENCH_REPS" --out "baseline_inproc_${scenario}.json"
+            fi
+          done
+
+      - name: Time Tier B (dist) scenarios
+        continue-on-error: true
+        shell: devenv shell bash -- -e {0}
+        run: |
+          BENCH=./target/debug/heph-bench
+          for scenario in cold full-hit incremental; do
+            $BENCH run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
+              --warmup 1 --reps "$PERFBENCH_REPS" --out "candidate_dist_${scenario}.json"
+            $BENCH run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
+              --warmup 1 --reps "$PERFBENCH_REPS" --out "baseline_dist_${scenario}.json"
+          done
+
+      - name: Compare and report
+        continue-on-error: true
+        shell: devenv shell bash -- -e {0}
+        run: |
+          BENCH=./target/debug/heph-bench
+          {
+            echo "# Perf: ${{ matrix.os }}/${{ matrix.arch }}"
+            for tier in inproc dist; do
+              tier_name="inprocess"; [ "$tier" = "dist" ] && tier_name="dist"
+              echo ""
+              echo "## Tier: $tier_name"
+              for scenario in cold full-hit incremental; do
+                base="baseline_${tier}_${scenario}.json"
+                cand="candidate_${tier}_${scenario}.json"
+                if [ -f "$base" ] && [ -f "$cand" ]; then
+                  $BENCH compare --baseline "$base" --candidate "$cand" \
+                    --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
+                    --allow-regression || true
+                else
+                  echo "_${scenario}: skipped (no baseline — merge-base predates the perf harness)_"
+                fi
+              done
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: sccache stats
+        if: always()
+        shell: devenv shell bash -- -e {0}
+        run: sccache --show-stats
+
   release:
     name: Release
     needs: [gen, upload_artifacts, lint, test, bin_e2e]
