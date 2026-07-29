@@ -406,7 +406,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_is_deterministic() -> Result<()> {
+    fn generate_is_deterministic() {
         let params = CorpusParams {
             seed: 42,
             target_count: 50,
@@ -416,33 +416,32 @@ mod tests {
             ..Default::default()
         };
 
-        let a = tempfile::tempdir()?;
-        let b = tempfile::tempdir()?;
-        generate(&params, a.path())?;
-        generate(&params, b.path())?;
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        generate(&params, a.path()).expect("generate a");
+        generate(&params, b.path()).expect("generate b");
 
-        let read_all = |root: &Path| -> Result<Vec<(String, String)>> {
+        let read_all = |root: &Path| -> Vec<(String, String)> {
             let mut out = Vec::new();
-            for entry in std::fs::read_dir(root)? {
-                let entry = entry?;
+            for entry in std::fs::read_dir(root).expect("read_dir") {
+                let entry = entry.expect("dir entry");
                 let build = entry.path().join("BUILD");
                 if build.is_file() {
                     out.push((
                         entry.file_name().to_string_lossy().into_owned(),
-                        std::fs::read_to_string(build)?,
+                        std::fs::read_to_string(build).expect("read BUILD"),
                     ));
                 }
             }
             out.sort();
-            Ok(out)
+            out
         };
 
-        assert_eq!(read_all(a.path())?, read_all(b.path())?);
-        Ok(())
+        assert_eq!(read_all(a.path()), read_all(b.path()));
     }
 
     #[test]
-    fn generate_writes_every_target_and_only_forward_deps() -> Result<()> {
+    fn generate_writes_every_target_and_only_forward_deps() {
         let params = CorpusParams {
             seed: 7,
             target_count: 200,
@@ -451,8 +450,8 @@ mod tests {
             fan_out: 3,
             ..Default::default()
         };
-        let dir = tempfile::tempdir()?;
-        let manifest = generate(&params, dir.path())?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = generate(&params, dir.path()).expect("generate");
         assert_eq!(manifest.bash_addrs.len(), 200);
 
         // Every referenced dep addr must name a target generated in an
@@ -461,14 +460,14 @@ mod tests {
         // dangling deps).
         let known: std::collections::HashSet<_> = manifest.bash_addrs.iter().collect();
         for pkg in &manifest.bash_packages {
-            let src = std::fs::read_to_string(dir.path().join(pkg).join("BUILD"))?;
+            let src =
+                std::fs::read_to_string(dir.path().join(pkg).join("BUILD")).expect("read BUILD");
             for line in src.lines().filter(|l| l.trim_start().starts_with("deps")) {
                 for addr in line.split('"').skip(1).step_by(2) {
                     assert!(known.contains(&addr.to_string()), "dangling dep {addr}");
                 }
             }
         }
-        Ok(())
     }
 
     // Ignored like `cache_load`/FUSE e2e: `go mod tidy` over gorepogen's
@@ -477,7 +476,7 @@ mod tests {
     // when touching the go-subtree path.
     #[test]
     #[ignore = "needs network for `go mod tidy` on gorepogen's third-party imports"]
-    fn go_tree_produces_requested_package_count() -> Result<()> {
+    fn go_tree_produces_requested_package_count() {
         let params = CorpusParams {
             seed: 3,
             target_count: 30,
@@ -487,15 +486,14 @@ mod tests {
             go_packages: 5,
             ..Default::default()
         };
-        let dir = tempfile::tempdir()?;
-        let manifest = generate(&params, dir.path())?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = generate(&params, dir.path()).expect("generate");
         assert_eq!(manifest.go_package_count, 5);
         assert!(dir.path().join("go/go.mod").is_file());
-        Ok(())
     }
 
     #[test]
-    fn incrementalize_touches_requested_fraction() -> Result<()> {
+    fn incrementalize_touches_requested_fraction() {
         let params = CorpusParams {
             seed: 1,
             target_count: 100,
@@ -504,31 +502,32 @@ mod tests {
             fan_out: 2,
             ..Default::default()
         };
-        let dir = tempfile::tempdir()?;
-        let manifest = generate(&params, dir.path())?;
-        let touched = incrementalize(&manifest, dir.path(), 0.2, 99)?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = generate(&params, dir.path()).expect("generate");
+        let touched = incrementalize(&manifest, dir.path(), 0.2, 99).expect("incrementalize");
         assert_eq!(touched, 2); // ceil(10 * 0.2)
-        Ok(())
     }
 
     #[test]
-    fn incrementalize_go_touches_requested_fraction_and_skips_tests() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+    fn incrementalize_go_touches_requested_fraction_and_skips_tests() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let go_root = dir.path().join("go");
-        std::fs::create_dir_all(go_root.join("pkg"))?;
+        std::fs::create_dir_all(go_root.join("pkg")).expect("create dir");
         for n in 0..10 {
             std::fs::write(
                 go_root.join("pkg").join(format!("f{n}.go")),
                 "package pkg\n",
-            )?;
+            )
+            .expect("write go file");
         }
-        std::fs::write(go_root.join("pkg").join("f0_test.go"), "package pkg\n")?;
+        std::fs::write(go_root.join("pkg").join("f0_test.go"), "package pkg\n")
+            .expect("write test file");
 
-        let touched = incrementalize_go(&go_root, 0.3, 7)?;
+        let touched = incrementalize_go(&go_root, 0.3, 7).expect("incrementalize_go");
         assert_eq!(touched, 3); // ceil(10 * 0.3), test file excluded from the pool
 
-        let test_src = std::fs::read_to_string(go_root.join("pkg").join("f0_test.go"))?;
+        let test_src = std::fs::read_to_string(go_root.join("pkg").join("f0_test.go"))
+            .expect("read test file");
         assert_eq!(test_src, "package pkg\n", "test file must not be mutated");
-        Ok(())
     }
 }
