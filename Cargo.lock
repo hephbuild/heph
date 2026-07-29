@@ -3805,6 +3805,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower-lsp-server",
+ "tracing",
  "walk",
  "xstarlark-fmt",
 ]
