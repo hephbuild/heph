@@ -22,6 +22,7 @@ use hcore::hartifactcontent::{Content, unpack};
 use hcore::hasync::Cancellable;
 use hlock::hlock::{FLock, Lock};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Input annotation opting a dep into read-only staging. Value must be the
 /// string `"true"`. Set by producers for artifacts the consuming target only
@@ -69,7 +70,7 @@ fn sanitize_component(key: &str) -> String {
               only move the noise"
 )]
 pub async fn stage_and_link(
-    content: &dyn Content,
+    content: &Arc<dyn Content>,
     stage_root: &Path,
     key_prefix: &str,
     link_root: &Path,
@@ -82,17 +83,15 @@ pub async fn stage_and_link(
         .hashout()
         .with_context(|| format!("hashout for staging ({key_prefix})"))?;
     if hashout.is_empty() {
-        // No stable key → nothing to dedup on; behave like the copy path. The
-        // predicate is built and consumed entirely before the first await, so
-        // it never crosses a suspension point.
-        let pred = |rel: &Path| filters.iter().any(|f| Path::new(f) == rel);
-        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
-            None
-        } else {
-            Some(&pred)
-        };
-        return unpack::unpack(content, link_root, list_path, predicate)
-            .with_context(|| format!("unshared unpack into {:?} (no content hash)", link_root));
+        // No stable key → nothing to dedup on; behave like the copy path.
+        return crate::driver_managed::unpack_blocking(
+            Arc::clone(content),
+            link_root.to_path_buf(),
+            list_path.map(Path::to_path_buf),
+            filters.to_vec(),
+        )
+        .await
+        .with_context(|| format!("unshared unpack into {:?} (no content hash)", link_root));
     }
 
     let group_dir = stage_root.join(sanitize_component(key_prefix));
@@ -105,18 +104,44 @@ pub async fn stage_and_link(
         std::fs::create_dir_all(&group_dir)
             .with_context(|| format!("create stage group dir {:?}", group_dir))?;
         let lock = FLock::new(&lock_path);
-        let _guard = lock
+        let guard = lock
             .lock(ctoken)
             .await
             .with_context(|| format!("acquire stage lock {:?}", lock_path))?;
-        // Re-check under the lock: another writer may have finished while we
-        // waited. The `.ready` marker is the witness, written last.
-        if !ready.exists() {
-            materialize(content, &entry)
-                .with_context(|| format!("materialize stage entry {:?}", entry))?;
-            std::fs::write(&ready, b"")
-                .with_context(|| format!("write stage ready marker {:?}", ready))?;
-        }
+
+        // Materialization reads the artifact's every byte out of the cache and
+        // writes the whole tree to disk, and the cache read parks the calling
+        // thread on any queued sqlite write to that key. Both belong off a
+        // runtime worker.
+        //
+        // The **guard moves into the job**, so the lock spans exactly the
+        // critical section it always did. Leaving it on this side would be a
+        // cancellation hole rather than a style choice: a pool job runs to
+        // completion even when its caller's future is dropped, so a cancelled
+        // consumer would release the lock while its orphaned job kept unpacking
+        // — and the next consumer, seeing no `.ready`, would take the lock and
+        // `remove_dir_all` the tree out from under it. Owning the guard keeps
+        // the whole "re-check, materialize, publish" sequence atomic against a
+        // dropped caller, exactly as it was when it ran inline.
+        //
+        // `.ready` is written inside too: it is the witness that the entry is
+        // complete, and publishing it from a future that may never be polled
+        // again would leave a materialized entry nobody can use.
+        let (content, entry_owned, ready_owned) =
+            (Arc::clone(content), entry.clone(), ready.clone());
+        hcore::blocking::run(move || {
+            let _guard = guard;
+            // Re-check under the lock: another writer may have finished while we
+            // waited. The `.ready` marker is the witness, written last.
+            if ready_owned.exists() {
+                return Ok(());
+            }
+            materialize(content.as_ref(), &entry_owned)
+                .with_context(|| format!("materialize stage entry {:?}", entry_owned))?;
+            std::fs::write(&ready_owned, b"")
+                .with_context(|| format!("write stage ready marker {:?}", ready_owned))
+        })
+        .await?;
     }
 
     // Unfiltered inputs (the common case: a whole self-contained read-only tree
@@ -132,6 +157,12 @@ pub async fn stage_and_link(
     // `tools` flatten each file into a `bin/` dir by basename — a subtree symlink
     // would list only the directory root, which they cannot use). `link_tree`
     // with empty filters links the whole tree.
+    //
+    // Both link paths stay on the calling worker, unlike the materialize above:
+    // they touch no cache and cannot park on the write queue, they hold no lock,
+    // and the common one (`link_symlinked`) is O(depth) syscalls. `link_tree` is
+    // O(files) and would be worth offloading if a filtered input ever got large
+    // — the exec `tools` shape it serves is a handful of files.
     if !filters.is_empty() || per_file {
         link_tree(&entry, link_root, list_path, filters)
             .with_context(|| format!("link staged {:?} into {:?}", entry, link_root))
@@ -394,6 +425,9 @@ fn link_symlinked(
 /// whole tree. Any partial leftover from a crashed prior attempt is removed
 /// first — `.ready` is absent here (checked under the lock), so whatever sits
 /// at `entry` is untrustworthy.
+///
+/// Synchronous and byte-moving: reached from [`stage_and_link`] only through
+/// `hcore::blocking::run`.
 fn materialize(content: &dyn Content, entry: &Path) -> anyhow::Result<()> {
     match hcore::fsutil::remove_dir_all(entry) {
         Ok(()) => {}
@@ -644,7 +678,7 @@ mod tests {
         }
     }
 
-    fn content(hash: &str, files: &[(&str, &str, bool)]) -> TarBytes {
+    fn content(hash: &str, files: &[(&str, &str, bool)]) -> Arc<dyn Content> {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut packer = TarPacker::new();
         for (rel, body, x) in files {
@@ -664,10 +698,10 @@ mod tests {
         }
         let mut bytes = Vec::new();
         packer.pack(&mut bytes).expect("pack");
-        TarBytes {
+        Arc::new(TarBytes {
             bytes,
             hash: hash.to_string(),
-        }
+        })
     }
 
     fn ct() -> StdCancellationToken {
@@ -803,10 +837,10 @@ mod tests {
         );
         let mut bytes = Vec::new();
         packer.pack(&mut bytes).expect("pack");
-        let c = TarBytes {
+        let c: Arc<dyn Content> = Arc::new(TarBytes {
             bytes,
             hash: "sym1".to_string(),
-        };
+        });
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
@@ -1330,5 +1364,99 @@ mod tests {
             "no-hash fallback must copy a real file, not symlink"
         );
         assert!(!stage.exists(), "fallback must not create a stage entry");
+    }
+
+    /// Materializing a stage entry must not run on a tokio worker.
+    ///
+    /// It reads the artifact's every byte out of the cache and writes the whole
+    /// tree to disk — for a read-only Go SDK input, ~11k files — and the cache
+    /// read underneath parks the calling thread on any queued sqlite write to
+    /// that key. It also runs under the stage `FLock`, so a parked worker holds
+    /// the lock every other consumer of that artifact is waiting on.
+    ///
+    /// The content records the thread it was walked on;
+    /// `hcore::blocking`'s pool threads are the only ones named
+    /// `heph-blocking-*`. Asserted positively — `!= "tokio-runtime-worker"`
+    /// would pass vacuously, since `#[tokio::test]` runs the body on the test
+    /// thread.
+    #[tokio::test]
+    async fn stage_materialization_runs_off_the_runtime_workers() {
+        struct ThreadRecordingTar {
+            inner: TarBytes,
+            thread: Arc<std::sync::Mutex<Option<String>>>,
+        }
+
+        impl Content for ThreadRecordingTar {
+            fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+                self.inner.reader()
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
+                record_current_thread(&self.thread);
+                self.inner.walk()
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                self.inner.hashout()
+            }
+        }
+
+        /// Record the name of the thread this runs on into `slot`.
+        ///
+        /// A free function returning `()` rather than a lock inside `walk`:
+        /// `walk` returns a `Result`, and `clippy::unwrap_in_result` (denied in
+        /// this crate) rejects an `expect` there. Poisoning is ignored — the
+        /// `Option` is still consistent, and a poisoned slot would only hide the
+        /// assertion.
+        fn record_current_thread(slot: &std::sync::Mutex<Option<String>>) {
+            let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+            *g = std::thread::current()
+                .name()
+                .map(std::borrow::ToOwned::to_owned);
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let thread = Arc::new(std::sync::Mutex::new(None));
+        // A real hashout, so this takes the staged path and not the
+        // `unpack_blocking` fallback `no_content_hash_falls_back_to_copy` covers.
+        let inner = content("stagethread", &[("pkg/x.txt", "hello", false)]);
+        let c: Arc<dyn Content> = Arc::new(ThreadRecordingTar {
+            inner: TarBytes {
+                bytes: drain_tar(&inner),
+                hash: "stagethread".to_string(),
+            },
+            thread: Arc::clone(&thread),
+        });
+
+        stage_and_link(&c, &stage, "k", &link, None, &[], false, &ct())
+            .await
+            .expect("stage");
+
+        assert_eq!(
+            std::fs::read_to_string(link.join("pkg/x.txt")).expect("linked file"),
+            "hello",
+            "the tree must still be staged and linked"
+        );
+        let ran_on = thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            ran_on
+                .as_deref()
+                .is_some_and(|n| n.starts_with("heph-blocking")),
+            "stage materialization must run on the blocking pool, ran on {ran_on:?}"
+        );
+    }
+
+    /// The packed tar bytes behind a `content(..)` fixture, so a decorator can
+    /// wrap them.
+    fn drain_tar(c: &Arc<dyn Content>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        c.reader()
+            .expect("reader")
+            .read_to_end(&mut buf)
+            .expect("read");
+        buf
     }
 }

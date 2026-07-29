@@ -1,10 +1,10 @@
 use anyhow::Context;
-use hcore::hartifactcontent;
 use hcore::hartifactcontent::tar_index::TarIndex;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, detect_output_collisions,
-    invoke_inner, list_path_for, resolve_unpack_root, write_source_map,
+    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs,
+    detect_output_collisions_blocking, invoke_inner, list_path_for, resolve_unpack_root,
+    unpack_blocking, write_source_map_blocking,
 };
 use hplugin::driver::{RunInput, RunRequest, RunResponse, SandboxGuard};
 use hsandboxfuse as sandboxfuse;
@@ -68,8 +68,11 @@ impl ManagedDriverFuse {
 
         // Reject two distinct targets producing the same sandbox file before we
         // register any slot — overlapping layer paths would otherwise silently
-        // shadow by registration order.
-        detect_output_collisions(&groups)
+        // shadow by registration order. Off the worker: the check enumerates
+        // every input's entry paths, which for a cache-backed input is a header
+        // scan over a sqlite blob and can park on that key's queued write.
+        let groups = detect_output_collisions_blocking(groups)
+            .await
             .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
 
         let mut slot_guards: Vec<sandboxfuse::SlotGuard> = Vec::new();
@@ -78,7 +81,15 @@ impl ManagedDriverFuse {
         for (unpack_root, group) in groups {
             fs::create_dir_all(&unpack_root)
                 .with_context(|| format!("create unpack root {:?}", unpack_root))?;
-            match try_register_slot(&self.fs, &self.fuse_lower, &unpack_root, &list_dir, &group)? {
+            let (slot, group) = try_register_slot_blocking(
+                Arc::clone(&self.fs),
+                self.fuse_lower.clone(),
+                unpack_root.clone(),
+                list_dir.clone(),
+                group,
+            )
+            .await?;
+            match slot {
                 Some(guard) => {
                     slot_guards.push(guard);
                     // Slot registered; inputs served via layers — no per-input unpack.
@@ -96,18 +107,15 @@ impl ManagedDriverFuse {
                     // into the FUSE upper layer just like OS mode.
                     for input in group {
                         let list_path = list_path_for(&input, &list_dir);
-                        let filters = input.filters.clone();
-                        let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
-                            None
-                        } else {
-                            Some(&|rel: &Path| filters.iter().any(|f| Path::new(f) == rel))
-                        };
-                        hartifactcontent::unpack::unpack(
-                            input.artifact.content.as_ref(),
-                            unpack_root.as_path(),
-                            list_path.as_deref(),
-                            predicate,
+                        // Off the worker, through the same shared helper the OS
+                        // runner uses — see `unpack_blocking`.
+                        unpack_blocking(
+                            Arc::clone(&input.artifact.content),
+                            unpack_root.clone(),
+                            list_path.clone(),
+                            input.filters.clone(),
                         )
+                        .await
                         .with_context(|| {
                             format!(
                                 "unpack input origin_id={} source_addr={} into {:?}",
@@ -130,7 +138,10 @@ impl ManagedDriverFuse {
         fs::create_dir_all(&sandbox_pkg_dir)
             .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
-        write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir)?;
+        // Off the worker, as the OS runner already does it: an input that opts in
+        // costs an `entry_paths()` per artifact, a header scan over a sqlite blob
+        // that can park on that key's queued write.
+        let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir).await?;
 
         let target = req.target;
         let hashin = req.hashin;
@@ -177,17 +188,75 @@ impl ManagedDriverFuse {
     }
 }
 
-/// Build per-input `TarIndex`es and register a slot on the shared FUSE
-/// filesystem. Returns `None` if any input lacks a seekable reader (the
-/// FUSE path requires random-access bytes) — caller falls back to
-/// unpack-into-upper for that group.
-fn try_register_slot(
-    fs: &Arc<sandboxfuse::LayeredFs>,
-    fuse_lower: &Path,
+/// Layers plus the list files a group's inputs want written.
+type SlotLayers = (Vec<sandboxfuse::Layer>, Vec<(PathBuf, Vec<PathBuf>)>);
+
+/// Build a group's FUSE layers off the runtime workers, then register the slot
+/// here on the caller's frame.
+///
+/// [`build_slot_layers`] is the expensive half — a `par_iter` that opens a
+/// seekable reader and builds a `TarIndex` per input, i.e. cache reads that park
+/// on any queued sqlite write to those keys. The rayon workers parking is their
+/// contract; the tokio worker pinned on the join for the whole group is the
+/// runtime stall `hcore::blocking` exists to remove.
+///
+/// **The registration deliberately stays out of the job.** `register_slot` is a
+/// map insert keyed by the sandbox prefix, and that prefix is stable per addr
+/// rather than per attempt — while an `hcore::blocking` job runs to completion
+/// even when its caller's future is dropped. Registering inside the job would
+/// let an abandoned attempt insert its layers over a *successor's* live slot,
+/// and then, when its unwanted `SlotGuard` was dropped on the pool thread,
+/// remove the prefix outright — the successor's sandbox would lose its inputs
+/// mid-run. Done here, a slot is only ever registered by a frame that is alive
+/// to own its guard. The insert itself is one `RwLock` write; there is nothing
+/// to offload.
+async fn try_register_slot_blocking(
+    fs: Arc<sandboxfuse::LayeredFs>,
+    fuse_lower: PathBuf,
+    unpack_root: PathBuf,
+    list_dir: PathBuf,
+    group: Vec<RunInput>,
+) -> anyhow::Result<(Option<sandboxfuse::SlotGuard>, Vec<RunInput>)> {
+    let prefix = unpack_root
+        .strip_prefix(&fuse_lower)
+        .map_err(|_e| {
+            anyhow::anyhow!(
+                "unpack_root {:?} not under FUSE mount {:?}",
+                unpack_root,
+                fuse_lower
+            )
+        })?
+        .to_path_buf();
+
+    let (built, group) = hcore::blocking::run(move || {
+        let built = build_slot_layers(&unpack_root, &list_dir, &group)?;
+        anyhow::Ok((built, group))
+    })
+    .await?;
+
+    let Some((layers, list_writes)) = built else {
+        return Ok((None, group));
+    };
+    let guard = fs.register_slot(prefix, layers);
+    for (list_path, abs_paths) in list_writes {
+        write_list_file(&list_path, &abs_paths)
+            .with_context(|| format!("write list file {:?} for fuse-slot group", list_path))?;
+    }
+    Ok((Some(guard), group))
+}
+
+/// Build one `TarIndex`-backed [`sandboxfuse::Layer`] per input, plus the list
+/// files the group's inputs want written. `None` if any input lacks a seekable
+/// reader (the FUSE path requires random-access bytes) — the caller falls back
+/// to unpack-into-upper for that group.
+///
+/// Synchronous and I/O-bound: reached from `run_inner` only through
+/// [`try_register_slot_blocking`].
+fn build_slot_layers(
     unpack_root: &Path,
     list_dir: &Path,
     group: &[RunInput],
-) -> anyhow::Result<Option<sandboxfuse::SlotGuard>> {
+) -> anyhow::Result<Option<SlotLayers>> {
     use rayon::prelude::*;
     type Built = (sandboxfuse::Layer, Option<(PathBuf, Vec<PathBuf>)>);
     let results: Vec<anyhow::Result<Option<Built>>> = group
@@ -242,20 +311,7 @@ fn try_register_slot(
         }
     }
 
-    let prefix = unpack_root.strip_prefix(fuse_lower).map_err(|_e| {
-        anyhow::anyhow!(
-            "unpack_root {:?} not under FUSE mount {:?}",
-            unpack_root,
-            fuse_lower
-        )
-    })?;
-    let guard = fs.register_slot(prefix.to_path_buf(), layers);
-
-    for (list_path, abs_paths) in list_writes {
-        write_list_file(&list_path, &abs_paths)
-            .with_context(|| format!("write list file {:?} for fuse-slot group", list_path))?;
-    }
-    Ok(Some(guard))
+    Ok(Some((layers, list_writes)))
 }
 
 fn write_list_file(list_path: &Path, paths: &[PathBuf]) -> std::io::Result<()> {
@@ -270,4 +326,102 @@ fn write_list_file(list_path: &Path, paths: &[PathBuf]) -> std::io::Result<()> {
         writeln!(f, "{}", p.display())?;
     }
     f.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hcore::hartifactcontent::tar::TarPacker;
+    use hcore::hartifactcontent::{Content, ReadSeek, WalkEntry};
+    use hplugin::driver::inputartifact::{InputArtifact, Type};
+    use std::collections::BTreeMap;
+
+    /// A tar-backed input whose `seekable_reader` records the thread it was
+    /// opened on. Both the reader open and the `TarIndex` build happen inside
+    /// `try_register_slot`'s `par_iter`, so this witnesses the whole fan-out.
+    struct ThreadRecordingTar {
+        bytes: Vec<u8>,
+        thread: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl Content for ThreadRecordingTar {
+        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
+                std::io::Cursor::new(self.bytes.clone()),
+            )?))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok("HO".to_string())
+        }
+        fn seekable_reader(&self) -> anyhow::Result<Option<Box<dyn ReadSeek + Send>>> {
+            // Not an `expect`: this returns a `Result`, and a poisoned slot would
+            // only hide the assertion rather than signal anything.
+            let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = std::thread::current()
+                .name()
+                .map(std::borrow::ToOwned::to_owned);
+            drop(slot);
+            Ok(Some(Box::new(std::io::Cursor::new(self.bytes.clone()))))
+        }
+    }
+
+    /// Registering a FUSE slot must not run on a tokio worker.
+    ///
+    /// It is the heaviest of the moved sites: a `par_iter` that opens a seekable
+    /// reader and builds a `TarIndex` per input. The rayon workers parking on
+    /// those cache reads is their contract — the tokio worker pinned on the join
+    /// for the whole group is not.
+    ///
+    /// Needs no FUSE mount: `LayeredFs::new_empty` + `register_slot` are a map
+    /// insert in both the real backend and the stub, so this runs on every
+    /// supported target and under either `fuse-sandbox` setting.
+    #[tokio::test]
+    async fn slot_registration_runs_off_the_runtime_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fuse_lower = dir.path().join("lower");
+        let unpack_root = fuse_lower.join("sandbox/ws");
+        let list_dir = dir.path().join("list");
+        fs::create_dir_all(&unpack_root).expect("mkdir unpack root");
+        fs::create_dir_all(&list_dir).expect("mkdir list dir");
+
+        let mut packer = TarPacker::new();
+        packer.create_raw(b"payload".to_vec(), "pkg/x.txt", false);
+        let mut bytes = Vec::new();
+        packer.pack(&mut bytes).expect("pack");
+        let thread = Arc::new(std::sync::Mutex::new(None));
+
+        let input = RunInput {
+            artifact: InputArtifact {
+                r#type: Type::Dep,
+                origin_id: "dep|a|0".to_string(),
+                content: Arc::new(ThreadRecordingTar {
+                    bytes,
+                    thread: Arc::clone(&thread),
+                }),
+            },
+            origin_id: "dep|a|0".to_string(),
+            source_addr: hmodel::htaddr::parse_addr("//pkg:_a").expect("addr"),
+            filters: vec![],
+            annotations: BTreeMap::new(),
+        };
+
+        let fs_handle = Arc::new(sandboxfuse::LayeredFs::new_empty(dir.path().join("upper")));
+        let (slot, group) =
+            try_register_slot_blocking(fs_handle, fuse_lower, unpack_root, list_dir, vec![input])
+                .await
+                .expect("register slot");
+
+        assert!(slot.is_some(), "a seekable input must register a slot");
+        assert_eq!(group.len(), 1, "the group must come back to the caller");
+        let ran_on = thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            ran_on
+                .as_deref()
+                .is_some_and(|n| n.starts_with("heph-blocking")),
+            "slot registration must run on the blocking pool, ran on {ran_on:?}"
+        );
+    }
 }

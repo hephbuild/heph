@@ -115,6 +115,17 @@ impl LocalCache for LocalCacheMem {
         self.inner.existence(addr, hashin, name)
     }
 
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+        let key = Self::key(addr, hashin, name);
+        // Mirrors `exists`/`existence`, peek included: a resident entry is
+        // served by `reader` from this tier alone, so it is committed as far as
+        // any caller is concerned, whatever the durable backend's queue says.
+        if self.cache.peek(&key).is_some() {
+            return Ok(true);
+        }
+        self.inner.exists_committed(addr, hashin, name)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let key = Self::key(addr, hashin, name);
         self.cache.remove(&key);
@@ -240,6 +251,12 @@ mod tests {
         // In-memory map, committed the instant the writer drops.
         fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
             Ok(Existence::Committed(self.exists(addr, hashin, name)?))
+        }
+
+        fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+            // Commits inline, so the committed answer is just `exists`. Counted
+            // the same way, so a probe through either name is visible.
+            self.exists(addr, hashin, name)
         }
 
         fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
@@ -406,6 +423,9 @@ mod tests {
         }
         fn existence(&self, _: &Addr, _: &str, _: &str) -> Result<Existence> {
             Ok(Existence::Committed(true))
+        }
+        fn exists_committed(&self, _: &Addr, _: &str, _: &str) -> Result<bool> {
+            Ok(true)
         }
         fn delete(&self, _: &Addr, _: &str, _: &str) -> Result<()> {
             Ok(())

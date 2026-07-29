@@ -832,6 +832,12 @@ impl LocalCache for LocalCacheSQLite {
         ))
     }
 
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+        // The inherent `exists_committed` is exactly this method's contract: one
+        // indexed point lookup, no `wait_if_pending`.
+        Self::exists_committed(self, &Self::key(addr), hashin, name)
+    }
+
     fn list_targets(&self) -> Result<TargetStream> {
         // Stream distinct addrs over a bounded channel: the producer holds one
         // pooled connection and a `SELECT DISTINCT addr` cursor on a dedicated
