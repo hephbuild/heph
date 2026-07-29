@@ -7,7 +7,7 @@
 //! registered — real users' most common path, and the one that never
 //! crosses the plugin ABI seam.
 
-use crate::timing::{RunResults, ScenarioResult};
+use crate::timing::{RunOptions, RunResults, ScenarioResult};
 use anyhow::{Context, Result};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
@@ -95,18 +95,17 @@ pub async fn run(
     corpus: &Path,
     manifest: &CorpusManifest,
     scenario: Scenario,
-    warmup: usize,
-    reps: usize,
+    opts: &RunOptions,
 ) -> Result<RunResults> {
-    let mut wall_ms = Vec::with_capacity(reps);
+    let mut wall_ms = Vec::with_capacity(opts.reps);
 
     match scenario {
         Scenario::Cold => {
-            for _ in 0..warmup {
+            for _ in 0..opts.warmup {
                 wipe_cache(corpus)?;
                 resolve_all(corpus).await?;
             }
-            for _ in 0..reps {
+            for _ in 0..opts.reps {
                 wipe_cache(corpus)?;
                 let start = Instant::now();
                 resolve_all(corpus).await?;
@@ -114,27 +113,36 @@ pub async fn run(
             }
         }
         Scenario::FullHit => {
-            wipe_cache(corpus)?;
-            for _ in 0..warmup {
-                resolve_all(corpus).await?;
+            if !opts.skip_prepare {
+                wipe_cache(corpus)?;
+                for _ in 0..opts.warmup {
+                    resolve_all(corpus).await?;
+                }
             }
-            for _ in 0..reps {
+            for _ in 0..opts.reps {
                 let start = Instant::now();
                 resolve_all(corpus).await?;
                 wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
             }
         }
         Scenario::Incremental => {
-            wipe_cache(corpus)?;
-            for _ in 0..warmup {
-                resolve_all(corpus).await?;
+            if !opts.skip_prepare {
+                wipe_cache(corpus)?;
+                for _ in 0..opts.warmup {
+                    resolve_all(corpus).await?;
+                }
             }
             // Fresh mutation before every measured rep — otherwise only the
             // first rep is a genuine incremental rebuild and the rest are
             // full-hit repeats wearing the wrong label.
-            for i in 0..reps {
-                bench_corpus::incrementalize(manifest, corpus, 0.01, 0xDEC1 ^ i as u64)
-                    .context("mutate corpus for incremental scenario")?;
+            for i in 0..opts.reps {
+                bench_corpus::incrementalize(
+                    manifest,
+                    corpus,
+                    0.01,
+                    0xDEC1 ^ (opts.rep_offset + i) as u64,
+                )
+                .context("mutate corpus for incremental scenario")?;
                 let start = Instant::now();
                 resolve_all(corpus).await?;
                 wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);

@@ -740,11 +740,17 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
 
-  # Perf-regression gate: generates one synthetic corpus, times a fixed
-  # scenario set against N (this PR's head, from the `build` job's own
-  # artifacts) and N-1 (a *published release* of the PR's merge-base), and
-  # reports a regression verdict. PR-only — there is nothing to compare a
-  # baseline against on a plain `push`.
+  # Perf-regression check: generates one synthetic corpus, times a fixed
+  # scenario set against N and N-1, and reports a regression verdict. Two
+  # triggers, two roles:
+  #   - `pull_request`: N is this PR's head, N-1 its merge-base with the
+  #     target branch. This is the GATE — a real regression fails the check
+  #     for real (see "Enforced for real" below).
+  #   - `push` to `master`: N is the commit that just landed, N-1 is the
+  #     commit immediately before it (`github.event.before`). Nothing is
+  #     blocked at this point (the merge already happened) — this is
+  #     continuous monitoring, so a regression instead files a GitHub issue
+  #     (see "File regression issue").
   #
   # Nothing in this job is built. `heph`, the go plugin cdylib, and
   # `heph-bench` itself are all release assets (the `build` job publishes
@@ -769,34 +775,40 @@ jobs:
   # prerelease to hephbuild/heph-artifacts-v1 (the `upload_artifacts` job).
   # The release tag isn't the commit SHA — it's `git describe` plus the CI
   # run_number that built it — so "resolve baseline release" re-derives that
-  # exact tag by finding the `master`-push CI run for the merge-base SHA via
+  # exact tag by finding the `master`-push CI run for the baseline SHA via
   # the GitHub API and feeding its run_number through the same `version.sh`
   # logic that originally produced it. If no such run is found (history
-  # pruned, merge-base predates this job, API hiccup), the job is skipped for
-  # that leg with a note — there is deliberately no "build it instead"
-  # fallback, since a slow silent fallback is exactly what turns into "why is
-  # this job suddenly slow" months from now.
+  # pruned, baseline predates this job, API hiccup, or — on `push` — this is
+  # the first commit on the ref), the job is skipped for that leg with a
+  # note — there is deliberately no "build it instead" fallback, since a slow
+  # silent fallback is exactly what turns into "why is this job suddenly
+  # slow" months from now.
   #
-  # Bootstrap note: this PR is what starts publishing `heph-bench`. Every
-  # merge-base predates that until this merges, so `baseline_fetch`'s
-  # `heph-bench` download will 404 on the very first runs — Tier A is skipped
-  # for those (Tier B still needs only `heph` + the go plugin, always
-  # present). Resolves itself permanently once this merges.
-  #
-  # Report-only for now: `continue-on-error` on the run/compare steps means a
-  # detected regression (or a harness bug) shows as a yellow warning, not a
-  # red required check. Once the thresholds in `.github/perfbench-thresholds.json`
-  # have been sanity-checked against a couple weeks of real PRs, drop
-  # `continue-on-error` and add "Perf" as a required status check in branch
-  # protection. That also gives the override this needs ("overridable by
-  # me"): a repo admin already bypasses required checks on merge — no extra
-  # plumbing to build.
+  # Enforced for real: the "Compare and report" step exits non-zero when any
+  # scenario regresses past its threshold, on both triggers. On a PR that
+  # fails the check; on `push` there is nothing left to block, but a red
+  # check on the commit is still useful signal, and it drives "File
+  # regression issue" below. The override this needs ("overridable by me")
+  # is a repo admin bypassing a required check on merge — no extra plumbing.
+  # Thresholds live in `.github/perfbench-thresholds.json`; they started
+  # deliberately loose (20%) and should tighten as real PR data comes in.
   perfbench:
     name: Perf ${{ matrix.os }}/${{ matrix.arch }}
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 20
     needs: [build]
+    # Specifying `permissions:` at all makes it exhaustive — everything not
+    # listed drops to `none`. `contents: read` for the checkout, `actions:
+    # read` for the "Resolve baseline release" run-lookup, `issues: write`
+    # for "File regression issue" (list/create/label, all against this
+    # repo). The cross-repo `gh release download` against
+    # hephbuild/heph-artifacts-v1 uses HEPH_ARTIFACTS_PAT, not this token, so
+    # it is unaffected either way.
+    permissions:
+      contents: read
+      actions: read
+      issues: write
     env:
       # Tunable without touching the steps below. Sized for a few minutes'
       # wall time per leg; raise toward the thousands-of-targets scale heph
@@ -807,7 +819,12 @@ jobs:
       PERFBENCH_LAYERS: "10"
       PERFBENCH_FAN_OUT: "4"
       PERFBENCH_GO_PACKAGES: "60"
-      PERFBENCH_REPS: "3"
+      # 3 was too few to tell signal from CI-runner noise (the first live
+      # runs showed exactly that). Interleaving (see the run steps below)
+      # fixes systematic drift between candidate/baseline; more reps is what
+      # narrows the noise floor itself. Bumped for now — a real number should
+      # come from watching `noise_band_pct` in actual runs, not a guess.
+      PERFBENCH_REPS: "7"
     strategy:
       fail-fast: false
       matrix:
@@ -841,18 +858,34 @@ jobs:
           go-version: "1.25"
           cache: false
 
-      - name: Resolve merge-base
+      # PR: the merge-base with the target branch. Push (to master): the
+      # commit immediately before this one — `github.event.before`, the
+      # correct source for "previous commit on this ref" (robust to force-
+      # pushes in a way `HEAD~1` is not). `before` is all-zeros on the very
+      # first push to a ref; treated the same as "no baseline found" below.
+      - name: Resolve baseline SHA
         id: base
         run: |
-          git fetch origin "${{ github.base_ref }}"
-          echo "sha=$(git merge-base "origin/${{ github.base_ref }}" HEAD)" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}"
+            echo "sha=$(git merge-base "origin/${{ github.base_ref }}" HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            sha="${{ github.event.before }}"
+            if [ -z "$sha" ] || [ "$sha" = "0000000000000000000000000000000000000000" ]; then
+              echo "no previous commit on this ref (first push) — nothing to compare against"
+              echo "sha=" >> "$GITHUB_OUTPUT"
+            else
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       # Re-derives the exact version tag `master`'s own CI run published the
-      # merge-base commit's release under — see the job comment. Only needs
+      # baseline commit's release under — see the job comment. Only needs
       # `gh api` (against this repo, default token) and `git describe`
       # against a commit already present from the full-history checkout
       # above; no build, no checkout of that commit.
       - name: Resolve baseline release
+        if: steps.base.outputs.sha != ''
         id: baseline_release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -860,7 +893,7 @@ jobs:
           RUN_NUMBER=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ steps.base.outputs.sha }}&status=success" \
             --jq '[.workflow_runs[] | select(.name=="CI" and .event=="push")] | first | .run_number // empty')
           if [ -z "$RUN_NUMBER" ]; then
-            echo "no successful master push run found for merge-base ${{ steps.base.outputs.sha }}"
+            echo "no successful master push run found for baseline ${{ steps.base.outputs.sha }}"
             echo "found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -930,36 +963,84 @@ jobs:
             --go-packages "$PERFBENCH_GO_PACKAGES" \
             --out bench-corpus
 
+      # Candidate and baseline are interleaved rep-by-rep, not run to
+      # completion one side at a time: `run ... --reps N` in one shot would
+      # let a systematic drift on the runner (thermal state ramping up, a
+      # noisy neighbor arriving mid-job) land entirely on whichever side
+      # happened to run second, biasing the comparison rather than adding
+      # symmetric noise to both. `--warmup 1 --reps 0` primes the shared
+      # cache state once per side (a no-op for `cold`, which has none); each
+      # `--reps 1 --skip-prepare --append` round after that measures one more
+      # rep per side and merges it into the same output file, alternating.
       - name: Time Tier A (inprocess) scenarios
         if: steps.baseline_fetch.outputs.bench_ok == 'true'
         continue-on-error: true
         run: |
           for scenario in cold full-hit incremental; do
+            cand_out="candidate_inproc_${scenario}.json"
+            base_out="baseline_inproc_${scenario}.json"
             ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "candidate_inproc_${scenario}.json"
+              --warmup 1 --reps 0 --out /dev/null
             ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "baseline_inproc_${scenario}.json"
+              --warmup 1 --reps 0 --out /dev/null
+            rm -f "$cand_out" "$base_out"
+            for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
+              ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
+              ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
+            done
           done
 
       - name: Time Tier B (dist) scenarios
         if: steps.baseline_fetch.outputs.ok == 'true'
         continue-on-error: true
         run: |
+          BENCH=./candidate-dist/heph-bench
           for scenario in cold full-hit incremental; do
-            ./candidate-dist/heph-bench run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "candidate_dist_${scenario}.json"
-            ./candidate-dist/heph-bench run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps "$PERFBENCH_REPS" --out "baseline_dist_${scenario}.json"
+            cand_out="candidate_dist_${scenario}.json"
+            base_out="baseline_dist_${scenario}.json"
+            "$BENCH" run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
+              --warmup 1 --reps 0 --out /dev/null
+            "$BENCH" run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
+              --warmup 1 --reps 0 --out /dev/null
+            rm -f "$cand_out" "$base_out"
+            for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
+              "$BENCH" run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
+              "$BENCH" run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
+                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
+            done
           done
 
+      # Every scenario/tier combination is always attempted and reported —
+      # `--allow-regression` keeps an individual `compare` call from ever
+      # exiting non-zero, so one regression doesn't cut the table short. The
+      # step's OWN exit code is what actually enforces: it greps the
+      # rendered table for "REGRESSION" (the verdict `compare --allow-
+      # regression` still prints even though it won't fail on it) and fails
+      # for real if anything regressed, on both `pull_request` and `push`.
+      #
+      # One `compare` call per TIER, not per scenario: each `run` invocation
+      # writes a single-scenario RunResults, so the 3 scenario files per side
+      # are merged into one multi-scenario RunResults first (`jq -s`) — a
+      # `compare` call per scenario would render its own header each time,
+      # repeating the table 3x instead of one table with 3 rows.
+      #
+      # The assembled report is captured to `perf-report.md` as well as the
+      # step summary — "File regression issue" reads that file back so the
+      # issue carries the actual numbers, not just links to go find them.
       - name: Compare and report
-        continue-on-error: true
+        id: compare
         run: |
-          {
+          BENCH=./candidate-dist/heph-bench
+          any_regression=false
+          mkdir -p verdicts
+          report=$(
             echo "# Perf: ${{ matrix.os }}/${{ matrix.arch }}"
             if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
               echo ""
-              echo "_skipped: no published release found for merge-base \`${{ steps.base.outputs.sha }}\`_"
+              echo "_skipped: no published release found for baseline \`${{ steps.base.outputs.sha }}\`_"
             else
               for tier in inproc dist; do
                 echo ""
@@ -968,20 +1049,117 @@ jobs:
                   echo "_skipped: baseline release predates publishing \`heph-bench\`_"
                   continue
                 fi
+                base_files=()
+                cand_files=()
                 for scenario in cold full-hit incremental; do
-                  base="baseline_${tier}_${scenario}.json"
-                  cand="candidate_${tier}_${scenario}.json"
-                  if [ -f "$base" ] && [ -f "$cand" ]; then
-                    ./candidate-dist/heph-bench compare --baseline "$base" --candidate "$cand" \
-                      --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
-                      --allow-regression || true
-                  else
-                    echo "_${scenario}: no results (run step failed — see logs)_"
+                  b="baseline_${tier}_${scenario}.json"
+                  c="candidate_${tier}_${scenario}.json"
+                  if [ -f "$b" ] && [ -f "$c" ]; then
+                    base_files+=("$b")
+                    cand_files+=("$c")
                   fi
                 done
+                if [ ${#base_files[@]} -eq 0 ]; then
+                  echo "_no results (run step failed — see logs)_"
+                  continue
+                fi
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${base_files[@]}" > "merged_baseline_${tier}.json"
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${cand_files[@]}" > "merged_candidate_${tier}.json"
+                "$BENCH" compare --baseline "merged_baseline_${tier}.json" --candidate "merged_candidate_${tier}.json" \
+                  --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
+                  --json "verdicts/${tier}.json" \
+                  --allow-regression
               done
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          )
+          printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$report" > perf-report.md
+          if printf '%s' "$report" | grep -q 'REGRESSION'; then
+            any_regression=true
+          fi
+          echo "regressed=$any_regression" >> "$GITHUB_OUTPUT"
+          if [ "$any_regression" = "true" ]; then
+            echo "regression detected — see the job summary for the table" >&2
+            exit 1
+          fi
+
+      # `always()`: the step above now genuinely exits non-zero on a real
+      # regression, and the numbers are worth having in PostHog regardless of
+      # whether this run passed or failed the gate. `event_type` (pull_request
+      # vs push) rides along as a property rather than gating which runs get
+      # sent — a trend chart can filter to `push` for the "master over time"
+      # view; nothing here decides that policy for it. Best-effort: PostHog
+      # being briefly unreachable must never fail this job over telemetry.
+      - name: Push metrics to PostHog
+        if: always() && steps.baseline_fetch.outputs.ok == 'true'
+        env:
+          POSTHOG_CI_KEY: ${{ secrets.POSTHOG_CI_KEY }}
+        run: |
+          events="[]"
+          for f in verdicts/*.json; do
+            [ -f "$f" ] || continue
+            # One file per tier (inproc/dist), each an array of per-scenario
+            # verdicts — `scenario` already lives inside each entry.
+            tier=$(basename "$f" .json)
+            batch=$(jq --arg tier "$tier" \
+              --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" \
+              --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.base.outputs.sha }}" \
+              --arg event_type "${{ github.event_name }}" \
+              --arg run_id "${{ github.run_id }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '[.[] | {
+                event: "perf_benchmark",
+                distinct_id: "perfbench",
+                properties: (. + {
+                  tier: $tier, os: $os, arch: $arch,
+                  sha: $sha, base_sha: $base_sha, event_type: $event_type,
+                  run_id: $run_id, run_url: $run_url
+                })
+              }]' "$f")
+            events=$(printf '%s' "$events" | jq --argjson add "$batch" '. + $add')
+          done
+          count=$(printf '%s' "$events" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "no verdicts to push"
+            exit 0
+          fi
+          echo "pushing $count perf_benchmark event(s) to PostHog"
+          payload=$(jq -n --arg key "$POSTHOG_CI_KEY" --argjson batch "$events" '{api_key: $key, batch: $batch}')
+          curl -sS --max-time 15 -X POST "https://eu.i.posthog.com/batch/" \
+            -H "Content-Type: application/json" \
+            -d "$payload" || echo "PostHog push failed — not failing the job over telemetry"
+
+      # Push-only: a PR failing this check already blocks the merge, so
+      # there's nothing further to escalate there. On `master` the merge
+      # already happened — a red check on the commit is easy to miss, so a
+      # regression instead becomes a durable, visible artifact. `always()`
+      # because the step above now genuinely exits non-zero on a real
+      # regression (outputs set before `exit 1` are still recorded); a dedup
+      # check against open issues keeps a re-run (or retry) from spamming.
+      - name: File regression issue
+        if: always() && steps.compare.outputs.regressed == 'true' && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Perf regression: ${{ matrix.os }}/${{ matrix.arch }} at ${{ github.sha }}"
+          existing=$(gh issue list --repo "${{ github.repository }}" --state open \
+            --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "issue #$existing already covers this — not filing a duplicate"
+            exit 0
+          fi
+          gh label create perf-regression --repo "${{ github.repository }}" \
+            --color d73a4a --description "Automated performance regression report" --force
+          LINKS=$(printf 'Job summary: %s/%s/actions/runs/%s\nCommit: %s/%s/commit/%s\n' \
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.sha }}")
+          BODY=$(printf 'Perf regression on `master` for **%s/%s**, vs the previous commit `%s`:\n\n%s\n%s' \
+            "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.base.outputs.sha }}" \
+            "$(cat perf-report.md)" "$LINKS")
+          gh issue create --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --label perf-regression \
+            --body "$BODY"
 
   release:
     name: Release

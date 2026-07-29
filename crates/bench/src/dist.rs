@@ -6,7 +6,7 @@
 //! `crates/bin-e2e/tests/common/mod.rs`'s `Dist` does: a normalized
 //! directory (`heph`, `heph-<name>-plugin.<ext>`), never rebuilt here.
 
-use crate::timing::{RunResults, ScenarioResult};
+use crate::timing::{RunOptions, RunResults, ScenarioResult};
 use anyhow::{Context, Result, bail};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
@@ -26,11 +26,17 @@ pub struct Dist {
 
 impl Dist {
     pub fn locate(dir: &Path) -> Result<Self> {
-        let root = dir.to_path_buf();
-        let heph = root.join("heph");
+        let heph = dir.join("heph");
         if !heph.is_file() {
-            bail!("{} does not contain a `heph` binary", root.display());
+            bail!("{} does not contain a `heph` binary", dir.display());
         }
+        // Absolute: `build_go_tree` spawns `heph` with `current_dir(corpus)`,
+        // so a relative `--dist` path (the common case — CI passes plain
+        // `candidate-dist`) would silently resolve against the corpus dir
+        // instead of the caller's cwd once that happens.
+        let root = dir
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", dir.display()))?;
         Ok(Self { root })
     }
 
@@ -159,8 +165,7 @@ pub fn run(
     corpus: &Path,
     manifest: &CorpusManifest,
     scenario: Scenario,
-    warmup: usize,
-    reps: usize,
+    opts: &RunOptions,
 ) -> Result<RunResults> {
     if manifest.go_package_count == 0 {
         bail!(
@@ -171,7 +176,7 @@ pub fn run(
     write_go_config(corpus, &dist)?;
     let home = tempfile::tempdir().context("create HOME tempdir")?;
 
-    let mut wall_ms = Vec::with_capacity(reps);
+    let mut wall_ms = Vec::with_capacity(opts.reps);
     let timed_build = |home: &Path| -> Result<f64> {
         let start = Instant::now();
         build_go_tree(&dist, corpus, home)?;
@@ -180,35 +185,43 @@ pub fn run(
 
     match scenario {
         Scenario::Cold => {
-            for _ in 0..warmup {
+            for _ in 0..opts.warmup {
                 wipe_cache(corpus)?;
                 timed_build(home.path())?;
             }
-            for _ in 0..reps {
+            for _ in 0..opts.reps {
                 wipe_cache(corpus)?;
                 wall_ms.push(timed_build(home.path())?);
             }
         }
         Scenario::FullHit => {
-            wipe_cache(corpus)?;
-            for _ in 0..warmup {
-                timed_build(home.path())?;
+            if !opts.skip_prepare {
+                wipe_cache(corpus)?;
+                for _ in 0..opts.warmup {
+                    timed_build(home.path())?;
+                }
             }
-            for _ in 0..reps {
+            for _ in 0..opts.reps {
                 wall_ms.push(timed_build(home.path())?);
             }
         }
         Scenario::Incremental => {
-            wipe_cache(corpus)?;
-            for _ in 0..warmup {
-                timed_build(home.path())?;
+            if !opts.skip_prepare {
+                wipe_cache(corpus)?;
+                for _ in 0..opts.warmup {
+                    timed_build(home.path())?;
+                }
             }
-            for i in 0..reps {
+            for i in 0..opts.reps {
                 // Mutates the go/ subtree being built here, not the bash
                 // pkgN packages `bench_corpus::incrementalize` touches — Tier
                 // B only builds `//go/...`.
-                bench_corpus::incrementalize_go(&corpus.join("go"), 0.01, 0xDEC1 ^ i as u64)
-                    .context("mutate go corpus for incremental scenario")?;
+                bench_corpus::incrementalize_go(
+                    &corpus.join("go"),
+                    0.01,
+                    0xDEC1 ^ (opts.rep_offset + i) as u64,
+                )
+                .context("mutate go corpus for incremental scenario")?;
                 wall_ms.push(timed_build(home.path())?);
             }
         }
