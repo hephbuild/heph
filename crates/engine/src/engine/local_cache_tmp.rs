@@ -187,10 +187,25 @@ impl LocalCache for LocalCacheTmp {
     }
 
     /// An admitted entry lives only in `map` — there is no file anywhere, so
-    /// `None` is the answer, not a gap. Anything else spilled, and the durable
-    /// cache decides. Unlike the other read paths this checks residency to
-    /// *avoid* delegating: the durable answer for a resident key would be a
-    /// wasted `stat` on a path that by construction does not exist.
+    /// `None` is the answer, not a gap to fill with an invented temp file.
+    /// Anything else spilled, and the durable cache decides. Residency is checked
+    /// for the same reason every read path here checks it, but to a different
+    /// end: the tier-local answer is negative, so a hit means "no file, and don't
+    /// ask" rather than "here it is" — saving a `stat` on a path that by
+    /// construction does not exist.
+    ///
+    /// **Lifetime exemption.** [`Content::file_path`]'s contract says the path
+    /// stays valid while the artifact is alive because a cache read guard rides
+    /// on it. That does not hold here: `build_eresult` attaches no
+    /// `GuardedArtifact` on the uncacheable path (`guard: None`), so a spilled
+    /// tmp entry hands out a durable path with *no lock held on its addr*. Its
+    /// revision is enumerable, so a concurrent `heph gc` can reclaim the blob
+    /// while the path is in flight. The consumer then gets `ENOENT` — a hard
+    /// error, not wrong bytes, and the same exposure `reader` already had. Do not
+    /// build a consumer that holds a tmp path across an await on the assumption
+    /// the guarded contract covers it.
+    ///
+    /// [`Content::file_path`]: hcore::hartifactcontent::Content::file_path
     fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
         let key = Self::key(addr, hashin, name);
         if self.store.map.read().contains_key(&key) {
@@ -281,6 +296,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingCache {
         store: Arc<RwLock<FxHashMap<Key, Arc<[u8]>>>>,
+        /// Counts `file_path` delegations, so a test can assert the tmp tier
+        /// answered from its own map instead of asking.
+        file_path_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     struct RecordingWriter {
@@ -341,6 +359,15 @@ mod tests {
             self.store.write().remove(&key);
             Ok(())
         }
+        /// Answers a path for *any* key, whether or not it holds it. Deliberately
+        /// unlike a real backend: it makes the tmp tier's residency
+        /// short-circuit observable, since delegating would visibly return
+        /// `Some` for a mem-resident entry.
+        fn file_path(&self, _a: &Addr, _h: &str, name: &str) -> Option<std::path::PathBuf> {
+            self.file_path_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(std::path::PathBuf::from("/durable").join(name))
+        }
     }
 
     fn addr() -> Addr {
@@ -390,12 +417,15 @@ mod tests {
     /// file. A spilled one is an ordinary durable blob and must expose the
     /// durable backend's path, or an uncacheable target's artifacts never take
     /// the direct-open path however large they are.
+    ///
+    /// The durable double answers `Some` for *every* key, including ones it does
+    /// not hold. That is what makes the mem-resident half discriminating: against
+    /// a real backend (which has no file for a mem-resident key either) the
+    /// assertion would hold whether or not the residency short-circuit existed.
     #[test]
     fn file_path_answers_only_for_spilled_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let durable = Arc::new(
-            crate::engine::local_cache_fs::LocalCacheFS::new(dir.path().join("blobs")).expect("fs"),
-        );
+        let durable = Arc::new(RecordingCache::default());
+        let calls = Arc::clone(&durable.file_path_calls);
         // per-entry cap of 8 bytes: the short entry stays in mem, the 64-byte
         // one spills.
         let tmp = LocalCacheTmp::new(durable, 8, 1024 * 1024);
@@ -404,15 +434,22 @@ mod tests {
         write_all(&tmp, &a, "h_m", "out", b"hi");
         assert!(
             tmp.file_path(&a, "h_m", "out").is_none(),
-            "mem-resident tmp entry has no file on disk"
+            "mem-resident tmp entry has no file on disk, whatever durable would say"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a resident entry must be answered locally, not delegated"
         );
 
         let big = vec![7u8; 64];
         write_all(&tmp, &a, "h_s", "out", &big);
-        let path = tmp
-            .file_path(&a, "h_s", "out")
-            .expect("spilled tmp entry is a durable file");
-        assert_eq!(std::fs::read(&path).expect("read"), big);
+        assert_eq!(
+            tmp.file_path(&a, "h_s", "out"),
+            Some(std::path::PathBuf::from("/durable/out")),
+            "a spilled entry must expose the durable backend's path"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

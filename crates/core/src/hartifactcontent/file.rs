@@ -57,8 +57,13 @@ impl Content for FileContent {
         Ok(Some(Box::new(self.open()?)))
     }
 
+    /// Gated on the file being there, per [`Content::file_path`]'s contract: a
+    /// caller opens what it is handed with no fallback to the stream, and this
+    /// content's file is a sandbox process log, which the sandbox cleaner deletes
+    /// on the target's next run — so `Some` to a vanished path is constructible,
+    /// not hypothetical.
     fn file_path(&self) -> Option<PathBuf> {
-        Some(self.path.clone())
+        self.path.is_file().then(|| self.path.clone())
     }
 }
 

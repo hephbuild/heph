@@ -321,6 +321,9 @@ pub use hplugin::eresult::{ArtifactMeta, EResult};
 /// silently answered `None` for on-disk cache blobs (the stable-ABI seam then
 /// streamed them chunk-by-chunk instead of opening the file) and `entry_paths`
 /// silently fell back to a byte-reading `walk` instead of the tar header scan.
+/// `missing_trait_methods` on the impl below makes that a compile error rather
+/// than a comment nobody reads — a doc cannot fail a build, and this exact
+/// omission survived two `Content` methods being added.
 ///
 /// [`file_path`](Content::file_path) is safe to forward for the same reason it
 /// needs the guard: cache GC deletes a revision only under the per-addr *write*
@@ -335,6 +338,11 @@ struct GuardedArtifact {
     _lock: Arc<ResultReadGuard>,
 }
 
+#[deny(
+    clippy::missing_trait_methods,
+    reason = "this wrapper must forward every Content method; a default here \
+              silently disables that method's fast path for every cached artifact"
+)]
 impl Content for GuardedArtifact {
     fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
         self.inner.reader()
@@ -7043,26 +7051,19 @@ mod tests {
         Ok((Arc::new(engine), dir, addr))
     }
 
-    /// The direct-open fast path, end to end through the real cache stack.
-    ///
-    /// Every tier has to answer for a consumer to get anything: the artifact is
-    /// a `GuardedArtifact` over a `CacheArtifact` over `Mem(Spill(SQLite, FS))`,
-    /// and a single tier defaulting to `None` — as all of them did — turns the
-    /// whole path off with nothing failing. The unit tests pin the tiers; this
-    /// pins that they compose, which is the property that was actually broken.
-    ///
-    /// The spill threshold is lowered to 64 bytes so the packed tar lands in the
-    /// FS blob store without the test writing megabytes. The mem tier is left at
-    /// its default — it is what production runs, and it is the tier sitting on
-    /// top of the answer.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cached_artifact_exposes_its_blob_file_for_direct_open() {
+    /// Resolve one cacheable target through the **real** production cache stack
+    /// (`Mem(Spill(SQLite, FS))`, mem tier at its default) at the given spill
+    /// threshold, and hand back its single result artifact. Held `TempDir` is
+    /// returned because the cache lives under it.
+    async fn resolve_one_artifact_at_spill(
+        spill_threshold_bytes: u64,
+    ) -> (Arc<dyn Content>, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
         let mut engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
-            spill_threshold_bytes: 64,
+            spill_threshold_bytes,
             ..Default::default()
         })
         .expect("engine");
@@ -7097,8 +7098,26 @@ mod tests {
             .await
             .expect("resolves");
         assert_eq!(r.artifacts.len(), 1, "the single output is surfaced");
+        (Arc::clone(&r.artifacts[0]), dir)
+    }
 
-        let path = r.artifacts[0]
+    /// The direct-open fast path, end to end through the real cache stack.
+    ///
+    /// Every tier has to answer for a consumer to get anything: the artifact is
+    /// a `GuardedArtifact` over a `CacheArtifact` over `Mem(Spill(SQLite, FS))`,
+    /// and a single tier defaulting to `None` — as all of them did — turns the
+    /// whole path off with nothing failing. The unit tests pin the tiers; this
+    /// pins that they compose, which is the property that was actually broken.
+    ///
+    /// The spill threshold is lowered to 64 bytes so the packed tar lands in the
+    /// FS blob store without the test writing megabytes. The mem tier is left at
+    /// its default — it is what production runs, and it is the tier sitting on
+    /// top of the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_artifact_exposes_its_blob_file_for_direct_open() {
+        let (artifact, _dir) = resolve_one_artifact_at_spill(64).await;
+
+        let path = artifact
             .file_path()
             .expect("a spilled cache blob must reach the consumer as a path");
         let via_path = std::fs::read(&path).expect("open the cache blob directly");
@@ -7107,14 +7126,78 @@ mod tests {
         // Same bytes either way — the fast path is a different route to the
         // artifact, not a different artifact.
         let mut via_stream = Vec::new();
-        std::io::Read::read_to_end(
-            &mut r.artifacts[0].reader().expect("reader"),
-            &mut via_stream,
-        )
-        .expect("stream the artifact");
+        std::io::Read::read_to_end(&mut artifact.reader().expect("reader"), &mut via_stream)
+            .expect("stream the artifact");
         assert_eq!(
             via_path, via_stream,
             "direct open and the byte stream must serve the same artifact"
+        );
+    }
+
+    /// The property that makes handing out a bare `PathBuf` safe at all: an fd
+    /// opened from it keeps serving the bytes it was opened on, even after the
+    /// same cache key is rewritten underneath it.
+    ///
+    /// This is the half of the safety argument that is not about locking.
+    /// `AtomicFileWriter` finishes by `rename`ing over the destination, so a
+    /// rewrite (a lazy remote-cache pull, a rebuild) swaps the *inode* the path
+    /// names while an already-open fd keeps the old one alive — POSIX unlink
+    /// semantics, identical on all three supported targets. Without that, a
+    /// consumer that opened the file could observe a torn mix of two revisions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_fd_opened_from_the_path_survives_the_blob_being_rewritten() {
+        let (artifact, _dir) = resolve_one_artifact_at_spill(64).await;
+        let path = artifact.file_path().expect("spilled blob has a path");
+
+        let mut fd = std::fs::File::open(&path).expect("open before the rewrite");
+        let original = std::fs::read(&path).expect("read blob");
+
+        // Replace the blob the way the cache does — write a sibling, rename over.
+        let tmp = path.with_extension("rewrite");
+        std::fs::write(&tmp, b"a completely different revision").expect("write");
+        std::fs::rename(&tmp, &path).expect("rename over the live blob");
+
+        let mut held = Vec::new();
+        std::io::Read::read_to_end(&mut fd, &mut held).expect("read through the held fd");
+        assert_eq!(
+            held, original,
+            "the open fd must still serve the revision it was opened on"
+        );
+        assert_ne!(
+            std::fs::read(&path).expect("read"),
+            original,
+            "precondition: the path itself now names different bytes"
+        );
+    }
+
+    /// The shape ~every production artifact actually has, which the test above
+    /// does not cover: at the **default** spill threshold a small artifact is a
+    /// sqlite row with no file anywhere, so the honest answer is `None` and the
+    /// consumer must fall back to the byte stream.
+    ///
+    /// This is the direction that turns a working read into a hard error if it
+    /// regresses — a consumer opens what it is handed and never falls back — and
+    /// it is exactly what a well-meaning "optimization" in the mem tier (answer
+    /// from residency!) would break, with every other test in this area still
+    /// green. `_golist`, the only artifact plugin-go reads across the seam, takes
+    /// this branch and never the one above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_small_cached_artifact_reports_no_file_and_still_streams() {
+        let (artifact, _dir) =
+            resolve_one_artifact_at_spill(crate::engine::config::DEFAULT_SPILL_THRESHOLD_BYTES)
+                .await;
+
+        assert!(
+            artifact.file_path().is_none(),
+            "a sub-threshold blob lives in sqlite; naming a path would be naming nothing"
+        );
+
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut artifact.reader().expect("reader"), &mut bytes)
+            .expect("stream the artifact");
+        assert!(
+            !bytes.is_empty(),
+            "the stream must still serve the artifact when there is no file"
         );
     }
 
@@ -7202,6 +7285,17 @@ mod tests {
             ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
             {
                 self.inner.seekable_reader(addr, hashin, name)
+            }
+            // Forwarded, not defaulted: a decorator that swallows this turns the
+            // direct-open path off for every artifact in the test that wraps the
+            // cache — the exact defect this file's `GuardedArtifact` doc warns of.
+            fn file_path(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> Option<std::path::PathBuf> {
+                self.inner.file_path(addr, hashin, name)
             }
         }
 
@@ -7534,6 +7628,16 @@ mod tests {
             ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
             {
                 self.inner.seekable_reader(addr, hashin, name)
+            }
+            // See the note on the other cache decorator in this file: defaulting
+            // this silently disables the direct-open path under the test.
+            fn file_path(
+                &self,
+                addr: &Addr,
+                hashin: &str,
+                name: &str,
+            ) -> Option<std::path::PathBuf> {
+                self.inner.file_path(addr, hashin, name)
             }
         }
 

@@ -94,6 +94,20 @@ impl LocalCache for LocalCacheSpill {
         if Self::is_manifest(name) {
             return self.primary.writer(addr, hashin, name);
         }
+        // Drop any stale FS copy before writing, so this key ends up in exactly
+        // one backend — the invariant the module doc asserts and every read path
+        // relies on. It is not self-maintaining: `spill` deletes the primary's
+        // staged prefix when a blob is promoted, but nothing deleted the FS copy
+        // when a rewrite of the same key stays *under* the threshold, which
+        // `cache.spillThresholdBytes` being user-tunable makes reachable. Dual
+        // residency would make `reader` (primary first) and `file_path` (FS only)
+        // resolve to different bytes for one key. Cheap and on the cold path: one
+        // `stat` per blob write, and an unlink only in the rare stale case.
+        if self.blobs.file_path(addr, hashin, name).is_some() {
+            self.blobs
+                .delete(addr, hashin, name)
+                .with_context(|| format!("drop stale spilled blob for {addr} {name}"))?;
+        }
         // Stream to the primary by default; promote to FS on the first byte past
         // the threshold. Opening the primary writer up front means small blobs
         // (the common case) hit their final home with no buffering and no copy.
@@ -168,10 +182,16 @@ impl LocalCache for LocalCacheSpill {
     }
 
     /// Only spilled blobs have a file. The primary is sqlite — its blobs live in
-    /// rows, so it answers `None` — and asking it first would cost a query to
-    /// learn that; go straight to the FS store, which answers `Some` only for a
-    /// path that exists. A `(addr, hashin, name)` lives in exactly one backend,
-    /// so a hit here is unambiguous.
+    /// rows, so it answers `None` — and asking it first would cost a query per
+    /// call to learn that; go straight to the FS store, which answers `Some` only
+    /// for a path that exists.
+    ///
+    /// Note this resolves against one backend where [`reader`](Self::reader)
+    /// tries the primary first. The two agree only because a key lives in exactly
+    /// one backend, so this rests on that invariant rather than re-deriving it —
+    /// which is why [`writer`](Self::writer) now enforces it instead of assuming
+    /// it. If the invariant ever breaks again, this method is where it shows up
+    /// as two answers for one key.
     fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
         self.blobs.file_path(addr, hashin, name)
     }
@@ -374,7 +394,7 @@ mod tests {
         let a = addr();
 
         let large = vec![2u8; 256];
-        write(&cache, &a, "small", &vec![1u8; 32]);
+        write(&cache, &a, "small", &[1u8; 32]);
         write(&cache, &a, "large", &large);
 
         assert!(
@@ -387,10 +407,51 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read"), large);
 
         // The manifest always stays in the primary, however big.
-        write(&cache, &a, MANIFEST_V1, &vec![9u8; 256]);
+        write(&cache, &a, MANIFEST_V1, &[9u8; 256]);
         assert!(
             cache.file_path(&a, "h", MANIFEST_V1).is_none(),
             "manifest never spills, so it never has a path"
+        );
+    }
+
+    /// A rewrite that lands under the threshold must not leave the previous
+    /// spilled copy behind. `spill` deletes the primary's staged prefix when a
+    /// blob is promoted, but the reverse — a key that used to spill and no longer
+    /// does — had no cleanup, and `cache.spillThresholdBytes` is user-tunable, so
+    /// lowering it and raising it back is enough to create it. Dual residency
+    /// makes `reader` (primary first) and `file_path` (FS only) resolve to
+    /// *different bytes for one key*: the read path would serve the new blob
+    /// while a plugin opening the path got the old one.
+    #[test]
+    fn a_rewrite_below_the_threshold_drops_the_stale_spilled_copy() {
+        let dir = tempdir().expect("tempdir");
+        let a = addr();
+
+        // Threshold 64: the 256-byte blob spills to the FS store.
+        let (low, _sqlite, fs) = spill(dir.path(), 64);
+        write(&low, &a, "out", &[1u8; 256]);
+        assert!(
+            fs.exists(&a, "h", "out").expect("ex"),
+            "precondition: spilled"
+        );
+
+        // Threshold raised; the same key is rewritten and now stays in sqlite.
+        let (high, sqlite2, fs2) = spill(dir.path(), 4096);
+        write(&high, &a, "out", &[2u8; 256]);
+
+        assert!(
+            sqlite2.exists(&a, "h", "out").expect("ex"),
+            "the rewrite belongs in the primary now"
+        );
+        assert!(
+            !fs2.exists(&a, "h", "out").expect("ex"),
+            "the stale spilled copy must be gone, not shadowed"
+        );
+        // The two read routes must not disagree.
+        assert_eq!(read(&high, &a, "out"), vec![2u8; 256]);
+        assert!(
+            high.file_path(&a, "h", "out").is_none(),
+            "file_path must not hand out the superseded blob"
         );
     }
 

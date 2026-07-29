@@ -175,6 +175,86 @@ mod tests {
         );
     }
 
+    /// The header scan and the walk must enumerate the same set.
+    ///
+    /// `Content::entry_paths` has two implementations — the trait default, which
+    /// drives [`TarWalker`](crate::hartifactcontent::tar::TarWalker) and reads
+    /// every byte to advance, and the tar-backed override, which seeks past file
+    /// data. Cache artifacts use the override; anything reaching the default gets
+    /// the walk. They are only interchangeable if they agree, and nothing checked
+    /// that — which is how the engine's `GuardedArtifact` silently served the
+    /// walk for every cached artifact while its callers documented a header scan.
+    ///
+    /// They agree as *sets*, not as sequences: the index is a `BTreeMap`, so it
+    /// is sorted and collapses a repeated path, where the walk preserves tar
+    /// order and repeats. Both consumers key by path (`detect_output_collisions`
+    /// compares producers, `build_source_map` builds a map), so set equality is
+    /// the property that matters — asserted here rather than assumed.
+    #[cfg(unix)]
+    #[test]
+    fn header_scan_and_walk_enumerate_the_same_paths() {
+        use crate::hartifactcontent::WalkEntryKind;
+        use crate::hartifactcontent::tar::TarWalker;
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"data").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink("target.txt", &link).unwrap();
+
+        // A nested file, an explicit dir entry, a symlink, and a duplicate path.
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut dh = tar::Header::new_gnu();
+            dh.set_entry_type(tar::EntryType::Directory);
+            dh.set_size(0);
+            dh.set_mode(0o755);
+            b.append_data(&mut dh, "d/", std::io::empty()).expect("dir");
+            for (path, data) in [
+                ("d/f.txt", &b"abc"[..]),
+                ("g.txt", b"z"),
+                ("d/f.txt", b"abc"),
+            ] {
+                let mut fh = tar::Header::new_gnu();
+                fh.set_entry_type(tar::EntryType::Regular);
+                fh.set_size(data.len() as u64);
+                fh.set_mode(0o644);
+                b.append_data(&mut fh, path, data).expect("file");
+            }
+            let mut lh = tar::Header::new_gnu();
+            lh.set_entry_type(tar::EntryType::Symlink);
+            lh.set_size(0);
+            lh.set_mode(0o777);
+            b.append_link(&mut lh, "link.txt", "target.txt")
+                .expect("symlink");
+            b.finish().expect("finish");
+        }
+
+        let from_index: BTreeSet<PathBuf> = TarIndex::build(Cursor::new(buf.clone()))
+            .expect("build")
+            .entry_paths()
+            .into_iter()
+            .collect();
+        let from_walk: BTreeSet<PathBuf> = TarWalker::new(Box::new(Cursor::new(buf)))
+            .expect("walker")
+            .map(|e| e.expect("entry").path)
+            .collect();
+
+        assert_eq!(
+            from_index, from_walk,
+            "the header scan and the walk must enumerate the same paths"
+        );
+        assert!(from_index.contains(std::path::Path::new("d/f.txt")));
+        assert!(from_index.contains(std::path::Path::new("link.txt")));
+        assert!(
+            !from_index.contains(std::path::Path::new("d/")),
+            "neither enumeration includes directory entries"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn build_indexes_symlinks() {

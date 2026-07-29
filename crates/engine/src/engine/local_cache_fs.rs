@@ -231,7 +231,20 @@ impl LocalCache for LocalCacheFS {
     /// [`LocalCacheSpill`]: crate::engine::local_cache_spill::LocalCacheSpill
     fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<PathBuf> {
         let path = self.get_path(addr, hashin, name);
-        path.is_file().then_some(path)
+        match fs::metadata(&path) {
+            Ok(m) if m.is_file() => Some(path),
+            Ok(_) => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            // Not-found is the ordinary answer (every sub-threshold key); anything
+            // else — EACCES on the blobs dir, EIO — means the fast path is off for
+            // *every* artifact while the build merely looks slow. `Path::is_file`
+            // would fold that into the same silent `false`, which is the
+            // invisible-degradation failure this whole path exists to undo.
+            Err(e) => {
+                tracing::debug!(?path, error = %e, "stat cache blob for direct-open path");
+                None
+            }
+        }
     }
 }
 

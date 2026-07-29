@@ -79,8 +79,17 @@ impl StableArtifactContent for HostArtifactContent {
     extern "C" fn path(&self) -> SString {
         // Non-empty only when the content is a real on-disk file (e.g. cache
         // artifact); the guest then reads it directly instead of streaming.
-        match self.content.file_path() {
-            Some(p) => SString::from(p.to_string_lossy().as_ref()),
+        //
+        // `to_str`, not `to_string_lossy`: the guest opens whatever it is handed
+        // and does NOT fall back to the stream on failure, so a path mangled by
+        // U+FFFD substitution is a hard read error where streaming would have
+        // worked. A non-UTF-8 cache path (reachable on Linux, where the cache
+        // root derives from an arbitrary `PathBuf`; APFS rejects invalid UTF-8)
+        // therefore reports "not file-backed" and takes the slower-but-correct
+        // route. `SString` is UTF-8, so carrying the raw bytes would mean an ABI
+        // change — not worth it for a case whose only cost is a stream.
+        match self.content.file_path().as_deref().and_then(Path::to_str) {
+            Some(p) => SString::from(p),
             None => SString::new(),
         }
     }
@@ -370,9 +379,64 @@ impl StableExecutor for HostExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostLogSink, HostSupervisor};
-    use crate::abi::{DynRead, StableRead, StableReadDyn};
+    use super::{HostArtifactContent, HostLogSink, HostSupervisor};
+    use crate::abi::{DynRead, StableArtifactContent, StableRead, StableReadDyn};
     use stabby::vec::Vec as SVec;
+
+    /// `Content` naming a path the seam has to render as a `SString`.
+    struct PathContent(std::path::PathBuf);
+
+    impl hcore::hartifactcontent::Content for PathContent {
+        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn walk(
+            &self,
+        ) -> anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
+        > {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok("h".to_string())
+        }
+        fn file_path(&self) -> Option<std::path::PathBuf> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// A UTF-8 cache path crosses intact — the ordinary case.
+    #[test]
+    fn path_carries_a_utf8_cache_path() {
+        let h = HostArtifactContent {
+            content: std::sync::Arc::new(PathContent("/cache/blobs/out.tar".into())),
+        };
+        assert_eq!(h.path().to_string(), "/cache/blobs/out.tar");
+    }
+
+    /// A non-UTF-8 cache path must report "not file-backed" (empty), so the guest
+    /// streams. `SString` is UTF-8, and the guest opens whatever it is handed
+    /// with no fallback — so lossy conversion would substitute U+FFFD and turn a
+    /// working read into `ENOENT`. Correct-and-slower beats wrong.
+    ///
+    /// Unix-only: the byte sequence has no `OsString` equivalent elsewhere. It is
+    /// reachable on Linux (ext4/xfs accept arbitrary bytes) and not on macOS
+    /// (APFS rejects invalid UTF-8), which is exactly why it needs a test rather
+    /// than a green CI run.
+    #[cfg(unix)]
+    #[test]
+    fn path_refuses_a_non_utf8_cache_path_instead_of_mangling_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"/cache/blobs/\xff\xfe/out.tar");
+        let h = HostArtifactContent {
+            content: std::sync::Arc::new(PathContent(std::path::PathBuf::from(raw))),
+        };
+        assert_eq!(
+            h.path().to_string(),
+            "",
+            "a path that cannot round-trip must read as 'not file-backed'"
+        );
+    }
 
     /// A distinct `StableRead` implementor per `N`: each monomorphization is its
     /// own source type, so each construction is a FIRST-USE insert into stabby's

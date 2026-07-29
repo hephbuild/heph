@@ -162,14 +162,25 @@ impl LocalCache for LocalCacheMem {
         self.inner.seekable_reader(addr, hashin, name)
     }
 
-    /// Delegated unconditionally: this tier only *fronts* reads — `writer`
-    /// forwards to the durable backend — so a resident entry is a copy of one
-    /// that is (or was) durable, never the only copy. Residency therefore says
-    /// nothing about whether a file exists, and the durable backend is the one
-    /// that can answer. In practice the two are disjoint anyway: entries here
-    /// are capped at `per_entry_bytes` (16 KiB by default) and only blobs over
-    /// the spill threshold (8 MiB) get a file, so a mem hit delegates to sqlite
-    /// and gets `None` without touching the disk.
+    /// Delegated unconditionally, unlike every other read path here: this tier
+    /// only *fronts* reads — `writer` forwards to the durable backend — so a
+    /// resident entry is a copy of a durable one, never the only copy. Residency
+    /// therefore cannot answer "is there a file?", and delegating is not an
+    /// optimization to skip but the only way to get the answer.
+    ///
+    /// It is not free. Under the production stack `inner` is [`LocalCacheSpill`],
+    /// which goes straight to the FS blob store, so this costs one `stat` that
+    /// misses for anything under the spill threshold — i.e. for every entry this
+    /// tier can hold. Paid on the seam hand-off path only, and worth it against
+    /// naming a file that is not there.
+    ///
+    /// The two tiers are disjoint *while* `per_entry_bytes` ≤ the spill
+    /// threshold (16 KiB vs 8 MiB by default) — both user-tunable, with nothing
+    /// enforcing the ordering. Above that an entry is both mem-resident and an FS
+    /// file, and `reader` (the mem copy) and `file_path` (the file) become two
+    /// sources for one key.
+    ///
+    /// [`LocalCacheSpill`]: crate::engine::local_cache_spill::LocalCacheSpill
     fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
         self.inner.file_path(addr, hashin, name)
     }

@@ -72,18 +72,23 @@ pub trait Content: Send + Sync {
     /// the stable-ABI seam, where a guest can read the file rather than pulling
     /// it chunk-by-chunk across the vtable.
     ///
-    /// **The path is only valid while this `Content` is alive.** Unlike
-    /// [`reader`](Self::reader) and [`seekable_reader`](Self::seekable_reader),
-    /// which hand back an open handle that pins its inode, a `PathBuf` is
-    /// detached: whatever keeps the bytes from being reclaimed — for a cache
-    /// artifact, the read guard riding on the `Content` (see `GuardedArtifact`
-    /// in the engine) — is released when the `Content` drops, and cache GC may
-    /// then delete the file the path names. Open it (or copy from it) before
-    /// dropping the handle you called this on; do not store it for later.
+    /// Two rules, both load-bearing:
     ///
-    /// An implementation must answer `None` rather than a path that does not
-    /// exist: callers treat `Some` as "open this", with no fallback to the byte
-    /// stream, so a stale path turns a working read into a hard error.
+    /// 1. **Open it before dropping the `Content` it came from; never store
+    ///    it.** Unlike [`reader`](Self::reader) and
+    ///    [`seekable_reader`](Self::seekable_reader), which hand back an open
+    ///    handle that pins its inode, a `PathBuf` is detached — whatever keeps
+    ///    the bytes from being reclaimed is tied to the `Content`, not to the
+    ///    path, so the file may be gone once the handle drops. The path is also
+    ///    host- and revision-specific (an absolute path under a particular
+    ///    user's cache), so it must never be embedded in a target's output: that
+    ///    would make a content-addressed artifact machine-specific.
+    /// 2. **Answer `None` rather than a path that does not exist.** Callers treat
+    ///    `Some` as "open this", with no fallback to the byte stream, so a stale
+    ///    path turns a working read into a hard error rather than a slow one.
+    ///
+    /// What backs rule 1 is per-implementation; the engine's cache artifacts
+    /// document their own guarantee, and it is not the same for every `Content`.
     fn file_path(&self) -> Option<std::path::PathBuf> {
         None
     }
