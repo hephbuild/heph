@@ -987,12 +987,16 @@ jobs:
       # rendered table for "REGRESSION" (the verdict `compare --allow-
       # regression` still prints even though it won't fail on it) and fails
       # for real if anything regressed, on both `pull_request` and `push`.
+      #
+      # The assembled report is captured to `perf-report.md` as well as the
+      # step summary — "File regression issue" reads that file back so the
+      # issue carries the actual numbers, not just links to go find them.
       - name: Compare and report
         id: compare
         run: |
           BENCH=./candidate-dist/heph-bench
           any_regression=false
-          {
+          report=$(
             echo "# Perf: ${{ matrix.os }}/${{ matrix.arch }}"
             if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
               echo ""
@@ -1009,20 +1013,21 @@ jobs:
                   base="baseline_${tier}_${scenario}.json"
                   cand="candidate_${tier}_${scenario}.json"
                   if [ -f "$base" ] && [ -f "$cand" ]; then
-                    table=$("$BENCH" compare --baseline "$base" --candidate "$cand" \
+                    "$BENCH" compare --baseline "$base" --candidate "$cand" \
                       --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
-                      --allow-regression)
-                    printf '%s\n' "$table"
-                    if printf '%s' "$table" | grep -q 'REGRESSION'; then
-                      any_regression=true
-                    fi
+                      --allow-regression
                   else
                     echo "_${scenario}: no results (run step failed — see logs)_"
                   fi
                 done
               done
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          )
+          printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$report" > perf-report.md
+          if printf '%s' "$report" | grep -q 'REGRESSION'; then
+            any_regression=true
+          fi
           echo "regressed=$any_regression" >> "$GITHUB_OUTPUT"
           if [ "$any_regression" = "true" ]; then
             echo "regression detected — see the job summary for the table" >&2
@@ -1050,10 +1055,12 @@ jobs:
           fi
           gh label create perf-regression --repo "${{ github.repository }}" \
             --color d73a4a --description "Automated performance regression report" --force
-          BODY=$(printf 'Perf regression on `master` for **%s/%s**, vs the previous commit `%s`.\n\nJob summary: %s/%s/actions/runs/%s\nCommit: %s/%s/commit/%s\n' \
-            "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.base.outputs.sha }}" \
+          LINKS=$(printf 'Job summary: %s/%s/actions/runs/%s\nCommit: %s/%s/commit/%s\n' \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.sha }}")
+          BODY=$(printf 'Perf regression on `master` for **%s/%s**, vs the previous commit `%s`:\n\n%s\n%s' \
+            "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.base.outputs.sha }}" \
+            "$(cat perf-report.md)" "$LINKS")
           gh issue create --repo "${{ github.repository }}" \
             --title "$TITLE" \
             --label perf-regression \
