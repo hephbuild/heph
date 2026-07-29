@@ -317,6 +317,19 @@ impl Engine {
     /// and the lock is reclaimed by the next write's trim or by `heph gc`. The
     /// authoritative enumeration is re-taken under the write lock below.
     ///
+    /// **The one revision that must not be missing from that count is our own.**
+    /// `list_target_entries` is a plain `SELECT DISTINCT` with no
+    /// [`wait_if_pending`](crate::engine::local_cache_sqlite) — unlike `exists`,
+    /// which waits — so the revision this call was handed can still be sitting in
+    /// the sqlite writer's queue and be absent here. Then `pre.len() <= keep`
+    /// fires on a target that is genuinely over budget, and the trim returns
+    /// having *never asked for the lock*: not contention, not an error, nothing to
+    /// retry, and indistinguishable in any log from a target that was legitimately
+    /// within budget. That is a systematic, every-run undercount by exactly one —
+    /// self-inflicted, unlike another writer's revision landing late — so the
+    /// count is barriered against it before it is trusted. Any other revision
+    /// arriving late is somebody else's write, and the paragraph above covers it.
+    ///
     /// Deliberately `try_write` and not a blocking `write`: the lock is a
     /// cross-process `flock`, so a blocking acquire can wait on another `heph`
     /// arbitrarily long — on the single FIFO cleaner thread that also owes every
@@ -324,44 +337,64 @@ impl Engine {
     /// the async `ResultLock::write` on anyway. A skip is recoverable; an
     /// unbounded stall of all cleanup is not. [`Engine::run_trim_batch_with_delay`] hedges
     /// the skip instead, with one immediate re-probe and one delayed retry.
+    /// One unlocked revision enumeration, logged under `stage` when it fails.
+    ///
+    /// `Err(())` rather than the error itself: every caller here turns a failure
+    /// into [`TrimOutcome::Failed`] after logging, and threading an `anyhow::Error`
+    /// through only to drop it invites a caller to propagate one instead — this is
+    /// a fire-and-forget background lane.
+    fn enumerate(&self, addr: &Addr, stage: &'static str) -> std::result::Result<Vec<String>, ()> {
+        self.local_cache.list_target_entries(addr).map_err(|e| {
+            tracing::debug!(error = %format!("{e:#}"), %addr, stage, "post-write gc enumerate");
+        })
+    }
+
     pub(crate) fn try_trim_after_write(
         &self,
         addr: &Addr,
         keep: u32,
         written_hashin: &str,
     ) -> TrimOutcome {
-        let pre = match self.local_cache.list_target_entries(addr) {
+        let pre = match self.enumerate(addr, "pre-count") {
             Ok(h) => h,
-            Err(e) => {
-                tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc pre-count");
+            Err(()) => return TrimOutcome::Failed,
+        };
+        // Barrier only when the count cannot see the revision it was handed —
+        // when it can, there is nothing to order against and a warm run pays a
+        // `Vec` scan instead of a cache round-trip. `exists` is the barrier
+        // because it is the read that waits: `LocalCacheSQLite::exists` calls
+        // `wait_if_pending` on this exact key, and neither tier above it can
+        // short-circuit that away — `LocalCacheMem::writer` *invalidates* the key
+        // rather than populating it, so a resident mem entry implies a landed
+        // write, and `LocalCacheSpill` asks its sqlite primary first.
+        let pre = if pre.iter().any(|h| h == written_hashin) {
+            pre
+        } else {
+            if let Err(e) = self.local_cache.exists(addr, written_hashin, MANIFEST_V1) {
+                tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc barrier");
                 return TrimOutcome::Failed;
             }
+            match self.enumerate(addr, "re-count") {
+                Ok(h) => h,
+                Err(()) => return TrimOutcome::Failed,
+            }
         };
-        // Undercount is safe (see above): the just-written revision may not be
-        // visible to this read yet, and a target at exactly `keep` has nothing to
-        // delete anyway. `Settled`, not `Contended` — the lock was never asked
-        // for, so there is nothing for a retry to win.
+        // Undercount by another writer is safe (see above): a target at exactly
+        // `keep` has nothing to delete anyway. `Settled`, not `Contended` — the
+        // lock was never asked for, so there is nothing for a retry to win.
         if pre.len() as u32 <= keep {
             return TrimOutcome::SETTLED_NOTHING;
         }
 
         match self.result_lock().try_write(addr) {
             Ok(Some(guard)) => {
-                // Barrier on the just-written manifest so enumeration observes it
-                // (the sqlite write may still be in flight) and we don't leave the
-                // fresh revision uncounted.
-                if let Err(e) = self.local_cache.exists(addr, written_hashin, MANIFEST_V1) {
-                    tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc barrier");
-                    return TrimOutcome::Failed;
-                }
                 // Re-listed under the lock: authoritative, and it may have grown
-                // since the unlocked pre-count above.
-                let hashins = match self.local_cache.list_target_entries(addr) {
+                // since the unlocked pre-count above. No second barrier — the
+                // count above is already ordered against our own write, and that
+                // is the only write this call knows about.
+                let hashins = match self.enumerate(addr, "locked") {
                     Ok(h) => h,
-                    Err(e) => {
-                        tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc enumerate");
-                        return TrimOutcome::Failed;
-                    }
+                    Err(()) => return TrimOutcome::Failed,
                 };
                 match self.trim_addr_history(&guard, addr, &hashins, keep, Some(written_hashin)) {
                     Ok((removed, _kept, bytes)) => TrimOutcome::Settled { removed, bytes },
@@ -972,6 +1005,115 @@ mod tests {
         }
     }
 
+    /// A cache that reproduces the one asymmetry the post-write trim depends on,
+    /// deterministically.
+    ///
+    /// On the real sqlite backend `exists` waits for an in-flight write of its key
+    /// (`PendingTracker::wait_if_pending`) and `list_target_entries` — a plain
+    /// `SELECT DISTINCT hashin` — does not. So a revision whose manifest write is
+    /// still queued is *invisible to an enumeration and visible to a barrier*, and
+    /// nothing in a CI log distinguishes a trim that skipped because of that from
+    /// a trim that skipped because the target really was within budget.
+    ///
+    /// `queued` names such a revision: it is filtered out of every enumeration
+    /// until an `exists` on its manifest clears it, exactly as a real
+    /// `wait_if_pending` would. Everything else is forwarded to a genuine sqlite
+    /// cache, so the trim under test is running against the real backend.
+    struct QueuedWriteCache {
+        inner: Arc<dyn LocalCache>,
+        queued: std::sync::Mutex<Option<(String, String)>>,
+        barrier_reads: Arc<AtomicUsize>,
+    }
+
+    impl QueuedWriteCache {
+        /// Hide `hashin` from enumerations until it is barriered.
+        fn queue(&self, addr: &Addr, hashin: &str) {
+            *self.queued.lock().expect("queued") = Some((addr.format(), hashin.to_string()));
+        }
+    }
+
+    impl LocalCache for QueuedWriteCache {
+        fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
+            self.inner.reader(addr, hashin, name)
+        }
+        fn writer(
+            &self,
+            addr: &Addr,
+            hashin: &str,
+            name: &str,
+        ) -> anyhow::Result<Box<dyn std::io::Write>> {
+            self.inner.writer(addr, hashin, name)
+        }
+        fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
+            if name == MANIFEST_V1 {
+                self.barrier_reads.fetch_add(1, Ordering::SeqCst);
+                // The wait: once this returns, the write has landed and every
+                // later enumeration sees it.
+                let mut q = self.queued.lock().expect("queued");
+                if q.as_ref()
+                    .is_some_and(|(a, h)| *a == addr.format() && h == hashin)
+                {
+                    *q = None;
+                }
+            }
+            self.inner.exists(addr, hashin, name)
+        }
+        fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Existence> {
+            self.inner.existence(addr, hashin, name)
+        }
+        fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
+            self.inner.delete(addr, hashin, name)
+        }
+        fn list_targets(&self) -> anyhow::Result<TargetStream> {
+            self.inner.list_targets()
+        }
+        fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
+            let mut entries = self.inner.list_target_entries(addr)?;
+            if let Some((a, h)) = self.queued.lock().expect("queued").as_ref()
+                && *a == addr.format()
+            {
+                entries.retain(|e| e != h);
+            }
+            Ok(entries)
+        }
+        fn seekable_reader(
+            &self,
+            addr: &Addr,
+            hashin: &str,
+            name: &str,
+        ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>> {
+            self.inner.seekable_reader(addr, hashin, name)
+        }
+        fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
+            self.inner.file_path(addr, hashin, name)
+        }
+    }
+
+    /// Engine whose cache can hide one just-written revision from enumerations.
+    fn test_engine_queued() -> (
+        Arc<Engine>,
+        Arc<QueuedWriteCache>,
+        Arc<AtomicUsize>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })
+        .expect("engine");
+        let barrier_reads = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(QueuedWriteCache {
+            inner: Arc::clone(&engine.local_cache),
+            queued: std::sync::Mutex::new(None),
+            barrier_reads: Arc::clone(&barrier_reads),
+        });
+        engine.local_cache = Arc::clone(&cache) as Arc<dyn LocalCache>;
+        (Arc::new(engine), cache, barrier_reads, dir)
+    }
+
     /// Engine whose cache counts manifest barrier/recency reads. Returns the two
     /// counters alongside it.
     fn test_engine_counting() -> (
@@ -1219,9 +1361,13 @@ mod tests {
         assert!(present(&engine, &a, "h2"));
     }
 
-    /// The mirror of the above: over budget, the trim *does* pay for the barrier
-    /// and the recency reads. Without this the skip assertion could pass on a
+    /// The mirror of the above: over budget, the trim *does* pay for the
+    /// per-revision recency reads. Without this the skip assertion could pass on a
     /// trim that had stopped working entirely.
+    ///
+    /// Still no barrier read: setup barriered its own writes, so the pre-count
+    /// already contains `h2` and there is nothing to order against. The case that
+    /// *does* barrier is the test below.
     #[tokio::test]
     async fn try_trim_after_write_reads_manifests_when_over_budget() {
         let (engine, barrier_reads, manifest_reads, _dir) = test_engine_counting();
@@ -1235,8 +1381,8 @@ mod tests {
 
         assert_eq!(
             barrier_reads.load(Ordering::SeqCst),
-            1,
-            "over budget: the just-written manifest is barriered once"
+            0,
+            "the pre-count could already see the written revision: no barrier"
         );
         assert_eq!(
             manifest_reads.load(Ordering::SeqCst),
@@ -1245,6 +1391,53 @@ mod tests {
              of the one revision actually deleted"
         );
         assert!(!present(&engine, &a, "h1"), "stale revision trimmed");
+    }
+
+    /// **A pre-count that cannot see its own revision must not be believed.**
+    ///
+    /// `list_target_entries` is a plain `SELECT DISTINCT` with no
+    /// `wait_if_pending` — unlike `exists`, which waits — so the revision this
+    /// trim was handed can still be queued in the sqlite writer and absent from
+    /// the count. Then `pre.len() <= keep` fires on a target that is genuinely
+    /// over budget and the trim returns having never asked for the lock: not
+    /// `Contended`, so #222's retry deliberately never revisits it ("the lock was
+    /// never asked for, so there is nothing for a retry to win" — true for a
+    /// within-budget target, false for a stale count). `cache.history` silently
+    /// goes unenforced for the run, and the log is identical to the legitimate
+    /// case.
+    ///
+    /// Constructed, not raced: [`QueuedWriteCache`] hides `h2` from every
+    /// enumeration until the manifest barrier runs, which is exactly what the real
+    /// backend does while a write sits in the queue. Delete the barrier and this
+    /// fails every time rather than one run in N.
+    #[tokio::test]
+    async fn try_trim_after_write_barriers_a_pre_count_that_cannot_see_its_own_revision() {
+        let (engine, cache, barrier_reads, _dir) = test_engine_queued();
+        let a = addr("t");
+        write_revision(&engine, &a, "h1", 100, &["o.tar"]);
+        write_revision(&engine, &a, "h2", 200, &["o.tar"]);
+        // `h2` is this run's write and its commit is not yet observable to an
+        // unbarriered enumeration.
+        cache.queue(&a, "h2");
+        barrier_reads.store(0, Ordering::SeqCst);
+
+        // Unbarriered the count is `["h1"]`, `1 <= keep`, and the answer is
+        // SETTLED_NOTHING with `h1` still on disk.
+        assert_eq!(
+            engine.try_trim_after_write(&a, 1, "h2"),
+            TrimOutcome::Settled {
+                removed: 1,
+                bytes: 4
+            },
+            "a queued revision is still a revision: the target is over budget",
+        );
+        assert_eq!(
+            barrier_reads.load(Ordering::SeqCst),
+            1,
+            "barriered exactly once, before the count is trusted"
+        );
+        assert!(!present(&engine, &a, "h1"), "the stale revision is trimmed");
+        assert!(present(&engine, &a, "h2"), "the just-written one is kept");
     }
 
     /// Take `addr`'s write lock synchronously, the way the trim itself asks for
