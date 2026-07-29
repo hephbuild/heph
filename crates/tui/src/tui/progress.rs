@@ -2381,6 +2381,27 @@ mod tests {
     }
 
     #[test]
+    fn op_timeline_dropped_from_ops_once_result_ends() {
+        // `ops` must not retain a finished target's timeline forever — that is
+        // unbounded per-target memory over the life of a run. Once `ResultEnd`
+        // fires, every op for the addr has already closed (`ResultEnd` is emitted
+        // after the whole result scope, including any cache-write tail), so the
+        // entry is dead weight: neither `long_running` nor `busy_workers` reads a
+        // closed-op entry (both walk `open_ops`, and `long_running`'s `?` already
+        // skips an addr with no active op). Retention should reclaim it here.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:b")));
+        s.apply(&ev(1_000, execute_end("//a:b")));
+        assert!(s.ops.contains_key("//a:b"));
+
+        s.apply(&ev(2_000, result_end("//a:b", None)));
+        assert!(
+            !s.ops.contains_key("//a:b"),
+            "ops must drop a target's timeline once its ResultEnd arrives"
+        );
+    }
+
+    #[test]
     fn busy_workers_counts_only_active_execute() {
         // One target mid-Execute, one mid-LocalCacheWrite: only Execute counts as
         // a busy worker (the semaphore-bound slot).
