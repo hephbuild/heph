@@ -827,6 +827,19 @@ impl BuildState {
                 }
             } else {
                 self.open_ops.remove(addr);
+                // Retention tail: `RemoteCacheWrite` is pushed from a detached
+                // background task (`Engine::spawn_remote_upload`), which the
+                // engine deliberately does not await inside the `ResultEnd` scope
+                // (see its doc comment in `remote_cache.rs`) — so its Start/End
+                // can arrive for an addr *after* that addr's `ResultEnd` already
+                // fired and removed the entry below. When that happens this Start
+                // recreates the entry (`entry().or_default()` above); nothing
+                // would ever remove it again unless caught here. Whichever
+                // closing edge is actually last — `ResultEnd` or this trailing
+                // End — is the one that reclaims it.
+                if self.finished.contains(addr) {
+                    self.ops.remove(addr);
+                }
             }
         }
         match &ev.kind {
@@ -876,15 +889,23 @@ impl BuildState {
                     self.matched_finished += 1;
                 }
                 // Retention: `ResultEnd` is emitted by the drop guard wrapping the
-                // whole `inner_result_addr` scope, strictly after every op
-                // (Execute/LocalCacheWrite/RemoteCacheWrite/RemoteCacheRead) has
-                // closed for this addr — no later event can reopen its timeline.
-                // Neither reader walks a closed entry (`open_ops` already dropped
-                // it when its last op ended), so keeping it around is unbounded
+                // whole `inner_result_addr` scope, so by the time it fires,
+                // Execute/LocalCacheWrite/RemoteCacheRead have all closed for this
+                // addr (they run awaited inside that scope) and neither reader
+                // walks a closed entry — keeping it around would be unbounded
                 // per-target memory for the rest of the run. `open_ops.remove` is
                 // normally a no-op here (the entry left it already) but guards
-                // against ever leaving a dangling index entry if `active` were
-                // somehow still open at this point.
+                // against a dangling index entry if `active` were somehow still
+                // open at this point.
+                //
+                // `RemoteCacheWrite` is the one op this does NOT catch:
+                // `Engine::spawn_remote_upload` pushes it from a detached
+                // background task the engine deliberately does not await inside
+                // this scope, so its Start/End can arrive after this removal has
+                // already run. The `Boundary::End` arm above closes that tail —
+                // it checks `self.finished` and reclaims the (re-created) entry
+                // itself once that trailing op closes, so whichever event is
+                // actually last is the one that frees it.
                 self.ops.remove(addr);
                 self.open_ops.remove(addr);
             }
@@ -2336,6 +2357,15 @@ mod tests {
             error: None,
         }
     }
+    fn remote_write_start(addr: &str) -> BuildEventKind {
+        BuildEventKind::RemoteCacheWriteStart { addr: addr.into() }
+    }
+    fn remote_write_end(addr: &str) -> BuildEventKind {
+        BuildEventKind::RemoteCacheWriteEnd {
+            addr: addr.into(),
+            error: None,
+        }
+    }
 
     #[test]
     fn op_timeline_records_execute_then_local_cache_write_breakdown() {
@@ -2398,12 +2428,12 @@ mod tests {
     #[test]
     fn op_timeline_dropped_from_ops_once_result_ends() {
         // `ops` must not retain a finished target's timeline forever — that is
-        // unbounded per-target memory over the life of a run. Once `ResultEnd`
-        // fires, every op for the addr has already closed (`ResultEnd` is emitted
-        // after the whole result scope, including any cache-write tail), so the
-        // entry is dead weight: neither `long_running` nor `busy_workers` reads a
-        // closed-op entry (both walk `open_ops`, and `long_running`'s `?` already
-        // skips an addr with no active op). Retention should reclaim it here.
+        // unbounded per-target memory over the life of a run. By the time
+        // `ResultEnd` fires, Execute (and any local-cache-write) has already
+        // closed for the addr, so the entry is dead weight: neither
+        // `long_running` nor `busy_workers` reads a closed-op entry (both walk
+        // `open_ops`, and `long_running`'s `?` already skips an addr with no
+        // active op). Retention should reclaim it here.
         let mut s = BuildState::new();
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(1_000, execute_end("//a:b")));
@@ -2413,6 +2443,59 @@ mod tests {
         assert!(
             !s.ops.contains_key("//a:b"),
             "ops must drop a target's timeline once its ResultEnd arrives"
+        );
+        assert!(
+            !s.open_ops.contains("//a:b"),
+            "open_ops must not disagree with ops once the entry is gone"
+        );
+    }
+
+    #[test]
+    fn op_timeline_reclaimed_when_remote_cache_write_trails_result_end() {
+        // `RemoteCacheWrite` is pushed from a detached background task
+        // (`Engine::spawn_remote_upload`) that the engine does not await inside
+        // the `ResultEnd` scope, so its Start/End can legitimately arrive after
+        // `ResultEnd` already removed the entry. The Start recreates it
+        // (`ops.entry(..).or_default()`); if nothing then reclaimed it, every
+        // remote-cache-uploading target would leak one `OpTimeline` forever —
+        // the exact unbounded growth this retention is meant to fix, just gated
+        // on remote caching instead of run size. The trailing End must be the
+        // one that frees it this time.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:b")));
+        s.apply(&ev(1_000, execute_end("//a:b")));
+        s.apply(&ev(2_000, result_end("//a:b", None)));
+        assert!(!s.ops.contains_key("//a:b"), "gone after ResultEnd");
+
+        // The background upload starts after ResultEnd already fired.
+        s.apply(&ev(3_000, remote_write_start("//a:b")));
+        assert!(
+            s.ops.contains_key("//a:b"),
+            "the trailing op legitimately recreates the entry"
+        );
+        assert!(s.open_ops.contains("//a:b"));
+
+        s.apply(&ev(4_000, remote_write_end("//a:b")));
+        assert!(
+            !s.ops.contains_key("//a:b"),
+            "the trailing RemoteCacheWriteEnd must reclaim it since ResultEnd already fired"
+        );
+        assert!(!s.open_ops.contains("//a:b"));
+    }
+
+    #[test]
+    fn op_timeline_dropped_from_ops_on_a_failing_result_end_too() {
+        // The removal in the `ResultEnd` arm runs unconditionally, before the
+        // success/error branch is even inspected — a failed target must not keep
+        // its timeline around any more than a successful one does.
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:b")));
+        s.apply(&ev(1_000, execute_end("//a:b")));
+
+        s.apply(&ev(2_000, result_end("//a:b", Some("boom".into()))));
+        assert!(
+            !s.ops.contains_key("//a:b"),
+            "a failing ResultEnd must drop the timeline too"
         );
     }
 
@@ -4216,7 +4299,11 @@ mod tests {
         s.apply(&ev(2, execute_start("//live:b")));
         s.apply(&ev(2, local_write_start("//live:c")));
 
-        assert_eq!(s.ops.len(), 2_003, "no ResultEnd fired, so nothing is retired");
+        assert_eq!(
+            s.ops.len(),
+            2_003,
+            "no ResultEnd fired, so nothing is retired"
+        );
         assert_eq!(
             s.open_ops.len(),
             3,
