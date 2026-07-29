@@ -1,5 +1,9 @@
 //! `codegen = "in_place"` write-back: a target that rewrites the very files it
 //! took as inputs (a formatter, a lint fixer).
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
 
 mod common;
 

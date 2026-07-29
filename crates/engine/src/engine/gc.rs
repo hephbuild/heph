@@ -944,6 +944,7 @@ mod tests {
         ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType, PendingWrite,
         SizedReader, TargetStream,
     };
+    use crate::engine::local_cache_test_double::ForwardingCache;
     use hcore::hasync::StdCancellationToken;
     use hmodel::htpkg::PkgBuf;
     use std::collections::BTreeMap;
@@ -976,72 +977,6 @@ mod tests {
         })
         .expect("engine");
         (Arc::new(engine), dir)
-    }
-
-    /// Counts the two cache round-trips the post-write trim must not make when
-    /// the target is already inside its history budget: the write barrier
-    /// (`exists` on the manifest key) and the per-revision recency reads
-    /// (`reader` on the manifest key, one per revision). Everything else is
-    /// forwarded verbatim to the real backend, so the target under test is a
-    /// genuine sqlite cache rather than a stub.
-    struct CountingCache {
-        inner: Arc<dyn LocalCache>,
-        barrier_reads: Arc<AtomicUsize>,
-        manifest_reads: Arc<AtomicUsize>,
-    }
-
-    impl LocalCache for CountingCache {
-        fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
-            if name == MANIFEST_V1 {
-                self.manifest_reads.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner.reader(addr, hashin, name)
-        }
-        fn writer(
-            &self,
-            addr: &Addr,
-            hashin: &str,
-            name: &str,
-        ) -> anyhow::Result<Box<dyn std::io::Write>> {
-            self.inner.writer(addr, hashin, name)
-        }
-        fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-            if name == MANIFEST_V1 {
-                self.barrier_reads.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner.exists(addr, hashin, name)
-        }
-        fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Existence> {
-            // Forwarded to the layer that owns the write-behind queue, per the
-            // trait's contract — never re-derived from `exists`.
-            self.inner.existence(addr, hashin, name)
-        }
-        fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-            // Likewise forwarded: only the queue's owner knows what is committed.
-            // Not counted — `barrier_reads` tracks the manifest barrier probe,
-            // which goes through `exists`.
-            self.inner.exists_committed(addr, hashin, name)
-        }
-        fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
-            self.inner.delete(addr, hashin, name)
-        }
-        fn list_targets(&self) -> anyhow::Result<TargetStream> {
-            self.inner.list_targets()
-        }
-        fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
-            self.inner.list_target_entries(addr)
-        }
-        fn seekable_reader(
-            &self,
-            addr: &Addr,
-            hashin: &str,
-            name: &str,
-        ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>> {
-            self.inner.seekable_reader(addr, hashin, name)
-        }
-        fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
-            self.inner.file_path(addr, hashin, name)
-        }
     }
 
     /// A cache that reproduces the one asymmetry the post-write trim depends on,
@@ -1213,11 +1148,31 @@ mod tests {
         .expect("engine");
         let barrier_reads = Arc::new(AtomicUsize::new(0));
         let manifest_reads = Arc::new(AtomicUsize::new(0));
-        engine.local_cache = Arc::new(CountingCache {
-            inner: Arc::clone(&engine.local_cache),
-            barrier_reads: Arc::clone(&barrier_reads),
-            manifest_reads: Arc::clone(&manifest_reads),
-        });
+        // Counts the two cache round-trips the post-write trim must not make
+        // when the target is already inside its history budget: the write
+        // barrier (`exists` on the manifest key) and the per-revision recency
+        // reads (`reader` on the manifest key, one per revision). Everything
+        // else is forwarded verbatim to the real backend, so the target under
+        // test is a genuine sqlite cache rather than a stub.
+        engine.local_cache = Arc::new(
+            ForwardingCache::new(Arc::clone(&engine.local_cache))
+                .on_reader({
+                    let manifest_reads = Arc::clone(&manifest_reads);
+                    move |_, _, name| {
+                        if name == MANIFEST_V1 {
+                            manifest_reads.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+                .on_exists({
+                    let barrier_reads = Arc::clone(&barrier_reads);
+                    move |_, _, name| {
+                        if name == MANIFEST_V1 {
+                            barrier_reads.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }),
+        );
         (Arc::new(engine), barrier_reads, manifest_reads, dir)
     }
 

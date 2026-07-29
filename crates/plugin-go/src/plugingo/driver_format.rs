@@ -520,7 +520,7 @@ mod tests {
 
     fn dep_groups(s: &TargetSpec) -> Vec<String> {
         match s.config.get("deps").unwrap() {
-            Value::Map(m) => m.iter().map(|(k, _)| k.clone()).collect(),
+            Value::Map(m) => m.keys().cloned().collect(),
             _ => panic!("deps not a map"),
         }
     }
@@ -564,7 +564,7 @@ mod tests {
         let g = govet();
         let s = build_format_check_spec(params(&g, None));
         assert_eq!(s.driver, "go_format_check");
-        assert!(s.config.get("out").is_none());
+        assert!(!s.config.contains_key("out"));
     }
 
     #[test]

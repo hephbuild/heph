@@ -926,11 +926,14 @@ fn merge_report_edits(reports: &[Vec<u8>]) -> anyhow::Result<HashMap<String, Vec
             // this report's own overlaps stay for `apply_edits` to arbitrate.
             let prior = merged.len();
             for e in edits {
-                if merged[..prior].iter().any(|x| is_same(x, &e)) {
+                // `take(prior)` rather than `merged[..prior]`: same elements,
+                // no panicking slice index.
+                if merged.iter().take(prior).any(|x| is_same(x, &e)) {
                     continue;
                 }
-                if let Some((start, end, new)) = merged[..prior]
+                if let Some((start, end, new)) = merged
                     .iter()
+                    .take(prior)
                     .find(|x| collides(x, &e))
                     .map(|x| (x.start, x.end, x.new.clone()))
                 {

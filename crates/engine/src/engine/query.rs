@@ -151,7 +151,11 @@ impl Engine {
                     let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
 
                     for provider in &engine.providers {
-                        let it = provider.provider.list(ListRequest {
+                        // Scoped under `IN_PROVIDER_LIST` so a reentrant
+                        // `executor.query()` called from inside this `list()` is
+                        // caught rather than silently nested — see its doc
+                        // comment in `result.rs`.
+                        let it = crate::engine::result::IN_PROVIDER_LIST.scope((), provider.provider.list(ListRequest {
                             request_id: rs.request_id().to_string(),
                             package: pkg.clone(),
                             states: states
@@ -160,7 +164,7 @@ impl Engine {
                                 .cloned()
                                 .collect(),
                             executor: Arc::clone(&executor),
-                        }, rs.ctoken()).await?;
+                        }, rs.ctoken())).await?;
                         // The iterator is not `Send`; drain it before the next await.
                         let raw: Vec<_> = it.collect::<anyhow::Result<Vec<_>>>()?;
 

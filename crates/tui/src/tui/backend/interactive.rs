@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use ansi_to_tui::IntoText;
@@ -53,6 +54,7 @@ pub async fn run<A: App + 'static>(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let mut build_events: Option<EventReceiver> = Some(event_rx);
 
+    record_raw_mode_restore();
     enable_raw_mode().context("enabling raw mode")?;
     // StderrBackend wraps CrosstermBackend<Stderr> and overrides
     // get_cursor_position so the DSR query goes to stderr instead of
@@ -416,6 +418,7 @@ pub async fn run<A: App + 'static>(
         drop(Backend::flush(backend));
     }
     drop(disable_raw_mode());
+    hcore::shutdown::clear_terminal_restore();
     sink.switch_to_direct();
     drain_logs_to_stderr(&mut rx);
 
@@ -434,6 +437,52 @@ pub async fn run<A: App + 'static>(
     view.last_render();
 
     result
+}
+
+/// Capture stderr's pre-raw-mode `termios` and register a restore closure
+/// with `hcore::shutdown` before raw mode mutates it. The closure is the
+/// only thing that still runs if the run ends via `bootstrap`'s hard abort
+/// on the second Ctrl-C (`std::process::exit`, which skips destructors) — it
+/// restores cooked mode and re-shows the cursor with direct syscalls only,
+/// never crossterm: the abort path must not risk contending crossterm's own
+/// raw-mode mutex, which a concurrently-aborting thread could already hold.
+///
+/// A failed `tcgetattr` (stderr is not a tty — output redirected) records
+/// nothing, so a non-interactive run's hard abort stays a no-op: no stray
+/// escape bytes land in redirected output.
+fn record_raw_mode_restore() {
+    let fd = io::stderr().as_raw_fd();
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `fd` is stderr's descriptor, valid for the process lifetime;
+    // `termios.as_mut_ptr()` points at valid, correctly-sized storage for
+    // `tcgetattr` to write into.
+    let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+    if rc != 0 {
+        return;
+    }
+    // SAFETY: `tcgetattr` returned success above, so `termios` is initialized.
+    let termios = unsafe { termios.assume_init() };
+    hcore::shutdown::set_terminal_restore(move || {
+        // SAFETY: `fd` was a valid, open tty when captured above; `tcsetattr`
+        // on an already-closed fd fails harmlessly (EBADF), not UB.
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+        // Cursor-show escape, then a plain notice on its own line: the TUI
+        // buffers `tracing` output through its log sink and only drains it
+        // to the terminal on the next render tick — a tick the hard abort
+        // never reaches — so without this direct write the process just
+        // vanishes with no visible sign it force-killed itself rather than
+        // finishing normally.
+        let notice = b"\r\n\x1b[?25hheph: aborted (second Ctrl-C)\r\n";
+        // SAFETY: `notice` is a valid pointer for exactly its own length;
+        // the return value is intentionally ignored — this runs right
+        // before `process::exit`, so there is nothing left to do with a
+        // short write.
+        unsafe {
+            libc::write(fd, notice.as_ptr().cast(), notice.len());
+        }
+    });
 }
 
 fn terminal_cols(terminal: &StderrTerminal) -> u16 {

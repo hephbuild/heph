@@ -109,6 +109,15 @@ pub trait ProviderExecutor: Send + Sync {
     /// `Engine::get_spec`, which registers `parent → addr` in the `DepDag`.
     /// Do not memoize this on the matcher in a provider — waiters would bypass
     /// the dep registration and a target-dep cycle would hide as a deadlock.
+    ///
+    /// **Do not call this from [`Provider::list`].** `ListRequest::executor`
+    /// hands `list()` this same `query()`, but `list()` itself runs inside one
+    /// of an already K-wide concurrent package fan-out; calling back into
+    /// `query()` from there nests another K-wide walk under it. The engine's
+    /// executor detects and rejects this reentrant call with an error rather
+    /// than nesting silently — use [`ProviderExecutor::states_under`] instead,
+    /// which is what `list()` implementations that need cross-package state
+    /// (e.g. a Go module's variant universe) are for.
     fn query<'a>(
         &'a self,
         m: &'a Matcher,
@@ -359,6 +368,10 @@ pub trait Provider: Send + Sync {
     /// come off a filesystem walk — therefore gives the same tree a different
     /// build definition, and a different list-file order, on every run. Sort, or
     /// preserve a stable walk order.
+    ///
+    /// `req.executor` must not have [`ProviderExecutor::query`] called on it from
+    /// here — see that method's doc for why. Use
+    /// [`ProviderExecutor::states_under`] for cross-package state instead.
     fn list<'a>(
         &'a self,
         req: ListRequest,
