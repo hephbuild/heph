@@ -43,6 +43,12 @@ pub fn mem_tlock() -> TBridge<MemLock, MemRWLock> {
 
 /// Filesystem transformable reader/writer lock. `outer_path` and `inner_path`
 /// must be different files.
+///
+/// Used by this crate's own bridge tests. The engine deliberately does *not*
+/// build its result lock through here: it wraps the outer `FLock` in a
+/// `GatewayLock` decorator that empties the lock file at acquire, because it
+/// keeps the holder's pid stamp there and a stamp must not outlive its writer.
+/// Reach for `TBridge::new` directly when the outer lock needs a policy.
 pub fn fs_tlock(
     outer_path: impl AsRef<Path>,
     inner_path: impl AsRef<Path>,
