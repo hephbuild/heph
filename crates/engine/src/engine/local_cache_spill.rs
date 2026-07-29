@@ -181,19 +181,48 @@ impl LocalCache for LocalCacheSpill {
         }
     }
 
-    /// Only spilled blobs have a file. The primary is sqlite — its blobs live in
-    /// rows, so it answers `None` — and asking it first would cost a query per
-    /// call to learn that; go straight to the FS store, which answers `Some` only
-    /// for a path that exists.
+    /// Only spilled blobs have a file: the primary is sqlite, whose blobs live in
+    /// rows. Ask the FS store first — it answers `Some` only for a path that
+    /// exists, and for anything under the threshold (nearly every artifact) that
+    /// single `stat` ends it.
     ///
-    /// Note this resolves against one backend where [`reader`](Self::reader)
-    /// tries the primary first. The two agree only because a key lives in exactly
-    /// one backend, so this rests on that invariant rather than re-deriving it —
-    /// which is why [`writer`](Self::writer) now enforces it instead of assuming
-    /// it. If the invariant ever breaks again, this method is where it shows up
-    /// as two answers for one key.
+    /// **Then confirm the primary does not also hold the key**, so this agrees
+    /// with [`reader`](Self::reader), which tries the primary *first*. The two
+    /// would otherwise resolve to different bytes for one key whenever both
+    /// backends hold it, and this method has no error to report it with — the
+    /// caller would just silently open the wrong blob.
+    ///
+    /// [`writer`](Self::writer) stops that state being *created*, but cannot
+    /// repair a cache that already has it: `spillThresholdBytes` is user-tunable
+    /// and nothing swept a still-live revision, so a directory written before
+    /// that fix can carry a superseded FS blob indefinitely — and GC only
+    /// reclaims trimmed or orphaned revisions, never audits a live one. Deferring
+    /// to the primary here makes the read side correct on those caches too,
+    /// without a migration.
+    ///
+    /// The probe costs nothing in the common case: it runs *only* when an FS blob
+    /// exists, which for a healthy cache means a genuinely spilled (large)
+    /// artifact, not the per-call sqlite query that asking primary-first would be.
     fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
-        self.blobs.file_path(addr, hashin, name)
+        let path = self.blobs.file_path(addr, hashin, name)?;
+        match self.primary.exists_committed(addr, hashin, name) {
+            // Sole resident: the ordinary spilled-blob case.
+            Ok(false) => Some(path),
+            // Both hold it. `reader` serves the primary, so this must not offer
+            // the FS copy; no direct-open beats a fast route to the wrong bytes.
+            Ok(true) => {
+                tracing::debug!(
+                    %addr, hashin, name,
+                    "cache key in both spill backends; superseded blob left for the next write"
+                );
+                None
+            }
+            // Cannot establish it is the only copy — decline rather than guess.
+            Err(e) => {
+                tracing::debug!(%addr, hashin, name, error = %e, "probe primary for spilled blob");
+                None
+            }
+        }
     }
 }
 
@@ -411,6 +440,41 @@ mod tests {
         assert!(
             cache.file_path(&a, "h", MANIFEST_V1).is_none(),
             "manifest never spills, so it never has a path"
+        );
+    }
+
+    /// A cache that *already* carries a superseded spilled blob must not serve it
+    /// through the direct-open path.
+    ///
+    /// `writer` stops this state being created, but cannot repair a directory
+    /// written before that fix, and GC never audits a still-live revision — so
+    /// the read side has to be correct on its own or those caches silently hand
+    /// out the wrong bytes. Both backends are written directly here, bypassing
+    /// `writer`, because that is exactly the state an older heph could leave.
+    ///
+    /// `reader` resolves primary-first, so the primary is the answer and
+    /// `file_path` must decline rather than offer a faster route to the stale
+    /// copy.
+    #[test]
+    fn file_path_declines_when_the_primary_also_holds_the_key() {
+        let dir = tempdir().expect("tempdir");
+        let (cache, sqlite, fs) = spill(dir.path(), 64);
+        let a = addr();
+
+        // Pre-existing dual residency: superseded blob on disk, live row in sqlite.
+        write(&*fs, &a, "out", &[9u8; 256]);
+        write(&*sqlite, &a, "out", &[4u8; 32]);
+        assert!(fs.exists(&a, "h", "out").expect("ex"));
+        assert!(sqlite.exists(&a, "h", "out").expect("ex"));
+
+        assert_eq!(
+            read(&cache, &a, "out"),
+            vec![4u8; 32],
+            "reader resolves primary-first"
+        );
+        assert!(
+            cache.file_path(&a, "h", "out").is_none(),
+            "direct open must not disagree with reader"
         );
     }
 
