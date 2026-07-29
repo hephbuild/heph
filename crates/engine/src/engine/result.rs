@@ -8254,89 +8254,7 @@ mod tests {
     /// (Linux's 16-byte `PR_SET_NAME` truncation affects `/proc`, not this).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn each_background_job_class_runs_on_its_own_lane() {
-        use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
-
-        /// Records the thread of the first `list_target_entries` call. In this
-        /// test that call can only come from `try_trim_after_write`, which starts
-        /// with an unlocked revision count — so it is reached whether or not the
-        /// trim goes on to take the write lock.
-        struct TrimThreadCache {
-            inner: SArc<dyn LocalCache>,
-            thread: SArc<std::sync::OnceLock<String>>,
-        }
-        impl LocalCache for TrimThreadCache {
-            fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
-                self.inner.reader(addr, hashin, name)
-            }
-            fn writer(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Box<dyn std::io::Write>> {
-                self.inner.writer(addr, hashin, name)
-            }
-            fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-                self.inner.exists(addr, hashin, name)
-            }
-            fn existence(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Existence> {
-                self.inner.existence(addr, hashin, name)
-            }
-            /// Mirrors this decorator's own `exists`: that one forwards, so the
-            /// committed-only answer forwards too. Required by the trait
-            /// precisely so a decorator cannot inherit a default that re-parks
-            /// the runtime on the backend's write-behind queue.
-            fn exists_committed(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<bool> {
-                self.inner.exists_committed(addr, hashin, name)
-            }
-            fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
-                self.inner.delete(addr, hashin, name)
-            }
-            fn list_targets(&self) -> anyhow::Result<TargetStream> {
-                self.inner.list_targets()
-            }
-            fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
-                drop(
-                    self.thread.set(
-                        std::thread::current()
-                            .name()
-                            .unwrap_or("<unnamed>")
-                            .to_string(),
-                    ),
-                );
-                self.inner.list_target_entries(addr)
-            }
-            fn seekable_reader(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
-            {
-                self.inner.seekable_reader(addr, hashin, name)
-            }
-            // Forwarded, not defaulted: a decorator that swallows this turns the
-            // direct-open path off for every artifact in the test that wraps the
-            // cache — the exact defect this file's `GuardedArtifact` doc warns of.
-            fn file_path(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> Option<std::path::PathBuf> {
-                self.inner.file_path(addr, hashin, name)
-            }
-        }
+        use crate::engine::local_cache_test_double::ForwardingCache;
 
         let exec_count = SArc::new(AtomicUsize::new(0));
         let rmdir_thread: SArc<std::sync::OnceLock<String>> = SArc::new(std::sync::OnceLock::new());
@@ -8348,10 +8266,24 @@ mod tests {
             "p62_lane_routing",
             Some(SArc::clone(&rmdir_thread)),
             Some(&|inner| {
-                SArc::new(TrimThreadCache {
-                    inner,
-                    thread: SArc::clone(&wrap_trim),
-                })
+                // Records the thread of the first `list_target_entries` call.
+                // In this test that call can only come from
+                // `try_trim_after_write`, which starts with an unlocked
+                // revision count — so it is reached whether or not the trim
+                // goes on to take the write lock.
+                SArc::new(ForwardingCache::new(inner).on_list_target_entries({
+                    let wrap_trim = SArc::clone(&wrap_trim);
+                    move |_| {
+                        drop(
+                            wrap_trim.set(
+                                std::thread::current()
+                                    .name()
+                                    .unwrap_or("<unnamed>")
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }))
             }),
         )
         .expect("engine");
@@ -8604,81 +8536,8 @@ mod tests {
         // presence-probe and the per-caller read each parsed the manifest (two
         // backend reads per hit); now the probe stashes the parsed manifest on
         // `LockedResolution` and the caller filters its outputs from it.
-        use crate::engine::local_cache::{
-            Existence, LocalCache, MANIFEST_V1, SizedReader, TargetStream,
-        };
-
-        struct CountingCache {
-            inner: SArc<dyn LocalCache>,
-            manifest_reads: SArc<AtomicUsize>,
-        }
-        impl LocalCache for CountingCache {
-            fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
-                if name == MANIFEST_V1 {
-                    self.manifest_reads.fetch_add(1, Ordering::SeqCst);
-                }
-                self.inner.reader(addr, hashin, name)
-            }
-            fn writer(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Box<dyn std::io::Write>> {
-                self.inner.writer(addr, hashin, name)
-            }
-            fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-                self.inner.exists(addr, hashin, name)
-            }
-            // Forwarded, not defaulted: defaulting would route the probe through
-            // the blocking  and park the worker this test runs on.
-            fn existence(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Existence> {
-                self.inner.existence(addr, hashin, name)
-            }
-            // Forwarded for the same reason: only the layer that owns the write
-            // queue can answer "committed" without waiting on it.
-            fn exists_committed(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<bool> {
-                self.inner.exists_committed(addr, hashin, name)
-            }
-            fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
-                self.inner.delete(addr, hashin, name)
-            }
-            fn list_targets(&self) -> anyhow::Result<TargetStream> {
-                self.inner.list_targets()
-            }
-            fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
-                self.inner.list_target_entries(addr)
-            }
-            fn seekable_reader(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
-            {
-                self.inner.seekable_reader(addr, hashin, name)
-            }
-            // See the note on the other cache decorator in this file: defaulting
-            // this silently disables the direct-open path under the test.
-            fn file_path(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> Option<std::path::PathBuf> {
-                self.inner.file_path(addr, hashin, name)
-            }
-        }
+        use crate::engine::local_cache::MANIFEST_V1;
+        use crate::engine::local_cache_test_double::ForwardingCache;
 
         let dir = tempdir().expect("tempdir");
         let mut engine = Engine::new(Config {
@@ -8695,10 +8554,14 @@ mod tests {
         })
         .expect("engine");
         let manifest_reads = SArc::new(AtomicUsize::new(0));
-        engine.local_cache = SArc::new(CountingCache {
-            inner: engine.local_cache.clone(),
-            manifest_reads: SArc::clone(&manifest_reads),
-        });
+        engine.local_cache = SArc::new(ForwardingCache::new(engine.local_cache.clone()).on_reader({
+            let manifest_reads = SArc::clone(&manifest_reads);
+            move |_, _, name| {
+                if name == MANIFEST_V1 {
+                    manifest_reads.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
         let exec_count = SArc::new(AtomicUsize::new(0));
         engine
             .register_driver(enclose!(
