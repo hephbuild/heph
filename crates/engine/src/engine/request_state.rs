@@ -422,7 +422,17 @@ impl Drop for DeferredTrims {
         // One job for the batch: `try_trim_after_write` is non-blocking and
         // short, and a job per target would allocate a boxed closure per
         // written revision — which is exactly what this replaces.
+        //
+        // Bookkeeping lane, never the reclaim one. This lands at request-state
+        // drop, which is exactly when the reclaim backlog is deepest — every
+        // sandbox the run finished with is still queued for `remove_dir_all`. On
+        // a shared queue the batch would sit behind all of them, so
+        // `cache.history` would only be enforced after the last 5k-50k-inode
+        // removal, and process exit (gated on `bg_pending`, which both lanes
+        // feed) would pay the rmdir drain *plus* the trim instead of the max of
+        // the two.
         crate::engine::sandbox_cleaner::enqueue(
+            crate::engine::sandbox_cleaner::Lane::Bookkeeping,
             format!("gc trim {} target(s)", trims.len()),
             Box::new(move || {
                 for (addr, trim) in trims {
