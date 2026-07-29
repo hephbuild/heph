@@ -10,7 +10,6 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
 use hmodel::htaddr::Addr;
-use std::io;
 use std::sync::Arc;
 
 impl Engine {
@@ -30,7 +29,7 @@ impl Engine {
         shell: bool,
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
-        Option<crate::engine::sandbox_cleaner::SandboxCleanupJob>,
+        crate::engine::sandbox_cleaner::SandboxTeardown,
         Vec<hplugin::driver::SandboxGuard>,
     )> {
         let driver = self
@@ -89,71 +88,134 @@ impl Engine {
                         dir.join(format!("__target_{}_{}", addr.name, addr.hash_str()))
                     }
                 };
-                // Stale cleanup only — the driver bridge owns the create step
-                // because it may redirect this path into a FUSE mount (v2 single-
-                // mount mode). Creating here would waste an inode + leave an
-                // orphan empty dir when the bridge picks the FUSE side.
-                hcore::hmemoizer::set_phase("execute:sandbox_remove");
-                sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
-                    match crate::engine::sandbox_cleaner::remove_dir_all(&sandbox_dir) {
-                        Ok(_) => Ok(()),
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-                        Err(err) => Err(err),
-                    }
-                }))
-                .await
-                .with_context(|| format!("remove stale sandbox dir {}", sandbox_dir.display()))?;
+                // Claim the sandbox path for this execute — inline, before any
+                // removal job is queued. The claim is what orders this run
+                // against every straggler: it happens synchronously here, so a
+                // predecessor's queued job (in any queue, under any lock-grant
+                // order) that runs after this line sees a stale claim and
+                // declines. See `sandbox_cleaner::generation`; `claim` takes
+                // only the fast generation lock, never the walk lock, so it is
+                // safe on the async path.
+                let sandbox_generation =
+                    crate::engine::sandbox_cleaner::generation::claim(&sandbox_dir);
+                // From the moment the path is claimed, its teardown is owned,
+                // and every exit resolves it exactly once, three ways:
+                // completion hands the bridge's cleanup job to `complete()` in
+                // `execute_and_cache_inner`; a *failing* run resolves it as
+                // `leave_for_diagnostics` in the match below (the failure
+                // renderer reads the log tail lazily from the sandbox, so a
+                // failed target's tree must survive until its next run — its
+                // documented pre-teardown behaviour); and a bare drop —
+                // cancellation or an unwind, and only those — queues a
+                // generation-checked reclaim of the directory. Without that
+                // last leg, mass fail-fast leaves one abandoned sandbox tree
+                // per *cancelled* execute and nothing ever collects them
+                // (`gc` has no sandbox sweep).
+                let mut sandbox_teardown = crate::engine::sandbox_cleaner::SandboxTeardown::arm(
+                    sandbox_dir.clone(),
+                    sandbox_generation,
+                    rs.bg_pending(),
+                );
 
-                let exec_wrapper: InteractiveWrapper = exec_wrapper.unwrap_or_else(|| {
-                    Arc::new(|inner: InteractiveInner| {
-                        Box::pin(async move { inner(None, None, None).await })
-                    })
-                });
-
-                let (tx, rx) = tokio::sync::oneshot::channel::<RunResponse>();
-
-                let hashin = hashin.to_owned();
-
-                let inner: InteractiveInner = Box::new(enclose!(
-                    (driver, def, rs, self => engine, sandbox_dir)
-                    move |stdin, stdout, stderr| {
-                        Box::pin(async move {
-                            let req = RunRequest {
-                                request_id: rs.request_id(),
-                                target: &def.target,
-                                tree_root_path: engine.cfg.root.clone(),
-                                inputs: deps_result,
-                                hashin: &hashin,
-                                stdin,
-                                stdout,
-                                stderr,
-                                sandbox_dir,
-                            };
-                            let res = if shell {
-                                driver.driver.run_shell(req, rs.ctoken()).await?
-                            } else {
-                                driver.driver.run(req, rs.ctoken()).await?
-                            };
-                            drop(tx.send(res));
-                            Ok(())
-                        })
-                    }
-                ));
-
-                hcore::hmemoizer::set_phase("execute:driver_run");
-                exec_wrapper(inner).await.with_context(|| "run")?;
-
-                hcore::hmemoizer::set_phase("execute:oneshot_rx");
-                let res = rx
+                // Everything fallible between the claim and the run response
+                // lives in this block, so an `Err` — a failing target above
+                // all — can be told apart from a drop: the error leaves the
+                // sandbox for diagnostics, the drop reclaims it.
+                let run = async {
+                    // Stale cleanup only — the driver bridge owns the create
+                    // step because it may redirect this path into a FUSE mount
+                    // (v2 single-mount mode). Creating here would waste an
+                    // inode + leave an orphan empty dir when the bridge picks
+                    // the FUSE side.
+                    //
+                    // Queued with this run's claim: if this future is cancelled
+                    // at the await below (the production wedge's phase), the
+                    // job still runs eventually — and by then a successor may
+                    // own the path, in which case the job declines rather than
+                    // deleting the successor's live sandbox.
+                    hcore::hmemoizer::set_phase("execute:sandbox_remove");
+                    sync_fs_op_on_thread(enclose!(
+                        (sandbox_dir) move ||
+                            crate::engine::sandbox_cleaner::generation::remove_stale(
+                                &sandbox_dir,
+                                sandbox_generation,
+                            )
+                    ))
                     .await
-                    .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))?;
+                    .with_context(|| {
+                        format!("remove stale sandbox dir {}", sandbox_dir.display())
+                    })?;
+
+                    let exec_wrapper: InteractiveWrapper = exec_wrapper.unwrap_or_else(|| {
+                        Arc::new(|inner: InteractiveInner| {
+                            Box::pin(async move { inner(None, None, None).await })
+                        })
+                    });
+
+                    let (tx, rx) = tokio::sync::oneshot::channel::<RunResponse>();
+
+                    let hashin = hashin.to_owned();
+
+                    let inner: InteractiveInner = Box::new(enclose!(
+                        (driver, def, rs, self => engine, sandbox_dir)
+                        move |stdin, stdout, stderr| {
+                            Box::pin(async move {
+                                let req = RunRequest {
+                                    request_id: rs.request_id(),
+                                    target: &def.target,
+                                    tree_root_path: engine.cfg.root.clone(),
+                                    inputs: deps_result,
+                                    hashin: &hashin,
+                                    stdin,
+                                    stdout,
+                                    stderr,
+                                    sandbox_dir,
+                                };
+                                let res = if shell {
+                                    driver.driver.run_shell(req, rs.ctoken()).await?
+                                } else {
+                                    driver.driver.run(req, rs.ctoken()).await?
+                                };
+                                drop(tx.send(res));
+                                Ok(())
+                            })
+                        }
+                    ));
+
+                    hcore::hmemoizer::set_phase("execute:driver_run");
+                    exec_wrapper(inner).await.with_context(|| "run")?;
+
+                    hcore::hmemoizer::set_phase("execute:oneshot_rx");
+                    rx.await
+                        .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))
+                }
+                .await;
+
+                let res = match run {
+                    Ok(res) => res,
+                    Err(err) => {
+                        // The target failed. Its sandbox *is* the diagnostic —
+                        // the failure paragraph reads the process's last log
+                        // lines from it lazily, at render time — so nothing may
+                        // be queued against it, or the diagnostic races its own
+                        // cleanup and a failing target reports an exit status
+                        // with no output. The tree survives until this target's
+                        // next run, whose `remove_stale` reclaims it.
+                        sandbox_teardown.leave_for_diagnostics();
+                        return Err(err);
+                    }
+                };
 
                 // Bridge owns the cleanup closure (knows whether the sandbox
                 // lives in the plain `<home>/sandbox/...` tree or under the
-                // FUSE upper-side dir). Slot guards travel with the response
-                // so result.rs can drop them in the same defer that fires
-                // sandbox cleanup.
-                Ok((res.artifacts, res.sandbox_cleanup, res.sandbox_guards))
+                // FUSE upper-side dir). It rides inside the teardown guard from
+                // here: `execute_and_cache_inner` completes the teardown after
+                // `cache_locally` (which reads from the sandbox), and any drop
+                // on the way there queues the generation-checked reclaim
+                // instead. Slot guards travel with the response so result.rs
+                // can drop them before completing the teardown.
+                sandbox_teardown.set_job(res.sandbox_cleanup);
+                Ok((res.artifacts, sandbox_teardown, res.sandbox_guards))
             },
         )
         .await;
@@ -212,9 +274,10 @@ impl Engine {
 /// Not `tokio::fs::*` (which routes through `spawn_blocking`, observed to lose
 /// wake-ups on macOS under heavy load) and not inline on the worker (which parks
 /// it without telling the runtime). See `hcore::blocking`.
-async fn sync_fs_op_on_thread<F>(f: F) -> std::io::Result<()>
+async fn sync_fs_op_on_thread<F, T>(f: F) -> std::io::Result<T>
 where
-    F: FnOnce() -> std::io::Result<()> + Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
 {
     hcore::blocking::run(f).await
 }
