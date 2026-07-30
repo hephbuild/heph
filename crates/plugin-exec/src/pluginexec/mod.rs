@@ -1009,6 +1009,17 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 }
 
 impl Driver {
+    /// The PATH injected into target processes, formatted for both the child's
+    /// env and the spawn-failure diagnostic. Empty `search_path` falls back to
+    /// a hardcoded default.
+    fn sandbox_path_display(&self) -> String {
+        if self.search_path.is_empty() {
+            ["/usr/local/bin", "/usr/bin", "/bin"].join(":")
+        } else {
+            self.search_path.join(":")
+        }
+    }
+
     async fn run_inner<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
@@ -1035,12 +1046,7 @@ impl Driver {
         if shell && let Ok(term) = std::env::var("TERM") {
             env.insert("TERM".to_string(), term);
         }
-        let path_value = if self.search_path.is_empty() {
-            ["/usr/local/bin", "/usr/bin", "/bin"].join(":")
-        } else {
-            self.search_path.join(":")
-        };
-        env.insert("PATH".to_string(), path_value);
+        env.insert("PATH".to_string(), self.sandbox_path_display());
         env.insert(
             "WORKSPACE_ROOT".to_string(),
             req.sandbox_ws_dir.to_string_lossy().to_string(),
@@ -1341,16 +1347,6 @@ impl Driver {
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect();
 
-        // Captured for the spawn-failure diagnostic below — `program` and
-        // `env_pairs` are moved into `spec` by both match arms.
-        let program_for_diag = program.clone();
-        let path_for_diag = env_pairs
-            .iter()
-            .find(|(k, _)| k == "PATH")
-            .map(|(_, v)| v.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let cwd_for_diag = req.sandbox_pkg_dir.clone();
-
         let spec = if let Some((master, slave)) = &pty_pair {
             // Inherit the parent's terminal size so bash can wrap and place the
             // prompt correctly. Falls back to 80x24 if the parent has no tty.
@@ -1411,18 +1407,20 @@ impl Driver {
         };
 
         hcore::hmemoizer::set_phase("pluginexec:spawn");
+        // Program/PATH/cwd are only formatted here, on the error path — `run`
+        // and `req` are still fully owned locals at this point (only cloned
+        // versions of their fields were moved into `spec` above), so no work
+        // happens on the far more common spawn-succeeds path.
         let mut handle = proc_exec::spawn(spec).map_err(|e| {
+            let program = run.first().map_or("", String::as_str);
             if e.kind() == std::io::ErrorKind::NotFound {
-                let path_display = if path_for_diag.is_empty() {
-                    "<empty>"
-                } else {
-                    &path_for_diag
-                };
                 anyhow::anyhow!(
-                    "spawn child process {program_for_diag:?}: {e} — not found in the driver's sandbox PATH ({path_display}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd_for_diag:?} exists."
+                    "spawn child process {program:?}: {e} — not found in the driver's sandbox PATH ({path}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd:?} exists.",
+                    path = self.sandbox_path_display(),
+                    cwd = req.sandbox_pkg_dir,
                 )
             } else {
-                anyhow::Error::new(e).context(format!("spawn child process {program_for_diag:?}"))
+                anyhow::Error::new(e).context(format!("spawn child process {program:?}"))
             }
         })?;
 
