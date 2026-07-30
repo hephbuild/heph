@@ -75,16 +75,17 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
 
     // Force-umount sandboxfuse mounts so a parent crash doesn't leave the
     // kext wedged. Done after killing children so no held FD blocks
-    // unmount. Best-effort; ignore errors (already unmounted, doesn't
-    // exist, etc.).
-    for root in &fuse_roots {
-        let lower = root.join("lower");
+    // unmount. The registered path is the mountpoint itself (the kernel/kext
+    // mount lives at `<root>/lower`; the FSKit mount lives under `/Volumes`),
+    // so umount it directly. Best-effort; ignore errors (already unmounted,
+    // doesn't exist, etc.).
+    for mountpoint in &fuse_roots {
         #[cfg(target_os = "linux")]
         {
             drop(
                 std::process::Command::new("fusermount3")
                     .arg("-uz")
-                    .arg(&lower)
+                    .arg(mountpoint)
                     .output(),
             );
         }
@@ -93,7 +94,7 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
             drop(
                 std::process::Command::new("umount")
                     .arg("-f")
-                    .arg(&lower)
+                    .arg(mountpoint)
                     .output(),
             );
         }

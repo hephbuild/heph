@@ -17,7 +17,7 @@ use heph::pluginstatictarget;
 use htestkit::WorkspaceBuilder;
 use std::sync::Arc;
 
-pub use htestkit::{artifact_bytes, artifact_paths, artifact_string, root};
+pub use htestkit::{artifact_bytes, artifact_paths, artifact_string, fuse_mount_works, root};
 
 pub struct Workspace {
     inner: htestkit::Workspace,
@@ -100,6 +100,11 @@ impl Workspace {
             home_dir: std::path::PathBuf::new(),
             parallelism: cfg.parallelism,
             fs_skip: cfg.fs_skip.clone(),
+            // Explicit, not the omitted-config platform default (`auto` on
+            // Linux): a second `Engine` reopened over the same root races the
+            // first's FUSE per-pid lock, and this harness isn't exercising
+            // FUSE anyway.
+            fuse: heph::engine::FuseConfig::off(),
             ..Default::default()
         })
         .context("reopen: build engine over the existing workspace root")?;
@@ -116,6 +121,22 @@ impl Workspace {
             .register_managed_driver(|_| Box::new(pluginhttp::Driver))
             .context("reopen: register http driver")?;
         Ok(Arc::new(engine))
+    }
+
+    /// Workspace with the FUSE sandbox overlay forced on. Callers must first
+    /// check [`fuse_mount_works`] and skip the test when it returns false —
+    /// a forced-on mount errors on hosts without usable FUSE.
+    pub fn with_fuse() -> Self {
+        let builder = WorkspaceBuilder::new()
+            .expect("workspace tempdir")
+            .with_fuse(heph::engine::FuseConfig::on())
+            .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_bash()));
+        Self {
+            inner: builder.build().expect("build fuse workspace"),
+            reopen_with: None,
+        }
     }
 
     pub fn with_static(targets: Vec<pluginstatictarget::Target>) -> Result<Self> {
