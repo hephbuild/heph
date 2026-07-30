@@ -1309,16 +1309,28 @@ fn resolve_named_contexts(
     for name in &def.bases {
         let origin = format!("base|{name}");
         let paths = dep_files(req, &origin)?;
+        anyhow::ensure!(
+            !paths.is_empty(),
+            "`bases` entry {name:?} produced no files in the sandbox"
+        );
+        // A dep's unpack list names *files*, never the directories holding them,
+        // so the layout root cannot be found by looking for a directory entry.
+        // Locate it by its marker instead: an OCI layout is exactly a tree with
+        // an `oci-layout` file at its root, which is also the thing buildx's
+        // `oci-layout://` wants pointed at.
         let dir = paths
             .iter()
-            .find(|p| p.is_dir())
-            .or_else(|| paths.first())
-            .with_context(|| format!("`bases` entry {name:?} produced no files in the sandbox"))?;
-        anyhow::ensure!(
-            dir.is_dir(),
-            "`bases` entry {name:?} resolved to {dir:?}, which is a file, not an OCI layout \
-             directory. Build the base with `oci_pull(layout = True)`."
-        );
+            .find(|p| p.file_name().is_some_and(|n| n == "oci-layout"))
+            .and_then(|p| p.parent())
+            .with_context(|| {
+                format!(
+                    "`bases` entry {name:?} is not an OCI layout directory: no `oci-layout` file \
+                     among {} staged path(s), the first being {:?}. Build the base with \
+                     `oci_pull(layout = True)` — a plain archive cannot be a build context.",
+                    paths.len(),
+                    paths.first()
+                )
+            })?;
         out.insert(
             name.clone(),
             format!("oci-layout://{}", dir.to_string_lossy()),
@@ -2118,6 +2130,116 @@ exit 0
     // ---------------------------------------------------------------
     // run(): what the driver actually does with the command it built.
     // ---------------------------------------------------------------
+
+    /// A `bases` dep is staged as the *files* of an OCI layout, never as a
+    /// directory entry, so the build context has to be recovered from the
+    /// layout's `oci-layout` marker. Resolving it to the first staged path
+    /// instead hands buildx a file, and every `FROM <base>` build fails.
+    #[tokio::test]
+    async fn run_points_a_base_context_at_the_layout_directory() {
+        let sbx = Sandbox::new("app");
+        std::fs::write(sbx.pkg.join("Dockerfile"), "FROM base\n").expect("dockerfile");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                (
+                    "bases",
+                    Value::Map(HashMap::from([(
+                        "base".to_string(),
+                        Value::String(":alpine".to_string()),
+                    )])),
+                ),
+            ]),
+        )
+        .await;
+
+        // What `oci_pull(layout = True)` leaves in the sandbox: a directory of
+        // files, listed one per line, with no entry for the directory itself.
+        let layout = sbx.pkg.join("alpine.oci");
+        std::fs::create_dir_all(layout.join("blobs/sha256")).expect("mkdir layout");
+        for f in ["oci-layout", "index.json"] {
+            std::fs::write(layout.join(f), "{}").expect("layout file");
+        }
+        let staged = vec![
+            layout.join("blobs/sha256/abc"),
+            layout.join("index.json"),
+            layout.join("oci-layout"),
+        ];
+        std::fs::write(&staged[0], "blob").expect("blob");
+
+        let bin = sbx.fake("docker", FAKE_DOCKER_OK);
+        let rid = "req".to_string();
+        let req = run_request(
+            &rid,
+            "hashin",
+            &resp.target_def,
+            &sbx,
+            &[("base|base", staged)],
+        );
+        Driver::with_binary(bin)
+            .run(req, &StdCancellationToken::new())
+            .await
+            .expect("run");
+
+        let build = sbx
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("buildx build"))
+            .expect("a buildx build call");
+        assert!(
+            build.contains(&format!(
+                "--build-context base=oci-layout://{}",
+                layout.to_string_lossy()
+            )),
+            "the base must point at the layout directory, got: {build}"
+        );
+    }
+
+    /// A base that is not a layout at all (an `oci_image` tar, say) must say so
+    /// rather than handing buildx a path it will fail on deep inside.
+    #[tokio::test]
+    async fn run_rejects_a_base_that_is_not_a_layout() {
+        let sbx = Sandbox::new("app");
+        std::fs::write(sbx.pkg.join("Dockerfile"), "FROM base\n").expect("dockerfile");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                (
+                    "bases",
+                    Value::Map(HashMap::from([(
+                        "base".to_string(),
+                        Value::String(":alpine".to_string()),
+                    )])),
+                ),
+            ]),
+        )
+        .await;
+
+        let tar = sbx.pkg.join("alpine.tar");
+        std::fs::write(&tar, "not a layout").expect("tar");
+        let bin = sbx.fake("docker", FAKE_DOCKER_OK);
+        let rid = "req".to_string();
+        let req = run_request(
+            &rid,
+            "hashin",
+            &resp.target_def,
+            &sbx,
+            &[("base|base", vec![tar])],
+        );
+        let err = Driver::with_binary(bin)
+            .run(req, &StdCancellationToken::new())
+            .await
+            .err()
+            .expect("a non-layout base must fail");
+        assert!(
+            format!("{err:#}").contains("layout = True"),
+            "the error must name the fix, got: {err:#}"
+        );
+    }
 
     /// Drive `run()` end to end against a fake docker: the build is invoked, the
     /// digest is read back out of the metadata file, and it lands in the digest
