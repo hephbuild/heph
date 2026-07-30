@@ -107,10 +107,10 @@ fn docker_available() -> bool {
 /// do it, so the only honest probe is to try one. This runs a `FROM scratch`
 /// two-platform build once and caches the verdict.
 ///
-/// It has to be the default builder: `oci_image` clears `BUILDX_BUILDER` out of
-/// the child environment on purpose (an ambient builder would change the image
-/// behind the cache key's back) and exposes no builder attribute, so a test
-/// cannot point the driver at one it created.
+/// This probes the *default* builder specifically. A target that needs another
+/// one names it with `builder =` — see
+/// [`test_real_docker_builds_multi_arch_on_a_named_builder`], which creates a
+/// `docker-container` builder and points a target at it.
 fn multi_platform_capable() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
@@ -802,5 +802,98 @@ target(
         derived.iter().any(|e| e == "index.json"),
         "the derived image must be a real OCI archive, got: {derived:?}"
     );
+    Ok(())
+}
+
+/// A `docker-container` buildx builder, removed on drop.
+///
+/// Creating one needs the network the first time (BuildKit's own image), so a
+/// failure here is a skip.
+struct ContainerBuilder {
+    name: String,
+}
+
+impl ContainerBuilder {
+    fn create() -> Option<Self> {
+        let name = format!("heph-e2e-{}", std::process::id());
+        probe_for(
+            &[
+                "buildx",
+                "create",
+                "--name",
+                &name,
+                "--driver",
+                "docker-container",
+                "--bootstrap",
+            ],
+            std::time::Duration::from_secs(180),
+        )
+        .then_some(ContainerBuilder { name })
+    }
+}
+
+impl Drop for ContainerBuilder {
+    fn drop(&mut self) {
+        drop(
+            Command::new("docker")
+                .args(["buildx", "rm", "-f", &self.name])
+                .output(),
+        );
+    }
+}
+
+/// `builder` is what makes a multi-platform build possible on a host whose
+/// current builder is the plain daemon one — the case every `docker buildx`
+/// default hits, and the reason the attribute exists at all.
+///
+/// It also has to reach the *probe*: with `platforms` unset the cache key
+/// carries the builder's default platform, and asking the wrong builder would
+/// key the target on a platform it never built.
+#[tokio::test]
+async fn test_real_docker_builds_multi_arch_on_a_named_builder() -> anyhow::Result<()> {
+    require_docker!();
+    let Some(builder) = ContainerBuilder::create() else {
+        eprintln!("skipping: could not create a docker-container builder (no network?)");
+        return Ok(());
+    };
+
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"
+target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
+target(
+    name = "dockerfile",
+    driver = "bash",
+    run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
+    out = "Dockerfile",
+)
+target(
+    name = "img",
+    driver = "oci_image",
+    context = [":dockerfile", ":payload"],
+    platforms = ["linux/amd64", "linux/arm64"],
+    builder = "{name}",
+)
+"#,
+            name = builder.name
+        ),
+    );
+
+    let tar = archive_of(&ws, "//app:img").await?;
+    let manifest_list: String = archive_file(
+        &tar,
+        &blob_path(&digest_of(&archive_file(&tar, "index.json"))),
+    )
+    .chars()
+    .filter(|c| !c.is_whitespace())
+    .collect();
+    for arch in ["amd64", "arm64"] {
+        assert!(
+            manifest_list.contains(&format!("\"architecture\":\"{arch}\"")),
+            "the named builder must have produced a {arch} entry, got: {manifest_list}"
+        );
+    }
     Ok(())
 }
