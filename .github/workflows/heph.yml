@@ -1107,6 +1107,7 @@ jobs:
               --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" \
               --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.base.outputs.sha }}" \
               --arg event_type "${{ github.event_name }}" \
+              --arg branch "${{ github.head_ref || github.ref_name }}" \
               --arg run_id "${{ github.run_id }}" \
               --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
               '[.[] | {
@@ -1115,7 +1116,7 @@ jobs:
                 properties: (. + {
                   tier: $tier, os: $os, arch: $arch,
                   sha: $sha, base_sha: $base_sha, event_type: $event_type,
-                  run_id: $run_id, run_url: $run_url
+                  branch: $branch, run_id: $run_id, run_url: $run_url
                 })
               }]' "$f")
             events=$(printf '%s' "$events" | jq --argjson add "$batch" '. + $add')
