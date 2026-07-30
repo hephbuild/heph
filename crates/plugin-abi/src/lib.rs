@@ -15,8 +15,11 @@
 /// The prost-generated wire message types (`heph.plugin.v1`).
 pub use hproto_gen::heph::plugin::v1 as pb;
 
-/// ABI semantic version. Major must match exactly between host and plugin;
-/// minor is negotiated to `min(host, plugin)` at handshake.
+/// ABI semantic version. Not read at runtime — no handshake or negotiation
+/// happens; a mismatched host/plugin pair just mismatches at `dlopen` load via
+/// stabby's structural `get_stabbied` check and aborts. This constant is
+/// bookkeeping: `scripts/abi-check.sh` fails CI if the ABI surface changed
+/// without a bump, so the version history documents *why* a break happened.
 ///
 /// 0.5.0: `StableExecutor` gained a `states` method (fetch a package's provider
 /// states for cross-subtree config resolution — the go variant `vp` lookup). A
