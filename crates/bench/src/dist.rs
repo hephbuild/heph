@@ -105,12 +105,18 @@ fn write_go_config(corpus: &Path, dist: &Dist) -> Result<()> {
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&doc)?)
         .with_context(|| format!("write {}", manifest_path.display()))?;
 
+    // `gotool: host` — the go provider requires an explicit choice (host /
+    // pinned version / a toolchain-producing target) and has no default.
+    // `host` uses the Go `actions/setup-go` already installed for
+    // `tools/gorepogen`, so this stays offline and pays no extra hermetic-
+    // SDK download — same choice `bin-e2e`'s own go-plugin fixture makes,
+    // and for the same reason.
     let config = format!(
         "plugins:\n  \
          - builtin: buildfile\n    options:\n      patterns:\n        - BUILD\n  \
          - builtin: exec\n  \
          - builtin: bash\n  \
-         - path: {}\n",
+         - path: {}\n    options:\n      gotool: \"host\"\n",
         manifest_path.display()
     );
     std::fs::write(corpus.join(".hephconfig"), config).context("write .hephconfig")
