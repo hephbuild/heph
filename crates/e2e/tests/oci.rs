@@ -1,3 +1,8 @@
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
 //! End-to-end coverage for the `oci_*` drivers against a fake `docker`.
 //!
 //! The unit tests in `plugin-oci` drive `run()` directly; these go through the

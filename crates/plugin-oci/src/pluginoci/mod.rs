@@ -1085,31 +1085,42 @@ impl TailBuf {
     }
 }
 
-/// Relay one of the child's streams to the user's terminal as it arrives, while
-/// keeping a bounded tail for the error message. `capture` additionally
-/// accumulates the whole stream — only used for stdout, which for every command
-/// here is a short status line (`Loaded image: …`); BuildKit's progress goes to
-/// stderr and is never accumulated.
+/// Relay the child's output to the user's terminal as it arrives, while keeping
+/// a bounded tail of each stream for the error message and accumulating stdout.
+///
+/// Both streams arrive interleaved through a single [`proc_exec::OutputReader`]
+/// tagged by [`proc_exec::StreamId`] — one reader, not two, is what keeps a
+/// chatty stderr from head-of-line blocking stdout on macOS.
+///
+/// Only stdout is accumulated: for every command here it is a short status line
+/// (`Loaded image: …`), while BuildKit's progress goes to stderr and would be
+/// megabytes.
 async fn tee<'w>(
-    reader: Option<proc_exec::ChunkReader>,
-    // The trait object's lifetime is a free parameter: `&mut dyn Trait` is
+    reader: Option<proc_exec::OutputReader>,
+    // The trait objects' lifetime is a free parameter: `&mut dyn Trait` is
     // invariant, so it cannot be shortened to the borrow's at the call site.
-    mut sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'w)>,
-    tail: &std::sync::Mutex<TailBuf>,
-    capture: Option<&std::sync::Mutex<Vec<u8>>>,
+    mut stdout_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'w)>,
+    mut stderr_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'w)>,
+    out_tail: &std::sync::Mutex<TailBuf>,
+    err_tail: &std::sync::Mutex<TailBuf>,
+    captured: &std::sync::Mutex<Vec<u8>>,
 ) {
     use tokio::io::AsyncWriteExt as _;
     let Some(mut reader) = reader else { return };
-    while let Ok(Some(chunk)) = reader.recv().await {
+    while let Ok(Some((stream, chunk))) = reader.recv().await {
+        let (tail, sink) = match stream {
+            proc_exec::StreamId::Stdout => {
+                if let Ok(mut c) = captured.lock() {
+                    c.extend_from_slice(&chunk);
+                }
+                (out_tail, &mut stdout_sink)
+            }
+            proc_exec::StreamId::Stderr => (err_tail, &mut stderr_sink),
+        };
         if let Ok(mut t) = tail.lock() {
             t.push(&chunk);
         }
-        if let Some(cap) = capture
-            && let Ok(mut c) = cap.lock()
-        {
-            c.extend_from_slice(&chunk);
-        }
-        if let Some(ref mut out) = sink {
+        if let Some(out) = sink {
             drop(out.write_all(&chunk).await);
             drop(out.flush().await);
         }
@@ -1155,20 +1166,31 @@ pub(crate) async fn run_tool(
     };
 
     let mut handle = proc_exec::spawn(spec).map_err(|e| missing_tool_error(e, bin, what))?;
-    let stdout_reader = handle.take_stdout();
-    let stderr_reader = handle.take_stderr();
+    let output_reader = handle.take_output();
 
     let out_tail = std::sync::Mutex::new(TailBuf::default());
     let err_tail = std::sync::Mutex::new(TailBuf::default());
     let captured = std::sync::Mutex::new(Vec::new());
 
     let (stdout_sink, stderr_sink) = io.sinks();
-    let stdout_fut = tee(stdout_reader, stdout_sink, &out_tail, Some(&captured));
-    let stderr_fut = tee(stderr_reader, stderr_sink, &err_tail, None);
+    let io_fut = tee(
+        output_reader,
+        stdout_sink,
+        stderr_sink,
+        &out_tail,
+        &err_tail,
+        &captured,
+    );
 
-    let (status, (), ()) = tokio::join!(handle.wait_or_cancel(ctoken), stdout_fut, stderr_fut);
+    // The wait must not share a task with the reader: it parks its worker until
+    // the child exits, so the pipes would stop draining and a build that fills
+    // one would wedge forever. `spawn_wait` is the only public wait for exactly
+    // that reason, and it carries the cancellation escalation
+    // (SIGINT → grace → SIGKILL) inside the spawned task.
+    let wait_handle = handle.spawn_wait(ctoken.clone_arc());
+    let (wait_res, ()) = tokio::join!(wait_handle, io_fut);
 
-    let status = match status {
+    let status = match wait_res.context("wait task for the child")? {
         Ok(s) => s,
         Err(e) if ctoken.is_cancelled() => {
             return Err(anyhow::Error::new(hplugin::error::CancelledError))
