@@ -100,6 +100,14 @@ pub const DEFAULT_INDENT: usize = 4;
 /// Every file directly inside `dir` whose name matches one of `patterns`
 /// (handles literal names like `BUILD` and globs like `*.BUILD`), sorted for
 /// deterministic order. A package may have more than one BUILD file.
+///
+/// **Diverges from the build.** This reads `std::fs` directly and pattern-matches
+/// a *lossy* name, where the engine's `find_build_files` goes through
+/// [`CachedWalker`], which rejects a non-UTF-8 name outright. So a
+/// `caf\xe9.BUILD` matches `*.BUILD` here (as `caf\u{FFFD}.BUILD`) and the
+/// formatter and LSP would open a file the build hard-refuses to see. Its
+/// callers are editor-side only, so this is a diagnosability trap rather than a
+/// hash route — but it should be routed through the walker.
 pub fn build_files_in_dir(dir: &Path, patterns: &[glob::Pattern]) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -297,6 +305,28 @@ impl Provider {
 /// def hash, here it is a correctness one — a stale list is a stale *definition*.
 /// `HEPH_DEBUG_CACHED_WALKER=0` bypasses the cache and can likewise compute a
 /// different def hash from the same tree.
+///
+/// # Unicode: names are taken byte-for-byte, deliberately
+///
+/// A package name is the directory name exactly as `readdir` returns it. heph
+/// applies **no Unicode normalization**, and none is intended.
+///
+/// That is uniform on the supported targets: for one commit checked out by git
+/// onto a local ext4/btrfs/APFS volume, `readdir` returns identical bytes on all
+/// three, so the sorted list and its def hash are identical. APFS is
+/// normalization-*preserving* (an NFD directory name reads back as NFD); it is
+/// only *lookup* that is normalization- and case-insensitive, which is a
+/// property of address resolution, not of this list. Legacy HFS+ *does*
+/// normalize to NFD on store, and so do some network and container-VM mounts —
+/// those produce a **different** def hash, which is a cache miss and never a
+/// wrong artifact, because every file input is content-hashed independently.
+///
+/// Normalizing here would be worse, not better: on a byte-preserving filesystem
+/// a tree can legitimately hold both the NFC and the NFD spelling as two
+/// distinct package directories, and folding them to one name would silently
+/// merge two packages — trading a cache miss on an exotic mount for a name
+/// collision on a supported one. It would also re-key every target of every
+/// workspace with a non-ASCII package name.
 pub(crate) struct PackageList {
     root: PathBuf,
     patterns: Vec<glob::Pattern>,
@@ -387,11 +417,16 @@ fn find_packages_sync(
     let mut has_build_file = false;
     for entry in &listing.entries {
         match entry.kind {
-            hwalk::EntryKind::File | hwalk::EntryKind::Symlink => {
+            // A symlinked BUILD file is not evidence of a package: `find_build_files`
+            // (run_file.rs) deliberately excludes symlinks when it later reads this
+            // package's build files, so counting one here would list a package that
+            // resolves zero targets when actually loaded.
+            hwalk::EntryKind::File => {
                 if patterns.iter().any(|p| p.matches(&entry.name)) {
                     has_build_file = true;
                 }
             }
+            hwalk::EntryKind::Symlink => {}
             hwalk::EntryKind::Dir => {
                 let entry_path = path.join(&entry.name);
                 let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
@@ -407,7 +442,22 @@ fn find_packages_sync(
     if has_build_file {
         let mut current = path;
         while let Ok(rel) = current.strip_prefix(root) {
-            let pkg_name = rel.to_string_lossy().to_string();
+            // `to_str`, never `to_string_lossy`: this string is a package name,
+            // and the sorted package list is a def-hash input. A lossy render
+            // would fold `x\xffy` and `x\xfey` into one `x\u{FFFD}y` package and
+            // hash two different trees the same. `CachedWalker::read_dir` already
+            // refuses a non-UTF-8 entry name, and every component below `root`
+            // comes from it, so this holds today — the check keeps it from
+            // becoming a silent assumption if that ever changes.
+            let pkg_name = rel
+                .to_str()
+                .with_context(|| {
+                    format!(
+                        "package directory name is not valid UTF-8: '{}'",
+                        current.display()
+                    )
+                })?
+                .to_string();
             packages.insert(pkg_name);
 
             if let Some(parent) = current.parent() {
@@ -728,6 +778,47 @@ mod tests {
             vec!["".to_string(), "a".to_string(), "b".to_string()],
             "a newly-added package is re-discovered"
         );
+    }
+
+    /// A symlinked BUILD file is not a build file to `find_build_files` (run_file.rs
+    /// deliberately mirrors the prior `file_type().is_file()`), so `list_packages`
+    /// must not count it as package evidence either — otherwise a symlinked-BUILD
+    /// package appears in `heph query` but resolves zero targets when loaded.
+    #[tokio::test]
+    async fn test_list_packages_excludes_symlink_only_build_file() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("real.BUILD"), "").unwrap();
+
+        let pkg_dir = root.join("linked");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        std::os::unix::fs::symlink(root.join("real.BUILD"), pkg_dir.join("BUILD")).unwrap();
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+        let listed: Vec<String> = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().pkg.to_string())
+            .collect();
+        assert!(
+            !listed.contains(&"linked".to_string()),
+            "symlinked-BUILD package must not be listed: {listed:?}"
+        );
+
+        // Consistent with the listing: actually loading the package (as
+        // `find_build_files` would for evaluation) finds no build files either.
+        let result = provider.run_pkg("linked").await.expect("eval package");
+        assert!(result.targets.is_empty(), "{:?}", result.targets);
     }
 
     #[test]
@@ -1135,6 +1226,176 @@ mod tests {
         assert!(packages.contains(&"a/b".to_string()));
         assert!(packages.contains(&"a".to_string())); // parent of a/b
         assert!(packages.contains(&"c".to_string()));
+    }
+
+    /// Create a directory whose name is the raw byte sequence `raw`, or `None`
+    /// when the filesystem refuses it. APFS rejects names that are not valid
+    /// UTF-8 with `EILSEQ`, so this fixture cannot be built on
+    /// `aarch64-apple-darwin`; callers skip loudly rather than assert on a
+    /// package directory that was never created.
+    fn try_create_non_utf8_package(root: &Path, raw: &[u8]) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = root.join(std::ffi::OsStr::from_bytes(raw));
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                fs::write(dir.join("BUILD"), "").unwrap();
+                Some(dir)
+            }
+            Err(e) => {
+                // Expected only on macOS. On Linux — the one target that
+                // exercises the fix — a refusal means `$TMPDIR` cannot host the
+                // fixture, and skipping would make the only real coverage a
+                // silent green.
+                assert!(
+                    cfg!(target_os = "macos"),
+                    "the non-UTF-8 package fixture must be constructible on this target, \
+                     but {root:?} refused it: {e}"
+                );
+                eprintln!(
+                    "SKIP: this filesystem refuses non-UTF-8 directory names ({e}); \
+                     the non-UTF-8 package fixture cannot be built here"
+                );
+                None
+            }
+        }
+    }
+
+    /// A package directory heph cannot name must fail the walk. Dropping it
+    /// silently removed the package — and every ancestor it would have inserted
+    /// — from the sorted list that feeds the def hash, so adding or editing a
+    /// BUILD file under it changed nothing anywhere.
+    #[tokio::test]
+    async fn list_packages_rejects_a_non_utf8_package_dir() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        fs::write(root.join("BUILD"), "").unwrap();
+        let Some(_bad) = try_create_non_utf8_package(root, b"caf\xe9") else {
+            return;
+        };
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+        let err = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .err()
+            .expect("a package dir heph cannot name must fail, not disappear from the list");
+        assert!(
+            format!("{err:#}").contains("not valid UTF-8"),
+            "error should say why, got: {err:#}"
+        );
+    }
+
+    /// Two package directories whose names `to_string_lossy` would both render
+    /// as `caf\u{FFFD}` — one package name for two distinct trees, hence one
+    /// def hash for two distinct definitions. Neither fusing them nor dropping
+    /// them is acceptable.
+    #[tokio::test]
+    async fn list_packages_rejects_package_dirs_that_would_fuse_under_lossy_rendering() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        fs::write(root.join("BUILD"), "").unwrap();
+        let Some(_a) = try_create_non_utf8_package(root, b"caf\xe9") else {
+            return;
+        };
+        let Some(_b) = try_create_non_utf8_package(root, b"caf\xe8") else {
+            return;
+        };
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+        let err = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .err()
+            .expect("two directories that render to one lossy name must not become one package");
+        // The report has to distinguish them, or it names a directory the user
+        // cannot tell from its neighbour — the very fusion being rejected.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(r"\xE9") || msg.contains(r"\xE8"),
+            "error must name the offending bytes escaped, got: {msg}"
+        );
+    }
+
+    /// Package names are the directory bytes verbatim — heph applies no Unicode
+    /// normalization, on any supported target. Pins the exemption documented on
+    /// [`PackageList`]: a normalization pass here would fold the NFC and NFD
+    /// spellings of a name into one package, and would re-key every target in a
+    /// workspace with non-ASCII package names. Both filesystems in the supported
+    /// set store the bytes they were given (APFS is normalization-preserving; it
+    /// is only *lookup* that is insensitive), so this holds identically on
+    /// Linux and macOS.
+    #[tokio::test]
+    async fn package_names_are_the_directory_bytes_not_a_normalized_form() {
+        // "café" decomposed: `e` + U+0301 COMBINING ACUTE ACCENT.
+        let nfd = "cafe\u{301}";
+        let nfc = "caf\u{e9}";
+        assert_ne!(nfd, nfc);
+
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        fs::write(root.join("BUILD"), "").unwrap();
+        let pkg = root.join(nfd);
+        fs::create_dir(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), "").unwrap();
+
+        // `$TMPDIR` may sit on one of the mounts the exemption names as *not*
+        // byte-preserving (HFS+, SMB, a container-VM share). Assert what heph
+        // does with the bytes the filesystem kept, not what the filesystem did.
+        let stored = fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n != "BUILD");
+        if stored.as_deref() != Some(nfd) {
+            eprintln!(
+                "SKIP: this filesystem did not preserve the decomposed name \
+                 (stored {stored:?}); nothing to pin here"
+            );
+            return;
+        }
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+        let res = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
+
+        assert!(
+            packages.iter().any(|p| p == nfd),
+            "expected the decomposed name verbatim, got {packages:?}"
+        );
+        assert!(
+            !packages.iter().any(|p| p == nfc),
+            "package names must not be normalized, got {packages:?}"
+        );
     }
 
     #[tokio::test]

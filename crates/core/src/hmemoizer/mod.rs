@@ -8,7 +8,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -232,7 +232,28 @@ pub fn dump_phases() -> String {
     if !phase_trace_enabled() {
         return format!("  (phase trace disabled — set {PHASE_TRACE_VAR}=1)");
     }
-    let map = phases().lock().expect("phases mutex poisoned");
+    format_phases()
+}
+
+/// The lock-and-format half of [`dump_phases`], split out so a poisoned-lock
+/// recovery can be exercised directly — `phase_trace_enabled` caches its
+/// answer for the process, so a test cannot reliably force this past the gate
+/// above once any other test in the binary has read the flag first.
+fn format_phases() -> String {
+    format_phases_from(phases())
+}
+
+/// Takes the mutex as a parameter (rather than reading the `phases()` static
+/// directly) so a test can poison a private `Mutex` of its own to exercise
+/// the recovery below, instead of poisoning the process-wide static — which
+/// every other test in the binary also locks, permanently, for the rest of
+/// the process.
+fn format_phases_from(m: &Mutex<HashMap<u64, &'static str>>) -> String {
+    // A panic while some other caller held this lock (mid `set_phase` or
+    // `clear_phase`) must not turn this diagnostic dump into a second panic —
+    // recover the guard rather than propagating the poison, same as
+    // `ApprovalCenter::lock`.
+    let map = m.lock().unwrap_or_else(PoisonError::into_inner);
     if map.is_empty() {
         return "  (none)".to_string();
     }
@@ -628,28 +649,93 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
     out
 }
 
-/// The complete in-flight picture: every incomplete cell, the wait-for graph,
-/// and each invocation's next-await label.
+/// One sampling of everything [`render_report`] prints.
+///
+/// Rendering reads four independent process-wide sources ([`inventory`],
+/// [`void_wakes`], [`dump_wait_graph`], [`dump_phases`]), each of which moves
+/// while a build runs. Sampling is split from formatting for the same reason
+/// [`inventory`] is split from [`render_inventory`] one screen up: so a value
+/// can be rendered more than once — by two writers being held against each
+/// other, or by one caller emitting both a capped and an uncapped view —
+/// without that being two reads of a moving target.
+///
+/// It is a snapshot, not a consistent cut: the four sources are sampled in
+/// order under their own locks, so they can disagree with each other by however
+/// much moved in between. That is fine for a diagnostic and is not what the
+/// split is for.
+#[derive(Debug)]
+pub struct ReportSnapshot {
+    cells: Vec<StuckCell>,
+    void_wakes: u64,
+    wait_graph: String,
+    phases: String,
+}
+
+impl ReportSnapshot {
+    /// Build a snapshot from values instead of from the live process, so
+    /// [`render_report`]'s output can be asserted against a controlled input.
+    ///
+    /// Without this the only way to exercise the format is to render whatever
+    /// the process registry happens to hold, which reduces every assertion to a
+    /// `contains` and leaves the branches that matter during an incident — an
+    /// empty inventory, an abandoned cell — uncovered. [`capture_report`] is the
+    /// live path.
+    pub fn from_parts(
+        cells: Vec<StuckCell>,
+        void_wakes: u64,
+        wait_graph: String,
+        phases: String,
+    ) -> Self {
+        Self {
+            cells,
+            void_wakes,
+            wait_graph,
+            phases,
+        }
+    }
+
+    /// The sampled cells, for a caller that needs to hand the *same* sample to
+    /// more than one renderer (see the stall watchdog's `sample_once`) instead
+    /// of taking a second, independent live read.
+    pub fn cells(&self) -> &[StuckCell] {
+        &self.cells
+    }
+}
+
+/// Sample the in-flight state once, for [`render_report`].
+pub fn capture_report() -> ReportSnapshot {
+    ReportSnapshot {
+        cells: inventory(),
+        void_wakes: void_wakes(),
+        wait_graph: dump_wait_graph(),
+        phases: dump_phases(),
+    }
+}
+
+/// Format a [`capture_report`] sampling: the complete in-flight picture — every
+/// incomplete cell, the wait-for graph, and each invocation's next-await label.
 ///
 /// Uncapped, and rendered identically wherever it is written — the `SIGQUIT`
 /// dump and the stall watchdog's companion file are the same text, so a reader
-/// does not have to learn two formats or wonder which one is truncated.
+/// does not have to learn two formats or wonder which one is truncated. There
+/// is deliberately no "capture and render" convenience wrapper: a third entry
+/// point is a third thing a writer can pick, and the two writers agreeing is the
+/// property here.
 ///
 /// The gated sections self-describe when off rather than being absent, because
 /// a missing section reads as "nothing to report" when it means "not recorded".
-pub fn render_full_report() -> String {
-    let cells = inventory();
+pub fn render_report(snapshot: &ReportSnapshot) -> String {
     format!(
         "=== in-flight inventory ({} incomplete cells) ===\n{}  \
          void wakes   {} (wakes that reached an incomplete cell and found nobody; \
          a count still climbing while nothing progresses is a lost-wake regression)\n\
          === memoizer wait-for graph ===\n{}\n\
          === memoizer phases (invocation -> next await) ===\n{}\n",
-        cells.len(),
-        render_inventory(&cells, usize::MAX),
-        void_wakes(),
-        dump_wait_graph(),
-        dump_phases(),
+        snapshot.cells.len(),
+        render_inventory(&snapshot.cells, usize::MAX),
+        snapshot.void_wakes,
+        snapshot.wait_graph,
+        snapshot.phases,
     )
 }
 
@@ -1037,7 +1123,23 @@ pub fn dump_wait_graph() -> String {
     if !cycle_detection_enabled() {
         return "  (cycle detection disabled — set HEPH_DEBUG_MEMOIZER_CYCLE=1)".to_string();
     }
-    let wg = wait_graph().lock().expect("wait_graph poisoned");
+    format_wait_graph()
+}
+
+/// The lock-and-format half of [`dump_wait_graph`], split out for the same
+/// reason as [`format_phases`]: `cycle_detection_enabled` is a process-cached
+/// flag, so a test cannot force this past the gate above on demand.
+fn format_wait_graph() -> String {
+    format_wait_graph_from(wait_graph())
+}
+
+/// Takes the mutex as a parameter for the same reason as
+/// [`format_phases_from`]: so a test can poison a private `Mutex` instead of
+/// the process-wide static.
+fn format_wait_graph_from(m: &Mutex<WaitGraph>) -> String {
+    // Recover a poisoned guard instead of panicking a second time — see
+    // `format_phases`.
+    let wg = m.lock().unwrap_or_else(PoisonError::into_inner);
     let mut out = String::new();
     if wg.cells.is_empty() && wg.waiting.is_empty() {
         out.push_str("  (empty)");
@@ -2182,6 +2284,149 @@ mod tests {
         );
     }
 
+    /// The full report over a *controlled* snapshot.
+    ///
+    /// Every other assertion on this text renders whatever the live process
+    /// registry happens to hold, so it can only ask whether a substring is
+    /// present. This one fixes the input, which is the only way to state that
+    /// the header count agrees with the lines below it, that the listing is
+    /// uncapped, and that the gated sections are echoed rather than rewritten.
+    #[test]
+    fn render_report_counts_what_it_lists_and_never_caps_it() {
+        let mut cells = vec![
+            StuckCell {
+                tag: "result",
+                key: "//a:stranded".to_string(),
+                waiters: Some(2),
+                has_driver: false,
+            },
+            StuckCell {
+                tag: "result",
+                key: "//a:abandoned".to_string(),
+                waiters: Some(0),
+                has_driver: false,
+            },
+        ];
+        // Enough to trip any cap a future edit might reintroduce.
+        cells.extend((0..40).map(|i| StuckCell {
+            tag: "spec",
+            key: format!("//p:{i}"),
+            waiters: Some(1),
+            has_driver: true,
+        }));
+
+        let text = render_report(&ReportSnapshot::from_parts(
+            cells,
+            7,
+            "  GRAPH-SECTION".to_string(),
+            "  PHASES-SECTION".to_string(),
+        ));
+
+        assert!(
+            text.contains("=== in-flight inventory (42 incomplete cells) ==="),
+            "the header counts every cell in the snapshot: {text}"
+        );
+        assert!(
+            !text.contains("… and "),
+            "the full report is uncapped — a truncated one is the thing this \
+             renderer exists to avoid: {text}"
+        );
+        assert!(
+            text.contains("[result] //a:stranded waiters=2 driver=false STRANDED"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[result] //a:abandoned waiters=0 driver=false ABANDONED"),
+            "{text}"
+        );
+        assert!(
+            text.contains("//p:39"),
+            "the last cell is listed too: {text}"
+        );
+        assert!(text.contains("void wakes   7 "), "{text}");
+        // The gated sections are pass-through: this renderer must not restate
+        // them, or "not recorded" turns into "nothing to report".
+        assert!(text.contains("  GRAPH-SECTION"), "{text}");
+        assert!(text.contains("  PHASES-SECTION"), "{text}");
+    }
+
+    /// The empty case has to say *why* it is empty. "No section" and "no cells"
+    /// read identically to someone opening this file during an incident.
+    #[test]
+    fn render_report_says_nothing_is_in_flight_rather_than_showing_nothing() {
+        let text = render_report(&ReportSnapshot::from_parts(
+            Vec::new(),
+            0,
+            "  (empty)".to_string(),
+            "  (none)".to_string(),
+        ));
+        assert!(
+            text.contains("=== in-flight inventory (0 incomplete cells) ==="),
+            "{text}"
+        );
+        assert!(
+            text.contains("none — no memoizer cell is incomplete"),
+            "{text}"
+        );
+        assert!(text.contains("memoizer wait-for graph"), "{text}");
+        assert!(text.contains("memoizer phases"), "{text}");
+    }
+
+    /// A panic while some other caller held the `phases` lock must not turn
+    /// `dump_phases`'s dump into a second panic — it should recover the
+    /// poisoned guard and still render, same as `ApprovalCenter::lock`.
+    ///
+    /// Goes through `format_phases_from` on a private `Mutex`, for two
+    /// reasons: `phase_trace_enabled` caches its answer for the whole
+    /// process the first time anything reads it, so a test cannot reliably
+    /// force `dump_phases` past its disabled-gate once some other test in
+    /// this binary has already read the flag as `false`; and poisoning the
+    /// real `phases()` static would poison it for every other test in this
+    /// binary for the rest of the process (a `Mutex`'s poison never clears),
+    /// not just this one.
+    #[test]
+    fn format_phases_recovers_from_a_poisoned_lock() {
+        let m: Mutex<HashMap<u64, &'static str>> = Mutex::new(HashMap::new());
+        drop(std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = m.lock().expect("lock for poisoning");
+                    panic!("intentional poison for format_phases_recovers_from_a_poisoned_lock");
+                })
+                .join()
+        }));
+
+        // Before the fix, this line panics with "phases mutex poisoned"
+        // instead of returning.
+        let text = format_phases_from(&m);
+        assert!(text.contains("(none)") || text.contains("inv "), "{text}");
+    }
+
+    /// Same as `format_phases_recovers_from_a_poisoned_lock`, for the
+    /// wait-for-graph lock.
+    #[test]
+    fn format_wait_graph_recovers_from_a_poisoned_lock() {
+        let m: Mutex<WaitGraph> = Mutex::new(WaitGraph::new());
+        drop(std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = m.lock().expect("lock for poisoning");
+                    panic!(
+                        "intentional poison for format_wait_graph_recovers_from_a_poisoned_lock"
+                    );
+                })
+                .join()
+        }));
+
+        // Before the fix, this line panics with "wait_graph poisoned" instead
+        // of returning.
+        let text = format_wait_graph_from(&m);
+        assert!(
+            text.contains("(empty)") || text.contains("cells (owned)"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn render_inventory_caps_the_listing_but_says_so() {
         let cells: Vec<StuckCell> = (0..5)
@@ -2202,10 +2447,12 @@ mod tests {
     /// every task parked on it waited forever — one panicking target silently
     /// hanging all of its reverse-deps. The `tokio::time::timeout` here is the
     /// assertion: without the fix these awaits never return.
+    /// A memoizer over a fallible value, shared the way the engine shares one.
+    type FallibleMemo = Arc<Memoizer<String, Result<Arc<i32>, Arc<anyhow::Error>>>>;
+
     #[tokio::test]
     async fn panic_in_a_memoized_task_fails_every_waiter() {
-        let memo: Arc<Memoizer<String, Result<Arc<i32>, Arc<anyhow::Error>>>> =
-            Arc::new(Memoizer::new());
+        let memo: FallibleMemo = Arc::new(Memoizer::new());
         let key = "boom".to_string();
 
         // The first caller panics; three more join the same in-flight cell.

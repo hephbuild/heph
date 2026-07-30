@@ -1,21 +1,8 @@
 use crate::htmatcher::Matcher;
-use crate::htpkg::PkgBuf;
+use crate::htpkg::{PkgBuf, join_rel_checked_pkg};
 
 fn resolve_relative_pkg(base: &PkgBuf, rel: &str) -> anyhow::Result<String> {
-    let mut components: Vec<&str> = base.as_str().split('/').filter(|s| !s.is_empty()).collect();
-    let rel = rel.strip_prefix("./").unwrap_or(rel);
-    for component in rel.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
-                    return Err(anyhow::anyhow!("relative path '{}' escapes root", rel));
-                }
-            }
-            c => components.push(c),
-        }
-    }
-    Ok(components.join("/"))
+    join_rel_checked_pkg(base.as_str(), rel)
 }
 
 pub fn parse(input: &str, base: &PkgBuf) -> anyhow::Result<Matcher> {
@@ -26,9 +13,13 @@ pub fn parse(input: &str, base: &PkgBuf) -> anyhow::Result<Matcher> {
             return Ok(Matcher::PackagePrefix(PkgBuf::from("")));
         }
         if let Some(prefix) = abs.strip_suffix("/...") {
-            return Ok(Matcher::PackagePrefix(PkgBuf::from(prefix)));
+            return Ok(Matcher::PackagePrefix(PkgBuf::from(join_rel_checked_pkg(
+                "", prefix,
+            )?)));
         }
-        return Ok(Matcher::Package(PkgBuf::from(abs)));
+        return Ok(Matcher::Package(PkgBuf::from(join_rel_checked_pkg(
+            "", abs,
+        )?)));
     }
 
     // Relative package reference
@@ -162,5 +153,28 @@ mod tests {
         let base = PkgBuf::from("a/b");
         let m = parse("./...", &base).unwrap();
         assert_eq!(m, Matcher::PackagePrefix(PkgBuf::from("a/b")));
+    }
+
+    #[test]
+    fn test_absolute_package_dotdot_escapes_root_fails() {
+        // The bare package pattern (`//pkg`, reachable via `heph query -e`)
+        // must not accept `..` past the workspace root either.
+        let base = PkgBuf::from("anywhere");
+        let res = parse("//../../etc", &base);
+        assert!(res.is_err(), "expected error, got {res:?}");
+    }
+
+    #[test]
+    fn test_absolute_package_prefix_dotdot_escapes_root_fails() {
+        let base = PkgBuf::from("anywhere");
+        let res = parse("//../../etc/...", &base);
+        assert!(res.is_err(), "expected error, got {res:?}");
+    }
+
+    #[test]
+    fn test_absolute_package_dotdot_within_bounds_normalizes() {
+        let base = PkgBuf::from("anywhere");
+        let m = parse("//a/b/../c", &base).unwrap();
+        assert_eq!(m, Matcher::Package(PkgBuf::from("a/c")));
     }
 }

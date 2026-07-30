@@ -325,9 +325,30 @@ fn collect_go_packages(
 
     if is_under {
         let rel = dir.strip_prefix(workspace_root).unwrap_or(dir);
-        result.push(Ok(ListPackageResponse {
-            pkg: PkgBuf::from(rel.to_string_lossy().as_ref()),
-        }));
+        // A package identifier, so `to_str` rather than a lossy render that could
+        // fold two distinct directories onto one `\u{FFFD}` name — see the same
+        // check in the buildfile provider. Unreachable while every walked
+        // component comes from `CachedWalker::read_dir`, which rejects non-UTF-8
+        // names; kept so the invariant is asserted rather than assumed.
+        match rel.to_str() {
+            Some(pkg) => result.push(Ok(ListPackageResponse {
+                pkg: PkgBuf::from(pkg),
+            })),
+            // Blames the workspace root, not the package directory: every
+            // component below the root comes from the walker, which rejects
+            // non-UTF-8 names, so the root is the only thing left that can make
+            // this relative path undecodable.
+            None => {
+                result.push(Err(anyhow::anyhow!(
+                    "package path is not valid UTF-8: '{}' (under workspace root '{}')",
+                    dir.display(),
+                    workspace_root.display()
+                )));
+                // Same as the `read_dir` arm below: stop here rather than emit
+                // one copy of the same error for every descendant.
+                return;
+            }
+        }
     }
 
     // Read through the shared walker: an unchanged tree skips the `readdir`
@@ -4548,7 +4569,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .unwrap();
         assert_eq!(check.target_spec.driver, "go_format_check");
         assert!(
-            check.target_spec.config.get("out").is_none(),
+            !check.target_spec.config.contains_key("out"),
             "check gate declares no outputs"
         );
 
@@ -4567,7 +4588,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             _ => panic!("default source group missing"),
         }
         assert!(
-            fix.target_spec.config.get("out").is_some(),
+            fix.target_spec.config.contains_key("out"),
             "fix declares in_place outputs"
         );
     }

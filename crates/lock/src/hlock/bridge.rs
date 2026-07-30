@@ -10,14 +10,12 @@
 //! readers draining, and a downgrader's `inner.read()` cannot block on any
 //! writer (no other task can reach the write lock without the gateway it holds).
 
-use crate::hlock::flock::{FLock, FRWLock};
 use crate::hlock::mem::{MemLock, MemRWLock};
 use crate::hlock::traits::{
     Ctoken, Lock, RWLock, TLock, TRWLock, TReadGuard, TUpgradableReadGuard, TWriteGuard,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::path::Path;
 
 /// A transformable lock composed of an outer exclusive lock and an inner
 /// reader/writer lock.
@@ -39,15 +37,6 @@ impl<O, I> TBridge<O, I> {
 /// In-memory transformable reader/writer lock.
 pub fn mem_tlock() -> TBridge<MemLock, MemRWLock> {
     TBridge::new(MemLock::new(), MemRWLock::new())
-}
-
-/// Filesystem transformable reader/writer lock. `outer_path` and `inner_path`
-/// must be different files.
-pub fn fs_tlock(
-    outer_path: impl AsRef<Path>,
-    inner_path: impl AsRef<Path>,
-) -> TBridge<FLock, FRWLock> {
-    TBridge::new(FLock::new(outer_path), FRWLock::new(inner_path))
 }
 
 /// Plain shared read guard from a [`TBridge`]: holds only the inner read lock.

@@ -9,33 +9,8 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-/// Close `file` (a freshly-written, writable handle to `path`) in a way that
-/// guarantees no writable descriptor for the file survives, then return.
-///
-/// Works around <https://github.com/rust-lang/rust/issues/114554>: if another
-/// thread `fork`s between our `File::create` and a later `exec` of the unpacked
-/// binary, the child inherits our writable fd and the `exec` fails with
-/// `ETXTBSY`. `flock` locks are tied to the open file description and shared
-/// with any forked child, so:
-///
-/// 1. take an exclusive lock on the writable fd,
-/// 2. close it (the lock lives on in any inherited copy),
-/// 3. reopen read-only and take a shared lock — this blocks until every
-///    writable fd (ours and any forked child's) is gone.
-///
-/// Only meaningful for files that will be executed, so callers gate on `+x`.
 #[cfg(unix)]
-fn close_ensure_ro_fd(file: fs::File, path: &Path) -> anyhow::Result<()> {
-    file.lock()
-        .with_context(|| format!("flock(exclusive) writable fd {:?}", path))?;
-    drop(file);
-
-    let ro = fs::File::open(path).with_context(|| format!("reopen {:?} read-only", path))?;
-    ro.lock_shared()
-        .with_context(|| format!("flock(shared) read-only fd {:?}", path))?;
-    drop(ro);
-    Ok(())
-}
+use crate::fsutil::close_ensure_ro_fd;
 
 /// Describe what currently exists at `path` for error messages. Returns a
 /// short tag like "file", "dir", "symlink->/foo", or "<none>". Never errors.

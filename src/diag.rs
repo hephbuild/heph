@@ -191,15 +191,18 @@ fn sweep() {
 /// Runs on the sweeper thread, after every signalled thread has written its
 /// frames — never inside the signal handler, and never with a blocking lock (see
 /// `hmemoizer::inventory`).
-fn inventory_report() -> String {
+/// Takes the sampling rather than doing it, so the caller that owns the timing
+/// decides when the picture is taken — and so the same picture can be handed to
+/// this and to the watchdog's renderer and the two compared.
+fn inventory_report(snapshot: &hcore::hmemoizer::ReportSnapshot) -> String {
     // Same renderer the stall watchdog writes to its companion file, so the two
     // are byte-identical and neither is the "truncated" one. No cap: this is
     // read once, on a build that has already gone wrong.
-    format!("\n{}", hcore::hmemoizer::render_full_report())
+    format!("\n{}", hcore::hmemoizer::render_report(snapshot))
 }
 
 fn write_inventory(fd: libc::c_int) {
-    let text = inventory_report();
+    let text = inventory_report(&hcore::hmemoizer::capture_report());
     let bytes = text.as_bytes();
     // SAFETY: appending an owned, initialised byte buffer to the diag fd.
     unsafe {
@@ -237,11 +240,6 @@ fn sweep_threads() -> usize {
     n
 }
 
-/// Our own Mach task port.
-///
-/// `libc::mach_task_self()` is deprecated in favour of the `mach2` crate; this
-/// reads the same underlying static rather than pulling in a dependency for one
-/// port lookup.
 /// macOS has no `tgkill`; the Mach layer is the way in.
 ///
 /// `task_threads` hands back a port for every thread in the task,
@@ -254,8 +252,6 @@ fn sweep_threads() -> usize {
     let mut ports: mach2::mach_types::thread_act_array_t = std::ptr::null_mut();
     let mut count: mach2::message::mach_msg_type_number_t = 0;
 
-    // SAFETY: `task_threads` fills `ports`/`count` on success; both are valid
-    // out-params, and `mach_task_self()` names our own task.
     // SAFETY: names our own task.
     let task = unsafe { mach2::traps::mach_task_self() };
     // SAFETY: `ports`/`count` are valid out-params; `task_threads` fills them.
@@ -349,7 +345,7 @@ mod tests {
     /// or the next reader has no way to know a deeper view exists.
     #[test]
     fn the_dump_carries_the_in_flight_state_and_names_its_gated_sections() {
-        let text = inventory_report();
+        let text = inventory_report(&hcore::hmemoizer::capture_report());
         assert!(text.contains("in-flight inventory"), "{text}");
         assert!(text.contains("memoizer wait-for graph"), "{text}");
         assert!(text.contains("memoizer phases"), "{text}");
@@ -383,11 +379,24 @@ mod tests {
     /// text. Two formats for one thing means a reader has to work out which of
     /// them is the truncated one, during an incident, which is exactly when
     /// nobody should be reverse-engineering a diagnostic.
+    ///
+    /// Both sides are the *writers*, not one library function against itself:
+    /// `inventory_report` is what the `SIGQUIT` sweeper appends to the dump,
+    /// `InflightLog::render` is what `heph run`'s stall watchdog writes to the
+    /// companion file. Change either and this fails.
+    ///
+    /// Both render *one* snapshot. Calling the renderers back to back compared
+    /// two separate reads of process-wide memoizer state instead, and any other
+    /// test in this binary building a request between them changed one read and
+    /// not the other — a ~10%-per-run failure that had nothing to do with the
+    /// formats being compared. Sampling once removes the only variable this test
+    /// was never about.
     #[test]
     fn the_dump_and_the_watchdog_companion_file_render_identically() {
+        let snapshot = hcore::hmemoizer::capture_report();
         assert_eq!(
-            inventory_report().trim(),
-            hcore::hmemoizer::render_full_report().trim()
+            inventory_report(&snapshot).trim(),
+            hengine::engine::diag::InflightLog::render(&snapshot).trim()
         );
     }
 }

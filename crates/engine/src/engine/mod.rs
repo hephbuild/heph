@@ -39,6 +39,8 @@ mod local_cache_fs;
 mod local_cache_mem;
 mod local_cache_spill;
 mod local_cache_sqlite;
+#[cfg(test)]
+pub(crate) mod local_cache_test_double;
 mod local_cache_tmp;
 mod packages;
 mod remote_cache;

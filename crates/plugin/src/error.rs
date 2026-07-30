@@ -68,9 +68,10 @@ impl std::error::Error for HashUnknownError {}
 /// How many group members the `--shell` diagnostic lists before eliding.
 const SHELL_MEMBERS_SHOWN: usize = 5;
 
-/// `--shell` was asked for on something that does not resolve to a single
-/// executing target — a multi-target selection, or a transparent group that is
-/// not an alias for one target.
+/// `--shell` was refused: either the request does not resolve to a single
+/// executing target (a multi-target selection, or a transparent group that is
+/// not an alias for one target), or it does, but there is no terminal to hand
+/// it to.
 ///
 /// A property of the *request*, not a failure of any target: nothing ran, and
 /// nothing was going to. So `classify_failure` propagates it unchanged rather
@@ -94,20 +95,24 @@ pub enum ShellNeedsSingleTarget {
         /// The group's distinct members, in declaration order.
         members: Vec<Addr>,
     },
+    /// `addr` is a single target — the shape is fine — but this run has
+    /// nothing to attach a shell to: no tty (CI, a redirected stdin/stdout),
+    /// or a client that never offered one.
+    NotInteractive { addr: Addr },
 }
 
 impl fmt::Display for ShellNeedsSingleTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("--shell needs exactly one target; ")?;
         match self {
             Self::Selection { query } => write!(
                 f,
-                "{query} selects many\n  try: heph run --shell //pkg:name with one address"
+                "--shell needs exactly one target; {query} selects many\n  \
+                 try: heph run --shell //pkg:name with one address"
             ),
             Self::Group { addr, members } => {
                 write!(
                     f,
-                    "{} is a group with {} members",
+                    "--shell needs exactly one target; {} is a group with {} members",
                     addr.format(),
                     members.len()
                 )?;
@@ -130,6 +135,14 @@ impl fmt::Display for ShellNeedsSingleTarget {
                 }
                 write!(f, "\n  try: heph run --shell {}", first.format())
             }
+            Self::NotInteractive { addr } => write!(
+                f,
+                "--shell needs a terminal to attach to; {} would run in a \
+                 non-interactive session (CI, a redirected stdin/stdout, or --no-tui)\n  \
+                 try: run `heph run --shell {}` from an interactive terminal",
+                addr.format(),
+                addr.format(),
+            ),
         }
     }
 }

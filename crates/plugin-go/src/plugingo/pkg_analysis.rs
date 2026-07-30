@@ -902,7 +902,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
             xtest_embed_files: vec!["x".to_string()],
         };
         let field = [0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78];
-        let golden: Vec<u8> = std::iter::repeat(field).take(9).flatten().collect();
+        let golden: Vec<u8> = std::iter::repeat_n(field, 9).flatten().collect();
         let got = encode_package_addrs(&addrs).expect("encode");
         assert_eq!(
             got, golden,

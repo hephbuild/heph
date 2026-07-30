@@ -44,6 +44,24 @@ const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5
 type BoxedResultFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<Arc<EResult>>> + Send + 'a>>;
 
+tokio::task_local! {
+    /// Set for the duration of a `Provider::list` call dispatched by a
+    /// discovery walk's per-package fan-out — both `Engine::query`'s (in
+    /// `query.rs`) and `EngineProviderExecutor::query`'s own nested one (below)
+    /// scope this around their `.list(...)` call.
+    ///
+    /// `ListRequest::executor` hands `list()` implementations the same `query()`
+    /// capability `get()` gets (see the ABI note at the `query()` call site). A
+    /// provider that calls `executor.query()` back from inside its own `list()`
+    /// would nest another K-wide walk under an already-running one — degrading to
+    /// pinned memory and scheduler pressure rather than a hard deadlock (nesting
+    /// doesn't manufacture extra `PKG_EVAL_SLOTS` permits, see the long comment at
+    /// the fan-out), but with no in-tree caller and no diagnostic if a third-party
+    /// or out-of-process plugin ever does it by accident. `query()` checks this
+    /// flag first and fails loudly instead of silently nesting.
+    pub(crate) static IN_PROVIDER_LIST: ();
+}
+
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
 /// does not need to store it separately.
 pub(crate) struct EngineProviderExecutor {
@@ -115,12 +133,57 @@ impl ProviderExecutor for EngineProviderExecutor {
                         let pkg_iter = engine.packages(&matcher, &rs).await?;
                         let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
 
-                        let mut acc: Vec<State> = Vec::new();
-                        for pkg_str in pkgs {
+                        // One probe per `(package, provider)` pair, overlapped.
+                        //
+                        // `buffered`, never `buffer_unordered`: `acc` order is
+                        // the order plugin-go's `variant::build_universe` walks
+                        // the module universe in, which is the order its `list`
+                        // emits library addrs in, which reaches a def hash
+                        // through `pluginquery` → `plugingroup`. `buffered`
+                        // yields in submission order, so `acc` is byte-identical
+                        // to what the serial nested loop produced no matter
+                        // which probe lands first; `buffer_unordered` would put
+                        // completion order — i.e. probe latency — into a build
+                        // definition.
+                        //
+                        // The pair sequence is produced lazily and mapped to
+                        // futures one at a time, so the live set stays O(K) —
+                        // materializing `packages × providers` up front would be
+                        // ~80k `(PkgBuf, Arc)` pairs on a 20k-package workspace,
+                        // for no gain. Everything the iterator touches is owned
+                        // (the memoized closure's future must be `'static`), so
+                        // the registry is shared by `Arc` rather than borrowed.
+                        let providers: Arc<Vec<Arc<crate::engine::engine::Provider>>> =
+                            Arc::new(engine.providers.clone());
+                        let n_providers = providers.len();
+                        // Set when the walk is abandoning. A probe is *not* cheap
+                        // — `pluginbuildfile::probe` is `run_pkg`, the heaviest
+                        // synchronous unit in a build, and it takes a
+                        // `PKG_EVAL_SLOTS` permit — so without this the drain
+                        // below keeps topping the buffer from the underlying
+                        // iterator and Starlark-evaluates the whole workspace
+                        // *after* the walk has already failed.
+                        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let probes = futures::stream::iter(pkgs.into_iter().flat_map(move |pkg_str| {
                             let pkg = PkgBuf::from(pkg_str.as_str());
-                            for provider in engine.providers.iter() {
-                                let inner = rs
-                                    .data
+                            let providers = Arc::clone(&providers);
+                            // `i < n_providers` holds by construction; `get`
+                            // rather than `[]` keeps this panic-free without an
+                            // unwrap, and without allocating a `Vec` per package.
+                            (0..n_providers).filter_map(move |i| {
+                                providers
+                                    .get(i)
+                                    .map(|provider| (pkg.clone(), Arc::clone(provider)))
+                            })
+                        }))
+                        .map(|(pkg, provider)| {
+                            enclose!((rs, stop) async move {
+                                if rs.ctoken().is_cancelled()
+                                    || stop.load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    return Err(anyhow::Error::new(CancelledError));
+                                }
+                                rs.data
                                     .mem_probe_inner
                                     .once(
                                         (provider.name.clone(), pkg.clone()),
@@ -139,8 +202,39 @@ impl ProviderExecutor for EngineProviderExecutor {
                                         }),
                                     )
                                     .await
-                                    .map_err(unwrap_arc_err)?;
-                                acc.extend(inner.iter().cloned());
+                                    .map_err(unwrap_arc_err)
+                            })
+                        })
+                        .buffered(crate::engine::fanout::discovery_concurrency());
+                        tokio::pin!(probes);
+
+                        let mut acc: Vec<State> = Vec::new();
+                        loop {
+                            match probes.next().await {
+                                None => break,
+                                Some(Ok(inner)) => acc.extend(inner.iter().cloned()),
+                                // Same reason as the two `query` walks: returning
+                                // here would drop up to K in-flight probes, each
+                                // holding an `Arc<RequestState>`, while this
+                                // fan-out is itself running *inside* the
+                                // `mem_states_under` cell. Since #241 that is no
+                                // longer a leak — dropping a probe releases its
+                                // memoizer interest, and the last one out evicts
+                                // the `mem_probe_inner` cell and drops its future
+                                // — so what the drain buys now is ordering, not
+                                // liveness: the request's in-flight probes are
+                                // finished before the error escapes, rather than
+                                // torn down underneath a caller that may still
+                                // want them. `Buffered` refills from the
+                                // underlying iterator on every poll, so the drain
+                                // visits all N pairs, not just the K in flight;
+                                // `stop` is what keeps the tail from costing a
+                                // package evaluation each.
+                                Some(Err(e)) => {
+                                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    while probes.next().await.is_some() {}
+                                    return Err(e);
+                                }
                             }
                         }
                         Ok(Arc::new(acc))
@@ -158,6 +252,16 @@ impl ProviderExecutor for EngineProviderExecutor {
         extra_skip: &'a [String],
     ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
         Box::pin(async move {
+            // See `IN_PROVIDER_LIST`: a provider calling back into `query()` from
+            // its own `list()` would nest a K-wide walk under an already-running
+            // one. Fail loudly here rather than let it silently nest.
+            if IN_PROVIDER_LIST.try_with(|()| ()).is_ok() {
+                anyhow::bail!(
+                    "ListRequest::executor.query() was called from inside Provider::list() \
+                     — this would nest a K-wide package walk under an already-running one; \
+                     use ProviderExecutor::states_under instead"
+                );
+            }
             let engine = self
                 .engine
                 .upgrade()
@@ -168,66 +272,155 @@ impl ProviderExecutor for EngineProviderExecutor {
             let pkg_iter = engine.packages(m, &rs).await?;
             let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
 
-            let mut result = Vec::new();
+            // One `list` callback surface for the whole walk, not one per
+            // (package, provider) pair — it is stateless apart from the engine
+            // handle and the request.
+            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::new(
+                Arc::downgrade(&engine),
+                rs.clone(),
+            ));
 
-            for pkg_str in pkgs {
+            // Set when the walk is abandoning; see `Engine::query`.
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Owned copy: each package runs as its own `'static` task (see the
+            // spawn note below), so the borrowed `extra_skip` cannot cross into
+            // it. One `Arc` for the whole walk, cloned per package, not per
+            // (package, provider) pair.
+            let extra_skip: Arc<[String]> = extra_skip.into();
+
+            // Enumeration overlapped, matcher evaluation serial — the same split,
+            // for the same reasons, as `Engine::query`; see the long note there.
+            // The short version: the `MatchShrug` arm runs on a *speculative*
+            // `RequestState` whose cycle detection is a per-chain breadcrumb walk
+            // that bypasses the shared `DepDag`, so two concurrent chains are
+            // mutually invisible — which decides by race both which provider wins
+            // a shared `mem_spec` cell (and so `hashin`, which folds
+            // `def.driver`) and whether a two-chain cycle is reported or hangs.
+            // Serial *within this walk* is structural: the arm is in the consumer
+            // below, so the fan-out is not polled while it awaits. Across walks it
+            // is not guaranteed — see the note in `Engine::query`.
+            //
+            // ABI note: `ListRequest::executor` hands this `query()` to K
+            // concurrent `list` calls, so a provider that calls back into it from
+            // `list` gets K nested walks. No in-tree provider does (plugin-go's
+            // `list` calls only `states_under`), but it is a constraint on the
+            // plugin surface, not an accident of the current callers — and it is
+            // enforced below (`IN_PROVIDER_LIST`), not just documented here.
+            let per_pkg = futures::stream::iter(pkgs.into_iter()
+                // Ends the source when abandoning, so the drain joins only the
+                // <=K tasks already spawned instead of spawning one per remaining
+                // package — see `Engine::query`.
+                .take_while(enclose!((stop) move |_| !stop.load(std::sync::atomic::Ordering::Relaxed)))
+                .filter_map(|pkg_str| {
                 let pkg = PkgBuf::from(pkg_str.as_str());
 
                 // Same pruning as `Engine::query`: skip packages the matcher
-                // cannot select before paying for probe + list.
+                // cannot select before paying for probe + list. Done here, off
+                // the buffered stream, so a pruned package costs no slot.
                 if m.matches_pkg(&pkg) == hmodel::htmatcher::MatchResult::MatchNo {
-                    continue;
+                    return None;
                 }
 
-                let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
+                // Spawned here, not through a later `.map()` — see `Engine::query`.
+                Some(hcore::hmemoizer::spawn_with_cycle_ctx(
+                    enclose!((engine, rs, executor, stop, extra_skip) async move {
+                        // See `Engine::query`: an abandoning walk stops evaluating
+                        // packages it has not started, so the drain below costs a
+                        // cheap poll per remaining package rather than a package
+                        // evaluation each. `Err`, never `Ok(vec![])` — this sequence
+                        // is `pluginquery`'s `deps` and is folded in order into a def
+                        // hash, so a short answer would hash a truncated graph.
+                        if rs.ctoken().is_cancelled()
+                            || stop.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            return Err(anyhow::Error::new(CancelledError));
+                        }
+                        let mut candidates: Vec<Addr> = Vec::new();
+                        let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
 
-                for provider in &engine.providers {
-                    if rs.skip_providers.contains(&provider.name)
-                        || extra_skip.iter().any(|n| n == &provider.name)
-                    {
-                        continue;
-                    }
-                    // Collect list results eagerly (non-Send iterator dropped before next await)
-                    let list_iter = provider
-                        .provider
-                        .list(
-                            ListRequest {
-                                request_id: rs.request_id().to_string(),
-                                package: pkg.clone(),
-                                states: states
-                                    .iter()
-                                    .filter(|s| s.provider == provider.name)
-                                    .cloned()
-                                    .collect(),
-                                executor: Arc::new(EngineProviderExecutor::new(
-                                    Arc::downgrade(&engine),
-                                    rs.clone(),
-                                )),
-                            },
-                            rs.ctoken(),
-                        )
-                        .await?;
-                    let raw: Vec<_> = list_iter.collect::<anyhow::Result<_>>()?;
+                        for provider in &engine.providers {
+                            if rs.skip_providers.contains(&provider.name)
+                                || extra_skip.iter().any(|n| n == &provider.name)
+                            {
+                                continue;
+                            }
+                            // Collect list results eagerly (non-Send iterator dropped before next await).
+                            // Scoped under `IN_PROVIDER_LIST` so a reentrant `executor.query()`
+                            // called from inside this `list()` is caught — see its doc comment.
+                            let list_iter = IN_PROVIDER_LIST
+                                .scope(
+                                    (),
+                                    provider.provider.list(
+                                        ListRequest {
+                                            request_id: rs.request_id().to_string(),
+                                            package: pkg.clone(),
+                                            states: states
+                                                .iter()
+                                                .filter(|s| s.provider == provider.name)
+                                                .cloned()
+                                                .collect(),
+                                            executor: Arc::clone(&executor),
+                                        },
+                                        rs.ctoken(),
+                                    ),
+                                )
+                                .await?;
+                            let raw: Vec<_> = list_iter.collect::<anyhow::Result<Vec<_>>>()?;
 
-                    for item in raw {
-                        let addr = item.addr;
-                        if addr.package != pkg {
-                            continue;
+                            for item in raw {
+                                if item.addr.package == pkg {
+                                    candidates.push(item.addr);
+                                }
+                            }
                         }
 
-                        match m.matches_addr(&addr) {
-                            MatchResult::MatchYes => result.push(addr),
-                            MatchResult::MatchNo => {}
-                            MatchResult::MatchShrug => {
-                                // Resolve the candidate's spec/def only to evaluate the
-                                // matcher — a speculative inspection, not a dependency. Use a
-                                // speculative rs so a rejected candidate leaves no edge in the
-                                // shared dep DAG (an edge would close a false cycle later).
-                                let spec_rs = rs.speculative();
-                                let spec = match Arc::clone(&engine)
-                                    .get_spec(spec_rs.clone(), &addr)
-                                    .await
-                                {
+                        anyhow::Ok(candidates)
+                    }),
+                ))
+            }))
+            // One task per package — see the long note in `Engine::query`: as
+            // plain futures the `PKG_EVAL_SLOTS` permit holders would be
+            // unpollable while this walk's consumer awaits the `MatchShrug` arm,
+            // and the consumer would then queue behind them on the same
+            // semaphore.
+            .buffered(crate::engine::fanout::discovery_concurrency())
+            .map(|joined| match joined {
+                Ok(res) => res,
+                Err(e) => Err(anyhow::Error::new(e).context("package discovery task panicked")),
+            });
+            tokio::pin!(per_pkg);
+
+            let mut result = Vec::new();
+            loop {
+                let candidates = match per_pkg.next().await {
+                    None => break,
+                    Some(Ok(candidates)) => candidates,
+                    // Never `?` straight out — returning drops `per_pkg` with up
+                    // to K-1 package *tasks* still running, each holding an
+                    // `Arc<RequestState>` it releases only when it finishes. See
+                    // `Engine::query` for why late deregistration races
+                    // `drain_bg`.
+                    Some(Err(e)) => {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        while per_pkg.next().await.is_some() {}
+                        return Err(e);
+                    }
+                };
+                for addr in candidates {
+                    match m.matches_addr(&addr) {
+                        MatchResult::MatchYes => result.push(addr),
+                        MatchResult::MatchNo => {}
+                        MatchResult::MatchShrug => {
+                            // Resolve the candidate's spec/def only to evaluate the
+                            // matcher — a speculative inspection, not a dependency. Use a
+                            // speculative rs so a rejected candidate leaves no edge in the
+                            // shared dep DAG (an edge would close a false cycle later).
+                            // One chain at a time *within this walk* — see the note
+                            // above the fan-out.
+                            let spec_rs = rs.speculative();
+                            let spec =
+                                match Arc::clone(&engine).get_spec(spec_rs.clone(), &addr).await {
                                     Ok(spec) => Ok(spec),
                                     Err(e)
                                         if downcast_chain_ref::<TargetNotFoundError>(&e)
@@ -244,33 +437,30 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     res => res,
                                 }?;
 
-                                match crate::engine::matcher_spec::match_spec(m, &spec) {
-                                    MatchResult::MatchYes => result.push(addr),
-                                    MatchResult::MatchNo => {}
-                                    MatchResult::MatchShrug => {
-                                        let def_res = Arc::clone(&engine)
-                                            .get_def(spec_rs.clone(), &addr)
-                                            .await;
-                                        let def = match def_res {
-                                            Ok(def) => def,
-                                            // Same as the get_spec branch: cycle means this
-                                            // target transitively depends on the query caller —
-                                            // it can't be a dep of the caller. Skip it.
-                                            Err(e)
-                                                if downcast_chain_ref::<CycleError>(&e)
-                                                    .is_some() =>
-                                            {
-                                                continue;
-                                            }
-                                            Err(e) => return Err(e),
-                                        };
-                                        if crate::engine::matcher_target::match_target(
-                                            m,
-                                            &def.target_def,
-                                        ) == MatchResult::MatchYes
+                            match crate::engine::matcher_spec::match_spec(m, &spec) {
+                                MatchResult::MatchYes => result.push(addr),
+                                MatchResult::MatchNo => {}
+                                MatchResult::MatchShrug => {
+                                    let def_res =
+                                        Arc::clone(&engine).get_def(spec_rs.clone(), &addr).await;
+                                    let def = match def_res {
+                                        Ok(def) => def,
+                                        // Same as the get_spec branch: cycle means this
+                                        // target transitively depends on the query caller —
+                                        // it can't be a dep of the caller. Skip it.
+                                        Err(e)
+                                            if downcast_chain_ref::<CycleError>(&e).is_some() =>
                                         {
-                                            result.push(addr);
+                                            continue;
                                         }
+                                        Err(e) => return Err(e),
+                                    };
+                                    if crate::engine::matcher_target::match_target(
+                                        m,
+                                        &def.target_def,
+                                    ) == MatchResult::MatchYes
+                                    {
+                                        result.push(addr);
                                     }
                                 }
                             }
@@ -313,11 +503,36 @@ pub use hplugin::eresult::{ArtifactMeta, EResult};
 /// purely for RAII, so the cache entry cannot be overwritten/deleted while any
 /// handle to it (here, or cloned into a dependent's sandbox input) is alive. The
 /// lock releases when the last `Arc<dyn Content>` for the entry drops.
+///
+/// **Every method must be forwarded**, including the ones with a working
+/// default. This wrapper sits on *every* cacheable result artifact, so a method
+/// left to its default is that method's fast path switched off product-wide,
+/// with the inner artifact's implementation dead and nothing to see: `file_path`
+/// silently answered `None` for on-disk cache blobs (the stable-ABI seam then
+/// streamed them chunk-by-chunk instead of opening the file) and `entry_paths`
+/// silently fell back to a byte-reading `walk` instead of the tar header scan.
+/// `missing_trait_methods` on the impl below makes that a compile error rather
+/// than a comment nobody reads — a doc cannot fail a build, and this exact
+/// omission survived two `Content` methods being added.
+///
+/// [`file_path`](Content::file_path) is safe to forward for the same reason it
+/// needs the guard: cache GC deletes a revision only under the per-addr *write*
+/// lock (`Engine::gc_apply`, `Engine::try_trim_after_write`), which cannot be
+/// taken while this read guard is alive — so the path stays valid for exactly as
+/// long as this artifact does, which is the contract `Content::file_path`
+/// states. Handing the bare `PathBuf` further out than the artifact would break
+/// that; the one consumer (`HostArtifactContent::path`) opens it while still
+/// holding the `Arc<dyn Content>`, and the open fd pins the inode thereafter.
 struct GuardedArtifact {
     inner: Arc<dyn Content>,
     _lock: Arc<ResultReadGuard>,
 }
 
+#[deny(
+    clippy::missing_trait_methods,
+    reason = "this wrapper must forward every Content method; a default here \
+              silently disables that method's fast path for every cached artifact"
+)]
 impl Content for GuardedArtifact {
     fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
         self.inner.reader()
@@ -328,11 +543,17 @@ impl Content for GuardedArtifact {
     fn hashout(&self) -> anyhow::Result<String> {
         self.inner.hashout()
     }
+    fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        self.inner.entry_paths()
+    }
     fn seekable_reader(&self) -> anyhow::Result<Option<Box<dyn ReadSeek + Send>>> {
         self.inner.seekable_reader()
     }
     fn byte_size(&self) -> Option<u64> {
         self.inner.byte_size()
+    }
+    fn file_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.file_path()
     }
 }
 
@@ -997,7 +1218,7 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<Arc<EResult>> {
         if opts.shell && opts.interactive.is_none() {
-            anyhow::bail!("cannot use --shell in non-interactive mode");
+            return Err(ShellNeedsSingleTarget::NotInteractive { addr: addr.clone() }.into());
         }
 
         // Stop the moment the request is cancelled (Ctrl-C). Every queued
@@ -1521,11 +1742,38 @@ impl Engine {
             }
         } else {
             // Broke early (cancelled, or a fatal landed): its answer is no longer
-            // wanted, and it may be deep inside a whole-package Starlark
-            // evaluation. Abort rather than wait it out — the previous shape
-            // dropped the stream mid-poll and Ctrl-C must stay that responsive.
+            // wanted. Abort rather than wait it out, so the *enqueue* side of
+            // Ctrl-C stays immediate.
+            //
+            // Read this precisely: aborting stops the walk **task**, which is the
+            // consumer of the discovery fan-out. It does not stop the fan-out.
+            // `Engine::query` runs each package as its own task and a dropped
+            // `JoinHandle` detaches rather than cancels, so up to K
+            // whole-package Starlark evaluations that were already in flight run
+            // to completion after this returns. Ctrl-C therefore stops
+            // *scheduling* new package work, not the work already started.
+            //
+            // That is deliberate, and it is the cheaper side of the trade: a
+            // detached package task drives its `mem_probe` cell to completion, so
+            // the cell releases its future and the `Arc<RequestState>` inside it,
+            // and the ≤K whole-package evaluations already paid for land in the
+            // memoizer instead of being thrown away. The residue is bounded at K
+            // because `query`'s per-package futures short-circuit on a cancelled
+            // token before starting anything new.
+            //
+            // Detaching is no longer what *rescues* those cells, only what
+            // happens to them. Before #241 a cell nobody polled kept its future
+            // forever — an Arc cycle through the `RequestStateData` that owns the
+            // memoizer, so the request never deregistered — and running the tasks
+            // out was the only way to avoid it. `Memoizer::process` now registers
+            // an interest per frame, and the last one to go on an incomplete cell
+            // evicts it and drops its future (`hmemoizer::cancel_abandoned`). So
+            // aborting the package tasks would be *safe* today; detaching is kept
+            // because it is the better trade, not because the alternative leaks.
+            // The `JoinSet` drain below stands on its own reasoning, not on this.
             walk.abort();
         }
+
         // Matcher fully resolved: mark the matched set final (drops the `~`).
         // Not on a failed walk — the set never became final, so claiming it did
         // would paint a wrong denominator over an aborting run.
@@ -2346,6 +2594,9 @@ impl Engine {
     ///   semantics). `Copy` (net-new) groups additionally stamp every written
     ///   file with the codegen xattr so a later fs glob excludes them; `InPlace`
     ///   groups are not stamped (they overwrite tracked source files).
+    ///
+    /// The gates are cheap and stay here; everything past them runs on
+    /// `hcore::blocking` (see [`Self::materialize_codegen_tree`]).
     async fn materialize_codegen(
         &self,
         is_top: bool,
@@ -2369,13 +2620,48 @@ impl Engine {
             return Ok(false);
         }
 
+        // Past the gates this walks every generated file, reads its bytes out of
+        // the cache, reads the tree file back and (when frozen) diffs the two —
+        // the heaviest synchronous read on the result path, and one that parks
+        // on any queued sqlite write to the artifact it is walking. It does not
+        // belong on a runtime worker. Cloned rather than borrowed because a pool
+        // job outlives a dropped caller future: an `Arc<TargetDef>` bump and a
+        // `Vec` of `ResultArtifact` (an `Arc` plus two short strings each).
+        //
+        // Outliving the caller is the accepted cost here. A run cancelled mid
+        // write-back reports cancelled while the job finishes rewriting the
+        // tree, where before it could only be interrupted by a signal. Stopping
+        // half way would be worse: the write-back is per-file and the tree is
+        // the user's source, so an abandoned job leaves a *partial* codegen tree
+        // either way, and letting it finish at least leaves a consistent one.
+        let (target, cached, root) = (
+            Arc::clone(&def.target),
+            cached.to_vec(),
+            self.cfg.root.clone(),
+        );
+        hcore::blocking::run(move || {
+            Self::materialize_codegen_tree(&target, &cached, &root, frozen)
+        })
+        .await
+    }
+
+    /// The body of [`Self::materialize_codegen`], past its gates.
+    ///
+    /// Synchronous and byte-moving: called only through `hcore::blocking::run`.
+    fn materialize_codegen_tree(
+        target: &crate::engine::driver::targetdef::TargetDef,
+        cached: &[ResultArtifact],
+        root: &std::path::Path,
+        frozen: bool,
+    ) -> anyhow::Result<bool> {
+        use crate::engine::driver::targetdef::path::CodegenMode;
+
         // Whether anything about the tree actually moved. Content writes, exec-bit
         // reconciles and symlink recreates all count; the codegen xattr does not
         // (it is metadata, outside the `@heph/fs` content+exec-bit hash). `false`
         // therefore means the tree still hashes exactly as it did before this
         // call — which is what lets the caller skip the fixpoint recompute.
         let mut wrote = false;
-        let root = &self.cfg.root;
         let mut frozen_diff = String::new();
 
         // Map each codegen output group to its declared mode (first non-None
@@ -2385,7 +2671,7 @@ impl Engine {
         // artifact, and exactly once.
         let mut group_mode: std::collections::HashMap<&str, &CodegenMode> =
             std::collections::HashMap::new();
-        for output in &def.target.outputs {
+        for output in &target.outputs {
             if let Some(mode) = output
                 .paths
                 .iter()
@@ -2495,7 +2781,7 @@ impl Engine {
                 // target hits the fixpoint cache instead of re-executing.
                 // Skipping identical writes also avoids needless source-control
                 // churn and pointless mtime bumps.
-                let stamp = def.target.addr.format();
+                let stamp = target.addr.format();
                 let walker = artifact
                     .content
                     .walk()
@@ -2610,7 +2896,7 @@ impl Engine {
 
         if frozen && !frozen_diff.is_empty() {
             return Err(anyhow::Error::new(crate::engine::error::FrozenCheckError {
-                addr: def.target.addr.clone(),
+                addr: target.addr.clone(),
                 diff: frozen_diff,
             }));
         }
@@ -2765,7 +3051,7 @@ impl Engine {
                     // here means its `try_write` can never succeed, which is
                     // exactly how `cache.history` came to be unenforced during a
                     // run. `RequestState::defer_trim` submits it once the guards
-                    // are gone, still on the background lane and still
+                    // are gone, onto the bookkeeping lane and still
                     // fire-and-forget.
                     if out.is_ok() && !use_tmp_cache {
                         rs.defer_trim(&addr, def.target.cache.history, hashin);
@@ -3624,6 +3910,82 @@ mod tests {
         }
     }
 
+    /// A [`Content`] whose fast paths are answerable and *differ* from what the
+    /// trait defaults would produce: `entry_paths` reports a name `walk` never
+    /// yields, and `file_path` names a real file whose bytes `reader` refuses to
+    /// serve. Standing in for a `CacheArtifact`, whose overrides are exactly
+    /// these two.
+    struct FastPathContent {
+        path: std::path::PathBuf,
+    }
+
+    impl Content for FastPathContent {
+        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+            anyhow::bail!("must be read through file_path, not the stream")
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            Ok(Box::new(std::iter::once(Ok(WalkEntry {
+                path: std::path::PathBuf::from("from-walk"),
+                kind: WalkEntryKind::Symlink {
+                    target: std::path::PathBuf::from("t"),
+                },
+            }))))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok("fast".to_string())
+        }
+        fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+            Ok(vec![std::path::PathBuf::from("from-index")])
+        }
+        fn file_path(&self) -> Option<std::path::PathBuf> {
+            Some(self.path.clone())
+        }
+    }
+
+    /// `GuardedArtifact` wraps *every* cacheable result artifact, so a `Content`
+    /// method it leaves to the trait default is that method's fast path switched
+    /// off product-wide — the inner artifact's implementation unreachable, and
+    /// nothing failing to show it. Both defaults are silent: `file_path` reports
+    /// "not a file" for an on-disk cache blob (the stable-ABI seam then streams
+    /// it 64 KiB at a time instead of opening it), and `entry_paths` falls back
+    /// to a `walk` that reads every byte instead of the tar header scan.
+    ///
+    /// Asserted through `&dyn Content`, which is how every consumer sees it.
+    #[tokio::test]
+    async fn guarded_artifact_forwards_the_direct_open_fast_paths() {
+        let dir = tempdir().expect("tempdir");
+        let lock = SArc::new(ResultLock::new(LockBackend::Mem, dir.path().to_path_buf()));
+        let addr = Addr::new(PkgBuf::from("pkg"), "x".to_string(), BTreeMap::new());
+        let read = lock
+            .read(&addr, &StdCancellationToken::new())
+            .await
+            .expect("read");
+
+        let blob = dir.path().join("blob.tar");
+        std::fs::write(&blob, b"artifact bytes").expect("write blob");
+
+        let guarded: Arc<dyn Content> = Arc::new(GuardedArtifact {
+            inner: Arc::new(FastPathContent { path: blob.clone() }),
+            _lock: SArc::new(read),
+        });
+
+        // The direct-open path reaches the consumer: it gets the cache file, not
+        // `None`, and the bytes are readable without going near `reader()`.
+        let path = guarded
+            .file_path()
+            .expect("the wrapper must not hide the artifact's on-disk path");
+        assert_eq!(path, blob);
+        assert_eq!(std::fs::read(&path).expect("read"), b"artifact bytes");
+
+        // The header-scan enumeration reaches the consumer too — the walk-based
+        // default would answer `from-walk`.
+        assert_eq!(
+            guarded.entry_paths().expect("entry_paths"),
+            vec![std::path::PathBuf::from("from-index")],
+            "must use the inner artifact's index, not the byte-reading walk"
+        );
+    }
+
     /// The read lock travels with the artifact, not the `EResult`: it stays held
     /// as long as *any* handle to the artifact is alive — including a handle
     /// cloned into a dependent's sandbox input (or a group target's merged
@@ -3836,6 +4198,352 @@ mod tests {
             .map(|s| s.package.as_str().to_string())
             .collect();
         assert_eq!(recorded_pkgs, vec!["a/b/c", "a/b", "a", ""]);
+        Ok(())
+    }
+
+    /// A provider over a fixed package set whose `probe` is slow, with a
+    /// per-package delay the test picks. Tracks peak in-flight probes.
+    struct SlowProbe {
+        pkgs: Vec<String>,
+        delay: SArc<dyn Fn(usize) -> Duration + Send + Sync>,
+        inflight: SArc<AtomicUsize>,
+        peak: SArc<AtomicUsize>,
+    }
+
+    impl crate::engine::provider::Provider for SlowProbe {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "slowprobe".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                .pkgs
+                .iter()
+                .map(|p| {
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from(p.as_str()),
+                    })
+                })
+                .collect();
+            Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            let pkg = req.package.clone();
+            // Packages this provider does not own (the always-on built-in
+            // `@heph/fs`) cost nothing and declare nothing.
+            let Some(idx) = self.pkgs.iter().position(|p| p == pkg.as_str()) else {
+                return Box::pin(async { Ok(ProbeResponse { states: vec![] }) });
+            };
+            let d = (self.delay)(idx);
+            let (inflight, peak) = (SArc::clone(&self.inflight), SArc::clone(&self.peak));
+            Box::pin(async move {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(d).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                Ok(ProbeResponse {
+                    states: vec![State {
+                        package: pkg,
+                        provider: "slowprobe".to_string(),
+                        state: Default::default(),
+                    }],
+                })
+            })
+        }
+    }
+
+    fn slow_probe_engine(
+        pkgs: Vec<String>,
+        delay: impl Fn(usize) -> Duration + Send + Sync + 'static,
+        inflight: SArc<AtomicUsize>,
+        peak: SArc<AtomicUsize>,
+    ) -> anyhow::Result<(SArc<Engine>, tempfile::TempDir)> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let delay: SArc<dyn Fn(usize) -> Duration + Send + Sync> = SArc::new(delay);
+        engine.register_provider(move |_| {
+            Box::new(SlowProbe {
+                pkgs: pkgs.clone(),
+                delay: SArc::clone(&delay),
+                inflight: SArc::clone(&inflight),
+                peak: SArc::clone(&peak),
+            })
+        })?;
+        Ok((SArc::new(engine), root))
+    }
+
+    fn states_under_of(engine: &SArc<Engine>, rs: &SArc<RequestState>) -> EngineProviderExecutor {
+        EngineProviderExecutor::new(SArc::downgrade(engine), SArc::clone(rs))
+    }
+
+    /// `states_under`'s output order is a build input, not a display detail:
+    /// plugin-go feeds it straight into `variant::build_universe`, which walks it
+    /// in order to build the module variant universe, which fixes the order its
+    /// `list` emits library addrs in — and that reaches a def hash.
+    ///
+    /// So the fan-out must be `buffered`, never `buffer_unordered`. The delays
+    /// here make the probes complete in the exact reverse of listing order, so a
+    /// `buffer_unordered` implementation returns the reverse sequence.
+    #[tokio::test]
+    async fn states_under_returns_states_in_package_order_not_completion_order()
+    -> anyhow::Result<()> {
+        const N: usize = 8;
+        let pkgs: Vec<String> = (0..N).map(|i| format!("p{i:02}")).collect();
+        let (engine, _root) = slow_probe_engine(
+            pkgs.clone(),
+            // First package probed sleeps longest, last sleeps least.
+            |i| Duration::from_millis(((N - i) * 15) as u64),
+            SArc::new(AtomicUsize::new(0)),
+            SArc::new(AtomicUsize::new(0)),
+        )?;
+        let rs = engine.new_state();
+
+        let states = states_under_of(&engine, &rs)
+            .states_under(&PkgBuf::from(""))
+            .await?;
+
+        let got: Vec<String> = states
+            .iter()
+            .filter(|s| s.provider == "slowprobe")
+            .map(|s| s.package.as_str().to_string())
+            .collect();
+        assert_eq!(
+            got, pkgs,
+            "states must accumulate in package-listing order even though the \
+             probes complete in the reverse order"
+        );
+        Ok(())
+    }
+
+    /// The same walk, overlapped: `for pkg { for provider { probe.await } }` paid
+    /// the sum of every probe. plugin-go calls this for a whole module root
+    /// before it can emit a single addr, so it sits on the critical path of a
+    /// Go workspace's discovery.
+    /// A failed `states_under` walk must stop probing.
+    ///
+    /// `Buffered` refills its queue from the underlying iterator on *every*
+    /// poll, so `while probes.next().await.is_some() {}` walks the entire
+    /// remaining `(package, provider)` sequence rather than the K in flight.
+    /// Without the `stop` flag each of those pulls runs a real probe — and
+    /// `pluginbuildfile::probe` is `run_pkg`, a whole-package Starlark
+    /// evaluation holding a `PKG_EVAL_SLOTS` permit. The observable difference
+    /// is stark: the whole workspace gets evaluated *after* the walk has
+    /// already failed.
+    ///
+    /// The drain itself stays — it finishes this request's in-flight probes
+    /// before the error escapes, rather than tearing them down from inside the
+    /// `mem_states_under` cell they run under. (Since #241 dropping them would
+    /// not *leak*: an abandoned cell now evicts itself and drops its future. The
+    /// drain is about ordering, not liveness.) What the flag buys is that the
+    /// drain costs a cheap poll per remaining pair instead of a package
+    /// evaluation per remaining pair.
+    #[tokio::test]
+    async fn failed_states_under_walk_stops_probing() -> anyhow::Result<()> {
+        /// Counts real probes; the first package it is asked about fails.
+        struct CountingFailProbe {
+            pkgs: Vec<String>,
+            probes: SArc<AtomicUsize>,
+        }
+
+        impl crate::engine::provider::Provider for CountingFailProbe {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "countingfail".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                _req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                    .pkgs
+                    .iter()
+                    .map(|p| {
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(p.as_str()),
+                        })
+                    })
+                    .collect();
+                Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                let pkg = req.package.clone();
+                let Some(idx) = self.pkgs.iter().position(|p| p == pkg.as_str()) else {
+                    return Box::pin(async { Ok(ProbeResponse { states: vec![] }) });
+                };
+                let probes = SArc::clone(&self.probes);
+                Box::pin(async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    // Yield so the fan-out actually fills before the first
+                    // result is consumed — otherwise a single-threaded runtime
+                    // could complete pair 0 before any sibling starts and the
+                    // test would prove nothing about the drain.
+                    tokio::task::yield_now().await;
+                    if idx == 0 {
+                        anyhow::bail!("probe blew up on package 0");
+                    }
+                    Ok(ProbeResponse {
+                        states: vec![State {
+                            package: pkg,
+                            provider: "countingfail".to_string(),
+                            state: Default::default(),
+                        }],
+                    })
+                })
+            }
+        }
+
+        // Large enough that "bounded" and "the whole workspace" cannot be
+        // confused on any core count.
+        const N: usize = 400;
+        let pkgs: Vec<String> = (0..N).map(|i| format!("p{i:04}")).collect();
+        let probes = SArc::new(AtomicUsize::new(0));
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(enclose!((probes) move |_| Box::new(CountingFailProbe {
+            pkgs: pkgs.clone(),
+            probes: SArc::clone(&probes),
+        })))?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let err = states_under_of(&engine, &rs)
+            .states_under(&PkgBuf::from(""))
+            .await
+            .expect_err("package 0's probe fails, so the walk must fail");
+        assert!(
+            format!("{err:#}").contains("blew up"),
+            "expected the probe's error, got: {err:#}"
+        );
+
+        // Package 0 is the first pair submitted, so `buffered` surfaces its
+        // error before anything later. Everything already in flight when that
+        // lands still counts — the bound is K-ish, not 1 — but the ~N-K pairs
+        // behind it must cost nothing.
+        let ran = probes.load(Ordering::SeqCst);
+        let k = crate::engine::fanout::discovery_concurrency();
+        assert!(
+            ran <= k * 4,
+            "a failed walk must stop probing: ran {ran} probes over {N} packages \
+             (K={k}). Unbounded would be ~{N} — the whole workspace evaluated \
+             after the walk had already failed."
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn states_under_overlaps_probes() -> anyhow::Result<()> {
+        const N: usize = 8;
+        let delay = Duration::from_millis(40);
+        let pkgs: Vec<String> = (0..N).map(|i| format!("p{i:02}")).collect();
+        let inflight = SArc::new(AtomicUsize::new(0));
+        let peak = SArc::new(AtomicUsize::new(0));
+        let (engine, _root) = slow_probe_engine(
+            pkgs,
+            move |_| delay,
+            SArc::clone(&inflight),
+            SArc::clone(&peak),
+        )?;
+        let rs = engine.new_state();
+
+        let start = std::time::Instant::now();
+        let states = states_under_of(&engine, &rs)
+            .states_under(&PkgBuf::from(""))
+            .await?;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            states.iter().filter(|s| s.provider == "slowprobe").count(),
+            N
+        );
+        // A serial `for pkg { for provider { probe.await } }` peaks at exactly
+        // one in-flight probe, on every machine.
+        assert!(
+            peak.load(Ordering::SeqCst) > 1,
+            "probes must overlap; serial discovery peaks at 1 in-flight probe"
+        );
+        // The buffer interleaves this provider's slow probes with the built-in
+        // `fs` provider's instant ones, so only about K/2 slow probes are live
+        // at once. At K=2 — a 1-CPU cgroup, where `available_parallelism`
+        // reports 1 — that is ~1, and no wall-clock bound can distinguish
+        // overlapped from serial. Rather than assert something vacuous there,
+        // the timing claim is made only where it means something; `peak > 1`
+        // above is the machine-independent half and carries the test either way.
+        let k = crate::engine::fanout::discovery_concurrency();
+        if k >= 4 {
+            assert!(
+                elapsed < delay * (N as u32) * 3 / 4,
+                "overlapped probing of {N} packages at K={k} must beat serial ({:?}), \
+                 took {elapsed:?}",
+                delay * (N as u32)
+            );
+        }
         Ok(())
     }
 
@@ -5763,6 +6471,15 @@ mod tests {
         inner: pluginstatictarget::Provider,
         parked: SArc<AtomicUsize>,
         expect_parked: usize,
+        /// Held with **zero** permits until the test hands them out, so a task
+        /// that wakes on cancellation cannot finish on its own. That is what makes
+        /// the drain observable as an *ordering* rather than a count: while this
+        /// is shut, a `result` that is genuinely draining cannot return, and one
+        /// that dropped its `JoinSet` returns anyway.
+        release: SArc<tokio::sync::Semaphore>,
+        /// Parked tasks that were let go — resumed after cancellation *and* after
+        /// the release, so their `get` returned instead of being dropped mid-poll.
+        resumed: SArc<AtomicUsize>,
     }
 
     impl crate::engine::provider::Provider for GateProvider {
@@ -5817,10 +6534,16 @@ mod tests {
         ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
             Box::pin(async move {
                 self.parked.fetch_add(1, Ordering::SeqCst);
-                // Park until the request is cancelled. Pre-fix nothing ever
-                // cancels it, because the early return skips `ctoken().cancel()`
-                // and `RequestStateData::drop` can't run either.
+                // Park until the request is cancelled, then wait for the test to
+                // let go. Both waits matter, and for different regressions: an
+                // early return that skips `ctoken().cancel()` never gets past the
+                // first, and one that cancels *and then* returns is caught by the
+                // second — its tasks are still held here, so `result` returning is
+                // proof it abandoned them rather than waiting.
                 ctoken.cancelled().await;
+                let permit = self.release.acquire().await;
+                self.resumed.fetch_add(1, Ordering::SeqCst);
+                drop(permit);
                 Err(GetError::NotFound)
             })
         }
@@ -5834,14 +6557,39 @@ mod tests {
     }
 
     /// A failing matcher walk must surface its error *through the drain*, not by
-    /// returning early. Returning drops the `JoinSet`, which leaves each spawned
-    /// task's future un-polled inside this request's `mem_result` — and those
-    /// futures hold an `Arc<RequestState>` back into the very memoizer that owns
-    /// them. That cycle pins `RequestStateData` forever, so its `Drop` never runs:
-    /// the token is never cancelled, running children are never signalled, and
-    /// their sandboxes are never enqueued for cleanup. Releasing the last external
-    /// `Arc` and finding the request actually gone is the observable proof the
-    /// cycle was not formed.
+    /// returning early. Returning drops the `JoinSet`, so every spawned task is
+    /// aborted where it stands: an in-flight target is never told to stop and
+    /// never gets to unwind — its child process is not taken through
+    /// `interrupt_child`'s SIGINT/grace/SIGKILL, and whatever cleanup its
+    /// destructors enqueue lands *after* `result` returned, outside the
+    /// `bg_pending` wait the caller uses to know the run is over.
+    ///
+    /// **The assertion moved, and the old one was vacuous.** This test used to
+    /// prove the drain indirectly: the un-polled futures the dropped `JoinSet`
+    /// left behind held an `Arc<RequestState>` back into the memoizer that owned
+    /// them, that cycle pinned `RequestStateData` forever, and so finding the
+    /// request deregistered proved the cycle was never formed. #241 removed the
+    /// cycle at the source — an abandoned memoizer cell now evicts itself and
+    /// drops its in-flight future — so the request is released either way.
+    /// Verified: with `result` restored to the pre-fix early return, the
+    /// registry assertion **passes**. It had stopped being able to catch the
+    /// regression, while still being able to fail spuriously on a loaded runner
+    /// (linux/arm64, CI run 30435613380), which is the worst of both.
+    ///
+    /// So the drain is now asserted where it happens, and as an **ordering**
+    /// rather than a count. `GateProvider::get` parks, waits for cancellation,
+    /// and then blocks on a semaphore this test holds shut. A `result` that is
+    /// draining is inside `join_next`, waiting on tasks it cannot get — so it
+    /// *cannot* return while the gate is shut. One that dropped its `JoinSet` has
+    /// nothing to wait for and returns anyway. A resumed-count alone would not
+    /// have been enough: the half-fixed shape that cancels the token and *then*
+    /// returns early wakes all three tasks, and on a multi-core runner they can
+    /// reach the counter before the abort lands.
+    ///
+    /// The registry check is kept as a bounded wait, downgraded to what it now
+    /// covers — that a request carrying real in-flight work is released rather
+    /// than leaked. It no longer discriminates this regression; the assertion
+    /// above does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_matcher_walk_drains_instead_of_dropping_the_joinset() -> anyhow::Result<()> {
         let root = tempdir()?;
@@ -5859,26 +6607,77 @@ mod tests {
             static_target("//pkg:c", &[], &[]),
         ];
         let expect_parked = targets.len();
+        assert!(
+            expect_parked > 0,
+            "the fixture must spawn something to drain"
+        );
         let parked = SArc::new(AtomicUsize::new(0));
+        let resumed = SArc::new(AtomicUsize::new(0));
+        // Starts shut. Every parked task blocks here after cancellation, so
+        // nothing can finish until this test says so.
+        let release = SArc::new(tokio::sync::Semaphore::new(0));
         let inner = pluginstatictarget::Provider::new(targets)?;
-        engine.register_provider(enclose!((parked) move |_| Box::new(GateProvider {
-            inner,
-            parked,
-            expect_parked,
-        })))?;
+        engine.register_provider(
+            enclose!((parked, resumed, release) move |_| Box::new(GateProvider {
+                inner,
+                parked,
+                expect_parked,
+                release,
+                resumed,
+            })),
+        )?;
         let engine = Arc::new(engine);
 
         let rs = engine.new_state();
 
-        let err = engine
-            .clone()
-            .result(
-                rs.clone(),
-                &Matcher::PackagePrefix(PkgBuf::from("")),
-                OutputMatcher::All,
-                &ResultOptions::default(),
-            )
+        // Driven from a task so the drain can be observed *while it is happening*
+        // rather than inferred afterwards.
+        let mut run = tokio::spawn(enclose!((engine, rs) async move {
+            engine
+                .result(
+                    rs,
+                    &Matcher::PackagePrefix(PkgBuf::from("")),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await
+        }));
+
+        // The gate in `list` only fails the walk once every target has parked, so
+        // reaching this means the walk has blown up (or is about to).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while parked.load(Ordering::SeqCst) < expect_parked {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "targets never parked, so the walk never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // **The drain, asserted as an ordering rather than a count.** Every
+        // spawned task is parked behind `release`, so a `result` that is draining
+        // *cannot* return: it is inside `join_next`, waiting for tasks this test
+        // is holding. One that dropped its `JoinSet` has nothing to wait for and
+        // returns immediately — including the half-fixed shape that cancels the
+        // token and *then* returns early, where a bare resumed-count would race
+        // the abort and could pass.
+        //
+        // No wall-clock dependence on the green path: correct code cannot finish
+        // in any window, so the timeout always elapses. The window only bounds how
+        // long a *broken* build gets, and a broken one returns in microseconds.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut run)
+                .await
+                .is_err(),
+            "`result` returned while every target it spawned was still parked: it \
+             dropped the JoinSet instead of draining it, so those targets were \
+             aborted mid-poll rather than told to stop and allowed to unwind"
+        );
+
+        release.add_permits(expect_parked);
+        let err = run
             .await
+            .expect("the result task must not panic")
             .err()
             .expect("a failed matcher walk must return Err");
         assert!(
@@ -5886,20 +6685,536 @@ mod tests {
             "the walk failure must be what surfaces, got: {err:#}"
         );
 
+        // Every parked task got to the far side of the gate under its own power.
+        // Reads 0 under both regression shapes; it would also read 0 if the
+        // memoizer wait ever gained a cancellation race that drops the provider
+        // `get` future mid-poll, so a failure here means *either* the JoinSet was
+        // dropped *or* that race was introduced.
+        let resumed = resumed.load(Ordering::SeqCst);
         assert_eq!(
-            parked.load(Ordering::SeqCst),
+            resumed,
             expect_parked,
-            "the gate must have opened because every target parked, not by timing out"
+            "{} of {expect_parked} parked targets never resumed, so `result` did \
+             not drain them",
+            expect_parked - resumed
         );
 
         drain_bg(rs).await;
 
+        // A weaker invariant than it looks, and deliberately kept anyway: **this
+        // no longer discriminates the drain regression** (see the doc comment —
+        // with `result` restored to the early return it passes). What it still
+        // freezes is that a request carrying real in-flight work — three spawned
+        // tasks, an aborted walk task, live memoizer cells — is released rather
+        // than leaked. Nothing else covers that; `test_request_state_tracking`
+        // drops a request that never ran anything.
+        //
+        // Bounded rather than instantaneous because deregistration is not
+        // synchronous with `result` returning: the matcher-walk task is `abort`ed
+        // and deliberately never awaited (its own comment says why — it may be
+        // deep inside a whole-package Starlark evaluation, and Ctrl-C must not
+        // wait it out), so the runtime releases the `Arc` that task captured at
+        // some later point of its choosing. Asserting otherwise is what made this
+        // test fail on a loaded linux/arm64 runner while the machinery was working
+        // correctly. A genuine leak is permanent, not slow, so the bound needs no
+        // tuning.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !engine.requests.lock().expect("requests lock").is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a RequestStateData was still registered 10s after the last external \
+                 Arc to it was released: something is still holding one — a captured \
+                 Arc<RequestState> in a task nobody joins, a hook, or a background \
+                 job that never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
+    }
+
+    /// The deep `MatchShrug` arm — the one that shrugs *again* at spec level and
+    /// so reaches `get_def` + `matcher_target::match_target`.
+    ///
+    /// This arm is the entire justification for the shape of this walk
+    /// (enumeration overlapped, matcher evaluation serial in the consumer), and
+    /// the change physically moved it: it used to run inside the per-provider
+    /// loop, interleaved with that provider's listing, and now runs after every
+    /// provider for a package has listed, while K other packages are mid-`list`.
+    /// `label(...)` does not reach it — that resolves at `match_spec` —
+    /// so without a `TreeOutputTo` case the deepest path has no coverage at all.
+    #[tokio::test]
+    async fn query_tree_output_matcher_resolves_through_get_def() -> anyhow::Result<()> {
+        // Both targets live in `gen`, so both survive the addr-level cheap
+        // reject (which needs the two packages to be prefix-related) and both
+        // shrug all the way down. Only `//gen:a`'s codegen tree actually lands
+        // in `gen/dst`, and deciding that needs the def, not the spec.
+        let engine = engine_with(vec![
+            codegen_target("//gen:a", &[], "dst", &[]),
+            codegen_target("//gen:b", &[], "other", &[]),
+        ])?;
+        let rs = engine.new_state();
+
+        let matcher = Matcher::TreeOutputTo(PkgBuf::from("gen/dst"));
+        let addrs: Vec<Addr> = SArc::clone(&engine)
+            .query(rs, &matcher)
+            .try_collect()
+            .await?;
+
+        let names: Vec<&str> = addrs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "only the target whose codegen tree lands in //gen/dst may match"
+        );
+        Ok(())
+    }
+
+    /// The same arm through `EngineProviderExecutor::query` — a second, separately
+    /// edited copy of the loop, and the one `pluginquery` actually drives.
+    #[tokio::test]
+    async fn executor_query_tree_output_matcher_resolves_through_get_def() -> anyhow::Result<()> {
+        let engine = engine_with(vec![
+            codegen_target("//gen:a", &[], "dst", &[]),
+            codegen_target("//gen:b", &[], "other", &[]),
+        ])?;
+        let rs = engine.new_state();
+        let executor = EngineProviderExecutor::new(SArc::downgrade(&engine), SArc::clone(&rs));
+
+        let matcher = Matcher::TreeOutputTo(PkgBuf::from("gen/dst"));
+        let addrs = executor.query(&matcher, &[]).await?;
+
+        let names: Vec<&str> = addrs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["a"]);
+        Ok(())
+    }
+
+    /// Models the `PKG_EVAL_SLOTS` shape: `probe` takes a permit and holds it
+    /// across a yield, `get` (reached from the shrug arm) needs one too.
+    struct PermitProvider {
+        pkgs: Vec<String>,
+        slots: SArc<tokio::sync::Semaphore>,
+    }
+
+    impl crate::engine::provider::Provider for PermitProvider {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "permit".to_string(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            let pkg = req.package.clone();
+            if !self.pkgs.iter().any(|p| p == pkg.as_str()) {
+                return Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) });
+            }
+            Box::pin(async move {
+                let items: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse {
+                    addr: Addr::new(pkg, "t".to_string(), Default::default()),
+                })];
+                Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+            })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+        > {
+            let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                .pkgs
+                .iter()
+                .map(|p| {
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from(p.as_str()),
+                    })
+                })
+                .collect();
+            Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+        }
+        fn get<'a>(
+            &'a self,
+            req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            let slots = SArc::clone(&self.slots);
+            let addr = req.addr.clone();
+            Box::pin(async move {
+                // The consumer's shrug arm lands here and needs a permit —
+                // the ones the fan-out is holding.
+                let _permit = slots
+                    .acquire()
+                    .await
+                    .map_err(|e| GetError::Other(anyhow::Error::new(e)))?;
+                Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr,
+                        driver: "exec".to_string(),
+                        config: Default::default(),
+                        ..Default::default()
+                    },
+                })
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            let pkg = req.package.clone();
+            if !self.pkgs.iter().any(|p| p == pkg.as_str()) {
+                return Box::pin(async { Ok(ProbeResponse { states: vec![] }) });
+            }
+            let slots = SArc::clone(&self.slots);
+            Box::pin(async move {
+                // Mirrors `run_pkg`: permit acquired in async-land, then held
+                // across a yield point.
+                let _permit = slots.acquire().await.context("permit")?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(ProbeResponse { states: vec![] })
+            })
+        }
+    }
+
+    /// The discovery fan-out must not be able to starve its own consumer.
+    ///
+    /// `pluginbuildfile`'s `probe`/`list` reach `run_pkg`, which holds a
+    /// `PKG_EVAL_SLOTS` permit — a global semaphore sized `cores` — across an
+    /// await. The consumer of the fan-out then awaits `get_spec`/`get_def` in the
+    /// `MatchShrug` arm, which can need a permit for a *different* package. If
+    /// the fan-out's futures are only advanced by the consumer polling them, the
+    /// permit holders are unpollable exactly while the consumer needs a permit,
+    /// and `Semaphore` is FIFO: deadlock.
+    ///
+    /// Modelled here with the provider's own semaphore rather than
+    /// `PKG_EVAL_SLOTS` (which is buildfile-internal): `probe` takes a permit and
+    /// holds it across a yield, `get` — reached from the shrug arm via a `Label`
+    /// matcher — needs one too, and there are more in-flight packages than
+    /// permits. Fails by timing out rather than by assertion, which is the only
+    /// honest way to test a deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn discovery_fanout_does_not_starve_the_matcher_consumer() -> anyhow::Result<()> {
+        let k = crate::engine::fanout::discovery_concurrency();
+        // Fewer permits than the fan-out width, so the fan-out can hold them all.
+        let slots = SArc::new(tokio::sync::Semaphore::new((k / 2).max(1)));
+        let n = k * 2;
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
+        engine.register_provider(enclose!((slots) move |_| Box::new(PermitProvider {
+            pkgs: pkgs.clone(),
+            slots: SArc::clone(&slots),
+        })))?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        // A `Label` matcher shrugs at `matches_addr` for every candidate, so the
+        // consumer awaits `get_spec` — and therefore a permit — between batches.
+        let matcher = Matcher::Label("nope".to_string());
+        let walk = SArc::clone(&engine)
+            .query(rs, &matcher)
+            .try_collect::<Vec<Addr>>();
+
+        let addrs = tokio::time::timeout(Duration::from_secs(20), walk)
+            .await
+            .context(
+                "discovery deadlocked: the fan-out held every permit while the \
+                 consumer's MatchShrug arm waited for one, and the holders were \
+                 only pollable by the consumer",
+            )??;
+        // No target carries the label, so nothing matches — the point is that it
+        // terminated.
+        assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
+        Ok(())
+    }
+
+    /// The same starvation through `EngineProviderExecutor::query` — a separate
+    /// copy of the loop, and the one behind every BUILD-file `query(...)` and
+    /// every `//@heph/query:q@expr=` target. It is also the *nested* case: this
+    /// walk runs inside `pluginquery::get`, reachable from `Engine::query`'s own
+    /// shrug arm, so before the fix an outer walk could deadlock through it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn executor_query_fanout_does_not_starve_its_consumer() -> anyhow::Result<()> {
+        let k = crate::engine::fanout::discovery_concurrency();
+        let slots = SArc::new(tokio::sync::Semaphore::new((k / 2).max(1)));
+        let n = k * 2;
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
+        engine.register_provider(enclose!((slots) move |_| Box::new(PermitProvider {
+            pkgs: pkgs.clone(),
+            slots: SArc::clone(&slots),
+        })))?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+        let executor = EngineProviderExecutor::new(SArc::downgrade(&engine), rs);
+
+        let matcher = Matcher::Label("nope".to_string());
+        let addrs = tokio::time::timeout(Duration::from_secs(20), executor.query(&matcher, &[]))
+            .await
+            .map_err(|_e| {
+                anyhow::anyhow!(
+                    "executor discovery deadlocked: the fan-out held every permit \
+                     while the consumer's MatchShrug arm waited for one"
+                )
+            })??;
+        assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
+        Ok(())
+    }
+
+    /// A `list()` implementation that calls back into `req.executor.query()` —
+    /// exactly the reentrant call `IN_PROVIDER_LIST` exists to catch (see its doc
+    /// comment). No in-tree provider does this, but nothing stopped a third-party
+    /// or out-of-process one from nesting a second K-wide walk under the one
+    /// already dispatching this `list()` call, silently, with no diagnostic.
+    /// Must fail loudly instead.
+    #[tokio::test]
+    async fn list_calling_back_into_query_is_rejected() -> anyhow::Result<()> {
+        struct ReentrantQueryProvider {
+            pkg: String,
+        }
+
+        impl crate::engine::provider::Provider for ReentrantQueryProvider {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "reentrant".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async move {
+                    // Incorrect provider behaviour: calling back into `query()`
+                    // from inside `list()`. This must error, not nest.
+                    req.executor
+                        .query(&Matcher::PackagePrefix(PkgBuf::from("")), &[])
+                        .await?;
+                    Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let pkg = self.pkg.clone();
+                Box::pin(async move {
+                    let items: Vec<anyhow::Result<ListPackageResponse>> =
+                        vec![Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(pkg.as_str()),
+                        })];
+                    Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+        }
+
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|_| {
+            Box::new(ReentrantQueryProvider {
+                pkg: "p".to_string(),
+            })
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
+        let err = SArc::clone(&engine)
+            .query(rs, &matcher)
+            .try_collect::<Vec<Addr>>()
+            .await
+            .expect_err(
+                "a list() that calls back into query() must be rejected, not silently nested",
+            );
         assert!(
-            engine.requests.lock().expect("requests lock").is_empty(),
-            "the request outlived its own `result` call: dropping the JoinSet left \
-             un-polled futures in this request's memoizers, and those futures hold an \
-             Arc back into the RequestStateData that owns them, so its Drop — which \
-             cancels the token and deregisters the request — can never run"
+            format!("{err:#}").contains("Provider::list"),
+            "expected the reentrancy error, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// Cancelling a walk must stop it *starting* packages it has not reached.
+    ///
+    /// Discovery is overlapped now, so an abandoned walk is abandoned with up to
+    /// K package futures in flight. Those cannot be un-started — but everything
+    /// behind them can, and must be: without the short-circuit the walk keeps
+    /// evaluating whole BUILD files, one per remaining package, for a request
+    /// whose answer nobody wants. On a 20k-package workspace that is the entire
+    /// workspace evaluated after Ctrl-C.
+    ///
+    /// The provider counts `list` calls. Slow, non-cancellation-aware packages
+    /// hold the fan-out open long enough for the cancel to land mid-walk.
+    #[tokio::test]
+    async fn cancelling_a_walk_stops_starting_new_packages() -> anyhow::Result<()> {
+        struct CountingSlowList {
+            pkgs: Vec<String>,
+            lists: SArc<AtomicUsize>,
+        }
+
+        impl crate::engine::provider::Provider for CountingSlowList {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "slowcount".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                if !self.pkgs.iter().any(|p| p == req.package.as_str()) {
+                    return Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) });
+                }
+                let lists = SArc::clone(&self.lists);
+                Box::pin(async move {
+                    lists.fetch_add(1, Ordering::SeqCst);
+                    // Deliberately not cancellation-aware: a whole-package
+                    // Starlark evaluation does not stop early either.
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok(Box::new(std::iter::empty()) as Box<_>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let items: Vec<anyhow::Result<ListPackageResponse>> = self
+                    .pkgs
+                    .iter()
+                    .map(|p| {
+                        Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(p.as_str()),
+                        })
+                    })
+                    .collect();
+                Box::pin(async move { Ok(Box::new(items.into_iter()) as Box<_>) })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+        }
+
+        let k = crate::engine::fanout::discovery_concurrency();
+        // Far more packages than the buffer, so an un-short-circuited walk has
+        // plenty left to start after the cancel lands.
+        let n = k * 8;
+        let root = tempdir()?;
+        let lists = SArc::new(AtomicUsize::new(0));
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        let pkgs: Vec<String> = (0..n).map(|i| format!("p{i:04}")).collect();
+        engine.register_provider(enclose!((lists) move |_| Box::new(CountingSlowList {
+            pkgs: pkgs.clone(),
+            lists: SArc::clone(&lists),
+        })))?;
+        let engine = SArc::new(engine);
+
+        let rs = engine.new_state();
+        let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
+        let stream = SArc::clone(&engine).query(rs.clone(), &matcher);
+        tokio::pin!(stream);
+
+        // Let one buffer-load get under way, then cancel and keep draining.
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            rs.ctoken().cancel();
+        };
+        let consume = async {
+            let mut last: Option<anyhow::Error> = None;
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item {
+                    last = Some(e);
+                }
+            }
+            last
+        };
+        let (err, ()) = tokio::join!(consume, drain);
+
+        let started = lists.load(Ordering::SeqCst);
+        assert!(
+            started < n,
+            "a cancelled walk must stop starting packages: it listed {started} of {n}"
+        );
+        // And it must *say so*. Returning `Ok(vec![])` for the packages it
+        // skipped would let the walk complete normally with a short answer —
+        // and that answer becomes `pluginquery`'s `deps`, folded in order into
+        // `plugingroup`'s def hash. A Ctrl-C during discovery would then write a
+        // cache entry keyed on a graph whose size depends on when the cancel
+        // landed, and that entry outlives the run that was abandoned.
+        let err = err.expect("a cancelled walk must surface an error, not a short answer");
+        assert!(
+            downcast_chain_ref::<CancelledError>(&err).is_some(),
+            "expected CancelledError, got: {err:#}"
         );
         Ok(())
     }
@@ -6679,6 +7994,11 @@ mod tests {
         exec_count: SArc<AtomicUsize>,
         /// `(output group, artifact name)` pairs this target emits.
         outputs: SArc<Vec<(String, String)>>,
+        /// When set, `run` hands `execute_cache` a sandbox-cleanup job (the way a
+        /// real sandboxing bridge does) whose body records the name of the thread
+        /// it ran on. That name is the only direct evidence of which background
+        /// lane the rmdir was routed to.
+        cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
     }
 
     #[async_trait]
@@ -6749,7 +8069,16 @@ mod tests {
                         hashout: "feedface".to_string(),
                     })
                     .collect(),
-                sandbox_cleanup: None,
+                sandbox_cleanup: self.cleanup_thread.clone().map(|cell| {
+                    Box::new(move || {
+                        let name = std::thread::current()
+                            .name()
+                            .unwrap_or("<unnamed>")
+                            .to_string();
+                        drop(cell.set(name));
+                        Ok(())
+                    }) as crate::engine::driver::SandboxCleanupJob
+                }),
                 sandbox_guards: vec![],
             })
         }
@@ -6834,6 +8163,28 @@ mod tests {
         exec_count: SArc<AtomicUsize>,
         outputs: Vec<(String, String)>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
+        blocking_engine_full(exec_count, outputs, "a", None, None)
+    }
+
+    /// Full form.
+    ///
+    /// `target_name` names the single target under `//pkg`. `cleanup_thread`
+    /// makes the driver hand back a sandbox-cleanup job that records the thread
+    /// it ran on. `wrap_cache` wraps the engine's `LocalCache`, which is how a
+    /// test observes the thread the post-write trim ran on.
+    /// Decorates the engine's `LocalCache` — how a test observes the thread the
+    /// post-write trim ran on.
+    type CacheWrapper<'a> = &'a dyn Fn(
+        SArc<dyn crate::engine::local_cache::LocalCache>,
+    ) -> SArc<dyn crate::engine::local_cache::LocalCache>;
+
+    fn blocking_engine_full(
+        exec_count: SArc<AtomicUsize>,
+        outputs: Vec<(String, String)>,
+        target_name: &str,
+        cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
+        wrap_cache: Option<CacheWrapper<'_>>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
         let dir = tempdir()?;
         let mut engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
@@ -6848,13 +8199,21 @@ mod tests {
             },
             ..Default::default()
         })?;
+        if let Some(wrap) = wrap_cache {
+            engine.local_cache = wrap(engine.local_cache.clone());
+        }
         engine.register_driver(|_| {
             Box::new(BlockingDriver {
                 exec_count,
                 outputs: SArc::new(outputs),
+                cleanup_thread,
             })
         })?;
-        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let addr = Addr::new(
+            PkgBuf::from("pkg"),
+            target_name.to_string(),
+            Default::default(),
+        );
         let spec = TargetSpec {
             addr: addr.clone(),
             driver: "blocking".to_string(),
@@ -6862,6 +8221,242 @@ mod tests {
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
+    }
+
+    /// Resolve one cacheable target through the **real** production cache stack
+    /// (`Mem(Spill(SQLite, FS))`, mem tier at its default) at the given spill
+    /// threshold, and hand back its single result artifact. Held `TempDir` is
+    /// returned because the cache lives under it.
+    async fn resolve_one_artifact_at_spill(
+        spill_threshold_bytes: u64,
+    ) -> (Arc<dyn Content>, tempfile::TempDir) {
+        let dir = tempdir().expect("tempdir");
+        let mut engine = Engine::new(Config {
+            root: dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            spill_threshold_bytes,
+            ..Default::default()
+        })
+        .expect("engine");
+        engine
+            .register_driver(|_| {
+                Box::new(BlockingDriver {
+                    exec_count: SArc::new(AtomicUsize::new(0)),
+                    outputs: SArc::new(vec![("main".to_string(), "out_main".to_string())]),
+                    cleanup_thread: None,
+                })
+            })
+            .expect("driver");
+        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let spec = TargetSpec {
+            addr: addr.clone(),
+            driver: "blocking".to_string(),
+            ..Default::default()
+        };
+        engine
+            .register_provider(move |_| Box::new(OneTargetProvider { spec }))
+            .expect("provider");
+        let engine = Arc::new(engine);
+
+        let r = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("resolves");
+        assert_eq!(r.artifacts.len(), 1, "the single output is surfaced");
+        (Arc::clone(&r.artifacts[0]), dir)
+    }
+
+    /// The direct-open fast path, end to end through the real cache stack.
+    ///
+    /// Every tier has to answer for a consumer to get anything: the artifact is
+    /// a `GuardedArtifact` over a `CacheArtifact` over `Mem(Spill(SQLite, FS))`,
+    /// and a single tier defaulting to `None` — as all of them did — turns the
+    /// whole path off with nothing failing. The unit tests pin the tiers; this
+    /// pins that they compose, which is the property that was actually broken.
+    ///
+    /// The spill threshold is lowered to 64 bytes so the packed tar lands in the
+    /// FS blob store without the test writing megabytes. The mem tier is left at
+    /// its default — it is what production runs, and it is the tier sitting on
+    /// top of the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_artifact_exposes_its_blob_file_for_direct_open() {
+        let (artifact, _dir) = resolve_one_artifact_at_spill(64).await;
+
+        let path = artifact
+            .file_path()
+            .expect("a spilled cache blob must reach the consumer as a path");
+        let via_path = std::fs::read(&path).expect("open the cache blob directly");
+        assert!(!via_path.is_empty(), "the path must name the real blob");
+
+        // Same bytes either way — the fast path is a different route to the
+        // artifact, not a different artifact.
+        let mut via_stream = Vec::new();
+        std::io::Read::read_to_end(&mut artifact.reader().expect("reader"), &mut via_stream)
+            .expect("stream the artifact");
+        assert_eq!(
+            via_path, via_stream,
+            "direct open and the byte stream must serve the same artifact"
+        );
+    }
+
+    /// The property that makes handing out a bare `PathBuf` safe at all: an fd
+    /// opened from it keeps serving the bytes it was opened on, even after the
+    /// same cache key is rewritten underneath it.
+    ///
+    /// This is the half of the safety argument that is not about locking.
+    /// `AtomicFileWriter` finishes by `rename`ing over the destination, so a
+    /// rewrite (a lazy remote-cache pull, a rebuild) swaps the *inode* the path
+    /// names while an already-open fd keeps the old one alive — POSIX unlink
+    /// semantics, identical on all three supported targets. Without that, a
+    /// consumer that opened the file could observe a torn mix of two revisions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_fd_opened_from_the_path_survives_the_blob_being_rewritten() {
+        let (artifact, _dir) = resolve_one_artifact_at_spill(64).await;
+        let path = artifact.file_path().expect("spilled blob has a path");
+
+        let mut fd = std::fs::File::open(&path).expect("open before the rewrite");
+        let original = std::fs::read(&path).expect("read blob");
+
+        // Replace the blob the way the cache does — write a sibling, rename over.
+        let tmp = path.with_extension("rewrite");
+        std::fs::write(&tmp, b"a completely different revision").expect("write");
+        std::fs::rename(&tmp, &path).expect("rename over the live blob");
+
+        let mut held = Vec::new();
+        std::io::Read::read_to_end(&mut fd, &mut held).expect("read through the held fd");
+        assert_eq!(
+            held, original,
+            "the open fd must still serve the revision it was opened on"
+        );
+        assert_ne!(
+            std::fs::read(&path).expect("read"),
+            original,
+            "precondition: the path itself now names different bytes"
+        );
+    }
+
+    /// The shape ~every production artifact actually has, which the test above
+    /// does not cover: at the **default** spill threshold a small artifact is a
+    /// sqlite row with no file anywhere, so the honest answer is `None` and the
+    /// consumer must fall back to the byte stream.
+    ///
+    /// This is the direction that turns a working read into a hard error if it
+    /// regresses — a consumer opens what it is handed and never falls back — and
+    /// it is exactly what a well-meaning "optimization" in the mem tier (answer
+    /// from residency!) would break, with every other test in this area still
+    /// green. `_golist`, the only artifact plugin-go reads across the seam, takes
+    /// this branch and never the one above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_small_cached_artifact_reports_no_file_and_still_streams() {
+        let (artifact, _dir) =
+            resolve_one_artifact_at_spill(crate::engine::config::DEFAULT_SPILL_THRESHOLD_BYTES)
+                .await;
+
+        assert!(
+            artifact.file_path().is_none(),
+            "a sub-threshold blob lives in sqlite; naming a path would be naming nothing"
+        );
+
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut artifact.reader().expect("reader"), &mut bytes)
+            .expect("stream the artifact");
+        assert!(
+            !bytes.is_empty(),
+            "the stream must still serve the artifact when there is no file"
+        );
+    }
+
+    /// P6.2: each background job class must reach its own lane.
+    ///
+    /// The two `Lane::` literals — the sandbox rmdir in `execute_cache`'s
+    /// `defer!` and the batched post-write trim in `DeferredTrims::drop` — are the
+    /// whole of the routing decision, and every other lane test drives `enqueue`
+    /// with a lane the test itself supplies. Swap those two literals and the lanes
+    /// invert while the rest of the suite stays green.
+    ///
+    /// Asserted on the *thread each job actually ran on*, not on the argument
+    /// passed to `enqueue`, so a `sender()` that ignored its lane would fail here
+    /// too. `Thread::name` reports the requested name on every supported target
+    /// (Linux's 16-byte `PR_SET_NAME` truncation affects `/proc`, not this).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_background_job_class_runs_on_its_own_lane() {
+        use crate::engine::local_cache_test_double::ForwardingCache;
+
+        let exec_count = SArc::new(AtomicUsize::new(0));
+        let rmdir_thread: SArc<std::sync::OnceLock<String>> = SArc::new(std::sync::OnceLock::new());
+        let trim_thread: SArc<std::sync::OnceLock<String>> = SArc::new(std::sync::OnceLock::new());
+        let wrap_trim = SArc::clone(&trim_thread);
+        let (engine, _dir, addr) = blocking_engine_full(
+            SArc::clone(&exec_count),
+            vec![("main".to_string(), "out".to_string())],
+            "p62_lane_routing",
+            Some(SArc::clone(&rmdir_thread)),
+            Some(&|inner| {
+                // Records the thread of the first `list_target_entries` call.
+                // In this test that call can only come from
+                // `try_trim_after_write`, which starts with an unlocked
+                // revision count — so it is reached whether or not the trim
+                // goes on to take the write lock.
+                SArc::new(ForwardingCache::new(inner).on_list_target_entries({
+                    let wrap_trim = SArc::clone(&wrap_trim);
+                    move |_| {
+                        drop(
+                            wrap_trim.set(
+                                std::thread::current()
+                                    .name()
+                                    .unwrap_or("<unnamed>")
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }))
+            }),
+        )
+        .expect("engine");
+
+        let rs = engine.new_state();
+        engine
+            .clone()
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("cold build resolves");
+        assert_eq!(exec_count.load(Ordering::SeqCst), 1, "target executed once");
+
+        // The trim is only *submitted* when the request state drops, so it cannot
+        // have run yet. This is the deferral the lane split has to compose with —
+        // if it ever regresses to running inline, the assertion below would be
+        // measuring the calling thread instead of a lane.
+        assert!(
+            trim_thread.get().is_none(),
+            "post-write trim must not run before the request state drops"
+        );
+
+        // Releases the request, which submits the trim batch, then waits for both
+        // lanes to drain through the counter they share.
+        drain_bg(rs).await;
+
+        assert_eq!(
+            rmdir_thread.get().map(String::as_str),
+            Some("heph-sandbox-cleaner"),
+            "the sandbox rmdir must run on the reclaim lane"
+        );
+        assert_eq!(
+            trim_thread.get().map(String::as_str),
+            Some("heph-cache-gc"),
+            "the batched post-write cache.history trim must run on the bookkeeping lane"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7074,61 +8669,8 @@ mod tests {
         // presence-probe and the per-caller read each parsed the manifest (two
         // backend reads per hit); now the probe stashes the parsed manifest on
         // `LockedResolution` and the caller filters its outputs from it.
-        use crate::engine::local_cache::{
-            Existence, LocalCache, MANIFEST_V1, SizedReader, TargetStream,
-        };
-
-        struct CountingCache {
-            inner: SArc<dyn LocalCache>,
-            manifest_reads: SArc<AtomicUsize>,
-        }
-        impl LocalCache for CountingCache {
-            fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
-                if name == MANIFEST_V1 {
-                    self.manifest_reads.fetch_add(1, Ordering::SeqCst);
-                }
-                self.inner.reader(addr, hashin, name)
-            }
-            fn writer(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Box<dyn std::io::Write>> {
-                self.inner.writer(addr, hashin, name)
-            }
-            fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-                self.inner.exists(addr, hashin, name)
-            }
-            // Forwarded, not defaulted: defaulting would route the probe through
-            // the blocking  and park the worker this test runs on.
-            fn existence(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Existence> {
-                self.inner.existence(addr, hashin, name)
-            }
-            fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
-                self.inner.delete(addr, hashin, name)
-            }
-            fn list_targets(&self) -> anyhow::Result<TargetStream> {
-                self.inner.list_targets()
-            }
-            fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
-                self.inner.list_target_entries(addr)
-            }
-            fn seekable_reader(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
-            {
-                self.inner.seekable_reader(addr, hashin, name)
-            }
-        }
+        use crate::engine::local_cache::MANIFEST_V1;
+        use crate::engine::local_cache_test_double::ForwardingCache;
 
         let dir = tempdir().expect("tempdir");
         let mut engine = Engine::new(Config {
@@ -7145,10 +8687,15 @@ mod tests {
         })
         .expect("engine");
         let manifest_reads = SArc::new(AtomicUsize::new(0));
-        engine.local_cache = SArc::new(CountingCache {
-            inner: engine.local_cache.clone(),
-            manifest_reads: SArc::clone(&manifest_reads),
-        });
+        engine.local_cache =
+            SArc::new(ForwardingCache::new(engine.local_cache.clone()).on_reader({
+                let manifest_reads = SArc::clone(&manifest_reads);
+                move |_, _, name| {
+                    if name == MANIFEST_V1 {
+                        manifest_reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }));
         let exec_count = SArc::new(AtomicUsize::new(0));
         engine
             .register_driver(enclose!(
@@ -7156,6 +8703,7 @@ mod tests {
                     Box::new(BlockingDriver {
                         exec_count,
                         outputs: SArc::new(vec![("main".to_string(), "out".to_string())]),
+                        cleanup_thread: None,
                     })
                 }
             ))
@@ -8811,6 +10359,46 @@ mod tests {
         Ok(())
     }
 
+    /// `--shell` on a single target with no terminal attached is refused with
+    /// a typed error naming the addr and the next action — not a bare
+    /// `anyhow::bail!` string with neither.
+    #[tokio::test]
+    async fn shell_without_a_terminal_names_the_addr_and_the_next_step() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![leaf_spec("//pkg:a", false)?])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let opts = ResultOptions {
+            shell: true,
+            interactive: None,
+            ..Default::default()
+        };
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &opts)
+            .await
+            .err()
+            .expect("--shell with no terminal must fail");
+
+        let typed = downcast_chain_ref::<ShellNeedsSingleTarget>(&err)
+            .expect("must be the typed shell error, not a bare anyhow string");
+        assert!(
+            matches!(typed, ShellNeedsSingleTarget::NotInteractive { addr } if addr.format() == "//pkg:a"),
+            "the error must carry the addr that was refused: {err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("//pkg:a"), "msg: {msg}");
+        assert!(
+            msg.contains("try: run `heph run --shell //pkg:a`"),
+            "an actionable message must name the next command: {msg}"
+        );
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            0,
+            "nothing may run once --shell is refused",
+        );
+        Ok(())
+    }
+
     /// The warm path: a single-member group whose member is already cached
     /// executes nothing, so it takes no terminal — `probe.calls` counts
     /// executes, and the whole suite rests on that. `--shell` still shells in,
@@ -8858,6 +10446,113 @@ mod tests {
             "--shell on a cached alias still shells into the member",
         );
         assert_eq!(h.probe.calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// The codegen write-back must not run on a tokio worker.
+    ///
+    /// It is the heaviest synchronous read on the result path: it walks every
+    /// generated file, pulls its bytes out of the cache, reads the tree file back
+    /// and (when frozen) diffs the two. The cache read underneath additionally
+    /// parks the calling thread until any queued sqlite write to that artifact
+    /// has been committed — and the artifacts it walks come straight from
+    /// `cache_locally`, which queues them.
+    ///
+    /// The content records the thread it was walked on. `hcore::blocking`'s pool
+    /// threads are the only ones named `heph-blocking-*`, so the name is the
+    /// witness. Asserted positively: `!= "tokio-runtime-worker"` would pass
+    /// vacuously, since `#[tokio::test]` runs the body on the test thread.
+    #[tokio::test]
+    async fn codegen_write_back_runs_off_the_runtime_workers() -> anyhow::Result<()> {
+        use crate::engine::driver::targetdef::path;
+
+        /// A one-file tar that records the thread its walk ran on.
+        struct ThreadRecordingTar {
+            bytes: Vec<u8>,
+            thread: Arc<std::sync::Mutex<Option<String>>>,
+        }
+
+        impl Content for ThreadRecordingTar {
+            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+                Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
+                *self.thread.lock().expect("thread slot") = std::thread::current()
+                    .name()
+                    .map(std::borrow::ToOwned::to_owned);
+                Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
+                    std::io::Cursor::new(self.bytes.clone()),
+                )?))
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                Ok("HO".to_string())
+            }
+        }
+
+        let root = tempdir()?;
+        let engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+
+        let mut packer = hcore::hartifactcontent::tar::TarPacker::new();
+        packer.create_raw(b"generated\n".to_vec(), "gen.txt", false);
+        let mut bytes = Vec::new();
+        packer.pack(&mut bytes)?;
+        let thread = Arc::new(std::sync::Mutex::new(None));
+
+        let def = LinkedTargetDef {
+            target: Arc::new(TargetDef {
+                addr: hmodel::htaddr::parse_addr("//pkg:gen")?,
+                labels: Vec::new(),
+                raw_def: Arc::new(()),
+                inputs: Vec::new(),
+                outputs: vec![crate::engine::driver::targetdef::Output {
+                    group: "out".to_string(),
+                    paths: vec![path::Path {
+                        content: path::Content::FilePath("gen.txt".to_string()),
+                        codegen_tree: path::CodegenMode::Copy,
+                        collect: false,
+                    }],
+                }],
+                support_files: Vec::new(),
+                cache: crate::engine::driver::targetdef::CacheConfig::on(false),
+                pty: false,
+                hash: Vec::new(),
+                transparent: false,
+            }),
+            inputs: Vec::new(),
+        };
+        let cached = vec![ResultArtifact {
+            content: Arc::new(ThreadRecordingTar {
+                bytes,
+                thread: Arc::clone(&thread),
+            }),
+            group: "out".to_string(),
+            r#type: ManifestArtifactType::Output,
+        }];
+
+        let wrote = engine
+            .materialize_codegen(true, &def, &cached, false)
+            .await?;
+
+        assert!(wrote, "the tree must actually be written back");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gen.txt"))?,
+            "generated\n",
+        );
+        let ran_on = thread.lock().expect("thread slot").clone();
+        assert!(
+            ran_on
+                .as_deref()
+                .is_some_and(|n| n.starts_with("heph-blocking")),
+            "the codegen write-back must run on the blocking pool, ran on {ran_on:?}"
+        );
         Ok(())
     }
 }

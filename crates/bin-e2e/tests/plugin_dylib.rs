@@ -80,6 +80,50 @@ fn shipped_gha_cdylib_loads() {
     );
 }
 
+/// Regression test for the log-sink-before-`create` ordering bug: if the host
+/// installs its log sink *after* calling the plugin's `create`, a
+/// `tracing::error!` logged during construction failure has no subscriber to
+/// go to and is silently dropped — right before the ABI seam turns the
+/// failure into a non-unwinding abort with zero diagnostic output. Nothing
+/// about this is observable in a linked test: it needs a real dlopen'd cdylib
+/// whose own statically-linked `tracing` has no subscriber until the host
+/// installs one.
+///
+/// The shipped go plugin already fails construction deterministically given a
+/// malformed `walk_db` option (it decodes as a `PathBuf`; a YAML sequence
+/// can't deserialize into one) — no purpose-built test hook needed.
+#[test]
+fn plugin_construction_failure_logs_before_the_abort() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      walk_db: [1, 2, 3]\n",
+        manifest.display()
+    ))
+    .expect("write config");
+
+    let out = ws.run(&dist, &["inspect", "functions"]).expect("run");
+    assert!(
+        !out.status.success(),
+        "plugin construction should have failed and aborted: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("plugin construction failed") && stderr.contains("walk_db"),
+        "construction-failure log was dropped — the log sink must be installed \
+         before `create` is called: {}",
+        describe(&out)
+    );
+}
+
 /// The checksum in the manifest is the supply-chain guard on a dylib that is
 /// about to be mapped into the process with full privileges. It must reject,
 /// loudly, before loading. Nothing about this path exists in a linked test —

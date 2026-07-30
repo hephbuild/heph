@@ -115,6 +115,17 @@ impl LocalCache for LocalCacheMem {
         self.inner.existence(addr, hashin, name)
     }
 
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+        let key = Self::key(addr, hashin, name);
+        // Mirrors `exists`/`existence`, peek included: a resident entry is
+        // served by `reader` from this tier alone, so it is committed as far as
+        // any caller is concerned, whatever the durable backend's queue says.
+        if self.cache.peek(&key).is_some() {
+            return Ok(true);
+        }
+        self.inner.exists_committed(addr, hashin, name)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let key = Self::key(addr, hashin, name);
         self.cache.remove(&key);
@@ -149,6 +160,29 @@ impl LocalCache for LocalCacheMem {
         // memory. The next `reader()` call will populate the cache for
         // streaming consumers.
         self.inner.seekable_reader(addr, hashin, name)
+    }
+
+    /// Delegated unconditionally, unlike every other read path here: this tier
+    /// only *fronts* reads — `writer` forwards to the durable backend — so a
+    /// resident entry is a copy of a durable one, never the only copy. Residency
+    /// therefore cannot answer "is there a file?", and delegating is not an
+    /// optimization to skip but the only way to get the answer.
+    ///
+    /// It is not free. Under the production stack `inner` is [`LocalCacheSpill`],
+    /// which goes straight to the FS blob store, so this costs one `stat` that
+    /// misses for anything under the spill threshold — i.e. for every entry this
+    /// tier can hold. Paid on the seam hand-off path only, and worth it against
+    /// naming a file that is not there.
+    ///
+    /// The two tiers are disjoint *while* `per_entry_bytes` ≤ the spill
+    /// threshold (16 KiB vs 8 MiB by default) — both user-tunable, with nothing
+    /// enforcing the ordering. Above that an entry is both mem-resident and an FS
+    /// file, and `reader` (the mem copy) and `file_path` (the file) become two
+    /// sources for one key.
+    ///
+    /// [`LocalCacheSpill`]: crate::engine::local_cache_spill::LocalCacheSpill
+    fn file_path(&self, addr: &Addr, hashin: &str, name: &str) -> Option<std::path::PathBuf> {
+        self.inner.file_path(addr, hashin, name)
     }
 }
 
@@ -242,6 +276,12 @@ mod tests {
             Ok(Existence::Committed(self.exists(addr, hashin, name)?))
         }
 
+        fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+            // Commits inline, so the committed answer is just `exists`. Counted
+            // the same way, so a probe through either name is visible.
+            self.exists(addr, hashin, name)
+        }
+
         fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
             self.delete_calls.fetch_add(1, Ordering::Relaxed);
             let key = CountingCache::key(addr, hashin, name);
@@ -282,6 +322,33 @@ mod tests {
         let mut w = cache.writer(addr, "h1", name).expect("writer");
         w.write_all(data).expect("write");
         drop(w);
+    }
+
+    /// This tier sits at the top of the cacheable stack, so a method left to the
+    /// trait default here is that method switched off for every cached artifact
+    /// in the product. It only *fronts* reads — writes go straight through — so
+    /// whether a durable file exists is the durable backend's question, and
+    /// residency must not change the answer.
+    #[test]
+    fn file_path_delegates_to_the_durable_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Arc::new(
+            crate::engine::local_cache_fs::LocalCacheFS::new(dir.path().join("blobs")).expect("fs"),
+        );
+        let dec = LocalCacheMem::new(inner, 1024, 64 * 1024);
+        let addr = make_addr();
+
+        write_blob(&dec, &addr, "out.tar", b"blob bytes");
+        // Read once so the entry is mem-resident; the answer must not change.
+        assert_eq!(
+            drain(dec.reader(&addr, "h1", "out.tar").expect("read").reader),
+            b"blob bytes"
+        );
+
+        let path = dec
+            .file_path(&addr, "h1", "out.tar")
+            .expect("durable backend has a file for this blob");
+        assert_eq!(std::fs::read(&path).expect("read"), b"blob bytes");
     }
 
     #[test]
@@ -407,6 +474,9 @@ mod tests {
         fn existence(&self, _: &Addr, _: &str, _: &str) -> Result<Existence> {
             Ok(Existence::Committed(true))
         }
+        fn exists_committed(&self, _: &Addr, _: &str, _: &str) -> Result<bool> {
+            Ok(true)
+        }
         fn delete(&self, _: &Addr, _: &str, _: &str) -> Result<()> {
             Ok(())
         }
@@ -445,6 +515,42 @@ mod tests {
         let before = inner.exists_calls.load(Ordering::Relaxed);
         assert!(dec.exists(&addr, "h1", "k").expect("exists"));
         assert_eq!(inner.exists_calls.load(Ordering::Relaxed), before);
+    }
+
+    /// **The mem tier must never answer `exists` for a key it has just written.**
+    ///
+    /// `exists` short-circuits on a resident entry, which is only safe because
+    /// `writer` *invalidates* the key instead of populating it — so the sole way
+    /// an entry becomes resident is through `reader`, which has already waited on
+    /// the inner backend's write queue. Populating the cache from `writer` with
+    /// the bytes it already holds is an obvious optimization, and it would quietly
+    /// turn `exists` into a non-barrier: `Engine::try_trim_after_write` would stop
+    /// being ordered against its own write, `cache.history` would go unenforced,
+    /// and every test of the trim itself would stay green.
+    ///
+    /// This is that invariant, pinned where it lives.
+    #[test]
+    fn exists_delegates_after_a_write_with_no_intervening_read() {
+        let inner = Arc::new(CountingCache::default());
+        let dec = LocalCacheMem::new(inner.clone(), 1024, 64 * 1024);
+        let addr = make_addr();
+
+        // A read first, to make the key resident and prove the short-circuit is
+        // otherwise live (see `exists_short_circuits_on_cache_hit`).
+        write_blob(&dec, &addr, "k", b"v");
+        let _ = drain(dec.reader(&addr, "h1", "k").expect("r").reader);
+
+        // Now rewrite it, with no read in between.
+        write_blob(&dec, &addr, "k", b"v2");
+
+        let before = inner.exists_calls.load(Ordering::Relaxed);
+        assert!(dec.exists(&addr, "h1", "k").expect("exists"));
+        assert_eq!(
+            inner.exists_calls.load(Ordering::Relaxed),
+            before + 1,
+            "the write invalidated the entry, so `exists` must reach the inner \
+             backend — that call is what makes it a write barrier"
+        );
     }
 
     #[test]

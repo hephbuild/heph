@@ -620,6 +620,10 @@ mod tests {
     /// permit stayed captured, and the backstop re-woke the abandoned cell
     /// every 250ms forever — the dumps show ~1000 such ticks over 269s.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "`exclusive()` serializes whole tests against each other, so its guard is meant to outlive every await below"
+    )]
     async fn an_abandoned_memoized_wait_releases_its_permit_and_its_backstop() {
         use crate::hmemoizer::Memoizer;
 
@@ -645,7 +649,9 @@ mod tests {
                             .await
                             .expect("semaphore is never closed");
                         run(move || {
-                            drop(release_rx.recv());
+                            // Park until the test releases us (or drops the
+                            // sender); either outcome means "carry on".
+                            let _released = release_rx.recv();
                             7
                         })
                         .await

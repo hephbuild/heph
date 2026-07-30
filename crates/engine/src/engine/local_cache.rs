@@ -200,6 +200,24 @@ pub trait LocalCache: Send + Sync {
     /// An inline backend answers `Ok(Existence::Committed(self.exists(..)?))`
     /// explicitly; a decorator forwards to the layer that owns the queue.
     fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Existence>;
+    /// [`exists`](Self::exists) answered from the *committed* state alone, with
+    /// no regard for the write-behind queue and no wait on it.
+    ///
+    /// The answer [`existence`](Self::existence) gives as
+    /// `Existence::Committed`, available on its own. [`Engine::exists_local`]
+    /// needs it for the one case `existence` cannot serve: having spent its
+    /// retry budget on a key that keeps reporting `Queued`, it has to answer
+    /// *something*, and the only non-waiting answer is the committed one.
+    /// Falling back to `exists` there re-parked the caller on the very condvar
+    /// the loop exists to avoid.
+    ///
+    /// **Required, for the same reason as `existence`.** A default of
+    /// `self.exists(..)` is right for a backend that commits inline and silently
+    /// reinstates the park for one that queues. A decorator must mirror its own
+    /// `exists` — including any tier-local short-circuit, since an entry this
+    /// layer can serve is committed as far as any caller is concerned — rather
+    /// than delegate blind.
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool>;
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
     /// Stream the distinct target address keys (`Addr::format()`, parseable via
     /// `htaddr::parse_addr`) present in the cache. Streamed rather than collected
@@ -787,6 +805,14 @@ impl Engine {
     /// exhaustion the committed answer is the right one to return — a reader has no
     /// happens-before against a write still in flight, so "absent" was always a
     /// legitimate answer, and the `warn!` says the backend is behaving oddly.
+    ///
+    /// That exhaustion answer comes from [`LocalCache::exists_committed`], not
+    /// from `exists`. `exists` waits out the queue, so using it here re-parked
+    /// the worker in precisely the case the cap exists to prevent, while the
+    /// `warn!` claimed the opposite. The case is reachable rather than
+    /// hypothetical: `SpillWriter::spill` re-arms the pending map twice for one
+    /// key (a write, then a `delete`) every time a blob crosses the spill
+    /// threshold.
     pub(crate) async fn exists_local(
         &self,
         addr: &Addr,
@@ -806,7 +832,7 @@ impl Engine {
             waits = MAX_QUEUE_WAITS,
             "local cache kept reporting a queued write for one key; answering from committed state"
         );
-        self.local_cache.exists(addr, hashin, name)
+        self.local_cache.exists_committed(addr, hashin, name)
     }
 
     /// Build this caller's artifact set from an already-parsed `manifest`, gating
@@ -1413,11 +1439,16 @@ mod tests {
     /// A backend that reports the write queue a fixed number of times before
     /// settling — a key rewritten while it is being probed, or a backend that has
     /// gone wrong and keeps claiming a queue forever.
+    ///
+    /// `exists` **blocks**, standing in for the real backend's
+    /// `wait_if_pending`: `exists_local` must never reach it, and a double that
+    /// answered instantly would let a regression through unnoticed.
     struct QueuedTimes {
         queued_answers: std::sync::Mutex<usize>,
         committed: bool,
         existence_calls: Arc<std::sync::atomic::AtomicUsize>,
         exists_calls: Arc<std::sync::atomic::AtomicUsize>,
+        exists_committed_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl LocalCache for QueuedTimes {
@@ -1429,6 +1460,18 @@ mod tests {
         }
         fn exists(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<bool> {
             self.exists_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The waiting variant: `LocalCacheSQLite::exists` parks on the
+            // pending slot's untimed condvar. Sleeping rather than blocking
+            // forever so a regression ends with the counters intact instead of
+            // hanging the suite — comfortably past the caller's 5s timeout, but
+            // not so long that a failing run is painful. Never reached while the
+            // fallback goes through `exists_committed`, so it costs nothing.
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            Ok(self.committed)
+        }
+        fn exists_committed(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<bool> {
+            self.exists_committed_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.committed)
         }
@@ -1468,6 +1511,7 @@ mod tests {
             committed: true,
             existence_calls: calls.clone(),
             exists_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            exists_committed_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }));
 
         assert!(
@@ -1487,15 +1531,28 @@ mod tests {
     /// A backend that never settles must not spin a worker. The loop gives up
     /// after a bounded number of waits and answers from committed state, which is
     /// a legitimate answer for a reader with no happens-before against the write.
+    ///
+    /// And it must reach that answer **without waiting**. `exists` is the
+    /// backend's waiting probe — on sqlite it parks on `PendingSlot`'s untimed
+    /// condvar — so falling back to it here re-parks the worker in exactly the
+    /// case the cap exists to prevent, while the `warn!` claims the opposite.
+    /// The double's `exists` therefore blocks: swap `exists_committed` back to
+    /// `exists` in `exists_local` and this test fails on the call counters
+    /// below. Not on the `timeout` — `#[tokio::test]` is current-thread, so the
+    /// double's `sleep` blocks the runtime and the timer never fires; the sleep
+    /// is there to make the park *real* rather than to trip a deadline, and the
+    /// counters are what catch it.
     #[tokio::test]
-    async fn exists_local_gives_up_after_a_bounded_number_of_waits() {
+    async fn exists_local_gives_up_without_ever_waiting_on_the_queue() {
         let existence_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let exists_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exists_committed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (engine, _dir) = engine_with_cache(Arc::new(QueuedTimes {
             queued_answers: std::sync::Mutex::new(usize::MAX),
             committed: false,
             existence_calls: existence_calls.clone(),
             exists_calls: exists_calls.clone(),
+            exists_committed_calls: exists_committed_calls.clone(),
         }));
 
         let found = tokio::time::timeout(
@@ -1513,9 +1570,14 @@ mod tests {
             "the retries must be capped"
         );
         assert_eq!(
-            exists_calls.load(std::sync::atomic::Ordering::SeqCst),
+            exists_committed_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the capped-out answer comes from one committed-state probe"
+        );
+        assert_eq!(
+            exists_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the capped-out path must never call the queue-waiting probe"
         );
     }
 }

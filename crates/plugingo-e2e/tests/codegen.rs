@@ -1,3 +1,9 @@
+#![expect(
+    clippy::panic_in_result_fn,
+    clippy::let_underscore_must_use,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
 mod common;
 
 use anyhow::Context as _;
@@ -55,7 +61,6 @@ async fn test_codegen_build_produces_binary() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
     use std::io::Read as _;
-    use std::os::unix::fs::PermissionsExt as _;
 
     require_go!();
     let dir = fixture("codegen")?;
@@ -78,10 +83,16 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
                 heph::hartifactcontent::WalkEntryKind::File { mut data, x } => {
                     let mut buf = Vec::new();
                     data.read_to_end(&mut buf)?;
-                    std::fs::write(&dest, &buf)?;
                     if x {
-                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+                        // Writing the binary by hand skips `unpack`, which is where
+                        // the rest of the tree gets the writable-fd barrier. This
+                        // suite runs many Go builds concurrently, each forking
+                        // subprocesses, so a fork racing the write inherits the
+                        // writable fd and the exec below fails with ETXTBSY.
+                        hcore::fsutil::write_executable(&dest, &buf)?;
                         binary_path = Some(dest);
+                    } else {
+                        std::fs::write(&dest, &buf)?;
                     }
                 }
                 heph::hartifactcontent::WalkEntryKind::Symlink { .. } => {}

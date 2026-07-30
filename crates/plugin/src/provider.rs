@@ -109,6 +109,15 @@ pub trait ProviderExecutor: Send + Sync {
     /// `Engine::get_spec`, which registers `parent → addr` in the `DepDag`.
     /// Do not memoize this on the matcher in a provider — waiters would bypass
     /// the dep registration and a target-dep cycle would hide as a deadlock.
+    ///
+    /// **Do not call this from [`Provider::list`].** `ListRequest::executor`
+    /// hands `list()` this same `query()`, but `list()` itself runs inside one
+    /// of an already K-wide concurrent package fan-out; calling back into
+    /// `query()` from there nests another K-wide walk under it. The engine's
+    /// executor detects and rejects this reentrant call with an error rather
+    /// than nesting silently — use [`ProviderExecutor::states_under`] instead,
+    /// which is what `list()` implementations that need cross-package state
+    /// (e.g. a Go module's variant universe) are for.
     fn query<'a>(
         &'a self,
         m: &'a Matcher,
@@ -348,20 +357,48 @@ pub struct StateSchema {
 
 pub trait Provider: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
+    /// The addrs this provider defines in `req.package`, in a **deterministic
+    /// order**.
+    ///
+    /// Unlike [`Provider::list_packages`], this order is *not* canonicalized by
+    /// the engine: `Engine::query` yields these addrs as it receives them, they
+    /// become `pluginquery`'s `deps`, and they reach the sandbox as the line
+    /// order of the staged `input_<origin>.list` / `dep_<group>.list` files.
+    /// Returning `HashSet` iteration order — the natural shape when the addrs
+    /// come off a filesystem walk — therefore gives the same tree a different
+    /// build definition, and a different list-file order, on every run. Sort, or
+    /// preserve a stable walk order.
+    ///
+    /// `req.executor` must not have [`ProviderExecutor::query`] called on it from
+    /// here — see that method's doc for why. Use
+    /// [`ProviderExecutor::states_under`] for cross-package state instead.
     fn list<'a>(
         &'a self,
         req: ListRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>;
-    /// The packages this provider knows about, in a **deterministic order**.
+    /// The packages this provider knows about.
     ///
-    /// The order is part of the contract, not a detail: the engine preserves it
-    /// through `Engine::packages` into `query`, which feeds `pluginquery`'s
-    /// `deps`, which `plugingroup` folds into its def hash *in order*. Returning
-    /// `HashSet` iteration order — the natural shape when the packages come from
-    /// a filesystem walk — therefore gives the same tree a different build
-    /// definition on every run, and a different `LIST_*` line order inside the
-    /// sandbox. Sort, or preserve a stable walk order.
+    /// The order returned here is **not** observable: `Engine::packages` sorts
+    /// each provider's block before merging it, so a `HashSet`-order listing is
+    /// as good as a sorted one. That was not always true — this order reaches a
+    /// def hash (`query` → `pluginquery`'s `deps` → `plugingroup` folds them in
+    /// order) and the sandbox's list-file line order, so a per-process hash seed
+    /// used to leak straight into a build definition. The engine now canonicalizes
+    /// it centrally rather than trusting every provider, in-tree or third-party,
+    /// to get it right.
+    ///
+    /// Notes for plugin authors:
+    ///
+    /// - The guarantee covers *this return value* and nothing else. A provider
+    ///   that surfaces the same list through another channel that reaches a spec
+    ///   or def — as the buildfile provider does via the `heph.core.packages()`
+    ///   builtin, whose result lands in a target's config verbatim — still owns
+    ///   the order on that channel. Do not drop a sort that is feeding one.
+    /// - The guarantee is a property of the *host*, and there is no version
+    ///   negotiation for it. A plugin that stops sorting because the host sorts
+    ///   will behave nondeterministically again under a host older than this
+    ///   change.
     fn list_packages<'a>(
         &'a self,
         req: ListPackagesRequest,

@@ -71,6 +71,24 @@ pub trait Content: Send + Sync {
     /// consumer open the file directly instead of streaming its bytes — notably
     /// the stable-ABI seam, where a guest can read the file rather than pulling
     /// it chunk-by-chunk across the vtable.
+    ///
+    /// Two rules, both load-bearing:
+    ///
+    /// 1. **Open it before dropping the `Content` it came from; never store
+    ///    it.** Unlike [`reader`](Self::reader) and
+    ///    [`seekable_reader`](Self::seekable_reader), which hand back an open
+    ///    handle that pins its inode, a `PathBuf` is detached — whatever keeps
+    ///    the bytes from being reclaimed is tied to the `Content`, not to the
+    ///    path, so the file may be gone once the handle drops. The path is also
+    ///    host- and revision-specific (an absolute path under a particular
+    ///    user's cache), so it must never be embedded in a target's output: that
+    ///    would make a content-addressed artifact machine-specific.
+    /// 2. **Answer `None` rather than a path that does not exist.** Callers treat
+    ///    `Some` as "open this", with no fallback to the byte stream, so a stale
+    ///    path turns a working read into a hard error rather than a slow one.
+    ///
+    /// What backs rule 1 is per-implementation; the engine's cache artifacts
+    /// document their own guarantee, and it is not the same for every `Content`.
     fn file_path(&self) -> Option<std::path::PathBuf> {
         None
     }

@@ -1,5 +1,13 @@
+// An integration-test target is only ever compiled as a test, so the exemption
+// needs no `cfg(test)` gate.
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
 mod common;
 
+use anyhow::Context as _;
 use common::Workspace;
 use heph::pluginstatictarget::Target;
 use std::collections::HashMap;
@@ -278,7 +286,7 @@ target(name = "root", driver = "bash", run = "cat $SRC_B1 $SRC_B2 > $OUT", out =
 
     tokio::time::timeout(std::time::Duration::from_secs(30), ws.run("//diamond:root"))
         .await
-        .map_err(|_| anyhow::anyhow!("deadlock detected: test timed out after 30s"))??;
+        .context("deadlock detected: test timed out after 30s")??;
 
     Ok(())
 }

@@ -17,20 +17,7 @@
 #![cfg_attr(
     test,
     expect(
-        clippy::get_unwrap,
-        clippy::panic_in_result_fn,
-        clippy::assertions_on_result_states,
-        clippy::unwrap_used,
-        clippy::unwrap_in_result,
-        clippy::unimplemented,
-        clippy::undocumented_unsafe_blocks,
-        clippy::unreachable,
-        clippy::let_underscore_must_use,
-        clippy::float_cmp,
         clippy::assertions_on_constants,
-        clippy::cloned_ref_to_slice_refs,
-        clippy::err_expect,
-        unused_imports,
         reason = "restriction/style lints scoped to production code; tests are exempt"
     )
 )]
@@ -64,7 +51,24 @@ impl Default for Ignore {
     }
 }
 
+/// The `.git` exclusion the engine always prepends to `fs.skip`. A `.git` dir is
+/// never a build input, and it is the one directory that reliably contains names
+/// no build tool chose — a ref file is whatever bytes the branch name was, so
+/// `git checkout -b $'\xe9'` puts a non-UTF-8 name in the tree that
+/// [`CachedWalker::read_dir`] refuses to walk past.
+pub const GIT_SKIP_GLOB: &str = "**/.git/**";
+
 impl Ignore {
+    /// An ignore set for a walker with no user skip configuration: prunes
+    /// [`GIT_SKIP_GLOB`] and nothing else.
+    ///
+    /// `Ignore::default()` prunes *nothing*, which is wrong for any real tree —
+    /// it descends into `.git`. Callers that genuinely have no config (the LSP)
+    /// want this instead.
+    pub fn git_only() -> Self {
+        Self::new(&[], &[GIT_SKIP_GLOB.to_string()]).expect("the .git ignore set is valid")
+    }
+
     /// Builds an ignore set from absolute `dirs` (exact-path prune) and
     /// workspace-relative `globs`.
     pub fn new(dirs: &[PathBuf], globs: &[String]) -> anyhow::Result<Self> {

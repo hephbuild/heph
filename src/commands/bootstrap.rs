@@ -230,8 +230,24 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
             return;
         }
         tracing::error!("second ctrl-c, aborting");
-        std::process::exit(130);
+        hard_abort(|code| std::process::exit(code));
     });
+}
+
+/// The second-Ctrl-C abort sequence, with the actual exit call taken as a
+/// parameter so tests can observe the ordering without killing the test
+/// process. `std::process::exit` runs no destructors — a raw-mode terminal
+/// left as-is would stay raw (and its cursor hidden) after heph exits — so
+/// the restore must happen here, before `exit`, rather than relying on a
+/// `Drop` impl the exit call would skip.
+///
+/// `restore_terminal` is a no-op unless a raw-mode session (the TUI)
+/// registered a restore closure, so a non-interactive run's second Ctrl-C
+/// still exits with no extra work and no stray writes to a redirected
+/// stdout/stderr.
+fn hard_abort(exit: impl FnOnce(i32)) {
+    hcore::shutdown::restore_terminal();
+    exit(130);
 }
 
 #[cfg(test)]
@@ -423,5 +439,60 @@ fs:
             await_cancelled(rs.ctoken()).await,
             "trigger after resume must cancel"
         );
+    }
+
+    // Serialized: `hcore::shutdown`'s restore-closure slot is a process-global
+    // static, so these must not run concurrently with each other (or with
+    // `crates/core`'s own tests of the same static, which live in a separate
+    // binary and can't collide with this one).
+    static TERMINAL_RESTORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Regression for the bug this module used to have: the second Ctrl-C
+    /// called `std::process::exit(130)` directly, which runs no destructors —
+    /// a raw-mode terminal stayed raw and its cursor stayed hidden after heph
+    /// exited. `hard_abort` must restore the terminal *before* exiting rather
+    /// than relying on a `Drop` impl the exit call would skip.
+    ///
+    /// Pre-fix (`std::process::exit(130)` called directly, no
+    /// `restore_terminal()`), this test goes red: the registered closure
+    /// never fires. Exit is injected so the test can observe the ordering
+    /// without killing the test process.
+    #[test]
+    fn hard_abort_restores_terminal_before_exiting() {
+        let _guard = TERMINAL_RESTORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let restored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let restored_in_closure = std::sync::Arc::clone(&restored);
+        hcore::shutdown::set_terminal_restore(move || {
+            restored_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let mut exit_code = None;
+        hard_abort(|code| exit_code = Some(code));
+
+        assert!(
+            restored.load(std::sync::atomic::Ordering::SeqCst),
+            "hard_abort must restore the terminal before exiting"
+        );
+        assert_eq!(exit_code, Some(130), "must exit with code 130");
+
+        hcore::shutdown::clear_terminal_restore();
+    }
+
+    /// A non-interactive run never registers a restore closure — `hard_abort`
+    /// must still exit cleanly and must not panic reaching for one.
+    #[test]
+    fn hard_abort_is_a_plain_exit_when_nothing_was_registered() {
+        let _guard = TERMINAL_RESTORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hcore::shutdown::clear_terminal_restore();
+
+        let mut exit_code = None;
+        hard_abort(|code| exit_code = Some(code));
+
+        assert_eq!(exit_code, Some(130));
     }
 }

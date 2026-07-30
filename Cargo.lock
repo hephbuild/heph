@@ -364,6 +364,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
+name = "bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-corpus",
+ "clap",
+ "heph",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "testkit",
+ "tokio",
+]
+
+[[package]]
+name = "bench-corpus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "bin-e2e"
 version = "0.1.0"
 dependencies = [
@@ -3805,6 +3832,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower-lsp-server",
+ "tracing",
  "walk",
  "xstarlark-fmt",
 ]
@@ -3832,6 +3860,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "xxhash-rust",
 ]
 
@@ -3904,6 +3933,7 @@ dependencies = [
  "plugin-go",
  "plugin-sdk",
  "stabby",
+ "tracing",
  "walk",
 ]
 

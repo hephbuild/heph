@@ -76,6 +76,16 @@ pub fn join_rel_checked(pkg: &str, rel: &str) -> anyhow::Result<String> {
     Ok(finish(&out, &joined))
 }
 
+/// Like [`join_rel_checked`], but for building a [`PkgBuf`] rather than a
+/// file/glob path: a package never carries a trailing slash (there is no
+/// directory-vs-file distinction to preserve), so it is trimmed after the
+/// same `..`-bounded join.
+pub fn join_rel_checked_pkg(pkg: &str, rel: &str) -> anyhow::Result<String> {
+    Ok(join_rel_checked(pkg, rel)?
+        .trim_end_matches('/')
+        .to_string())
+}
+
 /// Concatenate `pkg` and `rel` with a single separator, skipping the separator
 /// when either side is empty (root package, or a bare package reference).
 fn join_raw(pkg: &str, rel: &str) -> String {

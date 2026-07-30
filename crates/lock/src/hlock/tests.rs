@@ -2,8 +2,11 @@
 //! same trait surface as the in-memory one (the inline per-module tests cover
 //! the in-memory bridge in detail).
 
+use crate::hlock::bridge::TBridge;
+use crate::hlock::flock::{FLock, FRWLock};
 use crate::hlock::traits::{TLock, TUpgradableReadGuard, TWriteGuard};
 use hcore::hasync::StdCancellationToken;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,10 +14,16 @@ fn ct() -> StdCancellationToken {
     StdCancellationToken::new()
 }
 
+/// Filesystem-backed transformable lock, built directly from `TBridge` —
+/// used only by this module's own cross-backend tests.
+fn fs_tlock(outer_path: impl AsRef<Path>, inner_path: impl AsRef<Path>) -> TBridge<FLock, FRWLock> {
+    TBridge::new(FLock::new(outer_path), FRWLock::new(inner_path))
+}
+
 #[tokio::test]
 async fn fs_bridge_upgrade_then_downgrade() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let l = crate::hlock::fs_tlock(dir.path().join("outer"), dir.path().join("inner"));
+    let l = fs_tlock(dir.path().join("outer"), dir.path().join("inner"));
 
     // upgradable read -> upgrade -> exclusive
     let r = l.upgradable_read(&ct()).await.unwrap();
@@ -50,7 +59,7 @@ async fn fs_two_upgraders_no_deadlock() {
         let outer = Arc::clone(&outer);
         let inner = Arc::clone(&inner);
         tokio::spawn(async move {
-            let l = crate::hlock::fs_tlock(&*outer, &*inner);
+            let l = fs_tlock(&*outer, &*inner);
             let u = l.upgradable_read(&ct()).await.unwrap();
             let w = u.upgrade(&ct()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -74,8 +83,8 @@ async fn fs_bridge_writers_serialize_across_instances() {
     let dir = tempfile::tempdir().expect("tempdir");
     let outer = dir.path().join("outer");
     let inner = dir.path().join("inner");
-    let a = crate::hlock::fs_tlock(&outer, &inner);
-    let b = crate::hlock::fs_tlock(&outer, &inner);
+    let a = fs_tlock(&outer, &inner);
+    let b = fs_tlock(&outer, &inner);
 
     let _w = a.write(&ct()).await.unwrap();
     assert!(

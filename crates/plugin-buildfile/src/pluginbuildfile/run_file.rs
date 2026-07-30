@@ -1079,10 +1079,10 @@ impl Provider {
                 key.clone(),
                 enclose!((key) move || async move {
                     // Bound the fan-out before queueing: see `PKG_EVAL_SLOTS`.
-                    // Taken here rather than inside the closure so the wait
+                    // Waited for here rather than inside the closure so the wait
                     // happens in async-land, not on a pool thread — parking a
                     // pool thread to wait for a pool thread is the deadlock.
-                    let _slot = PKG_EVAL_SLOTS
+                    let slot = PKG_EVAL_SLOTS
                         .acquire()
                         .await
                         .context("acquiring a package-evaluation slot")?;
@@ -1091,6 +1091,27 @@ impl Provider {
                     // worker it stops that worker polling anything at all — see
                     // `hcore::blocking`.
                     hcore::blocking::run(move || -> anyhow::Result<Arc<RunResult>> {
+                        // The permit rides *into* the job rather than being held
+                        // across the await. `PKG_EVAL_SLOTS` is a static, so the
+                        // guard is already `'static`, and this costs nothing.
+                        //
+                        // It matters because a permit held across an await is
+                        // released only by a poll of this future — and callers
+                        // exist that stop polling. The discovery fan-out in
+                        // `Engine::query` buffers K of these and its consumer
+                        // parks in the `MatchShrug` arm awaiting a *different*
+                        // package's spec, which needs a permit of its own: the
+                        // holders go unpollable exactly when the consumer needs
+                        // what they hold, and the semaphore is FIFO. That walk
+                        // spawns each package as a task so the runtime keeps
+                        // polling them, which breaks the cycle — but that is the
+                        // caller's discipline, and `list` here is reachable from
+                        // arbitrary provider code. Submitted jobs run to
+                        // completion even when the receiver is gone
+                        // (`hcore::blocking::run`), so releasing on the pool
+                        // thread makes the class impossible rather than merely
+                        // unreached.
+                        let _slot = slot;
                         let loader =
                             BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages, loads);
                         loader
@@ -1173,11 +1194,20 @@ impl BuildFileLoader {
 
     /// Top-level entry: evaluate every BUILD file in `pkg`'s directory matching the
     /// configured patterns and merge their targets/states/symbols. Returns an empty
-    /// result if the directory is missing or has no matching file — this is the path
-    /// used by `Provider::list`/`get`/`probe`, where unknown packages should surface
-    /// as empty/`NotFound` rather than hard errors. Use `load_dir` directly (via the
-    /// `FileLoader` impl) for the `load(...)` path, which is strict.
+    /// result if the directory is missing, escapes the workspace root, or has no
+    /// matching file — this is the path used by `Provider::list`/`get`/`probe`,
+    /// where unknown packages should surface as empty/`NotFound` rather than hard
+    /// errors. Use `load_dir` directly (via the `FileLoader` impl) for the
+    /// `load(...)` path, which is strict.
+    ///
+    /// `pkg` reaches here from an `Addr`/`PkgBuf` that the address parser does not
+    /// itself bound to the workspace (a package segment may contain `..`), so this
+    /// is the chokepoint that keeps `root.join(pkg)` from walking outside the
+    /// workspace for a crafted address like `//../../etc:x`.
     fn load_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+        if hmodel::htpkg::join_rel_checked("", pkg).is_err() {
+            return Ok(Arc::new(empty_run_result()?));
+        }
         let dir = self.root.join(pkg);
         if !dir.is_dir() {
             return Ok(Arc::new(empty_run_result()?));
@@ -1477,51 +1507,37 @@ impl BuildFileLoader {
     }
 }
 
-/// Resolve a `load()` path argument to an absolute (logically normalized) filesystem path.
+/// Resolve a `load()` path argument to an absolute filesystem path, rejecting
+/// any path that would resolve outside the workspace root.
 ///
 /// Accepts:
 ///   `//pkg/...`     absolute, relative to workspace root
 ///   `./rel/...`     relative to `current_pkg`'s directory
 ///   `../rel/...`    relative to `current_pkg`'s directory (walks up via `..`)
+///
+/// Uses [`hmodel::htpkg::join_rel_checked`] — the same boundary check `fs.file`/
+/// `fs.glob` apply — so a `..`-laden path (e.g. `load("../../../../etc/hosts")`)
+/// errors instead of escaping the workspace and being parsed as Starlark.
 pub(crate) fn resolve_load_target(
     root: &Path,
     current_pkg: &str,
     path: &str,
 ) -> anyhow::Result<PathBuf> {
-    let raw = if let Some(rel) = path.strip_prefix("//") {
+    let rel_from_root = if let Some(rel) = path.strip_prefix("//") {
         if rel.is_empty() {
             anyhow::bail!("load() path must not be empty after `//`");
         }
-        root.join(rel)
+        hmodel::htpkg::join_rel_checked("", rel)
     } else if path.starts_with("./") || path.starts_with("../") {
-        root.join(current_pkg).join(path)
+        hmodel::htpkg::join_rel_checked(current_pkg, path)
     } else {
         anyhow::bail!("load() path must start with `//`, `./`, or `../`, got `{path}`");
-    };
-    Ok(normalize_path(&raw))
-}
-
-/// Logically collapse `.` and `..` components in an absolute path without touching the
-/// filesystem. Used so cache keys for `//a/sub` and `./sub` (from `a/BUILD`) match.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out: Vec<std::path::Component> = Vec::with_capacity(path.components().count());
-    for comp in path.components() {
-        match comp {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if matches!(
-                    out.last(),
-                    Some(std::path::Component::Normal(_)) | Some(std::path::Component::CurDir)
-                ) {
-                    out.pop();
-                } else {
-                    out.push(comp);
-                }
-            }
-            other => out.push(other),
-        }
     }
-    out.iter().map(|c| c.as_os_str()).collect()
+    .with_context(|| format!("resolving load() path `{path}`"))?;
+    // `join_rel_checked` preserves a trailing slash so `fs.glob` can tell a directory
+    // path from a file path; `load()` has no such distinction, and a trailing slash on
+    // a path that names a real file makes `std::fs::metadata` reject it as not-a-directory.
+    Ok(root.join(rel_from_root.trim_end_matches('/')))
 }
 
 /// Enumerate every file in `dir` whose name matches any of `patterns`.
@@ -1840,7 +1856,9 @@ mod tests {
         std::thread::scope(|s| {
             for pkg in ["pa", "pb"] {
                 s.spawn(enclose!((provider, tx) move || {
-                    drop(tx.send(run_pkg_blocking(&provider, pkg).is_err()));
+                    // The receiver outlives the scope, so a send error is
+                    // impossible; ignore it rather than panicking in a thread.
+                    let _sent = tx.send(run_pkg_blocking(&provider, pkg).is_err());
                 }));
             }
             drop(tx);
@@ -2722,6 +2740,33 @@ target(name = "t", driver = FOO + BAR)
         assert!(r.states.is_empty());
     }
 
+    /// `pkg` comes from an `Addr`'s package segment, which the address parser does
+    /// not itself bound to the workspace root — a package like `"../secret"` reaches
+    /// `Provider::get`/`list`/`probe` (and therefore `load_pkg`) unchecked. Without a
+    /// boundary check here, `root.join(pkg)` would walk outside the workspace and
+    /// parse whatever BUILD file lives there, the same class of escape `load()`
+    /// resolution is guarded against elsewhere in this file.
+    #[test]
+    fn test_run_pkg_escaping_package_addr_returns_empty() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let secret = tmp_dir.path().join("secret");
+        fs::create_dir_all(&secret).unwrap();
+        fs::write(
+            secret.join("BUILD"),
+            r#"target(name = "t", driver = "leaked")"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root,
+            ..Provider::default()
+        };
+        let r = run_pkg_blocking(&provider, "../secret").unwrap();
+        assert!(r.targets.is_empty(), "{:?}", r.targets);
+    }
+
     #[test]
     fn test_run_pkg_dir_without_match_returns_empty() {
         let tmp_dir = tempdir().unwrap();
@@ -3133,6 +3178,103 @@ target(name = "t", driver = FOO)
         let result = run_pkg_blocking(&provider, "app").unwrap();
         assert_eq!(result.targets.len(), 1);
         assert_eq!(result.targets[0].driver, "shared");
+    }
+
+    #[test]
+    fn test_load_relative_parent_dir_escaping_root_is_rejected() {
+        // A workspace root at `tmp/root`, with a secret file just outside it at
+        // `tmp/secret.BUILD`. `../secret.BUILD` from the root package's directory
+        // resolves (on disk) to that outside file — load() must refuse to follow
+        // it rather than parsing whatever lives outside the workspace.
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(tmp_dir.path().join("secret.BUILD"), "SECRET = \"leaked\"\n").unwrap();
+        fs::write(
+            root.join("BUILD"),
+            r#"
+load("../secret.BUILD", "SECRET")
+target(name = "t", driver = SECRET)
+"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root: root.clone(),
+            ..Provider::default()
+        };
+        let err = run_pkg_blocking(&provider, "").unwrap_err();
+        let chain = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chain.contains("escapes workspace root"), "{chain}");
+    }
+
+    #[test]
+    fn test_load_absolute_path_escaping_root_is_rejected() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("BUILD"),
+            r#"load("//../../../../etc/hosts", "X")"#,
+        )
+        .unwrap();
+
+        let provider = Provider {
+            root,
+            ..Provider::default()
+        };
+        let err = run_pkg_blocking(&provider, "").unwrap_err();
+        let chain = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chain.contains("escapes workspace root"), "{chain}");
+    }
+
+    #[test]
+    fn resolve_load_target_rejects_escape_from_nested_package() {
+        let root = Path::new("/workspace");
+        let err = resolve_load_target(root, "a/b", "../../../etc/hosts").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("escapes workspace root"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_load_target_allows_in_bounds_paths() {
+        let root = Path::new("/workspace");
+        assert_eq!(
+            resolve_load_target(root, "a/b", "../c/d.BUILD").unwrap(),
+            root.join("a/c/d.BUILD")
+        );
+        assert_eq!(
+            resolve_load_target(root, "a", "//lib/shared.BUILD").unwrap(),
+            root.join("lib/shared.BUILD")
+        );
+        // A trailing slash is meaningless for load() (unlike fs.glob's dir-vs-file
+        // distinction) and must not survive into the filesystem path, or `stat` on a
+        // path naming a real file fails with "not a directory".
+        assert_eq!(
+            resolve_load_target(root, "a", "./sub/").unwrap(),
+            root.join("a/sub")
+        );
+    }
+
+    #[test]
+    fn resolve_load_target_contains_leading_slash_smuggling() {
+        // `//` + a leading `/` in the remainder (e.g. `load("///etc/passwd")`) must not
+        // let `Path::join` treat the joined path as absolute and discard the root.
+        let root = Path::new("/workspace");
+        assert_eq!(
+            resolve_load_target(root, "", "///etc/passwd").unwrap(),
+            root.join("etc/passwd")
+        );
     }
 
     #[test]

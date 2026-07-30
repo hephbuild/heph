@@ -832,6 +832,12 @@ impl LocalCache for LocalCacheSQLite {
         ))
     }
 
+    fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
+        // The inherent `exists_committed` is exactly this method's contract: one
+        // indexed point lookup, no `wait_if_pending`.
+        Self::exists_committed(self, &Self::key(addr), hashin, name)
+    }
+
     fn list_targets(&self) -> Result<TargetStream> {
         // Stream distinct addrs over a bounded channel: the producer holds one
         // pooled connection and a `SELECT DISTINCT addr` cursor on a dedicated
@@ -934,12 +940,29 @@ impl LocalCache for LocalCacheSQLite {
 
 /// Owns both a pooled sqlite connection and a `Blob` opened against it.
 ///
-/// `rusqlite::blob::Blob<'conn>` borrows its connection; lifetime extension
-/// to `'static` is sound because the blob is dropped before `_conn` (Rust
-/// drops struct fields in declaration order).
+/// `rusqlite::blob::Blob<'conn>` borrows its connection, and we extend that
+/// borrow to `'static` to store the two together. Two things make it sound, and
+/// **both** are required:
+///
+/// 1. *Drop order* — `blob` is declared before `_conn`, and Rust drops fields in
+///    declaration order, so the blob is finalized while its connection is alive.
+/// 2. *A stable address* — the connection is behind a `Box`, so the
+///    `&Connection` the blob captured stays valid when this struct is moved.
+///
+/// The `Box` is the subtle one and is **not** an allocation to optimize away.
+/// [`r2d2::PooledConnection`] stores its `Connection` inline, so without the
+/// indirection the borrow would be taken from a local that is then *moved* into
+/// the returned struct (and moved again by every `Box::new`/return after it),
+/// leaving the blob pointing at a dead stack slot. Reads then go through a
+/// dangling pointer, which surfaces as sqlite's `RefCell` appearing already
+/// mutably borrowed — a panic inside `Blob::read`, followed by a second panic in
+/// this struct's own drop, i.e. a non-unwinding abort of the whole process.
+/// Boxing first is what makes the address the blob captured outlive the moves.
 struct OwnedBlob {
     blob: rusqlite::blob::Blob<'static>,
-    _conn: r2d2::PooledConnection<SqliteConnectionManager>,
+    /// Boxed for address stability — see the type doc. Never dereferenced here;
+    /// it exists to keep the connection alive and pinned for `blob`.
+    _conn: Box<r2d2::PooledConnection<SqliteConnectionManager>>,
 }
 
 // SAFETY: rusqlite::Connection is Send. The blob holds a raw sqlite3
@@ -950,13 +973,17 @@ unsafe impl Send for OwnedBlob {}
 
 impl OwnedBlob {
     fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>, row_id: i64) -> Result<Self> {
+        // Box BEFORE borrowing: the blob captures an address that must survive
+        // this struct being moved out of `new`. See the type doc.
+        let conn = Box::new(conn);
         let conn_ref: &Connection = &conn;
         let blob = conn_ref
             .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
             .context("opening seekable sqlite blob")?;
-        // SAFETY: `blob` borrows from `conn` which is owned alongside it in
-        // the returned struct; struct field drop order (blob before _conn)
-        // guarantees the borrow outlives no longer than the connection.
+        // SAFETY: `blob` borrows the `Connection` inside the heap allocation
+        // `conn` owns, which this struct keeps alive and never moves (moving the
+        // `Box` moves the pointer, not the pointee). Field order drops `blob`
+        // first, so the borrow never outlives the connection.
         let blob_static: rusqlite::blob::Blob<'static> = unsafe { std::mem::transmute(blob) };
         Ok(Self {
             blob: blob_static,
@@ -1597,6 +1624,80 @@ mod tests {
         Ok(())
     }
 
+    /// Scribble over a few KiB of stack below the current frame.
+    ///
+    /// Only meaningful for the test above: it turns "the blob may point at a
+    /// popped frame" from a platform-dependent maybe into a deterministic
+    /// corruption. `black_box` keeps the writes from being optimized out.
+    #[inline(never)]
+    fn clobber_stack() {
+        let mut scratch = [0xAAu8; 8192];
+        std::hint::black_box(&mut scratch);
+    }
+
+    /// A seekable blob reader must survive being returned, boxed and moved.
+    ///
+    /// `OwnedBlob` extends the blob's borrow of its connection to `'static`. That
+    /// is only sound while the `Connection` the blob captured stays put — and
+    /// `PooledConnection` stores it inline, so taking the borrow *before* moving
+    /// the connection into the struct leaves the blob pointing at a dead stack
+    /// slot. The reader still constructs fine; it is the reads afterwards that go
+    /// through a dangling pointer, which is why nothing catches it at the seam.
+    ///
+    /// This drives the shape `TarIndex::build` uses — interleaved seeks and short
+    /// reads, well past the first buffer — across the move boundary, and checks
+    /// the bytes rather than merely that it did not crash. Corrupt reads from a
+    /// reused stack slot fail the comparison even when they do not panic.
+    #[test]
+    fn a_seekable_blob_reads_correctly_after_the_reader_is_moved() -> Result<()> {
+        use std::io::Seek;
+
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "seekable");
+
+        // Distinctive, position-dependent bytes: a wrong offset or a garbage read
+        // cannot coincidentally match.
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        queued_write(&cache, &addr, "blob", &payload);
+        assert!(cache.exists(&addr, "h", "blob")?); // barrier
+
+        // Returned boxed from `seekable_reader`, then moved again into this local.
+        let mut reader = cache
+            .seekable_reader(&addr, "h", "blob")?
+            .expect("sqlite serves a seekable reader");
+
+        // Overwrite the stack region `OwnedBlob::new` and its callers used. If the
+        // blob captured an address in a frame that has since been popped, this is
+        // what a later caller doing ordinary work would do to it — made explicit
+        // and immediate so the failure is deterministic here instead of appearing
+        // as an abort somewhere downstream on one platform.
+        clobber_stack();
+
+        let mut whole = Vec::new();
+        reader.read_to_end(&mut whole)?;
+        assert_eq!(whole, payload, "sequential read must match");
+
+        // Seek back and re-read at several offsets, the way a tar header scan
+        // walks an archive.
+        for off in [0u64, 511, 1024, 40_000, 63_000] {
+            reader.seek(std::io::SeekFrom::Start(off))?;
+            let mut chunk = [0u8; 512];
+            let n = reader.read(&mut chunk)?;
+            let start = off as usize;
+            assert_eq!(
+                &chunk[..n],
+                &payload[start..start + n],
+                "read at offset {off} must match"
+            );
+        }
+        Ok(())
+    }
+
     /// A queued write has no settled answer, so `existence` reports the queue
     /// rather than guessing — and once the gate opens, the awaited answer is the
     /// write that landed.
@@ -1622,6 +1723,118 @@ mod tests {
         assert!(
             committed(cache.existence(&addr, "h", "blob")?),
             "after the queue drains the key is present"
+        );
+        Ok(())
+    }
+
+    /// **The asymmetry the post-write cache trim is built on.**
+    ///
+    /// `exists` waits on this key's in-flight write (`wait_if_pending`);
+    /// `list_target_entries` is a plain `SELECT DISTINCT hashin` and does not.
+    /// So a revision whose every write is still queued is *invisible to an
+    /// enumeration and knowable to a probe*.
+    ///
+    /// `Engine::try_trim_after_write` depends on exactly this: it counts with
+    /// `list_target_entries`, corrects that count with `existence`, and orders the
+    /// enumeration that chooses what to delete with `exists`. Its own tests use a
+    /// double that *models* the asymmetry, so this is the test that says the
+    /// backend really has it — delete `wait_if_pending` from `exists` and this
+    /// fails here, where the property lives, instead of nowhere.
+    ///
+    /// Every observation is *captured* while the gate is shut and asserted only
+    /// after it reopens. A panic with the gate closed would leave the writer
+    /// thread parked in it, and `LocalCacheSQLite::drop` joins that thread — so
+    /// asserting in place turns any failure into a hung test process instead of a
+    /// red one. (Found exactly that way: the first version of this test deadlocked
+    /// under the mutation it exists to catch.)
+    #[tokio::test]
+    async fn a_queued_revision_is_invisible_to_list_target_entries_and_awaited_by_exists()
+    -> Result<()> {
+        let dir = tempdir()?;
+        let cache = Arc::new(LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?);
+        let addr = make_addr("pkg", "trimmed");
+
+        cache.gate.close();
+        queued_write(&cache, &addr, "manifest-v1.borsh", b"manifest");
+
+        let listed_while_queued = cache.list_target_entries(&addr)?;
+        // The non-blocking probe knows better, and does not settle it either.
+        let existence_while_queued = cache.existence(&addr, "h", "manifest-v1.borsh")?;
+
+        // `exists` must *block* until the write lands, on another thread since
+        // this one has to open the gate.
+        let probe = std::thread::spawn({
+            let (cache, addr) = (cache.clone(), addr.clone());
+            move || cache.exists(&addr, "h", "manifest-v1.borsh")
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let probe_parked = !probe.is_finished();
+
+        cache.gate.open();
+
+        assert!(
+            listed_while_queued.is_empty(),
+            "an enumeration does not wait on the write queue — this is the \
+             undercount that makes a post-write trim skip a target that is over \
+             budget, and it is silent"
+        );
+        assert!(
+            probe_parked,
+            "`exists` must park on the queued write, not answer from the \
+             committed state — that wait is the barrier"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            queued(existence_while_queued),
+        )
+        .await
+        .expect("the queued write must land");
+        assert!(
+            probe.join().expect("probe thread")?,
+            "present once it lands"
+        );
+        assert_eq!(
+            cache.list_target_entries(&addr)?,
+            vec!["h".to_string()],
+            "and only then does the enumeration see it"
+        );
+        Ok(())
+    }
+
+    /// The other half of the same story, and the reason the trim's correction is
+    /// *conditional*: `cache_locally` writes artifacts before the manifest on one
+    /// FIFO writer, so a revision whose blob has committed is already in the
+    /// enumeration even while its manifest is queued. That is the common case on a
+    /// warm run, and it must cost no probe at all.
+    #[tokio::test]
+    async fn a_revision_with_one_committed_blob_is_listed_while_its_manifest_is_queued()
+    -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "partial");
+
+        queued_write(&cache, &addr, "out.tar", b"bytes");
+        assert!(cache.exists(&addr, "h", "out.tar")?); // barrier: the blob landed
+
+        cache.gate.close();
+        queued_write(&cache, &addr, "manifest-v1.borsh", b"manifest");
+
+        // Captured, not asserted, while the gate is shut — see the test above.
+        let listed = cache.list_target_entries(&addr)?;
+        cache.gate.open();
+
+        assert_eq!(
+            listed,
+            vec!["h".to_string()],
+            "the hashin is listed on the strength of the committed blob alone"
         );
         Ok(())
     }

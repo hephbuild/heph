@@ -377,14 +377,28 @@ async fn tee_stream(
     source: Option<impl tokio::io::AsyncRead + Unpin>,
     log: Arc<std::sync::Mutex<std::fs::File>>,
     mut sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    addr: &str,
+    stream: &str,
+    bytes_read: &std::sync::atomic::AtomicUsize,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Some(mut source) = source else { return };
     let mut buf = vec![0u8; 8192];
     loop {
         match source.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) => {
+                tracing::warn!(
+                    addr,
+                    stream,
+                    %error,
+                    bytes_read = bytes_read.load(std::sync::atomic::Ordering::Relaxed),
+                    "pluginexec: error draining child output; log tail may be truncated"
+                );
+                break;
+            }
             Ok(n) => {
+                bytes_read.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 #[expect(
                     clippy::indexing_slicing,
                     reason = "n guaranteed <= buf.len() by AsyncRead contract"
@@ -430,6 +444,10 @@ async fn tee_stream(
 /// time is accumulated per stream and reported against the target's address.
 /// Measuring here rather than in the drain is what makes the diagnostic name
 /// a target and cover both platforms with no `cfg`.
+///
+/// `stdout_bytes`/`stderr_bytes` mirror `tee_stream`'s `bytes_read`: a
+/// post-wait drain timeout reports how much of each stream it actually got
+/// before giving up, rather than just "it timed out".
 async fn tee_output<'io>(
     reader: Option<proc_exec::OutputReader>,
     log: Arc<std::sync::Mutex<std::fs::File>>,
@@ -438,6 +456,8 @@ async fn tee_output<'io>(
     mut stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     mut stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     addr: &str,
+    stdout_bytes: &std::sync::atomic::AtomicUsize,
+    stderr_bytes: &std::sync::atomic::AtomicUsize,
 ) {
     use tokio::io::AsyncWriteExt;
     let Some(mut reader) = reader else { return };
@@ -462,6 +482,11 @@ async fn tee_output<'io>(
             }
         };
         let started = std::time::Instant::now();
+        let bytes_counter = match stream {
+            proc_exec::StreamId::Stdout => stdout_bytes,
+            proc_exec::StreamId::Stderr => stderr_bytes,
+        };
+        bytes_counter.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut g) = log.lock() {
             drop(g.write_all(&chunk));
         }
@@ -564,6 +589,23 @@ async fn pump_stdin_pty(
         _ = io::copy(&mut src, &mut sink) => {}
     }
     drop(sink.shutdown().await);
+}
+
+/// Await `io` for up to `deadline`. By the time this runs the child has
+/// already exited, so anything it wrote is already read or sitting in the
+/// pipe — `io` arriving late means something else (typically a surviving
+/// descendant sharing the same stdout/stderr fd) still holds the write end
+/// open. Runs `on_timeout` in that case rather than silently discarding the
+/// timeout, so a truncated log.txt tail is diagnosable instead of vanishing
+/// unremarked — mirrors `proc_exec`'s own `DRAIN_DEADLINE` abandonment log.
+async fn drain_or_warn(
+    io: impl std::future::Future<Output = ()>,
+    deadline: std::time::Duration,
+    on_timeout: impl FnOnce(),
+) {
+    if tokio::time::timeout(deadline, io).await.is_err() {
+        on_timeout();
+    }
 }
 
 /// Pump bytes from an async source into a [`proc_exec::StdinPump`].
@@ -1376,10 +1418,6 @@ impl Driver {
             None
         };
 
-        // Named once so the tee's diagnostics can say which target is being
-        // throttled; the reader borrows it for the length of the run.
-        let tee_addr = rreq.target.addr.format();
-
         // Signal that cancels the stdin pump once the child has exited. Without
         // it, shell mode would deadlock waiting on a parent-stdin read that
         // nothing intends to satisfy.
@@ -1412,13 +1450,27 @@ impl Driver {
             },
         }
 
+        // Target addr for the drain diagnostics below, and per-stream byte
+        // counters so a post-wait drain timeout can report how much of the
+        // tail it actually got before giving up.
+        let addr_str = rreq.target.addr.format();
+        let stdout_bytes = std::sync::atomic::AtomicUsize::new(0);
+        let stderr_bytes = std::sync::atomic::AtomicUsize::new(0);
+
         let io_futures: IoFutures<'_> = if let Some(master) = pty_master {
             let read_fd = master.try_clone().context("dup pty master for read")?;
             let reader = pty::AsyncPty::new(read_fd).context("async pty reader")?;
             let writer = pty::AsyncPty::new(master).context("async pty writer")?;
 
             let log_for_out = Arc::clone(&output_log_file);
-            let stdout_fut = Box::pin(tee_stream(Some(reader), log_for_out, rreq.stdout));
+            let stdout_fut = Box::pin(tee_stream(
+                Some(reader),
+                log_for_out,
+                rreq.stdout,
+                &addr_str,
+                "pty",
+                &stdout_bytes,
+            ));
 
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
                 if let Some(src) = rreq.stdin {
@@ -1440,7 +1492,9 @@ impl Driver {
                 log_for_out,
                 rreq.stdout,
                 rreq.stderr,
-                &tee_addr,
+                &addr_str,
+                &stdout_bytes,
+                &stderr_bytes,
             ));
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
                 match (rreq.stdin, stdin_pump) {
@@ -1477,7 +1531,9 @@ impl Driver {
         // (the runtime may be tearing down) and surface `cancelled` below.
         let wait_res = match io_futures {
             IoFutures::Pty { stdin, stdout } => {
-                let io = async { tokio::join!(stdin, stdout) };
+                let io = async {
+                    tokio::join!(stdin, stdout);
+                };
                 tokio::pin!(io);
                 tokio::select! {
                     wait_res = &mut wait_handle => {
@@ -1486,10 +1542,13 @@ impl Driver {
                         _ = stdin_cancel_tx.send(());
                         if !ctoken.is_cancelled() {
                             hcore::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
-                            _ = tokio::time::timeout(
-                                std::time::Duration::from_millis(50),
-                                &mut io,
-                            ).await;
+                            drain_or_warn(&mut io, std::time::Duration::from_millis(50), || {
+                                tracing::warn!(
+                                    addr = addr_str.as_str(),
+                                    pty_bytes = stdout_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                    "pluginexec: post-wait output drain timed out; log tail may be truncated"
+                                );
+                            }).await;
                         }
                         wait_res
                     }
@@ -1500,7 +1559,9 @@ impl Driver {
                 }
             }
             IoFutures::Pipes { stdin, output } => {
-                let io = async { tokio::join!(stdin, output) };
+                let io = async {
+                    tokio::join!(stdin, output);
+                };
                 tokio::pin!(io);
                 tokio::select! {
                     wait_res = &mut wait_handle => {
@@ -1509,10 +1570,14 @@ impl Driver {
                         _ = stdin_cancel_tx.send(());
                         if !ctoken.is_cancelled() {
                             hcore::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
-                            _ = tokio::time::timeout(
-                                std::time::Duration::from_millis(50),
-                                &mut io,
-                            ).await;
+                            drain_or_warn(&mut io, std::time::Duration::from_millis(50), || {
+                                tracing::warn!(
+                                    addr = addr_str.as_str(),
+                                    stdout_bytes = stdout_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                    stderr_bytes = stderr_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                                    "pluginexec: post-wait output drain timed out; log tail may be truncated"
+                                );
+                            }).await;
                         }
                         wait_res
                     }
@@ -1581,6 +1646,137 @@ mod tests {
     use hmodel::htaddr::Addr;
     use hplugin::driver::RunRequest;
     use hplugin::driver::targetdef::CacheConfig;
+
+    /// Captures `tracing` events emitted on the calling OS thread while the
+    /// returned guard is alive. `#[tokio::test]`'s default `current_thread`
+    /// flavor keeps every task (including ones `tokio::spawn`ed by the code
+    /// under test) on this one thread, so the thread-local default this
+    /// installs covers the whole drive, not just the top-level future.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut guard = self
+                .0
+                .lock()
+                .map_err(|_e| std::io::Error::other("captured log mutex poisoned"))?;
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log mutex").clone())
+                .expect("captured log is utf8")
+        }
+    }
+
+    fn capture_tracing() -> (tracing::subscriber::DefaultGuard, CapturedLog) {
+        let captured = CapturedLog::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        (tracing::subscriber::set_default(subscriber), captured)
+    }
+
+    /// `AsyncRead` double that always fails — `tee_stream`'s real IO error
+    /// path (as opposed to clean `Ok(0)` EOF) has no other way to reach it,
+    /// since a real pipe/PTY essentially never produces a read error in a
+    /// controlled test.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("synthetic read failure")))
+        }
+    }
+
+    fn log_file(dir: &tempfile::TempDir) -> Arc<std::sync::Mutex<std::fs::File>> {
+        let file = std::fs::File::create(dir.path().join("log.txt")).expect("create log file");
+        Arc::new(std::sync::Mutex::new(file))
+    }
+
+    #[tokio::test]
+    async fn tee_stream_logs_real_io_errors() {
+        let (guard, log) = capture_tracing();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bytes_read = std::sync::atomic::AtomicUsize::new(0);
+
+        tee_stream(
+            Some(FailingReader),
+            log_file(&tmp),
+            None,
+            "//pkg:target",
+            "stdout",
+            &bytes_read,
+        )
+        .await;
+        drop(guard);
+
+        let text = log.text();
+        assert!(
+            text.contains("error draining child output"),
+            "missing diagnostic: {text}"
+        );
+        assert!(text.contains("//pkg:target"), "missing addr field: {text}");
+        assert!(text.contains("stdout"), "missing stream field: {text}");
+        assert!(
+            text.contains("synthetic read failure"),
+            "missing underlying error: {text}"
+        );
+    }
+
+    // `tee_output`'s own read-error path (the `Err(e) => { warn!(...); continue }`
+    // arm — see its doc comment on why a merged reader must not treat one
+    // stream's error as EOF for both) has no equivalent synthetic-fault test
+    // here: `proc_exec::OutputReader` wraps a real drain channel with no public
+    // constructor for injecting an IO error, the same constraint that made
+    // `tee_chunks`'s `ChunkSource` seam necessary before this merge — and that
+    // seam doesn't carry over to a merged single-reader design. The behavior
+    // it exists to prove (a read error does not stop the surviving stream) is
+    // exercised in proc_exec's own suite instead.
+
+    /// Regression for the post-wait drain: before the fix, whether
+    /// `tokio::time::timeout` elapsed was discarded (`_ = timeout(...).await`)
+    /// so a truncated tail vanished silently. `drain_or_warn` is the
+    /// extracted decision — this proves it actually invokes the diagnostic
+    /// when time runs out on stalled IO (a stand-in for a stray descendant
+    /// still holding the pipe open), the shape `run_inner` wires to
+    /// `tracing::warn!` on both the PTY and pipes branches.
+    #[tokio::test]
+    async fn drain_or_warn_fires_when_deadline_elapses() {
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        drain_or_warn(
+            std::future::pending::<()>(),
+            std::time::Duration::from_millis(1),
+            || {
+                fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn drain_or_warn_stays_quiet_when_io_finishes_in_time() {
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        drain_or_warn(async {}, std::time::Duration::from_millis(50), || {
+            fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn env_key_segment_sanitizes_invalid_chars() {
@@ -3310,12 +3506,12 @@ mod tests {
         name: &str,
         body: &str,
     ) -> anyhow::Result<std::path::PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}"))?;
-        let mut perms = std::fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms)?;
+        // These tools are exec'd by the driver while sibling tests spawn their own
+        // subprocesses; a fork racing the write inherits the writable fd and the
+        // exec fails with ETXTBSY. `write_executable` takes the barrier that
+        // writing by hand would skip.
+        hcore::fsutil::write_executable(&path, format!("#!/bin/sh\n{body}").as_bytes())?;
         Ok(path)
     }
 

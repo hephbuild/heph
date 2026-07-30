@@ -116,14 +116,21 @@ impl HephLspContext {
             // Fresh package list per call, for the same reason: a session-lifetime
             // one would freeze editor results — create a package and it would
             // never appear. Within one buffer evaluation it still dedupes the
-            // walk. Note this passes `Ignore::default()` (prunes nothing) where
-            // the build passes the configured `fs.skip`, so the editor can see
+            // walk. Note this passes only the always-on `.git` prune where the
+            // build passes the configured `fs.skip`, so the editor can see
             // packages the build does not; a pre-existing divergence, now at least
             // confined to a cell that is never shared with the build's.
+            //
+            // `.git` specifically must be pruned, not merely skipped as an
+            // optimization: a ref file's name is the branch name's raw bytes, so
+            // one `git checkout -b $'\xe9'` puts a name in `.git/refs/heads` that
+            // the walker refuses. Walking `.git` would fail the whole package
+            // list — and with it every completion — over something no build
+            // would ever have read.
             Arc::new(PackageList::new(
                 self.root.clone(),
                 self.patterns.clone(),
-                Arc::new(hwalk::Ignore::default()),
+                Arc::new(hwalk::Ignore::git_only()),
                 walker,
             )),
             Arc::default(),
@@ -146,7 +153,13 @@ impl HephLspContext {
                 .map(|r| r.pkg.to_string())
                 .filter(|p| p.starts_with(prefix))
                 .collect(),
-            Err(_) => Vec::new(),
+            // Completion degrades to "no suggestions" rather than failing the
+            // request, but the walk error is the only explanation the user will
+            // ever get for an empty list — never drop it.
+            Err(e) => {
+                tracing::warn!(error = ?e, prefix, "lsp: package walk failed");
+                Vec::new()
+            }
         }
     }
 

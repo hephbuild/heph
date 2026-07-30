@@ -21,11 +21,12 @@
 //! the in-memory backend serializes only within this process.
 
 use anyhow::Result;
+use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hlock::hlock::{
-    FLock, FRWLock, FWriteGuard, KeyedGuard, KeyedTLock, MemLock, MemRWLock, TBridge,
+    Ctoken, FLock, FRWLock, FWriteGuard, KeyedGuard, KeyedTLock, Lock, MemLock, MemRWLock, TBridge,
     TBridgeReadGuard, TBridgeUpgradableGuard, TBridgeWriteGuard, TUpgradableReadGuard, TWriteGuard,
-    fs_tlock, mem_tlock,
+    mem_tlock,
 };
 use hmodel::htaddr::Addr;
 use std::io::Read as _;
@@ -42,14 +43,80 @@ pub enum LockBackend {
     Mem,
 }
 
-type FsBridge = TBridge<FLock, FRWLock>;
+type FsBridge = TBridge<GatewayLock, FRWLock>;
 type MemBridge = TBridge<MemLock, MemRWLock>;
+
+/// The per-addr gateway lock: an [`FLock`] plus one policy — **acquiring it
+/// empties the lock file.**
+///
+/// The gateway file's contents are the holder's pid stamp, and they describe
+/// *the current holder*. They only ever outlive their writer when a holder is
+/// killed without running `Drop`: nothing unlinks the gateway file then, and
+/// nothing sweeps `<home>/lock/`. The next exclusive acquire is the first moment
+/// anyone can clear that, so it is where the clearing belongs.
+///
+/// This is what closes the *wide* window. [`TBridge`] takes the gateway first
+/// and only then parks on the inner lock — a wait bounded by a whole build —
+/// and [`stamp_pid`] runs after both. A waiter in another process reading the
+/// file in between now sees an empty one ("holder unknown") rather than the name
+/// of the previous, dead holder.
+///
+/// It also means the common cross-process shape — we hold the gateway and are
+/// waiting for *other* processes' read guards on the inner lock to drain —
+/// reports "holder unknown". That is the point: stamping at outer-acquire
+/// instead would make it report this very process as the holder, which is worse
+/// than admitting we do not know who is in the way.
+///
+/// Deliberately here and not in [`FLock`]: `FLock` is also `driver-support`'s
+/// staging lock, which keeps nothing in its file and should not pay a syscall
+/// per acquire for a stamp it never writes.
+#[derive(Clone, Debug)]
+pub struct GatewayLock(FLock);
+
+impl GatewayLock {
+    fn new(path: PathBuf) -> Self {
+        Self(FLock::new(path))
+    }
+}
+
+/// Empty a freshly-acquired gateway file. Best-effort for the same reason
+/// [`stamp_pid`] is: the contents are a diagnostic, and failing a build lock
+/// because a pid could not be *erased* would trade a stale pid for a dead build.
+/// A failure leaves exactly the behaviour that shipped before this existed.
+///
+/// One `ftruncate` — `write_all_at` on an empty slice issues no syscall — on the
+/// gateway acquire, which is the cold path (a warm cache hit takes only the
+/// inner read lock and never reaches here).
+fn blank_stamp(gateway: &FWriteGuard) {
+    if let Err(err) = gateway.write_contents(b"") {
+        tracing::debug!(error = %err, "blanking the gateway pid stamp on acquire");
+    }
+}
+
+#[async_trait]
+impl Lock for GatewayLock {
+    type Guard = FWriteGuard;
+
+    async fn lock(&self, ctoken: Ctoken<'_>) -> Result<FWriteGuard> {
+        let guard = self.0.lock(ctoken).await?;
+        blank_stamp(&guard);
+        Ok(guard)
+    }
+
+    fn try_lock(&self) -> Result<Option<FWriteGuard>> {
+        let guard = self.0.try_lock()?;
+        if let Some(guard) = &guard {
+            blank_stamp(guard);
+        }
+        Ok(guard)
+    }
+}
 
 type FsReadGuard = KeyedGuard<Addr, FsBridge, TBridgeReadGuard<FRWLock>>;
 type MemReadGuard = KeyedGuard<Addr, MemBridge, TBridgeReadGuard<MemRWLock>>;
-type FsUpgradableGuard = KeyedGuard<Addr, FsBridge, TBridgeUpgradableGuard<FLock, FRWLock>>;
+type FsUpgradableGuard = KeyedGuard<Addr, FsBridge, TBridgeUpgradableGuard<GatewayLock, FRWLock>>;
 type MemUpgradableGuard = KeyedGuard<Addr, MemBridge, TBridgeUpgradableGuard<MemLock, MemRWLock>>;
-type FsWriteGuard = KeyedGuard<Addr, FsBridge, TBridgeWriteGuard<FLock, FRWLock>>;
+type FsWriteGuard = KeyedGuard<Addr, FsBridge, TBridgeWriteGuard<GatewayLock, FRWLock>>;
 type MemWriteGuard = KeyedGuard<Addr, MemBridge, TBridgeWriteGuard<MemLock, MemRWLock>>;
 
 /// Plain shared read guard on a target's cache entry. Held for as long as the
@@ -131,7 +198,10 @@ impl ResultLock {
             LockBackend::Fs => ResultLock::Fs {
                 dir: dir.clone(),
                 lock: KeyedTLock::new(move |addr: &Addr| {
-                    fs_tlock(outer_lock_path(&dir, addr), inner_lock_path(&dir, addr))
+                    TBridge::new(
+                        GatewayLock::new(outer_lock_path(&dir, addr)),
+                        FRWLock::new(inner_lock_path(&dir, addr)),
+                    )
                 }),
             },
             LockBackend::Mem => ResultLock::Mem(KeyedTLock::new(|_| mem_tlock())),
@@ -212,13 +282,66 @@ impl ResultLock {
         }
     }
 
-    /// Best-effort pid of the process currently holding (or last to hold) the
-    /// gateway for `addr`. For the filesystem backend this reads the pid the
-    /// holder stamped into the gateway lock file; for the in-memory backend the
-    /// holder is always this process. `None` when the holder is unknown.
+    /// Best-effort pid of the process **currently holding** the gateway for
+    /// `addr`, or `None` when the holder is unknown. For the in-memory backend
+    /// the holder is always this process.
+    ///
+    /// For the filesystem backend this is two questions, asked **in this order**:
+    ///
+    /// 1. *Is the gateway held at all?* — [`FLock::is_path_held`] probes the
+    ///    `flock` itself. A stamp with nobody holding the lock is a stamp its
+    ///    writer left behind when it was killed; the kernel dropped that
+    ///    process's lock at exit, but nothing unlinked the file and nothing
+    ///    sweeps `<home>/lock/`, so the pid would otherwise be readable forever.
+    /// 2. *Who stamped it?* — [`read_pid`] on the gateway file, which
+    ///    [`GatewayLock`] empties at acquire, so a holder that has not stamped
+    ///    yet reads as unknown rather than as its predecessor.
+    ///
+    /// **Probe first, then read.** Reading first leaves a window: the pid is
+    /// captured, the holder releases (and unlinks), a new holder takes the
+    /// gateway, and the probe then reports "held" — naming a process that holds
+    /// nothing and whose pid may already have been recycled. That is the exact
+    /// failure this function exists to prevent, so the order is load-bearing
+    /// rather than incidental. Probe-first has no such window: after a
+    /// confirmed "held", the read yields the confirmed holder's stamp, a newer
+    /// holder's stamp, or nothing — never a released holder's.
+    ///
+    /// For the same reason the read is *not* fused into the probe by reusing
+    /// its fd, which would save an `open`: that fd names the inode that was
+    /// held, and if the holder releases in between, reading it returns the
+    /// stamp of a lock nobody holds. Re-resolving the path is what makes the
+    /// stale answer unreachable.
+    ///
+    /// Probing the lock is the liveness check, deliberately in place of
+    /// `kill(pid, 0)` on the stamped pid: `kill` answers for a *pid*, which is a
+    /// recycled name — a reused pid, or a zombie whose pid still answers,
+    /// reports a live process that never held anything. The lock is the thing we
+    /// actually want to know about, and it costs one `open` + one `flock` on a
+    /// path that has already spent `RESULT_LOCK_NOTICE` waiting.
+    ///
+    /// It stays best-effort by nature. The probe is a snapshot — the holder may
+    /// release the instant after — and a pid is only a hint for the user, never
+    /// something the engine acts on.
+    ///
+    /// What this still cannot report: a wait on the *inner* lock, which is the
+    /// common cross-process shape. Plain read guards are not stamped at all, so
+    /// "who is holding the artifacts I want to rebuild" reads as unknown. See
+    /// [`GatewayLock`].
     pub fn holder_pid(&self, addr: &Addr) -> Option<u32> {
         match self {
-            ResultLock::Fs { dir, .. } => read_pid(&outer_lock_path(dir, addr)),
+            ResultLock::Fs { dir, .. } => {
+                let path = outer_lock_path(dir, addr);
+                match FLock::is_path_held(&path) {
+                    Ok(true) => read_pid(&path),
+                    Ok(false) => None,
+                    Err(err) => {
+                        // The probe is the only caller of those contexts; without
+                        // this the diagnostic path is itself undiagnosable.
+                        tracing::debug!(error = %err, "probing gateway lock liveness");
+                        None
+                    }
+                }
+            }
             ResultLock::Mem(_) => Some(std::process::id()),
         }
     }
@@ -255,13 +378,18 @@ fn inner_lock_path(dir: &Path, addr: &Addr) -> PathBuf {
 /// belongs to nobody; without the truncate-first order, a partially visible
 /// write could still land inside the old frame. See [`read_pid`].
 ///
-/// This bounds what a *torn* read can report. It does not make the pid fresh: a
-/// stamp outlives the process that wrote it whenever the holder is killed
-/// without running `Drop` (nothing unlinks the gateway file then), and the stamp
-/// lands only after the acquire completes, so a waiter can also read the
-/// previous holder's pid while the current one is still parked on the inner
-/// lock. Both are pre-existing and unaddressed here; a liveness check on the
-/// pid, or blanking the stamp at acquire, would be the fix.
+/// That bounds what a *torn* read can report. Freshness is a separate question,
+/// and neither half of it is answered here: this runs only after the whole
+/// bridge acquire completes, so between the gateway acquire and this line the
+/// file holds whatever the last holder left; and a stamp outlives its writer
+/// whenever that writer is killed without running `Drop`. Both are handled at
+/// the other end — [`GatewayLock`] empties the file the moment the gateway is
+/// acquired, and [`holder_pid`] reports a pid only while the lock is genuinely
+/// held. Both of those are best-effort too: a blank that fails re-opens the
+/// window for this addr until the next acquire, which is why the liveness probe
+/// is a second, independent check rather than a belt on the first.
+///
+/// [`holder_pid`]: ResultLock::holder_pid
 fn stamp_pid(gateway: Option<&FWriteGuard>) {
     debug_assert!(
         gateway.is_some(),
@@ -333,6 +461,18 @@ mod tests {
 
     fn fs(dir: &tempfile::TempDir) -> ResultLock {
         ResultLock::new(LockBackend::Fs, dir.path().to_path_buf())
+    }
+
+    /// Hold the gateway for `addr` the way another *process* would: a raw
+    /// [`FLock`] on the outer path, bypassing both [`GatewayLock`]'s blank and
+    /// [`stamp_pid`]. That lets a test plant exact bytes in the gateway file and
+    /// still have [`ResultLock::holder_pid`]'s liveness probe see a held lock, so
+    /// the assertion is about the *parsing* and nothing else.
+    async fn hold_raw_gateway(dir: &tempfile::TempDir, a: &Addr) -> FWriteGuard {
+        FLock::new(outer_lock_path(dir.path(), a))
+            .lock(&ct())
+            .await
+            .expect("raw gateway")
     }
 
     // ResultReadGuard must be Send + Sync — it lives inside Arc<dyn Content>
@@ -548,18 +688,22 @@ mod tests {
         assert_eq!(lock.holder_pid(&addr("a")), None, "unknown after release");
     }
 
-    // `write_contents` writes positionally and truncates second, so a reader in
-    // another process can catch the gateway file mid-stamp. A killed holder
-    // leaves a 7-digit pid behind (Linux `pid_max` defaults to 4194304); the
-    // next holder stamps a 3-digit one over it, and this is what a third process
-    // sees before the truncate lands. Unframed, `4214304` parses cleanly and the
-    // TUI names a pid the user might kill.
-    #[test]
-    fn holder_pid_ignores_a_torn_stamp_rather_than_reporting_a_wrong_pid() {
+    // `write_contents` writes positionally, so a reader in another process can
+    // catch the gateway file mid-stamp. A killed holder leaves a 7-digit pid
+    // behind (Linux `pid_max` defaults to 4194304); the next holder stamps a
+    // 3-digit one over it, and this is what a third process sees before the
+    // truncate lands. Unframed, `4214304` parses cleanly and the TUI names a pid
+    // the user might kill.
+    //
+    // The gateway is genuinely held throughout, so the liveness probe passes and
+    // the framing is the only thing that can decide the answer.
+    #[tokio::test]
+    async fn holder_pid_ignores_a_torn_stamp_rather_than_reporting_a_wrong_pid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = fs(&dir);
         let a = addr("a");
 
+        let held = hold_raw_gateway(&dir, &a).await;
         std::fs::write(outer_lock_path(dir.path(), &a), b"421\n304\n").expect("torn stamp");
 
         assert_eq!(
@@ -567,23 +711,172 @@ mod tests {
             Some(421),
             "the framed pid, never the concatenation with the stale tail"
         );
+        drop(held);
     }
 
-    #[test]
-    fn holder_pid_is_unknown_for_an_unterminated_stamp() {
+    #[tokio::test]
+    async fn holder_pid_is_unknown_for_an_unterminated_stamp() {
         // A write only half visible has no terminator. Naming `42` while the
         // holder is really `4211592` is worse than naming nobody.
+        //
+        // The planted pid is this process's own and the gateway is held, so
+        // neither the liveness probe nor a dead pid can account for the `None` —
+        // only the missing frame can.
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = fs(&dir);
         let a = addr("a");
 
-        std::fs::write(outer_lock_path(dir.path(), &a), b"42").expect("partial stamp");
+        let held = hold_raw_gateway(&dir, &a).await;
+        std::fs::write(
+            outer_lock_path(dir.path(), &a),
+            std::process::id().to_string(),
+        )
+        .expect("partial stamp");
 
         assert_eq!(
             lock.holder_pid(&a),
             None,
             "an unframed payload is not a pid"
         );
+        drop(held);
+    }
+
+    #[test]
+    fn holder_pid_is_unknown_when_the_stamp_outlives_its_holder() {
+        // A holder killed mid-build leaves the gateway file behind: no `Drop`
+        // runs, so nothing unlinks it, and nothing sweeps `<home>/lock/`. The
+        // kernel does drop its `flock` at exit — so the lock is free while the
+        // stamp is not, and without a liveness check that pid stays readable
+        // forever.
+        //
+        // The stamp planted here is *this* process's pid: live, well-framed, and
+        // exactly what a `kill(pid, 0)` check would happily report. Only probing
+        // the lock itself gets this right.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = fs(&dir);
+        let a = addr("a");
+
+        std::fs::write(
+            outer_lock_path(dir.path(), &a),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("stamp from a holder that is gone");
+
+        assert_eq!(
+            lock.holder_pid(&a),
+            None,
+            "a stamp nobody holds names nobody"
+        );
+    }
+
+    // The gateway's contents describe its *current* holder. `TBridge` acquires
+    // the gateway, then parks on the inner lock for as long as a build takes,
+    // and only then stamps — so whatever the previous holder left must be gone
+    // at the *first* of those three, not the last.
+    //
+    // The seeded pid is this process's own, and the lock is held once we
+    // acquire, so nothing but the blank itself can make it unreadable.
+    #[tokio::test]
+    async fn gateway_lock_blanks_a_stale_stamp_at_acquire() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway.lock");
+        std::fs::write(&path, format!("{}\n", std::process::id())).expect("stale stamp");
+
+        let gw = GatewayLock::new(path.clone());
+        let held = gw.lock(&ct()).await.expect("gateway");
+
+        assert_eq!(
+            std::fs::read(&path).expect("gateway readable"),
+            b"",
+            "acquiring the gateway must empty the stamp"
+        );
+        assert_eq!(read_pid(&path), None, "leaving no pid to report");
+        drop(held);
+    }
+
+    // The wide window, end to end through the *shipped* `ResultLock` rather than
+    // through `GatewayLock` directly.
+    //
+    // Two `ResultLock`s on one directory model two processes. A killed
+    // predecessor's stamp is still in the gateway file; the builder takes the
+    // gateway (blanking it) and then parks on the inner lock behind the
+    // watcher's read guard — a wait bounded by a whole build. For that entire
+    // wait, `holder_pid` used to name the predecessor.
+    //
+    // This is also the only test that pins `GatewayLock` into the bridge: the
+    // two tests above construct one themselves, so reverting `FsBridge` to
+    // `TBridge<FLock, FRWLock>` leaves them green. Here the planted pid is this
+    // process's own — live, framed, and sitting under a gateway that genuinely
+    // is held — so nothing but the blank can produce the `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holder_pid_is_unknown_while_the_gateway_holder_waits_on_the_inner_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = addr("a");
+        let watcher = fs(&dir);
+        let builder = Arc::new(fs(&dir));
+
+        std::fs::write(
+            outer_lock_path(dir.path(), &a),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("stamp from a holder that is gone");
+
+        // Another process still has the artifacts open, so the inner write
+        // cannot be taken yet.
+        let reading = watcher.read(&a, &ct()).await.expect("plain read");
+
+        let b = Arc::clone(&builder);
+        let handle = tokio::spawn(async move {
+            let tok = StdCancellationToken::new();
+            b.write(&addr("a"), &tok).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "the builder must still be parked on the inner lock"
+        );
+        assert_eq!(
+            watcher.holder_pid(&a),
+            None,
+            "gateway held, but its new holder has not stamped yet"
+        );
+
+        drop(reading);
+        let held = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("did not hang")
+            .expect("join")
+            .expect("acquires once the read drains");
+        assert_eq!(
+            builder.holder_pid(&a),
+            Some(std::process::id()),
+            "and the stamp lands once the acquire completes"
+        );
+        drop(held);
+    }
+
+    // `try_write` is a live production stamp site (the GC trim), and it reaches
+    // the gateway through `try_lock`, not `lock`. Without this the blank could
+    // be dropped from that arm and ship green.
+    #[test]
+    fn gateway_try_lock_blanks_a_stale_stamp_at_acquire() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway.lock");
+        std::fs::write(&path, format!("{}\n", std::process::id())).expect("stale stamp");
+
+        let gw = GatewayLock::new(path.clone());
+        let held = gw
+            .try_lock()
+            .expect("try_lock ok")
+            .expect("free gateway acquires");
+
+        assert_eq!(
+            std::fs::read(&path).expect("gateway readable"),
+            b"",
+            "try_lock must empty the stamp too"
+        );
+        drop(held);
     }
 
     // Everything `read_pid` documents as `None`, in one place. The interesting
@@ -623,7 +916,6 @@ mod tests {
     // decoy was untouched — so a `stamp_pid` that wrote nothing cannot pass.
     #[tokio::test]
     async fn stamp_pid_writes_through_the_held_fd_not_the_path() {
-        use hlock::hlock::Lock;
         use std::os::unix::fs::FileExt as _;
 
         let dir = tempfile::tempdir().expect("tempdir");

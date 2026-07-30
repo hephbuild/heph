@@ -1,14 +1,14 @@
 use crate::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs, detect_output_collisions,
-    invoke_inner, list_path_for, resolve_unpack_root, write_source_map_blocking,
+    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs,
+    detect_output_collisions_blocking, invoke_inner, list_path_for, resolve_unpack_root,
+    unpack_blocking, write_source_map_blocking,
 };
 use anyhow::Context;
-use hcore::hartifactcontent;
 use hcore::hasync::Cancellable;
 use hplugin::driver::{RunInput, RunRequest, RunResponse};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// OS-backed managed driver: materializes every input artifact to disk via
@@ -65,8 +65,11 @@ impl ManagedDriverOs {
 
         // Reject two distinct targets producing the same sandbox file before we
         // materialize anything — the copy path would otherwise silently
-        // last-write-wins.
-        detect_output_collisions(&groups)
+        // last-write-wins. Off the worker: the check enumerates every input's
+        // entry paths, which for a cache-backed input is a header scan over a
+        // sqlite blob and can park on that key's queued write.
+        let groups = detect_output_collisions_blocking(groups)
+            .await
             .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
 
         let mut inputs: Vec<ManagedRunInput> = Vec::new();
@@ -78,7 +81,7 @@ impl ManagedDriverOs {
                 match self.stage_dir.as_deref() {
                     Some(stage_dir) if crate::stage::is_read_only(&input.annotations) => {
                         crate::stage::stage_and_link(
-                            input.artifact.content.as_ref(),
+                            &input.artifact.content,
                             stage_dir,
                             &input.source_addr.format(),
                             unpack_root.as_path(),
@@ -98,29 +101,14 @@ impl ManagedDriverOs {
                         })?;
                     }
                     _ => {
-                        // Writes the input's entire tree to disk. Inline in this
-                        // `async fn` that is a tokio worker held for the whole
-                        // materialization, and with `2 * ncpu` execute permits
-                        // against `ncpu` workers, enough targets in this window
-                        // park every one of them. The captures are an `Arc`
-                        // bump and the (usually empty) filter list.
-                        let content = Arc::clone(&input.artifact.content);
-                        let filters = input.filters.clone();
-                        let (root, lp) = (unpack_root.clone(), list_path.clone());
-                        hcore::blocking::run(move || {
-                            let pred = |rel: &Path| filters.iter().any(|f| Path::new(f) == rel);
-                            let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
-                                None
-                            } else {
-                                Some(&pred)
-                            };
-                            hartifactcontent::unpack::unpack(
-                                content.as_ref(),
-                                root.as_path(),
-                                lp.as_deref(),
-                                predicate,
-                            )
-                        })
+                        // Writes the input's entire tree to disk — off the
+                        // worker, see `unpack_blocking`.
+                        unpack_blocking(
+                            Arc::clone(&input.artifact.content),
+                            unpack_root.clone(),
+                            list_path.clone(),
+                            input.filters.clone(),
+                        )
                         .await
                         .with_context(|| {
                             format!(

@@ -18,7 +18,7 @@
 
 use crate::htaddr::parse_addr_with_base;
 use crate::htmatcher::Matcher;
-use crate::htpkg::{self, PkgBuf};
+use crate::htpkg::{self, PkgBuf, join_rel_checked_pkg};
 use anyhow::{Context, Result, bail};
 
 /// Render a [`Matcher`] back into query-language syntax — the inverse of
@@ -100,6 +100,7 @@ pub fn parse(input: &str, base: &PkgBuf) -> Result<Matcher> {
         tokens: &tokens,
         pos: 0,
         base,
+        depth: 0,
     };
     let m = p.parse_or()?;
     if let Some(tok) = p.peek() {
@@ -201,10 +202,17 @@ fn tokenize(input: &str) -> Result<Vec<Tok>> {
     Ok(tokens)
 }
 
+/// Cap on `!`/`(…)` nesting depth. Each level of nesting descends through
+/// `parse_not`, so this bounds native stack usage — a deeply nested or
+/// parenthesized expression must fail cleanly instead of overflowing the
+/// stack (reachable from `heph query -e '<expr>'` on user-controlled input).
+const MAX_NESTING_DEPTH: usize = 256;
+
 struct Parser<'a> {
     tokens: &'a [Tok],
     pos: usize,
     base: &'a PkgBuf,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -249,10 +257,24 @@ impl<'a> Parser<'a> {
     }
 
     /// `not := "!" not | atom`
+    ///
+    /// Every level of `!`/`(…)` nesting passes through here exactly once
+    /// (directly for `!`, via `parse_atom` -> `parse_or` -> `parse_and` for
+    /// `(…)`), so guarding depth here bounds both recursion paths.
     fn parse_not(&mut self) -> Result<Matcher> {
+        self.depth += 1;
+        let result = self.parse_not_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_not_inner(&mut self) -> Result<Matcher> {
+        if self.depth > MAX_NESTING_DEPTH {
+            bail!("query expression nested too deeply (limit: {MAX_NESTING_DEPTH})");
+        }
         if matches!(self.peek(), Some(Tok::Not)) {
             self.bump();
-            return Ok(Matcher::Not(Box::new(self.parse_not()?)));
+            return self.parse_not().map(|inner| Matcher::Not(Box::new(inner)));
         }
         self.parse_atom()
     }
@@ -308,13 +330,21 @@ impl<'a> Parser<'a> {
     fn func_to_matcher(&self, name: &str, arg: &str) -> Result<Matcher> {
         match name {
             "label" => Ok(Matcher::Label(arg.to_string())),
-            "tree_output" | "tree_output_to" => Ok(Matcher::TreeOutputTo(to_pkg(arg))),
+            "tree_output" | "tree_output_to" => Ok(Matcher::TreeOutputTo(
+                to_pkg(arg).with_context(|| format!("parsing {name}({arg})"))?,
+            )),
             "addr" => Ok(Matcher::Addr(
                 parse_addr_with_base(arg, self.base)
                     .with_context(|| format!("parsing addr({arg})"))?,
             )),
-            "package" | "pkg" => Ok(Matcher::Package(to_pkg(arg))),
-            "package_prefix" => Ok(Matcher::PackagePrefix(to_pkg(arg))),
+            "package" | "pkg" => Ok(Matcher::Package(
+                to_pkg(arg).with_context(|| format!("parsing {name}({arg})"))?,
+            )),
+            "package_prefix" => {
+                Ok(Matcher::PackagePrefix(to_pkg(arg).with_context(|| {
+                    format!("parsing package_prefix({arg})")
+                })?))
+            }
             other => bail!(
                 "unknown query function `{other}` (expected one of: label, tree_output, addr, package, package_prefix)"
             ),
@@ -336,10 +366,11 @@ impl<'a> Parser<'a> {
 }
 
 /// Normalise a package argument: strip a leading `//` so both `//pkg` and `pkg`
-/// are accepted, and drop any trailing `/`.
-fn to_pkg(arg: &str) -> PkgBuf {
+/// are accepted, and bound `..` segments to the workspace root (same rule
+/// `parse_addr` enforces for `//pkg:name`).
+fn to_pkg(arg: &str) -> Result<PkgBuf> {
     let arg = arg.strip_prefix("//").unwrap_or(arg);
-    PkgBuf::from(arg.trim_end_matches('/'))
+    Ok(PkgBuf::from(join_rel_checked_pkg("", arg)?))
 }
 
 #[cfg(test)]
@@ -625,5 +656,36 @@ mod tests {
     fn err_empty_addr_func_arg() {
         // `addr()` still needs a real address.
         assert!(parse("addr()", &base()).is_err());
+    }
+
+    #[test]
+    fn err_deeply_nested_not_returns_clean_error() {
+        // Reachable via `heph query -e '<expr>'` on user-controlled input;
+        // must fail cleanly instead of stack-overflowing the process.
+        let input = format!("{}//a:b", "!".repeat(10_000));
+        assert!(parse(&input, &base()).is_err());
+    }
+
+    #[test]
+    fn err_deeply_nested_parens_returns_clean_error() {
+        let input = format!("{}//a:b{}", "(".repeat(10_000), ")".repeat(10_000));
+        assert!(parse(&input, &base()).is_err());
+    }
+
+    #[test]
+    fn err_package_func_dotdot_escapes_root_fails() {
+        // package()/package_prefix()/tree_output() args funnel through the
+        // same PkgBuf construction as bare patterns — must reject `..` past
+        // the workspace root too.
+        assert!(parse("package(../../etc)", &base()).is_err());
+        assert!(parse("package_prefix(../../etc)", &base()).is_err());
+        assert!(parse("tree_output(../../etc)", &base()).is_err());
+    }
+
+    #[test]
+    fn moderately_nested_not_still_parses() {
+        // The depth cap must not reject ordinary, non-adversarial input.
+        let input = format!("{}//a:b", "!".repeat(10));
+        assert!(parse(&input, &base()).is_ok());
     }
 }
