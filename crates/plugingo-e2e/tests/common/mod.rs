@@ -1,7 +1,13 @@
 // Shared integration-test helper module: each test binary `mod common`s this but
 // uses only some helpers, so per-binary dead-code/unused-import warnings are
 // expected here (the items are exercised across the suite).
-#![allow(dead_code, unused_imports)]
+// `allow`, not `expect`: whether an item is dead or an import unused varies per
+// test binary, so an `expect` would be unfulfilled in some of them.
+#![allow(
+    dead_code,
+    unused_imports,
+    reason = "shared test harness; each test binary uses a different subset"
+)]
 
 use anyhow::Context as _;
 use heph::pluginbuildfile;
@@ -102,6 +108,7 @@ fn sdk_checksums_for(gotool: &str) -> std::collections::HashMap<String, String> 
 /// root package, a `provider="go"` state declaring two variants:
 ///   - `host`: the build host's own GOOS/GOARCH (the default the suite uses),
 ///   - `linux_amd64`: pinned linux/amd64 (for the build-tag cross-compile tests).
+///
 /// Every other endpoint is empty — targets/packages come from the real providers.
 struct VariantInjector;
 

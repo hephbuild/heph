@@ -189,7 +189,7 @@ impl ManagedDriverFuse {
 }
 
 /// Layers plus the list files a group's inputs want written.
-type SlotLayers = (Vec<sandboxfuse::Layer>, Vec<(PathBuf, Vec<PathBuf>)>);
+type SlotLayers = (Vec<Arc<sandboxfuse::Layer>>, Vec<(PathBuf, Vec<PathBuf>)>);
 
 /// Build a group's FUSE layers off the runtime workers, then register the slot
 /// here on the caller's frame.
@@ -258,7 +258,7 @@ fn build_slot_layers(
     group: &[RunInput],
 ) -> anyhow::Result<Option<SlotLayers>> {
     use rayon::prelude::*;
-    type Built = (sandboxfuse::Layer, Option<(PathBuf, Vec<PathBuf>)>);
+    type Built = (Arc<sandboxfuse::Layer>, Option<(PathBuf, Vec<PathBuf>)>);
     let results: Vec<anyhow::Result<Option<Built>>> = group
         .par_iter()
         .map(|input| -> anyhow::Result<Option<Built>> {
@@ -293,11 +293,14 @@ fn build_slot_layers(
                     anyhow::anyhow!("seekable_reader returned None for origin_id={origin_id}")
                 })
             });
-            Ok(Some((sandboxfuse::Layer::new(index, opener), list_write)))
+            Ok(Some((
+                Arc::new(sandboxfuse::Layer::new(index, opener)),
+                list_write,
+            )))
         })
         .collect();
 
-    let mut layers: Vec<sandboxfuse::Layer> = Vec::with_capacity(group.len());
+    let mut layers: Vec<Arc<sandboxfuse::Layer>> = Vec::with_capacity(group.len());
     let mut list_writes: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
     for result in results {
         match result? {

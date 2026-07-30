@@ -193,7 +193,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn header_scan_and_walk_enumerate_the_same_paths() {
-        use crate::hartifactcontent::WalkEntryKind;
         use crate::hartifactcontent::tar::TarWalker;
         use std::collections::BTreeSet;
         use std::os::unix::fs::symlink;

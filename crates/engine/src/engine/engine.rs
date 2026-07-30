@@ -11,11 +11,12 @@ use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::ResultLock;
 use crate::engine::{driver, provider};
 use anyhow::Context;
+use hlock::hlock::{FLock, FWriteGuard, Lock};
 use hsandboxfuse as sandboxfuse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Context the engine injects when constructing any plugin (provider, driver, or
 /// managed driver — whether registered directly or through a factory): the
@@ -126,6 +127,11 @@ pub struct EngineFuse {
     pub(crate) lower: PathBuf,
     pub(crate) upper: PathBuf,
     pub(crate) mount: Option<EngineMount>,
+    /// Held for the process's entire lifetime once `root` exists, so a later
+    /// process's `sweep_stale_sandboxfuse_dirs` can tell this directory is
+    /// still owned. `None` when `root` was never created (FUSE off or
+    /// unsupported).
+    _lock: Option<FWriteGuard>,
 }
 
 pub struct EngineMount {
@@ -148,6 +154,7 @@ impl EngineFuse {
                 lower,
                 upper,
                 mount: None,
+                _lock: None,
             });
         }
 
@@ -161,6 +168,7 @@ impl EngineFuse {
                 lower,
                 upper,
                 mount: None,
+                _lock: None,
             });
         }
 
@@ -168,6 +176,16 @@ impl EngineFuse {
             .with_context(|| format!("create FUSE lower dir {:?}", lower))?;
         std::fs::create_dir_all(&upper)
             .with_context(|| format!("create FUSE upper dir {:?}", upper))?;
+        // Ownership marker for `sweep_stale_sandboxfuse_dirs` in a future
+        // process: held for as long as this `EngineFuse` lives. `root` is
+        // freshly named after our own pid and any stale same-named leftover
+        // was already reclaimed by the sweep that ran before this call, so
+        // contention here means a real invariant violation, not a race to
+        // retry.
+        let lock = FLock::new(root.join("lock"))
+            .try_lock()
+            .with_context(|| format!("locking sandboxfuse dir {:?}", root))?
+            .with_context(|| format!("sandboxfuse dir {:?} already owned", root))?;
         let fs = Arc::new(sandboxfuse::LayeredFs::new_empty(upper.clone()));
         match sandboxfuse::Mount::mount(&lower, fs.clone()) {
             Ok(m) => {
@@ -180,6 +198,7 @@ impl EngineFuse {
                     lower,
                     upper,
                     mount: Some(EngineMount { _mount: m, fs }),
+                    _lock: Some(lock),
                 })
             }
             Err(e) => {
@@ -192,6 +211,7 @@ impl EngineFuse {
                     lower,
                     upper,
                     mount: None,
+                    _lock: Some(lock),
                 })
             }
         }
@@ -213,18 +233,29 @@ impl Drop for EngineFuse {
         // the worker thread so the process can still exit.
         if let Some(mount) = self.mount.take() {
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::Builder::new()
+            // Can't propagate a Result from Drop. On spawn failure the
+            // closure (and the `mount` it captured) is dropped in place —
+            // the unmount still runs, just synchronously and without the
+            // bounded-wait/force-umount watchdog below, since there's no
+            // worker thread left to send on `tx`. Log and fall through:
+            // `rx.recv_timeout` observes the disconnected channel and
+            // takes the same force-umount path as a timeout would.
+            let spawned = std::thread::Builder::new()
                 .name("heph-fuse-unmount".into())
                 .spawn(move || {
                     drop(mount);
                     _ = tx.send(());
-                })
-                .expect("spawn fuse unmount thread");
+                });
+            if let Err(e) = &spawned {
+                error!(error = ?e, lower = ?self.lower, "failed to spawn FUSE unmount thread");
+            }
             if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
-                warn!(
-                    lower = ?self.lower,
-                    "FUSE unmount exceeded 5s; issuing force umount and leaking session"
-                );
+                if spawned.is_ok() {
+                    warn!(
+                        lower = ?self.lower,
+                        "FUSE unmount exceeded 5s; issuing force umount and leaking session"
+                    );
+                }
                 force_umount(&self.lower);
             }
         }
@@ -258,10 +289,21 @@ pub(crate) fn force_umount(path: &Path) {
     }
 }
 
-/// Walk `<home>/` for `sandboxfuse<pid>` directories whose pid is no
-/// longer alive (via `kill(pid, 0)` returning ESRCH). For each: best-
-/// effort umount of `<dir>/lower` (idempotent — works whether stale or
-/// not), then `remove_dir_all(<dir>)`. Silent on any error.
+/// Walk `<home>/` for `sandboxfuse<pid>` directories no longer owned by a
+/// live process. For each: best-effort umount of `<dir>/lower` (idempotent —
+/// works whether stale or not), then `remove_dir_all(<dir>)`. Silent on any
+/// error.
+///
+/// Ownership is decided by probing `<dir>/lock` with [`FLock::is_path_held`],
+/// not by `kill(pid, 0)` on the directory's pid suffix. `kill` cannot tell a
+/// live process owned by another uid from a dead one: both report `EPERM` or
+/// `ESRCH` indistinguishably to a caller that only checks the return code, and
+/// treating `EPERM` (process exists, just not ours) as "dead" reclaims a live
+/// process's sandbox out from under it. The `flock` probe answers for the
+/// lock itself, so it is immune to that inversion, to pid reuse, and to a
+/// zombie whose pid still answers `kill`. `EngineFuse::new` takes the lock for
+/// the directory's whole lifetime, so "held" and "owned by a live process" are
+/// the same fact.
 fn sweep_stale_sandboxfuse_dirs(home: &Path) {
     let Ok(entries) = std::fs::read_dir(home) else {
         return;
@@ -272,15 +314,15 @@ fn sweep_stale_sandboxfuse_dirs(home: &Path) {
         let Some(pid_str) = name.strip_prefix("sandboxfuse") else {
             continue;
         };
-        let Ok(pid) = pid_str.parse::<libc::pid_t>() else {
-            continue;
-        };
-        // SAFETY: kill(pid, 0) is a probe-only syscall; sig=0 doesn't deliver.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        if alive {
+        if pid_str.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
         let dir = entry.path();
+        match FLock::is_path_held(dir.join("lock")) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => continue,
+        }
         let lower = dir.join("lower");
         // Best-effort force umount. The previous process crashed; any
         // mount it left is unowned and may have dangling kernel state.
@@ -812,5 +854,74 @@ impl hplugin::lsp::LspEngine for Engine {
                     .map(|p| p.options)
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Names the dir after pid 1 (init/launchd): always alive, always owned by
+    // another user, so a non-root caller's `kill(1, 0)` always answers
+    // `EPERM`. That is precisely the case the old `kill(pid, 0) == 0` check
+    // got backwards — `EPERM` means the process exists and isn't ours, not
+    // that it's dead — and it is what let the sweep reclaim a live process's
+    // sandbox out from under it. The fix doesn't probe the pid at all: it
+    // probes whether `<dir>/lock` is held, which this test pins by holding it
+    // itself for the sweep's whole duration.
+    #[test]
+    fn sweep_preserves_a_dir_whose_lock_is_held() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("sandboxfuse1");
+        std::fs::create_dir_all(&dir).expect("create sandboxfuse dir");
+        let guard = FLock::new(dir.join("lock"))
+            .try_lock()
+            .expect("try_lock")
+            .expect("lock free");
+
+        sweep_stale_sandboxfuse_dirs(home.path());
+
+        assert!(
+            dir.exists(),
+            "a dir whose lock is held must survive the sweep"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn sweep_removes_a_dir_whose_lock_is_not_held() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("sandboxfuse2");
+        std::fs::create_dir_all(&dir).expect("create sandboxfuse dir");
+        // A lock file can exist without being held (its owner exited without
+        // unlinking it, or it was never acquired): `try_lock` then drop
+        // leaves exactly that on disk.
+        drop(
+            FLock::new(dir.join("lock"))
+                .try_lock()
+                .expect("try_lock")
+                .expect("lock free"),
+        );
+
+        sweep_stale_sandboxfuse_dirs(home.path());
+
+        assert!(
+            !dir.exists(),
+            "a dir whose lock is not held must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn sweep_ignores_entries_that_do_not_match_the_naming_scheme() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let unrelated = home.path().join("sandboxfuse-not-a-pid");
+        std::fs::create_dir_all(&unrelated).expect("create dir");
+
+        sweep_stale_sandboxfuse_dirs(home.path());
+
+        assert!(
+            unrelated.exists(),
+            "a dir whose suffix isn't a pid must be left alone"
+        );
     }
 }

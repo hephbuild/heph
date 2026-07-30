@@ -1,3 +1,8 @@
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
 mod common;
 
 use common::Workspace;
@@ -342,7 +347,7 @@ async fn test_query_dep_order_is_stable_across_runs() -> anyhow::Result<()> {
     // Uneven Starlark work per package: every third package spins a loop before
     // declaring its target, so packages finish out of listing order.
     fn build_src(i: usize) -> String {
-        let spin = if i % 3 == 0 { 20000 } else { 10 };
+        let spin = if i.is_multiple_of(3) { 20000 } else { 10 };
         format!(
             r#"
 _acc = 0

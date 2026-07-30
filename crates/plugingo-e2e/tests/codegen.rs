@@ -1,3 +1,9 @@
+#![expect(
+    clippy::panic_in_result_fn,
+    clippy::let_underscore_must_use,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
 mod common;
 
 use anyhow::Context as _;
@@ -55,7 +61,6 @@ async fn test_codegen_build_produces_binary() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
     use std::io::Read as _;
-    use std::os::unix::fs::PermissionsExt as _;
 
     require_go!();
     let dir = fixture("codegen")?;

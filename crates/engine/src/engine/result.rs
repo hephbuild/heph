@@ -44,6 +44,24 @@ const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5
 type BoxedResultFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<Arc<EResult>>> + Send + 'a>>;
 
+tokio::task_local! {
+    /// Set for the duration of a `Provider::list` call dispatched by a
+    /// discovery walk's per-package fan-out — both `Engine::query`'s (in
+    /// `query.rs`) and `EngineProviderExecutor::query`'s own nested one (below)
+    /// scope this around their `.list(...)` call.
+    ///
+    /// `ListRequest::executor` hands `list()` implementations the same `query()`
+    /// capability `get()` gets (see the ABI note at the `query()` call site). A
+    /// provider that calls `executor.query()` back from inside its own `list()`
+    /// would nest another K-wide walk under an already-running one — degrading to
+    /// pinned memory and scheduler pressure rather than a hard deadlock (nesting
+    /// doesn't manufacture extra `PKG_EVAL_SLOTS` permits, see the long comment at
+    /// the fan-out), but with no in-tree caller and no diagnostic if a third-party
+    /// or out-of-process plugin ever does it by accident. `query()` checks this
+    /// flag first and fails loudly instead of silently nesting.
+    pub(crate) static IN_PROVIDER_LIST: ();
+}
+
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
 /// does not need to store it separately.
 pub(crate) struct EngineProviderExecutor {
@@ -234,6 +252,16 @@ impl ProviderExecutor for EngineProviderExecutor {
         extra_skip: &'a [String],
     ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
         Box::pin(async move {
+            // See `IN_PROVIDER_LIST`: a provider calling back into `query()` from
+            // its own `list()` would nest a K-wide walk under an already-running
+            // one. Fail loudly here rather than let it silently nest.
+            if IN_PROVIDER_LIST.try_with(|()| ()).is_ok() {
+                anyhow::bail!(
+                    "ListRequest::executor.query() was called from inside Provider::list() \
+                     — this would nest a K-wide package walk under an already-running one; \
+                     use ProviderExecutor::states_under instead"
+                );
+            }
             let engine = self
                 .engine
                 .upgrade()
@@ -277,7 +305,8 @@ impl ProviderExecutor for EngineProviderExecutor {
             // concurrent `list` calls, so a provider that calls back into it from
             // `list` gets K nested walks. No in-tree provider does (plugin-go's
             // `list` calls only `states_under`), but it is a constraint on the
-            // plugin surface, not an accident of the current callers.
+            // plugin surface, not an accident of the current callers — and it is
+            // enforced below (`IN_PROVIDER_LIST`), not just documented here.
             let per_pkg = futures::stream::iter(pkgs.into_iter()
                 // Ends the source when abandoning, so the drain joins only the
                 // <=K tasks already spawned instead of spawning one per remaining
@@ -316,21 +345,25 @@ impl ProviderExecutor for EngineProviderExecutor {
                             {
                                 continue;
                             }
-                            // Collect list results eagerly (non-Send iterator dropped before next await)
-                            let list_iter = provider
-                                .provider
-                                .list(
-                                    ListRequest {
-                                        request_id: rs.request_id().to_string(),
-                                        package: pkg.clone(),
-                                        states: states
-                                            .iter()
-                                            .filter(|s| s.provider == provider.name)
-                                            .cloned()
-                                            .collect(),
-                                        executor: Arc::clone(&executor),
-                                    },
-                                    rs.ctoken(),
+                            // Collect list results eagerly (non-Send iterator dropped before next await).
+                            // Scoped under `IN_PROVIDER_LIST` so a reentrant `executor.query()`
+                            // called from inside this `list()` is caught — see its doc comment.
+                            let list_iter = IN_PROVIDER_LIST
+                                .scope(
+                                    (),
+                                    provider.provider.list(
+                                        ListRequest {
+                                            request_id: rs.request_id().to_string(),
+                                            package: pkg.clone(),
+                                            states: states
+                                                .iter()
+                                                .filter(|s| s.provider == provider.name)
+                                                .cloned()
+                                                .collect(),
+                                            executor: Arc::clone(&executor),
+                                        },
+                                        rs.ctoken(),
+                                    ),
                                 )
                                 .await?;
                             let raw: Vec<_> = list_iter.collect::<anyhow::Result<Vec<_>>>()?;
@@ -1185,7 +1218,7 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<Arc<EResult>> {
         if opts.shell && opts.interactive.is_none() {
-            anyhow::bail!("cannot use --shell in non-interactive mode");
+            return Err(ShellNeedsSingleTarget::NotInteractive { addr: addr.clone() }.into());
         }
 
         // Stop the moment the request is cancelled (Ctrl-C). Every queued
@@ -6896,13 +6929,11 @@ mod tests {
 
         let addrs = tokio::time::timeout(Duration::from_secs(20), walk)
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "discovery deadlocked: the fan-out held every permit while the \
-                     consumer's MatchShrug arm waited for one, and the holders were \
-                     only pollable by the consumer"
-                )
-            })??;
+            .context(
+                "discovery deadlocked: the fan-out held every permit while the \
+                 consumer's MatchShrug arm waited for one, and the holders were \
+                 only pollable by the consumer",
+            )??;
         // No target carries the label, so nothing matches — the point is that it
         // terminated.
         assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
@@ -6945,6 +6976,106 @@ mod tests {
                 )
             })??;
         assert!(addrs.is_empty(), "no target has this label, got {addrs:?}");
+        Ok(())
+    }
+
+    /// A `list()` implementation that calls back into `req.executor.query()` —
+    /// exactly the reentrant call `IN_PROVIDER_LIST` exists to catch (see its doc
+    /// comment). No in-tree provider does this, but nothing stopped a third-party
+    /// or out-of-process one from nesting a second K-wide walk under the one
+    /// already dispatching this `list()` call, silently, with no diagnostic.
+    /// Must fail loudly instead.
+    #[tokio::test]
+    async fn list_calling_back_into_query_is_rejected() -> anyhow::Result<()> {
+        struct ReentrantQueryProvider {
+            pkg: String,
+        }
+
+        impl crate::engine::provider::Provider for ReentrantQueryProvider {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "reentrant".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async move {
+                    // Incorrect provider behaviour: calling back into `query()`
+                    // from inside `list()`. This must error, not nest.
+                    req.executor
+                        .query(&Matcher::PackagePrefix(PkgBuf::from("")), &[])
+                        .await?;
+                    Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let pkg = self.pkg.clone();
+                Box::pin(async move {
+                    let items: Vec<anyhow::Result<ListPackageResponse>> =
+                        vec![Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(pkg.as_str()),
+                        })];
+                    Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+        }
+
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|_| {
+            Box::new(ReentrantQueryProvider {
+                pkg: "p".to_string(),
+            })
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
+        let err = SArc::clone(&engine)
+            .query(rs, &matcher)
+            .try_collect::<Vec<Addr>>()
+            .await
+            .expect_err(
+                "a list() that calls back into query() must be rejected, not silently nested",
+            );
+        assert!(
+            format!("{err:#}").contains("Provider::list"),
+            "expected the reentrancy error, got: {err:#}"
+        );
         Ok(())
     }
 
@@ -8041,16 +8172,18 @@ mod tests {
     /// makes the driver hand back a sandbox-cleanup job that records the thread
     /// it ran on. `wrap_cache` wraps the engine's `LocalCache`, which is how a
     /// test observes the thread the post-write trim ran on.
+    /// Decorates the engine's `LocalCache` — how a test observes the thread the
+    /// post-write trim ran on.
+    type CacheWrapper<'a> = &'a dyn Fn(
+        SArc<dyn crate::engine::local_cache::LocalCache>,
+    ) -> SArc<dyn crate::engine::local_cache::LocalCache>;
+
     fn blocking_engine_full(
         exec_count: SArc<AtomicUsize>,
         outputs: Vec<(String, String)>,
         target_name: &str,
         cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
-        wrap_cache: Option<
-            &dyn Fn(
-                SArc<dyn crate::engine::local_cache::LocalCache>,
-            ) -> SArc<dyn crate::engine::local_cache::LocalCache>,
-        >,
+        wrap_cache: Option<CacheWrapper<'_>>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
         let dir = tempdir()?;
         let mut engine = Engine::new(Config {
@@ -8254,89 +8387,7 @@ mod tests {
     /// (Linux's 16-byte `PR_SET_NAME` truncation affects `/proc`, not this).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn each_background_job_class_runs_on_its_own_lane() {
-        use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
-
-        /// Records the thread of the first `list_target_entries` call. In this
-        /// test that call can only come from `try_trim_after_write`, which starts
-        /// with an unlocked revision count — so it is reached whether or not the
-        /// trim goes on to take the write lock.
-        struct TrimThreadCache {
-            inner: SArc<dyn LocalCache>,
-            thread: SArc<std::sync::OnceLock<String>>,
-        }
-        impl LocalCache for TrimThreadCache {
-            fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
-                self.inner.reader(addr, hashin, name)
-            }
-            fn writer(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Box<dyn std::io::Write>> {
-                self.inner.writer(addr, hashin, name)
-            }
-            fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-                self.inner.exists(addr, hashin, name)
-            }
-            fn existence(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Existence> {
-                self.inner.existence(addr, hashin, name)
-            }
-            /// Mirrors this decorator's own `exists`: that one forwards, so the
-            /// committed-only answer forwards too. Required by the trait
-            /// precisely so a decorator cannot inherit a default that re-parks
-            /// the runtime on the backend's write-behind queue.
-            fn exists_committed(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<bool> {
-                self.inner.exists_committed(addr, hashin, name)
-            }
-            fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
-                self.inner.delete(addr, hashin, name)
-            }
-            fn list_targets(&self) -> anyhow::Result<TargetStream> {
-                self.inner.list_targets()
-            }
-            fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
-                drop(
-                    self.thread.set(
-                        std::thread::current()
-                            .name()
-                            .unwrap_or("<unnamed>")
-                            .to_string(),
-                    ),
-                );
-                self.inner.list_target_entries(addr)
-            }
-            fn seekable_reader(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
-            {
-                self.inner.seekable_reader(addr, hashin, name)
-            }
-            // Forwarded, not defaulted: a decorator that swallows this turns the
-            // direct-open path off for every artifact in the test that wraps the
-            // cache — the exact defect this file's `GuardedArtifact` doc warns of.
-            fn file_path(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> Option<std::path::PathBuf> {
-                self.inner.file_path(addr, hashin, name)
-            }
-        }
+        use crate::engine::local_cache_test_double::ForwardingCache;
 
         let exec_count = SArc::new(AtomicUsize::new(0));
         let rmdir_thread: SArc<std::sync::OnceLock<String>> = SArc::new(std::sync::OnceLock::new());
@@ -8348,10 +8399,24 @@ mod tests {
             "p62_lane_routing",
             Some(SArc::clone(&rmdir_thread)),
             Some(&|inner| {
-                SArc::new(TrimThreadCache {
-                    inner,
-                    thread: SArc::clone(&wrap_trim),
-                })
+                // Records the thread of the first `list_target_entries` call.
+                // In this test that call can only come from
+                // `try_trim_after_write`, which starts with an unlocked
+                // revision count — so it is reached whether or not the trim
+                // goes on to take the write lock.
+                SArc::new(ForwardingCache::new(inner).on_list_target_entries({
+                    let wrap_trim = SArc::clone(&wrap_trim);
+                    move |_| {
+                        drop(
+                            wrap_trim.set(
+                                std::thread::current()
+                                    .name()
+                                    .unwrap_or("<unnamed>")
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }))
             }),
         )
         .expect("engine");
@@ -8604,81 +8669,8 @@ mod tests {
         // presence-probe and the per-caller read each parsed the manifest (two
         // backend reads per hit); now the probe stashes the parsed manifest on
         // `LockedResolution` and the caller filters its outputs from it.
-        use crate::engine::local_cache::{
-            Existence, LocalCache, MANIFEST_V1, SizedReader, TargetStream,
-        };
-
-        struct CountingCache {
-            inner: SArc<dyn LocalCache>,
-            manifest_reads: SArc<AtomicUsize>,
-        }
-        impl LocalCache for CountingCache {
-            fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader> {
-                if name == MANIFEST_V1 {
-                    self.manifest_reads.fetch_add(1, Ordering::SeqCst);
-                }
-                self.inner.reader(addr, hashin, name)
-            }
-            fn writer(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Box<dyn std::io::Write>> {
-                self.inner.writer(addr, hashin, name)
-            }
-            fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-                self.inner.exists(addr, hashin, name)
-            }
-            // Forwarded, not defaulted: defaulting would route the probe through
-            // the blocking  and park the worker this test runs on.
-            fn existence(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Existence> {
-                self.inner.existence(addr, hashin, name)
-            }
-            // Forwarded for the same reason: only the layer that owns the write
-            // queue can answer "committed" without waiting on it.
-            fn exists_committed(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<bool> {
-                self.inner.exists_committed(addr, hashin, name)
-            }
-            fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
-                self.inner.delete(addr, hashin, name)
-            }
-            fn list_targets(&self) -> anyhow::Result<TargetStream> {
-                self.inner.list_targets()
-            }
-            fn list_target_entries(&self, addr: &Addr) -> anyhow::Result<Vec<String>> {
-                self.inner.list_target_entries(addr)
-            }
-            fn seekable_reader(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> anyhow::Result<Option<Box<dyn hcore::hartifactcontent::ReadSeek + Send>>>
-            {
-                self.inner.seekable_reader(addr, hashin, name)
-            }
-            // See the note on the other cache decorator in this file: defaulting
-            // this silently disables the direct-open path under the test.
-            fn file_path(
-                &self,
-                addr: &Addr,
-                hashin: &str,
-                name: &str,
-            ) -> Option<std::path::PathBuf> {
-                self.inner.file_path(addr, hashin, name)
-            }
-        }
+        use crate::engine::local_cache::MANIFEST_V1;
+        use crate::engine::local_cache_test_double::ForwardingCache;
 
         let dir = tempdir().expect("tempdir");
         let mut engine = Engine::new(Config {
@@ -8695,10 +8687,15 @@ mod tests {
         })
         .expect("engine");
         let manifest_reads = SArc::new(AtomicUsize::new(0));
-        engine.local_cache = SArc::new(CountingCache {
-            inner: engine.local_cache.clone(),
-            manifest_reads: SArc::clone(&manifest_reads),
-        });
+        engine.local_cache =
+            SArc::new(ForwardingCache::new(engine.local_cache.clone()).on_reader({
+                let manifest_reads = SArc::clone(&manifest_reads);
+                move |_, _, name| {
+                    if name == MANIFEST_V1 {
+                        manifest_reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }));
         let exec_count = SArc::new(AtomicUsize::new(0));
         engine
             .register_driver(enclose!(
@@ -10353,6 +10350,46 @@ mod tests {
         assert!(
             !msg.contains("non-interactive mode"),
             "the user is on a terminal; do not claim otherwise: {msg}",
+        );
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            0,
+            "nothing may run once --shell is refused",
+        );
+        Ok(())
+    }
+
+    /// `--shell` on a single target with no terminal attached is refused with
+    /// a typed error naming the addr and the next action — not a bare
+    /// `anyhow::bail!` string with neither.
+    #[tokio::test]
+    async fn shell_without_a_terminal_names_the_addr_and_the_next_step() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![leaf_spec("//pkg:a", false)?])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let opts = ResultOptions {
+            shell: true,
+            interactive: None,
+            ..Default::default()
+        };
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &opts)
+            .await
+            .err()
+            .expect("--shell with no terminal must fail");
+
+        let typed = downcast_chain_ref::<ShellNeedsSingleTarget>(&err)
+            .expect("must be the typed shell error, not a bare anyhow string");
+        assert!(
+            matches!(typed, ShellNeedsSingleTarget::NotInteractive { addr } if addr.format() == "//pkg:a"),
+            "the error must carry the addr that was refused: {err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("//pkg:a"), "msg: {msg}");
+        assert!(
+            msg.contains("try: run `heph run --shell //pkg:a`"),
+            "an actionable message must name the next command: {msg}"
         );
         assert_eq!(
             h.runs.load(Ordering::SeqCst),

@@ -33,7 +33,7 @@ pub extern "C" fn heph_plugin_create(cfg: stabby::vec::Vec<u8>) -> PluginCompone
             // No safe way to surface an error through the stable bundle (it must
             // carry a valid provider handle), and unwinding across the FFI
             // boundary is UB — so fail loudly and abort.
-            eprintln!("heph-plugin-go: plugin construction failed: {e:#}");
+            tracing::error!("heph-plugin-go: plugin construction failed: {e:#}");
             std::process::abort();
         }
     }

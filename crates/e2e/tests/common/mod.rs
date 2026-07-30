@@ -1,4 +1,12 @@
-#![allow(dead_code, unused_imports)]
+// `allow`, not `expect`: this module is included by every integration-test
+// binary in the crate, and each one uses a different subset of it — so whether
+// an item is dead or an import unused varies per binary, and an `expect` would
+// be unfulfilled in some of them.
+#![allow(
+    dead_code,
+    unused_imports,
+    reason = "shared test harness; each test binary uses a different subset"
+)]
 
 use anyhow::{Context as _, Result};
 use heph::engine::{Config, Engine};

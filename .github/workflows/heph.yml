@@ -15,12 +15,14 @@ on:
   # alone.
   pull_request:
 
-# Cancel superseded runs on a branch/PR so a new push doesn't leave the old run
-# burning runners (and showing up as a noisy "cancelled"). master is never
-# cancelled — its runs publish releases and must always finish.
+# PR: cancel superseded runs so a new push doesn't leave the old run burning
+# runners (and showing up as a noisy "cancelled"). master: every commit gets
+# its own group (keyed by sha) so pushes run fully concurrently rather than
+# queuing behind each other — the `release` job below is what serializes to
+# "latest commit wins".
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # sccache config shared by every compiling job. RUSTC_WRAPPER=sccache is set by
 # the devenv shell; the storage backend (R2, or local disk on fork PRs) is wired
@@ -257,9 +259,16 @@ jobs:
           if [ "${{ matrix.os }}" = "darwin" ]; then ext=dylib; else ext=so; fi
           PLUGIN_GO_NAME="heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           PLUGIN_GHA_NAME="heph-gha-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
+          # heph-bench: the perf-regression harness (`perfbench` job). Publishing
+          # it as a release asset alongside `heph` itself means that job never
+          # builds anything to compare a PR against its baseline — both the
+          # binary under test AND the tool measuring it come from a release, for
+          # N (this build) and N-1 (a past release) alike.
+          BENCH_BIN_NAME="heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
           echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
+          echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
           OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
           # FUSE (default feature) on Linux is pure-Rust (no libfuse link), so
           # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
@@ -285,8 +294,10 @@ jobs:
           # link tail filling cores while the next codegens). `--bin heph` selects
           # the binary; `--lib` adds every selected package's lib target — i.e. both
           # cdylibs (heph's own lib is already built as the bin's dependency, so it
-          # costs nothing extra).
-          TARGETS="--bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib"
+          # costs nothing extra). `heph-bench` links the same `heph` lib crate, so
+          # adding it here is marginal — the expensive part (engine + deps) is
+          # already being compiled for `heph` itself.
+          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p bench"
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
@@ -295,6 +306,7 @@ jobs:
             # which is absent on user machines (dyld aborts at launch). Rewrite
             # those load commands to the OS /usr/lib copies — for every artifact.
             bash scripts/macos-portable.sh "$OUT/heph"
+            bash scripts/macos-portable.sh "$OUT/heph-bench"
             bash scripts/macos-portable.sh "$lib"
             bash scripts/macos-portable.sh "$gha_lib"
           else
@@ -303,6 +315,7 @@ jobs:
             gha_lib="$OUT/libplugin_gha_cdylib.so"
           fi
           cp "$OUT/heph" $BIN_NAME
+          cp "$OUT/heph-bench" $BENCH_BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
 
@@ -316,15 +329,24 @@ jobs:
       # on machines without macFUSE (dyld would abort here if it were hard-linked).
       - name: Smoke test launch (darwin)
         if: matrix.os == 'darwin'
-        run: ./$BIN_NAME version
+        run: |
+          ./$BIN_NAME version
+          ./$BENCH_BIN_NAME --help
         env:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
+          BENCH_BIN_NAME: "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{steps.build.outputs.bin_name}}
           path: ${{steps.build.outputs.bin_name}}
+
+      - name: Upload heph-bench artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.bench_bin_name}}
+          path: ${{steps.build.outputs.bench_bin_name}}
 
       - name: Upload go plugin artifact
         uses: actions/upload-artifact@v6
@@ -423,11 +445,84 @@ jobs:
       - name: Check plugin ABI version
         run: scripts/abi-check.sh "origin/${{ github.base_ref }}"
 
+  # The gate check-builds every workspace member's libs *and* test targets,
+  # three times (default features, --all-features, --no-default-features),
+  # where it used to build the root package alone in ~1m35s. A fork PR gets no
+  # R2 sccache credentials and runs every pass stone cold — and clippy's work is
+  # not sccache-cacheable at all (`sccache` does not cache `clippy-driver`,
+  # which is why these jobs' own stats report ~200 "non-cacheable calls"), so a
+  # warm cache only saves the dependency compiles. A timeout renders as a red
+  # lint leg indistinguishable from a real lint failure, so the 30min headroom
+  # is deliberate.
+  #
+  # Both platforms, because macOS-only code was clippy-linted nowhere.
+  # `Test darwin/arm64` compiles it, but nothing there passes `-D warnings`, so
+  # the Mach `sweep_threads` block in `src/diag.rs` — the largest unsafe region
+  # in the tree — plus `crates/proc/src/proc_exec/imp_macos.rs` and
+  # `process_watcher/kqueue_macos.rs` had never been through
+  # `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`,
+  # `indexing_slicing` or `unwrap_used`.
+  #
+  # Every leg runs the *same* `lint` script — no per-OS variant. The failure
+  # being closed is a Mac developer's local `lint` disagreeing with CI in either
+  # direction (`#[expect]` is fulfilled-or-error, so a lint that fires on one OS
+  # and not the other is a hard error on the other), and that only stays closed
+  # if every leg runs the same command as the developer does.
+  #
+  # This is a matrix, so the published status contexts are the *rendered* names,
+  # one per leg — `Lint linux/amd64` and `Lint darwin/arm64`. There is no longer
+  # any context named plain `Lint`. Branch protection must require the two new
+  # names; until it does, a red lint does not block a merge. (Verified from a
+  # real run of this matrix, not inferred: GitHub publishes the rendered name,
+  # with no parenthesised matrix suffix.)
+  #
+  # `needs: lint` elsewhere in this file waits for *every* leg and is skipped if
+  # any of them fails — the same fan-in the `build` matrix already relies on via
+  # `bin_e2e`'s `needs: [gen, build, …]`. Downstream gating therefore needs no
+  # aggregator job.
+  #
+  # No `continue-on-error:` and no `if:` on the Lint step, ever. Either one lets
+  # a leg conclude `success` with clippy never having run, which makes the leg's
+  # own check green — and, because `needs` treats a successful job as satisfied,
+  # lets `release` proceed over a platform that was not linted. It is the one
+  # remaining way to reach a silent pass here, and it is invisible in the check
+  # list. `tests/lint_gate.rs` asserts their absence.
+  #
+  # Cost, measured rather than assumed — see the PR body. The darwin leg is a
+  # fourth concurrent `macos-latest` job in the `needs: gen` wave, which is the
+  # real price rather than the minutes: the darwin build chain has been observed
+  # on the critical path, and macOS jobs in this repo have queued up to ~2m30s
+  # waiting for a slot. macOS also starts colder — the Nix setup alone measures
+  # 3m15s-4m42s there, and the cargo registry cache is restore-only on PRs
+  # (only master saves), so the darwin leg stays near its cold ~10min until this
+  # key is populated from master.
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Lint ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
     needs: gen
+    strategy:
+      # Both legs always report. With fail-fast the second is cancelled the
+      # moment the first goes red, and `cancelled` is exactly the state that
+      # tells you nothing about the platform you did not see.
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          # macos-latest is Apple Silicon. There is no `Lint linux/arm64` leg:
+          # aarch64 is covered here on the OS axis, and an `#[expect]` that is
+          # unfulfilled only on aarch64-linux would be invisible anyway — plain
+          # rustc silently ignores an unfulfilled expectation on a *tool* lint
+          # it does not know, so `Test linux/arm64` cannot stand in for one.
+          # See the note in devenv.nix.
+          - os: darwin
+            arch: arm64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
     steps:
       - name: Download repo
         uses: actions/download-artifact@v7
@@ -438,9 +533,10 @@ jobs:
       - name: Setup Nix + devenv
         uses: ./.github/actions/setup-nix
         with:
-          cargo-target: x86_64-unknown-linux-gnu
-          # Distinct from the linux/amd64 build job, which uses the same target
-          # triple: sharing a cargo cache key means whichever job saves first
+          cargo-target: ${{ matrix.target }}
+          # Distinct from the build and test jobs, which use the same target
+          # triples: actions/cache skips the save when the exact key already
+          # exists, so two jobs sharing a key means whichever saves first
           # freezes the entry and the other's crate downloads never persist.
           cache-suffix: "-lint"
           r2-secret: ${{ secrets.CF_SSCACHE }}
@@ -646,10 +742,429 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
 
+  # Perf-regression check: generates one synthetic corpus, times a fixed
+  # scenario set against N and N-1, and reports a regression verdict. Two
+  # triggers, two roles:
+  #   - `pull_request`: N is this PR's head, N-1 its merge-base with the
+  #     target branch. This is the GATE — a real regression fails the check
+  #     for real (see "Enforced for real" below).
+  #   - `push` to `master`: N is the commit that just landed, N-1 is the
+  #     commit immediately before it (`github.event.before`). Nothing is
+  #     blocked at this point (the merge already happened) — this is
+  #     continuous monitoring, so a regression instead files a GitHub issue
+  #     (see "File regression issue").
+  #
+  # Nothing in this job is built. `heph`, the go plugin cdylib, and
+  # `heph-bench` itself are all release assets (the `build` job publishes
+  # `heph-bench` alongside `heph` — see its TARGETS comment), so both N and
+  # N-1 are pure downloads: N from this run's own `build` job, N-1 from a
+  # past release. That is the whole point of publishing `heph-bench`: without
+  # it, comparing engine-in-process cost (Tier A) would need a harness
+  # compiled from EACH side's own source, which is exactly the slow-N-1-build
+  # this job exists to avoid.
+  #
+  # Two tiers per platform, matching `crates/e2e` vs `crates/bin-e2e`'s split
+  # (see `.claude/testing.md`):
+  #   - inprocess (Tier A): the engine linked directly into `heph-bench`, no
+  #     plugin cdylib. Isolates engine-internals cost (cache, hashing, DAG
+  #     resolution) from dlopen noise, which Tier B measures instead. It DOES
+  #     spawn a process per rep now (on both sides, symmetrically — see
+  #     `run inprocess`'s doc comment in `crates/bench/src/main.rs`), traded
+  #     deliberately for never needing baseline's binary to understand new
+  #     orchestration flags again.
+  #   - dist (Tier B): the real prebuilt `heph` binary + real `go` plugin
+  #     cdylib, dlopened for real — the only way to measure ABI-crossing and
+  #     plugin-load cost. Head's `heph-bench` drives both sides here (the
+  #     orchestrator doesn't need to match the binary under test).
+  #
+  # N-1 is fetched, never built: every push to `master` already publishes a
+  # prerelease to hephbuild/heph-artifacts-v1 (the `upload_artifacts` job).
+  # The release tag isn't the commit SHA — it's `git describe` plus the CI
+  # run_number that built it — so "resolve baseline release" re-derives that
+  # exact tag by finding the `master`-push CI run for the baseline SHA via
+  # the GitHub API and feeding its run_number through the same `version.sh`
+  # logic that originally produced it. If no such run is found (history
+  # pruned, baseline predates this job, API hiccup, or — on `push` — this is
+  # the first commit on the ref), the job is skipped for that leg with a
+  # note — there is deliberately no "build it instead" fallback, since a slow
+  # silent fallback is exactly what turns into "why is this job suddenly
+  # slow" months from now.
+  #
+  # Enforced for real: the "Compare and report" step exits non-zero when any
+  # scenario regresses past its threshold, on both triggers. On a PR that
+  # fails the check; on `push` there is nothing left to block, but a red
+  # check on the commit is still useful signal, and it drives "File
+  # regression issue" below. The override this needs ("overridable by me")
+  # is a repo admin bypassing a required check on merge — no extra plumbing.
+  # Thresholds live in `.github/perfbench-thresholds.json`; they started
+  # deliberately loose (20%) and should tighten as real PR data comes in.
+  perfbench:
+    name: Perf ${{ matrix.os }}/${{ matrix.arch }}
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 20
+    needs: [build]
+    # Specifying `permissions:` at all makes it exhaustive — everything not
+    # listed drops to `none`. `contents: read` for the checkout, `actions:
+    # read` for the "Resolve baseline release" run-lookup, `issues: write`
+    # for "File regression issue" (list/create/label, all against this
+    # repo). The cross-repo `gh release download` against
+    # hephbuild/heph-artifacts-v1 uses HEPH_ARTIFACTS_PAT, not this token, so
+    # it is unaffected either way.
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    env:
+      # Tunable without touching the steps below. Sized for a few minutes'
+      # wall time per leg; raise toward the thousands-of-targets scale heph
+      # actually runs at once this job's real-world timing is known from a
+      # few live runs.
+      PERFBENCH_TARGETS: "4000"
+      PERFBENCH_PACKAGES: "200"
+      PERFBENCH_LAYERS: "10"
+      PERFBENCH_FAN_OUT: "4"
+      PERFBENCH_GO_PACKAGES: "60"
+      # 3 was too few to tell signal from CI-runner noise (the first live
+      # runs showed exactly that). Interleaving (see the run steps below)
+      # fixes systematic drift between candidate/baseline; more reps is what
+      # narrows the noise floor itself. Bumped for now — a real number should
+      # come from watching `noise_band_pct` in actual runs, not a guess.
+      PERFBENCH_REPS: "7"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+          - os: darwin
+            arch: arm64
+            runs-on: macos-latest
+    steps:
+      # Fresh checkout (not the `repo` artifact `build`/`test`/`lint` reuse):
+      # this job needs real git history to resolve the merge-base, the same
+      # requirement the `abi` job already has — mirroring its proven
+      # `fetch-depth: 0` checkout instead of assuming the uploaded artifact's
+      # `.git` is equally usable. No devenv/Rust toolchain needed at all —
+      # every binary this job runs is downloaded, not compiled.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Corpus generation's go/ subtree (`tools/gorepogen` + `go mod tidy`)
+      # needs a host Go toolchain — separate from the hermetic one the `go`
+      # plugin downloads at target-build time.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      # PR: the merge-base with the target branch. Push (to master): the
+      # commit immediately before this one — `github.event.before`, the
+      # correct source for "previous commit on this ref" (robust to force-
+      # pushes in a way `HEAD~1` is not). `before` is all-zeros on the very
+      # first push to a ref; treated the same as "no baseline found" below.
+      - name: Resolve baseline SHA
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}"
+            echo "sha=$(git merge-base "origin/${{ github.base_ref }}" HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            sha="${{ github.event.before }}"
+            if [ -z "$sha" ] || [ "$sha" = "0000000000000000000000000000000000000000" ]; then
+              echo "no previous commit on this ref (first push) — nothing to compare against"
+              echo "sha=" >> "$GITHUB_OUTPUT"
+            else
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      # Re-derives the exact version tag `master`'s own CI run published the
+      # baseline commit's release under — see the job comment. Only needs
+      # `gh api` (against this repo, default token) and `git describe`
+      # against a commit already present from the full-history checkout
+      # above; no build, no checkout of that commit.
+      - name: Resolve baseline release
+        if: steps.base.outputs.sha != ''
+        id: baseline_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_NUMBER=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ steps.base.outputs.sha }}&status=success" \
+            --jq '[.workflow_runs[] | select(.name=="CI" and .event=="push")] | first | .run_number // empty')
+          if [ -z "$RUN_NUMBER" ]; then
+            echo "no successful master push run found for baseline ${{ steps.base.outputs.sha }}"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION=$(.github/workflows/version.sh "$RUN_NUMBER" "${{ steps.base.outputs.sha }}")
+          echo "resolved baseline release: $VERSION (run #$RUN_NUMBER)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # `heph-bench` may 404 (bootstrap note above) — fetched best-effort,
+      # separately from `heph` + the go plugin, so an old baseline still
+      # gets a Tier B comparison even without one.
+      - name: Fetch baseline (N-1) release artifacts
+        if: steps.baseline_release.outputs.found == 'true'
+        id: baseline_fetch
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+        run: |
+          ext=so; [ "${{ matrix.os }}" = "darwin" ] && ext=dylib
+          mkdir -p baseline-dist-raw baseline-dist
+          if gh release download "${{ steps.baseline_release.outputs.version }}" \
+              --repo hephbuild/heph-artifacts-v1 \
+              --dir baseline-dist-raw \
+              --pattern "heph_${{ matrix.os }}_${{ matrix.arch }}" \
+              --pattern "heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"; then
+            cp "baseline-dist-raw/heph_${{ matrix.os }}_${{ matrix.arch }}" baseline-dist/heph
+            cp "baseline-dist-raw/heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" "baseline-dist/heph-go-plugin.$ext"
+            chmod +x baseline-dist/heph
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release ${{ steps.baseline_release.outputs.version }} found but missing heph/go-plugin for this leg"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+          if gh release download "${{ steps.baseline_release.outputs.version }}" \
+              --repo hephbuild/heph-artifacts-v1 \
+              --dir baseline-dist-raw \
+              --pattern "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"; then
+            cp "baseline-dist-raw/heph-bench_${{ matrix.os }}_${{ matrix.arch }}" baseline-dist/heph-bench
+            chmod +x baseline-dist/heph-bench
+            echo "bench_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no heph-bench asset in ${{ steps.baseline_release.outputs.version }} — predates publishing it, Tier A skipped"
+            echo "bench_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download candidate (N) artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: heph*_${{ matrix.os }}_${{ matrix.arch }}*
+          path: candidate-dist-raw
+          merge-multiple: true
+
+      - name: Normalize candidate dist layout
+        run: |
+          ext=so; [ "${{ matrix.os }}" = "darwin" ] && ext=dylib
+          mkdir -p candidate-dist
+          cp "candidate-dist-raw/heph_${{ matrix.os }}_${{ matrix.arch }}" candidate-dist/heph
+          cp "candidate-dist-raw/heph-bench_${{ matrix.os }}_${{ matrix.arch }}" candidate-dist/heph-bench
+          cp "candidate-dist-raw/heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" "candidate-dist/heph-go-plugin.$ext"
+          chmod +x candidate-dist/heph candidate-dist/heph-bench
+
+      - name: Generate corpus
+        run: |
+          ./candidate-dist/heph-bench corpus \
+            --seed 1 \
+            --targets "$PERFBENCH_TARGETS" --packages "$PERFBENCH_PACKAGES" \
+            --layers "$PERFBENCH_LAYERS" --fan-out "$PERFBENCH_FAN_OUT" \
+            --go-packages "$PERFBENCH_GO_PACKAGES" \
+            --out bench-corpus
+
+      # `heph-bench run inprocess`/`run dist` are themselves the orchestrator
+      # now — one call per scenario measures BOTH candidate and baseline,
+      # interleaved rep-by-rep internally (see RunInprocessArgs'/RunDistArgs'
+      # doc comments in main.rs for the full rationale: a systematic drift on
+      # the runner, thermal state or a noisy neighbor, must land on both
+      # sides symmetrically, not on whichever side happens to run its whole
+      # batch second). Nothing here needs to know whether baseline's binary
+      # supports anything beyond the minimal `measure-inprocess` primitive —
+      # if it doesn't (baseline predates this PR), the call fails and
+      # `continue-on-error` + "Compare and report"'s missing-file handling
+      # absorb it as "no results" for that leg, same as any other run
+      # failure. That's a one-time gap that resolves itself once this PR
+      # merges; no fallback branching to maintain for it.
+      - name: Time Tier A (inprocess) scenarios
+        if: steps.baseline_fetch.outputs.bench_ok == 'true'
+        continue-on-error: true
+        run: |
+          for scenario in cold full-hit incremental; do
+            ./candidate-dist/heph-bench run inprocess \
+              --candidate-bin ./candidate-dist/heph-bench --baseline-bin ./baseline-dist/heph-bench \
+              --corpus bench-corpus --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_REPS" \
+              --out-candidate "candidate_inproc_${scenario}.json" --out-baseline "baseline_inproc_${scenario}.json"
+          done
+
+      - name: Time Tier B (dist) scenarios
+        if: steps.baseline_fetch.outputs.ok == 'true'
+        continue-on-error: true
+        run: |
+          for scenario in cold full-hit incremental; do
+            ./candidate-dist/heph-bench run dist \
+              --candidate-dist candidate-dist --baseline-dist baseline-dist \
+              --corpus bench-corpus --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_REPS" \
+              --out-candidate "candidate_dist_${scenario}.json" --out-baseline "baseline_dist_${scenario}.json"
+          done
+
+      # Every scenario/tier combination is always attempted and reported —
+      # `--allow-regression` keeps an individual `compare` call from ever
+      # exiting non-zero, so one regression doesn't cut the table short. The
+      # step's OWN exit code is what actually enforces: it greps the
+      # rendered table for "REGRESSION" (the verdict `compare --allow-
+      # regression` still prints even though it won't fail on it) and fails
+      # for real if anything regressed, on both `pull_request` and `push`.
+      #
+      # One `compare` call per TIER, not per scenario: each `run` invocation
+      # writes a single-scenario RunResults, so the 3 scenario files per side
+      # are merged into one multi-scenario RunResults first (`jq -s`) — a
+      # `compare` call per scenario would render its own header each time,
+      # repeating the table 3x instead of one table with 3 rows.
+      #
+      # The assembled report is captured to `perf-report.md` as well as the
+      # step summary — "File regression issue" reads that file back so the
+      # issue carries the actual numbers, not just links to go find them.
+      - name: Compare and report
+        id: compare
+        run: |
+          BENCH=./candidate-dist/heph-bench
+          any_regression=false
+          mkdir -p verdicts
+          report=$(
+            echo "# Perf: ${{ matrix.os }}/${{ matrix.arch }}"
+            if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
+              echo ""
+              echo "_skipped: no published release found for baseline \`${{ steps.base.outputs.sha }}\`_"
+            else
+              for tier in inproc dist; do
+                echo ""
+                echo "## Tier: $tier"
+                if [ "$tier" = "inproc" ] && [ "${{ steps.baseline_fetch.outputs.bench_ok }}" != "true" ]; then
+                  echo "_skipped: baseline release predates publishing \`heph-bench\`_"
+                  continue
+                fi
+                base_files=()
+                cand_files=()
+                for scenario in cold full-hit incremental; do
+                  b="baseline_${tier}_${scenario}.json"
+                  c="candidate_${tier}_${scenario}.json"
+                  if [ -f "$b" ] && [ -f "$c" ]; then
+                    base_files+=("$b")
+                    cand_files+=("$c")
+                  fi
+                done
+                if [ ${#base_files[@]} -eq 0 ]; then
+                  echo "_no results (run step failed — see logs)_"
+                  continue
+                fi
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${base_files[@]}" > "merged_baseline_${tier}.json"
+                jq -s '{tier: .[0].tier, scenarios: [.[].scenarios[0]]}' "${cand_files[@]}" > "merged_candidate_${tier}.json"
+                "$BENCH" compare --baseline "merged_baseline_${tier}.json" --candidate "merged_candidate_${tier}.json" \
+                  --thresholds "$GITHUB_WORKSPACE/.github/perfbench-thresholds.json" \
+                  --json "verdicts/${tier}.json" \
+                  --allow-regression
+              done
+            fi
+          )
+          printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$report" > perf-report.md
+          if printf '%s' "$report" | grep -q 'REGRESSION'; then
+            any_regression=true
+          fi
+          echo "regressed=$any_regression" >> "$GITHUB_OUTPUT"
+          if [ "$any_regression" = "true" ]; then
+            echo "regression detected — see the job summary for the table" >&2
+            exit 1
+          fi
+
+      # `always()`: the step above now genuinely exits non-zero on a real
+      # regression, and the numbers are worth having in PostHog regardless of
+      # whether this run passed or failed the gate. `event_type` (pull_request
+      # vs push) rides along as a property rather than gating which runs get
+      # sent — a trend chart can filter to `push` for the "master over time"
+      # view; nothing here decides that policy for it. Best-effort: PostHog
+      # being briefly unreachable must never fail this job over telemetry.
+      - name: Push metrics to PostHog
+        if: always() && steps.baseline_fetch.outputs.ok == 'true'
+        env:
+          POSTHOG_CI_KEY: ${{ secrets.POSTHOG_CI_KEY }}
+        run: |
+          events="[]"
+          for f in verdicts/*.json; do
+            [ -f "$f" ] || continue
+            # One file per tier (inproc/dist), each an array of per-scenario
+            # verdicts — `scenario` already lives inside each entry.
+            tier=$(basename "$f" .json)
+            batch=$(jq --arg tier "$tier" \
+              --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" \
+              --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.base.outputs.sha }}" \
+              --arg event_type "${{ github.event_name }}" \
+              --arg branch "${{ github.head_ref || github.ref_name }}" \
+              --arg run_id "${{ github.run_id }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '[.[] | {
+                event: "perf_benchmark",
+                distinct_id: "perfbench",
+                properties: (. + {
+                  tier: $tier, os: $os, arch: $arch,
+                  sha: $sha, base_sha: $base_sha, event_type: $event_type,
+                  branch: $branch, run_id: $run_id, run_url: $run_url
+                })
+              }]' "$f")
+            events=$(printf '%s' "$events" | jq --argjson add "$batch" '. + $add')
+          done
+          count=$(printf '%s' "$events" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "no verdicts to push"
+            exit 0
+          fi
+          echo "pushing $count perf_benchmark event(s) to PostHog"
+          payload=$(jq -n --arg key "$POSTHOG_CI_KEY" --argjson batch "$events" '{api_key: $key, batch: $batch}')
+          curl -sS --max-time 15 -X POST "https://eu.i.posthog.com/batch/" \
+            -H "Content-Type: application/json" \
+            -d "$payload" || echo "PostHog push failed — not failing the job over telemetry"
+
+      # Push-only: a PR failing this check already blocks the merge, so
+      # there's nothing further to escalate there. On `master` the merge
+      # already happened — a red check on the commit is easy to miss, so a
+      # regression instead becomes a durable, visible artifact. `always()`
+      # because the step above now genuinely exits non-zero on a real
+      # regression (outputs set before `exit 1` are still recorded); a dedup
+      # check against open issues keeps a re-run (or retry) from spamming.
+      - name: File regression issue
+        if: always() && steps.compare.outputs.regressed == 'true' && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Perf regression: ${{ matrix.os }}/${{ matrix.arch }} at ${{ github.sha }}"
+          existing=$(gh issue list --repo "${{ github.repository }}" --state open \
+            --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "issue #$existing already covers this — not filing a duplicate"
+            exit 0
+          fi
+          gh label create perf-regression --repo "${{ github.repository }}" \
+            --color d73a4a --description "Automated performance regression report" --force
+          LINKS=$(printf 'Job summary: %s/%s/actions/runs/%s\nCommit: %s/%s/commit/%s\n' \
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.sha }}")
+          BODY=$(printf 'Perf regression on `master` for **%s/%s**, vs the previous commit `%s`:\n\n%s\n%s' \
+            "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.base.outputs.sha }}" \
+            "$(cat perf-report.md)" "$LINKS")
+          gh issue create --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --label perf-regression \
+            --body "$BODY"
+
   release:
     name: Release
     needs: [gen, upload_artifacts, lint, test, bin_e2e]
     if: github.ref == 'refs/heads/master'
+    # Build/test run concurrently for every master commit (see top-level
+    # concurrency), but only the latest landed commit should ever mark a
+    # release as production. Shared group + cancel-in-progress means an older
+    # commit's release job is cancelled the moment a newer commit's reaches
+    # this point, so the newest always wins.
+    concurrency:
+      group: release-master
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -81,32 +81,34 @@ pub fn load(
 
     // Scope the symbol borrow so the library can be leaked after the call.
     let comps: PluginComponents = {
-        // SAFETY: get_stabbied verifies the symbol's stabby type report matches
-        // `CreateFn` before returning it; calling it is then ABI-sound.
-        let create = unsafe { lib.get_stabbied::<CreateFn>(CREATE_SYMBOL) }
-            .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
-        let comps = create(sv(&cfg));
-        // Optional: hand the plugin a host log sink so its `tracing` events (which
-        // its statically-linked `tracing` would otherwise drop — no subscriber is
-        // set in the dylib) are re-emitted on the host. A plugin built against an
-        // older SDK simply won't export the symbol; that is not an error.
+        // Install the host log sink and supervisor *before* `create` runs: `create`
+        // is exactly where plugin construction can fail, and a `tracing::error!`
+        // logged during that failure needs a subscriber already installed or it is
+        // silently dropped — right before the ABI seam turns any panic into a
+        // non-unwinding abort with no diagnostic at all. Optional: a plugin built
+        // against an older SDK simply won't export these symbols; that is not an
+        // error.
         // SAFETY: get_stabbied checks the symbol's stabby type report against
         // `SetLogSinkFn` before returning it.
         if let Ok(set_sink) = unsafe { lib.get_stabbied::<SetLogSinkFn>(SET_LOG_SINK_SYMBOL) } {
             set_sink(crate::host::HostLogSink::wrap());
         }
-        // Optional: hand the plugin the host's supervisor client. The plugin's own
-        // copy of the `proc` crate has an uninitialised tracker (statics are not
-        // shared across the dylib boundary), so without this every child it spawns
-        // goes unregistered — no reaping on a hard kill of the host, and a warning
-        // per spawn. Same older-SDK tolerance as the log sink.
+        // Hand the plugin the host's supervisor client. The plugin's own copy of
+        // the `proc` crate has an uninitialised tracker (statics are not shared
+        // across the dylib boundary), so without this every child it spawns goes
+        // unregistered — no reaping on a hard kill of the host, and a warning per
+        // spawn. Same older-SDK tolerance as the log sink.
         // SAFETY: get_stabbied checks the symbol's stabby type report against
         // `SetSupervisorFn` before returning it.
         let set_supervisor = unsafe { lib.get_stabbied::<SetSupervisorFn>(SET_SUPERVISOR_SYMBOL) };
         if let Ok(set_supervisor) = set_supervisor {
             set_supervisor(crate::host::HostSupervisor::wrap());
         }
-        comps
+        // SAFETY: get_stabbied verifies the symbol's stabby type report matches
+        // `CreateFn` before returning it; calling it is then ABI-sound.
+        let create = unsafe { lib.get_stabbied::<CreateFn>(CREATE_SYMBOL) }
+            .map_err(|e| anyhow::anyhow!("stabby ABI check failed for {}: {e}", path.display()))?;
+        create(sv(&cfg))
     };
     // Keep the dylib mapped for the process lifetime (the returned trait objects'
     // vtables point into its code); leaking the handle is intentional.

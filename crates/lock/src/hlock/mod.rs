@@ -18,9 +18,7 @@ pub mod traits;
 #[cfg(test)]
 mod tests;
 
-pub use bridge::{
-    TBridge, TBridgeReadGuard, TBridgeUpgradableGuard, TBridgeWriteGuard, fs_tlock, mem_tlock,
-};
+pub use bridge::{TBridge, TBridgeReadGuard, TBridgeUpgradableGuard, TBridgeWriteGuard, mem_tlock};
 pub use flock::{FLock, FRWLock, FReadGuard, FWriteGuard};
 pub use keyed::{KeyedGuard, KeyedLock, KeyedRWLock, KeyedTLock, KeyedTRWLock};
 pub use mem::{MemGuard, MemLock, MemRWLock, MemReadGuard, MemWriteGuard};
