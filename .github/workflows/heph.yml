@@ -845,6 +845,25 @@ jobs:
             arch: arm64
             runs-on: macos-latest
     steps:
+      # Opt-in gate for `pull_request` runs: fails immediately (before
+      # checkout, before anything expensive) rather than silently skipping,
+      # so an unlabeled PR gets a visible signal instead of looking like
+      # every other check just passed. `push` runs (the master-monitoring
+      # path) are never gated by this — there's no PR to label.
+      #
+      # Caveat: adding the label to an already-open PR does NOT retrigger
+      # this job on its own — the `pull_request` trigger above only fires on
+      # `opened`/`synchronize`/`reopened` (the default types), not
+      # `labeled`. Adding `labeled`/`unlabeled` to the trigger would fix
+      # that, but it also means EVERY label change on EVERY PR reruns the
+      # entire CI pipeline, not just this job — not worth it for this.
+      # Push a commit (or re-run the job manually) after labeling.
+      - name: Require perf-test label on PRs
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'perf-test')
+        run: |
+          echo "::error::This PR needs the 'perf-test' label to run perf validation (opt-in while the harness and its thresholds are still being proven out). Add the label, then push a commit or re-run this job — labeling alone doesn't retrigger it."
+          exit 1
+
       # Fresh checkout (not the `repo` artifact `build`/`test`/`lint` reuse):
       # this job needs real git history to resolve the merge-base, the same
       # requirement the `abi` job already has — mirroring its proven
@@ -1031,7 +1050,7 @@ jobs:
             echo "# Perf: ${{ matrix.os }}/${{ matrix.arch }}"
             if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
               echo ""
-              echo "_skipped: no published release found for baseline \`${{ steps.base.outputs.sha }}\`_"
+              echo "_FAILED: no published release found for baseline \`${{ steps.base.outputs.sha }}\`_"
             else
               for tier in inproc dist; do
                 echo ""
@@ -1065,6 +1084,20 @@ jobs:
           )
           printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$report" > perf-report.md
+
+          # No baseline is a FAILURE, not a silent pass — every run so far
+          # (bootstrap gap, release-lookup misses) has been "no baseline
+          # found" reporting green, which means this gate has never actually
+          # compared anything. A red check here is a data-availability
+          # problem, not a perf regression, so it deliberately does not set
+          # `regressed` — "File regression issue" is specifically about
+          # detected regressions and would mislabel this.
+          if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+            echo "no baseline artifacts found for ${{ steps.base.outputs.sha }} — failing rather than reporting a silent pass" >&2
+            exit 1
+          fi
+
           if printf '%s' "$report" | grep -q 'REGRESSION'; then
             any_regression=true
           fi
