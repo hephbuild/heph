@@ -53,12 +53,6 @@ pub struct Config {
     /// absent here downloads unverified (the toolchain driver warns); supply an
     /// entry to enforce verification. Empty for `gotool = "host"`.
     pub sdk_checksums: HashMap<String, String>,
-    /// Escape hatch: accept a hermetic SDK download with no matching
-    /// `sdk_checksums` entry instead of failing closed. Off by default — the
-    /// toolchain target's [`GetError`] refuses to resolve an unverified
-    /// download unless this is set. Set via the optional `allow_unverified_sdk`
-    /// provider option.
-    pub allow_unverified_sdk: bool,
     /// Addr of the `heph-govet` binary the lint/format targets exec. Defaults to
     /// [`govet::default_addr`] — the `http_fetch` target that downloads the
     /// binary published in this plugin's own heph release. Point it at a build
@@ -94,7 +88,6 @@ impl Default for Config {
         Self {
             go_version: toolchain::DEFAULT_GO_VERSION.to_string(),
             sdk_checksums: HashMap::new(),
-            allow_unverified_sdk: false,
             govet: govet::default_addr(),
             skip: Arc::new(Ignore::default()),
             foreign_name_guard: true,
@@ -118,8 +111,6 @@ pub(crate) struct ProviderInner {
     /// [`Config::sdk_checksums`]). Also carries the optional `heph-govet` binary
     /// checksums, under [`govet::checksum_key`]'s `govet/…` namespace.
     sdk_checksums: HashMap<String, String>,
-    /// See [`Config::allow_unverified_sdk`].
-    allow_unverified_sdk: bool,
     /// Addr of the `heph-govet` binary lint/format exec (see [`Config::govet`]).
     govet: String,
     /// Directories pruned during `collect_go_packages` (engine home + user globs).
@@ -250,13 +241,7 @@ impl Provider {
         hplugin::config::deny_unknown(
             "go provider",
             opts,
-            &[
-                "gotool",
-                "govet",
-                "skip",
-                "checksums",
-                "allow_unverified_sdk",
-            ],
+            &["gotool", "govet", "skip", "checksums"],
         )?;
         let go_version: String = hplugin::config::decode_opt(opts, "go provider", "gotool")?
             .ok_or_else(|| {
@@ -273,11 +258,6 @@ impl Provider {
         // so `gotool = "host"` needs none.
         let sdk_checksums: HashMap<String, String> =
             hplugin::config::decode_opt(opts, "go provider", "checksums")?.unwrap_or_default();
-        // Escape hatch: accept a hermetic SDK download with no matching
-        // `checksums` entry instead of failing closed. Off by default.
-        let allow_unverified_sdk: bool =
-            hplugin::config::decode_opt(opts, "go provider", "allow_unverified_sdk")?
-                .unwrap_or(false);
         // Optional: the addr of the `heph-govet` binary lint/format exec. Unset →
         // the `http_fetch` target that downloads the binary published in this
         // plugin's own release (see `govet::default_addr`). Point it at a build
@@ -296,7 +276,6 @@ impl Provider {
             Config {
                 go_version,
                 sdk_checksums,
-                allow_unverified_sdk,
                 govet,
                 skip,
                 walker,
@@ -311,7 +290,6 @@ impl Provider {
                 workspace_root,
                 go_version: config.go_version,
                 sdk_checksums: config.sdk_checksums,
-                allow_unverified_sdk: config.allow_unverified_sdk,
                 govet: config.govet,
                 skip: config.skip,
                 walker: config.walker,
@@ -1463,25 +1441,13 @@ impl ProviderInner {
         {
             let (goos, goarch) = (current_goos(), current_goarch());
             let key = toolchain::checksum_key(version, &goos, &goarch);
+            // Checksum is optional: absent → unverified download (the driver
+            // warns). An empty sha256 threads through to the toolchain target.
             let sha256 = self
                 .sdk_checksums
                 .get(&key)
                 .map(String::as_str)
                 .unwrap_or("");
-            // Fail closed: resolving the toolchain target is what the engine
-            // does whether or not `run()` ends up executing (a cache hit skips
-            // `run()` entirely), so this is the only point that reliably gates
-            // every path to an unverified download — checking inside the
-            // driver's `run()` would let a cache hit from a prior unverified (or
-            // opted-out) build silently satisfy a since-tightened policy.
-            if sha256.is_empty() && !self.allow_unverified_sdk {
-                return Err(GetError::Other(anyhow::anyhow!(
-                    "go provider: no checksum configured for Go {version} SDK on {goos}/{goarch} \
-                     — add `checksums: {{\"{key}\": \"<sha256>\"}}` to the go provider's options \
-                     (sha256 from https://go.dev/dl/?mode=json), or set \
-                     `allow_unverified_sdk: true` to accept an unverified download"
-                )));
-            }
             let spec = toolchain::build_spec(addr.clone(), version, &goos, &goarch, sha256);
             return Ok(GetResponse { target_spec: spec });
         }
@@ -4012,82 +3978,6 @@ mod tests {
         assert!(matches!(
             resp.target_spec.config.get("sha256"),
             Some(Value::String(s)) if s == "cafebabe"
-        ));
-    }
-
-    /// Default out-of-the-box case: `gotool` pins a version with no matching
-    /// `checksums` entry. Resolving the toolchain target must fail closed
-    /// rather than silently hand back a spec with an empty `sha256` — that was
-    /// the supply-chain gap (a compromised/MITM'd download trusted beyond TLS).
-    #[tokio::test]
-    async fn test_get_toolchain_target_fails_closed_with_no_checksum_configured() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let p = Provider::with_config(
-            tmp.path().to_path_buf(),
-            Config {
-                go_version: "1.26.4".to_string(),
-                ..Default::default()
-            },
-        )
-        .expect("provider");
-        let err = match provider_get(&p, toolchain::toolchain_addr("1.26.4")).await {
-            Err(GetError::Other(e)) => e,
-            Err(other) => panic!("expected a config error, got {other:?}"),
-            Ok(_) => panic!("no checksum configured — must not resolve unverified by default"),
-        };
-        let msg = format!("{err:#}");
-        assert!(msg.contains("no checksum configured"), "got: {msg}");
-        assert!(msg.contains("allow_unverified_sdk"), "got: {msg}");
-    }
-
-    /// A configured `checksums` entry resolves normally, threading the sha256
-    /// through to the toolchain target's spec.
-    #[tokio::test]
-    async fn test_get_toolchain_target_uses_configured_checksum() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (goos, goarch) = (current_goos(), current_goarch());
-        let p = Provider::with_config(
-            tmp.path().to_path_buf(),
-            Config {
-                go_version: "1.26.4".to_string(),
-                sdk_checksums: HashMap::from([(
-                    toolchain::checksum_key("1.26.4", &goos, &goarch),
-                    "deadbeef".to_string(),
-                )]),
-                ..Default::default()
-            },
-        )
-        .expect("provider");
-        let resp = provider_get(&p, toolchain::toolchain_addr("1.26.4"))
-            .await
-            .expect("toolchain target resolves with a configured checksum");
-        assert!(matches!(
-            resp.target_spec.config.get("sha256"),
-            Some(Value::String(s)) if s == "deadbeef"
-        ));
-    }
-
-    /// The `allow_unverified_sdk` escape hatch opts back into the old
-    /// warn-and-download-unverified behavior for a version/platform with no
-    /// configured checksum.
-    #[tokio::test]
-    async fn test_get_toolchain_target_allows_unverified_when_opted_in() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let p = Provider::with_config(
-            tmp.path().to_path_buf(),
-            Config {
-                go_version: "1.26.4".to_string(),
-                allow_unverified_sdk: true,
-                ..Default::default()
-            },
-        )
-        .expect("provider");
-        let resp = provider_get(&p, toolchain::toolchain_addr("1.26.4"))
-            .await
-            .expect("opted-in unverified download resolves");
-        assert!(matches!(
-            resp.target_spec.config.get("sha256"),
-            Some(Value::String(s)) if s.is_empty()
         ));
     }
 
