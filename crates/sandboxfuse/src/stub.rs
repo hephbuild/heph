@@ -25,7 +25,7 @@ pub struct LayeredFs {
 }
 
 impl LayeredFs {
-    pub fn new(_layers: Vec<Layer>, upper_root: PathBuf) -> Self {
+    pub fn new(_layers: Vec<Arc<Layer>>, upper_root: PathBuf) -> Self {
         Self { upper_root }
     }
 
@@ -33,7 +33,7 @@ impl LayeredFs {
         Self { upper_root }
     }
 
-    pub fn register_slot(self: &Arc<Self>, prefix: PathBuf, _layers: Vec<Layer>) -> SlotGuard {
+    pub fn register_slot(self: &Arc<Self>, prefix: PathBuf, _layers: Vec<Arc<Layer>>) -> SlotGuard {
         SlotGuard {
             _fs: Arc::clone(self),
             _prefix: prefix,

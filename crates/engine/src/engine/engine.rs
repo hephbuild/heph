@@ -16,7 +16,7 @@ use hsandboxfuse as sandboxfuse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Context the engine injects when constructing any plugin (provider, driver, or
 /// managed driver — whether registered directly or through a factory): the
@@ -233,18 +233,29 @@ impl Drop for EngineFuse {
         // the worker thread so the process can still exit.
         if let Some(mount) = self.mount.take() {
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::Builder::new()
+            // Can't propagate a Result from Drop. On spawn failure the
+            // closure (and the `mount` it captured) is dropped in place —
+            // the unmount still runs, just synchronously and without the
+            // bounded-wait/force-umount watchdog below, since there's no
+            // worker thread left to send on `tx`. Log and fall through:
+            // `rx.recv_timeout` observes the disconnected channel and
+            // takes the same force-umount path as a timeout would.
+            let spawned = std::thread::Builder::new()
                 .name("heph-fuse-unmount".into())
                 .spawn(move || {
                     drop(mount);
                     _ = tx.send(());
-                })
-                .expect("spawn fuse unmount thread");
+                });
+            if let Err(e) = &spawned {
+                error!(error = ?e, lower = ?self.lower, "failed to spawn FUSE unmount thread");
+            }
             if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
-                warn!(
-                    lower = ?self.lower,
-                    "FUSE unmount exceeded 5s; issuing force umount and leaking session"
-                );
+                if spawned.is_ok() {
+                    warn!(
+                        lower = ?self.lower,
+                        "FUSE unmount exceeded 5s; issuing force umount and leaking session"
+                    );
+                }
                 force_umount(&self.lower);
             }
         }
