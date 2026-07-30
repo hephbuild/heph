@@ -963,15 +963,35 @@ jobs:
             --go-packages "$PERFBENCH_GO_PACKAGES" \
             --out bench-corpus
 
-      # Candidate and baseline are interleaved rep-by-rep, not run to
-      # completion one side at a time: `run ... --reps N` in one shot would
-      # let a systematic drift on the runner (thermal state ramping up, a
-      # noisy neighbor arriving mid-job) land entirely on whichever side
-      # happened to run second, biasing the comparison rather than adding
-      # symmetric noise to both. `--warmup 1 --reps 0` primes the shared
-      # cache state once per side (a no-op for `cold`, which has none); each
-      # `--reps 1 --skip-prepare --append` round after that measures one more
-      # rep per side and merges it into the same output file, alternating.
+      # Bootstrap gap specific to whatever PR introduced --skip-prepare/
+      # --rep-offset/--append: baseline's heph-bench is fetched from a past
+      # release, so it won't understand those flags until a release built
+      # AFTER that PR merges becomes the baseline — which happens
+      # automatically, so this is a one-time fallback, not permanent
+      # branching. Tier B is unaffected: it only ever runs candidate's own
+      # heph-bench as the orchestrator (against both dist directories), never
+      # baseline's, so there is nothing to detect there.
+      - name: Detect baseline heph-bench capability
+        if: steps.baseline_fetch.outputs.bench_ok == 'true'
+        id: baseline_caps
+        run: |
+          if ./baseline-dist/heph-bench run inprocess --help 2>&1 | grep -q -- '--skip-prepare'; then
+            echo "interleave=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "baseline heph-bench predates --skip-prepare — falling back to non-interleaved timing this run"
+            echo "interleave=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Candidate and baseline are interleaved rep-by-rep when both sides
+      # support it, not run to completion one side at a time: `run ... --reps
+      # N` in one shot would let a systematic drift on the runner (thermal
+      # state ramping up, a noisy neighbor arriving mid-job) land entirely on
+      # whichever side happened to run second, biasing the comparison rather
+      # than adding symmetric noise to both. `--warmup 1 --reps 0` primes the
+      # shared cache state once per side (a no-op for `cold`, which has
+      # none); each `--reps 1 --skip-prepare --append` round after that
+      # measures one more rep per side and merges it into the same output
+      # file, alternating.
       - name: Time Tier A (inprocess) scenarios
         if: steps.baseline_fetch.outputs.bench_ok == 'true'
         continue-on-error: true
@@ -979,17 +999,24 @@ jobs:
           for scenario in cold full-hit incremental; do
             cand_out="candidate_inproc_${scenario}.json"
             base_out="baseline_inproc_${scenario}.json"
-            ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps 0 --out /dev/null
-            ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps 0 --out /dev/null
-            rm -f "$cand_out" "$base_out"
-            for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
+            if [ "${{ steps.baseline_caps.outputs.interleave }}" = "true" ]; then
               ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
+                --warmup 1 --reps 0 --out /dev/null
               ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
-            done
+                --warmup 1 --reps 0 --out /dev/null
+              rm -f "$cand_out" "$base_out"
+              for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
+                ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                  --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
+                ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                  --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
+              done
+            else
+              ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                --warmup 1 --reps "$PERFBENCH_REPS" --out "$cand_out"
+              ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
+                --warmup 1 --reps "$PERFBENCH_REPS" --out "$base_out"
+            fi
           done
 
       - name: Time Tier B (dist) scenarios

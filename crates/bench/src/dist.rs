@@ -172,6 +172,14 @@ pub fn run(
             "corpus has no go/ subtree (generate with --go-packages > 0) — nothing for Tier B to build"
         );
     }
+    // Absolute: `write_go_config` writes this same path into `.hephconfig`'s
+    // `path:` entry, and `build_go_tree` spawns `heph` with
+    // `current_dir(corpus)` — a relative `--corpus` (the common case) would
+    // have `heph` re-resolve that config path against its OWN cwd, which is
+    // already inside `corpus`, landing on the wrong (doubled) directory.
+    let corpus = &corpus
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", corpus.display()))?;
     let dist = Dist::locate(dist_dir)?;
     write_go_config(corpus, &dist)?;
     let home = tempfile::tempdir().context("create HOME tempdir")?;
