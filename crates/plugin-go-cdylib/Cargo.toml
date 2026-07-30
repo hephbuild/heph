@@ -20,3 +20,4 @@ hwalk = { package = "walk", path = "../walk" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 stabby = "72.1.8"
 anyhow = "1.0.102"
+tracing = "0.1"

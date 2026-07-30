@@ -3933,6 +3933,7 @@ dependencies = [
  "plugin-go",
  "plugin-sdk",
  "stabby",
+ "tracing",
  "walk",
 ]
 
