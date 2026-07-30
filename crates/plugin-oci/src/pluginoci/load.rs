@@ -7,6 +7,11 @@
 //! the archive); an `oci` archive is loaded with `skopeo copy oci-archive:<tar>
 //! docker-daemon:<tag>`, which needs an explicit `tag` to name the image in the
 //! daemon.
+//!
+//! A daemon tag holds one image, so loading a **multi-platform** archive means
+//! choosing an instance: `platform` (default Linux on the host's architecture)
+//! is pinned onto the skopeo copy rather than left to skopeo's host-derived
+//! default, which on macOS is a `darwin` no Linux manifest list matches.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -55,6 +60,18 @@ struct OciLoadSpec {
     /// `docker` cannot load an `oci` archive.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     tool: Option<String>,
+    /// Which instance to load out of a **multi-platform** archive, as `os/arch`
+    /// (e.g. `linux/amd64`). Defaults to Linux on the host's architecture.
+    ///
+    /// A daemon holds one image per tag, so a multi-arch archive built by
+    /// `oci_image(platforms = [...])` must be narrowed to one instance on the way
+    /// in. Left to skopeo's own default the choice would follow the host's
+    /// GOOS/GOARCH — `darwin` on macOS, which no Linux manifest list matches, so
+    /// the load would fail outright there.
+    ///
+    /// `tool = "docker"` rejects it: `docker load` has no instance selection.
+    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    platform: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -62,9 +79,14 @@ struct OciLoadDef {
     format: ImageFormat,
     tag: Option<String>,
     tool: Tool,
+    /// The `os/arch` instance taken out of the archive. `None` for `docker
+    /// load`, which has no instance selection.
+    platform: Option<String>,
 }
 
-const OCI_LOAD_FORMAT_VERSION: u32 = 1;
+/// v2: the skopeo path pins the loaded instance instead of following the host's
+/// GOOS/GOARCH.
+const OCI_LOAD_FORMAT_VERSION: u32 = 2;
 
 impl Hash for OciLoadDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -72,6 +94,7 @@ impl Hash for OciLoadDef {
         self.format.transport().hash(state);
         self.tag.hash(state);
         self.tool.label().hash(state);
+        self.platform.hash(state);
     }
 }
 
@@ -94,13 +117,21 @@ fn load_argv(
             let tag = def.tag.as_deref().context(
                 "oci_load with skopeo requires `tag` (skopeo must name the daemon image)",
             )?;
-            Ok(vec![
+            let mut argv = vec![
                 skopeo_bin.to_string(),
                 "copy".to_string(),
                 "--insecure-policy".to_string(),
-                format!("{}:{}", def.format.transport(), tar.to_string_lossy()),
-                format!("docker-daemon:{tag}"),
-            ])
+            ];
+            if let Some(platform) = &def.platform {
+                argv.extend(super::platform_override_args(platform)?);
+            }
+            argv.push(format!(
+                "{}:{}",
+                def.format.transport(),
+                tar.to_string_lossy()
+            ));
+            argv.push(format!("docker-daemon:{tag}"));
+            Ok(argv)
         }
     }
 }
@@ -151,6 +182,26 @@ impl ManagedDriver for Driver {
             anyhow::bail!("oci_load with skopeo requires `tag`");
         }
 
+        let platform = match tool {
+            Tool::Docker => {
+                if let Some(p) = &spec.platform {
+                    anyhow::bail!(
+                        "`platform` ({p:?}) is not supported with tool = \"docker\": `docker load` \
+                         loads what the archive holds and cannot select an instance. Use \
+                         tool = \"skopeo\"."
+                    );
+                }
+                None
+            }
+            // Always concrete, never the host's GOOS/GOARCH: a multi-arch
+            // archive has no `darwin` instance to match on macOS.
+            Tool::Skopeo => {
+                let p = spec.platform.unwrap_or_else(super::default_platform);
+                super::split_platform(&p)?;
+                Some(p)
+            }
+        };
+
         let mut image_ref = TargetAddr::parse(&spec.image, &addr.package)
             .with_context(|| format!("parse image ref {:?}", spec.image))?;
         super::pin_archive_group(&mut image_ref, &spec.image)?;
@@ -159,6 +210,7 @@ impl ManagedDriver for Driver {
             format,
             tag: spec.tag,
             tool,
+            platform,
         };
         let hash = {
             let mut h =
@@ -287,6 +339,7 @@ mod tests {
             format: ImageFormat::Docker,
             tag: None,
             tool: Tool::Docker,
+            platform: None,
         };
         let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
         assert_eq!(argv, ["docker", "load", "-i", "/t/i.tar"]);
@@ -298,6 +351,7 @@ mod tests {
             format: ImageFormat::Oci,
             tag: Some("app:dev".to_string()),
             tool: Tool::Skopeo,
+            platform: Some("linux/amd64".to_string()),
         };
         let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
         let joined = argv.join(" ");
@@ -317,11 +371,30 @@ mod tests {
             format: ImageFormat::Docker,
             tag: Some("app:dev".to_string()),
             tool: Tool::Skopeo,
+            platform: Some("linux/amd64".to_string()),
         };
         let argv = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar")).unwrap();
         let joined = argv.join(" ");
         assert!(joined.contains("docker-archive:/t/i.tar"), "{joined}");
         assert!(joined.contains("docker-daemon:app:dev"), "{joined}");
+    }
+
+    /// A daemon tag holds one image, so the instance taken out of a multi-arch
+    /// archive is pinned rather than matched against the host — which on macOS is
+    /// a `darwin` no Linux manifest list contains.
+    #[test]
+    fn load_argv_pins_the_instance_out_of_a_multi_arch_archive() {
+        let def = OciLoadDef {
+            format: ImageFormat::Oci,
+            tag: Some("app:dev".to_string()),
+            tool: Tool::Skopeo,
+            platform: Some("linux/arm64".to_string()),
+        };
+        let joined = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar"))
+            .expect("argv")
+            .join(" ");
+        assert!(joined.contains("--override-os linux"), "{joined}");
+        assert!(joined.contains("--override-arch arm64"), "{joined}");
     }
 
     #[test]
@@ -330,6 +403,7 @@ mod tests {
             format: ImageFormat::Oci,
             tag: None,
             tool: Tool::Skopeo,
+            platform: Some("linux/amd64".to_string()),
         };
         let err = load_argv("docker", "skopeo", &def, std::path::Path::new("/t/i.tar"))
             .expect_err("skopeo without tag must fail");
@@ -370,6 +444,65 @@ mod tests {
             .err()
             .expect("oci load without tag must fail parse");
         assert!(format!("{err:#}").contains("tag"), "got: {err:#}");
+    }
+
+    /// An implicit load records a concrete instance, so a multi-arch archive
+    /// resolves the same way on every host — and at all on macOS.
+    #[tokio::test]
+    async fn parse_defaults_platform_to_linux_host_arch() {
+        let resp = parse(
+            "//app:load",
+            cfg(&[
+                ("image", Value::String(":img".to_string())),
+                ("tag", Value::String("app:dev".to_string())),
+            ]),
+        )
+        .await;
+        let platform = resp
+            .target_def
+            .def::<OciLoadDef>()
+            .platform
+            .clone()
+            .expect("skopeo load pins a platform");
+        assert!(platform.starts_with("linux/"), "got: {platform}");
+    }
+
+    /// Loading the amd64 instance and loading the arm64 one are different
+    /// actions; they must not collapse to one def.
+    #[tokio::test]
+    async fn parse_hash_differs_per_platform() {
+        let base = |p: &str| {
+            cfg(&[
+                ("image", Value::String(":img".to_string())),
+                ("tag", Value::String("app:dev".to_string())),
+                ("platform", Value::String(p.to_string())),
+            ])
+        };
+        let a = parse("//app:load", base("linux/amd64")).await;
+        let b = parse("//app:load", base("linux/arm64")).await;
+        assert_ne!(a.target_def.hash, b.target_def.hash);
+    }
+
+    /// `docker load` has no instance selection, so honouring `platform` there is
+    /// impossible — say so instead of loading whatever the archive holds.
+    #[tokio::test]
+    async fn parse_platform_with_docker_tool_fails() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//app:load",
+                    cfg(&[
+                        ("image", Value::String(":img".to_string())),
+                        ("format", Value::String("docker".to_string())),
+                        ("platform", Value::String("linux/amd64".to_string())),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("platform + docker must fail");
+        assert!(format!("{err:#}").contains("platform"), "got: {err:#}");
     }
 
     #[tokio::test]
