@@ -300,11 +300,35 @@ struct OciImageSpec {
     /// key for different images and trade wrong-architecture artifacts through
     /// the remote cache.
     ///
-    /// Multi-platform builds need a container-driver builder
-    /// (`docker buildx create --driver docker-container`); the default daemon
-    /// builder only builds one platform, and `format = "docker"` cannot hold a
-    /// manifest list at all.
+    /// Multi-platform builds need a container-driver builder — see `builder`;
+    /// the default daemon builder only builds one platform, and
+    /// `format = "docker"` cannot hold a manifest list at all.
     platforms: Vec<String>,
+    /// The buildx builder to build on (`docker buildx --builder`), e.g. a
+    /// `docker buildx create --name multi --driver docker-container` instance.
+    /// Left unset, buildx's own current builder is used.
+    ///
+    /// This is the attribute to reach for when a multi-platform build fails with
+    /// "Multi-platform build is not supported for the docker driver": the
+    /// default daemon builder cannot produce a manifest list, a
+    /// `docker-container` one can.
+    ///
+    /// ```python
+    /// oci_image(name = "img", builder = "multi",
+    ///           platforms = ["linux/amd64", "linux/arm64"])
+    /// ```
+    ///
+    /// It is a **hashed input**, and it is why `BUILDX_BUILDER` is stripped from
+    /// the build's environment: which builder runs decides the platforms, the
+    /// BuildKit version and the layer cache behind the image, so it has to be
+    /// stated in the BUILD file where it lands in the cache key — not inherited
+    /// from whichever shell happened to launch heph.
+    ///
+    /// What is hashed is the *name*. Two machines whose `multi` builders differ
+    /// still agree on the key, the same way they do for the `docker` version
+    /// itself; naming the builder narrows that gap, it does not close it.
+    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    builder: Option<String>,
     /// BuildKit build secrets, as raw `--secret` specs, e.g.
     /// `["id=token,env=TOKEN"]`, consumed in the Dockerfile via
     /// `RUN --mount=type=secret`.
@@ -356,8 +380,11 @@ struct OciImageDef {
     /// Platforms as written by the user. Empty means "the builder's default",
     /// which is what `builder_platform` records.
     platforms: Vec<String>,
+    /// The buildx builder (`--builder`), as written by the user. `None` means
+    /// buildx's current builder.
+    builder: Option<String>,
     /// The platform actually built when `platforms` is empty, resolved from the
-    /// builder at parse time. `None` only when `platforms` is explicit.
+    /// selected builder at parse time. `None` only when `platforms` is explicit.
     ///
     /// This is the difference between a correct key and a silently wrong one: an
     /// empty `platforms` produces an arm64 image on one host and an amd64 image
@@ -384,7 +411,9 @@ struct OciImageDef {
 /// v2: build context rooted at the workspace dir (was the package dir), `SRC_*`
 /// build args, `--build-context` bases, and the resolved builder platform in the
 /// key. Every one of those changes what a given input set produces.
-const OCI_IMAGE_FORMAT_VERSION: u32 = 2;
+///
+/// v3: the builder is selectable (`builder`) and hashed.
+const OCI_IMAGE_FORMAT_VERSION: u32 = 3;
 
 impl Hash for OciImageDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -398,6 +427,7 @@ impl Hash for OciImageDef {
         // Order is significant here and only here: `--platform a,b` and
         // `--platform b,a` order the manifest list's entries differently.
         self.platforms.hash(state);
+        self.builder.hash(state);
         self.builder_platform.hash(state);
         self.secrets.hash(state);
         self.ssh.hash(state);
@@ -472,6 +502,10 @@ fn build_argv(
         metadata_file.to_string_lossy().into_owned(),
     ];
 
+    if let Some(builder) = &def.builder {
+        argv.push("--builder".to_string());
+        argv.push(builder.clone());
+    }
     if let Some(stage) = &def.stage {
         argv.push("--target".to_string());
         argv.push(stage.clone());
@@ -666,10 +700,14 @@ fn ensure_no_src_source(kind: &str, specs: &[String]) -> anyhow::Result<()> {
 
 pub struct Driver {
     docker_bin: String,
-    /// Memoized `docker buildx inspect --bootstrap` result. `parse` runs on the
-    /// warm path too, so the probe must happen at most once per process rather
-    /// than once per target.
-    builder_platform: tokio::sync::OnceCell<String>,
+    /// Memoized `docker buildx inspect --bootstrap` result, per builder. `parse`
+    /// runs on the warm path too, so the probe must happen at most once per
+    /// builder per process rather than once per target.
+    ///
+    /// Keyed by the target's `builder` (`None` = whatever buildx defaults to):
+    /// two builders answer with two different default platforms, and that answer
+    /// goes straight into the cache key.
+    builder_platforms: tokio::sync::Mutex<HashMap<Option<String>, String>>,
 }
 
 impl Default for Driver {
@@ -688,46 +726,63 @@ impl Driver {
     pub fn with_binary(bin: impl Into<String>) -> Self {
         Driver {
             docker_bin: bin.into(),
-            builder_platform: tokio::sync::OnceCell::new(),
+            builder_platforms: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// The platform a build with no `--platform` produces, asked of the builder
-    /// once per process and folded into the cache key by `parse`.
+    /// The platform a build with no `--platform` produces on `builder`, asked
+    /// once per builder per process and folded into the cache key by `parse`.
     async fn resolve_builder_platform(
         &self,
+        builder: Option<&str>,
         ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<&String> {
-        self.builder_platform
-            .get_or_try_init(|| async {
-                let argv = vec![
-                    self.docker_bin.clone(),
-                    "buildx".to_string(),
-                    "inspect".to_string(),
-                    "--bootstrap".to_string(),
-                ];
-                // The probe's own output is noise to the user; only its result
-                // matters, so no sinks are attached.
-                let mut io = ToolIo {
-                    stdout: None,
-                    stderr: None,
-                };
-                let out = run_tool(
-                    argv,
-                    &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                    "docker buildx inspect",
-                    &mut io,
-                    ctoken,
-                )
-                .await
-                .context(
-                    "resolving the builder's default platform — `oci_image` needs it for the \
-                     cache key when `platforms` is not set. Set `platforms` explicitly to skip \
-                     this probe.",
-                )?;
-                parse_builder_platform(&out)
-            })
-            .await
+    ) -> anyhow::Result<String> {
+        // The lock is held across the probe so concurrent `parse`s of targets
+        // sharing a builder wait for one answer instead of each spawning their
+        // own `docker buildx inspect`. Bootstrapping a container builder is
+        // seconds; doing it once per target in a large workspace is not.
+        let mut cache = self.builder_platforms.lock().await;
+        let key = builder.map(str::to_string);
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+
+        let mut argv = vec![
+            self.docker_bin.clone(),
+            "buildx".to_string(),
+            "inspect".to_string(),
+            "--bootstrap".to_string(),
+        ];
+        if let Some(builder) = builder {
+            argv.push(builder.to_string());
+        }
+        // The probe's own output is noise to the user; only its result matters,
+        // so no sinks are attached.
+        let mut io = ToolIo {
+            stdout: None,
+            stderr: None,
+        };
+        let out = run_tool(
+            argv,
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            "docker buildx inspect",
+            &mut io,
+            ctoken,
+        )
+        .await
+        .with_context(|| {
+            let which = builder.map_or_else(
+                || "the default builder".to_string(),
+                |b| format!("builder {b:?}"),
+            );
+            format!(
+                "resolving the default platform of {which} — `oci_image` needs it for the cache \
+                 key when `platforms` is not set. Set `platforms` explicitly to skip this probe."
+            )
+        })?;
+        let platform = parse_builder_platform(&out)?;
+        cache.insert(key, platform.clone());
+        Ok(platform)
     }
 }
 
@@ -794,8 +849,12 @@ impl ManagedDriver for Driver {
         // With no explicit `platforms` the builder picks, so ask it which one and
         // put the answer in the key — otherwise two hosts with different default
         // platforms compute the same key for different images.
+        let builder = spec.builder.filter(|b| !b.is_empty());
         let builder_platform = if spec.platforms.is_empty() {
-            Some(self.resolve_builder_platform(ctoken).await?.clone())
+            Some(
+                self.resolve_builder_platform(builder.as_deref(), ctoken)
+                    .await?,
+            )
         } else {
             None
         };
@@ -861,6 +920,7 @@ impl ManagedDriver for Driver {
             build_args: spec.build_args.into_iter().collect(),
             stage: spec.stage,
             platforms: spec.platforms,
+            builder,
             builder_platform,
             secrets,
             ssh,
@@ -983,10 +1043,22 @@ impl ManagedDriver for Driver {
                         def.bases.join(", ")
                     )
                 };
-                format!(
-                    "oci_image {addr}: multi-platform builds need a container builder — \
-                     `docker buildx create --use --driver docker-container`{bases}"
-                )
+                let builder = def.builder.as_deref().map_or_else(
+                    || {
+                        "multi-platform builds need a container builder — create one with \
+                         `docker buildx create --name multi --driver docker-container` and select \
+                         it with `builder = \"multi\"`"
+                            .to_string()
+                    },
+                    |b| {
+                        format!(
+                            "multi-platform builds need a container builder — check that {b:?} is \
+                             one (`docker buildx inspect {b}` should say \
+                             `Driver: docker-container`)"
+                        )
+                    },
+                );
+                format!("oci_image {addr}: {builder}{bases}")
             })?;
 
         let metadata = tokio::fs::read_to_string(&metadata_file)
@@ -1023,7 +1095,9 @@ impl ManagedDriver for Driver {
 /// Deliberately NOT passed: `BUILDX_BUILDER`, `BUILDKIT_HOST`,
 /// `DOCKER_DEFAULT_PLATFORM`, `SOURCE_DATE_EPOCH`, `DOCKER_BUILDKIT` — each
 /// changes the output while the def hash stays put. A user who needs one of
-/// these wants a spec field, not an ambient variable.
+/// these wants a spec field, not an ambient variable: `BUILDX_BUILDER` has one
+/// (`builder`), which is hashed, and `DOCKER_DEFAULT_PLATFORM` is what
+/// `platforms` is for.
 fn passthrough_oci_env() -> Vec<(OsString, OsString)> {
     let mut out = Vec::new();
     for name in &[
@@ -1643,6 +1717,7 @@ exit 0
             ]),
             stage: Some("runtime".to_string()),
             platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
+            builder: None,
             builder_platform: None,
             secrets: vec!["id=token,env=TOKEN".to_string()],
             ssh: vec!["default".to_string()],
@@ -1691,6 +1766,7 @@ exit 0
             build_args: BTreeMap::new(),
             stage: None,
             platforms: vec![],
+            builder: None,
             builder_platform: Some("linux/arm64".to_string()),
             secrets: vec![],
             ssh: vec![],
@@ -1721,6 +1797,7 @@ exit 0
             build_args: BTreeMap::new(),
             stage: None,
             platforms: vec!["linux/amd64".to_string()],
+            builder: None,
             builder_platform: None,
             secrets: vec![],
             ssh: vec![],
@@ -1764,6 +1841,7 @@ exit 0
             build_args: BTreeMap::new(),
             stage: None,
             platforms: vec![],
+            builder: None,
             builder_platform: Some("linux/amd64".to_string()),
             secrets: vec![],
             ssh: vec![],
@@ -1918,6 +1996,99 @@ exit 0
                 .def::<OciImageDef>()
                 .builder_platform
                 .is_none()
+        );
+    }
+
+    /// `builder` reaches buildx as `--builder`. Without it a multi-platform
+    /// build is stuck with whatever builder the shell happens to have selected,
+    /// which is exactly what the cleared environment forbids.
+    #[test]
+    fn build_argv_selects_the_named_builder() {
+        let def = OciImageDef {
+            dockerfile: "Dockerfile".to_string(),
+            out: "img.tar".to_string(),
+            digest_out: "img.digest".to_string(),
+            format: ImageFormat::Oci,
+            build_args: BTreeMap::new(),
+            stage: None,
+            platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
+            builder: Some("multi".to_string()),
+            builder_platform: None,
+            secrets: vec![],
+            ssh: vec![],
+            bases: vec![],
+            cache_from: vec![],
+            cache_to: vec![],
+        };
+        let argv = build_argv(
+            "docker",
+            &def,
+            Path::new("/c"),
+            Path::new("/c/Dockerfile"),
+            Path::new("/c/img.tar"),
+            Path::new("/m.json"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(argv.join(" ").contains("--builder multi"), "{argv:?}");
+    }
+
+    /// Two builders can produce different images from the same context — a
+    /// different BuildKit, a different default platform, a different layer
+    /// cache — so they must not share a cache entry.
+    #[tokio::test]
+    async fn hash_differs_per_builder() {
+        let sbx = Sandbox::new("app");
+        let plat = || {
+            (
+                "platforms",
+                Value::List(vec![Value::String("linux/amd64".to_string())]),
+            )
+        };
+        let a = parse_in(&sbx, "//app:img", cfg(&[ctx(), plat()])).await;
+        let b = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                plat(),
+                ("builder", Value::String("multi".to_string())),
+            ]),
+        )
+        .await;
+        assert_ne!(a.target_def.hash, b.target_def.hash);
+    }
+
+    /// The platform probe has to ask the *selected* builder: asking the default
+    /// one would put another builder's platform in this target's key.
+    #[tokio::test]
+    async fn empty_platforms_probes_the_selected_builder() {
+        let sbx = Sandbox::new("app");
+        let bin = sbx.fake("docker", FAKE_DOCKER_OK);
+        let d = Driver::with_binary(bin);
+        let resp = d
+            .parse(
+                parse_req(
+                    "//app:img",
+                    cfg(&[ctx(), ("builder", Value::String("multi".to_string()))]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse");
+
+        assert_eq!(
+            resp.target_def.def::<OciImageDef>().builder.as_deref(),
+            Some("multi")
+        );
+        let probe = sbx
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("inspect"))
+            .expect("a builder probe");
+        assert!(
+            probe.ends_with("--bootstrap multi"),
+            "the probe must name the builder, got: {probe}"
         );
     }
 
