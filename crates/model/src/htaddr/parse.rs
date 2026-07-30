@@ -1,5 +1,5 @@
 use crate::htaddr::addr::Addr;
-use crate::htpkg::PkgBuf;
+use crate::htpkg::{PkgBuf, join_rel_checked_pkg};
 use anyhow::Context;
 use nom::IResult;
 use nom::Parser;
@@ -75,20 +75,7 @@ fn addr_parser(i: &str) -> R<'_, (&str, &str, Vec<(&str, &str)>)> {
 }
 
 fn resolve_relative_pkg(base: &PkgBuf, rel: &str) -> anyhow::Result<String> {
-    let mut components: Vec<&str> = base.as_str().split('/').filter(|s| !s.is_empty()).collect();
-    let rel = rel.strip_prefix("./").unwrap_or(rel);
-    for component in rel.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
-                    return Err(anyhow::anyhow!("relative path '{}' escapes root", rel));
-                }
-            }
-            c => components.push(c),
-        }
-    }
-    Ok(components.join("/"))
+    join_rel_checked_pkg(base.as_str(), rel)
 }
 
 pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> {
@@ -144,12 +131,21 @@ pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
         .parse(input)
         .map_err(|e| anyhow::anyhow!("invalid address {:?}: {}", input, e))?;
 
+    // The absolute `//pkg:name` form has no base to resolve against, but a
+    // `..` segment in `pkg` must still be bound to the workspace root — same
+    // rule `resolve_relative_pkg` enforces for relative references, and the
+    // same mechanism `fs.file`/`fs.glob` use (`join_rel_checked`). Without
+    // this, `//../../etc:passwd` parses cleanly and escapes into filesystem
+    // joins downstream (BUILD discovery, cache dir, sandbox dir).
+    let package =
+        join_rel_checked_pkg("", p).with_context(|| format!("invalid address {input:?}"))?;
+
     let mut args = BTreeMap::new();
     for (k, v) in kvs {
         args.insert(k.to_string(), v.to_string());
     }
 
-    Ok(Addr::new(PkgBuf::from(p), n.to_string(), args))
+    Ok(Addr::new(PkgBuf::from(package), n.to_string(), args))
 }
 
 #[cfg(test)]
@@ -276,6 +272,32 @@ mod tests {
         assert_eq!(res.name, "build_lib");
         assert_eq!(res.args.get("goos").unwrap(), "linux");
         assert_eq!(res.args.get("goarch").unwrap(), "amd64");
+    }
+
+    #[test]
+    fn test_parse_addr_absolute_dotdot_escapes_root_fails() {
+        // //../../etc:passwd must not parse into a package that walks above
+        // the workspace root — it used to (path-traversal into BUILD
+        // discovery / cache / sandbox dirs downstream).
+        let res = parse_addr("//../../etc:passwd");
+        assert!(res.is_err(), "expected error, got {res:?}");
+    }
+
+    #[test]
+    fn test_parse_addr_absolute_dotdot_within_bounds_normalizes() {
+        // A `..` that stays within the package tree is fine and normalizes
+        // like `join_rel_checked` does elsewhere.
+        let res = parse_addr("//a/b/../c:name").unwrap();
+        assert_eq!(res.package.as_str(), "a/c");
+    }
+
+    #[test]
+    fn test_parse_addr_with_base_absolute_dotdot_escapes_root_fails() {
+        // The absolute form bypasses `resolve_relative_pkg`'s guard by going
+        // straight through `parse_addr` — must still be rejected.
+        let base = PkgBuf::from("base/pkg");
+        let res = parse_addr_with_base("//../../etc:passwd", &base);
+        assert!(res.is_err(), "expected error, got {res:?}");
     }
 
     #[test]
