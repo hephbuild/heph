@@ -1009,6 +1009,17 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 }
 
 impl Driver {
+    /// The PATH injected into target processes, formatted for both the child's
+    /// env and the spawn-failure diagnostic. Empty `search_path` falls back to
+    /// a hardcoded default.
+    fn sandbox_path_display(&self) -> String {
+        if self.search_path.is_empty() {
+            ["/usr/local/bin", "/usr/bin", "/bin"].join(":")
+        } else {
+            self.search_path.join(":")
+        }
+    }
+
     async fn run_inner<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
@@ -1035,12 +1046,7 @@ impl Driver {
         if shell && let Ok(term) = std::env::var("TERM") {
             env.insert("TERM".to_string(), term);
         }
-        let path_value = if self.search_path.is_empty() {
-            ["/usr/local/bin", "/usr/bin", "/bin"].join(":")
-        } else {
-            self.search_path.join(":")
-        };
-        env.insert("PATH".to_string(), path_value);
+        env.insert("PATH".to_string(), self.sandbox_path_display());
         env.insert(
             "WORKSPACE_ROOT".to_string(),
             req.sandbox_ws_dir.to_string_lossy().to_string(),
@@ -1401,7 +1407,22 @@ impl Driver {
         };
 
         hcore::hmemoizer::set_phase("pluginexec:spawn");
-        let mut handle = proc_exec::spawn(spec).with_context(|| "spawn child process")?;
+        // Program/PATH/cwd are only formatted here, on the error path — `run`
+        // and `req` are still fully owned locals at this point (only cloned
+        // versions of their fields were moved into `spec` above), so no work
+        // happens on the far more common spawn-succeeds path.
+        let mut handle = proc_exec::spawn(spec).map_err(|e| {
+            let program = run.first().map_or("", String::as_str);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "spawn child process {program:?}: {e} — not found in the driver's sandbox PATH ({path}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd:?} exists.",
+                    path = self.sandbox_path_display(),
+                    cwd = req.sandbox_pkg_dir,
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("spawn child process {program:?}"))
+            }
+        })?;
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -2122,6 +2143,79 @@ mod tests {
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output.trim(), "hello");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_missing_program_reports_sandbox_path_not_shell_path() -> anyhow::Result<()> {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "path".to_string(),
+            serde_yaml::from_str("[/nonexistent-test-search-dir]").expect("yaml"),
+        );
+        let driver = Driver::from_options_exec(&opts)?;
+        let ctoken = StdCancellationToken::new();
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["definitely-not-a-real-binary-xyz".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: true,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        let res = driver.run(make_req(req), &ctoken).await;
+        let Err(err) = res else {
+            panic!("missing binary must fail");
+        };
+        let msg = err.to_string();
+        // Names the program and the sandbox PATH it was searched in (not the
+        // ambient shell PATH), and points at the config knob that controls it —
+        // otherwise this reads as a bare ENOENT with no actionable next step.
+        assert!(
+            msg.contains("definitely-not-a-real-binary-xyz"),
+            "missing program name: {msg}"
+        );
+        assert!(
+            msg.contains("/nonexistent-test-search-dir"),
+            "missing sandbox PATH: {msg}"
+        );
+        assert!(
+            msg.contains("`path` option in .hephconfig"),
+            "missing config hint: {msg}"
+        );
 
         Ok(())
     }
