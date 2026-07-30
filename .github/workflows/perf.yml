@@ -177,16 +177,26 @@ jobs:
       # `gh api` (against this repo, default token) and `git describe`
       # against a commit already present from the full-history checkout
       # above; no build, no checkout of that commit.
+      #
+      # Deliberately does NOT filter by the run's overall conclusion: whether
+      # a release was actually published is what "Fetch baseline" below
+      # checks (best-effort `gh release download`), not whether every other
+      # job in that run happened to pass. A run's Perf legs or an unrelated
+      # job (Binary E2E, say) can fail while `upload_artifacts` still
+      # published fine — gating on run-level success here made a single
+      # flake unrecoverable: the next commit's baseline lookup would find no
+      # "successful" run, fail its own Perf job for missing baseline, and the
+      # failure would propagate to every commit after it forever.
       - name: Resolve baseline release
         if: steps.base.outputs.sha != ''
         id: baseline_release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_NUMBER=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ steps.base.outputs.sha }}&status=success" \
+          RUN_NUMBER=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ steps.base.outputs.sha }}" \
             --jq '[.workflow_runs[] | select(.name=="CI" and .event=="push")] | first | .run_number // empty')
           if [ -z "$RUN_NUMBER" ]; then
-            echo "no successful master push run found for baseline ${{ steps.base.outputs.sha }}"
+            echo "no master push run found for baseline ${{ steps.base.outputs.sha }}"
             echo "found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
