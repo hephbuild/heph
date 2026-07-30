@@ -417,11 +417,16 @@ fn find_packages_sync(
     let mut has_build_file = false;
     for entry in &listing.entries {
         match entry.kind {
-            hwalk::EntryKind::File | hwalk::EntryKind::Symlink => {
+            // A symlinked BUILD file is not evidence of a package: `find_build_files`
+            // (run_file.rs) deliberately excludes symlinks when it later reads this
+            // package's build files, so counting one here would list a package that
+            // resolves zero targets when actually loaded.
+            hwalk::EntryKind::File => {
                 if patterns.iter().any(|p| p.matches(&entry.name)) {
                     has_build_file = true;
                 }
             }
+            hwalk::EntryKind::Symlink => {}
             hwalk::EntryKind::Dir => {
                 let entry_path = path.join(&entry.name);
                 let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
@@ -773,6 +778,47 @@ mod tests {
             vec!["".to_string(), "a".to_string(), "b".to_string()],
             "a newly-added package is re-discovered"
         );
+    }
+
+    /// A symlinked BUILD file is not a build file to `find_build_files` (run_file.rs
+    /// deliberately mirrors the prior `file_type().is_file()`), so `list_packages`
+    /// must not count it as package evidence either — otherwise a symlinked-BUILD
+    /// package appears in `heph query` but resolves zero targets when loaded.
+    #[tokio::test]
+    async fn test_list_packages_excludes_symlink_only_build_file() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("real.BUILD"), "").unwrap();
+
+        let pkg_dir = root.join("linked");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        std::os::unix::fs::symlink(root.join("real.BUILD"), pkg_dir.join("BUILD")).unwrap();
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+        let listed: Vec<String> = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().pkg.to_string())
+            .collect();
+        assert!(
+            !listed.contains(&"linked".to_string()),
+            "symlinked-BUILD package must not be listed: {listed:?}"
+        );
+
+        // Consistent with the listing: actually loading the package (as
+        // `find_build_files` would for evaluation) finds no build files either.
+        let result = provider.run_pkg("linked").await.expect("eval package");
+        assert!(result.targets.is_empty(), "{:?}", result.targets);
     }
 
     #[test]
