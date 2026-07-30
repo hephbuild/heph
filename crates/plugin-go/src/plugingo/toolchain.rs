@@ -61,10 +61,12 @@ use xxhash_rust::xxh3::Xxh3Default;
 /// A convenient pinned Go release for tests and as a documented example. The
 /// provider requires the toolchain to be chosen explicitly (`gotool` option),
 /// so this is not an implicit default for real builds — only a constant the
-/// test helpers and examples reference. A hermetic version's tarball SHA-256 may
-/// be supplied via the provider's optional `checksums` config option (see
-/// [`checksum_key`]) to enforce verification; there is no built-in checksum
-/// table, and an absent entry downloads unverified.
+/// test helpers and examples reference. A hermetic version's tarball SHA-256
+/// must be supplied via the provider's optional `checksums` config option (see
+/// [`checksum_key`]); there is no built-in checksum table, and resolving the
+/// toolchain target fails closed for a version/platform with no entry unless
+/// the provider's `allow_unverified_sdk` option is set (see
+/// `ProviderInner::handle_get`).
 pub const DEFAULT_GO_VERSION: &str = "1.26.4";
 
 /// Sentinel toolchain spec selecting the **host** `go` (read from `PATH` /
@@ -153,9 +155,10 @@ fn toolchain_entries() -> Vec<String> {
 /// built-in checksum table — each version's checksum is supplied via config
 /// (`checksums:` under the go plugin's `options:`), keeping the binary free of
 /// release-specific data and letting users pin new versions without a source
-/// change. Checksums are **optional**: a missing entry downloads the SDK
-/// unverified (the driver logs a warning); supply one to enforce verification.
-/// Sourced from <https://go.dev/dl/?mode=json>.
+/// change. A missing entry fails the toolchain target closed (see
+/// `ProviderInner::handle_get`) unless the provider's `allow_unverified_sdk`
+/// option is set, in which case the SDK downloads unverified (the driver logs
+/// a warning). Sourced from <https://go.dev/dl/?mode=json>.
 pub fn checksum_key(version: &str, goos: &str, goarch: &str) -> String {
     format!("{version}/{goos}/{goarch}")
 }
@@ -378,8 +381,10 @@ struct GoToolchainSpec {
     /// Host GOARCH the SDK runs on.
     #[spec(required)]
     goarch: String,
-    /// Expected SHA-256 of the downloaded tarball (hex). Empty = download
-    /// unverified (no `checksums` entry was configured for this version/platform).
+    /// Expected SHA-256 of the downloaded tarball (hex). Empty only reaches
+    /// here when the provider's `allow_unverified_sdk` escape hatch is set —
+    /// otherwise an unconfigured version/platform fails closed before a spec
+    /// with an empty `sha256` is ever built (see `ProviderInner::handle_get`).
     #[spec(required)]
     sha256: String,
     /// Declared outputs, grouped by name → list of output paths.
@@ -582,11 +587,11 @@ fn download_verify_extract(
 }
 
 /// Compare the downloaded tarball's `got` SHA-256 against the `expected` one.
-/// Checksum verification is optional: an empty `expected` (no `checksums` entry
-/// configured for this version/platform) means the SDK is downloaded
-/// **unverified** — allowed, but logged as a warning since it drops the
-/// supply-chain guarantee. A non-empty `expected` that doesn't match fails the
-/// build closed.
+/// An empty `expected` only ever reaches this point when the provider's
+/// `allow_unverified_sdk` escape hatch let an unconfigured version/platform
+/// through `ProviderInner::handle_get` — the SDK is downloaded **unverified**,
+/// logged as a warning since it drops the supply-chain guarantee. A non-empty
+/// `expected` that doesn't match fails the build closed.
 fn verify_checksum(expected: &str, got: &str, version: &str, url: &str) -> anyhow::Result<()> {
     if expected.is_empty() {
         tracing::warn!(
@@ -620,7 +625,10 @@ mod tests {
 
     #[test]
     fn test_verify_checksum_empty_expected_skips() {
-        // No configured checksum → unverified download is allowed (warns).
+        // Reaching `verify_checksum` with an empty `expected` only happens once
+        // `allow_unverified_sdk` has already let the caller through the
+        // fail-closed gate in `ProviderInner::handle_get` — at that point the
+        // download is allowed unverified (warns).
         assert!(verify_checksum("", "anything", "1.26.4", "http://x").is_ok());
     }
 
