@@ -363,7 +363,29 @@ pub async fn run<A: App + 'static>(
                     None => build_events = None,
                 }
             }
-            _ = ticker.tick(), if !paused => {
+            _ = ticker.tick() => {
+                // Deliberately NOT gated on `!paused`. While paused, the tick
+                // draws nothing — the terminal belongs to the interactive
+                // child — but it must keep firing as the loop's only
+                // self-wake: with the event stream torn down and the ticker
+                // off, the loop's sole remaining wake sources are the control
+                // channel and the app `JoinHandle`, and both of those wakes
+                // are issued from the app task, which by the end of a target
+                // has usually gone through `block_in_place` (pluginexec's
+                // macOS drain path) and lost its runtime core — so they ride
+                // tokio's cross-thread wake (`mio::Waker` → kqueue
+                // `EVFILT_USER`), observed to be droppable on macOS (see
+                // `hproc::proc_exec` and `hcore::blocking`). One dropped
+                // `Control::Resume` wake then left this loop parked forever
+                // in a runtime with no timers: frame frozen mid-pause, engine
+                // idle, process never exiting. A timer expiry is a kernel
+                // timeout on the parked driver, not an `EVFILT_USER` trigger,
+                // so the tick is the wake that cannot be lost; each one
+                // re-enters the loop and the next `select!` re-polls the
+                // control channel, observing any message whose wake vanished.
+                if paused {
+                    continue;
+                }
                 if needs_resize {
                     // Re-anchor the inline viewport at the new size before drawing.
                     // The tick is a synchronous draw-owning point, so the
@@ -716,6 +738,84 @@ mod tests {
         assert!(
             observed >= 3,
             "renderer must keep ticking while app is in block_in_place; got {observed} ticks during {BLOCK_MS} ms"
+        );
+    }
+
+    /// Regression for the darwin-only CI hang in `bin-e2e`'s
+    /// `tui_renders_the_run_and_restores_the_terminal`: the run finished
+    /// engine-side (stall watchdog reported `open=0`), the frame stayed frozen
+    /// at the pre-pause render, and the process never exited.
+    ///
+    /// While the TUI is paused for an interactive target, the event stream is
+    /// torn down and the ticker used to be gated off (`, if !paused`), so the
+    /// loop's only remaining wake sources were the control channel and the app
+    /// `JoinHandle`. Both of those wakes are issued by the app task, which by
+    /// the end of a target has typically passed through `block_in_place`
+    /// (pluginexec's macOS drain path) and lost its runtime core, so they ride
+    /// tokio's cross-thread wake — kqueue `EVFILT_USER`, observed to drop on
+    /// macOS (see `hproc::proc_exec`, `hcore::blocking`). One dropped
+    /// `Control::Resume` wake left the loop parked in a runtime with no timers
+    /// registered at all: nothing could ever poll it again. The fix keeps the
+    /// ticker armed while paused (drawing nothing) as a wake the kernel
+    /// timeout delivers, so a message whose wake vanished is still observed on
+    /// the next tick's re-poll of the select.
+    ///
+    /// A genuinely dropped tokio wake cannot be forced from a test, so — like
+    /// the other tests in this module — this mirrors the loop's shape rather
+    /// than driving `run` itself (which needs a real terminal). The dropped
+    /// wake is modelled precisely: state that is observable by polling but
+    /// whose change produces *no* wake (an atomic flipped from a plain OS
+    /// thread), next to a control arm that never wakes. With the pre-fix shape
+    /// (tick arm gated on `!paused`) this loop has no wake source left and
+    /// hangs until the timeout; with the ticker armed it converges within a
+    /// few frames. What it does not prove: that `run`'s real arm carries no
+    /// gate — that line is covered by review, not by this mirror.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_loop_keeps_ticking_so_a_wakeless_resume_is_still_observed() {
+        use std::sync::atomic::AtomicBool;
+
+        // "A Resume is queued, but the wake that should announce it was
+        // dropped": observable state, zero waker traffic.
+        let resume_queued = Arc::new(AtomicBool::new(false));
+        {
+            let resume_queued = Arc::clone(&resume_queued);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                resume_queued.store(true, Ordering::Release);
+            });
+        }
+
+        let mut paused = true;
+        let mut interval = tokio::time::interval(TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    // The control channel whose wake never arrives.
+                    () = std::future::pending::<()>() => {}
+                    _ = interval.tick() => {
+                        // Mirrors the fix: the tick arm is NOT gated on
+                        // `!paused`; while paused it only re-enters the loop,
+                        // which is what lets the next poll observe the queued
+                        // resume.
+                        if paused && resume_queued.load(Ordering::Acquire) {
+                            paused = false;
+                        }
+                        if !paused {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a paused loop whose ticker is gated off has no wake source left \
+             once a cross-thread wake is dropped; the tick must stay armed \
+             while paused"
         );
     }
 
