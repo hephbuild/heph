@@ -5,8 +5,14 @@
 //! Only prebuilt artifacts are used, located the same way
 //! `crates/bin-e2e/tests/common/mod.rs`'s `Dist` does: a normalized
 //! directory (`heph`, `heph-<name>-plugin.<ext>`), never rebuilt here.
+//!
+//! Unlike Tier A, the thing under test here (the real `heph` binary) is
+//! already a prebuilt artifact on both sides, and the code driving it
+//! (this module) is always the current checkout's own — there is no
+//! per-commit "subject" binary to keep a stable contract with. `prepare`/
+//! `measure_once` still split the same way as `inprocess`'s for a uniform
+//! orchestrator shape, not because a compatibility seam requires it here.
 
-use crate::timing::{RunOptions, RunResults, ScenarioResult};
 use anyhow::{Context, Result, bail};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
@@ -73,7 +79,8 @@ fn host_arch() -> &'static str {
 
 /// Write the go-plugin manifest + a `.hephconfig` pointing at it, into
 /// `corpus` — a real config a real `heph` invocation loads, forcing the
-/// dlopen + ABI-negotiation + checksum-verify path.
+/// dlopen + ABI-negotiation + checksum-verify path. `corpus` must already be
+/// absolute (see `Dist::locate`'s comment for why).
 fn write_go_config(corpus: &Path, dist: &Dist) -> Result<()> {
     let dylib = dist.plugin("go");
     if !dylib.is_file() {
@@ -117,7 +124,7 @@ pub enum Scenario {
 }
 
 impl Scenario {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Scenario::Cold => "cold",
             Scenario::FullHit => "full-hit",
@@ -138,11 +145,13 @@ fn wipe_cache(corpus: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_go_tree(dist: &Dist, corpus: &Path, home: &Path) -> Result<()> {
+fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
+    let home = tempfile::tempdir().context("create HOME tempdir")?;
+    let start = Instant::now();
     let out = Command::new(dist.heph())
         .args(["r", "build", "//go/..."])
         .current_dir(corpus)
-        .env("HOME", home)
+        .env("HOME", home.path())
         .env("HEPH_CWD", corpus)
         .env("HEPH_NO_SELF_UPDATE", "1")
         .env("HEPH_DISABLE_TELEMETRY", "1")
@@ -157,89 +166,52 @@ fn build_go_tree(dist: &Dist, corpus: &Path, home: &Path) -> Result<()> {
             String::from_utf8_lossy(&out.stderr),
         );
     }
+    Ok(start.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// `corpus` must already be absolute (canonicalize before calling — see
+/// `write_go_config`'s comment on why a relative path breaks once `heph`
+/// runs with `current_dir(corpus)`).
+pub fn prepare(dist_dir: &Path, corpus: &Path, scenario: Scenario) -> Result<()> {
+    let dist = Dist::locate(dist_dir)?;
+    write_go_config(corpus, &dist)?;
+    match scenario {
+        Scenario::Cold | Scenario::FullHit | Scenario::Incremental => {
+            wipe_cache(corpus)?;
+            build_go_tree(&dist, corpus)?;
+        }
+    }
     Ok(())
 }
 
-pub fn run(
+/// One measured rep. `mutate_seed` only matters for `Incremental` (ignored
+/// otherwise) — the caller must vary it across repeated calls against the
+/// same corpus, or every call mutates the same files again. `corpus` must
+/// already be absolute, same as `prepare`.
+pub fn measure_once(
     dist_dir: &Path,
     corpus: &Path,
     manifest: &CorpusManifest,
     scenario: Scenario,
-    opts: &RunOptions,
-) -> Result<RunResults> {
+    mutate_seed: u64,
+) -> Result<f64> {
     if manifest.go_package_count == 0 {
         bail!(
             "corpus has no go/ subtree (generate with --go-packages > 0) — nothing for Tier B to build"
         );
     }
-    // Absolute: `write_go_config` writes this same path into `.hephconfig`'s
-    // `path:` entry, and `build_go_tree` spawns `heph` with
-    // `current_dir(corpus)` — a relative `--corpus` (the common case) would
-    // have `heph` re-resolve that config path against its OWN cwd, which is
-    // already inside `corpus`, landing on the wrong (doubled) directory.
-    let corpus = &corpus
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", corpus.display()))?;
     let dist = Dist::locate(dist_dir)?;
     write_go_config(corpus, &dist)?;
-    let home = tempfile::tempdir().context("create HOME tempdir")?;
 
-    let mut wall_ms = Vec::with_capacity(opts.reps);
-    let timed_build = |home: &Path| -> Result<f64> {
-        let start = Instant::now();
-        build_go_tree(&dist, corpus, home)?;
-        Ok(start.elapsed().as_secs_f64() * 1000.0)
-    };
-
-    match scenario {
-        Scenario::Cold => {
-            for _ in 0..opts.warmup {
-                wipe_cache(corpus)?;
-                timed_build(home.path())?;
-            }
-            for _ in 0..opts.reps {
-                wipe_cache(corpus)?;
-                wall_ms.push(timed_build(home.path())?);
-            }
-        }
-        Scenario::FullHit => {
-            if !opts.skip_prepare {
-                wipe_cache(corpus)?;
-                for _ in 0..opts.warmup {
-                    timed_build(home.path())?;
-                }
-            }
-            for _ in 0..opts.reps {
-                wall_ms.push(timed_build(home.path())?);
-            }
-        }
-        Scenario::Incremental => {
-            if !opts.skip_prepare {
-                wipe_cache(corpus)?;
-                for _ in 0..opts.warmup {
-                    timed_build(home.path())?;
-                }
-            }
-            for i in 0..opts.reps {
-                // Mutates the go/ subtree being built here, not the bash
-                // pkgN packages `bench_corpus::incrementalize` touches — Tier
-                // B only builds `//go/...`.
-                bench_corpus::incrementalize_go(
-                    &corpus.join("go"),
-                    0.01,
-                    0xDEC1 ^ (opts.rep_offset + i) as u64,
-                )
-                .context("mutate go corpus for incremental scenario")?;
-                wall_ms.push(timed_build(home.path())?);
-            }
-        }
+    if let Scenario::Cold = scenario {
+        wipe_cache(corpus)?;
     }
-
-    Ok(RunResults {
-        tier: "dist".to_string(),
-        scenarios: vec![ScenarioResult {
-            scenario: scenario.name().to_string(),
-            wall_ms,
-        }],
-    })
+    if let Scenario::Incremental = scenario {
+        // Mutates the go/ subtree being built here, not the bash pkgN
+        // packages `bench_corpus::incrementalize` touches — Tier B only
+        // builds `//go/...`.
+        bench_corpus::incrementalize_go(&corpus.join("go"), 0.01, 0xDEC1 ^ mutate_seed)
+            .context("mutate go corpus for incremental scenario")?;
+    }
+    build_go_tree(&dist, corpus)
 }
