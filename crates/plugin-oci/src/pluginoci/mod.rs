@@ -266,8 +266,14 @@ struct OciImageSpec {
     /// bases = {"base": ":alpine"}      # Dockerfile: FROM base
     /// ```
     ///
+    /// The name also works as a multi-stage source — `COPY --from=base /x /x`
+    /// pulls files out of it without a `FROM`.
+    ///
     /// The referenced target must expose an OCI **layout directory** — that is
-    /// `oci_pull(layout = True)`. Hashed inputs, like `context`.
+    /// `oci_pull(layout = True)`. For a multi-platform build it must also be
+    /// `all_platforms = True`: a layout holding one instance has no manifest for
+    /// the other platforms, and the build fails on whichever one it was not
+    /// pulled for. Hashed inputs, like `context`.
     bases: HashMap<String, Vec<String>>,
     /// Archive format: `oci` (default) or `docker`.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
@@ -570,6 +576,49 @@ pub(crate) fn ws_path(pkg: &str, rel: &str) -> String {
     } else {
         format!("{pkg}/{rel}")
     }
+}
+
+/// The platform a `skopeo`-driven pull/load resolves to when the BUILD file does
+/// not name one: Linux on the host's own architecture.
+///
+/// The OS is pinned to `linux` rather than taken from the host because container
+/// images are Linux images — on macOS, `skopeo` would otherwise ask a manifest
+/// list for a `darwin` instance that does not exist and fail, while `docker`
+/// would quietly get `linux` from the daemon's VM. Same target, two different
+/// answers, one of them an error.
+pub(crate) fn default_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("linux/{arch}")
+}
+
+/// Split `os/arch` into its parts.
+pub(crate) fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
+    // A platform may carry a variant (`linux/arm/v7`); only os and arch are
+    // addressable by skopeo's override flags.
+    let mut parts = platform.splitn(3, '/');
+    match (parts.next(), parts.next()) {
+        (Some(os), Some(arch)) if !os.is_empty() && !arch.is_empty() => Ok((os, arch)),
+        _ => anyhow::bail!("`platform` must look like `os/arch`, got {platform:?}"),
+    }
+}
+
+/// The `skopeo` flags that pin which instance is taken out of a manifest list.
+///
+/// Without them skopeo matches against the host's own GOOS/GOARCH — which is
+/// `darwin` on macOS, where no Linux image has a matching instance, so a
+/// multi-arch archive fails to copy at all.
+pub(crate) fn platform_override_args(platform: &str) -> anyhow::Result<[String; 4]> {
+    let (os, arch) = split_platform(platform)?;
+    Ok([
+        "--override-os".to_string(),
+        os.to_string(),
+        "--override-arch".to_string(),
+        arch.to_string(),
+    ])
 }
 
 /// Extract the builder's first (default) platform from `docker buildx inspect`
@@ -918,14 +967,26 @@ impl ManagedDriver for Driver {
         run_tool(argv, &context_dir, "docker buildx build", &mut io, ctoken)
             .await
             .with_context(|| {
-                if def.platforms.len() > 1 {
-                    format!(
-                        "oci_image {addr}: multi-platform builds need a container builder — \
-                         `docker buildx create --use --driver docker-container`"
-                    )
-                } else {
-                    format!("oci_image {addr}")
+                if def.platforms.len() <= 1 {
+                    return format!("oci_image {addr}");
                 }
+                // The two ways a multi-platform build fails that a single-platform
+                // one cannot: the default daemon builder does not do them at all,
+                // and a single-instance base has no manifest for the other
+                // platforms. Both read as an opaque buildx error otherwise.
+                let bases = if def.bases.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", and every base in `bases` ({}) must be pulled with \
+                         `all_platforms = True`",
+                        def.bases.join(", ")
+                    )
+                };
+                format!(
+                    "oci_image {addr}: multi-platform builds need a container builder — \
+                     `docker buildx create --use --driver docker-container`{bases}"
+                )
             })?;
 
         let metadata = tokio::fs::read_to_string(&metadata_file)

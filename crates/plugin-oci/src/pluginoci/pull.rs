@@ -25,6 +25,11 @@
 //!   for two different images, and would fail outright on macOS, where skopeo
 //!   would ask for a `darwin` instance no Linux image publishes. So the platform
 //!   is always resolved to a concrete `os/arch` and always hashed.
+//!
+//!   `all_platforms = True` is the other half of that: it keeps the whole index
+//!   rather than selecting one instance, which is what a base image for a
+//!   **multi-platform** `oci_image` has to be — a one-instance layout has no
+//!   manifest for the architectures it was not pulled for.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -67,8 +72,26 @@ struct OciPullSpec {
     /// `os/arch` (e.g. `linux/arm64`). Defaults to Linux on the host's
     /// architecture, and is always part of the cache key — otherwise an arm64
     /// and an amd64 machine would share one entry for two different images.
+    ///
+    /// Mutually exclusive with `all_platforms`.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     platform: Option<String>,
+    /// Pull **every** instance of the manifest list instead of selecting one,
+    /// keeping the index intact (`skopeo --multi-arch all`).
+    ///
+    /// This is what a base image for a multi-platform `oci_image` needs: a
+    /// single-instance layout has no manifest for the other platforms, so
+    /// `platforms = ["linux/amd64", "linux/arm64"]` would fail on whichever one
+    /// the base was not pulled for. Pair it with `layout = True`:
+    ///
+    /// ```python
+    /// oci_pull(name = "alpine", ref = "alpine:3.20", layout = True, all_platforms = True)
+    /// oci_image(name = "img", bases = {"base": ":alpine"},
+    ///           platforms = ["linux/amd64", "linux/arm64"])
+    /// ```
+    ///
+    /// Requires `tool = "skopeo"` — `docker save` writes one image, not an index.
+    all_platforms: bool,
     /// Output filename (or directory name, with `layout = True`), relative to
     /// the target's package. Must be a bare name. Default `<target name>.tar`,
     /// or `<target name>.oci` for a layout.
@@ -88,6 +111,25 @@ struct OciPullSpec {
     cache: TargetSpecCache,
 }
 
+/// Which instance(s) of a manifest list a pull takes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PlatformSelect {
+    /// One concrete `os/arch`, pinned with skopeo's override flags.
+    One(String),
+    /// Every instance, index intact (`--multi-arch all`).
+    All,
+}
+
+impl PlatformSelect {
+    /// Stable label for hashing and for the `oci_pull: pulled` log line.
+    fn label(&self) -> &str {
+        match self {
+            PlatformSelect::One(p) => p,
+            PlatformSelect::All => "all",
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciPullDef {
     src: String,
@@ -95,16 +137,16 @@ struct OciPullDef {
     /// Workspace-relative output archive (or layout directory) path.
     out: String,
     layout: bool,
-    /// The `os/arch` instance selected from the manifest list. Always concrete,
-    /// never "whatever the host is" — that is what makes the key honest.
-    platform: String,
+    /// Which instance of the manifest list is pulled. Never "whatever the host
+    /// is" — that is what makes the key honest.
+    platform: PlatformSelect,
     insecure: bool,
     tool: Tool,
 }
 
-/// v2: the selected platform is part of the key, and `layout` changes the output
-/// shape.
-const OCI_PULL_FORMAT_VERSION: u32 = 2;
+/// v3: `all_platforms` pulls the whole index, so the platform selection is no
+/// longer a single `os/arch` string.
+const OCI_PULL_FORMAT_VERSION: u32 = 3;
 
 impl Hash for OciPullDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -113,27 +155,10 @@ impl Hash for OciPullDef {
         self.format.transport().hash(state);
         self.out.hash(state);
         self.layout.hash(state);
-        self.platform.hash(state);
+        self.platform.label().hash(state);
         self.insecure.hash(state);
         self.tool.label().hash(state);
     }
-}
-
-/// The platform a bare `oci_pull` resolves to: Linux on the host's own
-/// architecture.
-///
-/// The OS is pinned to `linux` rather than taken from the host because container
-/// images are Linux images — on macOS, `skopeo` would otherwise ask a manifest
-/// list for a `darwin` instance that does not exist and fail, while `docker`
-/// would quietly get `linux` from the daemon's VM. Same target, two different
-/// answers, one of them an error.
-fn default_platform() -> String {
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    };
-    format!("linux/{arch}")
 }
 
 /// True when `ref` is pinned to a content digest (`…@sha256:<64 hex>`), the only
@@ -148,17 +173,6 @@ fn is_digest_pinned(image_ref: &str) -> bool {
         return false;
     };
     !algo.is_empty() && hex.len() >= 32 && hex.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Split `os/arch` into its parts.
-fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
-    // A platform may carry a variant (`linux/arm/v7`); only os and arch are
-    // addressable by skopeo's override flags.
-    let mut parts = platform.splitn(3, '/');
-    match (parts.next(), parts.next()) {
-        (Some(os), Some(arch)) if !os.is_empty() && !arch.is_empty() => Ok((os, arch)),
-        _ => anyhow::bail!("`platform` must look like `os/arch`, got {platform:?}"),
-    }
 }
 
 /// Pull an image into a docker-format archive with the docker CLI: pull it into
@@ -211,23 +225,27 @@ async fn docker_pull(
 fn pull_argv(
     skopeo_bin: &str,
     src: &str,
-    platform: &str,
+    platform: &PlatformSelect,
     dest: &str,
     insecure: bool,
 ) -> anyhow::Result<Vec<String>> {
-    let (os, arch) = split_platform(platform)?;
     let mut argv = vec![
         skopeo_bin.to_string(),
         "copy".to_string(),
         "--insecure-policy".to_string(),
+    ];
+    match platform {
         // Pin the instance chosen out of a manifest list. Without these skopeo
         // takes the host's GOOS/GOARCH — which is `darwin` on macOS, where no
         // Linux image has a matching instance.
-        "--override-os".to_string(),
-        os.to_string(),
-        "--override-arch".to_string(),
-        arch.to_string(),
-    ];
+        PlatformSelect::One(p) => argv.extend(super::platform_override_args(p)?),
+        // Copy every instance and keep the index, so a multi-platform build can
+        // resolve its own architecture out of the result.
+        PlatformSelect::All => {
+            argv.push("--multi-arch".to_string());
+            argv.push("all".to_string());
+        }
+    }
     if insecure {
         argv.push("--src-tls-verify=false".to_string());
     }
@@ -291,10 +309,26 @@ impl ManagedDriver for Driver {
             );
         }
 
-        let platform = spec.platform.unwrap_or_else(default_platform);
-        // Validate now rather than at run time: a malformed platform is a typo
-        // in the BUILD file, and parse is where the user finds out.
-        split_platform(&platform)?;
+        if spec.all_platforms && tool == Tool::Docker {
+            anyhow::bail!(
+                "`all_platforms = True` requires tool = \"skopeo\": `docker save` writes a single \
+                 image, not a manifest list"
+            );
+        }
+        let platform = match (spec.all_platforms, spec.platform) {
+            (true, Some(p)) => anyhow::bail!(
+                "`all_platforms = True` pulls every instance, so `platform` ({p:?}) has nothing to \
+                 select; drop one of them"
+            ),
+            (true, None) => PlatformSelect::All,
+            // Validate now rather than at run time: a malformed platform is a
+            // typo in the BUILD file, and parse is where the user finds out.
+            (false, Some(p)) => {
+                super::split_platform(&p)?;
+                PlatformSelect::One(p)
+            }
+            (false, None) => PlatformSelect::One(super::default_platform()),
+        };
 
         let default_out = if spec.layout {
             format!("{}.oci", addr.name)
@@ -416,10 +450,18 @@ impl ManagedDriver for Driver {
                     .with_context(|| format!("pull image {}", def.src))?;
             }
             Tool::Docker => {
+                // `all_platforms` is rejected at parse for this tool, so the
+                // selection is always a concrete platform here.
+                let PlatformSelect::One(platform) = &def.platform else {
+                    anyhow::bail!(
+                        "internal: oci_pull with tool = \"docker\" reached run with an \
+                         all-platforms selection"
+                    )
+                };
                 docker_pull(
                     &self.tools.docker,
                     &def.src,
-                    &def.platform,
+                    platform,
                     &out_path,
                     &cwd,
                     &mut io,
@@ -432,7 +474,7 @@ impl ManagedDriver for Driver {
         tracing::info!(
             addr,
             image = def.src,
-            platform = def.platform,
+            platform = def.platform.label(),
             "oci_pull: pulled"
         );
         Ok(ManagedRunResponse { artifacts: vec![] })
@@ -483,7 +525,7 @@ mod tests {
         let argv = pull_argv(
             "skopeo",
             "docker.io/library/alpine:3.20",
-            "linux/arm64",
+            &PlatformSelect::One("linux/arm64".to_string()),
             "oci-archive:/sbx/base/image.tar",
             false,
         )
@@ -510,7 +552,7 @@ mod tests {
         let argv = pull_argv(
             "skopeo",
             "alpine:3.20",
-            "linux/amd64",
+            &PlatformSelect::One("linux/amd64".to_string()),
             "oci-archive:/t/i.tar",
             false,
         )
@@ -522,9 +564,34 @@ mod tests {
 
     #[test]
     fn pull_argv_rejects_malformed_platform() {
-        let err = pull_argv("skopeo", "alpine", "linux", "oci-archive:/t.tar", false)
-            .expect_err("a platform without an arch must fail");
+        let err = pull_argv(
+            "skopeo",
+            "alpine",
+            &PlatformSelect::One("linux".to_string()),
+            "oci-archive:/t.tar",
+            false,
+        )
+        .expect_err("a platform without an arch must fail");
         assert!(format!("{err:#}").contains("os/arch"), "got: {err:#}");
+    }
+
+    /// `all_platforms` keeps the manifest list instead of selecting an instance
+    /// — the only shape a base image for a multi-platform build can have. The
+    /// override flags must be gone: they would narrow the copy back to one.
+    #[test]
+    fn pull_argv_all_platforms_copies_the_whole_index() {
+        let argv = pull_argv(
+            "skopeo",
+            "alpine:3.20",
+            &PlatformSelect::All,
+            "oci:/t/base.oci:latest",
+            false,
+        )
+        .expect("argv");
+        let joined = argv.join(" ");
+        assert!(joined.contains("--multi-arch all"), "{joined}");
+        assert!(!joined.contains("--override-os"), "{joined}");
+        assert!(!joined.contains("--override-arch"), "{joined}");
     }
 
     #[test]
@@ -532,7 +599,7 @@ mod tests {
         let argv = pull_argv(
             "skopeo",
             "localhost:5000/app:dev",
-            "linux/amd64",
+            &PlatformSelect::One("linux/amd64".to_string()),
             "docker-archive:/t/image.tar",
             true,
         )
@@ -606,11 +673,14 @@ mod tests {
         )
         .await;
         let def = resp.target_def.def::<OciPullDef>();
-        assert_eq!(def.platform, default_platform());
+        assert_eq!(
+            def.platform,
+            PlatformSelect::One(super::super::default_platform())
+        );
         assert!(
-            def.platform.starts_with("linux/"),
+            def.platform.label().starts_with("linux/"),
             "container images are linux images even on a mac host: {}",
-            def.platform
+            def.platform.label()
         );
     }
 
@@ -650,6 +720,90 @@ mod tests {
             .err()
             .expect("docker cannot write an OCI layout");
         assert!(format!("{err:#}").contains("layout"), "got: {err:#}");
+    }
+
+    /// The multi-arch base recipe: an all-platforms layout, which is what a
+    /// `platforms = [...]` build needs from its `bases` entry.
+    #[tokio::test]
+    async fn parse_all_platforms_selects_the_whole_index() {
+        let resp = parse(
+            "//base:alpine",
+            cfg(&[
+                ("ref", Value::String(PINNED.to_string())),
+                ("layout", Value::Bool(true)),
+                ("all_platforms", Value::Bool(true)),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            resp.target_def.def::<OciPullDef>().platform,
+            PlatformSelect::All
+        );
+    }
+
+    /// A one-instance archive and a full index are different bytes under the same
+    /// ref — they must not share a cache entry.
+    #[tokio::test]
+    async fn parse_hash_differs_between_all_platforms_and_one() {
+        let one = parse(
+            "//base:x",
+            cfg(&[("ref", Value::String(PINNED.to_string()))]),
+        )
+        .await;
+        let all = parse(
+            "//base:x",
+            cfg(&[
+                ("ref", Value::String(PINNED.to_string())),
+                ("all_platforms", Value::Bool(true)),
+            ]),
+        )
+        .await;
+        assert_ne!(one.target_def.hash, all.target_def.hash);
+    }
+
+    /// `docker save` writes one image, so the flag could only be silently
+    /// dropped — the user would get a single-arch base and a build that fails on
+    /// the other platform.
+    #[tokio::test]
+    async fn parse_all_platforms_with_docker_tool_fails() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//base:x",
+                    cfg(&[
+                        ("ref", Value::String(PINNED.to_string())),
+                        ("format", Value::String("docker".to_string())),
+                        ("all_platforms", Value::Bool(true)),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("all_platforms + docker must fail");
+        assert!(format!("{err:#}").contains("all_platforms"), "got: {err:#}");
+    }
+
+    /// Asking for every instance *and* naming one is a contradiction; honouring
+    /// either silently would hand back an archive the BUILD file did not ask for.
+    #[tokio::test]
+    async fn parse_all_platforms_and_platform_are_exclusive() {
+        let err = Driver::new()
+            .parse(
+                parse_req(
+                    "//base:x",
+                    cfg(&[
+                        ("ref", Value::String(PINNED.to_string())),
+                        ("all_platforms", Value::Bool(true)),
+                        ("platform", Value::String("linux/amd64".to_string())),
+                    ]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("all_platforms + platform must fail");
+        assert!(format!("{err:#}").contains("all_platforms"), "got: {err:#}");
     }
 
     /// `out` names a file in the package dir; a subdirectory would declare an

@@ -224,6 +224,72 @@ target(
     Ok(())
 }
 
+/// A multi-stage, multi-arch image: the stage and the whole platform list reach
+/// the builder, and two targets that differ only by stage are two cache entries.
+/// Collapsing them would serve one stage's image under the other's name.
+#[tokio::test]
+async fn test_oci_image_multi_stage_multi_arch() -> anyhow::Result<()> {
+    let fake = Fake::new();
+    let ws = workspace_with_fake(&fake);
+    ws.write_build_file(
+        "app",
+        r#"
+target(
+    name = "dockerfile",
+    driver = "bash",
+    run = "printf 'FROM scratch AS build\nFROM scratch AS runtime\n' > $OUT",
+    out = "Dockerfile",
+)
+target(
+    name = "runtime",
+    driver = "oci_image",
+    context = [":dockerfile"],
+    stage = "runtime",
+    platforms = ["linux/amd64", "linux/arm64"],
+    out = "runtime.tar",
+)
+target(
+    name = "build",
+    driver = "oci_image",
+    context = [":dockerfile"],
+    stage = "build",
+    platforms = ["linux/amd64", "linux/arm64"],
+    out = "build.tar",
+)
+"#,
+    );
+
+    ws.run("//app:runtime").await?;
+    let call = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.contains("buildx build"))
+        .expect("a buildx build call");
+    assert!(
+        call.contains("--platform linux/amd64,linux/arm64"),
+        "the whole platform list must reach the builder, got: {call}"
+    );
+    assert!(
+        call.contains("--target runtime"),
+        "the stage must reach the builder as --target, got: {call}"
+    );
+
+    // Same context, same platforms, different stage: a second build, not a hit.
+    ws.run("//app:build").await?;
+    assert_eq!(
+        fake.builds(),
+        2,
+        "a different stage is a different image and must not hit the first one's entry"
+    );
+    let stages: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.contains("buildx build"))
+        .collect();
+    assert!(stages[1].contains("--target build"), "got: {}", stages[1]);
+    Ok(())
+}
+
 /// A failing build fails the target, and the builder's own message survives to
 /// the user. The archive never becomes an artifact, so a broken build cannot
 /// poison the cache.
