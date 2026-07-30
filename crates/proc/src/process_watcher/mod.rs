@@ -6,7 +6,8 @@
 //!
 //! Compared to `tokio::process::Child::wait` this bypasses tokio's
 //! SIGCHLD-based reaper, which is unreliable on macOS for session leaders
-//! and starves under heavy runtime load (see `RCA_MACOS_WAKER.md`).
+//! and starves under heavy runtime load (see the macOS waker hazard in
+//! `crate::proc_exec`).
 //!
 //! Registration ordering: callers must register the pid **immediately**
 //! after `Command::spawn` and before any other code can race-reap it.

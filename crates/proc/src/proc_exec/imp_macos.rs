@@ -1,13 +1,18 @@
 //! macOS subprocess pipeline: `std::process` + `std::thread` + `std::sync::mpsc`.
 //!
 //! No tokio types touch the spawn/drain/wait path. The only point where tokio
-//! is involved is `block_or_inline` at the async boundary so the
-//! calling task synchronously parks on `std::sync::mpsc::Receiver::recv`
-//! (kernel condvar). Tokio's cross-thread waker (`mio::Waker` → `EVFILT_USER`)
-//! is never used.
+//! is involved is `block_in_place` at the async boundary, so the calling task
+//! synchronously parks on a `std::sync::mpsc` condvar. Tokio's cross-thread
+//! waker (`mio::Waker` → `EVFILT_USER`) is never used — see the module docs on
+//! [`super`] for why, and note that this rules out `yield_now` *after* a
+//! `block_in_place` as much as it rules out `spawn_blocking`: once the core has
+//! been handed off, the task's own wake goes out over the remote path. Where a
+//! blocking wait needs to be interruptible it terminates on a flag, not on a
+//! wake.
 
 use crate::process_supervisor;
 use crate::process_watcher;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use hcore::hasync::Cancellable;
 use std::io::{self, Write as _};
 use std::os::unix::process::CommandExt as _;
@@ -19,7 +24,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::{CHUNK_SIZE, Spec};
+use super::{CHUNK_SIZE, STREAM_DRAIN_CHUNKS, Spec, StreamId};
 
 /// Granularity for `recv_timeout` polls during `wait_or_cancel`. 100ms keeps
 /// CPU idle while still giving sub-second cancel response. Independent of
@@ -44,41 +49,30 @@ const DRAIN_JOIN_BUDGET: Duration = super::DRAIN_DEADLINE;
 /// `exit_rx`. Short enough to keep latency low; large enough not to spin.
 const DRAIN_JOIN_POLL: Duration = Duration::from_millis(10);
 
+/// How often the merged output park re-checks [`Handle`]'s `abandoned` flag.
+///
+/// This is a **liveness backstop, not a poll loop**: a chunk wakes the park
+/// immediately, so a live stream never pays for it, and the whole loop runs
+/// inside a *single* `block_in_place` — one worker handoff per park, exactly
+/// as an unsliced `recv()` costs. The tick only decides how quickly the
+/// reader notices that no chunk is ever coming.
+///
+/// It has to be a flag rather than an enclosing `timeout`. A future parked in
+/// `block_in_place` is never `Pending`, so nothing outside it can end it —
+/// `timeout` cannot fire, `select!` cannot drop the branch, `abort` has no
+/// yield point. The obvious repair, returning `Pending` between ticks, is
+/// worse than the disease: after `block_in_place` gives the core away the task
+/// usually resumes core-less, so its next wake goes out through
+/// `push_remote_task` → `notify_parked_remote` → `mio::Waker` → `EVFILT_USER`
+/// — the very wake this module exists to avoid depending on. Terminating on a
+/// flag the drain side sets keeps the whole path on the condvar.
+const OUTPUT_PARK_TICK: Duration = Duration::from_millis(100);
+
 fn is_multi_thread() -> bool {
     matches!(
         tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)
     )
-}
-
-/// Receive one value from a `std::sync::mpsc::Receiver` asynchronously.
-///
-/// On multi-thread runtimes, parks the calling worker via `block_in_place`
-/// on the channel's internal condvar — kernel wake, bypasses tokio's
-/// macOS-flaky cross-thread waker.
-///
-/// On current-thread runtimes (unit tests only), polls with `try_recv` +
-/// `tokio::time::sleep`. `block_in_place` would panic; calling `recv()`
-/// directly would block the only thread and starve every sibling task.
-/// The polling path is CPU-acceptable under test load and tolerates the
-/// macOS waker bug because tests don't reach the concurrency that triggers
-/// it.
-async fn recv_async<T: Send + 'static>(
-    rx: &mut std::sync::mpsc::Receiver<T>,
-) -> Result<T, mpsc::RecvError> {
-    if is_multi_thread() {
-        tokio::task::block_in_place(|| rx.recv())
-    } else {
-        loop {
-            match rx.try_recv() {
-                Ok(v) => return Ok(v),
-                Err(mpsc::TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
-            }
-        }
-    }
 }
 
 /// Synchronously park the calling worker on `f` (multi-thread) or call `f`
@@ -97,11 +91,68 @@ where
     }
 }
 
-/// Async chunk reader backed by a `std::sync::mpsc::Receiver`. Each
-/// `recv()` parks the calling worker via `block_in_place` on the condvar
-/// inside the channel; never goes through tokio's waker.
-pub struct ChunkReader {
-    rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+/// One item on the merged drain channel. Chunks carry the stream they came
+/// from so the single consumer can route them.
+///
+/// There is no explicit per-stream EOF marker: a drain thread owns its clone
+/// of the sender and drops it on return, so "both streams finished" is
+/// exactly "the channel disconnected". Nothing downstream needs to observe
+/// one stream ending while the other runs.
+enum DrainMsg {
+    Chunk(StreamId, Vec<u8>),
+    Err(StreamId, io::Error),
+}
+
+/// How much the drain threads may buffer ahead of the consumer.
+///
+/// Deliberately per-call-site rather than one global policy:
+///
+/// - **Streaming** ([`spawn`]) has a consumer running concurrently with the
+///   child, so a bound turns into backpressure on the child and caps the
+///   parent's heap.
+/// - **Batch** ([`output`]) has *no* consumer until the child has been
+///   reaped — it collects with `take_queued` afterwards. A bound there is a
+///   guaranteed deadlock: the drain would block in `send`, stop reading, the
+///   pipe would fill, and the child would never exit to release the wait that
+///   would start the consumer.
+///
+/// `crossbeam_channel` rather than `std::sync::mpsc` only because std splits
+/// bounded and unbounded into two *sender* types, which would force an enum
+/// and a hand-written `send` on every drain thread to carry the choice.
+/// Crossbeam's park is the same kernel wait, so the no-tokio-waker property
+/// is unchanged.
+#[derive(Clone, Copy)]
+enum DrainCapacity {
+    Bounded(usize),
+    Unbounded,
+}
+
+impl DrainCapacity {
+    fn channel(self) -> (Sender<DrainMsg>, Receiver<DrainMsg>) {
+        match self {
+            Self::Bounded(n) => crossbeam_channel::bounded(n),
+            Self::Unbounded => crossbeam_channel::unbounded(),
+        }
+    }
+}
+
+/// Async reader over **both** of the child's output streams, backed by one
+/// `std::sync::mpsc::Receiver`. Each `recv()` parks the calling worker via
+/// `block_in_place` on the condvar inside the channel; never goes through
+/// tokio's waker.
+///
+/// One receiver for two streams is the point. A per-stream reader whose
+/// `recv` blocks the task means the first stream polled owns the task until
+/// the child exits, and the other stream's output is invisible until then —
+/// a compile that is quiet on stdout and noisy on stderr showed nothing at
+/// all until it finished.
+pub struct OutputReader {
+    rx: Receiver<DrainMsg>,
+    /// Set by the [`Handle`] side once it has given up on a drain thread that
+    /// will never reach EOF. Without it this receiver has no termination
+    /// condition at all: a detached thread keeps its sender, so the channel
+    /// never disconnects. See [`OUTPUT_PARK_TICK`].
+    abandoned: Arc<AtomicBool>,
 }
 
 /// One spawned drain thread plus a flag the thread flips to `true` right
@@ -110,11 +161,29 @@ pub struct ChunkReader {
 struct DrainHandle {
     join: JoinHandle<()>,
     done: Arc<AtomicBool>,
+    /// True while the thread is parked handing a chunk to the consumer rather
+    /// than reading the pipe. The two are opposite diagnoses: a thread stuck
+    /// in `read` is waiting on a stray descendant and only `killpg` can help
+    /// it, while one stuck in `send` is waiting on *our* consumer, which no
+    /// signal can hurry and which always releases it in the end (a dropped
+    /// receiver fails the `send` outright).
+    sending: Arc<AtomicBool>,
 }
 
 impl DrainHandle {
     fn finished(&self) -> bool {
         self.done.load(Ordering::Acquire)
+    }
+
+    /// Blocked on something only the consumer can end, so neither the
+    /// escalation nor the abandon applies.
+    fn waiting_on_consumer(&self) -> bool {
+        !self.finished() && self.sending.load(Ordering::Acquire)
+    }
+
+    /// Blocked on a `read` that may never return.
+    fn waiting_on_pipe(&self) -> bool {
+        !self.finished() && !self.sending.load(Ordering::Acquire)
     }
 }
 
@@ -160,7 +229,18 @@ fn join_finished(drains: Vec<DrainHandle>) {
 /// If even that fails (fd dup'd into a process outside our pgid), we
 /// log and detach the still-running threads rather than parking the
 /// runtime forever.
-async fn drain_with_deadline(pid: i32, drains: Vec<DrainHandle>) {
+///
+/// **The bounded streaming drain adds a third state**, and conflating it with
+/// the second would be a bug in both directions. A thread parked in a full
+/// `send` is not waiting on the child at all — it is waiting on our own
+/// consumer, which no signal can hurry. Escalating would fire `killpg`+`kill`
+/// at a pid the watcher has already reaped (macOS recycles pids, and heph
+/// spawns thousands per build), and abandoning would tell the reader to stop
+/// while chunks are still queued for it. So the escalation and the abandon
+/// both key off [`DrainHandle::waiting_on_pipe`] only; a consumer-blocked
+/// drain is simply left to finish, which it always does — its `send` fails
+/// the moment the reader is dropped.
+async fn drain_with_deadline(pid: i32, drains: Vec<DrainHandle>, abandoned: &AtomicBool) {
     if drains.is_empty() {
         return;
     }
@@ -169,39 +249,116 @@ async fn drain_with_deadline(pid: i32, drains: Vec<DrainHandle>) {
         return;
     }
 
-    tracing::warn!(
-        pid,
-        "proc_exec: drain threads still reading after child exit; killpg on pgid"
-    );
-    process_supervisor::kill_child(pid);
+    if drains.iter().any(DrainHandle::waiting_on_pipe) {
+        tracing::warn!(
+            pid,
+            "proc_exec: drain threads still reading after child exit; killpg on pgid"
+        );
+        process_supervisor::kill_child(pid);
 
-    if poll_drains(&drains, DRAIN_JOIN_BUDGET).await {
-        join_finished(drains);
-        return;
+        if poll_drains(&drains, DRAIN_JOIN_BUDGET).await {
+            join_finished(drains);
+            return;
+        }
     }
 
-    let leaked = drains.iter().filter(|d| !d.finished()).count();
+    let stuck = drains.iter().filter(|d| d.waiting_on_pipe()).count();
+    let slow = drains.iter().filter(|d| d.waiting_on_consumer()).count();
     let finished: Vec<DrainHandle> = drains.into_iter().filter(DrainHandle::finished).collect();
     join_finished(finished);
-    tracing::warn!(
-        pid,
-        leaked,
-        "proc_exec: drain threads still blocked after killpg; detaching"
-    );
+
+    if stuck > 0 {
+        // Nothing will ever end these reads, and they still hold their
+        // senders, so the channel will never disconnect. Tell the reader
+        // directly — it has no other termination condition.
+        abandoned.store(true, Ordering::Release);
+        tracing::warn!(
+            pid,
+            stuck,
+            "proc_exec: drain threads still blocked on read after killpg; detaching"
+        );
+    }
+    if slow > 0 {
+        tracing::debug!(
+            pid,
+            slow,
+            "proc_exec: drain threads still handing output to a slower consumer; \
+             leaving them to finish"
+        );
+    }
     // Stuck thread JoinHandles fall out of scope here; the OS threads
     // remain alive until their read() finally returns. Acceptable leak
     // — the alternative is parking a tokio worker indefinitely.
 }
 
-impl ChunkReader {
-    /// Wait for the next chunk. Returns `Ok(None)` on EOF (drain thread
-    /// finished without error), `Ok(Some(chunk))` for data, or `Err(_)` if
-    /// the drain thread reported an io error.
-    pub async fn recv(&mut self) -> io::Result<Option<Vec<u8>>> {
-        match recv_async(&mut self.rx).await {
-            Ok(Ok(chunk)) => Ok(Some(chunk)),
-            Ok(Err(e)) => Err(e),
-            Err(_disconnected) => Ok(None),
+/// Name the stream a read error came from. With both streams on one channel
+/// a bare `io::Error` no longer says which pipe failed, and "reading the
+/// child's output failed" is not a diagnosis.
+fn stream_error(id: StreamId, e: io::Error) -> io::Error {
+    let stream = match id {
+        StreamId::Stdout => "stdout",
+        StreamId::Stderr => "stderr",
+    };
+    io::Error::new(e.kind(), format!("reading child {stream}: {e}"))
+}
+
+impl OutputReader {
+    /// Wait for the next chunk from either stream. Returns `Ok(None)` once
+    /// **both** streams have finished, `Ok(Some((stream, chunk)))` for data,
+    /// or `Err(_)` if a drain thread reported an io error.
+    ///
+    /// Must not be polled on the same task as [`Handle::wait_or_cancel`] —
+    /// see [`Handle`].
+    ///
+    /// Cancel-safe: there is no suspension point between taking a message off
+    /// the channel and returning it, so a dropped `recv` cannot lose a chunk.
+    pub async fn recv(&mut self) -> io::Result<Option<(StreamId, Vec<u8>)>> {
+        match self.recv_msg().await {
+            Some(DrainMsg::Chunk(id, chunk)) => Ok(Some((id, chunk))),
+            Some(DrainMsg::Err(id, e)) => Err(stream_error(id, e)),
+            None => Ok(None),
+        }
+    }
+
+    /// Park until a message arrives, both streams finish, or the `Handle` side
+    /// abandons a drain that will never reach EOF.
+    ///
+    /// The whole loop lives in **one** `block_in_place`: the tick re-checks a
+    /// flag, it does not re-enter the runtime. Deliberately not
+    /// `tokio::task::yield_now` between ticks — see [`OUTPUT_PARK_TICK`].
+    async fn recv_msg(&mut self) -> Option<DrainMsg> {
+        if is_multi_thread() {
+            let rx = &self.rx;
+            let abandoned = &self.abandoned;
+            tokio::task::block_in_place(move || {
+                loop {
+                    match rx.recv_timeout(OUTPUT_PARK_TICK) {
+                        Ok(msg) => return Some(msg),
+                        Err(RecvTimeoutError::Disconnected) => return None,
+                        // Queued messages always win: `recv_timeout` only
+                        // times out on an *empty* channel, so giving up here
+                        // cannot drop anything already handed over.
+                        Err(RecvTimeoutError::Timeout) => {
+                            if abandoned.load(Ordering::Acquire) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            })
+        } else {
+            loop {
+                match self.rx.try_recv() {
+                    Ok(msg) => return Some(msg),
+                    Err(TryRecvError::Disconnected) => return None,
+                    Err(TryRecvError::Empty) => {
+                        if self.abandoned.load(Ordering::Acquire) {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
         }
     }
 }
@@ -209,6 +366,11 @@ impl ChunkReader {
 /// Async stdin writer wrapping `std::process::ChildStdin`. Each write goes
 /// through `block_in_place` so the caller can sit in a tokio task while the
 /// underlying write is a sync `std::io::Write`.
+///
+/// The write blocks once the child's 64 KiB stdin pipe fills and the child is
+/// not reading, and `block_in_place` does not make that `Pending` — so a
+/// caller must not drive this on the same task as an [`OutputReader`]. See
+/// `pluginexec::pump_stdin`, which is why it spawns.
 pub struct StdinPump {
     inner: Arc<Mutex<Option<ChildStdin>>>,
 }
@@ -244,15 +406,30 @@ impl StdinPump {
 }
 
 /// Live child handle. Internally owns the `std::process::Child` (whose Drop
-/// would orphan the process), plus drain thread join handles and per-stream
-/// channels. Consume via [`wait`](Self::wait) or [`wait_or_cancel`] to reap.
+/// would orphan the process), plus drain thread join handles and the merged
+/// output channel. Consume via [`wait`](Self::wait) or [`wait_or_cancel`] to
+/// reap.
+///
+/// # Invariant: never poll a wait on the same task as [`OutputReader::recv`]
+///
+/// Both park the worker in `block_in_place`, and `wait_or_cancel` does so in
+/// a loop that only ends when the child does. A `join!` of the two therefore
+/// resolves to "the wait owns the task; nothing is read from the pipes; the
+/// child blocks in `write(2)` once they fill; the child never exits" — a
+/// deadlock, not a slowdown. Callers must `tokio::spawn` the wait (which is
+/// what `pluginexec` does) or drive the reader elsewhere. The same applies to
+/// tests: a canceller or a wait `join!`ed onto the reader's task is not just
+/// flaky, it is wrong.
 pub struct Handle {
     pid: i32,
     child: Option<Child>,
     stdin: Option<StdinPump>,
-    stdout: Option<ChunkReader>,
-    stderr: Option<ChunkReader>,
+    output: Option<OutputReader>,
     drains: Vec<DrainHandle>,
+    /// Shared with the [`OutputReader`]. Set once nobody is left to make the
+    /// drains reach EOF, which is the reader's only termination condition when
+    /// a detached thread still holds its sender.
+    abandoned: Arc<AtomicBool>,
     reaped: bool,
     /// Receiver registered with `process_watcher` at spawn time. The matching
     /// sender lives in the watcher's `pending` map; that registration is what
@@ -275,49 +452,24 @@ impl Handle {
         self.stdin.take()
     }
 
-    pub fn take_stdout(&mut self) -> Option<ChunkReader> {
-        self.stdout.take()
-    }
-
-    pub fn take_stderr(&mut self) -> Option<ChunkReader> {
-        self.stderr.take()
-    }
-
-    /// Wait for the child to exit, reaping the zombie via the global
-    /// `process_watcher` (kqueue `EVFILT_PROC NOTE_EXIT` + `waitpid(WNOHANG)`
-    /// backstop). Joins drain threads before returning so callers can rely on
-    /// all chunks having been delivered.
-    pub async fn wait(mut self) -> io::Result<ExitStatus> {
-        let mut rx = self.exit_rx.take().expect("exit_rx must be set by spawn()");
-        // The std::process::Child drop would call waitpid blocking; we want
-        // the watcher to own the reap. Forget the Child wrapper so its Drop
-        // doesn't try to wait. We still close pipe fds (stdin/stdout/stderr)
-        // by dropping them inside Child, but the pid itself stays with the
-        // watcher.
-        // Drop the Child wrapper: `std::process::Child::drop` does NOT call
-        // waitpid (documented stdlib behavior), so the pid stays alive for
-        // the watcher to reap. Any remaining stdin/stdout/stderr handles
-        // (if not already `take`n) are auto-closed via their Drop impls.
-        drop(self.child.take());
-        let status = recv_async(&mut rx)
-            .await
-            .map_err(|e| io::Error::other(format!("watcher dropped sender: {e}")))??;
-        self.reaped = true;
-        // Drain threads should reach EOF naturally now that the child's
-        // pipe write ends are gone, but a surviving descendant (e.g. a
-        // double-forked daemon reparented to pid 1) may still hold them.
-        // `drain_with_deadline` polls, escalates with killpg, then
-        // detaches anything still stuck so the runtime can't be parked
-        // forever by an orphaned writer.
-        let drains = std::mem::take(&mut self.drains);
-        drain_with_deadline(self.pid, drains).await;
-        Ok(status)
+    /// Take the merged stdout+stderr reader. `None` when neither stream was
+    /// piped. Must be driven on a different task from the wait — see
+    /// [`Handle`].
+    pub fn take_output(&mut self) -> Option<OutputReader> {
+        self.output.take()
     }
 
     /// Wait for exit, but cancel by `SIGKILL`-ing the child if `cancel`
     /// fires. Still consumes the final exit status before returning so the
     /// pid is reaped (no zombies).
-    pub async fn wait_or_cancel(
+    ///
+    /// Parks its worker in `block_in_place` for the child's whole lifetime,
+    /// and unlike [`OutputReader::recv`] has no tick: this wait is guaranteed
+    /// to end (the watcher always sends an exit status) and on runtime
+    /// teardown a wait that yielded might never be polled again, leaving the
+    /// child unkilled and unreaped. The cost of that choice is the invariant
+    /// on [`Handle`] — this must not share a task with an [`OutputReader`].
+    pub(super) async fn wait_or_cancel(
         mut self,
         cancel: &(dyn Cancellable + Send + Sync),
     ) -> io::Result<ExitStatus> {
@@ -391,7 +543,7 @@ impl Handle {
         };
         self.reaped = true;
         let drains = std::mem::take(&mut self.drains);
-        drain_with_deadline(self.pid, drains).await;
+        drain_with_deadline(self.pid, drains, &self.abandoned).await;
         if cancel.is_cancelled() {
             return Err(io::Error::other("cancelled"));
         }
@@ -411,10 +563,18 @@ impl Drop for Handle {
         // deadlock on a runtime worker — but dropping it is safe because the
         // watcher reaps before it tries to send on the sender.
         process_supervisor::kill_child(self.pid);
+        // Nothing will run `drain_with_deadline` for this child now, so a
+        // surviving descendant holding a pipe would leave an `OutputReader`
+        // parked with no termination condition. Release it.
+        self.abandoned.store(true, Ordering::Release);
     }
 }
 
 pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
+    spawn_with(spec, DrainCapacity::Bounded(STREAM_DRAIN_CHUNKS))
+}
+
+fn spawn_with(spec: Spec, capacity: DrainCapacity) -> io::Result<Handle> {
     let Spec {
         program,
         args,
@@ -458,36 +618,27 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
     let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
 
-    let (stdin_pump, stdin_drain) = match child.stdin.take() {
-        Some(s) => {
-            let p = StdinPump {
-                inner: Arc::new(Mutex::new(Some(s))),
-            };
-            (Some(p), None)
-        }
-        None => (None, None),
-    };
+    let stdin_pump = child.stdin.take().map(|s| StdinPump {
+        inner: Arc::new(Mutex::new(Some(s))),
+    });
 
-    let (stdout_reader, stdout_drain) = match child.stdout.take() {
-        Some(s) => {
-            let (rx, jh) = spawn_drain_thread(s);
-            (Some(ChunkReader { rx }), Some(jh))
-        }
-        None => (None, None),
-    };
-
-    let (stderr_reader, stderr_drain) = match child.stderr.take() {
-        Some(s) => {
-            let (rx, jh) = spawn_drain_thread(s);
-            (Some(ChunkReader { rx }), Some(jh))
-        }
-        None => (None, None),
-    };
-
-    let mut drains = Vec::new();
-    drains.extend(stdin_drain);
-    drains.extend(stdout_drain);
-    drains.extend(stderr_drain);
+    // One channel, one clone of the sender per drain thread. The original is
+    // dropped below so the receiver disconnects exactly when the *last*
+    // stream finishes — that disconnect is the merged reader's EOF.
+    let (tx, rx) = capacity.channel();
+    let mut drains = Vec::with_capacity(2);
+    if let Some(s) = child.stdout.take() {
+        drains.push(spawn_drain_thread(s, StreamId::Stdout, tx.clone()));
+    }
+    if let Some(s) = child.stderr.take() {
+        drains.push(spawn_drain_thread(s, StreamId::Stderr, tx.clone()));
+    }
+    drop(tx);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let output = (!drains.is_empty()).then_some(OutputReader {
+        rx,
+        abandoned: Arc::clone(&abandoned),
+    });
 
     let track_guard = process_supervisor::register_child(pid);
     // Register with the kqueue watcher *before* returning the Handle. This
@@ -502,9 +653,9 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
         pid,
         child: Some(child),
         stdin: stdin_pump,
-        stdout: stdout_reader,
-        stderr: stderr_reader,
+        output,
         drains,
+        abandoned,
         reaped: false,
         exit_rx: Some(exit_rx),
         _track_guard: track_guard,
@@ -515,14 +666,16 @@ pub(super) async fn output(
     spec: Spec,
     cancel: &(dyn Cancellable + Send + Sync),
 ) -> io::Result<Output> {
-    let mut handle = spawn(spec)?;
-    let stdout_rx = handle.take_stdout();
-    let stderr_rx = handle.take_stderr();
+    // Unbounded on purpose. Nothing consumes the channel until the wait below
+    // returns, so a bound here would stop the drains, fill the pipes, and
+    // wedge the child — see `DrainCapacity`.
+    let mut handle = spawn_with(spec, DrainCapacity::Unbounded)?;
+    let queued = handle.take_output();
 
     // No collector needed on this side: the drain threads spawned by
-    // `spawn` already read the pipes concurrently with the child (so the
+    // `spawn_with` already read the pipes concurrently with the child (so the
     // 64 KiB pipe buffer can never wedge it) and park the chunks in their
-    // unbounded channels. `wait_or_cancel` bounds the join on those threads
+    // unbounded channel. `wait_or_cancel` bounds the join on those threads
     // via `drain_with_deadline`, so by the time it returns either every
     // chunk has been queued or the drain has been abandoned.
     //
@@ -537,8 +690,7 @@ pub(super) async fn output(
     // while `take_queued` copies them out. Unbounded, as it was before.
     let status = handle.wait_or_cancel(cancel).await?;
 
-    let stdout = take_queued(stdout_rx)?;
-    let stderr = take_queued(stderr_rx)?;
+    let (stdout, stderr) = take_queued(queued)?;
 
     Ok(Output {
         status,
@@ -547,35 +699,43 @@ pub(super) async fn output(
     })
 }
 
-/// Collect everything the drain thread has already queued, without blocking.
+/// Split everything the drain threads have already queued into the two
+/// streams, without blocking.
 ///
-/// A finished drain has dropped its sender, so this walks the channel to
-/// `Disconnected` and returns the complete stream. An abandoned one (a
+/// Finished drains have dropped their senders, so this walks the channel to
+/// `Disconnected` and returns both streams complete. An abandoned drain (a
 /// descendant that outlived the child still holds the pipe write end) leaves
-/// the sender alive; we stop at `Empty` and return what the child itself
+/// its sender alive; we stop at `Empty` and return what the child itself
 /// wrote rather than parking on bytes that are not ours. Dropping the
 /// receiver here also releases the stuck thread the moment its `read`
 /// returns, since its next `send` fails.
-fn take_queued(reader: Option<ChunkReader>) -> io::Result<Vec<u8>> {
+fn take_queued(reader: Option<OutputReader>) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let Some(reader) = reader else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
-    let mut out = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     loop {
         match reader.rx.try_recv() {
-            Ok(Ok(chunk)) => out.extend_from_slice(&chunk),
-            Ok(Err(e)) => return Err(e),
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(out),
+            Ok(DrainMsg::Chunk(StreamId::Stdout, chunk)) => stdout.extend_from_slice(&chunk),
+            Ok(DrainMsg::Chunk(StreamId::Stderr, chunk)) => stderr.extend_from_slice(&chunk),
+            Ok(DrainMsg::Err(id, e)) => return Err(stream_error(id, e)),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                return Ok((stdout, stderr));
+            }
         }
     }
 }
 
 fn spawn_drain_thread<R: io::Read + Send + 'static>(
     mut src: R,
-) -> (mpsc::Receiver<io::Result<Vec<u8>>>, DrainHandle) {
-    let (tx, rx) = mpsc::channel();
+    id: StreamId,
+    tx: Sender<DrainMsg>,
+) -> DrainHandle {
     let done = Arc::new(AtomicBool::new(false));
+    let sending = Arc::new(AtomicBool::new(false));
     let done_for_thread = Arc::clone(&done);
+    let sending_for_thread = Arc::clone(&sending);
     let jh = std::thread::Builder::new()
         .name("heph-proc-drain".into())
         .spawn(move || {
@@ -589,7 +749,16 @@ fn spawn_drain_thread<R: io::Read + Send + 'static>(
                     Ok(n) => n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        drop(tx.send(Err(e)));
+                        // Bracket this send exactly like the chunk path below:
+                        // on a full bounded channel it blocks on *our*
+                        // consumer, not on the child, and `waiting_on_pipe`
+                        // must not misread that as a stray descendant still
+                        // holding the read end — that misread escalates to
+                        // `killpg` on a pid the watcher may have already
+                        // reaped and macOS may have already recycled.
+                        sending_for_thread.store(true, Ordering::Release);
+                        _ = tx.send(DrainMsg::Err(id, e));
+                        sending_for_thread.store(false, Ordering::Release);
                         break;
                     }
                 };
@@ -598,12 +767,25 @@ fn spawn_drain_thread<R: io::Read + Send + 'static>(
                     reason = "n <= buf.len() by Read::read contract"
                 )]
                 let slice = buf[..n].to_vec();
-                if tx.send(Ok(slice)).is_err() {
+                // On a bounded channel this blocks once the consumer is
+                // `STREAM_DRAIN_CHUNKS` behind, which stops us reading and
+                // lets the pipe fill — deliberate backpressure onto the
+                // child's `write(2)`. Published so `drain_with_deadline` can
+                // tell that apart from a `read` that will never return; see
+                // `DrainHandle::sending`.
+                sending_for_thread.store(true, Ordering::Release);
+                let handed_over = tx.send(DrainMsg::Chunk(id, slice));
+                sending_for_thread.store(false, Ordering::Release);
+                if handed_over.is_err() {
                     break; // receiver dropped: stop reading
                 }
             }
             done_for_thread.store(true, Ordering::Release);
         })
         .expect("spawn heph-proc-drain thread");
-    (rx, DrainHandle { join: jh, done })
+    DrainHandle {
+        join: jh,
+        done,
+        sending,
+    }
 }

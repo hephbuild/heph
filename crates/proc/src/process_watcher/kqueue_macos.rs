@@ -62,7 +62,7 @@ fn run_loop(kq: i32, rx: mpsc::Receiver<Registration>) {
 
     // 1 second poll backstop. macOS `EVFILT_PROC NOTE_EXIT` is observed
     // to silently drop events under heavy concurrent spawn load (see
-    // `RCA_MACOS_WAKER.md`). Every second we iterate `pending` and probe
+    // `crate::proc_exec`). Every second we iterate `pending` and probe
     // each pid with `waitpid(WNOHANG)`; any pid that has actually exited
     // is resolved even if the kernel never delivered NOTE_EXIT.
     let timeout = libc::timespec {

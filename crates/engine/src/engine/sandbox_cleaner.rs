@@ -3,7 +3,7 @@
 //! Posting to a queue is a non-blocking `crossbeam_channel::send`. A
 //! long-lived worker thread drains that queue and runs each job
 //! inline. No tokio waker is involved (avoids the macOS cross-thread
-//! waker bug — see `RCA_MACOS_WAKER.md`), and no tokio runtime worker
+//! waker bug — see the hazard note in `hproc::proc_exec`), and no tokio worker
 //! is parked for the cleanup (avoids the `block_in_place` concurrency
 //! regression measured in `PERFORMANCE.md` suggestion #0).
 //!

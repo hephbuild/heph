@@ -18,7 +18,8 @@
 //!   fresh thread out of the blocking pool.
 //! - **`tokio::task::spawn_blocking`** — its `JoinHandle` wake-up rides tokio's
 //!   cross-thread waker, observed to drop wake-ups on macOS under heavy load (see
-//!   `RCA_MACOS_WAKER.md`), which strands the awaiting task.
+//!   the macOS waker hazard documented in `hproc::proc_exec`), which strands the
+//!   awaiting task.
 //!
 //! So: a fixed set of named threads, a `crossbeam_channel` queue, and a
 //! `oneshot` for the result. The threads are created once and live for the

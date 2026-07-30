@@ -169,7 +169,7 @@ static CODEC_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| {
 ///
 /// `hcore::blocking` rather than `spawn_blocking`: the latter's `JoinHandle`
 /// wake-up rides tokio's cross-thread waker, observed to drop wake-ups on macOS
-/// under load (`RCA_MACOS_WAKER.md`) — the same load this path generates.
+/// under load (see `hproc::proc_exec`) — the same load this path generates.
 ///
 /// The closure is `Send`, but the values it builds are not required to be — the
 /// non-`Send` local-cache reader/writer is created and dropped entirely inside

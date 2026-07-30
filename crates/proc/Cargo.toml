@@ -11,6 +11,7 @@ hcore = { package = "core", path = "../core" }
 anyhow = "1.0.102"
 libc = "0.2"
 tracing = "0.1"
+crossbeam-channel = "0.5"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "time", "test-util"] }
 
 [dev-dependencies]
