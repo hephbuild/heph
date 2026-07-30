@@ -745,8 +745,15 @@ jobs:
   # Perf-regression check (own workflow: .github/workflows/perf.yml) —
   # generates one synthetic corpus, times a fixed scenario set against N and
   # N-1, and reports a regression verdict. Two triggers, two roles:
-  #   - `pull_request`: this is the GATE — a real regression fails the check
-  #     for real.
+  #   - `pull_request`, labeled `perf-test`: this is the GATE — a real
+  #     regression fails the check for real. Opt-in while the harness and its
+  #     thresholds are still being proven out; an unlabeled PR skips this job
+  #     entirely rather than running it just to fail on the missing label —
+  #     cheaper, and the `if:` below is the single source of truth for
+  #     whether perf runs at all. Adding the label to an already-open PR does
+  #     NOT retrigger this job on its own (`pull_request` only fires on
+  #     `opened`/`synchronize`/`reopened`, not `labeled`) — push a commit or
+  #     re-run the job after labeling.
   #   - `push` to `master`: nothing is blocked at this point (the merge
   #     already happened) — this is continuous monitoring, and a regression
   #     instead files a GitHub issue.
@@ -761,7 +768,9 @@ jobs:
   # concurrency policy, PostHog, issue filing).
   perfbench:
     name: Perf
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    if: |
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf-test')) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
     needs: [build]
     uses: ./.github/workflows/perf.yml
     secrets: inherit
