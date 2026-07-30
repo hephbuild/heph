@@ -201,6 +201,7 @@ mod tests {
             stdout: None,
             stderr: None,
             sandbox_dir: sandbox_dir.to_path_buf(),
+            events: None,
         }
     }
 
