@@ -132,8 +132,8 @@ jobs:
       # the caller (`heph.yml`'s `perfbench` job `if:`) — an unlabeled PR
       # never invokes this workflow at all, so there is no in-job gate step
       # here to fail past.
-      - name: Checkout
-      # this job needs real git history to resolve the merge-base, the same
+      #
+      # This job needs real git history to resolve the merge-base, the same
       # requirement the `abi` job already has — mirroring its proven
       # `fetch-depth: 0` checkout instead of assuming the uploaded artifact's
       # `.git` is equally usable. No devenv/Rust toolchain needed at all —
