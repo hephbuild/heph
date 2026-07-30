@@ -1,9 +1,12 @@
 //! [`RemoteCacheBackend`] backed by the `object_store` crate. A single backend
-//! type serves every supported URI scheme — `s3://`, `gs://`, `memory://`,
-//! `file://` — because `object_store::parse_url_opts` dispatches on the scheme
-//! and returns the right store. Credentials are read from the process
-//! environment (e.g. `AWS_ACCESS_KEY_ID`, `GOOGLE_SERVICE_ACCOUNT`) by feeding
-//! `std::env::vars()` to the builder, mirroring each builder's `from_env`.
+//! type serves every supported URI scheme — `s3://`, `gs://`, `az://`,
+//! `http(s)://`, `memory://`, `file://`. GCS, S3, Azure, and HTTP each go
+//! through their own `object_store` builder (so every networked scheme can
+//! carry [`retry_config()`] directly); `file`/`memory` fall back to
+//! `object_store::parse_url_opts`, which dispatches on the scheme and returns
+//! the right store. Credentials are read from the process environment (e.g.
+//! `AWS_ACCESS_KEY_ID`, `GOOGLE_SERVICE_ACCOUNT`) by feeding `std::env::vars()`
+//! to the builder, mirroring each builder's `from_env`.
 //!
 //! All transfers are streamed: reads expose the object's byte stream as an
 //! [`AsyncRead`], and writes go through object_store's multipart [`BufWriter`],
@@ -26,13 +29,16 @@ use async_trait::async_trait;
 use enclose::enclose;
 use futures::TryStreamExt;
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as AdcBuilder};
+use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::buffered::BufWriter;
 use object_store::client::{HttpClient, HttpConnector};
 use object_store::gcp::{GcpCredential, GcpCredentialProvider, GoogleCloudStorageBuilder};
+use object_store::http::HttpBuilder;
 use object_store::limit::LimitStore;
 use object_store::{
-    ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, RetryConfig, parse_url_opts,
-    path::Path as ObjPath,
+    ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, ObjectStoreScheme, RetryConfig,
+    parse_url_opts, path::Path as ObjPath,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -133,6 +139,26 @@ fn retry_config() -> RetryConfig {
     }
 }
 
+/// Fold `opts` onto `$builder::new().with_url($url)` exactly as
+/// `object_store::parse_url_opts`'s internal `builder_opts!` macro does: each
+/// `(key, value)` that parses as the builder's own `ConfigKey` is applied via
+/// `with_config`, everything else (most of the process environment) is
+/// silently skipped. A macro rather than a generic fn because
+/// `AmazonS3Builder`/`MicrosoftAzureBuilder`/`HttpBuilder` share no common
+/// trait for `with_config`/`ConfigKey` — `parse_url_opts` hits the same wall
+/// and works around it the same way.
+macro_rules! build_with_opts {
+    ($builder:ty, $url:expr, $opts:expr) => {
+        $opts.into_iter().fold(
+            <$builder>::new().with_url($url.to_string()),
+            |builder, (key, value): (String, String)| match key.to_ascii_lowercase().parse() {
+                Ok(k) => builder.with_config(k, value),
+                Err(_) => builder,
+            },
+        )
+    };
+}
+
 /// Extra options fed to [`parse_url_opts`] for networked schemes (s3/azure/http):
 /// a finite request timeout above object_store's 30s default. GCS does not use
 /// this path — it goes through [`NegotiatingConnector`]. Local schemes (`file`,
@@ -194,13 +220,62 @@ impl ObjStoreBackend {
                 .with_context(|| format!("parse object prefix from {uri}"))?;
             (Box::new(store), prefix)
         } else {
-            // s3/azure/http/memory/file: object_store's native path. Pass the
-            // environment through so builders pick up credentials as their
-            // `from_env` constructors would, plus a lifted-but-finite request
-            // timeout (last-wins: an explicit env `timeout` still overrides).
-            let opts = std::env::vars().chain(transfer_opts(url.scheme()));
-            parse_url_opts(&url, opts)
-                .with_context(|| format!("open remote cache store for {uri}"))?
+            // s3/azure/http: dedicated per-scheme builders so each carries
+            // `retry_config()` directly, the same policy GCS gets above.
+            // `parse_url_opts`'s generic dispatch has no string `ConfigKey`
+            // for retry_timeout/max_retries, so these three schemes used to
+            // silently fall back to object_store's `RetryConfig::default()`
+            // (180s) — already below `REQUEST_TIMEOUT`, and the same
+            // resume-via-`Range`-defeating bug class fixed for GCS above,
+            // just never wired for the other three schemes at all.
+            //
+            // `ObjectStoreScheme::parse` gives the same host-aware scheme
+            // detection `parse_url_opts` uses internally (e.g.
+            // `https://bucket.s3.<region>.amazonaws.com` still routes to S3,
+            // not a generic HTTP store) — this is a mechanical swap of
+            // builder, not a change to which store a URI resolves to.
+            let (scheme, path) = ObjectStoreScheme::parse(&url)
+                .with_context(|| format!("recognize remote cache uri scheme {uri}"))?;
+            // Environment pass-through, same as the GCS `from_env()` builder
+            // above: each builder's `ConfigKey::from_str` accepts only its
+            // own known aliases, so unrelated vars are silently skipped.
+            // Also carries a lifted-but-finite request timeout — chained
+            // after the env vars, so `transfer_opts`'s fixed value always
+            // wins over an env-supplied `timeout` (`fold` applies entries in
+            // order and `with_config` overwrites), not the other way round.
+            let opts: Vec<(String, String)> = std::env::vars()
+                .chain(transfer_opts(url.scheme()))
+                .collect();
+            let store: Box<dyn ObjectStore> = match scheme {
+                ObjectStoreScheme::AmazonS3 => Box::new(
+                    build_with_opts!(AmazonS3Builder, uri, opts)
+                        .with_retry(retry_config())
+                        .build()
+                        .with_context(|| format!("build S3 store for {uri}"))?,
+                ),
+                ObjectStoreScheme::MicrosoftAzure => Box::new(
+                    build_with_opts!(MicrosoftAzureBuilder, uri, opts)
+                        .with_retry(retry_config())
+                        .build()
+                        .with_context(|| format!("build Azure store for {uri}"))?,
+                ),
+                ObjectStoreScheme::Http => {
+                    let base = &url[..url::Position::BeforePath];
+                    Box::new(
+                        build_with_opts!(HttpBuilder, base, opts)
+                            .with_retry(retry_config())
+                            .build()
+                            .with_context(|| format!("build HTTP store for {uri}"))?,
+                    )
+                }
+                // `file`/`memory`: no network client, no retry semantics.
+                _ => {
+                    parse_url_opts(&url, opts)
+                        .with_context(|| format!("open remote cache store for {uri}"))?
+                        .0
+                }
+            };
+            (store, path)
         };
         let store: Arc<dyn ObjectStore> = Arc::new(LimitStore::new(store, max_concurrency));
         Ok(Self { store, prefix })
@@ -784,6 +859,59 @@ mod tests {
         assert!(r.retry_timeout > Duration::from_secs(180));
         // ...but under the ~1h GCS bearer lifetime.
         assert!(r.retry_timeout < Duration::from_secs(60 * 60));
+    }
+
+    /// Regression guard for the bug this fix closes: s3/azure/http used to
+    /// build via the generic `parse_url_opts` path, which has no string
+    /// `ConfigKey` for retry_timeout/max_retries, so all three silently fell
+    /// back to `RetryConfig::default()` (10 retries / 180s) instead of
+    /// [`retry_config()`] — the same policy GCS gets via its dedicated
+    /// builder. Every layer down to `RetryConfig` derives `Debug`, so
+    /// Debug-formatting the built store (through the `dyn ObjectStore` trait
+    /// object, itself `Debug`) surfaces the value without a public getter.
+    ///
+    /// Deliberately routes through [`ObjStoreBackend::from_uri`] itself,
+    /// not a hand-built store — a hand-built one would still pass if a
+    /// future edit dropped `.with_retry(retry_config())` from the actual
+    /// match arm. And deliberately never embeds the Debug string in an
+    /// assertion message: `from_uri` folds the live process environment into
+    /// these builders, and this repo's own CI sets real AWS credentials via
+    /// env for sccache/R2 — printing the store's Debug output on failure
+    /// would risk leaking them into CI logs, even though `AwsCredential`'s
+    /// `Debug` impl currently redacts secrets.
+    fn assert_wires_retry_config(store: &dyn ObjectStore, scheme: &str) {
+        let debug = format!("{store:?}");
+        let want = retry_config();
+        assert!(
+            debug.contains(&format!("max_retries: {}", want.max_retries)),
+            "{scheme} store missing retry_config()'s max_retries wiring"
+        );
+        assert!(
+            !debug.contains("max_retries: 10"),
+            "{scheme} store still carries object_store's RetryConfig::default() (max_retries: 10)"
+        );
+    }
+
+    #[test]
+    fn s3_scheme_wires_retry_config_not_object_store_default() {
+        let backend = ObjStoreBackend::from_uri("s3://some-bucket/prefix", 10).expect("backend");
+        assert_wires_retry_config(&*backend.store, "S3");
+    }
+
+    #[test]
+    fn azure_scheme_wires_retry_config_not_object_store_default() {
+        let backend = ObjStoreBackend::from_uri(
+            "abfss://some-container@some-account.dfs.core.windows.net/prefix",
+            10,
+        )
+        .expect("backend");
+        assert_wires_retry_config(&*backend.store, "Azure");
+    }
+
+    #[test]
+    fn http_scheme_wires_retry_config_not_object_store_default() {
+        let backend = ObjStoreBackend::from_uri("http://example.com/prefix", 10).expect("backend");
+        assert_wires_retry_config(&*backend.store, "HTTP");
     }
 
     #[test]
