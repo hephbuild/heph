@@ -114,7 +114,7 @@ fn build_layer_dirs(index: &TarIndex) -> HashMap<PathBuf, Vec<(OsString, IndexEn
 /// is FUSE-mount-relative (e.g. `<pkg>/__target_<hash>/ws`); paths under
 /// it consult the slot's layers first, falling back to the upper dir.
 pub struct Slot {
-    pub layers: Vec<Layer>,
+    pub layers: Vec<std::sync::Arc<Layer>>,
 }
 
 /// Mutable state guarded by a single Mutex. Inode allocation and the
@@ -202,7 +202,7 @@ impl LayeredFs {
 
     /// Backward-compat constructor: build a single-slot FS at the empty
     /// prefix. Used by v1 callers that mount one FUSE per unpack_root.
-    pub fn new(layers: Vec<Layer>, upper_root: PathBuf) -> Self {
+    pub fn new(layers: Vec<std::sync::Arc<Layer>>, upper_root: PathBuf) -> Self {
         let fs = Self::new_empty(upper_root);
         fs.slots.write().insert(PathBuf::new(), Slot { layers });
         fs
@@ -215,7 +215,7 @@ impl LayeredFs {
     pub fn register_slot(
         self: &std::sync::Arc<Self>,
         prefix: PathBuf,
-        layers: Vec<Layer>,
+        layers: Vec<std::sync::Arc<Layer>>,
     ) -> SlotGuard {
         self.slots.write().insert(prefix.clone(), Slot { layers });
         SlotGuard {
@@ -239,7 +239,7 @@ impl LayeredFs {
     /// dispatches ops on the session thread, and calling `inval_entry`
     /// from inside an op handler before sending its reply deadlocks
     /// against the kernel's parent inode lock.
-    pub fn set_notifier(&self, n: Notifier) -> std::thread::JoinHandle<()> {
+    pub fn set_notifier(&self, n: Notifier) -> anyhow::Result<std::thread::JoinHandle<()>> {
         let (tx, rx) = unbounded::<InvalEntry>();
         let handle = std::thread::Builder::new()
             .name("heph-fuse-notify".into())
@@ -250,9 +250,9 @@ impl LayeredFs {
                     drop(n.inval_entry(msg.parent, &msg.name));
                 }
             })
-            .expect("spawn fuse notify thread");
+            .context("spawn fuse notify thread")?;
         *self.notifier_tx.lock() = Some(tx);
-        handle
+        Ok(handle)
     }
 
     /// Drop the notifier sender so the bg thread observes channel
@@ -468,8 +468,16 @@ impl LayeredFs {
             NodeOrigin::Layer(idx) => {
                 // Re-locate the slot and layer by index that stat_path
                 // returned. We re-find the slot (cheap, in-mem) rather
-                // than threading the slot through the call.
-                let kind_action = self.find_slot(rel, |_prefix, slot, sub_rel| {
+                // than threading the slot through the call. The closure
+                // only clones the `Arc<Layer>` and the (small) index
+                // entry — it must NOT run `copy_up_layer_entry` here,
+                // since that's the actual layer-read + upper-write IO
+                // and `find_slot` holds the `slots` read lock for the
+                // closure's duration. Cloning is O(1) (Arc bump +
+                // IndexEntry copy), so the lock is held only for the
+                // lookup; the IO itself runs after `find_slot` returns
+                // and the lock is dropped.
+                let found = self.find_slot(rel, |_prefix, slot, sub_rel| {
                     let layer = slot
                         .layers
                         .get(idx)
@@ -478,10 +486,13 @@ impl LayeredFs {
                         .index
                         .entries
                         .get(sub_rel)
-                        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-                    copy_up_layer_entry(layer, entry, &dst)
+                        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?
+                        .clone();
+                    Ok::<_, std::io::Error>((std::sync::Arc::clone(layer), entry))
                 });
-                kind_action.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))??;
+                let (layer, entry) =
+                    found.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))??;
+                copy_up_layer_entry(&layer, &entry, &dst)?;
                 self.set_mode_override(rel.to_path_buf(), attr.mode);
                 Ok(())
             }
@@ -531,8 +542,9 @@ impl LayeredFs {
 }
 
 /// Helper: copy a layer's entry (file/symlink/dir) into `dst` on the
-/// upper layer. Hoisted out of `copy_up` so the slot-find closure
-/// remains compact and avoids holding the slots read-lock across IO.
+/// upper layer. Called from `copy_up` after the `find_slot` lookup has
+/// returned (and its `slots` read lock dropped) — this is the actual
+/// layer-read + upper-write IO and must not run while the lock is held.
 fn copy_up_layer_entry(
     layer: &Layer,
     entry: &hcore::hartifactcontent::tar_index::IndexEntry,
@@ -706,41 +718,69 @@ impl LayeredFs {
             IsDir,
             NotFile,
         }
-        let outcome = self
-            .find_slot(&rel, |_prefix, slot, sub_rel| -> Option<ReadHit> {
+        // Only the entry lookup runs inside `find_slot` (holds the `slots`
+        // read lock); the plan carries a cloned `Arc<Layer>` (cheap) out
+        // so the actual `open`/seek/read happens after the lock is
+        // dropped, per the comment above.
+        enum ReadPlan {
+            NotFile,
+            Empty,
+            Hit {
+                layer: std::sync::Arc<Layer>,
+                data_offset: u64,
+                want: usize,
+            },
+        }
+        let plan = self
+            .find_slot(&rel, |_prefix, slot, sub_rel| -> Option<ReadPlan> {
                 for layer in &slot.layers {
                     let Some(entry) = layer.index.entries.get(sub_rel) else {
                         continue;
                     };
                     let IndexEntryKind::File = entry.kind else {
-                        return Some(ReadHit::NotFile);
+                        return Some(ReadPlan::NotFile);
                     };
                     if offset >= entry.size {
-                        return Some(ReadHit::Bytes(Vec::new()));
+                        return Some(ReadPlan::Empty);
                     }
                     let want = ((entry.size - offset) as usize).min(size as usize);
-                    let mut buf = vec![0u8; want];
-                    let mut reader = match (layer.open)() {
-                        Ok(r) => r,
-                        Err(_) => return Some(ReadHit::IsDir),
-                    };
-                    if reader
-                        .seek(SeekFrom::Start(entry.data_offset + offset))
-                        .is_err()
-                    {
-                        return Some(ReadHit::IsDir);
-                    }
-                    match reader.read(&mut buf) {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            return Some(ReadHit::Bytes(buf));
-                        }
-                        Err(_) => return Some(ReadHit::IsDir),
-                    }
+                    return Some(ReadPlan::Hit {
+                        layer: std::sync::Arc::clone(layer),
+                        data_offset: entry.data_offset + offset,
+                        want,
+                    });
                 }
                 None
             })
             .flatten();
+        let outcome = match plan {
+            Some(ReadPlan::NotFile) => Some(ReadHit::NotFile),
+            Some(ReadPlan::Empty) => Some(ReadHit::Bytes(Vec::new())),
+            Some(ReadPlan::Hit {
+                layer,
+                data_offset,
+                want,
+            }) => {
+                let mut buf = vec![0u8; want];
+                match (layer.open)() {
+                    Ok(mut reader) => {
+                        if reader.seek(SeekFrom::Start(data_offset)).is_err() {
+                            Some(ReadHit::IsDir)
+                        } else {
+                            match reader.read(&mut buf) {
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    Some(ReadHit::Bytes(buf))
+                                }
+                                Err(_) => Some(ReadHit::IsDir),
+                            }
+                        }
+                    }
+                    Err(_) => Some(ReadHit::IsDir),
+                }
+            }
+            None => None,
+        };
         match outcome {
             Some(ReadHit::Bytes(b)) => reply.data(&b),
             Some(ReadHit::IsDir) => reply.error(Errno::EIO),
@@ -1500,7 +1540,7 @@ impl Mount {
         // Plumb a Notifier so the FS can invalidate kernel caches after
         // creating new entries — macFUSE 5.x otherwise caches negative
         // lookups past our writes and returns stale ENOENT.
-        let notifier_thread = fs_clone.set_notifier(session.notifier());
+        let notifier_thread = fs_clone.set_notifier(session.notifier())?;
         Ok(Self {
             notifier_thread: Some(notifier_thread),
             fs: fs_clone,
@@ -1525,10 +1565,10 @@ mod tests {
         buf
     }
 
-    fn layer_from_tar(bytes: Vec<u8>) -> Layer {
+    fn layer_from_tar(bytes: Vec<u8>) -> std::sync::Arc<Layer> {
         let index = TarIndex::build(Cursor::new(bytes.clone())).expect("index");
         let opener: LayerOpener = Box::new(move || Ok(Box::new(Cursor::new(bytes.clone()))));
-        Layer::new(index, opener)
+        std::sync::Arc::new(Layer::new(index, opener))
     }
 
     #[test]
@@ -1589,6 +1629,68 @@ mod tests {
         assert_eq!(bytes, b"layered");
     }
 
+    /// Regression test for a lock-scope bug: `copy_up` used to run the
+    /// layer's blocking `open()` + read while still holding `slots`'
+    /// read lock (acquired inside `find_slot`), contradicting this
+    /// module's own documented intent of releasing the lock before IO.
+    /// A concurrent `register_slot` (which needs the write lock) would
+    /// then stall for the full duration of the layer IO instead of
+    /// completing immediately.
+    ///
+    /// The layer's `open()` here blocks until explicitly released, so a
+    /// `register_slot` that completes while `open()` is still blocked
+    /// proves the read lock was already dropped before the IO ran.
+    #[test]
+    fn copy_up_releases_slots_lock_before_layer_io() {
+        let bytes = pack(&[("slow.txt", b"hi")]);
+        let index = TarIndex::build(Cursor::new(bytes.clone())).expect("index");
+        let (started_tx, started_rx) = unbounded::<()>();
+        let (proceed_tx, proceed_rx) = unbounded::<()>();
+        let opener: LayerOpener = Box::new(move || {
+            started_tx.send(()).expect("send started");
+            proceed_rx.recv().expect("recv proceed");
+            Ok(Box::new(Cursor::new(bytes.clone())) as Box<dyn ReadSeek + Send>)
+        });
+        let layer = std::sync::Arc::new(Layer::new(index, opener));
+        let upper = tempfile::tempdir().expect("upper");
+        let fs = std::sync::Arc::new(LayeredFs::new(vec![layer], upper.path().to_path_buf()));
+
+        let fs_copy = std::sync::Arc::clone(&fs);
+        let copy_thread = std::thread::spawn(move || {
+            fs_copy.copy_up(Path::new("slow.txt")).expect("copy_up");
+        });
+
+        // Wait until copy_up is blocked inside the layer opener — by
+        // this point `find_slot`'s read guard has already gone out of
+        // scope (it lives only for the lookup, not the IO).
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("copy_up did not reach the layer opener");
+
+        // A write-lock acquisition must succeed promptly here. If
+        // `copy_up` still held the read lock across the opener call,
+        // this would block until `proceed_tx` is sent below, and the
+        // recv_timeout would fire instead.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let fs_register = std::sync::Arc::clone(&fs);
+        let register_thread = std::thread::spawn(move || {
+            let _guard = fs_register.register_slot(PathBuf::from("other"), vec![]);
+            done_tx.send(()).expect("send done");
+        });
+        done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("register_slot blocked on slots lock still held across layer IO");
+
+        proceed_tx.send(()).expect("unblock opener");
+        copy_thread.join().expect("copy_up thread panicked");
+        register_thread
+            .join()
+            .expect("register_slot thread panicked");
+
+        let bytes = std::fs::read(upper.path().join("slow.txt")).expect("read upper");
+        assert_eq!(bytes, b"hi");
+    }
+
     #[test]
     fn write_after_create_with_readonly_mode_succeeds() {
         // Regression: `cp -R` of a Go module cache creates files with
@@ -1634,7 +1736,7 @@ mod tests {
             entry.mode = 0o444;
         }
         let opener: LayerOpener = Box::new(move || Ok(Box::new(Cursor::new(tar_bytes.clone()))));
-        let layer = Layer::new(index, opener);
+        let layer = std::sync::Arc::new(Layer::new(index, opener));
         let upper = tempfile::tempdir().expect("upper");
         let fs = LayeredFs::new(vec![layer], upper.path().to_path_buf());
 
