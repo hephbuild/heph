@@ -117,18 +117,20 @@ impl HttpConnector for NegotiatingConnector {
 /// multi-GiB transfer would hit the 180s elapsed cap and fail despite using a
 /// single retry. Widen it so resume-via-`Range` has room.
 ///
-/// `retry_timeout` is per *request*, and every request heph makes now carries its
-/// own bound — [`METADATA_TIMEOUT`](super::remote_cache::METADATA_TIMEOUT) for
-/// metadata, `BLOB_WRITE_STALL_TIMEOUT` per upload write, `InactivityReader` on a
-/// download body. So this only has to cover one request's retry chain, not a whole
-/// transfer: 5 minutes is ample, and keeping it *tight* matters because a request
-/// retrying inside this budget is holding one of the cache's request slots the
-/// whole time. The previous 30 minutes let a single unlucky request squat a slot
-/// for half an hour.
+/// object_store's retry clock (`retry.rs`) starts once per logical GET and
+/// keeps running across every mid-stream `Range`-resume attempt — it is not
+/// reset per attempt. `retry_timeout` therefore has to cover a *whole*
+/// transfer's retry chain, not one [`REQUEST_TIMEOUT`] attempt: setting it
+/// equal to (or below) `REQUEST_TIMEOUT` means the very first attempt on a
+/// large/slow blob exhausts the retry clock at the same moment it hits the
+/// per-request timeout, leaving zero budget for the resume retries
+/// `max_retries` promises. Keep this several multiples of `REQUEST_TIMEOUT`
+/// (a guard test enforces the margin) — still comfortably under GCS's ~1h
+/// token lifetime.
 fn retry_config() -> RetryConfig {
     RetryConfig {
         max_retries: 20,
-        retry_timeout: Duration::from_secs(5 * 60),
+        retry_timeout: Duration::from_secs(30 * 60),
         ..Default::default()
     }
 }
@@ -732,6 +734,24 @@ mod tests {
         // Local schemes have no HTTP client and reject client config keys.
         assert!(transfer_opts("file").is_empty());
         assert!(transfer_opts("memory").is_empty());
+    }
+
+    /// object_store's retry clock runs for the whole GET, including
+    /// mid-stream `Range`-resume attempts — it does not reset per attempt.
+    /// If `retry_timeout` were <= `REQUEST_TIMEOUT`, the first attempt on a
+    /// large/slow blob would exhaust the retry clock the instant it hit the
+    /// per-request timeout, leaving zero budget for any resume retry despite
+    /// `max_retries` promising 20. Guards against the regression where both
+    /// were narrowed to the same 5 minutes.
+    #[test]
+    fn retry_timeout_stays_well_above_request_timeout() {
+        let retry_timeout = retry_config().retry_timeout;
+        assert!(
+            retry_timeout >= REQUEST_TIMEOUT * 3,
+            "retry_timeout ({retry_timeout:?}) must stay several multiples of \
+             REQUEST_TIMEOUT ({REQUEST_TIMEOUT:?}) so resume-via-Range retries \
+             have room after the first attempt hits its per-request timeout"
+        );
     }
 
     #[test]
