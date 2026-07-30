@@ -1341,6 +1341,16 @@ impl Driver {
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect();
 
+        // Captured for the spawn-failure diagnostic below — `program` and
+        // `env_pairs` are moved into `spec` by both match arms.
+        let program_for_diag = program.clone();
+        let path_for_diag = env_pairs
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cwd_for_diag = req.sandbox_pkg_dir.clone();
+
         let spec = if let Some((master, slave)) = &pty_pair {
             // Inherit the parent's terminal size so bash can wrap and place the
             // prompt correctly. Falls back to 80x24 if the parent has no tty.
@@ -1401,7 +1411,20 @@ impl Driver {
         };
 
         hcore::hmemoizer::set_phase("pluginexec:spawn");
-        let mut handle = proc_exec::spawn(spec).with_context(|| "spawn child process")?;
+        let mut handle = proc_exec::spawn(spec).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                let path_display = if path_for_diag.is_empty() {
+                    "<empty>"
+                } else {
+                    &path_for_diag
+                };
+                anyhow::anyhow!(
+                    "spawn child process {program_for_diag:?}: {e} — not found in the driver's sandbox PATH ({path_display}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd_for_diag:?} exists."
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("spawn child process {program_for_diag:?}"))
+            }
+        })?;
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -2122,6 +2145,79 @@ mod tests {
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output.trim(), "hello");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_missing_program_reports_sandbox_path_not_shell_path() -> anyhow::Result<()> {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "path".to_string(),
+            serde_yaml::from_str("[/nonexistent-test-search-dir]").expect("yaml"),
+        );
+        let driver = Driver::from_options_exec(&opts)?;
+        let ctoken = StdCancellationToken::new();
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["definitely-not-a-real-binary-xyz".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+                outputs: BTreeMap::new(),
+                support_files: vec![],
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: CacheConfig::on(true),
+            pty: true,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        let res = driver.run(make_req(req), &ctoken).await;
+        let Err(err) = res else {
+            panic!("missing binary must fail");
+        };
+        let msg = err.to_string();
+        // Names the program and the sandbox PATH it was searched in (not the
+        // ambient shell PATH), and points at the config knob that controls it —
+        // otherwise this reads as a bare ENOENT with no actionable next step.
+        assert!(
+            msg.contains("definitely-not-a-real-binary-xyz"),
+            "missing program name: {msg}"
+        );
+        assert!(
+            msg.contains("/nonexistent-test-search-dir"),
+            "missing sandbox PATH: {msg}"
+        );
+        assert!(
+            msg.contains("`path` option in .hephconfig"),
+            "missing config hint: {msg}"
+        );
 
         Ok(())
     }
