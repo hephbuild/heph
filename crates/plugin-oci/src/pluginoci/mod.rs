@@ -53,8 +53,28 @@
 //! [`passthrough_oci_env`]), so a stray `BUILDX_BUILDER` or `SOURCE_DATE_EPOCH`
 //! cannot change the build behind the key's back.
 //!
+//! # The builder
+//!
 //! The builder is host `docker buildx` (a host capability, like `http_fetch`'s
 //! network); a hermetic toolchain can replace it later without changing targets.
+//!
+//! It must be one that can **write an image archive to a file**. The plain
+//! `docker` driver — what a stock Docker Engine selects by default — cannot: it
+//! only loads or pushes into the daemon, so both `--output type=oci,dest=…` and
+//! `type=docker,dest=…` fail on it, and with them every `oci_image` target
+//! whatever its `format`. Either turn on the daemon's containerd image store, or
+//! create a container builder and name it:
+//!
+//! ```console
+//! $ docker buildx create --name heph --driver docker-container
+//! ```
+//!
+//! ```python
+//! oci_image(name = "img", builder = "heph", ...)
+//! ```
+//!
+//! Which builder runs is a hashed input (`builder`), which is why
+//! `BUILDX_BUILDER` is stripped from the build's environment.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -1026,40 +1046,7 @@ impl ManagedDriver for Driver {
         let mut io = ToolIo::from_request(&mut req.request);
         run_tool(argv, &context_dir, "docker buildx build", &mut io, ctoken)
             .await
-            .with_context(|| {
-                if def.platforms.len() <= 1 {
-                    return format!("oci_image {addr}");
-                }
-                // The two ways a multi-platform build fails that a single-platform
-                // one cannot: the default daemon builder does not do them at all,
-                // and a single-instance base has no manifest for the other
-                // platforms. Both read as an opaque buildx error otherwise.
-                let bases = if def.bases.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        ", and every base in `bases` ({}) must be pulled with \
-                         `all_platforms = True`",
-                        def.bases.join(", ")
-                    )
-                };
-                let builder = def.builder.as_deref().map_or_else(
-                    || {
-                        "multi-platform builds need a container builder — create one with \
-                         `docker buildx create --name multi --driver docker-container` and select \
-                         it with `builder = \"multi\"`"
-                            .to_string()
-                    },
-                    |b| {
-                        format!(
-                            "multi-platform builds need a container builder — check that {b:?} is \
-                             one (`docker buildx inspect {b}` should say \
-                             `Driver: docker-container`)"
-                        )
-                    },
-                );
-                format!("oci_image {addr}: {builder}{bases}")
-            })?;
+            .map_err(|e| build_error_hint(e, &def, &addr))?;
 
         let metadata = tokio::fs::read_to_string(&metadata_file)
             .await
@@ -1073,6 +1060,68 @@ impl ManagedDriver for Driver {
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
+}
+
+/// Turn a `docker buildx build` failure into one the user can act on.
+///
+/// BuildKit's own message is kept — it is usually the specific one — and the
+/// heph-side remedy is layered on top for the two failures whose fix lives in
+/// the BUILD file rather than in the Dockerfile.
+fn build_error_hint(e: anyhow::Error, def: &OciImageDef, addr: &str) -> anyhow::Error {
+    let text = format!("{e:#}");
+
+    // The `docker` driver (a plain daemon builder without the containerd image
+    // store) has no file exporters at all: it can only load or push into the
+    // daemon. `oci_image` always writes an archive, so on such a builder *every*
+    // build fails, whatever `format` says — and BuildKit's message names the
+    // exporter without saying how to get one.
+    if text.contains("exporter is not supported for the docker driver") {
+        let fix = match &def.builder {
+            Some(b) => format!(
+                "builder {b:?} uses the `docker` driver, which cannot write an image archive to a \
+                 file. Recreate it with `docker buildx create --name {b} --driver docker-container`"
+            ),
+            None => "the current buildx builder uses the `docker` driver, which cannot write an \
+                     image archive to a file. Create one that can — `docker buildx create --name \
+                     heph --driver docker-container` — and select it with `builder = \"heph\"`"
+                .to_string(),
+        };
+        return e.context(format!(
+            "oci_image {addr}: {fix} (or turn on the daemon's containerd image store, which gives \
+             the `docker` driver the same exporters)"
+        ));
+    }
+
+    if def.platforms.len() <= 1 {
+        return e.context(format!("oci_image {addr}"));
+    }
+    // The two ways a multi-platform build fails that a single-platform one
+    // cannot: the builder does not do them at all, and a single-instance base
+    // has no manifest for the other platforms. Both read as an opaque BuildKit
+    // error otherwise.
+    let bases = if def.bases.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", and every base in `bases` ({}) must be pulled with `all_platforms = True`",
+            def.bases.join(", ")
+        )
+    };
+    let builder = def.builder.as_deref().map_or_else(
+        || {
+            "multi-platform builds need a container builder — create one with `docker buildx \
+             create --name multi --driver docker-container` and select it with `builder = \
+             \"multi\"`"
+                .to_string()
+        },
+        |b| {
+            format!(
+                "multi-platform builds need a container builder — check that {b:?} is one \
+                 (`docker buildx inspect {b}` should say `Driver: docker-container`)"
+            )
+        },
+    );
+    e.context(format!("oci_image {addr}: {builder}{bases}"))
 }
 
 /// Host env vars forwarded to `docker` / `skopeo`. Everything else is cleared
@@ -2472,6 +2521,35 @@ exit 0
 
     /// Metadata without `containerimage.digest` fails loudly rather than writing
     /// an empty digest output.
+    /// The plain `docker` driver has no file exporters, so an `oci_image` build
+    /// on it fails whatever `format` says. BuildKit names the exporter but not
+    /// the remedy — the driver has to add it, or the user is left guessing.
+    #[tokio::test]
+    async fn run_names_the_fix_when_the_builder_has_no_file_exporter() {
+        let sbx = Sandbox::new("app");
+        std::fs::write(sbx.pkg.join("Dockerfile"), "FROM scratch\n").expect("dockerfile");
+        let resp = parse_in(&sbx, "//app:img", cfg(&[ctx()])).await;
+
+        let bin = sbx.fake(
+            "docker",
+            "case \"$2\" in\n  inspect) echo \"Platforms: linux/amd64\"; exit 0 ;;\nesac\necho \
+             'ERROR: failed to build: OCI exporter is not supported for the docker driver.' \
+             >&2\nexit 1",
+        );
+        let rid = "req".to_string();
+        let req = run_request(&rid, "hashin", &resp.target_def, &sbx, &[]);
+        let err = Driver::with_binary(bin)
+            .run(req, &StdCancellationToken::new())
+            .await
+            .err()
+            .expect("the build must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("docker buildx create"), "got: {msg}");
+        assert!(msg.contains("builder ="), "got: {msg}");
+        // BuildKit's own message stays in the chain.
+        assert!(msg.contains("exporter is not supported"), "got: {msg}");
+    }
+
     #[tokio::test]
     async fn run_fails_when_metadata_has_no_digest() {
         let sbx = Sandbox::new("app");
