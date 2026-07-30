@@ -804,6 +804,20 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 20
     needs: [build]
+    # Own group per leg (matrix.os/arch), separate from the top-level `ci-*`
+    # group: this job's cost (real runners, real corpus, real timing) is high
+    # enough to warrant its own policy rather than inheriting the top-level
+    # one, and the two diverge on `push`. PR: same as top-level — a new push
+    # cancels the previous run's perf legs, since a superseded PR head's
+    # numbers are worthless once cancelled anyway. `push` (master): the group
+    # key drops the sha (fixed `master` suffix) so consecutive master commits
+    # queue on the same runner-flavour lane instead of racing each other for
+    # timing noise — cancel-in-progress stays false there so a queued commit's
+    # regression check still runs rather than getting starved forever by the
+    # next push.
+    concurrency:
+      group: perfbench-${{ matrix.os }}-${{ matrix.arch }}-${{ github.event_name == 'pull_request' && github.ref || 'master' }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     # Specifying `permissions:` at all makes it exhaustive — everything not
     # listed drops to `none`. `contents: read` for the checkout, `actions:
     # read` for the "Resolve baseline release" run-lookup, `issues: write`
