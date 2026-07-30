@@ -100,18 +100,17 @@ fn docker_available() -> bool {
     })
 }
 
-/// Whether the *default* builder can emit a multi-platform image.
+/// Whether the *default* buildx builder can write an image archive to a file.
 ///
-/// There is no cheap way to ask: the `docker` driver reports emulated platforms
-/// in `buildx inspect` exactly like a `docker-container` builder that can really
-/// do it, so the only honest probe is to try one. This runs a `FROM scratch`
-/// two-platform build once and caches the verdict.
+/// It very often cannot. The plain `docker` driver — what a stock Docker Engine
+/// gives you — has no file exporters at all: it can load or push into the
+/// daemon and nothing else, so `--output type=oci,dest=…` *and*
+/// `type=docker,dest=…` both fail. A `docker-container` builder, or the daemon's
+/// containerd image store, is what `oci_image` actually needs.
 ///
-/// This probes the *default* builder specifically. A target that needs another
-/// one names it with `builder =` — see
-/// [`test_real_docker_builds_multi_arch_on_a_named_builder`], which creates a
-/// `docker-container` builder and points a target at it.
-fn multi_platform_capable() -> bool {
+/// There is no cheap way to ask (`buildx inspect` reports the driver but not the
+/// image store), so the probe is a real one-platform build.
+fn default_builder_can_export() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
         if !docker_available() {
@@ -124,19 +123,15 @@ fn multi_platform_capable() -> bool {
         if std::fs::write(ctx.join("Dockerfile"), "FROM scratch\n").is_err() {
             return false;
         }
-        // Generous bound: this is a real build, and a `docker-container` builder
-        // may have to start its BuildKit container first.
         probe_for(
             &[
                 "buildx",
                 "build",
-                "--platform",
-                "linux/amd64,linux/arm64",
                 "--output",
                 &format!("type=oci,dest={}", ctx.join("probe.tar").display()),
                 &ctx.display().to_string(),
             ],
-            std::time::Duration::from_secs(180),
+            std::time::Duration::from_secs(120),
         )
     })
 }
@@ -201,6 +196,44 @@ macro_rules! require_skopeo_daemon {
                  /var/run/docker.sock, not docker contexts)"
             );
             return Ok(());
+        }
+    };
+}
+
+/// A builder every archive-producing test can use.
+///
+/// `None` means "the default one is fine" — a containerd-backed daemon, or
+/// something like OrbStack. Otherwise a throwaway `docker-container` builder is
+/// created for the test and removed when it drops, which is exactly what a user
+/// on a stock Docker Engine has to do: `oci_image` writes an archive, and the
+/// plain `docker` driver cannot write one at all.
+///
+/// `Err` when neither is possible — the caller skips.
+fn test_builder() -> Result<Option<ContainerBuilder>, ()> {
+    if default_builder_can_export() {
+        return Ok(None);
+    }
+    ContainerBuilder::create().map(Some).ok_or(())
+}
+
+/// The `builder = "…"` line to splice into a BUILD file, if one is needed.
+fn builder_attr(b: &Option<ContainerBuilder>) -> String {
+    b.as_ref()
+        .map_or_else(String::new, |b| format!("builder = \"{}\",", b.name))
+}
+
+/// Resolve a builder for the test, or skip.
+macro_rules! require_builder {
+    () => {
+        match test_builder() {
+            Ok(b) => b,
+            Err(()) => {
+                eprintln!(
+                    "skipping: the default buildx builder cannot export an image archive and a \
+                     docker-container builder could not be created"
+                );
+                return Ok(());
+            }
         }
     };
 }
@@ -379,10 +412,12 @@ async fn archive_of(ws: &htestkit::Workspace, addr: &str) -> anyhow::Result<Vec<
 #[tokio::test]
 async fn test_real_docker_builds_an_oci_archive_and_a_real_digest() -> anyhow::Result<()> {
     require_docker!();
+    let builder = require_builder!();
     let ws = workspace();
     ws.write_build_file(
         "app",
-        r#"
+        &format!(
+            r#"
 target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
 target(
     name = "dockerfile",
@@ -390,8 +425,15 @@ target(
     run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "oci_image", context = [":dockerfile", ":payload"])
+target(
+    name = "img",
+    driver = "oci_image",
+    context = [":dockerfile", ":payload"],
+    {builder}
+)
 "#,
+            builder = builder_attr(&builder)
+        ),
     );
 
     let entries = archive_entries(&archive_of(&ws, "//app:img").await?);
@@ -423,10 +465,12 @@ target(name = "img", driver = "oci_image", context = [":dockerfile", ":payload"]
 #[tokio::test]
 async fn test_real_docker_format_produces_a_docker_archive() -> anyhow::Result<()> {
     require_docker!();
+    let builder = require_builder!();
     let ws = workspace();
     ws.write_build_file(
         "app",
-        r#"
+        &format!(
+            r#"
 target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
 target(
     name = "dockerfile",
@@ -439,8 +483,11 @@ target(
     driver = "oci_image",
     format = "docker",
     context = [":dockerfile", ":payload"],
+    {builder}
 )
 "#,
+            builder = builder_attr(&builder)
+        ),
     );
 
     let entries = archive_entries(&archive_of(&ws, "//app:img").await?);
@@ -463,6 +510,7 @@ target(
 #[tokio::test]
 async fn test_real_docker_copies_a_cross_package_dep_through_the_src_arg() -> anyhow::Result<()> {
     require_docker!();
+    let builder = require_builder!();
     let ws = workspace();
     ws.write_build_file(
         "cmd/server",
@@ -472,19 +520,23 @@ target(name = "bin", driver = "bash", run = "echo server-binary > $OUT", out = "
     );
     ws.write_build_file(
         "app",
-        r#"
+        &format!(
+            r#"
 target(
     name = "dockerfile",
     driver = "bash",
-    run = "printf 'FROM scratch\nARG SRC_BIN\nCOPY ${SRC_BIN} /usr/bin/server\n' > $OUT",
+    run = "printf 'FROM scratch\nARG SRC_BIN\nCOPY ${{SRC_BIN}} /usr/bin/server\n' > $OUT",
     out = "Dockerfile",
 )
 target(
     name = "img",
     driver = "oci_image",
-    context = {"": [":dockerfile"], "bin": ["//cmd/server:bin"]},
+    context = {{"": [":dockerfile"], "bin": ["//cmd/server:bin"]}},
+    {builder}
 )
 "#,
+            builder = builder_attr(&builder)
+        ),
     );
 
     // The assertion is that this succeeds: BuildKit resolves `COPY ${SRC_BIN}`
@@ -503,10 +555,12 @@ target(
 #[tokio::test]
 async fn test_real_docker_builds_only_the_selected_stage() -> anyhow::Result<()> {
     require_docker!();
+    let builder = require_builder!();
     let ws = workspace();
     ws.write_build_file(
         "app",
-        r#"
+        &format!(
+            r#"
 target(
     name = "dockerfile",
     driver = "bash",
@@ -520,6 +574,7 @@ target(
     stage = "good",
     out = "good.tar",
     context = [":dockerfile", ":payload"],
+    {builder}
 )
 target(
     name = "bad",
@@ -527,8 +582,11 @@ target(
     stage = "bad",
     out = "bad.tar",
     context = [":dockerfile", ":payload"],
+    {builder}
 )
 "#,
+            builder = builder_attr(&builder)
+        ),
     );
 
     ws.run("//app:good").await?;
@@ -552,18 +610,12 @@ target(
 #[tokio::test]
 async fn test_real_docker_multi_arch_build_indexes_both_platforms() -> anyhow::Result<()> {
     require_docker!();
-    if !multi_platform_capable() {
-        eprintln!(
-            "skipping: the default buildx builder cannot emit a multi-platform image \
-             (needs `docker buildx create --use --driver docker-container`, or the containerd \
-             image store)"
-        );
-        return Ok(());
-    }
+    let builder = require_builder!();
     let ws = workspace();
     ws.write_build_file(
         "app",
-        r#"
+        &format!(
+            r#"
 target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
 target(
     name = "dockerfile",
@@ -576,8 +628,11 @@ target(
     driver = "oci_image",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
+    {builder}
 )
 "#,
+            builder = builder_attr(&builder)
+        ),
     );
 
     let tar = archive_of(&ws, "//app:img").await?;
@@ -604,6 +659,7 @@ target(
 #[tokio::test]
 async fn test_real_docker_load_tags_the_image_in_the_daemon() -> anyhow::Result<()> {
     require_docker!();
+    let builder = require_builder!();
     // Unique per process so parallel runs (and a leftover from a killed run) do
     // not collide in the shared daemon.
     let tag = format!("heph-e2e-oci-load:{}", std::process::id());
@@ -625,9 +681,11 @@ target(
     driver = "oci_image",
     format = "docker",
     context = [":dockerfile", ":payload"],
+    {builder}
 )
 target(name = "load", driver = "oci_load", image = ":img", format = "docker", tag = "{tag}")
-"#
+"#,
+            builder = builder_attr(&builder),
         ),
     );
 
@@ -657,6 +715,7 @@ async fn test_real_skopeo_loads_an_oci_archive_into_the_daemon() -> anyhow::Resu
     require_docker!();
     require_skopeo!();
     require_skopeo_daemon!();
+    let builder = require_builder!();
     let tag = format!("heph-e2e-skopeo-load:{}", std::process::id());
 
     let ws = workspace();
@@ -671,9 +730,15 @@ target(
     run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
     out = "Dockerfile",
 )
-target(name = "img", driver = "oci_image", context = [":dockerfile", ":payload"])
+target(
+    name = "img",
+    driver = "oci_image",
+    context = [":dockerfile", ":payload"],
+    {builder}
+)
 target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
-"#
+"#,
+            builder = builder_attr(&builder),
         ),
     );
 
@@ -705,14 +770,7 @@ target(name = "load", driver = "oci_load", image = ":img", tag = "{tag}")
 async fn test_real_multi_arch_push_pull_and_build_from_the_pulled_base() -> anyhow::Result<()> {
     require_docker!();
     require_skopeo!();
-    if !multi_platform_capable() {
-        eprintln!(
-            "skipping: the default buildx builder cannot emit a multi-platform image \
-             (needs `docker buildx create --use --driver docker-container`, or the containerd \
-             image store)"
-        );
-        return Ok(());
-    }
+    let builder = require_builder!();
     let Some(registry) = Registry::start() else {
         eprintln!("skipping: could not start a local registry:2 (no network, or no daemon)");
         return Ok(());
@@ -735,6 +793,7 @@ target(
     driver = "oci_image",
     context = [":dockerfile", ":payload"],
     platforms = ["linux/amd64", "linux/arm64"],
+    {builder}
 )
 target(
     name = "push",
@@ -765,9 +824,11 @@ target(
     context = [":derived_dockerfile", ":payload"],
     bases = {{"base": [":base"]}},
     platforms = ["linux/amd64", "linux/arm64"],
+    {builder}
 )
 "#,
-            host = registry.host()
+            host = registry.host(),
+            builder = builder_attr(&builder),
         ),
     );
 
@@ -815,7 +876,15 @@ struct ContainerBuilder {
 
 impl ContainerBuilder {
     fn create() -> Option<Self> {
-        let name = format!("heph-e2e-{}", std::process::id());
+        // Unique per instance, not just per process: tests run in parallel and
+        // each one removes its builder on drop, so a shared name means one test
+        // tearing the builder out from under another mid-build.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let name = format!(
+            "heph-e2e-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         probe_for(
             &[
                 "buildx",
@@ -895,5 +964,50 @@ target(
             "the named builder must have produced a {arch} entry, got: {manifest_list}"
         );
     }
+    Ok(())
+}
+
+/// On a stock Docker Engine the default builder cannot write an image archive
+/// at all — the `docker` driver has no file exporters — so *every* `oci_image`
+/// build fails there, whatever `format` says. BuildKit's own message names the
+/// exporter but not the remedy; heph has to supply it.
+///
+/// Runs only where that is actually the situation: on a containerd-backed
+/// daemon there is nothing to diagnose.
+#[tokio::test]
+async fn test_real_docker_default_builder_without_exporters_is_diagnosable() -> anyhow::Result<()> {
+    require_docker!();
+    if default_builder_can_export() {
+        eprintln!("skipping: this host's default builder can export archives, nothing to diagnose");
+        return Ok(());
+    }
+
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "payload", driver = "bash", run = "echo payload > $OUT", out = "payload.txt")
+target(
+    name = "dockerfile",
+    driver = "bash",
+    run = "printf 'FROM scratch\nCOPY app/payload.txt /payload.txt\n' > $OUT",
+    out = "Dockerfile",
+)
+target(name = "img", driver = "oci_image", context = [":dockerfile", ":payload"])
+"#,
+    );
+
+    let err = ws
+        .run("//app:img")
+        .await
+        .err()
+        .expect("a builder with no file exporters cannot build an oci_image");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("docker-container") && msg.contains("builder ="),
+        "the error must say how to fix it, got: {msg}"
+    );
+    // BuildKit's own diagnosis survives underneath.
+    assert!(msg.contains("exporter is not supported"), "got: {msg}");
     Ok(())
 }
