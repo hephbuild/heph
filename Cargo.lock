@@ -1445,6 +1445,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "heph",
+ "tar",
  "tempfile",
  "testkit",
  "tokio",
