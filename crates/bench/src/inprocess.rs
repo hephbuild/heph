@@ -6,8 +6,16 @@
 //! Tier B (`run dist`) measures instead. Only `bash`/`exec` builtins are
 //! registered — real users' most common path, and the one that never
 //! crosses the plugin ABI seam.
+//!
+//! Exposes two primitives, [`prepare`] and [`measure_once`], rather than a
+//! self-contained "do N reps" loop. The engine under test is compiled into
+//! *this* binary, so candidate and baseline are necessarily two different
+//! compiled artifacts — orchestrating warmup counts, rep counts, and
+//! interleaving order belongs in one stable place (the `run inprocess`
+//! orchestrator in `main.rs`, always built from the current checkout), not
+//! duplicated inside every historical binary that gets fetched as a
+//! baseline. See that orchestrator's doc comment for the full rationale.
 
-use crate::timing::{RunOptions, RunResults, ScenarioResult};
 use anyhow::{Context, Result};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
@@ -22,15 +30,15 @@ use std::time::Instant;
 pub enum Scenario {
     /// Every rep starts from an empty on-disk cache.
     Cold,
-    /// One untimed rep populates the cache; every measured rep hits it.
+    /// `prepare` populates the cache; every `measure_once` hits it.
     FullHit,
-    /// Like `full-hit`, but a small fraction of BUILD files are rewritten
-    /// after the warmup rep, so measured reps do a partial rebuild.
+    /// Like `full-hit`, but each `measure_once` first rewrites a small
+    /// fraction of BUILD files, so it does a partial rebuild.
     Incremental,
 }
 
 impl Scenario {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Scenario::Cold => "cold",
             Scenario::FullHit => "full-hit",
@@ -91,70 +99,39 @@ fn wipe_cache(corpus: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn run(
+/// Get the corpus into the state `measure_once` expects, once. Cold has
+/// nothing to share across calls (every `measure_once` is independently
+/// cold) but still benefits from a throwaway build to warm the OS/page
+/// cache. `full-hit`/`incremental` wipe and do one real build here — that
+/// build's cache is what every subsequent `measure_once` on this corpus
+/// hits.
+pub async fn prepare(corpus: &Path, scenario: Scenario) -> Result<()> {
+    match scenario {
+        Scenario::Cold | Scenario::FullHit | Scenario::Incremental => {
+            wipe_cache(corpus)?;
+            resolve_all(corpus).await?;
+        }
+    }
+    Ok(())
+}
+
+/// One measured rep. `mutate_seed` only matters for `Incremental` (ignored
+/// otherwise) — the caller must vary it across repeated calls against the
+/// same corpus, or every call mutates the same files again.
+pub async fn measure_once(
     corpus: &Path,
     manifest: &CorpusManifest,
     scenario: Scenario,
-    opts: &RunOptions,
-) -> Result<RunResults> {
-    let mut wall_ms = Vec::with_capacity(opts.reps);
-
-    match scenario {
-        Scenario::Cold => {
-            for _ in 0..opts.warmup {
-                wipe_cache(corpus)?;
-                resolve_all(corpus).await?;
-            }
-            for _ in 0..opts.reps {
-                wipe_cache(corpus)?;
-                let start = Instant::now();
-                resolve_all(corpus).await?;
-                wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-            }
-        }
-        Scenario::FullHit => {
-            if !opts.skip_prepare {
-                wipe_cache(corpus)?;
-                for _ in 0..opts.warmup {
-                    resolve_all(corpus).await?;
-                }
-            }
-            for _ in 0..opts.reps {
-                let start = Instant::now();
-                resolve_all(corpus).await?;
-                wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-            }
-        }
-        Scenario::Incremental => {
-            if !opts.skip_prepare {
-                wipe_cache(corpus)?;
-                for _ in 0..opts.warmup {
-                    resolve_all(corpus).await?;
-                }
-            }
-            // Fresh mutation before every measured rep — otherwise only the
-            // first rep is a genuine incremental rebuild and the rest are
-            // full-hit repeats wearing the wrong label.
-            for i in 0..opts.reps {
-                bench_corpus::incrementalize(
-                    manifest,
-                    corpus,
-                    0.01,
-                    0xDEC1 ^ (opts.rep_offset + i) as u64,
-                )
-                .context("mutate corpus for incremental scenario")?;
-                let start = Instant::now();
-                resolve_all(corpus).await?;
-                wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-            }
-        }
+    mutate_seed: u64,
+) -> Result<f64> {
+    if let Scenario::Cold = scenario {
+        wipe_cache(corpus)?;
     }
-
-    Ok(RunResults {
-        tier: "inprocess".to_string(),
-        scenarios: vec![ScenarioResult {
-            scenario: scenario.name().to_string(),
-            wall_ms,
-        }],
-    })
+    if let Scenario::Incremental = scenario {
+        bench_corpus::incrementalize(manifest, corpus, 0.01, 0xDEC1 ^ mutate_seed)
+            .context("mutate corpus for incremental scenario")?;
+    }
+    let start = Instant::now();
+    resolve_all(corpus).await?;
+    Ok(start.elapsed().as_secs_f64() * 1000.0)
 }

@@ -765,9 +765,13 @@ jobs:
   #
   # Two tiers per platform, matching `crates/e2e` vs `crates/bin-e2e`'s split
   # (see `.claude/testing.md`):
-  #   - inprocess (Tier A): the engine linked directly, no process spawn, no
+  #   - inprocess (Tier A): the engine linked directly into `heph-bench`, no
   #     plugin cdylib. Isolates engine-internals cost (cache, hashing, DAG
-  #     resolution) from process-startup/dlopen noise.
+  #     resolution) from dlopen noise, which Tier B measures instead. It DOES
+  #     spawn a process per rep now (on both sides, symmetrically — see
+  #     `run inprocess`'s doc comment in `crates/bench/src/main.rs`), traded
+  #     deliberately for never needing baseline's binary to understand new
+  #     orchestration flags again.
   #   - dist (Tier B): the real prebuilt `heph` binary + real `go` plugin
   #     cdylib, dlopened for real — the only way to measure ABI-crossing and
   #     plugin-load cost. Head's `heph-bench` drives both sides here (the
@@ -965,54 +969,39 @@ jobs:
             --go-packages "$PERFBENCH_GO_PACKAGES" \
             --out bench-corpus
 
-      # Candidate and baseline are interleaved rep-by-rep, not run to
-      # completion one side at a time: `run ... --reps N` in one shot would
-      # let a systematic drift on the runner (thermal state ramping up, a
-      # noisy neighbor arriving mid-job) land entirely on whichever side
-      # happened to run second, biasing the comparison rather than adding
-      # symmetric noise to both. `--warmup 1 --reps 0` primes the shared
-      # cache state once per side (a no-op for `cold`, which has none); each
-      # `--reps 1 --skip-prepare --append` round after that measures one more
-      # rep per side and merges it into the same output file, alternating.
+      # `heph-bench run inprocess`/`run dist` are themselves the orchestrator
+      # now — one call per scenario measures BOTH candidate and baseline,
+      # interleaved rep-by-rep internally (see RunInprocessArgs'/RunDistArgs'
+      # doc comments in main.rs for the full rationale: a systematic drift on
+      # the runner, thermal state or a noisy neighbor, must land on both
+      # sides symmetrically, not on whichever side happens to run its whole
+      # batch second). Nothing here needs to know whether baseline's binary
+      # supports anything beyond the minimal `measure-inprocess` primitive —
+      # if it doesn't (baseline predates this PR), the call fails and
+      # `continue-on-error` + "Compare and report"'s missing-file handling
+      # absorb it as "no results" for that leg, same as any other run
+      # failure. That's a one-time gap that resolves itself once this PR
+      # merges; no fallback branching to maintain for it.
       - name: Time Tier A (inprocess) scenarios
         if: steps.baseline_fetch.outputs.bench_ok == 'true'
         continue-on-error: true
         run: |
           for scenario in cold full-hit incremental; do
-            cand_out="candidate_inproc_${scenario}.json"
-            base_out="baseline_inproc_${scenario}.json"
-            ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps 0 --out /dev/null
-            ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps 0 --out /dev/null
-            rm -f "$cand_out" "$base_out"
-            for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
-              ./candidate-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
-              ./baseline-dist/heph-bench run inprocess --corpus bench-corpus --scenario "$scenario" \
-                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
-            done
+            ./candidate-dist/heph-bench run inprocess \
+              --candidate-bin ./candidate-dist/heph-bench --baseline-bin ./baseline-dist/heph-bench \
+              --corpus bench-corpus --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_REPS" \
+              --out-candidate "candidate_inproc_${scenario}.json" --out-baseline "baseline_inproc_${scenario}.json"
           done
 
       - name: Time Tier B (dist) scenarios
         if: steps.baseline_fetch.outputs.ok == 'true'
         continue-on-error: true
         run: |
-          BENCH=./candidate-dist/heph-bench
           for scenario in cold full-hit incremental; do
-            cand_out="candidate_dist_${scenario}.json"
-            base_out="baseline_dist_${scenario}.json"
-            "$BENCH" run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps 0 --out /dev/null
-            "$BENCH" run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
-              --warmup 1 --reps 0 --out /dev/null
-            rm -f "$cand_out" "$base_out"
-            for i in $(seq 0 $((PERFBENCH_REPS - 1))); do
-              "$BENCH" run dist --dist candidate-dist --corpus bench-corpus --scenario "$scenario" \
-                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$cand_out"
-              "$BENCH" run dist --dist baseline-dist --corpus bench-corpus --scenario "$scenario" \
-                --warmup 0 --reps 1 --skip-prepare --rep-offset "$i" --append --out "$base_out"
-            done
+            ./candidate-dist/heph-bench run dist \
+              --candidate-dist candidate-dist --baseline-dist baseline-dist \
+              --corpus bench-corpus --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_REPS" \
+              --out-candidate "candidate_dist_${scenario}.json" --out-baseline "baseline_dist_${scenario}.json"
           done
 
       # Every scenario/tier combination is always attempted and reported —

@@ -5,9 +5,10 @@ mod timing;
 
 use anyhow::{Context, Result};
 use bench_corpus::CorpusParams;
-use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
-use timing::RunOptions;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use timing::{RunResults, ScenarioResult};
 
 /// Perf-regression harness: generate a deterministic synthetic corpus, time
 /// `heph` scenarios against it (in-process or the real prebuilt binary +
@@ -23,11 +24,15 @@ struct Cli {
 enum Cmd {
     /// Generate a synthetic corpus.
     Corpus(GenerateArgs),
-    /// Time a scenario, in-process (Tier A) or against a real binary (Tier B).
+    /// Orchestrate a scenario across both candidate and baseline, in-process
+    /// (Tier A) or against real binaries (Tier B).
     Run {
         #[command(subcommand)]
         cmd: RunCmd,
     },
+    /// Tier A's minimal, stable "subject" primitive — see its own doc
+    /// comment. Not meant to be run by hand; `run inprocess` spawns it.
+    MeasureInprocess(MeasureInprocessArgs),
     /// Decide regression between two `run` result files.
     Compare(CompareArgs),
 }
@@ -53,14 +58,62 @@ struct GenerateArgs {
     out: PathBuf,
 }
 
-#[derive(Subcommand)]
-enum RunCmd {
-    Inprocess(InprocessArgs),
-    Dist(DistArgs),
+#[derive(Clone, Copy, ValueEnum)]
+enum MeasureMode {
+    /// Get the corpus into the state a measured rep expects (wipe + one
+    /// throwaway build). Prints nothing.
+    Prepare,
+    /// One measured rep. Prints ONLY the elapsed milliseconds, as a single
+    /// line — the entire contract a caller can rely on.
+    Once,
 }
 
 #[derive(Args)]
-struct InprocessArgs {
+struct MeasureInprocessArgs {
+    #[arg(long)]
+    corpus: PathBuf,
+    #[arg(long, value_enum)]
+    scenario: inprocess::Scenario,
+    #[arg(long, value_enum)]
+    mode: MeasureMode,
+    /// Only consulted for `incremental` in `--mode once`. Ignored otherwise.
+    #[arg(long, default_value_t = 0)]
+    mutate_seed: u64,
+}
+
+#[derive(Subcommand)]
+enum RunCmd {
+    Inprocess(RunInprocessArgs),
+    Dist(RunDistArgs),
+}
+
+/// Why this orchestrates both sides in one call instead of being invoked
+/// once per side: the engine under test is compiled into the `heph-bench`
+/// binary itself for Tier A, so candidate and baseline are two different
+/// compiled artifacts — there is no single binary that can link both
+/// engines to compare them in-process. Baseline's binary is always fetched
+/// from a past release, so it is compiled from OLDER source than whatever
+/// orchestration logic (warmup counts, rep counts, interleaving order,
+/// output format) the current PR wants — asking baseline's binary to
+/// understand new orchestration flags means every such change needs a
+/// bootstrap PR before it can be exercised (this crate hit that twice).
+///
+/// The fix: shrink what a per-commit binary needs to expose to the smallest
+/// possible stable contract — `measure-inprocess --mode prepare|once`,
+/// which prints only a single elapsed-ms number and needs no format changes
+/// to support new orchestration ideas — and keep ALL orchestration in the
+/// current checkout's own `heph-bench`, spawned fresh for every run. This
+/// command spawns that primitive on `--candidate-bin` AND `--baseline-bin`
+/// symmetrically (never calling in-process on itself, even though it could
+/// for the candidate side) so both sides pay identical process-spawn
+/// overhead — that overhead is then symmetric noise on both sides of every
+/// rep, not a fixed advantage for whichever side skips it.
+#[derive(Args)]
+struct RunInprocessArgs {
+    #[arg(long)]
+    candidate_bin: PathBuf,
+    #[arg(long)]
+    baseline_bin: PathBuf,
     #[arg(long)]
     corpus: PathBuf,
     #[arg(long, value_enum)]
@@ -69,31 +122,27 @@ struct InprocessArgs {
     warmup: usize,
     #[arg(long, default_value_t = 5)]
     reps: usize,
-    /// Skip the scenario's wipe/warm preamble — assumes a prior invocation
-    /// already did it. Lets a caller interleave candidate/baseline rep by
-    /// rep: one `--skip-prepare=false` call to prepare, then alternating
-    /// `--reps 1 --skip-prepare --append` calls per side per round.
     #[arg(long)]
-    skip_prepare: bool,
-    /// Seed offset for `incremental`'s per-rep mutation. Required to be
-    /// distinct across separate `--reps 1` invocations of the same
-    /// scenario/corpus, or each call mutates the same files again.
-    #[arg(long, default_value_t = 0)]
-    rep_offset: usize,
-    /// Merge into an existing `--out` file's matching scenario instead of
-    /// overwriting it — the other half of interleaving one rep at a time.
+    out_candidate: PathBuf,
     #[arg(long)]
-    append: bool,
-    #[arg(long)]
-    out: PathBuf,
+    out_baseline: PathBuf,
 }
 
+/// Unlike Tier A, `heph`/the go plugin are already prebuilt artifacts on
+/// both sides and the code driving them (`dist::prepare`/`measure_once`) is
+/// always the current checkout's own — there is no per-commit "subject"
+/// binary to keep compatible here, so this calls into that module directly
+/// rather than spawning anything. Still orchestrates both sides in one
+/// command, interleaved, for the same symmetric-noise reasoning as
+/// `RunInprocessArgs` — and for a uniform shape between the two tiers.
 #[derive(Args)]
-struct DistArgs {
+struct RunDistArgs {
     /// Directory containing the prebuilt `heph` binary and plugin cdylibs
     /// (same layout `crates/bin-e2e`'s `Dist` expects). Never rebuilt here.
     #[arg(long)]
-    dist: PathBuf,
+    candidate_dist: PathBuf,
+    #[arg(long)]
+    baseline_dist: PathBuf,
     #[arg(long)]
     corpus: PathBuf,
     #[arg(long, value_enum)]
@@ -102,17 +151,10 @@ struct DistArgs {
     warmup: usize,
     #[arg(long, default_value_t = 3)]
     reps: usize,
-    /// See `run inprocess --skip-prepare` — identical contract here.
     #[arg(long)]
-    skip_prepare: bool,
-    /// See `run inprocess --rep-offset` — identical contract here.
-    #[arg(long, default_value_t = 0)]
-    rep_offset: usize,
-    /// See `run inprocess --append` — identical contract here.
+    out_candidate: PathBuf,
     #[arg(long)]
-    append: bool,
-    #[arg(long)]
-    out: PathBuf,
+    out_baseline: PathBuf,
 }
 
 #[derive(Args)]
@@ -157,6 +199,13 @@ fn main() -> Result<()> {
                 .context("build tokio runtime")?;
             rt.block_on(run_run(cmd))
         }
+        Cmd::MeasureInprocess(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("build tokio runtime")?;
+            rt.block_on(run_measure_inprocess(args))
+        }
         Cmd::Compare(args) => run_compare(args),
     }
 }
@@ -184,78 +233,217 @@ fn run_corpus(args: GenerateArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_run(cmd: RunCmd) -> Result<()> {
-    match cmd {
-        RunCmd::Inprocess(args) => {
-            let manifest = bench_corpus::load_manifest(&args.corpus)
-                .context("load corpus manifest (run `corpus` first)")?;
-            let opts = RunOptions {
-                warmup: args.warmup,
-                reps: args.reps,
-                skip_prepare: args.skip_prepare,
-                rep_offset: args.rep_offset,
-            };
-            let results = inprocess::run(&args.corpus, &manifest, args.scenario, &opts)
+async fn run_measure_inprocess(args: MeasureInprocessArgs) -> Result<()> {
+    match args.mode {
+        MeasureMode::Prepare => {
+            inprocess::prepare(&args.corpus, args.scenario)
                 .await
-                .context("run inprocess scenario")?;
-            write_results(&args.out, &results, args.append)
+                .context("prepare inprocess scenario")?;
         }
-        RunCmd::Dist(args) => {
+        MeasureMode::Once => {
             let manifest = bench_corpus::load_manifest(&args.corpus)
                 .context("load corpus manifest (run `corpus` first)")?;
-            let opts = RunOptions {
-                warmup: args.warmup,
-                reps: args.reps,
-                skip_prepare: args.skip_prepare,
-                rep_offset: args.rep_offset,
-            };
-            let results = dist::run(&args.dist, &args.corpus, &manifest, args.scenario, &opts)
-                .context("run dist scenario")?;
-            write_results(&args.out, &results, args.append)
+            let ms =
+                inprocess::measure_once(&args.corpus, &manifest, args.scenario, args.mutate_seed)
+                    .await
+                    .context("measure inprocess scenario")?;
+            println!("{ms}");
+        }
+    }
+    Ok(())
+}
+
+/// Spawns `bin measure-inprocess ...` and, for `Once`, parses its one line
+/// of stdout as the elapsed milliseconds. `corpus` must already be
+/// absolute — this never changes the child's cwd, but staying consistent
+/// with the rest of this crate's (hard-won) path handling avoids relying on
+/// that.
+fn spawn_measure_inprocess(
+    bin: &Path,
+    corpus: &Path,
+    scenario: inprocess::Scenario,
+    mode: MeasureMode,
+    mutate_seed: u64,
+) -> Result<Option<f64>> {
+    let mode_str = match mode {
+        MeasureMode::Prepare => "prepare",
+        MeasureMode::Once => "once",
+    };
+    let out = Command::new(bin)
+        .arg("measure-inprocess")
+        .arg("--corpus")
+        .arg(corpus)
+        .args(["--scenario", scenario.name(), "--mode", mode_str])
+        .args(["--mutate-seed", &mutate_seed.to_string()])
+        .output()
+        .with_context(|| format!("spawn {} measure-inprocess", bin.display()))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{} measure-inprocess failed: status {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            bin.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    match mode {
+        MeasureMode::Prepare => Ok(None),
+        MeasureMode::Once => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let ms: f64 = stdout.trim().parse().with_context(|| {
+                format!(
+                    "parse elapsed ms from {} measure-inprocess: {stdout:?}",
+                    bin.display()
+                )
+            })?;
+            Ok(Some(ms))
         }
     }
 }
 
-/// `append`: merge `results`' scenarios into whatever's already at `out`
-/// (extending a matching scenario's `wall_ms` rather than replacing it),
-/// instead of overwriting — how interleaved single-rep invocations
-/// accumulate into one file across separate process runs.
-fn write_results(out: &std::path::Path, results: &timing::RunResults, append: bool) -> Result<()> {
-    let merged = if append && out.exists() {
-        let existing_bytes =
-            std::fs::read(out).with_context(|| format!("read {}", out.display()))?;
-        let mut existing: timing::RunResults = serde_json::from_slice(&existing_bytes)
-            .with_context(|| format!("parse {}", out.display()))?;
-        for new_scenario in &results.scenarios {
-            match existing
-                .scenarios
-                .iter_mut()
-                .find(|s| s.scenario == new_scenario.scenario)
-            {
-                Some(existing_scenario) => {
-                    existing_scenario
-                        .wall_ms
-                        .extend(new_scenario.wall_ms.iter().copied());
-                }
-                None => existing.scenarios.push(new_scenario.clone()),
-            }
-        }
-        existing
-    } else {
-        results.clone()
-    };
+async fn run_run(cmd: RunCmd) -> Result<()> {
+    match cmd {
+        RunCmd::Inprocess(args) => run_inprocess_both(args).await,
+        RunCmd::Dist(args) => run_dist_both(args),
+    }
+}
 
-    let bytes = serde_json::to_vec_pretty(&merged).context("encode results")?;
-    std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
-    for s in &merged.scenarios {
-        println!(
-            "{}: {} reps, {:.1}ms mean",
-            s.scenario,
-            s.wall_ms.len(),
-            s.wall_ms.iter().sum::<f64>() / s.wall_ms.len().max(1) as f64
+/// Prepares both sides once, then interleaves `reps` measured rounds
+/// (candidate, baseline, candidate, baseline, ...) so a systematic drift on
+/// the runner — thermal state ramping up, a noisy neighbor arriving
+/// mid-job — lands on both sides symmetrically instead of biasing whichever
+/// side happens to run its whole batch second. `blocking spawn` per rep is
+/// deliberate: there is nothing to overlap (the whole point is serialized,
+/// alternating timing), so async buys nothing here.
+async fn run_inprocess_both(args: RunInprocessArgs) -> Result<()> {
+    let corpus = args
+        .corpus
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", args.corpus.display()))?;
+
+    for _ in 0..args.warmup {
+        spawn_measure_inprocess(
+            &args.candidate_bin,
+            &corpus,
+            args.scenario,
+            MeasureMode::Prepare,
+            0,
+        )
+        .context("prepare candidate")?;
+        spawn_measure_inprocess(
+            &args.baseline_bin,
+            &corpus,
+            args.scenario,
+            MeasureMode::Prepare,
+            0,
+        )
+        .context("prepare baseline")?;
+    }
+
+    let mut candidate_ms = Vec::with_capacity(args.reps);
+    let mut baseline_ms = Vec::with_capacity(args.reps);
+    for i in 0..args.reps {
+        let seed = i as u64;
+        let cand = spawn_measure_inprocess(
+            &args.candidate_bin,
+            &corpus,
+            args.scenario,
+            MeasureMode::Once,
+            seed,
+        )
+        .context("measure candidate")?
+        .context("candidate measure-inprocess printed no timing")?;
+        candidate_ms.push(cand);
+        let base = spawn_measure_inprocess(
+            &args.baseline_bin,
+            &corpus,
+            args.scenario,
+            MeasureMode::Once,
+            seed,
+        )
+        .context("measure baseline")?
+        .context("baseline measure-inprocess printed no timing")?;
+        baseline_ms.push(base);
+    }
+
+    write_results(
+        &args.out_candidate,
+        "inprocess",
+        args.scenario.name(),
+        candidate_ms,
+    )?;
+    write_results(
+        &args.out_baseline,
+        "inprocess",
+        args.scenario.name(),
+        baseline_ms,
+    )?;
+    Ok(())
+}
+
+/// Same interleaving shape as `run_inprocess_both`, calling straight into
+/// `dist::prepare`/`measure_once` (no subprocess spawn of `heph-bench`
+/// itself needed — see `RunDistArgs`'s doc comment for why).
+fn run_dist_both(args: RunDistArgs) -> Result<()> {
+    let corpus = args
+        .corpus
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", args.corpus.display()))?;
+    let manifest = bench_corpus::load_manifest(&corpus)
+        .context("load corpus manifest (run `corpus` first)")?;
+
+    for _ in 0..args.warmup {
+        dist::prepare(&args.candidate_dist, &corpus, args.scenario).context("prepare candidate")?;
+        dist::prepare(&args.baseline_dist, &corpus, args.scenario).context("prepare baseline")?;
+    }
+
+    let mut candidate_ms = Vec::with_capacity(args.reps);
+    let mut baseline_ms = Vec::with_capacity(args.reps);
+    for i in 0..args.reps {
+        let seed = i as u64;
+        candidate_ms.push(
+            dist::measure_once(
+                &args.candidate_dist,
+                &corpus,
+                &manifest,
+                args.scenario,
+                seed,
+            )
+            .context("measure candidate")?,
+        );
+        baseline_ms.push(
+            dist::measure_once(&args.baseline_dist, &corpus, &manifest, args.scenario, seed)
+                .context("measure baseline")?,
         );
     }
+
+    write_results(
+        &args.out_candidate,
+        "dist",
+        args.scenario.name(),
+        candidate_ms,
+    )?;
+    write_results(
+        &args.out_baseline,
+        "dist",
+        args.scenario.name(),
+        baseline_ms,
+    )?;
     Ok(())
+}
+
+fn write_results(out: &Path, tier: &str, scenario: &str, wall_ms: Vec<f64>) -> Result<()> {
+    let mean = wall_ms.iter().sum::<f64>() / wall_ms.len().max(1) as f64;
+    println!("{scenario}: {} reps, {mean:.1}ms mean", wall_ms.len());
+    let results = RunResults {
+        tier: tier.to_string(),
+        scenarios: vec![ScenarioResult {
+            scenario: scenario.to_string(),
+            wall_ms,
+        }],
+    };
+    let bytes = serde_json::to_vec_pretty(&results).context("encode results")?;
+    std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))
 }
 
 fn run_compare(args: CompareArgs) -> Result<()> {
