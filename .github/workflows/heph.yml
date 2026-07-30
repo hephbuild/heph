@@ -15,12 +15,14 @@ on:
   # alone.
   pull_request:
 
-# Cancel superseded runs on a branch/PR so a new push doesn't leave the old run
-# burning runners (and showing up as a noisy "cancelled"). master is never
-# cancelled — its runs publish releases and must always finish.
+# PR: cancel superseded runs so a new push doesn't leave the old run burning
+# runners (and showing up as a noisy "cancelled"). master: every commit gets
+# its own group (keyed by sha) so pushes run fully concurrently rather than
+# queuing behind each other — the `release` job below is what serializes to
+# "latest commit wins".
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # sccache config shared by every compiling job. RUSTC_WRAPPER=sccache is set by
 # the devenv shell; the storage backend (R2, or local disk on fork PRs) is wired
@@ -1105,6 +1107,7 @@ jobs:
               --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" \
               --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.base.outputs.sha }}" \
               --arg event_type "${{ github.event_name }}" \
+              --arg branch "${{ github.head_ref || github.ref_name }}" \
               --arg run_id "${{ github.run_id }}" \
               --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
               '[.[] | {
@@ -1113,7 +1116,7 @@ jobs:
                 properties: (. + {
                   tier: $tier, os: $os, arch: $arch,
                   sha: $sha, base_sha: $base_sha, event_type: $event_type,
-                  run_id: $run_id, run_url: $run_url
+                  branch: $branch, run_id: $run_id, run_url: $run_url
                 })
               }]' "$f")
             events=$(printf '%s' "$events" | jq --argjson add "$batch" '. + $add')
@@ -1165,6 +1168,14 @@ jobs:
     name: Release
     needs: [gen, upload_artifacts, lint, test, bin_e2e]
     if: github.ref == 'refs/heads/master'
+    # Build/test run concurrently for every master commit (see top-level
+    # concurrency), but only the latest landed commit should ever mark a
+    # release as production. Shared group + cancel-in-progress means an older
+    # commit's release job is cancelled the moment a newer commit's reaches
+    # this point, so the newest always wins.
+    concurrency:
+      group: release-master
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
