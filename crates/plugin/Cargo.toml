@@ -10,7 +10,6 @@ workspace = true
 hcore = { package = "core", path = "../core" }
 hconfig = { package = "config", path = "../config" }
 hmodel = { package = "model", path = "../model" }
-hwalk = { package = "walk", path = "../walk" }
 htspec-derive = { path = "../htspec-derive" }
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
