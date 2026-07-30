@@ -15,12 +15,14 @@ on:
   # alone.
   pull_request:
 
-# Cancel superseded runs on a branch/PR so a new push doesn't leave the old run
-# burning runners (and showing up as a noisy "cancelled"). master is never
-# cancelled — its runs publish releases and must always finish.
+# PR: cancel superseded runs so a new push doesn't leave the old run burning
+# runners (and showing up as a noisy "cancelled"). master: every commit gets
+# its own group (keyed by sha) so pushes run fully concurrently rather than
+# queuing behind each other — the `release` job below is what serializes to
+# "latest commit wins".
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # sccache config shared by every compiling job. RUSTC_WRAPPER=sccache is set by
 # the devenv shell; the storage backend (R2, or local disk on fork PRs) is wired
@@ -1165,6 +1167,14 @@ jobs:
     name: Release
     needs: [gen, upload_artifacts, lint, test, bin_e2e]
     if: github.ref == 'refs/heads/master'
+    # Build/test run concurrently for every master commit (see top-level
+    # concurrency), but only the latest landed commit should ever mark a
+    # release as production. Shared group + cancel-in-progress means an older
+    # commit's release job is cancelled the moment a newer commit's reaches
+    # this point, so the newest always wins.
+    concurrency:
+      group: release-master
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
