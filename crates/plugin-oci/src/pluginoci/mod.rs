@@ -251,11 +251,26 @@ pub(crate) fn ensure_tool_supports_format(tool: Tool, format: ImageFormat) -> an
 /// Config for an `oci_image` target.
 #[derive(Spec)]
 struct OciImageSpec {
-    /// Dockerfile path, relative to the target's package. Default `Dockerfile`.
-    /// A relative path may reach into a sibling package (`../base/Dockerfile`)
-    /// as long as a `context` dep materializes it; absolute paths are rejected,
-    /// since a host file outside the sandbox is not a declared input and its
-    /// edits would never invalidate the cache.
+    /// The Dockerfile, as either a **target address** or a path. Default
+    /// `Dockerfile`.
+    ///
+    /// An address — anything starting with `:` or `//`, e.g. `":dockerfile"` or
+    /// `"//base:Dockerfile"` — makes the target producing it a dep of this one,
+    /// staged and hashed on its own. That is the form to reach for when the
+    /// Dockerfile is generated, or lives in another package: no `context` entry
+    /// and no path spelling, and the target that produces it is what the cache
+    /// key follows.
+    ///
+    /// ```python
+    /// oci_image(name = "img", dockerfile = ":dockerfile", context = [":srcs"])
+    /// ```
+    ///
+    /// A path is relative to the target's package, and names a file some
+    /// `context` dep must materialize (a plain checked-in `Dockerfile` comes
+    /// from the `fs` provider). A relative path may reach into a sibling package
+    /// (`../base/Dockerfile`); absolute paths are rejected, since a host file
+    /// outside the sandbox is not a declared input and its edits would never
+    /// invalidate the cache.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     dockerfile: Option<String>,
     /// Build-context dependencies, grouped by name → list of target addresses.
@@ -383,11 +398,26 @@ struct OciImageSpec {
     cache: TargetSpecCache,
 }
 
+/// Where the build's Dockerfile comes from.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DockerfileSource {
+    /// A workspace-relative path (the spec's package-relative value joined onto
+    /// the package), resolved against the sandbox workspace root. Some `context`
+    /// dep has to put it there.
+    Path(String),
+    /// A target that produces it, staged as this target's own dep input under
+    /// [`DOCKERFILE_ORIGIN`]. Its address is not hashed — the input's content
+    /// hash is what the key follows, so two targets producing identical bytes
+    /// are correctly one cache entry.
+    Dep,
+}
+
+/// Origin id of the `dockerfile = ":target"` dep input.
+const DOCKERFILE_ORIGIN: &str = "dockerfile";
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciImageDef {
-    /// Workspace-relative Dockerfile path (the spec's package-relative value
-    /// joined onto the package), resolved against the sandbox workspace root.
-    dockerfile: String,
+    dockerfile: DockerfileSource,
     /// Workspace-relative output archive path (its basename is written into the
     /// sandbox package dir at run time).
     out: String,
@@ -438,7 +468,16 @@ const OCI_IMAGE_FORMAT_VERSION: u32 = 3;
 impl Hash for OciImageDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         OCI_IMAGE_FORMAT_VERSION.hash(state);
-        self.dockerfile.hash(state);
+        match &self.dockerfile {
+            DockerfileSource::Path(p) => {
+                "path".hash(state);
+                p.hash(state);
+            }
+            // The address is deliberately absent: the dep's own hashout covers
+            // what it produced, and hashing the address too would split the
+            // cache on a rename that changes nothing.
+            DockerfileSource::Dep => "dep".hash(state),
+        }
         self.out.hash(state);
         self.digest_out.hash(state);
         self.format.output_type().hash(state);
@@ -620,6 +659,15 @@ fn parse_metadata_digest(metadata: &str) -> anyhow::Result<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .context("buildx metadata missing `containerimage.digest`")
+}
+
+/// Whether an attribute value names a target rather than a path.
+///
+/// The same two prefixes every other target-valued attribute here accepts
+/// (`context`, `bases`, `image`): `//pkg:name` absolute, `:name` in this
+/// package. No path worth writing starts with either.
+pub(crate) fn is_addr(value: &str) -> bool {
+    value.starts_with("//") || value.starts_with(':')
 }
 
 /// Join a package-relative path onto a (possibly empty) package prefix, yielding
@@ -831,14 +879,27 @@ impl ManagedDriver for Driver {
 
         let format = ImageFormat::parse(spec.format.as_deref().unwrap_or("oci"))?;
 
-        let dockerfile_rel = spec.dockerfile.unwrap_or_else(|| "Dockerfile".to_string());
-        anyhow::ensure!(
-            !Path::new(&dockerfile_rel).is_absolute(),
-            "`dockerfile` {dockerfile_rel:?} is an absolute path: it would be read from outside \
-             the sandbox and would not be a declared input, so edits to it could never invalidate \
-             the cache. Use a path relative to the package."
-        );
-        let dockerfile = ws_path(pkg_str, &dockerfile_rel);
+        let dockerfile_spec = spec.dockerfile.unwrap_or_else(|| "Dockerfile".to_string());
+        let dockerfile_ref = if is_addr(&dockerfile_spec) {
+            Some(
+                TargetAddr::parse(&dockerfile_spec, &pkg)
+                    .with_context(|| format!("parse `dockerfile` target {dockerfile_spec:?}"))?,
+            )
+        } else {
+            None
+        };
+        let dockerfile = if dockerfile_ref.is_some() {
+            DockerfileSource::Dep
+        } else {
+            anyhow::ensure!(
+                !Path::new(&dockerfile_spec).is_absolute(),
+                "`dockerfile` {dockerfile_spec:?} is an absolute path: it would be read from \
+                 outside the sandbox and would not be a declared input, so edits to it could never \
+                 invalidate the cache. Use a path relative to the package, or the address of a \
+                 target that produces it."
+            );
+            DockerfileSource::Path(ws_path(pkg_str, &dockerfile_spec))
+        };
 
         let out_rel = spec.out.unwrap_or_else(|| format!("{}.tar", addr.name));
         anyhow::ensure!(
@@ -883,6 +944,19 @@ impl ManagedDriver for Driver {
         // sandbox at its workspace-relative path, and the workspace root is the
         // build context — so a dep from any package is reachable.
         let mut inputs: Vec<Input> = Vec::new();
+
+        // `dockerfile = ":target"` is a dep in its own right, so the user does
+        // not have to also list it in `context` and spell the path it lands at.
+        if let Some(r#ref) = dockerfile_ref {
+            inputs.push(Input {
+                r#ref,
+                mode: InputMode::Standard,
+                origin_id: DOCKERFILE_ORIGIN.to_string(),
+                annotations: BTreeMap::new(),
+                hashed: true,
+                runtime: true,
+            });
+        }
         let mut context_groups: Vec<String> = spec.context.keys().cloned().collect();
         // HashMap iteration order varies per process; sort so the def and the
         // input ordering are byte-stable across runs.
@@ -1013,13 +1087,21 @@ impl ManagedDriver for Driver {
         // it. Dockerfile `COPY` paths are therefore workspace-relative.
         let context_dir = req.sandbox_ws_dir.clone();
 
-        let dockerfile_full = context_dir.join(&def.dockerfile);
-        anyhow::ensure!(
-            dockerfile_full.exists(),
-            "oci_image: Dockerfile {:?} not found in the build context — declare the target that \
-             produces it in `context`. Paths are workspace-relative (e.g. \"app/Dockerfile\").",
-            def.dockerfile
-        );
+        let dockerfile_full = match &def.dockerfile {
+            // The dep staged it; its own list file says where.
+            DockerfileSource::Dep => dep_single_file(&req, DOCKERFILE_ORIGIN)
+                .context("oci_image: resolving the `dockerfile` target's output")?,
+            DockerfileSource::Path(rel) => {
+                let full = context_dir.join(rel);
+                anyhow::ensure!(
+                    full.exists(),
+                    "oci_image: Dockerfile {rel:?} not found in the build context — declare the \
+                     target that produces it in `context`, or set `dockerfile` to that target's \
+                     address. Paths are workspace-relative (e.g. \"app/Dockerfile\")."
+                );
+                full
+            }
+        };
 
         // Archive and digest are written into the package dir, where `parse`
         // declared them as outputs.
@@ -1754,7 +1836,7 @@ exit 0
     #[test]
     fn build_argv_assembles_expected_command() {
         let def = OciImageDef {
-            dockerfile: "app/Dockerfile".to_string(),
+            dockerfile: DockerfileSource::Path("app/Dockerfile".to_string()),
             out: "app/img.tar".to_string(),
             digest_out: "app/img.digest".to_string(),
             format: ImageFormat::Oci,
@@ -1806,7 +1888,7 @@ exit 0
     #[test]
     fn build_argv_passes_the_resolved_builder_platform() {
         let def = OciImageDef {
-            dockerfile: "Dockerfile".to_string(),
+            dockerfile: DockerfileSource::Path("Dockerfile".to_string()),
             out: "img.tar".to_string(),
             digest_out: "img.digest".to_string(),
             format: ImageFormat::Oci,
@@ -1837,7 +1919,7 @@ exit 0
     #[test]
     fn build_argv_wires_named_contexts_and_src_args() {
         let def = OciImageDef {
-            dockerfile: "Dockerfile".to_string(),
+            dockerfile: DockerfileSource::Path("Dockerfile".to_string()),
             out: "img.tar".to_string(),
             digest_out: "img.digest".to_string(),
             format: ImageFormat::Oci,
@@ -1881,7 +1963,7 @@ exit 0
     #[test]
     fn docker_format_selects_docker_output_type() {
         let def = OciImageDef {
-            dockerfile: "Dockerfile".to_string(),
+            dockerfile: DockerfileSource::Path("Dockerfile".to_string()),
             out: "img.tar".to_string(),
             digest_out: "img.digest".to_string(),
             format: ImageFormat::Docker,
@@ -1964,7 +2046,10 @@ exit 0
             Content::FilePath(p) if p == "app/img.digest"
         ));
         let def = resp.target_def.def::<OciImageDef>();
-        assert_eq!(def.dockerfile, "app/Dockerfile");
+        assert_eq!(
+            def.dockerfile,
+            DockerfileSource::Path("app/Dockerfile".to_string())
+        );
         assert_eq!(def.format, ImageFormat::Oci);
     }
 
@@ -2052,7 +2137,7 @@ exit 0
     #[test]
     fn build_argv_selects_the_named_builder() {
         let def = OciImageDef {
-            dockerfile: "Dockerfile".to_string(),
+            dockerfile: DockerfileSource::Path("Dockerfile".to_string()),
             out: "img.tar".to_string(),
             digest_out: "img.digest".to_string(),
             format: ImageFormat::Oci,
@@ -2136,6 +2221,126 @@ exit 0
         assert!(
             probe.ends_with("--bootstrap multi"),
             "the probe must name the builder, got: {probe}"
+        );
+    }
+
+    /// `dockerfile = ":target"` makes the producing target a dep in its own
+    /// right — no `context` entry and no path to spell. Getting this wrong
+    /// (treating the address as a path) fails at run time with a missing file,
+    /// long after parse said the target was fine.
+    #[tokio::test]
+    async fn parse_dockerfile_address_declares_a_dep() {
+        let sbx = Sandbox::new("app");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[ctx(), ("dockerfile", Value::String(":gen".to_string()))]),
+        )
+        .await;
+
+        let df = resp
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.origin_id == DOCKERFILE_ORIGIN)
+            .expect("a dockerfile dep input");
+        assert_eq!(df.r#ref.r#ref.format(), "//app:gen");
+        assert!(df.hashed && df.runtime);
+        assert_eq!(
+            resp.target_def.def::<OciImageDef>().dockerfile,
+            DockerfileSource::Dep
+        );
+    }
+
+    /// A cross-package address resolves against this target's package, like
+    /// every other target-valued attribute.
+    #[tokio::test]
+    async fn parse_dockerfile_absolute_address_declares_a_dep() {
+        let sbx = Sandbox::new("app");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                ("dockerfile", Value::String("//base:Dockerfile".to_string())),
+            ]),
+        )
+        .await;
+        let df = resp
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.origin_id == DOCKERFILE_ORIGIN)
+            .expect("a dockerfile dep input");
+        assert_eq!(df.r#ref.r#ref.format(), "//base:Dockerfile");
+    }
+
+    /// A path stays a path: no dep input, and the workspace-relative form in the
+    /// def.
+    #[tokio::test]
+    async fn parse_dockerfile_path_declares_no_dep() {
+        let sbx = Sandbox::new("app");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[
+                ctx(),
+                ("dockerfile", Value::String("Dockerfile".to_string())),
+            ]),
+        )
+        .await;
+        assert!(
+            !resp
+                .target_def
+                .inputs
+                .iter()
+                .any(|i| i.origin_id == DOCKERFILE_ORIGIN)
+        );
+        assert_eq!(
+            resp.target_def.def::<OciImageDef>().dockerfile,
+            DockerfileSource::Path("app/Dockerfile".to_string())
+        );
+    }
+
+    /// A generated Dockerfile is read from where the dep staged it, not from a
+    /// guessed path under the package.
+    #[tokio::test]
+    async fn run_reads_the_dockerfile_from_its_dep() {
+        let sbx = Sandbox::new("app");
+        let resp = parse_in(
+            &sbx,
+            "//app:img",
+            cfg(&[ctx(), ("dockerfile", Value::String(":gen".to_string()))]),
+        )
+        .await;
+
+        // Deliberately not `app/Dockerfile`: a driver that ignored the dep and
+        // joined the package path would find nothing here.
+        let staged = sbx.pkg.join("generated.Dockerfile");
+        std::fs::write(&staged, "FROM scratch\n").expect("dockerfile");
+
+        let bin = sbx.fake("docker", FAKE_DOCKER_OK);
+        let rid = "req".to_string();
+        let req = run_request(
+            &rid,
+            "hashin",
+            &resp.target_def,
+            &sbx,
+            &[(DOCKERFILE_ORIGIN, vec![staged.clone()])],
+        );
+        Driver::with_binary(bin)
+            .run(req, &StdCancellationToken::new())
+            .await
+            .expect("run");
+
+        let build = sbx
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("buildx build"))
+            .expect("a buildx build call");
+        assert!(
+            build.contains(&format!("--file {}", staged.to_string_lossy())),
+            "the build must read the staged Dockerfile, got: {build}"
         );
     }
 

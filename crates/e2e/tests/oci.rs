@@ -226,6 +226,46 @@ target(
     Ok(())
 }
 
+/// `dockerfile = ":target"` is the whole point of addressing it: the generated
+/// Dockerfile is a dep, so it is staged and hashed without appearing in
+/// `context` and without the BUILD file spelling where it lands.
+#[tokio::test]
+async fn test_oci_image_takes_a_dockerfile_by_address() -> anyhow::Result<()> {
+    let fake = Fake::new();
+    let ws = workspace_with_fake(&fake);
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "srcs", driver = "bash", run = "echo hi > $OUT", out = "hi.txt")
+target(
+    name = "gen",
+    driver = "bash",
+    run = "printf 'FROM scratch\nCOPY app/hi.txt /hi.txt\n' > $OUT",
+    out = "generated.Dockerfile",
+)
+target(
+    name = "img",
+    driver = "oci_image",
+    dockerfile = ":gen",
+    context = [":srcs"],
+)
+"#,
+    );
+
+    ws.run("//app:img").await?;
+    let build = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.contains("buildx build"))
+        .expect("a buildx build call");
+    assert!(
+        build.contains("--file") && build.contains("generated.Dockerfile"),
+        "the build must read the dep's Dockerfile, got: {build}"
+    );
+
+    Ok(())
+}
+
 /// A multi-stage, multi-arch image: the stage and the whole platform list reach
 /// the builder, and two targets that differ only by stage are two cache entries.
 /// Collapsing them would serve one stage's image under the other's name.
