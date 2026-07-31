@@ -1,8 +1,8 @@
 use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::workspace::{self, PkgManager, WorkspaceMember};
 use crate::pluginjs::{
-    PACKAGE_INFO_TARGET, PACKAGE_JSON, deps, importgraph, is_skipped_dir_name, package_json,
-    platform, resolvers, thirdparty,
+    PACKAGE_INFO_TARGET, PACKAGE_JSON, TYPECHECK_TARGET, deps, importgraph, is_skipped_dir_name,
+    package_json, platform, resolvers, thirdparty, toolchain,
 };
 use anyhow::Context;
 use enclose::enclose;
@@ -17,6 +17,7 @@ use hplugin::provider::{
     Provider as ProviderTrait, TargetSpec,
 };
 use hwalk::{CachedWalker, EntryKind, Ignore};
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +42,14 @@ pub struct Config {
     /// see `ai-docs/js-plugin-plan.md`'s Hermeticity section: heph owns this
     /// allowlist itself, uniformly across both managers.
     pub allow_scripts: Vec<String>,
+    /// Which TypeScript toolchain `js_typecheck` uses — mirrors the Go
+    /// plugin's `gotool` axis (provider-level, never a variant), but with
+    /// exactly one supported value today: `"host"`
+    /// (`toolchain::HOST`/`toolchain::is_host`) — see `toolchain.rs` module
+    /// docs for why. Defaults to `"host"` since it is currently the *only*
+    /// working value — unlike `pkgmanager`, there is no genuine ambiguity to
+    /// force an explicit choice over.
+    pub tstool: String,
 }
 
 impl Config {
@@ -50,6 +59,7 @@ impl Config {
             skip: Arc::new(Ignore::default()),
             walker: Arc::new(CachedWalker::disabled()),
             allow_scripts: Vec::new(),
+            tstool: toolchain::HOST.to_string(),
         }
     }
 }
@@ -60,12 +70,23 @@ pub struct Provider {
     skip: Arc<Ignore>,
     walker: Arc<CachedWalker>,
     allow_scripts: Vec<String>,
+    tstool: String,
     /// Lazily parsed lockfile (`None` when the workspace has none) and its
     /// derived [`ResolvedGraph`] — each `Provider::get` for a third-party
     /// `js_install` addr or a package's declared deps would otherwise
     /// re-read and re-parse the whole lockfile from scratch.
     lockfile_cache: OnceCell<Option<Arc<Lockfile>>>,
     resolved_graph_cache: OnceCell<Option<Arc<ResolvedGraph>>>,
+    /// Lazily resolved host `tsc` binary path + queried `tsc --version`,
+    /// cached once for the `Provider`'s lifetime — same rationale as
+    /// `lockfile_cache`/`resolved_graph_cache`: `typecheck_config` runs once
+    /// per `js_typecheck` target per `Provider::get`, and the host toolchain
+    /// resolution/version query is identical across every package in the
+    /// workspace, so re-resolving and re-spawning `tsc --version` per package
+    /// would scale a real subprocess cost linearly with package count on
+    /// every single invocation, including a 100%-cache-hit run (M3 review
+    /// finding).
+    tsc_cache: OnceCell<Arc<(PathBuf, String)>>,
 }
 
 impl Provider {
@@ -87,7 +108,7 @@ impl Provider {
         hplugin::config::deny_unknown(
             "js provider",
             opts,
-            &["pkgmanager", "skip", "allow_scripts"],
+            &["pkgmanager", "skip", "allow_scripts", "tstool"],
         )?;
         let pkgmanager_str: String =
             hplugin::config::decode_opt(opts, "js provider", "pkgmanager")?.ok_or_else(|| {
@@ -109,6 +130,10 @@ impl Provider {
         let allow_scripts: Vec<String> =
             hplugin::config::decode_opt(opts, "js provider", "allow_scripts")?.unwrap_or_default();
 
+        // See `Config::tstool`'s doc: defaults to the only supported value.
+        let tstool: String = hplugin::config::decode_opt(opts, "js provider", "tstool")?
+            .unwrap_or_else(|| toolchain::HOST.to_string());
+
         Ok(Self::with_config(
             workspace_root,
             Config {
@@ -116,6 +141,7 @@ impl Provider {
                 skip,
                 walker,
                 allow_scripts,
+                tstool,
             },
         ))
     }
@@ -127,8 +153,10 @@ impl Provider {
             skip: config.skip,
             walker: config.walker,
             allow_scripts: config.allow_scripts,
+            tstool: config.tstool,
             lockfile_cache: OnceCell::new(),
             resolved_graph_cache: OnceCell::new(),
+            tsc_cache: OnceCell::new(),
         }
     }
 
@@ -215,6 +243,35 @@ impl Provider {
             })
             .await?;
         Ok(result.clone())
+    }
+
+    /// The host `tsc` binary path and its queried `--version`, resolved once
+    /// and cached for the `Provider`'s lifetime — see [`Provider::tsc_cache`]'s
+    /// doc for why this matters (a real subprocess spawn, otherwise repeated
+    /// once per `js_typecheck` target per `Provider::get`).
+    async fn resolved_host_tsc(&self) -> anyhow::Result<Arc<(PathBuf, String)>> {
+        let workspace_root = self.workspace_root.clone();
+        let tstool = self.tstool.clone();
+        let result = self
+            .tsc_cache
+            .get_or_try_init(|| async move {
+                anyhow::ensure!(
+                    toolchain::is_host(&tstool),
+                    "js provider: unsupported tstool {tstool:?} — only \"host\" is supported in \
+                     this milestone (no hermetic TypeScript toolchain exists yet); see \
+                     pluginjs::toolchain module docs"
+                );
+                hcore::blocking::run(move || -> anyhow::Result<Arc<(PathBuf, String)>> {
+                    let tsc_bin = toolchain::resolve_host_tsc(&workspace_root)
+                        .context("resolving the js_typecheck tsc toolchain")?;
+                    let tsc_version = toolchain::query_tsc_version(&tsc_bin)
+                        .with_context(|| format!("querying {tsc_bin:?} --version"))?;
+                    Ok(Arc::new((tsc_bin, tsc_version)))
+                })
+                .await
+            })
+            .await?;
+        Ok(Arc::clone(result))
     }
 
     /// Whether the provider's `allow_scripts` option permits `name@version`
@@ -340,6 +397,81 @@ impl Provider {
         .await
     }
 
+    /// Build the config for a `js_typecheck` target: `typecheck_deps_config`'s
+    /// pure, tsc-free Input-scoping (see that function's doc) plus the host
+    /// toolchain resolution/version-query this milestone's disclosed
+    /// `tstool = "host"` escape hatch requires — see `toolchain.rs` module
+    /// docs for why the version is queried here (spec-resolution time) and
+    /// not deferred to the driver's `run()`.
+    async fn typecheck_config(&self, pkg: &PkgBuf) -> anyhow::Result<HashMap<String, Value>> {
+        let (tsc_bin, tsc_version) = self.resolved_host_tsc().await?.as_ref().clone();
+        let lockfile = self.lockfile().await?;
+        let resolved_graph = self.resolved_graph().await?;
+        let workspace_root = self.workspace_root.clone();
+        let walker = Arc::clone(&self.walker);
+        let skip = Arc::clone(&self.skip);
+        let pkgmanager = self.pkgmanager;
+        let pkg_str = pkg.as_str().to_string();
+        let goos = platform::current_goos();
+        let goarch = platform::current_goarch();
+
+        hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
+            // Same workspace-member discovery `Provider::deps_config` does
+            // in its own blocking closure — needed here too so an import
+            // that never resolved on disk (no ambient `node_modules`) can
+            // still be attributed to a workspace sibling by name (see
+            // `typecheck_deps_config`'s doc).
+            let patterns = match pkgmanager {
+                PkgManager::Npm => workspace::read_npm_workspace_globs(&workspace_root)?,
+                PkgManager::Pnpm => workspace::read_pnpm_workspace_globs(&workspace_root)?,
+            };
+            let member_addrs_by_name: BTreeMap<String, String> = if patterns.is_empty() {
+                BTreeMap::new()
+            } else {
+                let mut packages = Vec::new();
+                collect_js_packages(
+                    &walker,
+                    &workspace_root,
+                    &workspace_root,
+                    &skip,
+                    &mut packages,
+                );
+                let packages: Vec<PkgBuf> = packages.into_iter().collect::<anyhow::Result<_>>()?;
+                workspace::resolve_members(&workspace_root, &packages, &patterns)?
+                    .into_iter()
+                    .map(|m| (m.name, m.addr.format()))
+                    .collect()
+            };
+
+            let (deps, tsconfig_path, tsconfig_content) = typecheck_deps_config(
+                &walker,
+                &workspace_root,
+                &pkg_str,
+                lockfile.as_deref(),
+                resolved_graph.as_deref(),
+                &member_addrs_by_name,
+                &goos,
+                &goarch,
+            )
+            .with_context(|| format!("building js_typecheck inputs for {pkg_str:?}"))?;
+
+            let mut config: HashMap<String, Value> = HashMap::new();
+            config.insert(
+                "tsc_bin".to_string(),
+                Value::String(tsc_bin.to_string_lossy().into_owned()),
+            );
+            config.insert("tsc_version".to_string(), Value::String(tsc_version));
+            config.insert("tsconfig_path".to_string(), Value::String(tsconfig_path));
+            config.insert(
+                "tsconfig_content".to_string(),
+                Value::String(tsconfig_content),
+            );
+            config.insert("deps".to_string(), Value::Map(deps));
+            Ok(config)
+        })
+        .await
+    }
+
     /// Build the `js_install` `TargetSpec` for a third-party
     /// `@heph/js/thirdparty/<name>@<version>` addr, resolving `(name,
     /// version)` against the lockfile's [`ResolvedGraph`] for its
@@ -412,6 +544,266 @@ impl Provider {
             approval: Default::default(),
         })
     }
+}
+
+/// Build the `deps` map (`""` = the package's own first-party source files,
+/// scoped to the tsconfig's own `include`/`files`/`exclude` when it declares
+/// any; `"types"` = every file `ImportGraph::type_edges`/`runtime_edges`
+/// resolved to outside the package (workspace-sibling or third-party),
+/// **plus** — for an import that named a third-party/sibling package but
+/// never resolved on disk at all (the ambient-`node_modules`-absent steady
+/// state) — that package's whole `js_install`/sibling addr, resolved the
+/// same lockfile-driven way `Provider::deps_config` already does; `"tsconfig"`
+/// = the resolved tsconfig itself plus every config in its `extends` chain)
+/// plus the resolved tsconfig's own workspace-relative path and raw content
+/// (the leaf's, with every `extends`-chain ancestor's content appended), for
+/// a `js_typecheck` target.
+///
+/// Deliberately split out from [`Provider::typecheck_config`] so it never
+/// touches the host `tsc` toolchain — the whole point being that it's
+/// unit-testable **without** a real `tsc` binary. This is the piece the
+/// M3 task calls "the single most important test in this milestone": a
+/// scoping mistake here either silently under-caches (a `.d.ts` dependency
+/// change never busts the cache) or over-caches (every package's
+/// `js_typecheck` re-keys on any workspace file touch, defeating per-package
+/// granularity entirely). See this module's tests.
+///
+/// A *shared* tsconfig (the package has none of its own, and inherits an
+/// ancestor's) is only trusted when that ancestor's own `include`/`files`
+/// provably confine it to this package — see
+/// `importgraph::check_tsconfig_scope`'s doc. Anything else is a hard
+/// `Provider::get` error naming the ambiguity, rather than silently building
+/// an Input set that might not match what `tsc --project` actually reads.
+///
+/// `pkg` is the package's workspace-relative path (`""` for the root).
+/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` are
+/// only consulted when an import names a package that never resolved on
+/// disk — see above — and mirror the identically-named parameters
+/// `deps::resolve_package_deps` already takes for `Provider::deps_config`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors deps::resolve_package_deps's own lockfile/graph/member/platform parameter \
+              set, needed here too for the same on-demand third-party-type-input resolution"
+)]
+fn typecheck_deps_config(
+    walker: &CachedWalker,
+    workspace_root: &Path,
+    pkg: &str,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+    member_addrs_by_name: &BTreeMap<String, String>,
+    goos: &str,
+    goarch: &str,
+) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+    let pkg_dir = if pkg.is_empty() {
+        workspace_root.to_path_buf()
+    } else {
+        workspace_root.join(pkg)
+    };
+
+    let manifest =
+        package_json::read_package_manifest(&pkg_dir.join(PACKAGE_JSON)).with_context(|| {
+            format!("reading {pkg:?}'s package.json for js_typecheck Input scoping")
+        })?;
+
+    // `edge.resolved`/`extends` targets are realpath'd (`symlinks: true` —
+    // see `importgraph.rs` module docs' "Hermeticity" section), so every
+    // containment check below must compare against a canonicalized
+    // `workspace_root` — comparing against the non-canonicalized one
+    // silently breaks containment on any host where an ancestor of the
+    // workspace is itself a symlink (e.g. macOS's `/tmp` -> `/private/tmp`),
+    // the same class of bug `check_phantom_dependencies` already guards
+    // against.
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize workspace root {workspace_root:?}"))?;
+
+    let tsconfig = importgraph::find_nearest_tsconfig(workspace_root, &pkg_dir);
+    let tsconfig_fields = match &tsconfig {
+        Some(p) => importgraph::read_tsconfig_fields(p)
+            .with_context(|| format!("reading {p:?}'s include/exclude/files"))?,
+        None => Default::default(),
+    };
+    if let Some(p) = &tsconfig {
+        let tsconfig_dir = p.parent().unwrap_or(p);
+        importgraph::check_tsconfig_scope(p, tsconfig_dir, &pkg_dir, &tsconfig_fields)
+            .with_context(|| format!("checking tsconfig scope for {pkg:?}"))?;
+    }
+
+    let (tsconfig_path_rel, mut tsconfig_content) = match &tsconfig {
+        Some(p) => {
+            let rel = p
+                .strip_prefix(workspace_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content =
+                std::fs::read_to_string(p).with_context(|| format!("reading tsconfig {p:?}"))?;
+            (rel, content)
+        }
+        None => (String::new(), String::new()),
+    };
+
+    // `extends` chain: `tsc --project` merges every ancestor's
+    // `compilerOptions` into the effective program, so each one is both a
+    // declared Input (so the sandbox actually stages it — otherwise a real
+    // `tsc` run can't find it at all) and folded into the hash.
+    let mut tsconfig_rel: BTreeSet<String> = BTreeSet::new();
+    if let Some(leaf) = &tsconfig {
+        tsconfig_rel.insert(tsconfig_path_rel.clone());
+        let chain = importgraph::resolve_tsconfig_extends_chain(&canonical_root, leaf)
+            .with_context(|| format!("resolving tsconfig extends chain for {pkg:?}"))?;
+        for ancestor in &chain {
+            let rel = ancestor
+                .strip_prefix(&canonical_root)
+                .unwrap_or(ancestor)
+                .to_string_lossy()
+                .replace('\\', "/");
+            tsconfig_rel.insert(rel);
+            let content = std::fs::read_to_string(ancestor)
+                .with_context(|| format!("reading extended tsconfig {ancestor:?}"))?;
+            tsconfig_content.push('\n');
+            tsconfig_content.push_str(&content);
+        }
+    }
+
+    let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
+    let resolve_cache = importgraph::ResolveCache::new();
+    let graph = importgraph::build_package_import_graph(
+        walker,
+        workspace_root,
+        pkg,
+        &import_resolvers,
+        &resolve_cache,
+        tsconfig.as_deref(),
+    )
+    .with_context(|| format!("building import graph for {pkg:?}"))?;
+
+    // Phantom-dependency check: `Provider::deps_config` (the `js_package_info`
+    // target) already runs this, but a workspace member requesting only
+    // `js_typecheck` (never `js_package_info`) must not skip it — this is
+    // also what justifies treating every name reached below via
+    // `member_addrs_by_name`/the lockfile as genuinely declared, rather than
+    // re-deriving that from scratch.
+    let declared_closure = importgraph::declared_closure(&manifest);
+    importgraph::check_phantom_dependencies(workspace_root, pkg, &graph, &declared_closure)
+        .with_context(|| {
+            format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
+        })?;
+
+    let src_files = importgraph::package_source_files(walker, workspace_root, pkg)
+        .with_context(|| format!("collecting first-party source files for {pkg:?}"))?;
+    let src_files = importgraph::filter_by_tsconfig_fields(
+        src_files,
+        tsconfig
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(&pkg_dir),
+        &tsconfig_fields,
+    )
+    .with_context(|| format!("filtering {pkg:?}'s source files by tsconfig include/exclude"))?;
+
+    // BTreeSet: deterministic order (the config/hash must not depend on
+    // filesystem walk order) and cheap de-dup of any path reachable more than
+    // once (e.g. two type-only imports of the same sibling file).
+    let mut src_rel: BTreeSet<String> = BTreeSet::new();
+    for f in &src_files {
+        let rel = f
+            .strip_prefix(workspace_root)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        src_rel.insert(rel);
+    }
+
+    // Every edge — type-only *and* plain runtime — that resolved outside the
+    // package is something `tsc` reads for this package and must be a
+    // declared Input; a plain (non-`import type`) cross-package import needs
+    // its target's types just as much as an `import type` does (code-quality
+    // M3 review finding).
+    let mut types_addrs: BTreeSet<String> = BTreeSet::new();
+    for edge in graph.type_edges.iter().chain(graph.runtime_edges.iter()) {
+        let rel = edge
+            .resolved
+            .strip_prefix(&canonical_root)
+            .with_context(|| {
+                format!(
+                    "js_typecheck: {:?} imports from {:?}, which resolved outside the workspace \
+                     root ({:?}) — cannot express it as a declared `js_typecheck` input (this \
+                     typically means node_modules is a symlink to a global store outside the \
+                     workspace)",
+                    edge.file, edge.resolved, workspace_root
+                )
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !src_rel.contains(&rel) {
+            types_addrs.insert(hbuiltins::pluginfs::file_addr(&rel).format());
+        }
+    }
+
+    // An import that named a third-party/sibling package but never resolved
+    // on disk at all — the realistic steady state absent an out-of-band
+    // install — is otherwise invisible to the loop above (an unresolved
+    // specifier never becomes an edge). Resolve each such name the same
+    // lockfile-driven way `Provider::deps_config` addresses a declared
+    // dependency, so the Input set doesn't silently go empty just because
+    // `node_modules` doesn't happen to exist yet (feature-quality M3 review
+    // finding). `check_phantom_dependencies` above already proved every one
+    // of these names is declared; a `None` here means it's a declared
+    // `optionalDependencies` entry that doesn't apply to this
+    // platform/lockfile state — nothing to depend on, matching
+    // `deps_config`'s own handling of the same case.
+    for site in &graph.unresolved_bare_specifiers {
+        if let Some(addr) = deps::resolve_one_dependency(
+            pkg,
+            &site.package_name,
+            &manifest,
+            lockfile,
+            resolved_graph,
+            member_addrs_by_name,
+            goos,
+            goarch,
+        )
+        .with_context(|| {
+            format!(
+                "resolving {:?}'s unresolved import of `{}` for js_typecheck",
+                site.file, site.package_name
+            )
+        })? {
+            types_addrs.insert(addr);
+        }
+    }
+
+    let mut deps: HashMap<String, Value> = HashMap::new();
+    deps.insert(
+        String::new(),
+        Value::List(
+            src_rel
+                .iter()
+                .map(|p| Value::String(hbuiltins::pluginfs::file_addr(p).format()))
+                .collect(),
+        ),
+    );
+    if !types_addrs.is_empty() {
+        deps.insert(
+            "types".to_string(),
+            Value::List(types_addrs.into_iter().map(Value::String).collect()),
+        );
+    }
+    if !tsconfig_rel.is_empty() {
+        deps.insert(
+            "tsconfig".to_string(),
+            Value::List(
+                tsconfig_rel
+                    .iter()
+                    .map(|p| Value::String(hbuiltins::pluginfs::file_addr(p).format()))
+                    .collect(),
+            ),
+        );
+    }
+
+    Ok((deps, tsconfig_path_rel, tsconfig_content))
 }
 
 /// The default npm registry tarball URL for a `(name, version)` — used when
@@ -615,6 +1007,42 @@ impl ProviderTrait for Provider {
                     .await
                     .map_err(GetError::Other)?;
                 return Ok(GetResponse { target_spec });
+            }
+
+            // `js_typecheck` is a second per-package target kind alongside
+            // `package_info`, checked before the `PACKAGE_INFO_TARGET` gate
+            // below so it isn't rejected as an unknown target name.
+            if req.addr.name == TYPECHECK_TARGET {
+                if self
+                    .skip
+                    .prunes_package(&self.workspace_root, Path::new(req.addr.package.as_str()))
+                {
+                    return Err(GetError::NotFound);
+                }
+                let package_json = self
+                    .workspace_root
+                    .join(req.addr.package.as_str())
+                    .join(PACKAGE_JSON);
+                if !package_json.is_file() {
+                    return Err(GetError::NotFound);
+                }
+                let config = self
+                    .typecheck_config(&req.addr.package)
+                    .await
+                    .with_context(|| {
+                        format!("resolving js_typecheck config for {}", req.addr.format())
+                    })
+                    .map_err(GetError::Other)?;
+                return Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr: req.addr.clone(),
+                        driver: "js_typecheck".to_string(),
+                        config,
+                        labels: vec![],
+                        transitive: Default::default(),
+                        approval: Default::default(),
+                    },
+                });
             }
 
             if req.addr.name != PACKAGE_INFO_TARGET {
@@ -1269,6 +1697,7 @@ mod tests {
                 skip: Arc::new(Ignore::default()),
                 walker: Arc::new(CachedWalker::disabled()),
                 allow_scripts: vec!["native-thing".to_string()],
+                tstool: toolchain::HOST.to_string(),
             },
         );
 
@@ -1547,5 +1976,513 @@ mod tests {
             )
             .await
             .expect("a properly declared import must not fail Provider::get");
+    }
+
+    // ---- M3: `js_typecheck` Input scoping (`typecheck_deps_config`) ----
+    //
+    // Per the task, this is "the single most important test in this
+    // milestone": a scoping mistake here either silently under-caches (a
+    // `.d.ts` dependency change never busts the cache) or over-caches (every
+    // package re-keys on any workspace file touch, defeating per-package
+    // granularity). Deliberately does not touch `tsc` at all — see
+    // `typecheck_deps_config`'s own doc comment — so it runs unconditionally,
+    // unlike the driver-level `run()` tests in `driver_typecheck.rs`.
+
+    fn dep_addrs(config: &HashMap<String, Value>, group: &str) -> Vec<String> {
+        match config.get(group) {
+            Some(Value::List(items)) => items
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("expected string addr, got {other:?}"),
+                })
+                .collect(),
+            None => vec![],
+            other => panic!("expected list for group {group:?}, got {other:?}"),
+        }
+    }
+
+    /// `typecheck_deps_config` with no lockfile/workspace-member context —
+    /// what most of these tests need, since they exercise scoping behavior
+    /// that doesn't touch an unresolved third-party/sibling import.
+    fn call_typecheck_deps_config(
+        walker: &CachedWalker,
+        workspace_root: &Path,
+        pkg: &str,
+    ) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+        typecheck_deps_config(
+            walker,
+            workspace_root,
+            pkg,
+            None,
+            None,
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+    }
+
+    #[test]
+    fn typecheck_deps_config_scopes_inputs_to_firstparty_and_resolved_type_edge_not_whole_workspace()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "node_modules/pkg/package.json",
+            r#"{"name": "pkg", "main": "index.js", "types": "index.d.ts"}"#,
+        );
+        write(
+            dir.path(),
+            "node_modules/pkg/index.js",
+            "module.exports.x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "node_modules/pkg/index.d.ts",
+            "export declare const x: number;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"pkg": "^1.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "import type { x } from 'pkg';\nexport const y = 1;\n",
+        );
+        // An unrelated file elsewhere in the workspace — must NOT appear in
+        // packages/a's declared inputs, proving the scoping is per-package,
+        // not workspace-wide (the point of this whole test).
+        write(
+            dir.path(),
+            "packages/c/unrelated.ts",
+            "export const unrelated = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, tsconfig_path, tsconfig_content) =
+            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+                .expect("build typecheck deps config");
+
+        assert!(
+            tsconfig_path.is_empty(),
+            "no tsconfig anywhere on the ancestor chain: {tsconfig_path:?}"
+        );
+        assert!(tsconfig_content.is_empty());
+        assert!(!deps.contains_key("tsconfig"));
+
+        let src_addrs = dep_addrs(&deps, "");
+        assert_eq!(src_addrs.len(), 1, "{src_addrs:?}");
+        assert!(
+            src_addrs[0].contains("packages/a/src/index.ts"),
+            "{src_addrs:?}"
+        );
+
+        let type_addrs = dep_addrs(&deps, "types");
+        assert_eq!(type_addrs.len(), 1, "{type_addrs:?}");
+        assert!(
+            type_addrs[0].contains("node_modules/pkg/index.d.ts"),
+            "{type_addrs:?}"
+        );
+
+        for addr in src_addrs.iter().chain(type_addrs.iter()) {
+            assert!(
+                !addr.contains("unrelated"),
+                "an unrelated workspace file must not be a declared input: {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn typecheck_deps_config_includes_tsconfig_group_and_content_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, tsconfig_path, tsconfig_content) =
+            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+                .expect("build typecheck deps config");
+
+        assert_eq!(tsconfig_path, "packages/a/tsconfig.json");
+        assert_eq!(tsconfig_content, r#"{"compilerOptions":{"strict":true}}"#);
+        let tsconfig_addrs = dep_addrs(&deps, "tsconfig");
+        assert_eq!(tsconfig_addrs.len(), 1);
+        assert!(tsconfig_addrs[0].contains("packages/a/tsconfig.json"));
+    }
+
+    /// Same "nearest ancestor" walk-up rule real `tsc` resolution uses (and
+    /// the same one `find_nearest_tsconfig` already implements for the
+    /// import graph) — a package without its own tsconfig inherits the
+    /// nearest ancestor's, *provided* that ancestor's `include` provably
+    /// confines it to this package (see `check_tsconfig_scope`'s doc) — an
+    /// unscoped shared config is covered separately below, since trusting it
+    /// unconditionally would be unsound whenever another package sits under
+    /// the same ancestor.
+    #[test]
+    fn typecheck_deps_config_walks_up_to_nearest_ancestor_tsconfig() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{"compilerOptions":{"strict":false},"include":["packages/a/**/*"]}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (_deps, tsconfig_path, tsconfig_content) =
+            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+                .expect("build typecheck deps config");
+        assert_eq!(tsconfig_path, "tsconfig.json");
+        assert_eq!(
+            tsconfig_content,
+            r#"{"compilerOptions":{"strict":false},"include":["packages/a/**/*"]}"#
+        );
+    }
+
+    /// Hermeticity/feature-quality M3 review finding: a shared ancestor
+    /// tsconfig with no `include`/`files` at all defaults (per real `tsc`
+    /// semantics) to every source file under *its own* directory — which, for
+    /// a package with no tsconfig of its own, is broader than just that
+    /// package whenever a sibling package sits under the same ancestor. This
+    /// must be a loud `Provider::get` error, not a silently unsound
+    /// per-package Input set.
+    #[test]
+    fn typecheck_deps_config_rejects_unscoped_shared_ancestor_tsconfig() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{"compilerOptions":{"strict":false}}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        // A sibling package under the very same (unscoped) ancestor
+        // tsconfig — proof this shape is genuinely ambiguous, not merely
+        // theoretically so.
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+        write(
+            dir.path(),
+            "packages/b/src/index.ts",
+            "export const y = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let err = call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+            .expect_err("an unscoped shared ancestor tsconfig must not be silently trusted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("include"), "{msg}");
+    }
+
+    /// An ancestor tsconfig whose `include` reaches beyond the requesting
+    /// package (covers a sibling too) is exactly as unsound as no `include`
+    /// at all — this is the actual shared-program case named in the
+    /// hermeticity review, not just the no-`include` default.
+    #[test]
+    fn typecheck_deps_config_rejects_ancestor_tsconfig_include_reaching_a_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.json",
+            r#"{"include":["packages/a/**/*","packages/b/**/*"]}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+
+        let walker = CachedWalker::disabled();
+        let err = call_typecheck_deps_config(&walker, dir.path(), "packages/a").expect_err(
+            "a shared tsconfig `include` reaching a sibling package must not be silently trusted",
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("packages/b/**/*"), "{msg}");
+    }
+
+    /// Code-quality M3 review finding: a plain (non-`import type`) import
+    /// that resolves to a workspace-sibling file must still be a declared
+    /// Input — `tsc` reads the imported file's types regardless of whether
+    /// the importing syntax used `import type`.
+    #[test]
+    fn typecheck_deps_config_scopes_plain_runtime_import_of_workspace_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"b": "workspace:*"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "import { helper } from '../../b/helper';\nexport const y = helper();\n",
+        );
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+        write(
+            dir.path(),
+            "packages/b/helper.ts",
+            "export function helper(): number { return 1; }\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _tsconfig_path, _tsconfig_content) =
+            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+                .expect("build typecheck deps config");
+
+        let type_addrs = dep_addrs(&deps, "types");
+        assert!(
+            type_addrs
+                .iter()
+                .any(|a| a.contains("packages/b/helper.ts")),
+            "a plain runtime import of a workspace sibling must be a declared Input: \
+             {type_addrs:?}"
+        );
+    }
+
+    /// Feature-quality M3 review finding: an import naming a third-party
+    /// package that never resolves on disk at all (no `node_modules`
+    /// installed — the realistic steady state before an out-of-band
+    /// install) must still become a declared Input, via the same
+    /// lockfile-driven addressing `Provider::deps_config` already uses for
+    /// runtime deps — not silently omitted just because there's nothing to
+    /// walk on disk.
+    #[test]
+    fn typecheck_deps_config_declares_thirdparty_type_input_with_no_ambient_node_modules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"zod": "^3.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "import type { z } from 'zod';\nexport const y = 1;\n",
+        );
+        // Deliberately no `node_modules` anywhere in this fixture.
+
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/zod": {
+                        "version": "3.0.0",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph();
+
+        let walker = CachedWalker::disabled();
+        let (deps, _tsconfig_path, _tsconfig_content) = typecheck_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .expect("build typecheck deps config");
+
+        let type_addrs = dep_addrs(&deps, "types");
+        assert!(
+            type_addrs
+                .iter()
+                .any(|a| a.contains("zod") && a.contains("js_install")),
+            "an unresolved third-party type import must still declare a js_install Input even \
+             absent ambient node_modules: {type_addrs:?}"
+        );
+    }
+
+    /// Hermeticity M3 review finding: a tsconfig's `extends` chain is a real
+    /// config file `tsc --project` merges in — it must be declared as an
+    /// additional Input (so the sandbox actually stages it) and its content
+    /// must bust the cache the same way the leaf's own content does.
+    #[test]
+    fn typecheck_deps_config_declares_and_hashes_tsconfig_extends_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"strict":false}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"extends":"../../tsconfig.base.json","include":["src/**/*"]}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _tsconfig_path, tsconfig_content) =
+            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+                .expect("build typecheck deps config");
+
+        let tsconfig_addrs = dep_addrs(&deps, "tsconfig");
+        assert_eq!(tsconfig_addrs.len(), 2, "{tsconfig_addrs:?}");
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("packages/a/tsconfig.json"))
+        );
+        assert!(
+            tsconfig_addrs
+                .iter()
+                .any(|a| a.contains("tsconfig.base.json")),
+            "the extends-chain ancestor must be a declared Input too: {tsconfig_addrs:?}"
+        );
+        assert!(
+            tsconfig_content.contains("strict"),
+            "the extended base config's content must be folded into the hashed content: \
+             {tsconfig_content:?}"
+        );
+
+        // Editing only the base config (leaf byte-identical) must change the
+        // hashed content — this is the actual cache-soundness claim, not
+        // just "the file is listed".
+        write(
+            dir.path(),
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        );
+        let (_deps2, _p2, tsconfig_content2) =
+            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+                .expect("build typecheck deps config after editing the base config");
+        assert_ne!(
+            tsconfig_content, tsconfig_content2,
+            "editing only the extended base config must change the hashed tsconfig content"
+        );
+    }
+
+    /// Feature-quality/hermeticity M3 review finding: the first-party Input
+    /// set must honor the tsconfig's own `include`/`exclude`, not just walk
+    /// every source file under the package directory — otherwise editing a
+    /// file `tsc` never reads (excluded) still busts the cache.
+    #[test]
+    fn typecheck_deps_config_honors_tsconfig_exclude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/tsconfig.json",
+            r#"{"exclude":["src/legacy/**"]}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/legacy/old.ts",
+            "export const old = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _tsconfig_path, _tsconfig_content) =
+            call_typecheck_deps_config(&walker, dir.path(), "packages/a")
+                .expect("build typecheck deps config");
+
+        let src_addrs = dep_addrs(&deps, "");
+        assert!(
+            src_addrs.iter().any(|a| a.contains("src/index.ts")),
+            "{src_addrs:?}"
+        );
+        assert!(
+            !src_addrs.iter().any(|a| a.contains("legacy")),
+            "an excluded file must not be a declared Input: {src_addrs:?}"
+        );
+    }
+
+    // ---- `Provider::get` end to end for `js_typecheck` — gated on a real
+    // `tsc` binary being available in this devenv (querying `tsc --version`
+    // is unavoidably a real subprocess call — see `toolchain.rs` module
+    // docs), unlike the Input-scoping tests above.
+
+    fn find_real_tsc_for_test() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join("tsc");
+            if std::fs::metadata(&cand)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real `tsc` on PATH — devenv.nix provisions no Node/TypeScript \
+                toolchain (see toolchain.rs module docs); run explicitly with \
+                `cargo test -- --ignored` on a host with TypeScript installed"]
+    async fn get_resolves_js_typecheck_target_end_to_end() {
+        find_real_tsc_for_test().expect(
+            "this test is #[ignore]d precisely because `tsc` isn't guaranteed on PATH — it was \
+             run explicitly, so a missing `tsc` here is a real failure, not a skip",
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(
+                        PkgBuf::from("packages/a"),
+                        TYPECHECK_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_typecheck target_spec");
+        assert_eq!(resp.target_spec.driver, "js_typecheck");
+        assert!(resp.target_spec.config.contains_key("tsc_version"));
     }
 }

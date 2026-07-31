@@ -3,6 +3,7 @@ mod conformance;
 mod deps;
 mod driver_install;
 mod driver_package_info;
+mod driver_typecheck;
 mod importgraph;
 mod importparse;
 mod lockfile;
@@ -11,10 +12,12 @@ mod platform;
 mod provider;
 mod resolvers;
 mod thirdparty;
+mod toolchain;
 mod workspace;
 
 pub use driver_install::JsInstallDriver;
 pub use driver_package_info::JsPackageInfoDriver;
+pub use driver_typecheck::JsTypecheckDriver;
 pub use provider::{Config, Provider};
 pub use workspace::{PkgManager, WorkspaceMember};
 
@@ -31,6 +34,11 @@ pub const PACKAGE_JSON: &str = "package.json";
 /// `js_install`/`js_typecheck`/... targets land in later milestones (see
 /// `ai-docs/js-plugin-plan.md`).
 pub const PACKAGE_INFO_TARGET: &str = "package_info";
+
+/// Target name of the M3 `js_typecheck` target: runs `tsc --noEmit` (or the
+/// nearest ancestor tsconfig's equivalent) over one package at a time. See
+/// `driver_typecheck.rs` module docs.
+pub const TYPECHECK_TARGET: &str = "js_typecheck";
 
 /// Directory names that are never a package boundary or workspace member,
 /// however deep they appear: `node_modules` is third-party/manager-owned

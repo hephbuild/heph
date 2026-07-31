@@ -1,22 +1,24 @@
 //! The JS/TS plugin as a loadable cdylib behind the stable ABI.
 //!
-//! **M0+M1 scope**: exports the `js` provider (package discovery + pnpm/npm
-//! workspace-member resolution + lockfile-driven dependency wiring), its
-//! `js_package_info` dependency-wiring driver, and the hermetic `js_install`
-//! third-party fetch driver. The host loads this with
-//! `hplugin_stabby::load_stable::load`, which verifies ABI compatibility via
-//! stabby's type reports before use. Calls then run in-process at native
-//! speed — no serialization on the hot path, no IPC.
+//! **M0-M3 scope**: exports the `js` provider (package discovery + pnpm/npm
+//! workspace-member resolution + lockfile-driven dependency wiring + oxc-based
+//! import-graph resolution), its `js_package_info` dependency-wiring driver,
+//! the hermetic `js_install` third-party fetch driver, and the `js_typecheck`
+//! driver (M3 — `tsc --noEmit` per package, via a disclosed non-hermetic
+//! `tstool = "host"` toolchain; see `hplugin_js::pluginjs::driver_typecheck`
+//! module docs). The host loads this with `hplugin_stabby::load_stable::load`,
+//! which verifies ABI compatibility via stabby's type reports before use.
+//! Calls then run in-process at native speed — no serialization on the hot
+//! path, no IPC.
 //!
-//! Type-checking, testing, linting, and bundling drivers are later
-//! milestones (see `ai-docs/js-plugin-plan.md`) and are not wired up here
-//! yet.
+//! Testing, linting, formatting, and bundling drivers are later milestones
+//! (see `ai-docs/js-plugin-plan.md`) and are not wired up here yet.
 //!
 //! Plugin-specific settings are read from the environment; only the
 //! workspace root crosses in [`CreateConfig`].
 
 use hdriver_support::driver_managed::ManagedDriver;
-use hplugin_js::pluginjs::{JsInstallDriver, JsPackageInfoDriver, Provider};
+use hplugin_js::pluginjs::{JsInstallDriver, JsPackageInfoDriver, JsTypecheckDriver, Provider};
 use plugin_sdk::stabby::abi::{DynLogSink, DynSupervisor, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
     create_config_from_bytes, install_log_sink, install_supervisor, make_dyn_managed_driver,
@@ -94,6 +96,14 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "js_install".into(),
         driver: make_dyn_managed_driver(install),
+    });
+    // `js_typecheck` (M3): runs `tsc --noEmit` per package — see
+    // `hplugin_js::pluginjs::driver_typecheck` module docs, including its
+    // disclosed non-hermetic `tstool = "host"` toolchain gap.
+    let typecheck: Arc<dyn ManagedDriver> = Arc::new(JsTypecheckDriver::new());
+    drivers.push(NamedDriver {
+        name: "js_typecheck".into(),
+        driver: make_dyn_managed_driver(typecheck),
     });
 
     Ok(PluginComponents {

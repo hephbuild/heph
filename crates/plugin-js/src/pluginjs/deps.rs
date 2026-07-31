@@ -24,6 +24,11 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDep {
     pub group: &'static str,
+    /// The declared dependency name this addr came from — lets a caller
+    /// (e.g. `js_typecheck`'s on-demand third-party-type-input resolution in
+    /// `provider.rs`) look a specific addr back up by name without
+    /// re-deriving the whole list.
+    pub name: String,
     pub addr: String,
 }
 
@@ -73,68 +78,109 @@ pub fn resolve_package_deps(
     let mut out = Vec::new();
     for (group, deps) in manifest.dependency_groups() {
         for name in deps.keys() {
-            if let Some(addr) = member_addrs_by_name.get(name) {
+            if let Some(addr) = resolve_one_dependency(
+                pkg,
+                name,
+                manifest,
+                lockfile,
+                resolved_graph,
+                member_addrs_by_name,
+                goos,
+                goarch,
+            )? {
                 out.push(ResolvedDep {
                     group,
-                    addr: addr.clone(),
+                    name: name.clone(),
+                    addr,
                 });
-                continue;
-            }
-
-            let resolution = match lockfile {
-                Some(lf) => lf
-                    .resolve_dependency(pkg, name)
-                    .with_context(|| format!("resolving `{name}` declared by {pkg:?}"))?,
-                None => None,
-            };
-
-            match resolution {
-                Some(DepResolution::Workspace) => {
-                    // A lockfile-recorded `link:`/`file:` to a workspace
-                    // member whose name we didn't already match (e.g. a
-                    // scoped alias) — fall back to the same hard-error path
-                    // as an unresolved required dep rather than guessing.
-                    anyhow::bail!(
-                        "{pkg:?}: `{name}` resolves to a workspace link in the lockfile but no \
-                         discovered workspace member has that name — is the workspace-member \
-                         list stale?"
-                    );
-                }
-                Some(DepResolution::ThirdParty { name, version }) => {
-                    if let Some(resolved) = resolved_graph.and_then(|g| g.get(&name, &version))
-                        && !platform::matches_platform(&resolved.os, &resolved.cpu, goos, goarch)
-                    {
-                        if manifest.is_optional(&name) {
-                            continue;
-                        }
-                        anyhow::bail!(
-                            "{pkg:?}: `{name}` resolves to {name}@{version}, which is \
-                             restricted to os={:?} cpu={:?} — that does not include the \
-                             current platform {goos}/{goarch}",
-                            resolved.os,
-                            resolved.cpu
-                        );
-                    }
-                    let addr = thirdparty::thirdparty_addr(&name, &version, goos, goarch);
-                    out.push(ResolvedDep {
-                        group,
-                        addr: addr.format(),
-                    });
-                }
-                None => {
-                    if manifest.is_optional(name) {
-                        continue;
-                    }
-                    anyhow::bail!(
-                        "{pkg:?}: `{name}` is declared in package.json but has no lockfile \
-                         resolution — the lockfile is likely stale; re-run the package manager's \
-                         install to regenerate it"
-                    );
-                }
             }
         }
     }
     Ok(out)
+}
+
+/// Resolve a single declared dependency `name` to a target addr — the
+/// per-name primitive [`resolve_package_deps`] loops over, factored out so a
+/// caller that only needs *one specific* name's resolution (e.g.
+/// `js_typecheck`'s on-demand third-party-type-input resolution in
+/// `provider.rs::typecheck_deps_config`, which only needs the handful of
+/// names actually reached by an unresolved import, not every declared
+/// dependency) doesn't have to resolve — and therefore require a lockfile
+/// entry for — names it was never going to look up.
+///
+/// `None` means "no resolution, and that's fine" (an `optionalDependencies`
+/// entry the package manager never installed, on this platform or at all) —
+/// see [`resolve_package_deps`]'s doc for the full semantics this mirrors.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors resolve_package_deps's own parameter set — this is its per-name primitive"
+)]
+pub fn resolve_one_dependency(
+    pkg: &str,
+    name: &str,
+    manifest: &PackageManifest,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+    member_addrs_by_name: &BTreeMap<String, String>,
+    goos: &str,
+    goarch: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(addr) = member_addrs_by_name.get(name) {
+        return Ok(Some(addr.clone()));
+    }
+
+    let resolution = match lockfile {
+        Some(lf) => lf
+            .resolve_dependency(pkg, name)
+            .with_context(|| format!("resolving `{name}` declared by {pkg:?}"))?,
+        None => None,
+    };
+
+    match resolution {
+        Some(DepResolution::Workspace) => {
+            // A lockfile-recorded `link:`/`file:` to a workspace member
+            // whose name we didn't already match (e.g. a scoped alias) —
+            // fall back to the same hard-error path as an unresolved
+            // required dep rather than guessing.
+            anyhow::bail!(
+                "{pkg:?}: `{name}` resolves to a workspace link in the lockfile but no \
+                 discovered workspace member has that name — is the workspace-member list \
+                 stale?"
+            );
+        }
+        Some(DepResolution::ThirdParty {
+            name: resolved_name,
+            version,
+        }) => {
+            if let Some(resolved) = resolved_graph.and_then(|g| g.get(&resolved_name, &version))
+                && !platform::matches_platform(&resolved.os, &resolved.cpu, goos, goarch)
+            {
+                if manifest.is_optional(&resolved_name) {
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "{pkg:?}: `{name}` resolves to {resolved_name}@{version}, which is \
+                     restricted to os={:?} cpu={:?} — that does not include the current \
+                     platform {goos}/{goarch}",
+                    resolved.os,
+                    resolved.cpu
+                );
+            }
+            let addr = thirdparty::thirdparty_addr(&resolved_name, &version, goos, goarch);
+            Ok(Some(addr.format()))
+        }
+        None => {
+            if manifest.is_optional(name) {
+                Ok(None)
+            } else {
+                anyhow::bail!(
+                    "{pkg:?}: `{name}` is declared in package.json but has no lockfile \
+                     resolution — the lockfile is likely stale; re-run the package manager's \
+                     install to regenerate it"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
