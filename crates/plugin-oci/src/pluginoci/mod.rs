@@ -1553,13 +1553,11 @@ pub(crate) mod testfake {
                  \"$LOG\"\nfor a in \"$@\"; do printf ' %s' \"$a\" >> \"$LOG\"; done\nprintf \
                  '\\n' >> \"$LOG\"\n{body}\n"
             );
-            std::fs::write(&path, script).expect("write fake");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod fake");
-            }
+            // Not `fs::write` + `set_permissions`: tests run in parallel, and a
+            // sibling test's fork between our create and our exec inherits a
+            // writable fd to this file, so the exec fails with `ETXTBSY`.
+            // `write_executable` drains those descriptors before returning.
+            hcore::fsutil::write_executable(&path, script.as_bytes()).expect("write fake");
             path.to_string_lossy().into_owned()
         }
 

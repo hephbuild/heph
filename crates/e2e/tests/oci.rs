@@ -60,13 +60,10 @@ impl Fake {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join("docker");
-        std::fs::write(&bin, FAKE_DOCKER).expect("write fake docker");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake docker");
-        }
+        // Not `fs::write` + `set_permissions`: tests run in parallel, and a
+        // sibling test's fork between our create and our exec inherits a
+        // writable fd to this file, so the exec fails with `ETXTBSY`.
+        hcore::fsutil::write_executable(&bin, FAKE_DOCKER.as_bytes()).expect("write fake docker");
         Fake { dir, bin }
     }
 
@@ -302,17 +299,12 @@ target(
 async fn test_oci_image_build_failure_surfaces_the_builder_error() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = dir.path().join("docker");
-    std::fs::write(
+    hcore::fsutil::write_executable(
         &bin,
-        "#!/bin/sh\ncase \"$2\" in inspect) echo 'Platforms: linux/amd64'; exit 0;; esac\n\
-         echo 'ERROR: failed to solve: unknown instruction: FROOM' >&2\nexit 1\n",
+        b"#!/bin/sh\ncase \"$2\" in inspect) echo 'Platforms: linux/amd64'; exit 0;; esac\n\
+          echo 'ERROR: failed to solve: unknown instruction: FROOM' >&2\nexit 1\n",
     )
     .expect("write fake");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
 
     let ws = WorkspaceBuilder::new()
         .expect("workspace tempdir")
