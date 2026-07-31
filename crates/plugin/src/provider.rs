@@ -117,7 +117,10 @@ pub trait ProviderExecutor: Send + Sync {
     /// executor detects and rejects this reentrant call with an error rather
     /// than nesting silently — use [`ProviderExecutor::states_under`] instead,
     /// which is what `list()` implementations that need cross-package state
-    /// (e.g. a Go module's variant universe) are for.
+    /// (e.g. a Go module's variant universe) are for. The refusal is a property
+    /// of the executor *instance*, for its entire lifetime — an executor
+    /// received via `ListRequest` rejects `query()` even from a spawned task or
+    /// after `list()` has returned, so do not retain it for later querying.
     fn query<'a>(
         &'a self,
         m: &'a Matcher,
@@ -369,9 +372,11 @@ pub trait Provider: Send + Sync {
     /// build definition, and a different list-file order, on every run. Sort, or
     /// preserve a stable walk order.
     ///
-    /// `req.executor` must not have [`ProviderExecutor::query`] called on it from
-    /// here — see that method's doc for why. Use
-    /// [`ProviderExecutor::states_under`] for cross-package state instead.
+    /// `req.executor` must not have [`ProviderExecutor::query`] called on it —
+    /// not from here, not from a task spawned here, and not later via a retained
+    /// copy: the refusal is for the executor instance's lifetime. See that
+    /// method's doc for why. Use [`ProviderExecutor::states_under`] for
+    /// cross-package state instead.
     fn list<'a>(
         &'a self,
         req: ListRequest,
