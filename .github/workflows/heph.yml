@@ -266,10 +266,10 @@ jobs:
           # N (this build) and N-1 (a past release) alike.
           BENCH_BIN_NAME="heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
           # `heph`'s two release flavours, from the ONE compile below: `$OUT/heph`
-          # keeps the profile's DWARF line tables (published as-is as the "debug"
-          # flavour, $DEBUG_BIN_NAME), and $BIN_NAME (the default "std" flavour,
-          # what `version_flavour: debug` in `.hephconfig` opts out of) is a
-          # `strip`-ped copy of it. No second compile — see the comment on
+          # keeps the profile's DWARF line tables (published, flavour-stamped, as
+          # $DEBUG_BIN_NAME), and $BIN_NAME (the default "std" flavour, what
+          # `versionFlavour: debug` in `.hephconfig` opts out of) is a `strip`-ped,
+          # flavour-stamped copy of it. No second compile — see the comment on
           # `[profile.release]` in the root Cargo.toml for why.
           DEBUG_BIN_NAME="heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
@@ -322,10 +322,16 @@ jobs:
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
           fi
-          cp "$OUT/heph" $DEBUG_BIN_NAME
           cp "$OUT/heph-bench" $BENCH_BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
+
+          # `heph` diverges into its two flavours from here — each stamped by
+          # `patch-flavour.sh` with which one it is (`heph version` / self-upgrade
+          # read that back via `hcore::version::flavour()`), since nothing at
+          # compile time can tell them apart (see the comment above `OUT/heph`).
+          cp "$OUT/heph" $DEBUG_BIN_NAME
+          bash scripts/patch-flavour.sh $DEBUG_BIN_NAME debug
 
           # "std" flavour: strip a copy of the same compiled `heph` — no second
           # compile. `zig objcopy` (not host `strip`/binutils) because it's
@@ -333,6 +339,7 @@ jobs:
           # on an amd64 runner (see the zigbuild comment above), and a native
           # `strip` built for one arch typically can't touch a foreign-arch ELF.
           zig objcopy --strip-all "$OUT/heph" $BIN_NAME
+          bash scripts/patch-flavour.sh $BIN_NAME ""
 
       - name: sccache stats
         if: always()
@@ -347,7 +354,14 @@ jobs:
         run: |
           ./$BIN_NAME version
           ./$BENCH_BIN_NAME --help
-          ./$DEBUG_BIN_NAME version
+          # Both flavours launch, and each reports the flavour patch-flavour.sh
+          # actually stamped — not just that the binary runs at all.
+          std_version="$(./$BIN_NAME version)"
+          debug_version="$(./$DEBUG_BIN_NAME version)"
+          echo "std: $std_version"
+          echo "debug: $debug_version"
+          case "$std_version" in *+*) echo "std flavour must not report build metadata: $std_version" >&2; exit 1 ;; esac
+          case "$debug_version" in *+debug) ;; *) echo "debug flavour did not report +debug: $debug_version" >&2; exit 1 ;; esac
         env:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           BENCH_BIN_NAME: "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"

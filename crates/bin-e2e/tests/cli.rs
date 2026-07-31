@@ -34,9 +34,23 @@ fn shipped_binary_launches_outside_a_workspace() {
         .expect("spawn heph version");
 
     assert!(out.status.success(), "{}", describe(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        !stdout.trim().is_empty(),
         "version printed nothing: {}",
+        describe(&out)
+    );
+
+    // `dist/heph` is always the "std" release flavour (the `e2e` script only
+    // ever stages the exact `heph_<os>_<arch>` name, never a flavoured one —
+    // see devenv.nix). Its `version_flavour` slot must have been patched
+    // empty by `scripts/patch-flavour.sh`, not left as "debug" or the
+    // unpatched marker — a compile-only (in-process) test can't catch this,
+    // since it never runs the patch/strip pipeline the shipped binary went
+    // through.
+    assert!(
+        !stdout.contains('+'),
+        "std flavour must not report build metadata: {}",
         describe(&out)
     );
 }
