@@ -42,6 +42,22 @@ fn sv(bytes: &[u8]) -> SVec<u8> {
     SVec::from(bytes)
 }
 
+/// Wrap the engine executor for the seam, choosing the spawn mode explicitly.
+///
+/// Production always reaches this on the engine runtime (these methods are
+/// engine-driven futures), so callback bodies spawn there. The `Err` arm is
+/// the in-process test harnesses (`futures::executor`-driven, no tokio
+/// runtime): there the *caller* is the driver of every future involved, so
+/// inline execution on the polling thread is exactly right — and there is no
+/// host reactor a callback body could touch. The fork is explicit here, at
+/// the one layer that serves both, rather than a silent probe inside `wrap`.
+fn wrap_executor(exec: &Arc<dyn hplugin::provider::ProviderExecutor>) -> DynExecutor {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => HostExecutor::wrap(Arc::clone(exec), handle),
+        Err(_) => HostExecutor::wrap_inline(Arc::clone(exec)),
+    }
+}
+
 /// A loaded plugin's host-side handles: an optional provider + named drivers +
 /// named hooks.
 pub type LoadedComponents = (
@@ -338,7 +354,7 @@ impl Provider for StableRemoteProvider {
             // Server-streaming **with** the executor, so the plugin's `list` can
             // call back (e.g. the go module variant universe via `states_under`).
             // Items still stream lazily across the seam.
-            let exec: DynExecutor = HostExecutor::wrap(Arc::clone(&req.executor));
+            let exec: DynExecutor = wrap_executor(&req.executor);
             let stream = self
                 .inner
                 .invoke_exec_server_stream(pb::ProviderMethod::List as u32, sv(&pb_req), exec)
@@ -394,7 +410,7 @@ impl Provider for StableRemoteProvider {
                 states: req.states.iter().map(convert::state_to_pb).collect(),
             }
             .encode_to_vec();
-            let exec: DynExecutor = HostExecutor::wrap(Arc::clone(&req.executor));
+            let exec: DynExecutor = wrap_executor(&req.executor);
             let fut = self
                 .inner
                 .invoke_exec(pb::ProviderMethod::Get as u32, sv(&pb_req), exec);
@@ -504,7 +520,13 @@ impl Provider for StableRemoteProvider {
             })
             .collect();
         let metadata = pb::FunctionRegistry { functions }.encode_to_vec();
-        let cb = crate::host::HostFunctionRegistry::wrap(reg);
+        // Same explicit fork as `wrap_executor`: production wiring happens on
+        // the engine runtime; only runtime-less in-process harnesses take the
+        // inline arm, and they drive the callback futures themselves.
+        let cb = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => crate::host::HostFunctionRegistry::wrap(reg, handle),
+            Err(_) => crate::host::HostFunctionRegistry::wrap_inline(reg),
+        };
         self.inner.invoke_registry(
             pb::ProviderMethod::SetFunctionRegistry as u32,
             sv(&metadata),

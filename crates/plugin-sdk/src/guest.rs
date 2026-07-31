@@ -278,7 +278,7 @@ mod tests {
         let mock = Arc::new(MockExec {
             note_deps: AtomicU32::new(0),
         });
-        let dynexec = HostExecutor::wrap(mock.clone() as Arc<dyn ProviderExecutor>);
+        let dynexec = HostExecutor::wrap_inline(mock.clone() as Arc<dyn ProviderExecutor>);
         let guest = GuestExecutor::new(dynexec);
         let addr = parse_addr("//pkg/a:b").expect("parse addr");
 
@@ -365,7 +365,7 @@ mod tests {
         std::fs::write(&path, big_payload()).expect("write artifact");
 
         let mock = Arc::new(MockExecFile { path });
-        let dynexec = HostExecutor::wrap(mock as Arc<dyn ProviderExecutor>);
+        let dynexec = HostExecutor::wrap_inline(mock as Arc<dyn ProviderExecutor>);
         let guest = GuestExecutor::new(dynexec);
         let addr = parse_addr("//pkg/a:b").expect("parse addr");
 
@@ -417,7 +417,10 @@ mod tests {
             .build()
             .expect("rt");
         rt.block_on(async {
-            let dynexec = HostExecutor::wrap(Arc::new(PanicExec) as Arc<dyn ProviderExecutor>);
+            let dynexec = HostExecutor::wrap(
+                Arc::new(PanicExec) as Arc<dyn ProviderExecutor>,
+                tokio::runtime::Handle::current(),
+            );
             let guest = GuestExecutor::new(dynexec);
             let addr = parse_addr("//pkg/a:b").expect("parse addr");
             let msg = match guest.result(&addr).await {

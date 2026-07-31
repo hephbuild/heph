@@ -29,6 +29,7 @@ use hplugin_stabby::abi::{
     StableHook, StableItemStream, StableItemStreamDyn, StableManagedDriver, StableMeta,
     StableProvider,
 };
+use hplugin_stabby::seam::panic_text;
 use hplugin_stabby::vtable::dynify;
 use plugin_abi::convert;
 use plugin_abi::pb;
@@ -75,9 +76,10 @@ fn cdylib_runtime() -> &'static tokio::runtime::Runtime {
 ///   drops, so it is unaffected.
 /// - **Backstop**: the completion wake crosses from a plugin-runtime worker to
 ///   the host's waker through the stabby seam. That hazard has not been
-///   reproduced in isolation (docs/CONCURRENCY_MEASUREMENTS.md §2); arming
-///   `hcore::blocking::Backstop` on every pending poll is defense-in-depth,
-///   the same treatment `hcore::blocking::run` gives its oneshot wait.
+///   reproduced in isolation (docs/CONCURRENCY_MEASUREMENTS.md §2, lands with
+///   #298 below this PR in the stack); arming `hcore::blocking::Backstop` on
+///   every pending poll is defense-in-depth, the same treatment
+///   `hcore::blocking::run` gives its oneshot wait.
 ///
 /// `JoinHandle::poll` is runtime-free, so polling this from a host worker (or
 /// a plain `futures::executor::block_on`) is sound — `hook_on_events` is the
@@ -109,17 +111,6 @@ impl<T> Drop for SeamTask<T> {
     fn drop(&mut self) {
         // No-op on a finished task; stops an abandoned body otherwise.
         self.handle.abort();
-    }
-}
-
-/// Best-effort text of a panic payload (`panic!` string/`String`, else a stub).
-fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
-    if let Some(s) = p.downcast_ref::<&'static str>() {
-        s
-    } else if let Some(s) = p.downcast_ref::<String>() {
-        s.as_str()
-    } else {
-        "<non-string panic payload>"
     }
 }
 
@@ -168,6 +159,15 @@ where
                 "plugin {plugin}: {method}({key}) aborted: plugin runtime shut down"
             )),
         }
+    }
+}
+
+/// Component name for seam diagnostics: the configured name, or `<unnamed>`
+/// when `config()` failed or returned an empty name.
+fn seam_name(configured: Result<String>) -> Arc<str> {
+    match configured {
+        Ok(n) if !n.is_empty() => n.into(),
+        _ => "<unnamed>".into(),
     }
 }
 
@@ -303,12 +303,9 @@ fn get_error_kind(e: &anyhow::Error) -> pb::get_error::Kind {
 pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::DynProvider {
     // Captured once for seam diagnostics (panic messages) — `config` is static
     // metadata; calling it lazily on the error path would run author code
-    // inside the extern shim's poll.
-    let name: Arc<str> = provider
-        .config(ConfigRequest {})
-        .map(|r| r.name)
-        .unwrap_or_default()
-        .into();
+    // inside the extern shim's poll. `<unnamed>` rather than an empty string,
+    // so a failing config still yields a readable "plugin <unnamed>: …" error.
+    let name: Arc<str> = seam_name(provider.config(ConfigRequest {}).map(|r| r.name));
     dynify(stabby::boxed::Box::new(StableProviderImpl {
         provider,
         name,
@@ -320,11 +317,7 @@ pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::Dy
 pub fn make_dyn_managed_driver(
     driver: Arc<dyn ManagedDriver>,
 ) -> hplugin_stabby::abi::DynManagedDriver {
-    let name: Arc<str> = driver
-        .config(DriverConfigRequest {})
-        .map(|r| r.name)
-        .unwrap_or_default()
-        .into();
+    let name: Arc<str> = seam_name(driver.config(DriverConfigRequest {}).map(|r| r.name));
     dynify(stabby::boxed::Box::new(StableManagedDriverImpl {
         driver,
         name,
@@ -336,9 +329,14 @@ pub fn make_dyn_managed_driver(
 /// token a running call handed the provider/driver. A cancel that races ahead of
 /// its call (arrives before the call registers) is parked in `precancelled` and
 /// applied when the call enters — so it is never lost.
+///
+/// A request id names an engine *request* (`req-{n}`), not a single call — the
+/// whole request subtree shares it — so multiple calls can be in flight under
+/// one id concurrently. Each keeps its own token in the `Vec`; `cancel` trips
+/// them all (a request cancel means the whole subtree stops).
 #[derive(Default)]
 struct CancelRegistry {
-    inflight: Mutex<HashMap<String, StdCancellationToken>>,
+    inflight: Mutex<HashMap<String, Vec<StdCancellationToken>>>,
     precancelled: Mutex<HashSet<String>>,
 }
 
@@ -360,7 +358,9 @@ impl CancelRegistry {
             self.inflight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(id.to_string(), token.clone());
+                .entry(id.to_string())
+                .or_default()
+                .push(token.clone());
             if self
                 .precancelled
                 .lock()
@@ -390,8 +390,11 @@ impl CancelRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.to_string());
         let map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(t) = map.get(id) {
-            t.cancel();
+        if let Some(tokens) = map.get(id) {
+            // Every call in flight under this request id, not just the latest.
+            for t in tokens {
+                t.cancel();
+            }
         }
     }
 }
@@ -412,12 +415,34 @@ impl CancelGuard {
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         if !self.id.is_empty() {
-            let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            // Identity-checked: a request id names an engine request, not a
-            // single call, so a later call under the same id may have replaced
-            // this entry — a stale guard's late drop must not deregister it.
-            if map.get(&self.id).is_some_and(|t| t.ptr_eq(&self.token)) {
-                map.remove(&self.id);
+            {
+                let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                // Identity-checked: a request id names an engine request, not a
+                // single call, so sibling calls' tokens share this entry — a
+                // guard removes only its OWN token, never a sibling's.
+                if let Some(tokens) = map.get_mut(&self.id) {
+                    if let Some(i) = tokens.iter().position(|t| t.ptr_eq(&self.token)) {
+                        tokens.swap_remove(i);
+                    }
+                    if tokens.is_empty() {
+                        map.remove(&self.id);
+                    }
+                }
+            }
+            // A cancelled call consumes its request's parked pre-cancel marker,
+            // so a cancelled request with no later `enter` doesn't park its id
+            // forever (unbounded in a long-lived LSP/watch process). Safe to
+            // consume: every token in flight under this id was already tripped
+            // by `cancel`, and any *later* call under this (cancelled) request
+            // gets re-cancelled by its own host-side `await_with_cancel`, which
+            // observes the already-tripped request token on first poll and
+            // fires `provider_cancel` again.
+            if self.token.is_cancelled() {
+                self.reg
+                    .precancelled
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.id);
             }
         }
     }
@@ -2532,6 +2557,88 @@ mod tests {
         assert!(
             !host.supports_shell(),
             "remote proxy must defer --shell to the host pluginexec fallback"
+        );
+    }
+
+    // ---- CancelRegistry: deterministic coverage of the enter/cancel/drop
+    // contract. The race-loop test below exercises the concurrent interleaving;
+    // these pin each ordering on its own. ----
+
+    // (a) A cancel that arrives before its call registers is parked and applied
+    // at enter — the token starts cancelled.
+    #[test]
+    fn registry_cancel_before_enter_starts_cancelled() {
+        let reg = Arc::new(CancelRegistry::default());
+        reg.cancel("x");
+        let g = reg.enter("x");
+        assert!(
+            g.token().is_cancelled(),
+            "parked pre-cancel must apply at enter"
+        );
+    }
+
+    // (b) The plain order: enter, then cancel trips the registered token.
+    #[test]
+    fn registry_cancel_after_enter_trips_the_token() {
+        let reg = Arc::new(CancelRegistry::default());
+        let g = reg.enter("x");
+        reg.cancel("x");
+        assert!(g.token().is_cancelled(), "cancel must trip the live token");
+    }
+
+    // (c) Request ids are shared by the whole request subtree, so a stale
+    // guard's late drop must not deregister a successor call's token. With the
+    // old unconditional `remove(&self.id)` this goes red: g1's drop removed the
+    // entry g2 re-registered, and the cancel found nothing to trip.
+    #[test]
+    fn registry_stale_guard_drop_does_not_deregister_successor() {
+        let reg = Arc::new(CancelRegistry::default());
+        let g1 = reg.enter("x");
+        let g2 = reg.enter("x");
+        drop(g1);
+        reg.cancel("x");
+        assert!(
+            g2.token().is_cancelled(),
+            "g1's late drop must not have deregistered g2's token"
+        );
+    }
+
+    // Concurrent calls under ONE request id each keep their own token, and a
+    // request cancel trips them ALL. With the old single-slot map this goes
+    // red: the second enter replaced the first's token, so the cancel tripped
+    // only the last registrant while the first call ran to completion.
+    #[test]
+    fn registry_cancel_trips_every_concurrent_call_under_one_id() {
+        let reg = Arc::new(CancelRegistry::default());
+        let g1 = reg.enter("x");
+        let g2 = reg.enter("x");
+        reg.cancel("x");
+        assert!(g1.token().is_cancelled(), "first call's token must trip");
+        assert!(g2.token().is_cancelled(), "second call's token must trip");
+    }
+
+    // A cancelled guard's drop consumes the parked pre-cancel marker and its
+    // own inflight slot, so a long-lived process (LSP/watch) doesn't accumulate
+    // one parked id per cancelled request.
+    #[test]
+    fn registry_cancelled_guard_drop_leaves_no_state_behind() {
+        let reg = Arc::new(CancelRegistry::default());
+        let g = reg.enter("x");
+        reg.cancel("x");
+        drop(g);
+        assert!(
+            reg.precancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the parked marker must be consumed by the cancelled guard's drop"
+        );
+        assert!(
+            reg.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the guard's token (and the emptied entry) must be gone"
         );
     }
 

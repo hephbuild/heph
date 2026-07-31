@@ -884,7 +884,10 @@ fn cancel_abandoned<K, V>(
 
     // Dropped last, with nothing held: the drop cascades through the retained
     // chain and runs arbitrary destructors — releasing the worker permit,
-    // leaving the semaphore queue, disarming backstop registrations.
+    // leaving the semaphore queue, disarming backstop registrations. (One
+    // exception at the plugin ABI seam: a seam wrapper's drop only *requests*
+    // its spawned body stop via JoinHandle::abort — the body ends on a plugin
+    // worker after this cascade returns, not synchronously within it.)
     //
     // The cascade is *recursive*: this future's state machine holds the
     // `AbandonGuard` + `Await` for the next cell down, whose guard re-enters
