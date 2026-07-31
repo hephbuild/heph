@@ -928,6 +928,38 @@ fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
     )
 }
 
+/// Run a driver call on the cdylib's own runtime and await its answer.
+///
+/// The future this returns is polled by a *host* worker thread, whose tokio
+/// thread-locals belong to the host's separately-linked tokio instance — this
+/// cdylib's copy sees no runtime there at all. Any reactor touch (a `proc_exec`
+/// spawn, a timer) then panics, and a panic across the ABI seam is a
+/// non-unwinding abort, not an error: the whole `heph` process dies.
+///
+/// `run` has always hopped for this reason. `parse` and `apply_transitive` must
+/// too: a driver that probes its toolchain to build the cache key shells out
+/// from `parse` (`oci_image` asks buildx for its default platform), which is the
+/// same reactor touch one call earlier.
+///
+/// The `CancelGuard` moves into the task so the registry entry outlives the
+/// call, and the borrowed token it hands the driver stays valid for it.
+async fn on_plugin_runtime<F, Fut>(guard: CancelGuard, f: F) -> SVec<u8>
+where
+    F: FnOnce(CancelGuard) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Body> + Send,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // The guard moves into the task: it must outlive the call it cancels, and
+    // the token the driver borrows comes from it there.
+    cdylib_runtime().spawn(async move {
+        drop(tx.send(f(guard).await));
+    });
+    match rx.await {
+        Ok(body) => unary(body),
+        Err(_) => unary(err_body("plugin task dropped before completing".into())),
+    }
+}
+
 async fn driver_parse(
     driver: Arc<dyn ManagedDriver>,
     req: pb::ParseRequest,
@@ -940,16 +972,18 @@ async fn driver_parse(
             req.target_spec.unwrap_or_default(),
         )),
     };
-    let body = match driver.parse(preq, guard.token()).await {
-        Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
-            Ok(td) => Body::ParseResp(pb::ParseResponse {
-                target_def: Some(td),
-            }),
+    on_plugin_runtime(guard, move |guard| async move {
+        match driver.parse(preq, guard.token()).await {
+            Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+                Ok(td) => Body::ParseResp(pb::ParseResponse {
+                    target_def: Some(td),
+                }),
+                Err(e) => err_body(err_message(&e)),
+            },
             Err(e) => err_body(err_message(&e)),
-        },
-        Err(e) => err_body(err_message(&e)),
-    };
-    unary(body)
+        }
+    })
+    .await
 }
 
 async fn driver_apply_transitive(
@@ -967,16 +1001,18 @@ async fn driver_apply_transitive(
         target_def,
         sandbox: convert::sandbox_from_pb(req.sandbox.unwrap_or_default()),
     };
-    let body = match driver.apply_transitive(areq, guard.token()).await {
-        Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
-            Ok(td) => Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
-                target_def: Some(td),
-            }),
+    on_plugin_runtime(guard, move |guard| async move {
+        match driver.apply_transitive(areq, guard.token()).await {
+            Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+                Ok(td) => Body::ApplyTransitiveResp(pb::ApplyTransitiveResponse {
+                    target_def: Some(td),
+                }),
+                Err(e) => err_body(err_message(&e)),
+            },
             Err(e) => err_body(err_message(&e)),
-        },
-        Err(e) => err_body(err_message(&e)),
-    };
-    unary(body)
+        }
+    })
+    .await
 }
 
 impl StableMeta for StableManagedDriverImpl {
