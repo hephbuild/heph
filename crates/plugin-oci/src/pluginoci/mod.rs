@@ -104,31 +104,58 @@ use xxhash_rust::xxh3::Xxh3Default;
 pub(crate) struct ToolIo<'io> {
     pub stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    /// The target's `log.txt`, in the sandbox dir.
+    ///
+    /// This is what makes a build's progress *visible*: the engine collects that
+    /// file as the target's output artifact, renders its tail in the failure box
+    /// and serves it to `heph log`. The `stdout`/`stderr` sinks above are the
+    /// live path and are `None` outside an interactive run, so without this a
+    /// `docker buildx build` printed its whole progress log nowhere at all.
+    log: Option<std::sync::Mutex<std::fs::File>>,
 }
+
+/// The three places a tool's output goes: the user's live stdout/stderr (absent
+/// outside an interactive run) and the target's log file.
+///
+/// `&mut dyn Trait` is invariant, so the trait objects' lifetime has to stay
+/// `'io` rather than being shortened to the reborrow's.
+type Sinks<'a, 'io> = (
+    Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'io)>,
+    Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'io)>,
+    Option<&'a std::sync::Mutex<std::fs::File>>,
+);
 
 impl<'io> ToolIo<'io> {
     /// Take the sinks out of a run request. They are `&mut` and single-owner, so
     /// this consumes them for the duration of the run.
     pub(crate) fn from_request<'a>(req: &mut hplugin::driver::RunRequest<'a, 'io>) -> Self {
+        // Appended, not truncated: one run may shell out several times
+        // (`oci_push` does load → tag → push → rmi) and each one's output
+        // belongs to the same target's log.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(req.sandbox_dir.join("log.txt"))
+            .map_err(|e| {
+                // Losing the log must not fail the build; say so once and carry
+                // on with whatever live sinks exist.
+                tracing::warn!(error = %e, "oci: could not open the target's log.txt");
+            })
+            .ok()
+            .map(std::sync::Mutex::new);
         ToolIo {
             stdout: req.stdout.take(),
             stderr: req.stderr.take(),
+            log,
         }
     }
 
     /// Reborrow both sinks at once. Split out as a method so the two disjoint
     /// field borrows come from a single `&mut self`, which the borrow checker
     /// accepts where two separate `io.stdout` / `io.stderr` reborrows would not.
-    fn sinks(
-        &mut self,
-    ) -> (
-        // `&mut dyn Trait` is invariant, so the trait object's lifetime must
-        // stay `'io` here rather than being shortened to the borrow's.
-        Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'io)>,
-        Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'io)>,
-    ) {
-        let ToolIo { stdout, stderr } = self;
-        (stdout.as_deref_mut(), stderr.as_deref_mut())
+    fn sinks(&mut self) -> Sinks<'_, 'io> {
+        let ToolIo { stdout, stderr, log } = self;
+        (stdout.as_deref_mut(), stderr.as_deref_mut(), log.as_ref())
     }
 }
 
@@ -826,9 +853,12 @@ impl Driver {
         }
         // The probe's own output is noise to the user; only its result matters,
         // so no sinks are attached.
+        // The probe runs at parse time, where there is no sandbox and so no
+        // target log; its output is noise anyway — only its result matters.
         let mut io = ToolIo {
             stdout: None,
             stderr: None,
+            log: None,
         };
         let out = run_tool(
             argv,
@@ -1304,13 +1334,22 @@ async fn tee<'w>(
     // invariant, so it cannot be shortened to the borrow's at the call site.
     mut stdout_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'w)>,
     mut stderr_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'w)>,
+    log: Option<&std::sync::Mutex<std::fs::File>>,
     out_tail: &std::sync::Mutex<TailBuf>,
     err_tail: &std::sync::Mutex<TailBuf>,
     captured: &std::sync::Mutex<Vec<u8>>,
 ) {
+    use std::io::Write as _;
     use tokio::io::AsyncWriteExt as _;
     let Some(mut reader) = reader else { return };
     while let Ok(Some((stream, chunk))) = reader.recv().await {
+        // Both streams land in the target's log, in arrival order — the same
+        // shape `pluginexec` gives a `bash` target's output.
+        if let Some(log) = log
+            && let Ok(mut f) = log.lock()
+        {
+            drop(f.write_all(&chunk));
+        }
         let (tail, sink) = match stream {
             proc_exec::StreamId::Stdout => {
                 if let Ok(mut c) = captured.lock() {
@@ -1375,11 +1414,12 @@ pub(crate) async fn run_tool(
     let err_tail = std::sync::Mutex::new(TailBuf::default());
     let captured = std::sync::Mutex::new(Vec::new());
 
-    let (stdout_sink, stderr_sink) = io.sinks();
+    let (stdout_sink, stderr_sink, log) = io.sinks();
     let io_fut = tee(
         output_reader,
         stdout_sink,
         stderr_sink,
+        log,
         &out_tail,
         &err_tail,
         &captured,
@@ -2698,6 +2738,44 @@ exit 0
 
     /// A non-zero exit surfaces the tool's own stderr — the user needs the
     /// BuildKit message, not just "exit status 1".
+    /// The builder's progress has to land in the target's `log.txt`: that file is
+    /// what the engine collects, what the failure box renders a tail of, and what
+    /// `heph log` serves. The live `stdout`/`stderr` sinks are `None` outside an
+    /// interactive run, so without this the whole build log goes nowhere.
+    #[tokio::test]
+    async fn run_writes_the_tool_output_to_the_target_log() {
+        let sbx = Sandbox::new("app");
+        std::fs::write(sbx.pkg.join("Dockerfile"), "FROM scratch\n").expect("dockerfile");
+        let resp = parse_in(&sbx, "//app:img", cfg(&[ctx()])).await;
+
+        let bin = sbx.fake(
+            "docker",
+            "case \"$2\" in\n  inspect) echo \"Platforms: linux/amd64\"; exit 0 ;;\nesac\n\
+             echo 'to-stdout'\necho '#1 [internal] load build definition' >&2\n\
+             meta=\"\"; dest=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in --metadata-file) \
+             meta=\"$2\";; --output) dest=\"${2#*dest=}\";; esac; shift; done\n\
+             printf '{\"containerimage.digest\":\"sha256:deadbeef\"}' > \"$meta\"\n\
+             printf 'tar' > \"$dest\"\nexit 0",
+        );
+        let rid = "req".to_string();
+        let req = run_request(&rid, "hashin", &resp.target_def, &sbx, &[]);
+        let sandbox_dir = req.sandbox_dir.clone();
+        Driver::with_binary(bin)
+            .run(req, &StdCancellationToken::new())
+            .await
+            .expect("run");
+
+        let log = std::fs::read_to_string(sandbox_dir.join("log.txt")).expect("log.txt");
+        assert!(
+            log.contains("#1 [internal] load build definition"),
+            "the builder's progress (stderr) must reach the log, got: {log:?}"
+        );
+        assert!(
+            log.contains("to-stdout"),
+            "the builder's stdout must reach the log too, got: {log:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_surfaces_stderr_on_failure() {
         let sbx = Sandbox::new("app");

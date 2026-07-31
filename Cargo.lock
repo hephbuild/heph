@@ -4075,6 +4075,7 @@ dependencies = [
  "stabby",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

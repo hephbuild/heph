@@ -260,7 +260,6 @@ impl ManagedDriver for Driver {
         let def = req.request.target.def_de::<OciLoadDef>().clone();
         let tar = dep_single_file(&req, IMAGE_ORIGIN)?;
         let cwd = req.sandbox_ws_dir.clone();
-        let addr = req.request.target.addr.format();
         let argv = load_argv(&self.tools.docker, &self.tools.skopeo, &def, &tar)?;
         let mut io = ToolIo::from_request(&mut req.request);
         let stdout = run_tool(argv, &cwd, "oci_load", &mut io, ctoken)
@@ -271,7 +270,7 @@ impl ManagedDriver for Driver {
         // explicit `tag` has to be applied afterwards. Doing nothing with it
         // would leave the user with a dangling `<none>:<none>` image and no way
         // to run what they just asked to load.
-        let tagged = match (def.tool, def.tag.as_deref()) {
+        match (def.tool, def.tag.as_deref()) {
             (Tool::Docker, Some(tag)) => {
                 let loaded = parse_docker_load_ref(&stdout)?;
                 run_tool(
@@ -287,13 +286,11 @@ impl ManagedDriver for Driver {
                     ctoken,
                 )
                 .await?;
-                Some(tag)
             }
-            // skopeo named the daemon image via `docker-daemon:<tag>` already.
-            (Tool::Skopeo, tag) => tag,
-            (Tool::Docker, None) => None,
-        };
-        tracing::info!(addr, tag = tagged, "oci_load: loaded into the local daemon");
+            // skopeo named the daemon image via `docker-daemon:<tag>` already,
+            // and `docker load` with no `tag` keeps whatever the archive named.
+            (Tool::Skopeo, _) | (Tool::Docker, None) => {}
+        }
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
