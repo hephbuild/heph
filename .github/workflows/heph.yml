@@ -265,10 +265,18 @@ jobs:
           # binary under test AND the tool measuring it come from a release, for
           # N (this build) and N-1 (a past release) alike.
           BENCH_BIN_NAME="heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
+          # `heph`'s two release flavours, from the ONE compile below: `$OUT/heph`
+          # keeps the profile's DWARF line tables (published, flavour-stamped, as
+          # $DEBUG_BIN_NAME), and $BIN_NAME (the default "std" flavour, what
+          # `versionFlavour: debug` in `.hephconfig` opts out of) is a `strip`-ped,
+          # flavour-stamped copy of it. No second compile — see the comment on
+          # `[profile.release]` in the root Cargo.toml for why.
+          DEBUG_BIN_NAME="heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
           echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
           echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
+          echo "debug_bin_name=$DEBUG_BIN_NAME" >> $GITHUB_OUTPUT
           OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
           # FUSE (default feature) on Linux is pure-Rust (no libfuse link), so
           # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
@@ -314,33 +322,78 @@ jobs:
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
           fi
-          cp "$OUT/heph" $BIN_NAME
           cp "$OUT/heph-bench" $BENCH_BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
+
+          # `heph` diverges into its two flavours from here — each stamped by
+          # `patch-flavour.sh` with which one it is (`heph version` / self-upgrade
+          # read that back via `hcore::version::flavour()`), since nothing at
+          # compile time can tell them apart (see the comment above `OUT/heph`).
+          cp "$OUT/heph" $DEBUG_BIN_NAME
+          bash scripts/patch-flavour.sh $DEBUG_BIN_NAME debug
+
+          # "std" flavour: strip a copy of the same compiled `heph` — no second
+          # compile. `rust-strip` (cargo-binutils' wrapper around the
+          # `llvm-tools` component's llvm-objcopy, added in devenv.nix) rather
+          # than host `strip`/binutils: it's LLVM-based and target-agnostic,
+          # so it handles the Linux arm64 leg's cross-compiled output from an
+          # amd64 runner (see the zigbuild comment above) where a native
+          # `strip` typically can't touch a foreign-arch ELF. `zig objcopy`
+          # was tried first — already in this shell for zigbuild — but its
+          # `--strip-all` hit an unimplemented code path on real release
+          # output (verified in CI, not just locally).
+          cp "$OUT/heph" $BIN_NAME
+          rust-strip --strip-all $BIN_NAME
+          bash scripts/patch-flavour.sh $BIN_NAME ""
 
       - name: sccache stats
         if: always()
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
 
-      # macFUSE is NOT installed on this runner. libfuse is weak-linked, so the
-      # binary must still launch — this proves the shipped macOS artifact runs
-      # on machines without macFUSE (dyld would abort here if it were hard-linked).
-      - name: Smoke test launch (darwin)
-        if: matrix.os == 'darwin'
+      # Runs wherever this runner can actually execute what it just built: the
+      # darwin leg and the linux/amd64 leg both build for the runner's own
+      # arch. linux/arm64 cross-compiles on an amd64 runner (see the zigbuild
+      # comment above) — nothing here can execute that binary; the `bin_e2e`
+      # job launches it for real on a native arm64 runner instead. On darwin
+      # specifically this also proves the weak-linked libfuse binary still
+      # launches without macFUSE installed (dyld would abort here if it were
+      # hard-linked).
+      - name: Smoke test launch
+        if: matrix.os == 'darwin' || matrix.arch == 'amd64'
         run: |
           ./$BIN_NAME version
           ./$BENCH_BIN_NAME --help
+          # Both flavours launch, and each reports the flavour patch-flavour.sh
+          # actually stamped — not just that the binary runs at all. The
+          # baked-in version already carries its own build metadata (a commit
+          # hash), so check for the debug flavour marker specifically, not
+          # "any build metadata at all" (`hcore::version::reported` joins the
+          # flavour onto the existing metadata with a `.`, or a bare `+` if
+          # there wasn't any — either way it ends in `.debug` or `+debug`).
+          std_version="$(./$BIN_NAME version)"
+          debug_version="$(./$DEBUG_BIN_NAME version)"
+          echo "std: $std_version"
+          echo "debug: $debug_version"
+          case "$std_version" in *+debug|*.debug) echo "std flavour must not report the debug flavour: $std_version" >&2; exit 1 ;; esac
+          case "$debug_version" in *+debug|*.debug) ;; *) echo "debug flavour did not report itself: $debug_version" >&2; exit 1 ;; esac
         env:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           BENCH_BIN_NAME: "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
+          DEBUG_BIN_NAME: "heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{steps.build.outputs.bin_name}}
           path: ${{steps.build.outputs.bin_name}}
+
+      - name: Upload debug flavour artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.debug_bin_name}}
+          path: ${{steps.build.outputs.debug_bin_name}}
 
       - name: Upload heph-bench artifact
         uses: actions/upload-artifact@v6
@@ -383,7 +436,8 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          # Matches the CLI (`heph_<os>_<arch>`) and the go plugin cdylib
+          # Matches the CLI, both release flavours (`heph_<os>_<arch>` std,
+          # `heph_debug_<os>_<arch>` debug) and the go plugin cdylib
           # (`heph-go-plugin_<os>_<arch>.{so,dylib}`); excludes the `repo` source artifact.
           pattern: "heph*"
           path: dist
@@ -713,9 +767,12 @@ jobs:
           name: repo
           path: .
 
-      # Only this platform's three artifacts: `heph_<os>_<arch>` plus the two
-      # `heph-*-plugin_<os>_<arch>.{so,dylib}`. `heph-govet` carries no
-      # os/arch suffix, so the pattern leaves it out.
+      # Only this platform's artifacts: the std-flavour `heph_<os>_<arch>` (what
+      # the `e2e` script stages as `dist/heph`), the debug-flavour
+      # `heph_debug_<os>_<arch>` (downloaded too since it matches the glob, but
+      # unused — the `e2e` script only picks up the exact std name), and the two
+      # `heph-*-plugin_<os>_<arch>.{so,dylib}`. `heph-govet` carries no os/arch
+      # suffix, so the pattern leaves it out.
       - name: Download artifacts under test
         uses: actions/download-artifact@v7
         with:

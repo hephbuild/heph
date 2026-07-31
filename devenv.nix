@@ -18,6 +18,17 @@ in
     pkgs.cargo-zigbuild
     pkgs.tokio-console
     pkgs.sccache
+    # `rust-objcopy`/`rust-strip` (wraps the `llvm-tools` component's
+    # llvm-objcopy, below) — used by `scripts/patch-flavour.sh`'s CI caller to
+    # derive the "std" release flavour's stripped binary. LLVM-based and
+    # target-agnostic, unlike host binutils `strip`: the Linux arm64 leg
+    # cross-compiles on an amd64 runner (see the zigbuild comment in
+    # `.github/workflows/heph.yml`), and a native `strip` typically can't
+    # touch a foreign-arch ELF. (`zig objcopy` was tried first — it's already
+    # in this shell for zigbuild — but its `--strip-all` hits unimplemented
+    # code paths on real release-profile output; cargo-binutils' llvm-objcopy
+    # is the mature tool for this.)
+    pkgs.cargo-binutils
     # pkg-config + libfuse for the `fuse-sandbox` feature.
     # - Linux: `fuse3` ships headers/pc files fuser links against.
     # - macOS: `macfuse-stubs` provides the build-time `osxfuse.pc` per
@@ -40,7 +51,9 @@ in
    languages.rust = {
      enable = true;
      channel = "stable";
-     components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
+     # `llvm-tools`: ships llvm-objcopy/llvm-strip in the sysroot, which
+     # `cargo-binutils` (above) wraps as `rust-objcopy`/`rust-strip`.
+     components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" "llvm-tools" ];
      targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" ]
        ++ lib.optionals pkgs.stdenv.isLinux [ "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
    };

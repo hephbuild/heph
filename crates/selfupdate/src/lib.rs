@@ -7,6 +7,11 @@
 //! file lock — into `~/.heph/versions/<tag>/` and re-execs into it, replacing the
 //! current process so the rest of the run is served by the pinned version.
 //!
+//! `versionFlavour` (default: empty, the "std" build) selects which published
+//! artifact is downloaded: empty picks `heph_<os>_<arch>`, a named flavour (e.g.
+//! `debug`, a build kept unstripped for backtraces) picks
+//! `heph_<flavour>_<os>_<arch>`.
+//!
 //! Only **exact** version pins are acted on today; a constraint expression (e.g.
 //! `>=1.2, <2`) is recognized and skipped with a warning until resolution against
 //! the release index is implemented.
@@ -16,6 +21,12 @@
 //! - [`DISABLE_ENV`] (`HEPH_NO_SELF_UPDATE`) opts a process tree out entirely;
 //! - the re-exec sets [`UPGRADED_ENV`] so the upgraded binary never re-upgrades,
 //!   bounding the chain to a single hop even if a download reports a stale version.
+//!
+//! A version-number match alone isn't "nothing to do": `.hephconfig` can pin a
+//! `versionFlavour` without bumping `version`. `hcore::version::flavour()` —
+//! a post-build patch, not a compile-time constant, since both flavours of a
+//! release share one compile — is what lets the running binary answer "which
+//! flavour am I" directly, so [`decide`] can catch a flavour-only change too.
 
 // Test code uses panicking helpers and fixture asserts; exempt the test cfg from
 // the workspace restriction lints rather than rewriting each test. `allow` (not
@@ -50,7 +61,8 @@ pub enum SelfUpgradeError {
 }
 
 /// Base URL of the published release artifacts. Each release tags a set of
-/// `heph_<os>_<arch>` binaries under `<base>/<tag>/`.
+/// `heph_<os>_<arch>` (std flavour) and `heph_<flavour>_<os>_<arch>` (named
+/// flavour, e.g. `debug`) binaries under `<base>/<tag>/`.
 const ARTIFACTS_BASE: &str = "https://github.com/hephbuild/heph-artifacts-v1/releases/download";
 
 /// The dev-build sentinel stamped when `HEPH_BUILD_VERSION` is unset. Never
@@ -77,10 +89,11 @@ enum Decision {
     Unsupported { reason: String },
 }
 
-/// Read the workspace pin and, when it calls for a different exact version,
-/// download it and re-exec into it. Returns `Ok(())` when nothing needs to happen
-/// (no workspace, no pin, already current, dev build, or opted out). On a
-/// successful upgrade this **does not return** — the process image is replaced.
+/// Read the workspace pin and, when it calls for a different exact version or
+/// flavour, download it and re-exec into it. Returns `Ok(())` when nothing needs
+/// to happen (no workspace, no pin, already current, dev build, or opted out).
+/// On a successful upgrade this **does not return** — the process image is
+/// replaced.
 ///
 /// Errors are returned so the caller can log them, but a failed upgrade should
 /// never be fatal: the caller is expected to warn and continue with the current
@@ -96,18 +109,20 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
     // a distinct error so the caller can tolerate it for `heph version`.
     let root = hconfig::get_root().map_err(|_e| SelfUpgradeError::NoConfig)?;
     let cfg = hconfig::load_from_root(&root)?;
-    let Some(pin) = cfg.version.as_deref() else {
+    let Some(desired_version) = cfg.version.as_deref() else {
         return Ok(());
     };
+    let flavour = cfg.version_flavour.as_deref().unwrap_or("");
+    let current_flavour = version::flavour();
 
-    match decide(current, pin) {
+    match decide(current, &current_flavour, desired_version, flavour) {
         Decision::UpToDate => Ok(()),
         Decision::Unsupported { reason } => {
-            tracing::warn!(pin, current, %reason, "ignoring .hephconfig version pin");
+            tracing::warn!(desired_version, current, %reason, "ignoring .hephconfig version pin");
             Ok(())
         }
         Decision::Upgrade { target } => {
-            let binary = imp::ensure_binary(&target)?;
+            let binary = imp::ensure_binary(&target, flavour)?;
             // Replaces the process image; only returns on failure.
             imp::exec_into(&binary)?;
             Ok(())
@@ -134,20 +149,28 @@ fn env_opts_out() -> bool {
     version::VERSION == DEV_VERSION
 }
 
-/// Decide what to do given the running version and the configured pin.
-fn decide(current: &str, pin: &str) -> Decision {
-    let pin = pin.trim();
-    if pin.is_empty() {
+/// Decide what to do given the running version+flavour and the configured
+/// pin. A flavour mismatch forces an upgrade even when the version tag alone
+/// matches — a workspace can pin the same `version` but change
+/// `versionFlavour`.
+fn decide(
+    current: &str,
+    current_flavour: &str,
+    desired_version: &str,
+    desired_flavour: &str,
+) -> Decision {
+    let desired_version = desired_version.trim();
+    if desired_version.is_empty() {
         return Decision::UpToDate;
     }
-    if is_constraint(pin) {
+    if is_constraint(desired_version) {
         return Decision::Unsupported {
             reason: "version constraints are not yet supported; pin an exact version".to_string(),
         };
     }
-    let Some(target) = version::parse(pin) else {
+    let Some(target) = version::parse(desired_version) else {
         return Decision::Unsupported {
-            reason: format!("`{pin}` is not a valid version"),
+            reason: format!("`{desired_version}` is not a valid version"),
         };
     };
     let Some(running) = version::parse(current) else {
@@ -157,15 +180,16 @@ fn decide(current: &str, pin: &str) -> Decision {
     };
     // Build metadata is ignored when comparing (it is not part of version
     // identity); the core triple + pre-release decides equality.
-    if running.major == target.major
+    let version_matches = running.major == target.major
         && running.minor == target.minor
         && running.patch == target.patch
-        && running.pre_release == target.pre_release
-    {
+        && running.pre_release == target.pre_release;
+
+    if version_matches && current_flavour == desired_flavour {
         Decision::UpToDate
     } else {
         Decision::Upgrade {
-            target: pin.to_string(),
+            target: desired_version.to_string(),
         }
     }
 }
@@ -195,14 +219,21 @@ fn host_os_arch() -> (&'static str, &'static str) {
     (os, arch)
 }
 
-/// Release asset name for the host: `heph_<os>_<arch>`.
-fn binary_name(os: &str, arch: &str) -> String {
-    format!("heph_{os}_{arch}")
+/// Release asset name for the host: `heph_<os>_<arch>` for the std (empty)
+/// flavour, `heph_<flavour>_<os>_<arch>` for a named one (e.g. `debug`).
+fn binary_name(flavour: &str, os: &str, arch: &str) -> String {
+    if flavour.is_empty() {
+        format!("heph_{os}_{arch}")
+    } else {
+        format!("heph_{flavour}_{os}_{arch}")
+    }
 }
 
-/// Download URL for `tag`'s host binary: `<base>/<tag>/heph_<os>_<arch>`.
-fn download_url(tag: &str, os: &str, arch: &str) -> String {
-    format!("{ARTIFACTS_BASE}/{tag}/{}", binary_name(os, arch))
+/// Download URL for `tag`'s host binary in `flavour`:
+/// `<base>/<tag>/heph_<os>_<arch>` (std), or
+/// `<base>/<tag>/heph_<flavour>_<os>_<arch>` (named flavour).
+fn download_url(tag: &str, flavour: &str, os: &str, arch: &str) -> String {
+    format!("{ARTIFACTS_BASE}/{tag}/{}", binary_name(flavour, os, arch))
 }
 
 #[cfg(unix)]
@@ -227,12 +258,13 @@ mod imp {
         Ok(home.join(".heph").join("versions").join(tag))
     }
 
-    /// Ensure `tag`'s host binary is present in the cache, downloading it once
-    /// under an exclusive cross-process lock, and return its path.
-    pub(super) fn ensure_binary(tag: &str) -> anyhow::Result<PathBuf> {
+    /// Ensure `tag`'s host binary in `flavour` is present in the cache,
+    /// downloading it once under an exclusive cross-process lock, and return its
+    /// path.
+    pub(super) fn ensure_binary(tag: &str, flavour: &str) -> anyhow::Result<PathBuf> {
         let (os, arch) = host_os_arch();
         let dir = version_cache_dir(tag)?;
-        let dest = dir.join(binary_name(os, arch));
+        let dest = dir.join(binary_name(flavour, os, arch));
         if dest.exists() {
             return Ok(dest);
         }
@@ -245,7 +277,7 @@ mod imp {
             return Ok(dest);
         }
 
-        let url = download_url(tag, os, arch);
+        let url = download_url(tag, flavour, os, arch);
         let bytes = download_with_ui(&url, tag)?;
         install_atomic(&dir, &dest, &bytes)?;
         Ok(dest)
@@ -519,25 +551,74 @@ mod imp {
 mod tests {
     use super::*;
 
+    /// `decide` with flavour held constant (both empty) — for tests that only
+    /// care about version-number comparison; flavour comparison is covered
+    /// separately below.
+    fn decide_version_only(current: &str, desired_version: &str) -> Decision {
+        decide(current, "", desired_version, "")
+    }
+
     #[test]
     fn up_to_date_when_versions_match() {
-        assert_eq!(decide("v1.2.3", "v1.2.3"), Decision::UpToDate);
+        assert_eq!(decide_version_only("v1.2.3", "v1.2.3"), Decision::UpToDate);
         // Leading `v` is optional and build metadata is ignored.
-        assert_eq!(decide("1.2.3", "v1.2.3"), Decision::UpToDate);
-        assert_eq!(decide("v1.2.3+build.9", "v1.2.3"), Decision::UpToDate);
+        assert_eq!(decide_version_only("1.2.3", "v1.2.3"), Decision::UpToDate);
+        assert_eq!(
+            decide_version_only("v1.2.3+build.9", "v1.2.3"),
+            Decision::UpToDate
+        );
+    }
+
+    // A flavour-only edit (`.hephconfig` gains/changes `versionFlavour` without
+    // bumping `version`) must still trigger a re-fetch — a version match alone
+    // isn't "nothing to do".
+
+    #[test]
+    fn upgrades_on_flavour_mismatch_even_when_version_matches() {
+        // Running the std ("") flavour; `.hephconfig` now asks for `debug` with
+        // the *same* version pin — must not be a no-op.
+        assert_eq!(
+            decide("v1.2.3", "", "v1.2.3", "debug"),
+            Decision::Upgrade {
+                target: "v1.2.3".to_string()
+            }
+        );
+        assert_eq!(
+            decide("v1.2.3", "debug", "v1.2.3", ""),
+            Decision::Upgrade {
+                target: "v1.2.3".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn up_to_date_when_version_and_flavour_both_match() {
+        assert_eq!(
+            decide("v1.2.3", "debug", "v1.2.3", "debug"),
+            Decision::UpToDate
+        );
+        assert_eq!(decide("v1.2.3", "", "v1.2.3", ""), Decision::UpToDate);
+    }
+
+    #[test]
+    fn unsupported_pin_ignored_regardless_of_flavour() {
+        assert!(matches!(
+            decide("v1.0.0", "", ">=1.2", "debug"),
+            Decision::Unsupported { .. }
+        ));
     }
 
     #[test]
     fn upgrade_when_versions_differ() {
         assert_eq!(
-            decide("v1.2.3", "v1.3.0"),
+            decide_version_only("v1.2.3", "v1.3.0"),
             Decision::Upgrade {
                 target: "v1.3.0".to_string()
             }
         );
         // Pre-release is part of identity: a release differs from its rc.
         assert_eq!(
-            decide("v1.2.3-rc.1", "v1.2.3"),
+            decide_version_only("v1.2.3-rc.1", "v1.2.3"),
             Decision::Upgrade {
                 target: "v1.2.3".to_string()
             }
@@ -549,7 +630,7 @@ mod tests {
         // The target carries the pin verbatim (trimmed) so the download tag
         // matches the release tag the user wrote.
         assert_eq!(
-            decide("v1.0.0", "  v2.0.0  "),
+            decide_version_only("v1.0.0", "  v2.0.0  "),
             Decision::Upgrade {
                 target: "v2.0.0".to_string()
             }
@@ -560,7 +641,10 @@ mod tests {
     fn constraints_are_unsupported() {
         for pin in [">=1.2", "^1.0.0", "~1.2.3", "1.2.* ", "1.0, 2.0", ">1 <2"] {
             assert!(
-                matches!(decide("v1.0.0", pin), Decision::Unsupported { .. }),
+                matches!(
+                    decide_version_only("v1.0.0", pin),
+                    Decision::Unsupported { .. }
+                ),
                 "expected {pin:?} to be unsupported"
             );
         }
@@ -569,14 +653,14 @@ mod tests {
     #[test]
     fn unparseable_pin_is_unsupported() {
         assert!(matches!(
-            decide("v1.0.0", "banana"),
+            decide_version_only("v1.0.0", "banana"),
             Decision::Unsupported { .. }
         ));
     }
 
     #[test]
     fn empty_pin_is_noop() {
-        assert_eq!(decide("v1.0.0", "   "), Decision::UpToDate);
+        assert_eq!(decide_version_only("v1.0.0", "   "), Decision::UpToDate);
     }
 
     #[test]
@@ -594,13 +678,29 @@ mod tests {
     #[test]
     fn download_url_is_well_formed() {
         assert_eq!(
-            download_url("v1.2.3", "darwin", "arm64"),
+            download_url("v1.2.3", "", "darwin", "arm64"),
             "https://github.com/hephbuild/heph-artifacts-v1/releases/download/v1.2.3/heph_darwin_arm64"
         );
     }
 
     #[test]
+    fn download_url_includes_flavour_when_set() {
+        assert_eq!(
+            download_url("v1.2.3", "debug", "darwin", "arm64"),
+            "https://github.com/hephbuild/heph-artifacts-v1/releases/download/v1.2.3/heph_debug_darwin_arm64"
+        );
+    }
+
+    #[test]
     fn binary_name_per_platform() {
-        assert_eq!(binary_name("linux", "amd64"), "heph_linux_amd64");
+        assert_eq!(binary_name("", "linux", "amd64"), "heph_linux_amd64");
+    }
+
+    #[test]
+    fn binary_name_includes_flavour_when_set() {
+        assert_eq!(
+            binary_name("debug", "linux", "amd64"),
+            "heph_debug_linux_amd64"
+        );
     }
 }
