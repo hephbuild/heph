@@ -154,7 +154,11 @@ impl<'io> ToolIo<'io> {
     /// field borrows come from a single `&mut self`, which the borrow checker
     /// accepts where two separate `io.stdout` / `io.stderr` reborrows would not.
     fn sinks(&mut self) -> Sinks<'_, 'io> {
-        let ToolIo { stdout, stderr, log } = self;
+        let ToolIo {
+            stdout,
+            stderr,
+            log,
+        } = self;
         (stdout.as_deref_mut(), stderr.as_deref_mut(), log.as_ref())
     }
 }
