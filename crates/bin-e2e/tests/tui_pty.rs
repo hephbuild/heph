@@ -64,9 +64,17 @@ fn tui_renders_the_run_and_restores_the_terminal() {
         "interactive TUI never engaged with a tty attached\n{}",
         session.report()
     );
+    // Raw bytes, not the vt100-rendered screen: `rendered` snapshots the
+    // screen once per pty `read()`, and on a loaded CI runner several ticks'
+    // worth of draws can land in one read before the pump thread gets
+    // scheduled — the in-progress frame is overwritten by the next one before
+    // it is ever sampled, even though it was genuinely painted. The address
+    // only ever reaches stderr as literal text drawn by the viewport (there is
+    // no other path that would write it), so its presence in the byte stream
+    // still proves it was rendered, just not caught at a read boundary.
     assert!(
-        session.rendered.contains("//pkg:ok"),
-        "the target never appeared on the rendered screen\n{}",
+        contains(&session.raw, b"//pkg:ok"),
+        "the target never appeared in the rendered output\n{}",
         session.report()
     );
 
