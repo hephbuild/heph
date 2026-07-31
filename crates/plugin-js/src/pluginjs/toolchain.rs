@@ -60,38 +60,124 @@ pub fn is_host(spec: &str) -> bool {
     spec == HOST
 }
 
+/// `<workspace_root>/node_modules/.bin/<bin_name>` first, then the process's
+/// own `PATH` — the shared resolution order behind both [`resolve_host_tsc`]
+/// and `js_test`'s `testrunner` binary resolution (`resolve_host_test_runner`
+/// in this module). `None` when neither has it; each caller wraps that into
+/// its own error naming both places checked, per this milestone's explicit
+/// "do not silently assume the binary is on PATH" requirement.
+fn find_host_bin(workspace_root: &Path, bin_name: &str) -> Option<PathBuf> {
+    let local = workspace_root
+        .join("node_modules")
+        .join(".bin")
+        .join(bin_name);
+    if std::fs::metadata(&local)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return Some(local);
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join(bin_name);
+            if std::fs::metadata(&cand)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the `tsc` binary to run: `<workspace_root>/node_modules/.bin/tsc`
 /// first, then the process's own `PATH`. Fails loudly, naming both places
 /// checked, rather than silently assuming `tsc` is reachable — per this
 /// milestone's explicit "do not silently assume tsc is on PATH" requirement.
 pub(crate) fn resolve_host_tsc(workspace_root: &Path) -> anyhow::Result<PathBuf> {
     let local = workspace_root.join("node_modules").join(".bin").join("tsc");
-    if std::fs::metadata(&local)
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
-        return Ok(local);
-    }
+    find_host_bin(workspace_root, "tsc").ok_or_else(|| {
+        anyhow::anyhow!(
+            "js_typecheck: no `tsc` binary found at {local:?} or on PATH — install TypeScript \
+             (`npm install -D typescript` / `pnpm add -D typescript`) so `node_modules/.bin/tsc` \
+             exists, or make a `tsc` binary available on PATH. There is no hermetic TypeScript \
+             toolchain yet in this plugin — `tstool=\"host\"` (the only supported value in this \
+             milestone) requires one of those two to be reachable."
+        )
+    })
+}
 
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let cand = dir.join("tsc");
-            if std::fs::metadata(&cand)
-                .map(|m| m.is_file())
-                .unwrap_or(false)
-            {
-                return Ok(cand);
-            }
-        }
-    }
+/// Sentinel `testrunner` values `js_test` accepts — see this module's
+/// `resolve_host_test_runner` doc and `driver_test.rs` module docs for the
+/// same disclosed non-hermetic-toolchain shape `tstool = "host"` already has.
+pub const VITEST: &str = "vitest";
+pub const JEST: &str = "jest";
 
-    anyhow::bail!(
-        "js_typecheck: no `tsc` binary found at {local:?} or on PATH — install TypeScript \
-         (`npm install -D typescript` / `pnpm add -D typescript`) so `node_modules/.bin/tsc` \
-         exists, or make a `tsc` binary available on PATH. There is no hermetic TypeScript \
-         toolchain yet in this plugin — `tstool=\"host\"` (the only supported value in this \
-         milestone) requires one of those two to be reachable."
-    )
+/// Whether `testrunner` names a supported test runner — the only two values
+/// `js_test` recognizes in this milestone (see `ai-docs/js-plugin-plan.md`'s
+/// `js_test` row: `testrunner` defaults to `vitest`, alt `jest`).
+pub fn is_supported_testrunner(testrunner: &str) -> bool {
+    testrunner == VITEST || testrunner == JEST
+}
+
+/// Resolve the configured `testrunner`'s binary:
+/// `<workspace_root>/node_modules/.bin/<vitest|jest>` first, then the
+/// process's own `PATH` — the same disclosed non-hermetic escape hatch
+/// `tstool = "host"` already has (see [`resolve_host_tsc`]), extended to
+/// `js_test`'s toolchain axis. Fails loudly, naming both places checked, when
+/// neither has it.
+pub(crate) fn resolve_host_test_runner(
+    workspace_root: &Path,
+    testrunner: &str,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        is_supported_testrunner(testrunner),
+        "js_test: unsupported testrunner {testrunner:?} — expected \"vitest\" or \"jest\""
+    );
+    let local = workspace_root
+        .join("node_modules")
+        .join(".bin")
+        .join(testrunner);
+    find_host_bin(workspace_root, testrunner).ok_or_else(|| {
+        anyhow::anyhow!(
+            "js_test: no `{testrunner}` binary found at {local:?} or on PATH — install it \
+             (`npm install -D {testrunner}` / `pnpm add -D {testrunner}`) so \
+             `node_modules/.bin/{testrunner}` exists, or make a `{testrunner}` binary available \
+             on PATH. There is no hermetic {testrunner} toolchain yet in this plugin — \
+             `testrunner=\"{testrunner}\"` requires one of those two to be reachable."
+        )
+    })
+}
+
+/// Query the resolved test runner's own `--version` output, trimmed —
+/// hashed into `JsTestDef` so a host runner upgrade/downgrade busts the
+/// cache, mirroring [`query_tsc_version`]'s "query once at `Provider::get`
+/// time, not `run()` time" rationale (see that function's doc): the
+/// driver's cache-key hash is computed in `parse()`, strictly before `run()`,
+/// so a version bump queried only inside `run()` would never bust a cache
+/// hit.
+pub(crate) fn query_test_runner_version(runner_bin: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new(runner_bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run {runner_bin:?} --version"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`{runner_bin:?} --version` failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let version = String::from_utf8(out.stdout)
+        .with_context(|| format!("{runner_bin:?} --version output is not utf8"))?
+        .trim()
+        .to_string();
+    anyhow::ensure!(
+        !version.is_empty(),
+        "`{runner_bin:?} --version` returned empty output"
+    );
+    Ok(version)
 }
 
 /// Query `tsc --version`'s full trimmed output (e.g. `"Version 5.6.2"`) —
@@ -198,6 +284,92 @@ mod tests {
             std::fs::set_permissions(&fake_tsc, perms).expect("chmod");
         }
         let err = query_tsc_version(&fake_tsc).expect_err("nonzero exit must error");
+        assert!(format!("{err:#}").contains("failed"));
+    }
+
+    // ---- testrunner (js_test) ----
+
+    #[test]
+    fn is_supported_testrunner_recognizes_only_vitest_and_jest() {
+        assert!(is_supported_testrunner(VITEST));
+        assert!(is_supported_testrunner(JEST));
+        assert!(!is_supported_testrunner("mocha"));
+        assert!(!is_supported_testrunner(""));
+    }
+
+    #[test]
+    fn resolve_host_test_runner_rejects_unsupported_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = resolve_host_test_runner(dir.path(), "mocha")
+            .expect_err("unsupported testrunner must error");
+        assert!(format!("{err:#}").contains("mocha"));
+    }
+
+    #[test]
+    fn resolve_host_test_runner_prefers_local_node_modules_bin_over_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_bin_dir = dir.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&local_bin_dir).expect("mkdir");
+        let local_vitest = local_bin_dir.join(VITEST);
+        std::fs::write(&local_vitest, b"#!/bin/sh\necho local\n").expect("write local vitest");
+
+        let found = resolve_host_test_runner(dir.path(), VITEST).expect("resolve");
+        assert_eq!(found, local_vitest);
+    }
+
+    #[test]
+    fn resolve_host_test_runner_errors_clearly_when_absent_everywhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prior = std::env::var_os("PATH");
+        // SAFETY: test-only, single-threaded within this process for the
+        // duration of the mutation; restored immediately below.
+        unsafe { std::env::set_var("PATH", "") };
+        let result = resolve_host_test_runner(dir.path(), JEST);
+        match &prior {
+            // SAFETY: test-only, restoring the prior value we saved above.
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            // SAFETY: test-only, restoring the prior (unset) state.
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        let err = result.expect_err("no jest anywhere must error, not silently succeed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("jest"), "{msg}");
+        assert!(msg.contains("PATH"), "{msg}");
+    }
+
+    #[test]
+    fn query_test_runner_version_reads_trimmed_stdout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_bin = dir.path().join("vitest");
+        std::fs::write(&fake_bin, "#!/bin/sh\necho 'vitest/1.6.0'\n").expect("write fake runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).expect("chmod");
+        }
+        let version = query_test_runner_version(&fake_bin).expect("query version");
+        assert_eq!(version, "vitest/1.6.0");
+    }
+
+    #[test]
+    fn query_test_runner_version_errors_on_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_bin = dir.path().join("jest");
+        std::fs::write(&fake_bin, "#!/bin/sh\nexit 3\n").expect("write fake runner");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).expect("chmod");
+        }
+        let err = query_test_runner_version(&fake_bin).expect_err("nonzero exit must error");
         assert!(format!("{err:#}").contains("failed"));
     }
 }
