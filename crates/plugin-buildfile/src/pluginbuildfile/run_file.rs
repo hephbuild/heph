@@ -288,13 +288,18 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         // more than that trips Starlark's own too-many-args error first.
         let (_, optional) =
             starlark::__derive_refs::parse_args::parse_positional::<0, 8>(args, eval.heap())?;
-        let positional: Vec<htvalue::Value> =
-            optional.iter().flatten().map(starlark_to_rust).collect();
+        let positional: Vec<htvalue::Value> = optional
+            .iter()
+            .flatten()
+            .map(starlark_to_rust)
+            .collect::<anyhow::Result<_>>()
+            .map_err(starlark::Error::new_other)?;
         let named: HashMap<String, htvalue::Value> = args
             .names_map()?
             .iter()
-            .map(|(k, v)| (k.as_str().to_string(), starlark_to_rust(v)))
-            .collect();
+            .map(|(k, v)| Ok((k.as_str().to_string(), starlark_to_rust(v)?)))
+            .collect::<anyhow::Result<_>>()
+            .map_err(starlark::Error::new_other)?;
 
         // Enforce the declared signature: hard-fail on bad arity, missing
         // required, unknown named, or wrong type; substitute optional defaults.
@@ -577,51 +582,54 @@ pub(crate) struct Extra<'a> {
     pub capture_provenance: bool,
 }
 
-// Unsupported starlark value types (not str/bool/int/float/list/dict) are a programming error
-#[expect(
-    clippy::panic,
-    reason = "caller must only pass supported starlark value types; any other type is a programming error"
-)]
-fn starlark_to_rust(v: &Value) -> htvalue::Value {
+/// Unsupported starlark value types (not str/bool/int/float/list/dict) are a
+/// BUILD-file authoring error (e.g. passing a namespace or a native function
+/// value where a plain value is expected) — never a programming error, so
+/// this must return an error rather than panic: it runs inside the LSP, which
+/// must survive a malformed BUILD file rather than crash the whole server.
+fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
     if v.is_none() {
-        return htvalue::Value::Null();
+        return Ok(htvalue::Value::Null());
     }
 
     if let Some(s) = v.unpack_str() {
-        return htvalue::Value::String(s.to_string());
+        return Ok(htvalue::Value::String(s.to_string()));
     }
 
     if let Some(b) = v.unpack_bool() {
-        return htvalue::Value::Bool(b);
+        return Ok(htvalue::Value::Bool(b));
     }
 
     if let Some(i) = v.unpack_i32() {
-        return htvalue::Value::Int(i as i64);
+        return Ok(htvalue::Value::Int(i as i64));
     }
 
     if let Ok(Some(UnpackFloat(f))) = UnpackFloat::unpack_value(*v) {
-        return htvalue::Value::Float(f);
+        return Ok(htvalue::Value::Float(f));
     }
 
     if let Ok(Some(l)) = UnpackList::<Value>::unpack_value(*v) {
-        return htvalue::Value::List(l.items.iter().map(starlark_to_rust).collect());
+        return Ok(htvalue::Value::List(
+            l.items
+                .iter()
+                .map(starlark_to_rust)
+                .collect::<anyhow::Result<_>>()?,
+        ));
     }
 
     if let Some(d) = DictRef::from_value(*v) {
         let map = d
             .iter()
-            .filter_map(|(k, val)| {
-                k.unpack_str()
-                    .map(|s| (s.to_string(), starlark_to_rust(&val)))
-            })
-            .collect();
-        return htvalue::Value::Map(map);
+            .filter_map(|(k, val)| k.unpack_str().map(|s| (s.to_string(), val)))
+            .map(|(k, val)| Ok((k, starlark_to_rust(&val)?)))
+            .collect::<anyhow::Result<_>>()?;
+        return Ok(htvalue::Value::Map(map));
     }
 
-    panic!(
-        "starlark_to_rust: Unsupported starlark value type: {}",
+    Err(anyhow::anyhow!(
+        "unsupported starlark value type: {} (expected None/str/bool/int/float/list/dict)",
         v.get_type()
-    );
+    ))
 }
 
 /// Returns `path` prefixed with the current package and lexically normalized
@@ -769,16 +777,16 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                         Ok(None)
                     }
                     "transitive" => {
-                        transitive = sandbox_from(starlark_to_rust(e.1), &PkgBuf::from(extra.pkg))
+                        transitive = sandbox_from(starlark_to_rust(e.1)?, &PkgBuf::from(extra.pkg))
                             .with_context(|| "transitive")?;
                         Ok(None)
                     }
                     "approval" => {
                         approval =
-                            approval_from(starlark_to_rust(e.1)).with_context(|| "approval")?;
+                            approval_from(starlark_to_rust(e.1)?).with_context(|| "approval")?;
                         Ok(None)
                     }
-                    _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)))),
+                    _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)?))),
                 }
             })
             .collect::<anyhow::Result<Vec<_>>>()?
@@ -903,15 +911,20 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         let mut provider = String::new();
         let kwargs = m
             .iter()
-            .filter_map(|e| match e.0.as_str() {
-                "provider" => {
-                    if let Some(s) = e.1.unpack_str() {
-                        provider = s.to_string();
+            .map(|e| -> anyhow::Result<Option<(String, htvalue::Value)>> {
+                match e.0.as_str() {
+                    "provider" => {
+                        if let Some(s) = e.1.unpack_str() {
+                            provider = s.to_string();
+                        }
+                        Ok(None)
                     }
-                    None
+                    _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)?))),
                 }
-                _ => Some((e.0.as_str().to_string(), starlark_to_rust(e.1))),
             })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect::<HashMap<String, htvalue::Value>>();
 
         if provider.is_empty() {
@@ -3334,6 +3347,29 @@ target(name = "t_in_app", driver = SHARED)
         let lib_res = run_pkg_blocking(&provider, "lib").unwrap();
         assert_eq!(lib_res.targets.len(), 1);
         assert_eq!(lib_res.targets[0].name, "t_in_lib");
+    }
+
+    #[test]
+    fn test_target_unsupported_kwarg_type_errors_instead_of_panicking() {
+        // Passing a namespace value (e.g. the bare `heph.fs` provider namespace,
+        // rather than calling one of its functions) as a target() kwarg used to
+        // panic in starlark_to_rust, which aborts the whole LSP process instead
+        // of reporting a BUILD-file error.
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"target(name = "t", driver = "d", bad = heph.fs)"#,
+        )
+        .unwrap();
+
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "p").expect_err("must error, not panic");
+        assert!(
+            format!("{err:#}").contains("unsupported starlark value type"),
+            "{err:#}"
+        );
     }
 
     fn expect_string_list(v: Option<&htvalue::Value>) -> Vec<String> {
