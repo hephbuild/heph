@@ -8,8 +8,7 @@ use tokio::sync::mpsc;
 use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
 use crate::{
-    engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, pluginoci,
-    plugintextfile,
+    engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, plugintextfile,
 };
 
 /// Builds the multi-thread runtime used by every command entry point.
@@ -132,14 +131,10 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // `http_fetch`: downloads a URL (templated over the target's addr args) into a
     // cacheable file output — how tool binaries are provisioned off the internet.
     e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
-    // `oci_image`: builds a container image archive (OCI or docker format) from a
-    // Dockerfile + build context into a cacheable target output, shelling out to
-    // host `docker buildx`. `oci_push` / `oci_load` are non-cached actions that
-    // ship that archive to a registry (skopeo) / the local daemon (docker/skopeo).
-    e.register_managed_driver(|_| Box::new(pluginoci::Driver::new()))?;
-    e.register_managed_driver(|_| Box::new(pluginoci::push::Driver::new()))?;
-    e.register_managed_driver(|_| Box::new(pluginoci::load::Driver::new()))?;
-    e.register_managed_driver(|_| Box::new(pluginoci::pull::Driver::new()))?;
+    // The `oci_*` drivers are not compiled in: like the go plugin, they ship as
+    // a separate cdylib loaded from a `path:`/`url:` manifest entry
+    // (`heph-oci-plugin.json`), under their own `oci_image` / `oci_pull` /
+    // `oci_push` / `oci_load` names.
     e.register_managed_driver(|_| Box::new(pluginnix::Driver::new(home_dir.join("nix-driver"))))?;
 
     // Opt-in built-in factories — instantiated only when a `plugins: - { builtin:
@@ -303,10 +298,6 @@ mod tests {
         e.register_driver(|_| Box::new(pluginhostbin::Driver))?;
         e.register_driver(|_| Box::new(plugintextfile::Driver))?;
         e.register_managed_driver(|_| Box::new(pluginhttp::Driver))?;
-        e.register_managed_driver(|_| Box::new(pluginoci::Driver::new()))?;
-        e.register_managed_driver(|_| Box::new(pluginoci::push::Driver::new()))?;
-        e.register_managed_driver(|_| Box::new(pluginoci::load::Driver::new()))?;
-        e.register_managed_driver(|_| Box::new(pluginoci::pull::Driver::new()))?;
         e.register_managed_driver(|_| {
             Box::new(pluginnix::Driver::new(home_dir.join("nix-driver")))
         })?;

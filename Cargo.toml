@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "crates/e2e", "crates/bin-e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/config", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-stabby", "crates/plugin-sdk", "crates/plugin-go-cdylib", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/driver-bridge", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-http", "crates/plugin-oci", "crates/plugin-query", "crates/plugin-go", "crates/plugin-gha", "crates/plugin-gha-cdylib", "crates/telemetry", "crates/tui", "crates/lock", "crates/selfupdate", "crates/engine", "crates/xstarlark-fmt", "crates/bench-corpus", "crates/bench"]
+members = ["gen/proto", "crates/e2e", "crates/bin-e2e", "crates/testkit", "crates/plugingo-e2e", "crates/htspec-derive", "crates/core", "crates/config", "crates/walk", "crates/proc", "crates/model", "crates/sandboxfuse", "crates/plugin", "crates/plugin-abi", "crates/plugin-stabby", "crates/plugin-sdk", "crates/plugin-go-cdylib", "crates/builtins", "crates/plugin-buildfile", "crates/driver-support", "crates/driver-bridge", "crates/plugin-exec", "crates/plugin-nix", "crates/plugin-http", "crates/plugin-oci", "crates/plugin-query", "crates/plugin-go", "crates/plugin-gha", "crates/plugin-gha-cdylib", "crates/plugin-oci-cdylib", "crates/telemetry", "crates/tui", "crates/lock", "crates/selfupdate", "crates/engine", "crates/xstarlark-fmt", "crates/bench-corpus", "crates/bench"]
 
 [profile.profiling]
 inherits = "release"
@@ -118,7 +118,6 @@ hdriver-support = { package = "driver-support", path = "crates/driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
 hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
 hplugin-http = { package = "plugin-http", path = "crates/plugin-http" }
-hplugin-oci = { package = "plugin-oci", path = "crates/plugin-oci" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
 htui = { package = "tui", path = "crates/tui" }

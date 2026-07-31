@@ -17,7 +17,7 @@
 
 mod common;
 
-use heph::pluginoci;
+use hplugin_oci::pluginoci;
 use htestkit::WorkspaceBuilder;
 use std::path::PathBuf;
 

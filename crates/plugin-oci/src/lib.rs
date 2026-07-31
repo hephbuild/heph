@@ -5,8 +5,17 @@
 //! Docker/BuildKit is the builder heph shells out to, but the plugin is named
 //! for what it *produces* — an OCI image archive — so the builder can be swapped
 //! (buildah, podman, a hermetic buildkit) without changing the plugin's
-//! identity. See sibling `oci_push` / `oci_load` action drivers (later
-//! milestones) that consume this driver's tar output.
+//! identity. See sibling `oci_push` / `oci_load` action drivers that consume
+//! this driver's tar output.
+//!
+//! Not compiled into the CLI: like the go plugin, this ships as a loadable
+//! cdylib (`crates/plugin-oci-cdylib`) published per os/arch with a
+//! `heph-oci-plugin.json` manifest, selected by a workspace with
+//!
+//! ```yaml
+//! plugins:
+//!   - url: https://…/heph-oci-plugin.json
+//! ```
 #![cfg_attr(
     test,
     allow(
