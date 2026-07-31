@@ -13,9 +13,12 @@
 //!   never fire, the TUI freezes. Nothing is deadlocked and the build looks hung.
 //!   This is the failure this module exists to remove.
 //! - **`tokio::task::block_in_place`** — correct in principle (the runtime hands
-//!   off), but measured a concurrency regression on this workload (0.94 → 0.74,
-//!   see `PERFORMANCE.md`), because every call burns a worker handoff and pulls a
-//!   fresh thread out of the blocking pool.
+//!   off), but every call burns a worker handoff and pulls a fresh thread out of
+//!   the blocking pool, and it needs a runtime context this module cannot assume
+//!   (see below). A 0.94 → 0.74 concurrency regression was measured against it
+//!   in the #180 era; a 2026-07-31 re-test found parity within noise on macOS
+//!   Tier A (`docs/CONCURRENCY_MEASUREMENTS.md`) — treat the number as
+//!   historical, not as the reason this pool exists.
 //! - **`tokio::task::spawn_blocking`** — its `JoinHandle` wake-up rides tokio's
 //!   cross-thread waker, observed to drop wake-ups on macOS under heavy load (see
 //!   `docs/RCA_MACOS_WAKER.md` and the hazard note in `hproc::proc_exec`), which

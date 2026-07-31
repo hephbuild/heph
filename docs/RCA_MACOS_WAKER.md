@@ -8,9 +8,12 @@
 > previously lived only in a gitignored scratch directory. File paths inside
 > refer to the pre-workspace-split layout (`src/engine/…` is now
 > `crates/engine/src/engine/…`, etc.); they are kept as written. The hypothesis
-> below has **no isolated reproducer** — re-testing it on current tokio is
-> tracked work, and any decision newly leaning on this document should re-run
-> that experiment first.
+> below has **no isolated reproducer** — a 2026-07-31 isolated stress attempt
+> on tokio 1.52.3 / macOS 26.5.2 did **not** reproduce it (~40M off-runtime
+> wake deliveries, zero losses; see `docs/CONCURRENCY_MEASUREMENTS.md`), so
+> treat the hazard as defense-in-depth evidence from the field, not a standing
+> prohibition, and re-run that experiment before newly leaning on this
+> document.
 
 ## Symptom
 

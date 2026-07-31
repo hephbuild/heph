@@ -3,9 +3,11 @@
 //! Posting to a queue is a non-blocking `crossbeam_channel::send`. A
 //! long-lived worker thread drains that queue and runs each job
 //! inline. No tokio waker is involved (avoids the macOS cross-thread
-//! waker bug — see the hazard note in `hproc::proc_exec`), and no tokio worker
-//! is parked for the cleanup (avoids the `block_in_place` concurrency
-//! regression measured in `PERFORMANCE.md` suggestion #0).
+//! waker hazard — `docs/RCA_MACOS_WAKER.md`), and no tokio worker is
+//! parked for the cleanup. (Both hazards were re-tested 2026-07-31 and did not
+//! reproduce in isolation — `docs/CONCURRENCY_MEASUREMENTS.md`; the dedicated
+//! thread stays because fire-and-forget with `bg_pending` exit accounting needs
+//! a long-lived owner regardless.)
 //!
 //! Each job is an opaque `FnOnce` so the layer that built the sandbox
 //! also owns the knowledge of how to tear it down. The FUSE bridge
