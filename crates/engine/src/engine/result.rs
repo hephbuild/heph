@@ -7501,6 +7501,64 @@ mod tests {
         Ok(())
     }
 
+    /// A deep, fully-warm descent completes on a 2 MiB stack.
+    ///
+    /// The poll-cell model descended a warm chain synchronously in one poll
+    /// (~100 KiB per level — the overflow `GrowStack` exists for). With
+    /// task-backed request memoizers every level is its own task, so per-poll
+    /// stack depth is O(1) regardless of graph depth. Pinned to a 2 MiB
+    /// thread (explicitly, because `RUST_MIN_STACK` makes the default
+    /// unfalsifiable) so a regression back to deep synchronous polling fails
+    /// here rather than on a user's monorepo. This is the regression gate for
+    /// deleting `GrowStack`.
+    #[test]
+    fn deep_warm_chain_completes_on_a_2mib_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async {
+                    const N: usize = 200;
+                    let addrs: Vec<String> = (0..N).map(|i| format!("//chain:a{i}")).collect();
+                    let mut targets = Vec::with_capacity(N);
+                    for i in 0..N {
+                        if i + 1 < N {
+                            targets.push(run_target(&addrs[i], &[addrs[i + 1].as_str()], "true"));
+                        } else {
+                            targets.push(run_target(&addrs[i], &[], "true"));
+                        }
+                    }
+                    // `engine_with_home`: the TempDir must outlive both runs —
+                    // the warm run reads the lock dir and cache under it.
+                    let (engine, _home) = engine_with_home(targets).expect("engine");
+                    let head = hmodel::htaddr::parse_addr(&addrs[0]).expect("addr");
+
+                    // Cold run populates the local cache.
+                    let rs = engine.new_state();
+                    engine
+                        .clone()
+                        .result_addr(rs, &head, OutputMatcher::All, &ResultOptions::default())
+                        .await
+                        .expect("cold run");
+
+                    // Warm run, fresh request state: the full-hit descent that
+                    // used to be one synchronous poll per chain.
+                    let rs = engine.new_state();
+                    engine
+                        .clone()
+                        .result_addr(rs, &head, OutputMatcher::All, &ResultOptions::default())
+                        .await
+                        .expect("warm run");
+                });
+            })
+            .expect("spawn deep-chain thread")
+            .join()
+            .expect("deep-chain thread panicked");
+    }
+
     #[test]
     fn deep_chain_failure_has_bounded_error_depth() {
         // A linear chain a0→a1→…→aN where only the tail fails. The error

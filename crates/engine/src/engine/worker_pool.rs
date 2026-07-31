@@ -240,6 +240,78 @@ mod tests {
         drop(live);
     }
 
+    /// Task-mode variant of the wedge above. With task-backed memoizers,
+    /// cancellation is abort-based and teardown is *asynchronous*: the permit
+    /// comes back when the runtime drops the aborted chain, not synchronously
+    /// on the awaiter's drop. So the assertions are eventual (bounded), plus
+    /// the property that actually matters to a user — a live caller is served
+    /// while the abandoned chain drains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_task_memoized_chain_returns_its_worker_permit() {
+        use hcore::hmemoizer::Memoizer;
+
+        let handle = tokio::runtime::Handle::current();
+        let pool = WorkerPool::new(1);
+        let mem_result: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
+            "wp-task-repro-result",
+            handle.clone(),
+        ));
+        let mem_locked: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
+            "wp-task-repro-locked_result",
+            handle.clone(),
+        ));
+        let mem_execute: Arc<Memoizer<String, u32>> =
+            Arc::new(Memoizer::with_tag_task("wp-task-repro-execute_cache", handle));
+
+        let mut outer = Box::pin(mem_result.process("//pkg:tgt".to_string(), {
+            let (mem_locked, mem_execute) = (Arc::clone(&mem_locked), Arc::clone(&mem_execute));
+            let pool = Arc::clone(&pool);
+            move || async move {
+                mem_locked
+                    .process("//pkg:tgt".to_string(), move || async move {
+                        mem_execute
+                            .process("//pkg:tgt".to_string(), move || async move {
+                                let _permit = pool.acquire().await.expect("pool is never closed");
+                                futures::future::pending::<u32>().await
+                            })
+                            .await
+                    })
+                    .await
+            }
+        }));
+
+        // The chain's bodies run in spawned tasks: drive the joiner and wait
+        // (bounded) for the leaf to actually take the permit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while pool.available() != 0 {
+            assert!(futures::poll!(&mut outer).is_pending());
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leaf never acquired the permit"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        drop(outer);
+
+        // Teardown is asynchronous under abort: the permit returns when the
+        // runtime drops the chain. Eventual, but bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while pool.available() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "abandoning the chain must (eventually) return the worker permit"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let live = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
+            .await
+            .expect("a live caller must not be blocked by the abandoned chain")
+            .expect("acquire");
+        drop(live);
+    }
+
     /// Dropping a waiter mid-wait leaves the pool untouched.
     #[tokio::test]
     async fn a_cancelled_waiter_leaves_no_trace() {
