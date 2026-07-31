@@ -26,12 +26,79 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 const SHELL_INIT_SH: &str = include_str!("./init.sh");
 
-const EXEC_DEF_FORMAT_VERSION: u32 = 1;
+// Bumped for the `default_tool_inputs` field addition — deliberately
+// invalidates every exec/bash/sh cache entry rather than relying on the new
+// field's hash contribution to differ by coincidence.
+const EXEC_DEF_FORMAT_VERSION: u32 = 2;
+
+/// Curated default tool set injected into every target this driver parses,
+/// when `.hephconfig` doesn't override `default_tools` and doesn't set the
+/// raw-directory `path` escape hatch. Each name becomes an implicit,
+/// hashed `//@heph/bin:<name>` tool dependency (see [`probe_default_tools`]
+/// and [`Driver::parse`]) — the same mechanism an explicit `tools = [...]`
+/// target declaration already uses, not a bespoke PATH-directory fallback.
+const DEFAULT_TOOLS: &[&str] = &[
+    "sh", "bash", "cat", "cp", "mv", "rm", "mkdir", "ln", "ls", "grep", "sed", "awk", "find",
+    "xargs", "tar", "gzip", "gunzip", "chmod", "touch", "env", "cut", "sort", "uniq", "head",
+    "tail", "tr", "wc", "basename", "dirname", "readlink", "date", "printf", "true", "false",
+    "test", "sleep", "mktemp", "diff", "tee", "seq", "expr", "realpath",
+];
+
+/// Fixed, invoker-independent directory list used only to decide *whether* a
+/// default-tool name is eligible on this host — never to build the sandbox
+/// PATH itself. Deliberately not the running process's ambient `$PATH`: two
+/// developers on the same machine with different shell setups (asdf/nvm
+/// shims, homebrew-first PATH, etc.) must see the same default tool *set*.
+///
+/// Known, accepted limitation: the tool that actually ends up on a target's
+/// PATH is still resolved by the `hostbin` driver's own `which` lookup at run
+/// time (`crates/builtins/src/pluginhostbin`), which *does* read heph's own
+/// ambient `$PATH` — not this fixed list. So (a) a homebrew/nix/asdf-shimmed
+/// `bash` earlier on one developer's PATH can still be the one that actually
+/// runs, differing from a teammate on the same host/arch with a plainer PATH,
+/// and (b) running heph with an empty/minimal PATH (`env -i heph run ...`,
+/// some CI/systemd contexts) makes every default tool fail to resolve, where
+/// the old hardcoded-PATH fallback worked regardless of the caller's
+/// environment. Deliberately left as-is: the fix would mean not reusing
+/// `hostbin` unmodified for the resolution itself, which is a materially
+/// bigger change than this PR's scope — closing this gap, if it bites in
+/// practice, is a follow-up.
+const DEFAULT_TOOLS_PROBE_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Filter `names` down to the ones actually present on this host, probed
+/// against [`DEFAULT_TOOLS_PROBE_PATH`] rather than the process's own
+/// `$PATH`. A name that isn't installed is silently dropped rather than
+/// turned into a hard, always-required dependency — an implicit default
+/// must never fail a target that never calls it.
+fn probe_default_tools(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| which::which_in(name, Some(DEFAULT_TOOLS_PROBE_PATH), "/").is_ok())
+        .cloned()
+        .collect()
+}
 
 pub struct Driver {
     name: String,
-    /// PATH the driver injects into target processes. Empty falls back to a hardcoded default.
+    /// Raw directory PATH override (`.hephconfig`'s `path` option). When
+    /// non-empty, bypasses `default_tools` entirely — the explicit "I know
+    /// what I'm doing" escape hatch, unchanged from before this feature.
     search_path: Vec<String>,
+    /// Default tool names confirmed present on this host (see
+    /// `probe_default_tools`), injected as implicit `//@heph/bin:<name>`
+    /// tool deps by every target this driver parses. Empty when `path` was
+    /// set, when `default_tools: []` opted out, or for the bare
+    /// `new_exec`/`new_bash`/`new_sh` constructors (below).
+    default_tools: Vec<String>,
+    /// True only for the bare constructors: keeps the historical ambient
+    /// `/usr/local/bin:/usr/bin:/bin` PATH fallback so callers that
+    /// construct a `Driver` directly — ~40 engine/e2e test harnesses and the
+    /// interactive `--shell` fallback (`default_exec_shell_fallback`) —
+    /// keep working without also registering the `hostbin` provider that
+    /// `default_tools` depends on. `.hephconfig`-driven drivers
+    /// (`from_options_*`) always set this false: they get curated
+    /// `default_tools` instead and never fall through to an ambient PATH.
+    legacy_ambient_path_fallback: bool,
     wrap_run: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
     wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
 }
@@ -49,6 +116,13 @@ struct TargetDef {
     /// not invalidate the cache — that's the whole point of `runtime_deps`.
     pub runtime_dep_group_inputs: BTreeMap<String, Vec<Input>>,
     pub tool_group_inputs: BTreeMap<String, Vec<Input>>,
+    /// Driver-injected default tool deps (curated/configured `default_tools`
+    /// list, probed against this host). Symlinked into the same shared tool
+    /// `bin/` dir as `tool_group_inputs` so they land on PATH, but never
+    /// exposed via a `TOOL_<GROUP>` env var — they exist to populate PATH,
+    /// not to be referenced by absolute path from a script. Hashed like
+    /// `tool_group_inputs`: a different resolved tool changes the cache key.
+    pub default_tool_inputs: Vec<Input>,
     /// Declared outputs (`out`), normalized and keyed by group. Folded into
     /// the def hash: the paths are wired into `$OUT`/`$OUT_<group>` and decide
     /// what the sandbox captures, so changing them is a semantic change to the
@@ -72,6 +146,7 @@ impl Hash for TargetDef {
         // runtime_dep_group_inputs intentionally excluded — runtime_deps
         // (and runtime-only transitives) must not affect the cache key.
         self.tool_group_inputs.hash(state);
+        self.default_tool_inputs.hash(state);
         self.outputs.hash(state);
         self.support_files.hash(state);
         self.env.hash(state);
@@ -260,6 +335,8 @@ impl Driver {
         Self {
             name: "exec".to_string(),
             search_path: vec![],
+            default_tools: vec![],
+            legacy_ambient_path_fallback: true,
             wrap_run: |_, run| Ok(run.to_vec()),
             wrap_run_shell: |sandbox_dir, run| {
                 let joined: Vec<String> = if run.is_empty() {
@@ -296,6 +373,8 @@ impl Driver {
         Self {
             name: "bash".to_string(),
             search_path: vec![],
+            default_tools: vec![],
+            legacy_ambient_path_fallback: true,
             wrap_run: |sandbox_dir, run| {
                 bash_args_public(sandbox_dir, run.join("\n").as_str(), vec![])
             },
@@ -307,6 +386,8 @@ impl Driver {
         Self {
             name: "sh".to_string(),
             search_path: vec![],
+            default_tools: vec![],
+            legacy_ambient_path_fallback: true,
             wrap_run: |sandbox_dir, run| {
                 sh_args_public(sandbox_dir, run.join("\n").as_str(), vec![])
             },
@@ -317,22 +398,31 @@ impl Driver {
     }
 
     pub fn from_options_exec(opts: &hplugin::config::Options) -> anyhow::Result<Self> {
+        let (search_path, default_tools) = decode_search_path_and_default_tools(opts)?;
         Ok(Self {
-            search_path: decode_path(opts)?,
+            search_path,
+            default_tools,
+            legacy_ambient_path_fallback: false,
             ..Self::new_exec()
         })
     }
 
     pub fn from_options_bash(opts: &hplugin::config::Options) -> anyhow::Result<Self> {
+        let (search_path, default_tools) = decode_search_path_and_default_tools(opts)?;
         Ok(Self {
-            search_path: decode_path(opts)?,
+            search_path,
+            default_tools,
+            legacy_ambient_path_fallback: false,
             ..Self::new_bash()
         })
     }
 
     pub fn from_options_sh(opts: &hplugin::config::Options) -> anyhow::Result<Self> {
+        let (search_path, default_tools) = decode_search_path_and_default_tools(opts)?;
         Ok(Self {
-            search_path: decode_path(opts)?,
+            search_path,
+            default_tools,
+            legacy_ambient_path_fallback: false,
             ..Self::new_sh()
         })
     }
@@ -359,9 +449,91 @@ fn spec_path_to_target_path(
     })
 }
 
-fn decode_path(opts: &hplugin::config::Options) -> anyhow::Result<Vec<String>> {
-    hplugin::config::deny_unknown("exec/bash/sh driver", opts, &["path"])?;
-    Ok(hplugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?.unwrap_or_default())
+/// Decode the `path` (raw directory override) and `default_tools` (curated
+/// tool-name allowlist) options shared by the `exec`/`bash`/`sh` builtins.
+///
+/// The two are mutually exclusive: `path` is the pre-existing "I know what
+/// I'm doing, give me these raw host directories" escape hatch, unchanged;
+/// `default_tools` picks from (or replaces) the curated
+/// [`DEFAULT_TOOLS`] list, each entry becoming an implicit, hashed
+/// `//@heph/bin:<name>` tool dependency (see `Driver::parse`) rather than a
+/// blindly-trusted PATH directory. Setting both is a config error, not a
+/// silent precedence rule.
+///
+/// `default_tools` entries are always probed against this host (see
+/// [`probe_default_tools`]) before being used, whether they come from the
+/// curated default or an explicit override — an implicit default must never
+/// hard-fail a target that never calls it, unlike a target's own explicit
+/// `tools = [...]` dependency, which is meant to be a hard requirement.
+fn decode_search_path_and_default_tools(
+    opts: &hplugin::config::Options,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    hplugin::config::deny_unknown("exec/bash/sh driver", opts, &["path", "default_tools"])?;
+
+    if opts.contains_key("path") && opts.contains_key("default_tools") {
+        anyhow::bail!(
+            "exec/bash/sh driver: `path` and `default_tools` are mutually exclusive — \
+             `path` is a raw directory override, `default_tools` selects from the curated \
+             default tool set; set at most one"
+        );
+    }
+
+    let path: Vec<String> =
+        hplugin::config::decode_opt(opts, "exec/bash/sh driver", "path")?.unwrap_or_default();
+
+    if !path.is_empty() {
+        return Ok((path, vec![]));
+    }
+
+    let explicit: Option<Vec<String>> =
+        hplugin::config::decode_opt(opts, "exec/bash/sh driver", "default_tools")?;
+    let names: Vec<String> = explicit
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect());
+
+    // Order-preserving dedup: a duplicate entry must not produce two Inputs
+    // for the same `//@heph/bin:<name>` addr (and a def hash that differs
+    // from the deduped form for no semantic reason).
+    let mut seen = std::collections::HashSet::new();
+    let names: Vec<String> = names
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect();
+
+    for name in &names {
+        if name.is_empty() || name.contains('/') {
+            anyhow::bail!(
+                "exec/bash/sh driver: invalid `default_tools` entry {name:?} — must be a bare \
+                 tool name, not a path (use `path` for raw directories, or a target's own \
+                 `tools = [\"//@heph/bin:{name}\"]` for a hard dependency)"
+            );
+        }
+    }
+
+    let resolved = probe_default_tools(&names);
+
+    // An explicitly configured list is a user statement — a name that can't
+    // be probed is a config error, not silently dropped. The *curated*
+    // default (no `default_tools` key at all) stays best-effort: an implicit
+    // default must never fail a target that never calls it.
+    if explicit.is_some() {
+        let missing: Vec<&String> = names.iter().filter(|n| !resolved.contains(n)).collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "exec/bash/sh driver: `default_tools` entries not found on this host: {missing:?} \
+                 (probed {DEFAULT_TOOLS_PROBE_PATH:?}) — remove them, or install the tool, or \
+                 depend on it explicitly via a target's own `tools = [...]`"
+            );
+        }
+    }
+
+    tracing::debug!(
+        configured = ?names,
+        resolved = ?resolved,
+        "exec/bash/sh driver: resolved default_tools"
+    );
+
+    Ok((path, resolved))
 }
 
 /// RAII guard that restores the parent terminal's cooked mode when dropped.
@@ -803,6 +975,47 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 .push(input.clone());
         }
 
+        // Implicit `default_tools` (curated or `.hephconfig`-configured,
+        // already filtered to what's present on this host — see
+        // `probe_default_tools`), one `//@heph/bin:<name>` dep each. Kept
+        // separate from `tool_group_inputs`: they still land in the shared
+        // tool `bin/` dir (see `run_inner`), but never produce a
+        // `TOOL_<GROUP>` env var — a target should reach them by bare name
+        // on PATH, not by an env-var path lookup.
+        let default_tool_inputs = self
+            .default_tools
+            .iter()
+            .map(|name| -> anyhow::Result<Input> {
+                Ok(Input {
+                    r#ref: TargetAddr::parse(&format!("//@heph/bin:{name}"), &pkg)?,
+                    mode: InputMode::Tool,
+                    origin_id: format!("default_tool|{name}"),
+                    // Read-only executables, never mutated by the target, so
+                    // the OS sandbox runner stages them once into the shared
+                    // stage dir and links them in rather than copying all of
+                    // `default_tools` into every sandbox — same annotations
+                    // `apply_transitive` already uses for transitive
+                    // `sandbox(tools=...)` deps, and for the same reason
+                    // (see there). `stage_per_file` also forces per-file
+                    // listing, which the `bin/` flattening in `run_inner`
+                    // needs.
+                    annotations: BTreeMap::from([
+                        ("unpack_root".to_string(), "tools".to_string()),
+                        (
+                            hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                            "true".to_string(),
+                        ),
+                        (
+                            hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+                            "true".to_string(),
+                        ),
+                    ]),
+                    hashed: true,
+                    runtime: true,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
         // captures the whole environment — only use it on uncached targets).
@@ -841,6 +1054,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             dep_group_inputs,
             runtime_dep_group_inputs,
             tool_group_inputs,
+            default_tool_inputs: default_tool_inputs.clone(),
             outputs: output_groups,
             support_files: support_files.clone(),
             env: spec.env.into_iter().collect(),
@@ -878,6 +1092,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .chain(hash_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(runtime_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(tool_inputs.into_iter().map(|(_, v)| v))
+                    .chain(default_tool_inputs)
                     .collect(),
                 outputs,
                 support_files,
@@ -1009,14 +1224,22 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 }
 
 impl Driver {
-    /// The PATH injected into target processes, formatted for both the child's
-    /// env and the spawn-failure diagnostic. Empty `search_path` falls back to
-    /// a hardcoded default.
+    /// The directory-list component of the PATH injected into target
+    /// processes, formatted for both the child's env and the spawn-failure
+    /// diagnostic (`run_inner` prepends the `default_tools`/`tools=` bin dir
+    /// on top of whatever this returns). Empty `search_path` means: fall
+    /// back to the historical ambient `/usr/local/bin:/usr/bin:/bin` for the
+    /// bare constructors (`legacy_ambient_path_fallback`), or otherwise stay
+    /// empty — `.hephconfig`-driven drivers rely entirely on `default_tools`
+    /// deps for what's implicitly on PATH, not on blindly trusting whatever
+    /// happens to live in 3 system directories.
     fn sandbox_path_display(&self) -> String {
-        if self.search_path.is_empty() {
+        if !self.search_path.is_empty() {
+            self.search_path.join(":")
+        } else if self.legacy_ambient_path_fallback {
             ["/usr/local/bin", "/usr/bin", "/bin"].join(":")
         } else {
-            self.search_path.join(":")
+            String::new()
         }
     }
 
@@ -1179,7 +1402,9 @@ impl Driver {
             }
         }
 
-        let tool_bin_dir = if !def.tool_group_inputs.is_empty() {
+        let tool_bin_dir = if !def.tool_group_inputs.is_empty()
+            || !def.default_tool_inputs.is_empty()
+        {
             let bin_dir = req.sandbox_dir.join("bin");
             std::fs::create_dir_all(&bin_dir)
                 .with_context(|| format!("create tool bin dir {:?}", bin_dir))?;
@@ -1274,6 +1499,60 @@ impl Driver {
                 }
             }
 
+            // Default tools: same shared `bin/` dir and `linked` dedup as
+            // above, but no `TOOL_<GROUP>` env var — a script reaches these
+            // by bare name on PATH, not by env-var lookup.
+            for input in &def.default_tool_inputs {
+                let Some(m) = req.inputs.iter().find(|m| {
+                    m.input.origin_id == input.origin_id
+                        && matches!(
+                            m.input.artifact.r#type,
+                            hplugin::driver::inputartifact::Type::Dep
+                        )
+                }) else {
+                    continue;
+                };
+                let list_path = m.require_list_path()?;
+                let list_f = std::fs::File::open(list_path).with_context(|| {
+                    format!(
+                        "open default tool list {:?} (origin_id={})",
+                        list_path, input.origin_id
+                    )
+                })?;
+                let mut any = false;
+                for line in std::io::BufReader::new(list_f).lines() {
+                    let file_path = line.with_context(|| {
+                        format!("read line from default tool list {:?}", list_path)
+                    })?;
+                    if file_path.is_empty() {
+                        continue;
+                    }
+                    any = true;
+                    let filename = std::path::Path::new(&file_path)
+                        .file_name()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("tool file path has no filename: {}", file_path)
+                        })?
+                        .to_os_string();
+                    let bin_path = bin_dir.join(&filename);
+
+                    if !linked.insert(filename.clone()) {
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&file_path, &bin_path).with_context(|| {
+                        format!("symlink default tool {file_path:?} -> {bin_path:?}")
+                    })?;
+                    #[cfg(not(unix))]
+                    std::fs::copy(&file_path, &bin_path).with_context(|| {
+                        format!("copy default tool {file_path:?} -> {bin_path:?}")
+                    })?;
+                }
+                if !any {
+                    anyhow::bail!("default tool '{}' produced no files", input.origin_id);
+                }
+            }
+
             Some(bin_dir)
         } else {
             None
@@ -1342,6 +1621,18 @@ impl Driver {
         argv_for_filter.push(OsString::from(&program));
         argv_for_filter.extend(args_os.iter().cloned());
         let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter);
+
+        // Read from the *post-eviction* env: the spawn-failure diagnostic
+        // wants the PATH actually handed to the child (including any
+        // `default_tools`/`tools=` bin dir already prepended above). On a
+        // huge `pass_env: ["*"]` environment, `filter_long_env` can itself
+        // evict `PATH` to stay under ARG_MAX — in that case the child gets no
+        // PATH at all, and the message should say so rather than repeat a
+        // value the child never received.
+        let final_path = env_vec
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone());
         let env_pairs: Vec<(OsString, OsString)> = env_vec
             .into_iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -1414,9 +1705,36 @@ impl Driver {
         let mut handle = proc_exec::spawn(spec).map_err(|e| {
             let program = run.first().map_or("", String::as_str);
             if e.kind() == std::io::ErrorKind::NotFound {
+                let path_display = match &final_path {
+                    Some(p) => format!("{p:?}"),
+                    // `filterenv::filter_long_env` can itself evict PATH to
+                    // stay under ARG_MAX on a huge `pass_env: ["*"]` env —
+                    // the child then got none, so say that plainly rather
+                    // than silently repeating a value it never received.
+                    None => {
+                        "none — evicted to stay under the process argv/env size limit".to_string()
+                    }
+                };
+                let hint = if self.legacy_ambient_path_fallback {
+                    "This is the historical ambient `/usr/local/bin:/usr/bin:/bin` fallback \
+                     used by this driver instance (not `.hephconfig`-driven — e.g. the \
+                     interactive `--shell` fallback, or a driver constructed directly)."
+                        .to_string()
+                } else {
+                    format!(
+                        "It's built from the driver's `default_tools` ({} resolved on this \
+                         host) plus any target `tools = [...]` dependencies, or from the raw \
+                         `path` option if set in .hephconfig. Add {program:?} to \
+                         `default_tools`, depend on `//@heph/bin:{program}`, or set `path` \
+                         explicitly.",
+                        self.default_tools.len()
+                    )
+                };
                 anyhow::anyhow!(
-                    "spawn child process {program:?}: {e} — not found in the driver's sandbox PATH ({path}). This PATH is set by the driver's `path` option in .hephconfig and is independent of the invoking shell's PATH — a program on your interactive PATH can still be missing here. Also check that the working directory {cwd:?} exists.",
-                    path = self.sandbox_path_display(),
+                    "spawn child process {program:?}: {e} — not found in the driver's sandbox \
+                     PATH ({path_display}). This PATH is independent of the invoking shell's \
+                     PATH — a program on your interactive PATH can still be missing here. {hint} \
+                     Also check that the working directory {cwd:?} exists.",
                     cwd = req.sandbox_pkg_dir,
                 )
             } else {
@@ -1919,6 +2237,14 @@ mod tests {
         let d = Driver::from_options_sh(&opts).expect("from_options");
         assert_eq!(d.name, "sh");
         assert!(d.search_path.is_empty());
+        // No override: falls back to the curated default set, probed against
+        // this host — `sh` is present on every supported target.
+        assert!(
+            d.default_tools.contains(&"sh".to_string()),
+            "{:?}",
+            d.default_tools
+        );
+        assert!(!d.legacy_ambient_path_fallback);
     }
 
     #[test]
@@ -1927,6 +2253,11 @@ mod tests {
         let d = Driver::from_options_exec(&opts).expect("from_options");
         assert_eq!(d.name, "exec");
         assert!(d.search_path.is_empty());
+        assert!(
+            d.default_tools.contains(&"cat".to_string()),
+            "{:?}",
+            d.default_tools
+        );
     }
 
     #[test]
@@ -1938,6 +2269,110 @@ mod tests {
         );
         let d = Driver::from_options_exec(&opts).expect("from_options");
         assert_eq!(d.search_path, vec!["/usr/bin", "/bin"]);
+        // `path` is the raw-directory escape hatch — it must fully disable
+        // implicit default-tool injection, not stack on top of it.
+        assert!(d.default_tools.is_empty());
+    }
+
+    #[test]
+    fn from_options_exec_path_and_default_tools_are_mutually_exclusive() {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "path".to_string(),
+            serde_yaml::from_str("[/usr/bin]").expect("yaml"),
+        );
+        opts.insert(
+            "default_tools".to_string(),
+            serde_yaml::from_str("[cat]").expect("yaml"),
+        );
+        let err = Driver::from_options_exec(&opts).err().expect("must error");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn from_options_exec_default_tools_empty_opts_out() {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "default_tools".to_string(),
+            serde_yaml::from_str("[]").expect("yaml"),
+        );
+        let d = Driver::from_options_exec(&opts).expect("from_options");
+        // Present-but-empty must be distinguishable from absent: this is an
+        // explicit "no implicit tools at all", not "use the curated default".
+        assert!(d.default_tools.is_empty());
+    }
+
+    #[test]
+    fn from_options_exec_default_tools_curated_probe_drops_missing() {
+        // The *curated* default list (no `default_tools` key at all) is
+        // best-effort: a name that isn't installed is dropped, not turned
+        // into a hard dependency that would fail every target.
+        let opts = hplugin::config::Options::new();
+        let d = Driver::from_options_exec(&opts).expect("from_options");
+        assert!(
+            !d.default_tools
+                .contains(&"__definitely_not_a_real_binary_xyz__".to_string())
+        );
+    }
+
+    #[test]
+    fn from_options_exec_default_tools_explicit_missing_entry_errors() {
+        // An *explicit* `default_tools` override is a user statement — a
+        // name that can't be probed on this host must error, not silently
+        // vanish (the old hardcoded fallback never dropped input silently).
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "default_tools".to_string(),
+            serde_yaml::from_str("[cat, __definitely_not_a_real_binary_xyz__]").expect("yaml"),
+        );
+        let err = Driver::from_options_exec(&opts).err().expect("must error");
+        assert!(
+            err.to_string()
+                .contains("__definitely_not_a_real_binary_xyz__"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn from_options_exec_default_tools_explicit_all_present_succeeds() {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "default_tools".to_string(),
+            serde_yaml::from_str("[cat]").expect("yaml"),
+        );
+        let d = Driver::from_options_exec(&opts).expect("from_options");
+        assert_eq!(d.default_tools, vec!["cat".to_string()]);
+    }
+
+    #[test]
+    fn from_options_exec_default_tools_dedupes() {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "default_tools".to_string(),
+            serde_yaml::from_str("[cat, cat]").expect("yaml"),
+        );
+        let d = Driver::from_options_exec(&opts).expect("from_options");
+        assert_eq!(d.default_tools, vec!["cat".to_string()]);
+    }
+
+    #[test]
+    fn from_options_exec_default_tools_rejects_path_like_entry() {
+        let mut opts = hplugin::config::Options::new();
+        opts.insert(
+            "default_tools".to_string(),
+            serde_yaml::from_str("[/bin/cat]").expect("yaml"),
+        );
+        let err = Driver::from_options_exec(&opts).err().expect("must error");
+        assert!(err.to_string().contains("bare tool name"), "{err}");
+    }
+
+    #[test]
+    fn probe_default_tools_drops_missing_names() {
+        let names = vec![
+            "cat".to_string(),
+            "__definitely_not_a_real_binary_xyz__".to_string(),
+        ];
+        assert_eq!(probe_default_tools(&names), vec!["cat".to_string()]);
     }
 
     #[test]
@@ -2108,6 +2543,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2166,6 +2602,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2213,7 +2650,9 @@ mod tests {
             "missing sandbox PATH: {msg}"
         );
         assert!(
-            msg.contains("`path` option in .hephconfig"),
+            msg.contains("`default_tools`")
+                && msg.contains("`path`")
+                && msg.contains(".hephconfig"),
             "missing config hint: {msg}"
         );
 
@@ -2234,6 +2673,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2293,6 +2733,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2363,6 +2804,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2428,6 +2870,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2600,6 +3043,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2685,6 +3129,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2755,6 +3200,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -2910,6 +3356,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -3010,6 +3457,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env,
                 runtime_pass_env,
                 runtime_env,
@@ -3379,6 +3827,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parse_default_tools_produce_hashed_hostbin_inputs() -> anyhow::Result<()> {
+        // A driver-level default tool must show up as a real, hashed
+        // `//@heph/bin:<name>` dependency — the same mechanism an explicit
+        // `tools = [...]` target declaration uses — not a bespoke unhashed
+        // PATH entry.
+        let driver = Driver {
+            default_tools: vec!["cat".to_string()],
+            ..Driver::new_exec()
+        };
+        let ctoken = StdCancellationToken::new();
+        let res = driver
+            .parse(
+                hplugin::driver::ParseRequest {
+                    request_id: "test".to_string(),
+                    target_spec: std::sync::Arc::new(hplugin::provider::TargetSpec {
+                        addr: Addr::default(),
+                        driver: "exec".to_string(),
+                        config: HashMap::from([(
+                            "run".to_string(),
+                            hcore::htvalue::Value::String("echo".to_string()),
+                        )]),
+                        ..Default::default()
+                    }),
+                },
+                &ctoken,
+            )
+            .await?;
+
+        let input = res
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.origin_id == "default_tool|cat")
+            .expect("default tool input must be present");
+        assert_eq!(input.r#ref.r#ref.name, "cat");
+        assert_eq!(input.r#ref.r#ref.package.as_str(), "@heph/bin");
+        assert!(input.hashed, "default tool inputs must be hashed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_default_tools_change_def_hash() -> anyhow::Result<()> {
+        let without = Driver::new_exec();
+        let with_cat = Driver {
+            default_tools: vec!["cat".to_string()],
+            ..Driver::new_exec()
+        };
+        let ctoken = StdCancellationToken::new();
+        let make_req = || hplugin::driver::ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: std::sync::Arc::new(hplugin::provider::TargetSpec {
+                addr: Addr::default(),
+                driver: "exec".to_string(),
+                config: HashMap::from([(
+                    "run".to_string(),
+                    hcore::htvalue::Value::String("echo".to_string()),
+                )]),
+                ..Default::default()
+            }),
+        };
+        let base = without.parse(make_req(), &ctoken).await?.target_def;
+        let with_default_tool = with_cat.parse(make_req(), &ctoken).await?.target_def;
+        assert_ne!(base.hash, with_default_tool.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_parse_env_value_change_def_hash() -> anyhow::Result<()> {
         // Literal `env` values must invalidate the per-target def hash —
         // changing an env value is a semantic change to the target's input.
@@ -3692,6 +4207,7 @@ mod tests {
                         runtime: true,
                     }],
                 )]),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -3828,6 +4344,7 @@ mod tests {
                         runtime: true,
                     }],
                 )]),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -3974,6 +4491,7 @@ mod tests {
                         runtime: true,
                     }],
                 )]),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -4151,6 +4669,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -4236,6 +4755,7 @@ mod tests {
                         },
                     ],
                 )]),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -4337,6 +4857,7 @@ mod tests {
                         }],
                     ),
                 ]),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -4398,6 +4919,7 @@ mod tests {
                 runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
+                default_tool_inputs: vec![],
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),

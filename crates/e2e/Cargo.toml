@@ -13,3 +13,4 @@ htestkit = { package = "testkit", path = "../testkit" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1"
 tempfile = "3"
+serde_yaml = "0.9"
