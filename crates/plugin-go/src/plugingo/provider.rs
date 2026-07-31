@@ -29,7 +29,7 @@ use hcore::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
 use hcore::htvalue::{Value, parse_map_string_strings, parse_strings};
 use hmodel::htaddr::Addr;
-use hmodel::htpkg::PkgBuf;
+use hmodel::htpkg::{PkgBuf, join_rel_checked_pkg};
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, FnArgs, FnCallContext, GetError, GetRequest, GetResponse,
     ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait,
@@ -442,12 +442,14 @@ impl ProviderTrait for Provider {
                 returns: ParamType::String,
             },
             doc: "Build the address of a Go package's user-facing `build` target, as \
-                  used in `deps`. With a variant name, returns \
-                  `//<pkg>:build@v=<variant>`. Omit `variant` (or pass \"\") to get \
-                  the magic host-default target `//<pkg>:build` — a `group` that \
-                  forwards to the first variant matching this machine's os/arch. The \
-                  provider resolves the variant (and pins the defining package) when \
-                  built."
+                  used in `deps`. `pkg` is a heph package path (e.g. \"mylib\", \
+                  \"@heph/go/std/fmt\") or, starting with `./` or `../`, a path \
+                  relative to the calling BUILD file's package. With a variant name, \
+                  returns `//<pkg>:build@v=<variant>`. Omit `variant` (or pass \"\") \
+                  to get the magic host-default target `//<pkg>:build` — a `group` \
+                  that forwards to the first variant matching this machine's \
+                  os/arch. The provider resolves the variant (and pins the defining \
+                  package) when built."
                 .to_string(),
             func: Arc::new(BuildAddrFn),
         }]
@@ -547,11 +549,13 @@ impl ProviderTrait for Provider {
 }
 
 /// `heph.go.build_addr(pkg, v)` — format the heph address of a Go package's
-/// user-facing `build` target for variant `v`, without resolving anything. Takes
-/// a heph package (the addr's package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a
-/// thirdparty `@heph/go/thirdparty/…@v` path) and a variant name, and returns the
-/// canonical addr string `//<pkg>:build@v=<variant>`. Pure string transform — the
-/// provider resolves the variant (and pins its defining package) at get time.
+/// user-facing `build` target for variant `v`. Takes a heph package (the addr's
+/// package, e.g. `"mylib"`, `"@heph/go/std/fmt"`, or a thirdparty
+/// `@heph/go/thirdparty/…@v` path, or a `./`/`../`-relative path resolved against
+/// the calling BUILD file's package) and a variant name, and returns the
+/// canonical addr string `//<pkg>:build@v=<variant>`. Otherwise a pure string
+/// transform — the provider resolves the variant (and pins its defining package)
+/// at get time.
 struct BuildAddrFn;
 
 impl BuildAddrFn {
@@ -585,9 +589,16 @@ impl BuildAddrFn {
 
 #[async_trait]
 impl ProviderFn for BuildAddrFn {
-    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
         let pkg = Self::arg_str(&args, 0, "pkg")?;
         let v = Self::opt_arg_str(&args, 1, "variant")?.unwrap_or("");
+
+        let pkg = if pkg == "." || pkg == ".." || pkg.starts_with("./") || pkg.starts_with("../") {
+            join_rel_checked_pkg(ctx.pkg, pkg)
+                .with_context(|| format!("heph.go.build_addr: resolving relative pkg `{pkg}`"))?
+        } else {
+            pkg.to_string()
+        };
 
         // With a variant name, a user-facing `build` target carries only `v` (the
         // provider resolves the closest variant and fills in `vp` when built).
@@ -3565,6 +3576,48 @@ mod tests {
         };
         let v = BuildAddrFn.call(&build_addr_ctx(), args).await.unwrap();
         assert_eq!(v, Value::String("//mylib:build".into()));
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_dot_slash_relative_to_caller_pkg() {
+        let ctx = FnCallContext {
+            pkg: "foo",
+            root: std::path::Path::new("/"),
+        };
+        let args = FnArgs {
+            positional: vec![Value::String("./cmd".into())],
+            named: HashMap::new(),
+        };
+        let v = BuildAddrFn.call(&ctx, args).await.unwrap();
+        assert_eq!(v, Value::String("//foo/cmd:build".into()));
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_dot_dot_slash_relative_to_caller_pkg() {
+        let ctx = FnCallContext {
+            pkg: "foo/bar",
+            root: std::path::Path::new("/"),
+        };
+        let args = FnArgs {
+            positional: vec![Value::String("../cmd".into())],
+            named: HashMap::new(),
+        };
+        let v = BuildAddrFn.call(&ctx, args).await.unwrap();
+        assert_eq!(v, Value::String("//foo/cmd:build".into()));
+    }
+
+    #[tokio::test]
+    async fn test_build_addr_relative_escaping_root_errors() {
+        let ctx = FnCallContext {
+            pkg: "foo",
+            root: std::path::Path::new("/"),
+        };
+        let args = FnArgs {
+            positional: vec![Value::String("../../escape".into())],
+            named: HashMap::new(),
+        };
+        let err = BuildAddrFn.call(&ctx, args).await.unwrap_err();
+        assert!(err.to_string().contains("escape"), "{err}");
     }
 
     fn go_available() -> bool {
