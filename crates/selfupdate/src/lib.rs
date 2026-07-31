@@ -21,6 +21,18 @@
 //! - [`DISABLE_ENV`] (`HEPH_NO_SELF_UPDATE`) opts a process tree out entirely;
 //! - the re-exec sets [`UPGRADED_ENV`] so the upgraded binary never re-upgrades,
 //!   bounding the chain to a single hop even if a download reports a stale version.
+//!
+//! The running binary has no compile-time record of its own flavour (both
+//! flavours of a release share one compile — see the `strip`-after-build note on
+//! `[profile.release]` in the root `Cargo.toml` — so `version::VERSION` alone
+//! can't distinguish them). A pure version-number comparison would therefore miss
+//! a workspace that only changes `versionFlavour` without bumping `version`. To
+//! catch that, each workspace's last-*confirmed* `(tag, flavour)` is recorded in
+//! `~/.heph/pins/<hash of workspace root>` (`imp::read_applied_pin` /
+//! `imp::write_applied_pin`), and only ever written either as a plain
+//! nothing-to-download bookkeeping note, or by the re-exec'd child once `execve`
+//! has actually succeeded (never by the parent before a download/exec it hasn't
+//! confirmed) — see [`maybe_self_upgrade`].
 
 // Test code uses panicking helpers and fixture asserts; exempt the test cfg from
 // the workspace restriction lints rather than rewriting each test. `allow` (not
@@ -68,7 +80,9 @@ pub const DISABLE_ENV: &str = "HEPH_NO_SELF_UPDATE";
 
 /// Set on the re-exec'd child so it does not attempt to upgrade again. Bounds the
 /// exec chain to a single hop even if the downloaded binary reports an unexpected
-/// version.
+/// version. Carries `<tag>:<flavour>` (not just a boolean) — the child reads this
+/// to confirm the applied pin in the workspace's pin-state file, the only point at
+/// which "this pin actually applied" is provable (`execve` succeeded).
 pub const UPGRADED_ENV: &str = "HEPH_SELF_UPDATED";
 
 /// Outcome of comparing the running version against the workspace pin.
@@ -83,6 +97,33 @@ enum Decision {
     Unsupported { reason: String },
 }
 
+/// What to do once [`decide`] has already said [`Decision::UpToDate`] — i.e.
+/// the version tag matches — given what this workspace last confirmed its
+/// applied flavour to be. A version match alone isn't "nothing to do": the
+/// workspace's pin could have only changed `versionFlavour`, which `decide`
+/// can't see (see the module-level doc for why the running binary can't just
+/// compare its own flavour directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinCheck {
+    /// Already recorded and agrees with the desired flavour — nothing to do.
+    Confirmed,
+    /// Never recorded (first time resolving this pin): trust the version
+    /// match — the existing no-download fast path — but note it down so a
+    /// later flavour-only edit can be detected without a version bump.
+    RecordAndSkip,
+    /// Recorded, but for a different flavour: the version tag alone hasn't
+    /// changed, but the desired artifact has — upgrade anyway.
+    Upgrade,
+}
+
+fn check_pin(applied_flavour: Option<&str>, desired_flavour: &str) -> PinCheck {
+    match applied_flavour {
+        None => PinCheck::RecordAndSkip,
+        Some(f) if f == desired_flavour => PinCheck::Confirmed,
+        Some(_) => PinCheck::Upgrade,
+    }
+}
+
 /// Read the workspace pin and, when it calls for a different exact version,
 /// download it and re-exec into it. Returns `Ok(())` when nothing needs to happen
 /// (no workspace, no pin, already current, dev build, or opted out). On a
@@ -93,6 +134,12 @@ enum Decision {
 /// binary.
 #[cfg(unix)]
 pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
+    // If we're the freshly exec'd child of a prior hop, confirm the pin it
+    // carried actually applied — see the module-level doc and `UPGRADED_ENV`.
+    // Independent of `env_opts_out` below: this must run even though the child
+    // is about to bail out of self-upgrading again.
+    imp::confirm_applied_pin_if_upgraded_child();
+
     if env_opts_out() {
         return Ok(());
     }
@@ -108,17 +155,27 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
     let flavour = cfg.version_flavour.as_deref().unwrap_or("");
 
     match decide(current, pin) {
-        Decision::UpToDate => Ok(()),
+        Decision::UpToDate => {
+            let applied = imp::read_applied_pin(&root).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "reading self-upgrade pin state");
+                None
+            });
+            match check_pin(applied.as_ref().map(|(_, f)| f.as_str()), flavour) {
+                PinCheck::Confirmed => Ok(()),
+                PinCheck::RecordAndSkip => {
+                    if let Err(e) = imp::write_applied_pin(&root, pin, flavour) {
+                        tracing::warn!(error = %e, "recording self-upgrade pin state");
+                    }
+                    Ok(())
+                }
+                PinCheck::Upgrade => imp::upgrade_to(pin, flavour),
+            }
+        }
         Decision::Unsupported { reason } => {
             tracing::warn!(pin, current, %reason, "ignoring .hephconfig version pin");
             Ok(())
         }
-        Decision::Upgrade { target } => {
-            let binary = imp::ensure_binary(&target, flavour)?;
-            // Replaces the process image; only returns on failure.
-            imp::exec_into(&binary)?;
-            Ok(())
-        }
+        Decision::Upgrade { target } => imp::upgrade_to(&target, flavour),
     }
 }
 
@@ -221,7 +278,7 @@ fn download_url(tag: &str, flavour: &str, os: &str, arch: &str) -> String {
 
 #[cfg(unix)]
 mod imp {
-    use super::{UPGRADED_ENV, binary_name, download_url, host_os_arch};
+    use super::{SelfUpgradeError, UPGRADED_ENV, binary_name, download_url, host_os_arch};
     use anyhow::{Context, anyhow};
     use std::io::{IsTerminal, Read, Write};
     use std::os::unix::io::AsRawFd;
@@ -264,6 +321,84 @@ mod imp {
         let bytes = download_with_ui(&url, tag)?;
         install_atomic(&dir, &dest, &bytes)?;
         Ok(dest)
+    }
+
+    /// `~/.heph/pins/<hash of workspace root>` — this workspace's last-confirmed
+    /// applied `(tag, flavour)`. Keyed by a hash (not the raw path — arbitrary
+    /// length/characters) of the root so distinct workspaces never collide; see
+    /// the module-level doc for why this exists at all.
+    fn pin_state_path(root: &Path) -> anyhow::Result<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is not set; cannot locate ~/.heph pin state"))?;
+        let hash = xxhash_rust::xxh3::xxh3_64(root.as_os_str().as_encoded_bytes());
+        Ok(home.join(".heph").join("pins").join(format!("{hash:016x}")))
+    }
+
+    /// `(tag, flavour)` recorded at `path`, or `None` if there's nothing usable
+    /// there (absent or malformed) — either way, nothing to compare a desired
+    /// pin against. Pure file I/O, no env dependency, so it's exercised directly
+    /// in tests; [`read_applied_pin`] adds the `~/.heph`-relative path lookup.
+    fn read_pin_file(path: &Path) -> anyhow::Result<Option<(String, String)>> {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return Ok(None);
+        };
+        let mut lines = contents.lines();
+        let (Some(tag), Some(flavour)) = (lines.next(), lines.next()) else {
+            return Ok(None);
+        };
+        Ok(Some((tag.to_string(), flavour.to_string())))
+    }
+
+    /// Write `(tag, flavour)` to `path`. See [`read_pin_file`].
+    fn write_pin_file(path: &Path, tag: &str, flavour: &str) -> anyhow::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        std::fs::write(path, format!("{tag}\n{flavour}\n"))
+            .with_context(|| format!("write {}", path.display()))
+    }
+
+    /// `(tag, flavour)` this workspace last confirmed its pin resolved to.
+    pub(super) fn read_applied_pin(root: &Path) -> anyhow::Result<Option<(String, String)>> {
+        read_pin_file(&pin_state_path(root)?)
+    }
+
+    /// Record `(tag, flavour)` as this workspace's confirmed applied pin.
+    pub(super) fn write_applied_pin(root: &Path, tag: &str, flavour: &str) -> anyhow::Result<()> {
+        write_pin_file(&pin_state_path(root)?, tag, flavour)
+    }
+
+    /// If we're the freshly exec'd child of a prior self-upgrade hop,
+    /// `UPGRADED_ENV` carries the `<tag>:<flavour>` we were sent to. `execve`
+    /// succeeding — we're running at all — is the only point at which "this pin
+    /// actually applied" is provable, so confirm it here rather than in the
+    /// parent: a parent-side write could survive a later `exec` failure and
+    /// wrongly convince the next run nothing needs to change. Best-effort — a
+    /// failure to record just costs one extra hop next time.
+    pub(super) fn confirm_applied_pin_if_upgraded_child() {
+        let Some(applied) = std::env::var(UPGRADED_ENV).ok().filter(|v| !v.is_empty()) else {
+            return;
+        };
+        let Some((tag, flavour)) = applied.split_once(':') else {
+            return;
+        };
+        let Ok(root) = hconfig::get_root() else {
+            return;
+        };
+        if let Err(e) = write_applied_pin(&root, tag, flavour) {
+            tracing::warn!(error = %e, "recording self-upgrade pin state");
+        }
+    }
+
+    /// Ensure `tag`'s `flavour` binary is present, then re-exec into it.
+    /// Replaces the process image on success — only returns on failure, in
+    /// which case the pin state is deliberately left untouched (the child
+    /// confirms it instead; see `confirm_applied_pin_if_upgraded_child`).
+    pub(super) fn upgrade_to(tag: &str, flavour: &str) -> Result<(), SelfUpgradeError> {
+        let binary = ensure_binary(tag, flavour)?;
+        exec_into(&binary, tag, flavour)?;
+        Ok(())
     }
 
     /// Download `tag`'s binary, surfacing progress in the mode that fits the caller.
@@ -407,13 +542,15 @@ mod imp {
     }
 
     /// Replace the current process with `binary`, forwarding the original CLI
-    /// arguments and marking the child so it won't self-upgrade again. Returns
-    /// only if `execv` fails.
-    pub(super) fn exec_into(binary: &Path) -> anyhow::Result<()> {
+    /// arguments and marking the child (via `UPGRADED_ENV = "<tag>:<flavour>"`)
+    /// so it won't self-upgrade again, and so it can confirm this exact pin
+    /// applied (see `confirm_applied_pin_if_upgraded_child`). Returns only if
+    /// `execv` fails.
+    pub(super) fn exec_into(binary: &Path, tag: &str, flavour: &str) -> anyhow::Result<()> {
         let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
         let err = std::process::Command::new(binary)
             .args(&args)
-            .env(UPGRADED_ENV, "1")
+            .env(UPGRADED_ENV, format!("{tag}:{flavour}"))
             .exec();
         Err(err).with_context(|| format!("exec into {}", binary.display()))
     }
@@ -452,7 +589,7 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{fmt_bytes, install_atomic, progress_line};
+        use super::{fmt_bytes, install_atomic, progress_line, read_pin_file, write_pin_file};
 
         /// `install_atomic` is the last step before `exec_into` replaces the
         /// process image, and its errors are fatal (`main` turns them into
@@ -527,6 +664,40 @@ mod imp {
                 "⠋ downloading heph v2.0.0 4 KiB"
             );
         }
+
+        #[test]
+        fn pin_file_roundtrips() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("pin");
+
+            write_pin_file(&path, "v1.2.3", "debug").expect("write");
+
+            assert_eq!(
+                read_pin_file(&path).expect("read"),
+                Some(("v1.2.3".to_string(), "debug".to_string()))
+            );
+        }
+
+        #[test]
+        fn pin_file_absent_is_none() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("pin");
+            assert_eq!(read_pin_file(&path).expect("read"), None);
+        }
+
+        #[test]
+        fn pin_file_overwrites_previous_value() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("pin");
+
+            write_pin_file(&path, "v1.0.0", "").expect("write first");
+            write_pin_file(&path, "v2.0.0", "debug").expect("write second");
+
+            assert_eq!(
+                read_pin_file(&path).expect("read"),
+                Some(("v2.0.0".to_string(), "debug".to_string()))
+            );
+        }
     }
 }
 
@@ -540,6 +711,34 @@ mod tests {
         // Leading `v` is optional and build metadata is ignored.
         assert_eq!(decide("1.2.3", "v1.2.3"), Decision::UpToDate);
         assert_eq!(decide("v1.2.3+build.9", "v1.2.3"), Decision::UpToDate);
+    }
+
+    // `check_pin` is what makes a flavour-only edit (`.hephconfig` gains/changes
+    // `versionFlavour` without bumping `version`) actually trigger a re-fetch:
+    // `decide` alone would see the same version tag and call it `UpToDate`,
+    // missing the flavour change entirely (see the module-level doc for why the
+    // running binary can't just check its own flavour instead).
+
+    #[test]
+    fn check_pin_upgrades_when_recorded_flavour_differs() {
+        // Workspace previously confirmed the std ("") flavour; `.hephconfig` now
+        // asks for `debug` with the *same* version pin — must not be a no-op.
+        assert_eq!(check_pin(Some(""), "debug"), PinCheck::Upgrade);
+        assert_eq!(check_pin(Some("debug"), ""), PinCheck::Upgrade);
+    }
+
+    #[test]
+    fn check_pin_confirmed_when_recorded_flavour_matches() {
+        assert_eq!(check_pin(Some("debug"), "debug"), PinCheck::Confirmed);
+        assert_eq!(check_pin(Some(""), ""), PinCheck::Confirmed);
+    }
+
+    #[test]
+    fn check_pin_records_and_skips_when_never_recorded() {
+        // First time resolving this pin: trust the version match, don't force
+        // a download, but the caller is expected to record it afterward.
+        assert_eq!(check_pin(None, "debug"), PinCheck::RecordAndSkip);
+        assert_eq!(check_pin(None, ""), PinCheck::RecordAndSkip);
     }
 
     #[test]

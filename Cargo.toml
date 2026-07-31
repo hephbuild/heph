@@ -19,21 +19,14 @@ strip = "none"
 codegen-units = 16
 lto = "thin"
 opt-level = 3 # Prioritizes speed.
-# The "std" release flavour: no debug info, symbols stripped. This is what
-# ships by default (empty `version_flavour`) — small download, no in-process
-# backtrace symbolication. Anyone who needs that trades size for it via the
-# "debug" flavour (`[profile.release-debug]` below), published alongside it.
-debug = false
-strip = "symbols"
-
-# The "debug" release flavour (`version_flavour: debug` in `.hephconfig`).
-# Emits line-table DWARF and keeps it (no strip) so in-process backtraces
+# Emit line-table DWARF and keep it (no strip) so in-process backtraces
 # (`--diag-backtrace`, panic backtraces) resolve to function names + file:line.
-# `.symtab` alone is not enough — std's symbolizer reads DWARF. Costs binary
-# size (this is the flavour that was ~200MB on Linux); worth it when
-# diagnosability matters more than download size.
-[profile.release-debug]
-inherits = "release"
+# `.symtab` alone is not enough — std's symbolizer reads DWARF. This is the
+# "debug" release flavour's shape; CI derives the "std" flavour from the same
+# build by running `strip` on a copy afterwards (see `.github/workflows/heph.yml`)
+# rather than recompiling under a stripped profile — a second full compile
+# under `codegen-units = 16` + thin-LTO costs roughly as much wall time as this
+# one, for no runtime-behavior difference.
 debug = "line-tables-only"
 strip = "none"
 

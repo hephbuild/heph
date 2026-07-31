@@ -16,6 +16,9 @@ tracing = "0.1"
 # avoids a system OpenSSL link; blocking runs on its own thread (matches the
 # engine's plugin downloader).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# Derives the per-workspace self-upgrade pin-state filename from the workspace
+# root path (see `imp::pin_state_path`). Already a workspace dependency.
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

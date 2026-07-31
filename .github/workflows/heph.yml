@@ -193,10 +193,7 @@ jobs:
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    # 30 -> 45: the "debug" release flavour of `heph` is a second, separately
-    # profiled build (see the "Build" step) that can't reuse the std flavour's
-    # compiled objects.
-    timeout-minutes: 45
+    timeout-minutes: 30
     needs: [gen, govet]
     strategy:
       fail-fast: false
@@ -268,11 +265,12 @@ jobs:
           # binary under test AND the tool measuring it come from a release, for
           # N (this build) and N-1 (a past release) alike.
           BENCH_BIN_NAME="heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
-          # `heph`'s "debug" release flavour: same source, `release-debug`
-          # profile (unstripped, DWARF line tables — see root Cargo.toml),
-          # published as a second, separately-named `heph` asset. `version_flavour:
-          # debug` in `.hephconfig` is what makes self-upgrade fetch this one
-          # instead of the (default, stripped) "std" `$BIN_NAME` above.
+          # `heph`'s two release flavours, from the ONE compile below: `$OUT/heph`
+          # keeps the profile's DWARF line tables (published as-is as the "debug"
+          # flavour, $DEBUG_BIN_NAME), and $BIN_NAME (the default "std" flavour,
+          # what `version_flavour: debug` in `.hephconfig` opts out of) is a
+          # `strip`-ped copy of it. No second compile — see the comment on
+          # `[profile.release]` in the root Cargo.toml for why.
           DEBUG_BIN_NAME="heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
@@ -324,23 +322,17 @@ jobs:
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
           fi
-          cp "$OUT/heph" $BIN_NAME
+          cp "$OUT/heph" $DEBUG_BIN_NAME
           cp "$OUT/heph-bench" $BENCH_BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
 
-          # Second flavour: only `heph` itself gets rebuilt under `release-debug`
-          # (bench and the plugin cdylibs have no flavour, one copy of each is
-          # enough) — a separate invocation because a cargo profile is fixed for
-          # the whole build, it cannot vary per binary within one `cargo build`.
-          DEBUG_OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release-debug"
-          if [ "${{ matrix.os }}" = "darwin" ]; then
-            cargo build --profile release-debug --locked --target ${{ matrix.target }} --bin heph -p heph
-            bash scripts/macos-portable.sh "$DEBUG_OUT/heph"
-          else
-            cargo zigbuild --profile release-debug --locked --target ${{ matrix.target }} --bin heph -p heph
-          fi
-          cp "$DEBUG_OUT/heph" $DEBUG_BIN_NAME
+          # "std" flavour: strip a copy of the same compiled `heph` — no second
+          # compile. `zig objcopy` (not host `strip`/binutils) because it's
+          # LLVM-based and target-agnostic: the Linux arm64 leg cross-compiles
+          # on an amd64 runner (see the zigbuild comment above), and a native
+          # `strip` built for one arch typically can't touch a foreign-arch ELF.
+          zig objcopy --strip-all "$OUT/heph" $BIN_NAME
 
       - name: sccache stats
         if: always()
