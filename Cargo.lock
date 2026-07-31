@@ -1447,6 +1447,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "heph",
+ "plugin-oci",
  "tar",
  "tempfile",
  "testkit",
@@ -2183,7 +2184,6 @@ dependencies = [
  "plugin-exec",
  "plugin-http",
  "plugin-nix",
- "plugin-oci",
  "plugin-query",
  "posthog-rs",
  "pprof",
@@ -4028,6 +4028,18 @@ dependencies = [
  "tokio",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "plugin-oci-cdylib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "driver-support",
+ "plugin-oci",
+ "plugin-sdk",
+ "stabby",
+ "tracing",
 ]
 
 [[package]]

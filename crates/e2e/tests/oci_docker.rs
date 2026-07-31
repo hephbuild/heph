@@ -23,7 +23,7 @@
 
 mod common;
 
-use heph::pluginoci;
+use hplugin_oci::pluginoci;
 use htestkit::WorkspaceBuilder;
 use std::process::Command;
 use std::sync::OnceLock;
