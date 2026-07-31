@@ -1161,16 +1161,84 @@ async fn run_bidi(
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), async move {
         let guard = cancels.enter(&start.request_id);
-        let out = run_once(driver, start, guard.token()).await;
+        // `tx` carries both the live output frames and the terminal one, in that
+        // order, so the host sees the log before the result that ends the stream.
+        let out = run_once(driver, start, &tx, guard.token()).await;
         // Host gone => receiver dropped; ignore send failure.
         drop(tx.send(out.encode_to_vec()).await);
     });
     make_channel_item_stream(rx)
 }
 
+/// An `AsyncWrite` that turns everything written to it into `RunOutFrame`s on the
+/// run's response channel — one frame per write, tagged stdout or stderr.
+///
+/// This is what makes a driver's subprocess output visible when the driver is a
+/// cdylib. In-process, a driver writes straight to the sinks the engine handed
+/// it; across the ABI seam there is nothing to hand it, so the bytes have to
+/// travel as stream frames and be re-attached to the target's stdio on the host
+/// side. Without it a `docker buildx build` prints its whole progress log into a
+/// channel nobody reads, and the user watches an idle spinner for minutes.
+struct FrameSink {
+    tx: tokio_util::sync::PollSender<Vec<u8>>,
+    stderr: bool,
+}
+
+impl FrameSink {
+    fn new(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, stderr: bool) -> Self {
+        FrameSink {
+            tx: tokio_util::sync::PollSender::new(tx.clone()),
+            stderr,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for FrameSink {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        // Reserving (rather than `try_send`) applies the channel's backpressure
+        // to the child: a host that stops reading slows the writer instead of
+        // dropping its output on the floor.
+        match self.tx.poll_reserve(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            // Host gone. Report the write as done rather than erroring: losing
+            // the log tail must not fail a build that otherwise succeeded.
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Ok(buf.len())),
+            std::task::Poll::Ready(Ok(())) => {
+                let msg = if self.stderr {
+                    pb::run_out_frame::Msg::StderrChunk(buf.to_vec().into())
+                } else {
+                    pb::run_out_frame::Msg::StdoutChunk(buf.to_vec().into())
+                };
+                let frame = pb::RunOutFrame { msg: Some(msg) }.encode_to_vec();
+                drop(self.tx.send_item(frame));
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 async fn run_once(
     driver: Arc<dyn ManagedDriver>,
     req: pb::ManagedRunRequest,
+    out: &tokio::sync::mpsc::Sender<Vec<u8>>,
     ct: &StdCancellationToken,
 ) -> pb::RunOutFrame {
     // `shell` selects run_shell over run; it rides the request.
@@ -1185,6 +1253,11 @@ async fn run_once(
     let run_inputs: Vec<RunInput> = req.inputs.iter().map(run_input_from_pb).collect();
     let managed_inputs: Vec<ManagedRunInput> =
         req.inputs.into_iter().map(managed_input_from_pb).collect();
+    // The driver's subprocess output rides the response stream back to the host,
+    // which re-attaches it to the target's stdio. Handing it `None` here is what
+    // made a cdylib driver's build log disappear.
+    let mut stdout_sink = FrameSink::new(out, false);
+    let mut stderr_sink = FrameSink::new(out, true);
     let rr = RunRequest {
         request_id: &request_id,
         target: &target,
@@ -1192,8 +1265,8 @@ async fn run_once(
         inputs: run_inputs,
         hashin: hashin.as_str(),
         stdin: None,
-        stdout: None,
-        stderr: None,
+        stdout: Some(&mut stdout_sink),
+        stderr: Some(&mut stderr_sink),
         sandbox_dir: sandbox_dir.clone(),
     };
     let mrr = ManagedRunRequest {
@@ -1876,6 +1949,9 @@ mod tests {
             }),
             ..Default::default()
         };
+        // The output channel goes nowhere here: this test is about the terminal
+        // error frame, not about live output.
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let frame = futures::executor::block_on(run_once(
             Arc::new(FailDriver) as Arc<dyn ManagedDriver>,
             pb::ManagedRunRequest {
@@ -1883,6 +1959,7 @@ mod tests {
                 target: Some(target),
                 ..Default::default()
             },
+            &out_tx,
             &StdCancellationToken::new(),
         ));
         match frame.msg {

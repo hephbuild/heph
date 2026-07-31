@@ -425,7 +425,6 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("out {:?} has no file name", def.out))?;
         let out_path = req.sandbox_pkg_dir.join(out_name);
         let cwd = req.sandbox_ws_dir.clone();
-        let addr = req.request.target.addr.format();
         let mut io = ToolIo::from_request(&mut req.request);
 
         match def.tool {
@@ -471,12 +470,6 @@ impl ManagedDriver for Driver {
                 .with_context(|| format!("pull image {}", def.src))?;
             }
         }
-        tracing::info!(
-            addr,
-            image = def.src,
-            platform = def.platform.label(),
-            "oci_pull: pulled"
-        );
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }

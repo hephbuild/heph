@@ -298,7 +298,6 @@ impl ManagedDriver for Driver {
         let def = req.request.target.def_de::<OciPushDef>().clone();
         let tar = dep_single_file(&req, IMAGE_ORIGIN)?;
         let cwd = req.sandbox_ws_dir.clone();
-        let addr = req.request.target.addr.format();
         let mut io = ToolIo::from_request(&mut req.request);
         match def.tool {
             Tool::Skopeo => {
@@ -318,7 +317,6 @@ impl ManagedDriver for Driver {
         // A push is the one place the build graph meets the outside world, so
         // say what left the machine: without this line neither a human nor an
         // agent can learn what `heph run //app:push` actually shipped.
-        tracing::info!(addr, r#ref = def.dest, "oci_push: pushed");
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }

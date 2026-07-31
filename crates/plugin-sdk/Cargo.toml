@@ -34,7 +34,10 @@ serde_json = { version = "1", optional = true }
 # A loaded cdylib owns its own tokio runtime — its statically-linked tokio is
 # distinct from the host's, so async work that touches the reactor (e.g. plugin-go
 # shelling out to `go list` in a driver `run`) must execute on the cdylib's runtime.
-tokio = { version = "1.52", features = ["rt-multi-thread", "sync"], optional = true }
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "io-util"], optional = true }
+# `PollSender`: the run stream's stdout/stderr sinks are `AsyncWrite`s over the
+# response channel, so they need a poll-based send that carries backpressure.
+tokio-util = { version = "0.7", optional = true }
 # A loaded cdylib statically links its own `tracing` whose global subscriber is
 # unset, so plugin logs would vanish. The SDK installs a subscriber that forwards
 # every event to the host sink over the ABI.
@@ -55,6 +58,7 @@ stabby = [
     "dep:prost",
     "dep:serde_json",
     "dep:tokio",
+    "dep:tokio-util",
     "dep:tracing",
     "dep:tracing-subscriber",
 ]
