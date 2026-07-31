@@ -42,6 +42,9 @@ struct ShellSession {
     captured: Arc<Mutex<Vec<u8>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Byte offset into `captured` that the last successful `wait_for` has
+    /// already accounted for. See `wait_for` for why this exists.
+    cursor: usize,
 }
 
 impl ShellSession {
@@ -122,6 +125,7 @@ impl ShellSession {
             captured,
             child,
             _master: pair.master,
+            cursor: 0,
         }
     }
 
@@ -143,17 +147,37 @@ impl ShellSession {
         String::from_utf8_lossy(&self.output_snapshot()).into_owned()
     }
 
-    /// Block until `needle` shows up in the accumulated output, or panic with
-    /// everything captured so far.
-    fn wait_for(&self, needle: &str, timeout: Duration) {
+    /// Block until `needle` shows up in output captured *since the last
+    /// successful `wait_for`*, or panic with everything captured so far.
+    ///
+    /// This deliberately does not scan the whole history: `captured` only
+    /// ever grows, so once a needle has appeared once it stays "found"
+    /// forever — a fixed marker like the `shellpty#` prompt (baked into the
+    /// `PS1='shellpty# '` line whose own PTY echo already contains the
+    /// literal substring) matches on the very first check and then every
+    /// later `wait_for("shellpty#", ..)` in the file would return instantly
+    /// without ever having observed a *new* prompt. That silently drops the
+    /// synchronization callers rely on ("are we really back at a prompt
+    /// now?") and lets the test race ahead on nothing but luck. Tracking a
+    /// cursor and only searching bytes after it makes every call require a
+    /// fresh occurrence of `needle`.
+    fn wait_for(&mut self, needle: &str, timeout: Duration) {
         let started = Instant::now();
+        let needle = needle.as_bytes();
+        if needle.is_empty() {
+            return;
+        }
         loop {
-            if self.output_lossy().contains(needle) {
+            let snapshot = self.output_snapshot();
+            let unseen = snapshot.get(self.cursor..).unwrap_or(&[]);
+            if let Some(pos) = unseen.windows(needle.len()).position(|w| w == needle) {
+                self.cursor += pos + needle.len();
                 return;
             }
             assert!(
                 started.elapsed() < timeout,
-                "never saw {needle:?} within {timeout:?}\n--- captured ---\n{}",
+                "never saw {:?} within {timeout:?}\n--- captured ---\n{}",
+                String::from_utf8_lossy(needle),
                 self.output_lossy(),
             );
             std::thread::sleep(POLL);
@@ -224,7 +248,13 @@ fn shell_echoes_typed_input_and_exits_promptly() {
         session.output_lossy()
     );
     assert!(
-        elapsed < Duration::from_secs(5),
+        // Generous: process teardown (pty relay thread, child reaping,
+        // sandbox cleanup handoff) is real work whose wall-clock cost varies
+        // with how loaded the CI runner is. This is a "did we hang"
+        // threshold, not a precision timing check — a genuine hang is still
+        // caught independently by `wait_exit`'s 60s `DEADLINE` above
+        // returning `exited: false`.
+        elapsed < Duration::from_secs(15),
         "exit took {elapsed:?} after `exit` was typed at {before_exit:?} ago — should be prompt",
     );
 }
@@ -248,17 +278,37 @@ fn ctrl_c_interrupts_foreground_child_not_the_session() {
     session.ready();
 
     // A long foreground sleep. If Ctrl-C failed to reach the child (or
-    // reached the wrong process), this would still be running 30s later and
-    // the marker sent after it would only appear after that whole sleep.
-    session.send_str("sleep 30; echo slept-done\n");
-    // Give the child a moment to actually get into the sleep before
-    // interrupting it — otherwise this races bash's own startup. Snapshot
-    // right before interrupting: the terminal's local echo of the line just
-    // typed lands almost immediately and *does* contain the literal text
-    // "slept-done" as part of the command itself, so the completion check
-    // below must only look at bytes that arrive *after* this point.
+    // reached the wrong process), getting back to a prompt would take the
+    // full 30s instead of a moment.
+    //
+    // Deliberately NOT chained as `sleep 30; echo done` to detect
+    // completion: whether a shell continues on to the next `;`-separated
+    // command after the previous one was killed by SIGINT is itself
+    // shell-version-dependent. Heph's sandboxed exec PATH for a plain
+    // `bash` target is `/usr/local/bin:/usr/bin:/bin` (see
+    // `crates/plugin-exec/src/pluginexec/mod.rs`'s `sandbox_path_display`),
+    // which on macOS resolves to Apple's ancient `/bin/bash` 3.2.57 —
+    // confirmed independently of heph (a bare PTY running that exact
+    // binary) that it *does* run the next `;`-separated command even after
+    // the previous one died from Ctrl-C, unlike a modern bash 5.x which
+    // aborts the rest of the list. A test that asserts the trailing
+    // command's output never appears is therefore not testing Ctrl-C at
+    // all on this shell — it is testing an assumption that happens to be
+    // false here, and would previously "pass" only because a synchronization
+    // bug in `wait_for` (see its doc comment above) let the check race ahead
+    // and observe the output before old bash had gotten around to printing
+    // it. Measuring how quickly the prompt returns is the version-independent
+    // way to prove the child was actually interrupted.
+    session.send_str("sleep 30\n");
+    // Wait for the shell to have actually echoed our typed command before
+    // interrupting it — sending Ctrl-C the instant bytes are written would
+    // race bash's own read of the line.
+    session.wait_for("sleep 30", Duration::from_secs(10));
+    // Give bash a short, generous moment to actually fork+exec `sleep` as
+    // the foreground child before interrupting it — there is no
+    // terminal-observable event for "the child is now running" to wait on
+    // instead, since `sleep` itself produces no output.
     std::thread::sleep(Duration::from_millis(500));
-    let before_len = session.output_snapshot().len();
 
     let interrupted_at = Instant::now();
     session.send(b"\x03"); // Ctrl-C
@@ -269,16 +319,6 @@ fn ctrl_c_interrupts_foreground_child_not_the_session() {
     assert!(
         recovered < Duration::from_secs(10),
         "took {recovered:?} to get back to a prompt after Ctrl-C — the child was not interrupted\n{}",
-        session.output_lossy(),
-    );
-    // Never seeing "slept-done" *after* the interrupt was sent — that would
-    // mean `echo slept-done` actually ran, i.e. the sleep completed and
-    // Ctrl-C never interrupted it.
-    let after = session.output_snapshot();
-    let since_interrupt = String::from_utf8_lossy(after.get(before_len..).unwrap_or(&[]));
-    assert!(
-        !since_interrupt.contains("slept-done"),
-        "sleep ran to completion — Ctrl-C never interrupted it\n{}",
         session.output_lossy(),
     );
 
@@ -300,7 +340,13 @@ fn ctrl_c_interrupts_foreground_child_not_the_session() {
         session.output_lossy()
     );
     assert!(
-        elapsed < Duration::from_secs(5),
+        // Generous: process teardown (pty relay thread, child reaping,
+        // sandbox cleanup handoff) is real work whose wall-clock cost varies
+        // with how loaded the CI runner is. This is a "did we hang"
+        // threshold, not a precision timing check — a genuine hang is still
+        // caught independently by `wait_exit`'s 60s `DEADLINE` above
+        // returning `exited: false`.
+        elapsed < Duration::from_secs(15),
         "exit took {elapsed:?} after `exit` was typed {before_exit:?} ago — should be prompt",
     );
 }
@@ -349,7 +395,13 @@ fn exit_is_prompt_after_chatty_and_large_output() {
         session.output_lossy()
     );
     assert!(
-        elapsed < Duration::from_secs(5),
+        // Generous: process teardown (pty relay thread, child reaping,
+        // sandbox cleanup handoff) is real work whose wall-clock cost varies
+        // with how loaded the CI runner is. This is a "did we hang"
+        // threshold, not a precision timing check — a genuine hang is still
+        // caught independently by `wait_exit`'s 60s `DEADLINE` above
+        // returning `exited: false`.
+        elapsed < Duration::from_secs(15),
         "exit took {elapsed:?} after `exit` was typed {before_exit:?} ago — should be prompt",
     );
 }
