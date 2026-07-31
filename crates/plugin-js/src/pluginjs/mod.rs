@@ -3,6 +3,7 @@ mod conformance;
 mod deps;
 mod driver_install;
 mod driver_package_info;
+mod driver_test;
 mod driver_typecheck;
 mod importgraph;
 mod importparse;
@@ -17,6 +18,7 @@ mod workspace;
 
 pub use driver_install::JsInstallDriver;
 pub use driver_package_info::JsPackageInfoDriver;
+pub use driver_test::JsTestDriver;
 pub use driver_typecheck::JsTypecheckDriver;
 pub use provider::{Config, Provider};
 pub use workspace::{PkgManager, WorkspaceMember};
@@ -39,6 +41,12 @@ pub const PACKAGE_INFO_TARGET: &str = "package_info";
 /// nearest ancestor tsconfig's equivalent) over one package at a time. See
 /// `driver_typecheck.rs` module docs.
 pub const TYPECHECK_TARGET: &str = "js_typecheck";
+
+/// Target name of the M4 `js_test` target: runs the configured test runner
+/// (`vitest` default, `jest` alt) against one test file at a time — one
+/// target address per matched test file (distinguished by a `file` addr
+/// arg), never one per package. See `driver_test.rs` module docs.
+pub const TEST_TARGET: &str = "js_test";
 
 /// Directory names that are never a package boundary or workspace member,
 /// however deep they appear: `node_modules` is third-party/manager-owned

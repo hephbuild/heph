@@ -139,7 +139,12 @@ use crate::pluginjs::resolvers::{ResolveOutcome, Resolvers};
 use crate::pluginjs::{PACKAGE_JSON, is_skipped_dir_name};
 use anyhow::Context;
 use hwalk::{CachedWalker, EntryKind};
-use std::collections::{HashMap, HashSet};
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{ArrayExpressionElement, Expression, PropertyKey};
+use oxc_ast_visit::{Visit, walk};
+use oxc_parser::Parser;
+use oxc_span::SourceType;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use wax::{Glob, Program as _};
@@ -390,15 +395,83 @@ fn bare_specifier_guard(tsconfig: Option<&Path>) -> BareSpecifierGuard {
     BareSpecifierGuard::ExceptPatterns(paths.keys().cloned().collect())
 }
 
+/// Walk up from `pkg_dir` (inclusive) to `workspace_root`, returning the
+/// first directory's `candidates` entry (checked in order at each level)
+/// that exists as a file. Shared walk-up logic behind [`find_nearest_tsconfig`]
+/// and [`find_nearest_test_runner_config`] — `js_test`'s runner config
+/// (`vitest.config.ts` / `jest.config.js`) is walked up the same way a
+/// package's tsconfig is, per `ai-docs/js-plugin-plan.md`'s `js_test` milestone
+/// note.
+fn find_nearest_file(
+    workspace_root: &Path,
+    pkg_dir: &Path,
+    candidates: &[&str],
+) -> Option<PathBuf> {
+    let mut dir = pkg_dir;
+    loop {
+        for name in candidates {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if dir == workspace_root {
+            return None;
+        }
+        match dir.parent() {
+            Some(parent) if parent.starts_with(workspace_root) || parent == workspace_root => {
+                dir = parent;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Walk up from `pkg_dir` (inclusive) to `workspace_root` looking for the
 /// nearest `tsconfig.json` — used to configure `Resolvers`' `paths`/
 /// `baseUrl`/`extends` support. `None` if no workspace directory on that
 /// ancestor chain has one.
 pub fn find_nearest_tsconfig(workspace_root: &Path, pkg_dir: &Path) -> Option<PathBuf> {
+    find_nearest_file(workspace_root, pkg_dir, &["tsconfig.json"])
+}
+
+/// Walk up from `pkg_dir` (inclusive) to `workspace_root` looking for the
+/// nearest test-runner config file among `candidates` (e.g.
+/// `["vitest.config.ts", "vitest.config.js", ...]`) — the same ancestor walk
+/// [`find_nearest_tsconfig`] performs, generalized to whatever filenames the
+/// configured `testrunner` uses. `None` if no workspace directory on that
+/// ancestor chain has any of them.
+pub fn find_nearest_test_runner_config(
+    workspace_root: &Path,
+    pkg_dir: &Path,
+    candidates: &[&str],
+) -> Option<PathBuf> {
+    find_nearest_file(workspace_root, pkg_dir, candidates)
+}
+
+/// Walk up from `pkg_dir` (inclusive) to `workspace_root` looking for the
+/// nearest `package.json` whose own `"jest"` field is present — jest's other
+/// documented config location, alongside the dedicated `jest.config.*`
+/// filenames [`find_nearest_test_runner_config`] already checks. Called by
+/// `test_deps_config` only once none of those dedicated filenames are found
+/// on the same ancestor chain, matching jest's own precedence (a dedicated
+/// config file wins over the shared `package.json`). `None` if no ancestor's
+/// `package.json` carries a `"jest"` field (or fails to parse as JSON, or
+/// doesn't exist) — a hermeticity M4 review finding: this fallback was
+/// previously entirely absent, so a project configured this way had its real
+/// config invisible to the declared Input set and the cache key.
+pub fn find_nearest_jest_package_json_config(
+    workspace_root: &Path,
+    pkg_dir: &Path,
+) -> Option<PathBuf> {
     let mut dir = pkg_dir;
     loop {
-        let candidate = dir.join("tsconfig.json");
-        if candidate.is_file() {
+        let candidate = dir.join(PACKAGE_JSON);
+        if candidate.is_file()
+            && let Ok(text) = std::fs::read_to_string(&candidate)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+            && value.get("jest").is_some()
+        {
             return Some(candidate);
         }
         if dir == workspace_root {
@@ -409,6 +482,236 @@ pub fn find_nearest_tsconfig(workspace_root: &Path, pkg_dir: &Path) -> Option<Pa
                 dir = parent;
             }
             _ => return None,
+        }
+    }
+}
+
+/// Test-runner config keys whose value names one or more first-party files
+/// the real runner reads at test time, beyond the config file's own leaf
+/// bytes — `setupFiles`/`globalSetup`/`globalTeardown` (jest and vitest both
+/// support these); `setupFilesAfterEnv` is jest-only, harmless to also look
+/// for under vitest. See [`extract_runner_config_referenced_paths`] for the
+/// extraction itself, and this crate's M4 hermeticity-review note for why
+/// this exists: a `setupFiles` entry mutates real test behavior (mocks,
+/// globals) without touching the test file, its import closure, or the
+/// config's own leaf bytes' *meaning* to a casual diff reader — it must
+/// still bust the cache.
+///
+/// **Known scope trim, disclosed rather than silent**: `moduleNameMapper`
+/// (jest) / `resolve.alias` (vitest) mock-path values and a custom
+/// `testEnvironment` module are not extracted — the former's values commonly
+/// carry regex backreferences (`$1`) this static scan can't resolve without
+/// evaluating the mapping, and the latter is usually a package name, not a
+/// path. TODO M4+.
+const RUNNER_CONFIG_FILE_KEYS: &[&str] = &[
+    "setupFiles",
+    "setupFilesAfterEnv",
+    "globalSetup",
+    "globalTeardown",
+];
+
+/// Statically extract every string-literal value named by
+/// [`RUNNER_CONFIG_FILE_KEYS`] anywhere in `content` — a single string
+/// (`setupFiles: './setup.ts'`) or an array of strings (`setupFiles:
+/// ['./setup.ts']`). Deliberately not scoped to "the exported config
+/// object" specifically: this crate doesn't evaluate JS, so rather than
+/// trying to precisely locate the one object a `defineConfig(...)`/
+/// `module.exports = ...` call wraps (which can nest arbitrarily), it scans
+/// every object literal in the file. Over-inclusion (a same-named key that
+/// happens to appear elsewhere) costs one extra declared Input;
+/// under-inclusion is the actual hermeticity bug this exists to close, so
+/// the asymmetry is deliberate.
+///
+/// A config file that fails to parse (invalid syntax, or an extension this
+/// parser doesn't recognize) yields an empty list rather than an error — the
+/// leaf config's own raw bytes are already declared/hashed regardless of
+/// this scan's success (`test_deps_config`), so a parse failure here only
+/// means the extra references go undetected, not that the whole `js_test`
+/// target becomes unbuildable.
+fn extract_runner_config_referenced_paths(path: &Path, content: &str) -> Vec<String> {
+    let Ok(source_type) = SourceType::from_path(path) else {
+        return Vec::new();
+    };
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, content, source_type).parse();
+    if ret.panicked {
+        return Vec::new();
+    }
+    let mut visitor = RunnerConfigRefVisitor::default();
+    visitor.visit_program(&ret.program);
+    visitor.paths
+}
+
+#[derive(Default)]
+struct RunnerConfigRefVisitor {
+    paths: Vec<String>,
+}
+
+impl RunnerConfigRefVisitor {
+    fn push_value(&mut self, value: &Expression<'_>) {
+        match value {
+            Expression::StringLiteral(s) => self.paths.push(s.value.as_str().to_string()),
+            Expression::ArrayExpression(arr) => {
+                for el in &arr.elements {
+                    if let ArrayExpressionElement::StringLiteral(s) = el {
+                        self.paths.push(s.value.as_str().to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visit<'a> for RunnerConfigRefVisitor {
+    fn visit_object_property(&mut self, it: &oxc_ast::ast::ObjectProperty<'a>) {
+        let key_name = match &it.key {
+            PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+            PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
+            _ => None,
+        };
+        if key_name.is_some_and(|name| RUNNER_CONFIG_FILE_KEYS.contains(&name)) {
+            self.push_value(&it.value);
+        }
+        walk::walk_object_property(self, it);
+    }
+}
+
+/// Probe `candidate_no_ext` against Node/esbuild's common extension set for
+/// an extensionless specifier, then its own `index.*` if it names a
+/// directory — the same shape [`resolvers::Resolvers`] handles for real
+/// import resolution, kept separate and deliberately simpler here (no
+/// `package.json` `exports` map, no `tsconfig` `paths`) since a runner
+/// config's own referenced files are always plain relative paths in
+/// practice, never package-style specifiers.
+fn probe_first_party_path(candidate_no_ext: &Path) -> Option<PathBuf> {
+    const EXTS: &[&str] = &["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"];
+    for ext in EXTS {
+        let candidate = if ext.is_empty() {
+            candidate_no_ext.to_path_buf()
+        } else {
+            let mut s = candidate_no_ext.as_os_str().to_os_string();
+            s.push(ext);
+            PathBuf::from(s)
+        };
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for index in &[
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.jsx",
+        "index.mjs",
+        "index.cjs",
+    ] {
+        let candidate = candidate_no_ext.join(index);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Resolve one `RUNNER_CONFIG_FILE_KEYS` value (`raw`) against `config_dir` —
+/// handling jest's `<rootDir>/...` token (approximated as `config_dir`,
+/// jest's own default when no explicit `rootDir` override exists) as well as
+/// a plain relative path. `None` for anything else (a bare module specifier
+/// naming a third-party setup package — not this scan's job; see
+/// [`RUNNER_CONFIG_FILE_KEYS`]'s doc).
+fn resolve_config_value_path(config_dir: &Path, raw: &str) -> Option<PathBuf> {
+    if let Some(rest) = raw.strip_prefix("<rootDir>") {
+        return probe_first_party_path(&config_dir.join(rest.trim_start_matches('/')));
+    }
+    if raw.starts_with("./") || raw.starts_with("../") {
+        return probe_first_party_path(&config_dir.join(raw));
+    }
+    None
+}
+
+/// Resolve one relative `import`/`require` specifier found *inside* a config
+/// file against that file's own directory. Deliberately only ever a relative
+/// specifier (`./...`/`../...`) — a bare specifier (`import { defineConfig }
+/// from 'vitest/config'`) names the config's own npm dependency, which is
+/// `js_install`'s concern, not this one-hop config-file scan's.
+fn resolve_config_import_specifier(config_dir: &Path, specifier: &str) -> Option<PathBuf> {
+    if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+        return None;
+    }
+    probe_first_party_path(&config_dir.join(specifier))
+}
+
+/// Recursively resolve every additional first-party file a test-runner
+/// config's own content names or imports: [`RUNNER_CONFIG_FILE_KEYS`]
+/// entries, plus a relative `import`/`require` of a shared base config
+/// (`import base from '../../vitest.config.base'`) — which may itself name
+/// or import more, so each newly-resolved file is scanned the same way in
+/// turn. Bounded depth + a visited set guard against a cyclic/self-importing
+/// config; in practice a real config chain is one or two files deep.
+///
+/// **Known scope trim, disclosed rather than silent**: only a *relative*
+/// import/require inside the config file is followed — a shared base config
+/// pulled in via a bare package specifier (e.g. an internal
+/// `@myorg/test-config` package) is not, the same "third-party is
+/// `js_install`'s job" boundary `test_deps_config` draws elsewhere for the
+/// test file's own closure.
+pub fn resolve_runner_config_referenced_files(
+    config_path: &Path,
+    config_content: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    const MAX_DEPTH: usize = 4;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue: VecDeque<(PathBuf, String, usize)> = VecDeque::new();
+    seen.insert(config_path.to_path_buf());
+    queue.push_back((config_path.to_path_buf(), config_content.to_string(), 0));
+
+    while let Some((path, content, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let dir = path.parent().unwrap_or(Path::new(""));
+
+        for raw in extract_runner_config_referenced_paths(&path, &content) {
+            if let Some(resolved) = resolve_config_value_path(dir, &raw) {
+                enqueue_referenced_config_file(resolved, depth, &mut seen, &mut found, &mut queue);
+            }
+        }
+
+        // A config file with an unrecognized extension (e.g. `.json`, which
+        // `importparse::parse_file_imports` can't parse as a module) simply
+        // yields no import sites here — not an error, since `.json` config
+        // files (jest's `jest.config.json`) never `import` anything anyway.
+        if let Ok(imports) = importparse::parse_file_imports(&path, &content) {
+            for site in imports.sites {
+                if let Some(resolved) = resolve_config_import_specifier(dir, &site.specifier) {
+                    enqueue_referenced_config_file(
+                        resolved, depth, &mut seen, &mut found, &mut queue,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(found.into_iter().collect())
+}
+
+/// Record a newly-resolved referenced-config file (if not already seen) and
+/// queue it for its own scan one depth deeper — the shared "insert once,
+/// re-read, re-enqueue" step [`resolve_runner_config_referenced_files`]'s two
+/// call sites (config-value paths, config-file imports) both need.
+fn enqueue_referenced_config_file(
+    resolved: PathBuf,
+    depth: usize,
+    seen: &mut HashSet<PathBuf>,
+    found: &mut BTreeSet<PathBuf>,
+    queue: &mut VecDeque<(PathBuf, String, usize)>,
+) {
+    if seen.insert(resolved.clone()) {
+        found.insert(resolved.clone());
+        if let Ok(next_content) = std::fs::read_to_string(&resolved) {
+            queue.push_back((resolved, next_content, depth + 1));
         }
     }
 }
@@ -747,6 +1050,178 @@ pub fn package_source_files(
     let mut files = Vec::new();
     collect_source_files(walker, &pkg_dir, true, &mut files)?;
     Ok(files)
+}
+
+/// Every first-party source file directly owned by `pkg` (see
+/// [`package_source_files`]) whose path, relative to the package directory,
+/// matches at least one of `patterns` (wax glob syntax) — `js_test`'s
+/// per-test-file target discovery
+/// (`ai-docs/js-plugin-plan.md`'s `js_test` milestone: "one `js_test` target
+/// per test file", matched by a configurable glob).
+///
+/// Returned paths are workspace-root-relative strings, sorted, so target
+/// discovery is deterministic across filesystem-walk order/platform — same
+/// discipline as `resolve_members`/`typecheck_deps_config`'s own sorted
+/// output.
+pub fn discover_test_files(
+    walker: &CachedWalker,
+    workspace_root: &Path,
+    pkg: &str,
+    patterns: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let pkg_dir = if pkg.is_empty() {
+        workspace_root.to_path_buf()
+    } else {
+        workspace_root.join(pkg)
+    };
+    let globs: Vec<Glob<'_>> = patterns
+        .iter()
+        .map(|p| Glob::new(p).with_context(|| format!("invalid js_test test_glob {p:?}")))
+        .collect::<anyhow::Result<_>>()?;
+
+    let files = package_source_files(walker, workspace_root, pkg)?;
+    let mut matched: Vec<String> = files
+        .into_iter()
+        .filter_map(|f| {
+            let rel = f.strip_prefix(&pkg_dir).unwrap_or(&f);
+            if globs.iter().any(|g| g.is_match(rel)) {
+                Some(
+                    f.strip_prefix(workspace_root)
+                        .unwrap_or(&f)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                )
+            } else {
+                None
+            }
+        })
+        .collect();
+    matched.sort();
+    Ok(matched)
+}
+
+/// One test file's own runtime-transitive first-party closure within its
+/// owning package, plus everything it reaches just outside that boundary —
+/// see [`build_test_closure`].
+#[derive(Debug, Clone, Default)]
+pub struct TestClosure {
+    /// Workspace-relative paths of every first-party file, *within the same
+    /// package*, transitively reachable from the test file via
+    /// `ImportGraph::runtime_edges` — always includes the test file itself.
+    /// This is the per-test-file (not per-package) declared `Input` set that
+    /// is this milestone's stated differentiator over Turborepo/Nx (see
+    /// `ai-docs/js-plugin-plan.md`'s "Caching / incrementality" section).
+    pub files: BTreeSet<String>,
+    /// Workspace-relative paths of every file a closure member's own edge
+    /// resolved *outside* the owning package (a workspace sibling, or a
+    /// third-party package reached while `node_modules` happens to be
+    /// installed) — recorded but **not** recursed into further, the same
+    /// "one-hop" trim `js_typecheck`'s type-edge handling already accepts
+    /// (see `driver_typecheck.rs` module docs' "Known scope trims"). TODO
+    /// M4+: recurse into a workspace sibling's own import graph once
+    /// cross-package graph construction exists.
+    pub external_files: BTreeSet<String>,
+    /// Bare specifiers that never resolved on disk, restricted to sites
+    /// inside `files` — the ambient-`node_modules`-absent counterpart to
+    /// `external_files`, resolved by package name via
+    /// `deps::resolve_one_dependency` at the call site (see `provider.rs`'s
+    /// `test_deps_config`), mirroring `typecheck_deps_config`'s identical
+    /// on-demand third-party handling.
+    pub bare_specifiers: Vec<BareSpecifierSite>,
+}
+
+/// BFS `test_file_rel`'s own `ImportGraph::runtime_edges` closure, bounded to
+/// files first-party-owned by `pkg` (`canonical_workspace_root.join(pkg)`) —
+/// see [`TestClosure`]'s doc for exactly what counts as "in" vs. "one-hop
+/// external". `graph` must be `pkg`'s own whole-package import graph (as
+/// built by [`build_package_import_graph`]) — this never re-parses source
+/// itself, only walks the edges already resolved for `pkg`.
+///
+/// `canonical_workspace_root` must already be canonicalized (`edge.resolved`
+/// is realpath'd by `oxc_resolver` — see `check_phantom_dependencies`'s
+/// identical canonicalization requirement and its doc for why comparing
+/// against a non-canonical root silently breaks containment on a host where
+/// an ancestor of the workspace is itself a symlink).
+pub fn build_test_closure(
+    graph: &ImportGraph,
+    canonical_workspace_root: &Path,
+    pkg: &str,
+    test_file_rel: &str,
+) -> anyhow::Result<TestClosure> {
+    let pkg_dir = if pkg.is_empty() {
+        canonical_workspace_root.to_path_buf()
+    } else {
+        canonical_workspace_root.join(pkg)
+    };
+
+    let mut edges_by_file: HashMap<&str, Vec<&ResolvedEdge>> = HashMap::new();
+    for edge in &graph.runtime_edges {
+        edges_by_file
+            .entry(edge.file.as_str())
+            .or_default()
+            .push(edge);
+    }
+    let mut bare_by_file: HashMap<&str, Vec<&BareSpecifierSite>> = HashMap::new();
+    for site in &graph.unresolved_bare_specifiers {
+        bare_by_file
+            .entry(site.file.as_str())
+            .or_default()
+            .push(site);
+    }
+
+    let mut closure = TestClosure::default();
+    closure.files.insert(test_file_rel.to_string());
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(test_file_rel.to_string());
+
+    while let Some(current) = queue.pop_front() {
+        if let Some(sites) = bare_by_file.get(current.as_str()) {
+            for site in sites {
+                closure.bare_specifiers.push((*site).clone());
+            }
+        }
+        let Some(edges) = edges_by_file.get(current.as_str()) else {
+            continue;
+        };
+        for edge in edges {
+            if edge.resolved.starts_with(&pkg_dir) {
+                let rel = edge
+                    .resolved
+                    .strip_prefix(canonical_workspace_root)
+                    .with_context(|| {
+                        format!(
+                            "js_test: {:?} resolved to {:?}, inside the package directory but \
+                             outside the canonicalized workspace root ({:?}) — cannot express it \
+                             as a declared js_test input",
+                            edge.file, edge.resolved, canonical_workspace_root
+                        )
+                    })?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if closure.files.insert(rel.clone()) {
+                    queue.push_back(rel);
+                }
+            } else {
+                let rel = edge
+                    .resolved
+                    .strip_prefix(canonical_workspace_root)
+                    .with_context(|| {
+                        format!(
+                            "js_test: {:?} imports from {:?}, which resolved outside the \
+                             workspace root ({:?}) — cannot express it as a declared js_test \
+                             input (this typically means node_modules is a symlink to a global \
+                             store outside the workspace)",
+                            edge.file, edge.resolved, canonical_workspace_root
+                        )
+                    })?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                closure.external_files.insert(rel);
+            }
+        }
+    }
+
+    Ok(closure)
 }
 
 /// Build the import graph for every first-party source file directly owned
@@ -1574,5 +2049,438 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("packages/a/src/index.ts"), "{msg}");
         assert!(msg.contains("escaped"), "{msg}");
+    }
+
+    // ---- js_test: discover_test_files / find_nearest_test_runner_config / build_test_closure ----
+
+    #[test]
+    fn discover_test_files_matches_configured_globs_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.test.ts",
+            "import { x } from './index'; test('x', () => x);\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/other.spec.tsx",
+            "test('y', () => 1);\n",
+        );
+
+        let patterns = vec![
+            "**/*.test.{ts,tsx,js,jsx}".to_string(),
+            "**/*.spec.{ts,tsx,js,jsx}".to_string(),
+        ];
+        let files =
+            discover_test_files(&walker(), dir.path(), "packages/a", &patterns).expect("discover");
+        assert_eq!(
+            files,
+            vec![
+                "packages/a/src/index.test.ts".to_string(),
+                "packages/a/src/other.spec.tsx".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn discover_test_files_empty_when_no_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        let patterns = vec!["**/*.test.{ts,tsx,js,jsx}".to_string()];
+        let files =
+            discover_test_files(&walker(), dir.path(), "packages/a", &patterns).expect("discover");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn find_nearest_test_runner_config_walks_up_like_tsconfig() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "vitest.config.ts", "export default {};\n");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        let found = find_nearest_test_runner_config(
+            dir.path(),
+            &dir.path().join("packages/a"),
+            &["vitest.config.ts", "vitest.config.js"],
+        )
+        .expect("found");
+        assert_eq!(found, dir.path().join("vitest.config.ts"));
+    }
+
+    #[test]
+    fn find_nearest_test_runner_config_none_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        assert!(
+            find_nearest_test_runner_config(
+                dir.path(),
+                &dir.path().join("packages/a"),
+                &["vitest.config.ts"],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn find_nearest_jest_package_json_config_walks_up_to_the_ancestor_that_has_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"root","jest":{"testEnvironment":"node"}}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        let found =
+            find_nearest_jest_package_json_config(dir.path(), &dir.path().join("packages/a"))
+                .expect("found");
+        assert_eq!(found, dir.path().join("package.json"));
+    }
+
+    #[test]
+    fn find_nearest_jest_package_json_config_prefers_closest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"root","jest":{"testEnvironment":"node"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","jest":{"testEnvironment":"jsdom"}}"#,
+        );
+        let found =
+            find_nearest_jest_package_json_config(dir.path(), &dir.path().join("packages/a"))
+                .expect("found");
+        assert_eq!(found, dir.path().join("packages/a/package.json"));
+    }
+
+    #[test]
+    fn find_nearest_jest_package_json_config_none_without_a_jest_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "package.json", r#"{"name":"root"}"#);
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        assert!(
+            find_nearest_jest_package_json_config(dir.path(), &dir.path().join("packages/a"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_runner_config_referenced_paths_finds_single_string_and_array_values() {
+        let path = Path::new("vitest.config.ts");
+        let content = "export default { test: { \
+                        setupFiles: './single-setup.ts', \
+                        setupFilesAfterEnv: ['./after-env-1.ts', './after-env-2.ts'], \
+                        globalSetup: './global-setup.ts', \
+                        unrelatedKey: './not-collected.ts' \
+                        } };\n";
+        let mut found = extract_runner_config_referenced_paths(path, content);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "./after-env-1.ts",
+                "./after-env-2.ts",
+                "./global-setup.ts",
+                "./single-setup.ts",
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_runner_config_referenced_paths_empty_on_unparseable_content() {
+        let path = Path::new("jest.config.js");
+        let found = extract_runner_config_referenced_paths(path, "not valid js {{{");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn resolve_runner_config_referenced_files_resolves_root_dir_token_and_recurses_into_base_config()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "vitest.config.base.ts",
+            "export default { test: { setupFiles: ['<rootDir>/base.setup.ts'] } };\n",
+        );
+        write(dir.path(), "base.setup.ts", "globalThis.__base = true;\n");
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "import base from './vitest.config.base';\n\
+             export default { ...base, test: { ...base.test, setupFiles: ['./leaf.setup.ts'] } };\n",
+        );
+        write(dir.path(), "leaf.setup.ts", "globalThis.__leaf = true;\n");
+
+        let config_path = dir.path().join("vitest.config.ts");
+        let content = std::fs::read_to_string(&config_path).expect("read fixture");
+        let mut refs = resolve_runner_config_referenced_files(&config_path, &content)
+            .expect("resolve referenced files");
+        refs.sort();
+
+        assert_eq!(
+            refs,
+            vec![
+                dir.path().join("base.setup.ts"),
+                dir.path().join("leaf.setup.ts"),
+                dir.path().join("vitest.config.base.ts"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_runner_config_referenced_files_empty_when_config_names_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("vitest.config.ts");
+        let content = "export default { test: {} };\n";
+        write(dir.path(), "vitest.config.ts", content);
+        let refs = resolve_runner_config_referenced_files(&config_path, content)
+            .expect("resolve referenced files");
+        assert!(refs.is_empty(), "{refs:?}");
+    }
+
+    /// The single most important test in this milestone (per the task): the
+    /// closure for one test file must include only files transitively
+    /// reachable *from that file*, not every file in the package — an
+    /// unrelated sibling test file (and the source it alone imports) must
+    /// stay out of the closure entirely.
+    #[test]
+    fn build_test_closure_is_scoped_to_the_one_test_files_own_imports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        write(dir.path(), "packages/a/src/a.ts", "export const a = 1;\n");
+        write(dir.path(), "packages/a/src/b.ts", "export const b = 2;\n");
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { a } from './a';\ntest('a', () => a);\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/b.test.ts",
+            "import { b } from './b';\ntest('b', () => b);\n",
+        );
+
+        let resolvers = Resolvers::new(None);
+        let cache = ResolveCache::new();
+        let graph = build_package_import_graph(
+            &walker(),
+            dir.path(),
+            "packages/a",
+            &resolvers,
+            &cache,
+            None,
+        )
+        .expect("build graph");
+
+        let canonical_root = dir.path().canonicalize().expect("canonicalize");
+        let closure = build_test_closure(
+            &graph,
+            &canonical_root,
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build closure");
+
+        assert!(closure.files.contains("packages/a/src/a.test.ts"));
+        assert!(closure.files.contains("packages/a/src/a.ts"));
+        assert!(
+            !closure.files.contains("packages/a/src/b.ts"),
+            "b.ts is only imported by b.test.ts, never by a.test.ts: {:?}",
+            closure.files
+        );
+        assert!(
+            !closure.files.contains("packages/a/src/b.test.ts"),
+            "an unrelated sibling test file must never appear in a.test.ts's own closure: {:?}",
+            closure.files
+        );
+    }
+
+    /// A file reached transitively (test -> helper -> deep) must also be in
+    /// the closure, not just the test file's own direct imports.
+    #[test]
+    fn build_test_closure_follows_transitive_first_party_imports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name":"a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/deep.ts",
+            "export const deep = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/helper.ts",
+            "export { deep } from './deep';\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { deep } from './helper';\ntest('a', () => deep);\n",
+        );
+
+        let resolvers = Resolvers::new(None);
+        let cache = ResolveCache::new();
+        let graph = build_package_import_graph(
+            &walker(),
+            dir.path(),
+            "packages/a",
+            &resolvers,
+            &cache,
+            None,
+        )
+        .expect("build graph");
+
+        let canonical_root = dir.path().canonicalize().expect("canonicalize");
+        let closure = build_test_closure(
+            &graph,
+            &canonical_root,
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build closure");
+
+        assert!(closure.files.contains("packages/a/src/helper.ts"));
+        assert!(
+            closure.files.contains("packages/a/src/deep.ts"),
+            "a transitively-reached file must be in the closure: {:?}",
+            closure.files
+        );
+    }
+
+    /// An import that resolves outside the owning package (a workspace
+    /// sibling) lands in `external_files`, one-hop only — it is not itself
+    /// recursed into.
+    #[test]
+    fn build_test_closure_records_cross_package_import_as_external_one_hop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"b":"workspace:*"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { x } from '../../b/src/index';\ntest('a', () => x);\n",
+        );
+        write(dir.path(), "packages/b/package.json", r#"{"name":"b"}"#);
+        write(
+            dir.path(),
+            "packages/b/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let resolvers = Resolvers::new(None);
+        let cache = ResolveCache::new();
+        let graph = build_package_import_graph(
+            &walker(),
+            dir.path(),
+            "packages/a",
+            &resolvers,
+            &cache,
+            None,
+        )
+        .expect("build graph");
+
+        let canonical_root = dir.path().canonicalize().expect("canonicalize");
+        let closure = build_test_closure(
+            &graph,
+            &canonical_root,
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build closure");
+
+        assert!(
+            closure.external_files.contains("packages/b/src/index.ts"),
+            "{:?}",
+            closure.external_files
+        );
+        assert!(!closure.files.contains("packages/b/src/index.ts"));
+    }
+
+    /// Pins the *boundary* of the accepted "one-hop external" trim (see this
+    /// module's `TestClosure` doc and `driver_test.rs`'s module docs): the
+    /// externally-reached file itself (`packages/b/src/index.ts`) is
+    /// declared, but its own further import (`packages/b/src/helper.ts`,
+    /// reached only because `index.ts` re-exports it — the common
+    /// barrel-file pattern) is not walked or declared anywhere, in either
+    /// `files` or `external_files`. A feature-quality M4 review flagged this
+    /// as untested: without this test, nothing pins *where* the accepted
+    /// trim stops, so a future change that accidentally started following
+    /// one more hop (or stopped following the first) would not be caught.
+    #[test]
+    fn build_test_closure_does_not_follow_the_cross_package_files_own_further_imports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name":"a","dependencies":{"b":"workspace:*"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { x } from '../../b/src/index';\ntest('a', () => x);\n",
+        );
+        write(dir.path(), "packages/b/package.json", r#"{"name":"b"}"#);
+        // `index.ts` re-exports `helper.ts` — the common barrel-file
+        // pattern. A test reaching only `index.ts` directly must not also
+        // get `helper.ts`'s own content folded into its declared Input set.
+        write(
+            dir.path(),
+            "packages/b/src/index.ts",
+            "export { x } from './helper';\n",
+        );
+        write(
+            dir.path(),
+            "packages/b/src/helper.ts",
+            "export const x = 1;\n",
+        );
+
+        let resolvers = Resolvers::new(None);
+        let cache = ResolveCache::new();
+        let graph = build_package_import_graph(
+            &walker(),
+            dir.path(),
+            "packages/a",
+            &resolvers,
+            &cache,
+            None,
+        )
+        .expect("build graph");
+
+        let canonical_root = dir.path().canonicalize().expect("canonicalize");
+        let closure = build_test_closure(
+            &graph,
+            &canonical_root,
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build closure");
+
+        assert!(
+            closure.external_files.contains("packages/b/src/index.ts"),
+            "the one-hop external file itself must still be declared: {:?}",
+            closure.external_files
+        );
+        assert!(
+            !closure.external_files.contains("packages/b/src/helper.ts")
+                && !closure.files.contains("packages/b/src/helper.ts"),
+            "the externally-reached file's own further import must NOT be followed — this pins \
+             the accepted one-hop trim's boundary: files={:?} external_files={:?}",
+            closure.files,
+            closure.external_files
+        );
     }
 }
