@@ -334,11 +334,17 @@ jobs:
           bash scripts/patch-flavour.sh $DEBUG_BIN_NAME debug
 
           # "std" flavour: strip a copy of the same compiled `heph` — no second
-          # compile. `zig objcopy` (not host `strip`/binutils) because it's
-          # LLVM-based and target-agnostic: the Linux arm64 leg cross-compiles
-          # on an amd64 runner (see the zigbuild comment above), and a native
-          # `strip` built for one arch typically can't touch a foreign-arch ELF.
-          zig objcopy --strip-all "$OUT/heph" $BIN_NAME
+          # compile. `rust-strip` (cargo-binutils' wrapper around the
+          # `llvm-tools` component's llvm-objcopy, added in devenv.nix) rather
+          # than host `strip`/binutils: it's LLVM-based and target-agnostic,
+          # so it handles the Linux arm64 leg's cross-compiled output from an
+          # amd64 runner (see the zigbuild comment above) where a native
+          # `strip` typically can't touch a foreign-arch ELF. `zig objcopy`
+          # was tried first — already in this shell for zigbuild — but its
+          # `--strip-all` hit an unimplemented code path on real release
+          # output (verified in CI, not just locally).
+          cp "$OUT/heph" $BIN_NAME
+          rust-strip --strip-all $BIN_NAME
           bash scripts/patch-flavour.sh $BIN_NAME ""
 
       - name: sccache stats
@@ -346,11 +352,16 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: sccache --show-stats
 
-      # macFUSE is NOT installed on this runner. libfuse is weak-linked, so the
-      # binary must still launch — this proves the shipped macOS artifact runs
-      # on machines without macFUSE (dyld would abort here if it were hard-linked).
-      - name: Smoke test launch (darwin)
-        if: matrix.os == 'darwin'
+      # Runs wherever this runner can actually execute what it just built: the
+      # darwin leg and the linux/amd64 leg both build for the runner's own
+      # arch. linux/arm64 cross-compiles on an amd64 runner (see the zigbuild
+      # comment above) — nothing here can execute that binary; the `bin_e2e`
+      # job launches it for real on a native arm64 runner instead. On darwin
+      # specifically this also proves the weak-linked libfuse binary still
+      # launches without macFUSE installed (dyld would abort here if it were
+      # hard-linked).
+      - name: Smoke test launch
+        if: matrix.os == 'darwin' || matrix.arch == 'amd64'
         run: |
           ./$BIN_NAME version
           ./$BENCH_BIN_NAME --help
