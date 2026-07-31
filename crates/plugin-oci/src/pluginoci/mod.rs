@@ -1138,8 +1138,6 @@ impl ManagedDriver for Driver {
             .await
             .with_context(|| format!("write digest {digest_path:?}"))?;
 
-        tracing::info!(addr, digest, "oci_image built");
-
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
