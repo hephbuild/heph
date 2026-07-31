@@ -7,6 +7,11 @@
 //! file lock — into `~/.heph/versions/<tag>/` and re-execs into it, replacing the
 //! current process so the rest of the run is served by the pinned version.
 //!
+//! `versionFlavour` (default: empty, the "std" build) selects which published
+//! artifact is downloaded: empty picks `heph_<os>_<arch>`, a named flavour (e.g.
+//! `debug`, a build kept unstripped for backtraces) picks
+//! `heph_<flavour>_<os>_<arch>`.
+//!
 //! Only **exact** version pins are acted on today; a constraint expression (e.g.
 //! `>=1.2, <2`) is recognized and skipped with a warning until resolution against
 //! the release index is implemented.
@@ -50,7 +55,8 @@ pub enum SelfUpgradeError {
 }
 
 /// Base URL of the published release artifacts. Each release tags a set of
-/// `heph_<os>_<arch>` binaries under `<base>/<tag>/`.
+/// `heph_<os>_<arch>` (std flavour) and `heph_<flavour>_<os>_<arch>` (named
+/// flavour, e.g. `debug`) binaries under `<base>/<tag>/`.
 const ARTIFACTS_BASE: &str = "https://github.com/hephbuild/heph-artifacts-v1/releases/download";
 
 /// The dev-build sentinel stamped when `HEPH_BUILD_VERSION` is unset. Never
@@ -99,6 +105,7 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
     let Some(pin) = cfg.version.as_deref() else {
         return Ok(());
     };
+    let flavour = cfg.version_flavour.as_deref().unwrap_or("");
 
     match decide(current, pin) {
         Decision::UpToDate => Ok(()),
@@ -107,7 +114,7 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
             Ok(())
         }
         Decision::Upgrade { target } => {
-            let binary = imp::ensure_binary(&target)?;
+            let binary = imp::ensure_binary(&target, flavour)?;
             // Replaces the process image; only returns on failure.
             imp::exec_into(&binary)?;
             Ok(())
@@ -195,14 +202,21 @@ fn host_os_arch() -> (&'static str, &'static str) {
     (os, arch)
 }
 
-/// Release asset name for the host: `heph_<os>_<arch>`.
-fn binary_name(os: &str, arch: &str) -> String {
-    format!("heph_{os}_{arch}")
+/// Release asset name for the host: `heph_<os>_<arch>` for the std (empty)
+/// flavour, `heph_<flavour>_<os>_<arch>` for a named one (e.g. `debug`).
+fn binary_name(flavour: &str, os: &str, arch: &str) -> String {
+    if flavour.is_empty() {
+        format!("heph_{os}_{arch}")
+    } else {
+        format!("heph_{flavour}_{os}_{arch}")
+    }
 }
 
-/// Download URL for `tag`'s host binary: `<base>/<tag>/heph_<os>_<arch>`.
-fn download_url(tag: &str, os: &str, arch: &str) -> String {
-    format!("{ARTIFACTS_BASE}/{tag}/{}", binary_name(os, arch))
+/// Download URL for `tag`'s host binary in `flavour`:
+/// `<base>/<tag>/heph_<os>_<arch>` (std), or
+/// `<base>/<tag>/heph_<flavour>_<os>_<arch>` (named flavour).
+fn download_url(tag: &str, flavour: &str, os: &str, arch: &str) -> String {
+    format!("{ARTIFACTS_BASE}/{tag}/{}", binary_name(flavour, os, arch))
 }
 
 #[cfg(unix)]
@@ -227,12 +241,13 @@ mod imp {
         Ok(home.join(".heph").join("versions").join(tag))
     }
 
-    /// Ensure `tag`'s host binary is present in the cache, downloading it once
-    /// under an exclusive cross-process lock, and return its path.
-    pub(super) fn ensure_binary(tag: &str) -> anyhow::Result<PathBuf> {
+    /// Ensure `tag`'s host binary in `flavour` is present in the cache,
+    /// downloading it once under an exclusive cross-process lock, and return its
+    /// path.
+    pub(super) fn ensure_binary(tag: &str, flavour: &str) -> anyhow::Result<PathBuf> {
         let (os, arch) = host_os_arch();
         let dir = version_cache_dir(tag)?;
-        let dest = dir.join(binary_name(os, arch));
+        let dest = dir.join(binary_name(flavour, os, arch));
         if dest.exists() {
             return Ok(dest);
         }
@@ -245,7 +260,7 @@ mod imp {
             return Ok(dest);
         }
 
-        let url = download_url(tag, os, arch);
+        let url = download_url(tag, flavour, os, arch);
         let bytes = download_with_ui(&url, tag)?;
         install_atomic(&dir, &dest, &bytes)?;
         Ok(dest)
@@ -594,13 +609,29 @@ mod tests {
     #[test]
     fn download_url_is_well_formed() {
         assert_eq!(
-            download_url("v1.2.3", "darwin", "arm64"),
+            download_url("v1.2.3", "", "darwin", "arm64"),
             "https://github.com/hephbuild/heph-artifacts-v1/releases/download/v1.2.3/heph_darwin_arm64"
         );
     }
 
     #[test]
+    fn download_url_includes_flavour_when_set() {
+        assert_eq!(
+            download_url("v1.2.3", "debug", "darwin", "arm64"),
+            "https://github.com/hephbuild/heph-artifacts-v1/releases/download/v1.2.3/heph_debug_darwin_arm64"
+        );
+    }
+
+    #[test]
     fn binary_name_per_platform() {
-        assert_eq!(binary_name("linux", "amd64"), "heph_linux_amd64");
+        assert_eq!(binary_name("", "linux", "amd64"), "heph_linux_amd64");
+    }
+
+    #[test]
+    fn binary_name_includes_flavour_when_set() {
+        assert_eq!(
+            binary_name("debug", "linux", "amd64"),
+            "heph_debug_linux_amd64"
+        );
     }
 }

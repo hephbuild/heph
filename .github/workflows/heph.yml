@@ -193,7 +193,10 @@ jobs:
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 30
+    # 30 -> 45: the "debug" release flavour of `heph` is a second, separately
+    # profiled build (see the "Build" step) that can't reuse the std flavour's
+    # compiled objects.
+    timeout-minutes: 45
     needs: [gen, govet]
     strategy:
       fail-fast: false
@@ -265,10 +268,17 @@ jobs:
           # binary under test AND the tool measuring it come from a release, for
           # N (this build) and N-1 (a past release) alike.
           BENCH_BIN_NAME="heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
+          # `heph`'s "debug" release flavour: same source, `release-debug`
+          # profile (unstripped, DWARF line tables — see root Cargo.toml),
+          # published as a second, separately-named `heph` asset. `version_flavour:
+          # debug` in `.hephconfig` is what makes self-upgrade fetch this one
+          # instead of the (default, stripped) "std" `$BIN_NAME` above.
+          DEBUG_BIN_NAME="heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           echo "plugin_go_name=$PLUGIN_GO_NAME" >> $GITHUB_OUTPUT
           echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
           echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
+          echo "debug_bin_name=$DEBUG_BIN_NAME" >> $GITHUB_OUTPUT
           OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release"
           # FUSE (default feature) on Linux is pure-Rust (no libfuse link), so
           # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
@@ -319,6 +329,19 @@ jobs:
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
 
+          # Second flavour: only `heph` itself gets rebuilt under `release-debug`
+          # (bench and the plugin cdylibs have no flavour, one copy of each is
+          # enough) — a separate invocation because a cargo profile is fixed for
+          # the whole build, it cannot vary per binary within one `cargo build`.
+          DEBUG_OUT="$CARGO_TARGET_DIR/${{ matrix.target }}/release-debug"
+          if [ "${{ matrix.os }}" = "darwin" ]; then
+            cargo build --profile release-debug --locked --target ${{ matrix.target }} --bin heph -p heph
+            bash scripts/macos-portable.sh "$DEBUG_OUT/heph"
+          else
+            cargo zigbuild --profile release-debug --locked --target ${{ matrix.target }} --bin heph -p heph
+          fi
+          cp "$DEBUG_OUT/heph" $DEBUG_BIN_NAME
+
       - name: sccache stats
         if: always()
         shell: devenv shell bash -- -e {0}
@@ -332,15 +355,23 @@ jobs:
         run: |
           ./$BIN_NAME version
           ./$BENCH_BIN_NAME --help
+          ./$DEBUG_BIN_NAME version
         env:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           BENCH_BIN_NAME: "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"
+          DEBUG_BIN_NAME: "heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{steps.build.outputs.bin_name}}
           path: ${{steps.build.outputs.bin_name}}
+
+      - name: Upload debug flavour artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.debug_bin_name}}
+          path: ${{steps.build.outputs.debug_bin_name}}
 
       - name: Upload heph-bench artifact
         uses: actions/upload-artifact@v6
@@ -383,7 +414,8 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          # Matches the CLI (`heph_<os>_<arch>`) and the go plugin cdylib
+          # Matches the CLI, both release flavours (`heph_<os>_<arch>` std,
+          # `heph_debug_<os>_<arch>` debug) and the go plugin cdylib
           # (`heph-go-plugin_<os>_<arch>.{so,dylib}`); excludes the `repo` source artifact.
           pattern: "heph*"
           path: dist
@@ -713,9 +745,12 @@ jobs:
           name: repo
           path: .
 
-      # Only this platform's three artifacts: `heph_<os>_<arch>` plus the two
-      # `heph-*-plugin_<os>_<arch>.{so,dylib}`. `heph-govet` carries no
-      # os/arch suffix, so the pattern leaves it out.
+      # Only this platform's artifacts: the std-flavour `heph_<os>_<arch>` (what
+      # the `e2e` script stages as `dist/heph`), the debug-flavour
+      # `heph_debug_<os>_<arch>` (downloaded too since it matches the glob, but
+      # unused — the `e2e` script only picks up the exact std name), and the two
+      # `heph-*-plugin_<os>_<arch>.{so,dylib}`. `heph-govet` carries no os/arch
+      # suffix, so the pattern leaves it out.
       - name: Download artifacts under test
         uses: actions/download-artifact@v7
         with:

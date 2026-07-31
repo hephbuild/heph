@@ -29,6 +29,12 @@ pub struct ConfigYaml {
     /// self-upgrade for the workspace.
     #[serde(default)]
     pub version: Option<String>,
+    /// Release flavour to pin `version` to, e.g. `debug`. Selects which published
+    /// artifact self-upgrade downloads: empty/omitted is the default "std" build
+    /// (`heph_<os>_<arch>`); a non-empty flavour downloads `heph_<flavour>_<os>_<arch>`
+    /// (e.g. `heph_debug_darwin_arm64`) instead.
+    #[serde(default)]
+    pub version_flavour: Option<String>,
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     /// Every provider/driver — built-in or external — is declared as a single
@@ -168,6 +174,9 @@ impl ConfigYaml {
     pub fn merge(&mut self, other: ConfigYaml) {
         if other.version.is_some() {
             self.version = other.version;
+        }
+        if other.version_flavour.is_some() {
+            self.version_flavour = other.version_flavour;
         }
         if other.home_dir.is_some() {
             self.home_dir = other.home_dir;
@@ -619,6 +628,32 @@ plugins:
     }
 
     #[test]
+    fn parses_version_flavour_field() {
+        let cfg: ConfigYaml = serde_yaml::from_str("versionFlavour: debug\n").expect("parse");
+        assert_eq!(cfg.version_flavour.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn version_flavour_omitted_is_none() {
+        let cfg: ConfigYaml = serde_yaml::from_str("homeDir: .heph3\n").expect("parse");
+        assert!(cfg.version_flavour.is_none());
+    }
+
+    #[test]
+    fn merge_overrides_version_flavour_only_when_present() {
+        let mut base: ConfigYaml =
+            serde_yaml::from_str("versionFlavour: debug\n").expect("parse base");
+        let overlay: ConfigYaml = serde_yaml::from_str("homeDir: .prof\n").expect("parse overlay");
+        base.merge(overlay);
+        assert_eq!(base.version_flavour.as_deref(), Some("debug"));
+
+        let overlay2: ConfigYaml =
+            serde_yaml::from_str("versionFlavour: \"\"\n").expect("parse o2");
+        base.merge(overlay2);
+        assert_eq!(base.version_flavour.as_deref(), Some(""));
+    }
+
+    #[test]
     fn merge_overrides_version_only_when_present() {
         let mut base: ConfigYaml = serde_yaml::from_str("version: v1.0.0\n").expect("parse base");
         // Overlay without `version` leaves the base pin untouched.
@@ -740,6 +775,7 @@ caches:
         let cfg = load(&path).expect("load");
         assert!(cfg.home_dir.is_none());
         assert!(cfg.plugins.is_empty());
+        assert!(cfg.version_flavour.is_none());
     }
 
     #[test]
