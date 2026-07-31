@@ -189,18 +189,27 @@ impl Engine {
             // engine future with `block_on` across the synchronous seam, so state
             // the precondition rather than leave it to be rediscovered.
             //
-            // `pluginbuildfile::probe`/`list` reach `run_pkg`, which holds a
-            // `PKG_EVAL_SLOTS` permit (a global semaphore sized `cores`) across
-            // its `blocking::run(..).await`. As plain futures, those permit
-            // holders advance only when the consumer polls this stream — and the
-            // consumer stops polling it the moment it awaits `get_spec`/`get_def`
-            // in the `MatchShrug` arm, which itself can need a permit for another
-            // package. The blocking jobs finish, but the permits are released
-            // only by a poll that never comes, and `Semaphore` is FIFO: the
-            // consumer queues behind `cores` futures that cannot advance.
-            // Deadlock, escaping only if some unrelated task happens to drive the
-            // same `pkg_cache` cell. Spawned, they are polled by the runtime
-            // regardless of what the consumer is doing, so permits always drain.
+            // `pluginbuildfile::probe`/`list` reach `run_pkg`, which takes a
+            // `PKG_EVAL_SLOTS` permit (a global semaphore sized `cores`). When
+            // this walk was written the permit was held across `run_pkg`'s
+            // `blocking::run(..).await`, and as plain futures the holders
+            // advanced only when the consumer polled this stream — while the
+            // consumer stops polling it the moment it awaits
+            // `get_spec`/`get_def` in the `MatchShrug` arm, which itself can
+            // need a permit for another package. `Semaphore` is FIFO: the
+            // consumer queued behind `cores` futures that could not advance.
+            // Deadlock. `run_pkg` has since moved the permit *into* the
+            // blocking job (released on the pool thread, no poll required —
+            // see its comment), which makes that specific wedge impossible on
+            // its own. Spawning stays as the structural half of the fix:
+            // `run_pkg` is reachable from arbitrary provider code, and this
+            // walk cannot know what those bodies acquire and hold across an
+            // await — spawned, they are polled by the runtime regardless of
+            // what the consumer is doing, so no such resource can wedge the
+            // walk again. It also keeps packages progressing while the
+            // consumer parks in the `MatchShrug` arm.
+            // `discovery_fanout_does_not_starve_the_matcher_consumer` models
+            // the original shape.
             //
             // `spawn_with_cycle_ctx`, not bare `tokio::spawn`, for the reason
             // `Engine::result` uses it one level up: the body calls

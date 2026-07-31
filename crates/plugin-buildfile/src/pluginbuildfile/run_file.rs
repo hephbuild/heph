@@ -1067,7 +1067,22 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
 /// core-count cap, a build that peaks on both at once can still fill the pool.
 /// Guaranteeing a reserve is a change to the pool itself.
 static PKG_EVAL_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(pkg_eval_slots()));
+    std::sync::LazyLock::new(|| {
+        let slots = pkg_eval_slots();
+        // `LoadRegistry`'s cross-chain claim parks a pool thread on a condvar while
+        // the claim's holder evaluates on another pool thread. That is deadlock-free
+        // only while every holder can actually be running — i.e. while the number of
+        // concurrent evaluations stays strictly below the pool size. The two
+        // constants live in different crates and nothing ties their formulas
+        // together, so enforce the invariant where the slots are minted.
+        assert!(
+            slots < hcore::blocking::pool_size(),
+            "PKG_EVAL_SLOTS ({slots}) must stay strictly below hcore::blocking::pool_size() \
+         ({}): a LoadRegistry claim waiter parks a pool thread while its holder needs one",
+            hcore::blocking::pool_size()
+        );
+        tokio::sync::Semaphore::new(slots)
+    });
 
 fn pkg_eval_slots() -> usize {
     std::thread::available_parallelism()
@@ -2365,6 +2380,23 @@ target(
             .expect("releasing the slots must let the evaluation through")
             .unwrap();
         assert_eq!(result.targets.len(), 1);
+    }
+
+    /// `LoadRegistry::claim` parks a pool thread on a condvar until the claim's
+    /// holder — another evaluation, on another pool thread — finishes the file.
+    /// Every holder must therefore be able to run, which requires strictly
+    /// fewer concurrent evaluations than pool threads. The formulas live in
+    /// different crates (`pkg_eval_slots` here, `pool_size` in `hcore`), so pin
+    /// the inequality; the `PKG_EVAL_SLOTS` initializer asserts it at runtime
+    /// for non-test binaries.
+    #[test]
+    fn eval_slots_stay_strictly_below_the_blocking_pool() {
+        assert!(
+            pkg_eval_slots() < hcore::blocking::pool_size(),
+            "pkg_eval_slots ({}) must stay strictly below hcore::blocking::pool_size ({})",
+            pkg_eval_slots(),
+            hcore::blocking::pool_size()
+        );
     }
 
     #[tokio::test]
