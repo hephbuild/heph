@@ -1,8 +1,8 @@
 use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::workspace::{self, PkgManager, WorkspaceMember};
 use crate::pluginjs::{
-    PACKAGE_INFO_TARGET, PACKAGE_JSON, TYPECHECK_TARGET, deps, importgraph, is_skipped_dir_name,
-    package_json, platform, resolvers, thirdparty, toolchain,
+    PACKAGE_INFO_TARGET, PACKAGE_JSON, TEST_TARGET, TYPECHECK_TARGET, deps, importgraph,
+    is_skipped_dir_name, package_json, platform, resolvers, thirdparty, toolchain,
 };
 use anyhow::Context;
 use enclose::enclose;
@@ -22,6 +22,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+
+/// Default `js_test` test-file globs, applied when the provider's
+/// `test_glob` option is absent — mirrors vitest's own default
+/// (`**/*.{test,spec}.?(c|m)[jt]s?(x)`) and jest's `**/?(*.)+(spec|test).[tj]s?(x)`
+/// convention (jest's separate `**/__tests__/**/*` convention is not matched
+/// — a disclosed scope trim, not silent; see `driver_test.rs` module docs).
+/// Matches this task's own example glob.
+const DEFAULT_TEST_GLOBS: &[&str] = &["**/*.test.{ts,tsx,js,jsx}", "**/*.spec.{ts,tsx,js,jsx}"];
 
 /// Provider construction config. See [`Provider::from_options`] for how each
 /// field is populated from the provider's `options:` map.
@@ -50,6 +58,15 @@ pub struct Config {
     /// working value — unlike `pkgmanager`, there is no genuine ambiguity to
     /// force an explicit choice over.
     pub tstool: String,
+    /// Which test runner `js_test` invokes — `"vitest"` (default) or
+    /// `"jest"`, per `ai-docs/js-plugin-plan.md`'s `js_test` row. Same
+    /// provider-level, host-toolchain shape as `tstool` — see
+    /// `toolchain::resolve_host_test_runner`.
+    pub testrunner: String,
+    /// Glob patterns (wax syntax) a package's own first-party source files
+    /// are matched against to discover `js_test` targets. Defaults to
+    /// [`DEFAULT_TEST_GLOBS`] when unset — see that constant's doc for why.
+    pub test_glob: Vec<String>,
 }
 
 impl Config {
@@ -60,6 +77,11 @@ impl Config {
             walker: Arc::new(CachedWalker::disabled()),
             allow_scripts: Vec::new(),
             tstool: toolchain::HOST.to_string(),
+            testrunner: toolchain::VITEST.to_string(),
+            test_glob: DEFAULT_TEST_GLOBS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         }
     }
 }
@@ -71,6 +93,8 @@ pub struct Provider {
     walker: Arc<CachedWalker>,
     allow_scripts: Vec<String>,
     tstool: String,
+    testrunner: String,
+    test_glob: Vec<String>,
     /// Lazily parsed lockfile (`None` when the workspace has none) and its
     /// derived [`ResolvedGraph`] — each `Provider::get` for a third-party
     /// `js_install` addr or a package's declared deps would otherwise
@@ -87,6 +111,14 @@ pub struct Provider {
     /// every single invocation, including a 100%-cache-hit run (M3 review
     /// finding).
     tsc_cache: OnceCell<Arc<(PathBuf, String)>>,
+    /// Lazily resolved host test-runner binary path + queried `--version`,
+    /// cached once for the `Provider`'s lifetime — same rationale as
+    /// `tsc_cache`: `test_config` runs once per `js_test` target (one per
+    /// test *file*, potentially many per package) per `Provider::get`, so
+    /// re-resolving and re-spawning `<runner> --version` per target would
+    /// scale a real subprocess cost with the number of test files, not just
+    /// packages.
+    testrunner_cache: OnceCell<Arc<(PathBuf, String)>>,
 }
 
 impl Provider {
@@ -108,7 +140,14 @@ impl Provider {
         hplugin::config::deny_unknown(
             "js provider",
             opts,
-            &["pkgmanager", "skip", "allow_scripts", "tstool"],
+            &[
+                "pkgmanager",
+                "skip",
+                "allow_scripts",
+                "tstool",
+                "testrunner",
+                "test_glob",
+            ],
         )?;
         let pkgmanager_str: String =
             hplugin::config::decode_opt(opts, "js provider", "pkgmanager")?.ok_or_else(|| {
@@ -134,6 +173,25 @@ impl Provider {
         let tstool: String = hplugin::config::decode_opt(opts, "js provider", "tstool")?
             .unwrap_or_else(|| toolchain::HOST.to_string());
 
+        // See `Config::testrunner`'s doc: defaults to the design doc's
+        // recommended default.
+        let testrunner: String = hplugin::config::decode_opt(opts, "js provider", "testrunner")?
+            .unwrap_or_else(|| toolchain::VITEST.to_string());
+        anyhow::ensure!(
+            toolchain::is_supported_testrunner(&testrunner),
+            "js provider: unsupported `testrunner` {testrunner:?} — expected \"vitest\" or \"jest\""
+        );
+
+        // See `DEFAULT_TEST_GLOBS`'s doc: defaults to vitest/jest's own
+        // conventions when unset.
+        let test_glob: Vec<String> = hplugin::config::decode_opt(opts, "js provider", "test_glob")?
+            .unwrap_or_else(|| {
+                DEFAULT_TEST_GLOBS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            });
+
         Ok(Self::with_config(
             workspace_root,
             Config {
@@ -142,6 +200,8 @@ impl Provider {
                 walker,
                 allow_scripts,
                 tstool,
+                testrunner,
+                test_glob,
             },
         ))
     }
@@ -154,9 +214,12 @@ impl Provider {
             walker: config.walker,
             allow_scripts: config.allow_scripts,
             tstool: config.tstool,
+            testrunner: config.testrunner,
+            test_glob: config.test_glob,
             lockfile_cache: OnceCell::new(),
             resolved_graph_cache: OnceCell::new(),
             tsc_cache: OnceCell::new(),
+            testrunner_cache: OnceCell::new(),
         }
     }
 
@@ -267,6 +330,34 @@ impl Provider {
                     let tsc_version = toolchain::query_tsc_version(&tsc_bin)
                         .with_context(|| format!("querying {tsc_bin:?} --version"))?;
                     Ok(Arc::new((tsc_bin, tsc_version)))
+                })
+                .await
+            })
+            .await?;
+        Ok(Arc::clone(result))
+    }
+
+    /// The host test-runner binary path and its queried `--version`, resolved
+    /// once and cached for the `Provider`'s lifetime — see
+    /// [`Provider::testrunner_cache`]'s doc for why this matters.
+    async fn resolved_host_test_runner(&self) -> anyhow::Result<Arc<(PathBuf, String)>> {
+        let workspace_root = self.workspace_root.clone();
+        let testrunner = self.testrunner.clone();
+        let result = self
+            .testrunner_cache
+            .get_or_try_init(|| async move {
+                anyhow::ensure!(
+                    toolchain::is_supported_testrunner(&testrunner),
+                    "js provider: unsupported testrunner {testrunner:?} — only \"vitest\" or \
+                     \"jest\" is supported in this milestone; see pluginjs::toolchain module docs"
+                );
+                hcore::blocking::run(move || -> anyhow::Result<Arc<(PathBuf, String)>> {
+                    let runner_bin =
+                        toolchain::resolve_host_test_runner(&workspace_root, &testrunner)
+                            .context("resolving the js_test runner toolchain")?;
+                    let runner_version = toolchain::query_test_runner_version(&runner_bin)
+                        .with_context(|| format!("querying {runner_bin:?} --version"))?;
+                    Ok(Arc::new((runner_bin, runner_version)))
                 })
                 .await
             })
@@ -404,7 +495,14 @@ impl Provider {
     /// docs for why the version is queried here (spec-resolution time) and
     /// not deferred to the driver's `run()`.
     async fn typecheck_config(&self, pkg: &PkgBuf) -> anyhow::Result<HashMap<String, Value>> {
-        let (tsc_bin, tsc_version) = self.resolved_host_tsc().await?.as_ref().clone();
+        // Read straight out of the cached `Arc`'s fields rather than cloning
+        // the whole tuple: `tsc_bin` only ever ends up re-stringified via
+        // `to_string_lossy().into_owned()` below, so cloning the `PathBuf`
+        // first (via `.as_ref().clone()`) would allocate a copy that's
+        // immediately discarded.
+        let resolved_tsc = self.resolved_host_tsc().await?;
+        let tsc_bin = resolved_tsc.0.to_string_lossy().into_owned();
+        let tsc_version = resolved_tsc.1.clone();
         let lockfile = self.lockfile().await?;
         let resolved_graph = self.resolved_graph().await?;
         let workspace_root = self.workspace_root.clone();
@@ -456,15 +554,119 @@ impl Provider {
             .with_context(|| format!("building js_typecheck inputs for {pkg_str:?}"))?;
 
             let mut config: HashMap<String, Value> = HashMap::new();
-            config.insert(
-                "tsc_bin".to_string(),
-                Value::String(tsc_bin.to_string_lossy().into_owned()),
-            );
+            config.insert("tsc_bin".to_string(), Value::String(tsc_bin));
             config.insert("tsc_version".to_string(), Value::String(tsc_version));
             config.insert("tsconfig_path".to_string(), Value::String(tsconfig_path));
             config.insert(
                 "tsconfig_content".to_string(),
                 Value::String(tsconfig_content),
+            );
+            config.insert("deps".to_string(), Value::Map(deps));
+            Ok(config)
+        })
+        .await
+    }
+
+    /// Discover this package's own `js_test` test files (see
+    /// `importgraph::discover_test_files`), matched against the provider's
+    /// configured `test_glob`. Workspace-root-relative paths, sorted.
+    async fn discover_test_files(&self, pkg: &PkgBuf) -> anyhow::Result<Vec<String>> {
+        let workspace_root = self.workspace_root.clone();
+        let walker = Arc::clone(&self.walker);
+        let pkg_str = pkg.as_str().to_string();
+        let test_glob = self.test_glob.clone();
+        hcore::blocking::run(move || -> anyhow::Result<Vec<String>> {
+            importgraph::discover_test_files(&walker, &workspace_root, &pkg_str, &test_glob)
+        })
+        .await
+        .with_context(|| format!("discovering js_test targets for {}", pkg.as_str()))
+    }
+
+    /// Build the config for one `js_test` target (one test file): the host
+    /// runner toolchain resolution/version-query this milestone's disclosed
+    /// `testrunner`-is-host-resolved escape hatch requires (see
+    /// `toolchain.rs` module docs for why the version is queried here, at
+    /// spec-resolution time, rather than deferred to the driver's `run()`)
+    /// plus `test_deps_config`'s pure, runner-free Input-scoping.
+    async fn test_config(
+        &self,
+        pkg: &PkgBuf,
+        test_file_rel: &str,
+    ) -> anyhow::Result<HashMap<String, Value>> {
+        // See `typecheck_config`'s identical fix: read the cached `Arc`'s
+        // fields directly instead of cloning the whole tuple, since
+        // `runner_bin` only ever ends up re-stringified below.
+        let resolved_test_runner = self.resolved_host_test_runner().await?;
+        let runner_bin = resolved_test_runner.0.to_string_lossy().into_owned();
+        let runner_version = resolved_test_runner.1.clone();
+        let lockfile = self.lockfile().await?;
+        let resolved_graph = self.resolved_graph().await?;
+        let workspace_root = self.workspace_root.clone();
+        let walker = Arc::clone(&self.walker);
+        let skip = Arc::clone(&self.skip);
+        let pkgmanager = self.pkgmanager;
+        let testrunner = self.testrunner.clone();
+        let pkg_str = pkg.as_str().to_string();
+        let test_file_rel = test_file_rel.to_string();
+        let goos = platform::current_goos();
+        let goarch = platform::current_goarch();
+
+        hcore::blocking::run(move || -> anyhow::Result<HashMap<String, Value>> {
+            // Same workspace-member discovery `Provider::typecheck_config`
+            // does in its own blocking closure — needed here too so an
+            // import that never resolved on disk can still be attributed to
+            // a workspace sibling by name.
+            let patterns = match pkgmanager {
+                PkgManager::Npm => workspace::read_npm_workspace_globs(&workspace_root)?,
+                PkgManager::Pnpm => workspace::read_pnpm_workspace_globs(&workspace_root)?,
+            };
+            let member_addrs_by_name: BTreeMap<String, String> = if patterns.is_empty() {
+                BTreeMap::new()
+            } else {
+                let mut packages = Vec::new();
+                collect_js_packages(
+                    &walker,
+                    &workspace_root,
+                    &workspace_root,
+                    &skip,
+                    &mut packages,
+                );
+                let packages: Vec<PkgBuf> = packages.into_iter().collect::<anyhow::Result<_>>()?;
+                workspace::resolve_members(&workspace_root, &packages, &patterns)?
+                    .into_iter()
+                    .map(|m| (m.name, m.addr.format()))
+                    .collect()
+            };
+
+            let (deps, runner_config_path, runner_config_content) = test_deps_config(
+                &walker,
+                &workspace_root,
+                &pkg_str,
+                &test_file_rel,
+                lockfile.as_deref(),
+                resolved_graph.as_deref(),
+                &member_addrs_by_name,
+                &goos,
+                &goarch,
+                &testrunner,
+                runner_config_candidates(&testrunner)?,
+            )
+            .with_context(|| {
+                format!("building js_test inputs for {pkg_str:?} test file {test_file_rel:?}")
+            })?;
+
+            let mut config: HashMap<String, Value> = HashMap::new();
+            config.insert("testrunner".to_string(), Value::String(testrunner));
+            config.insert("runner_bin".to_string(), Value::String(runner_bin));
+            config.insert("runner_version".to_string(), Value::String(runner_version));
+            config.insert("test_file".to_string(), Value::String(test_file_rel));
+            config.insert(
+                "runner_config_path".to_string(),
+                Value::String(runner_config_path),
+            );
+            config.insert(
+                "runner_config_content".to_string(),
+                Value::String(runner_config_content),
             );
             config.insert("deps".to_string(), Value::Map(deps));
             Ok(config)
@@ -806,6 +1008,326 @@ fn typecheck_deps_config(
     Ok((deps, tsconfig_path_rel, tsconfig_content))
 }
 
+/// Candidate config filenames for `testrunner`'s ancestor-chain walk (see
+/// `importgraph::find_nearest_test_runner_config`) — every extension the
+/// runner itself accepts for its own config file. Errors on an unsupported
+/// `testrunner` rather than guessing — callers only ever reach this after
+/// `toolchain::is_supported_testrunner` has already validated it (see
+/// `Provider::resolved_host_test_runner`), so this should never actually
+/// trigger in practice, but a fallible return keeps that an enforced
+/// invariant rather than an assumed one.
+fn runner_config_candidates(testrunner: &str) -> anyhow::Result<&'static [&'static str]> {
+    match testrunner {
+        toolchain::VITEST => Ok(&[
+            "vitest.config.ts",
+            "vitest.config.js",
+            "vitest.config.mjs",
+            "vitest.config.cjs",
+            "vitest.config.mts",
+            "vitest.config.cts",
+            // Vitest's own documented fallback: a project that configures
+            // testing entirely under `vite.config.ts`'s `test: {...}` key,
+            // with no separate `vitest.config.*` file at all, is real and
+            // common (hermeticity M4 review) — checked after the dedicated
+            // filenames above, matching vitest's own precedence (dedicated
+            // config wins over the shared `vite.config.*`).
+            "vite.config.ts",
+            "vite.config.js",
+            "vite.config.mjs",
+            "vite.config.cjs",
+            "vite.config.mts",
+            "vite.config.cts",
+        ]),
+        toolchain::JEST => Ok(&[
+            "jest.config.js",
+            "jest.config.ts",
+            "jest.config.mjs",
+            "jest.config.cjs",
+            "jest.config.json",
+            // `package.json`'s own `"jest"` field (jest's other documented
+            // config location) is handled separately by
+            // `importgraph::find_nearest_jest_package_json_config` — checked
+            // by `test_deps_config` only once none of these dedicated
+            // filenames are found on the same ancestor chain.
+        ]),
+        other => anyhow::bail!(
+            "js_test: unsupported testrunner {other:?} — expected \"vitest\" or \"jest\" (should \
+             have been rejected earlier by toolchain::is_supported_testrunner)"
+        ),
+    }
+}
+
+/// Reject a `js_test` addr's `file` arg — or, defensively, a resolved
+/// `runner_config_path` read back out of a cached `JsTestDef` — that is
+/// anything other than a plain workspace-relative path: absolute, or
+/// `..`-escaping. `Path::join` silently *replaces* the base when the joined
+/// argument is absolute, so an unvalidated `file=/etc/passwd` addr would
+/// otherwise resolve to the literal host path in both `Provider::get`
+/// (`workspace_root.join(&test_file)`) and `driver_test.rs::run()`
+/// (`sandbox_ws_dir.join(&def.test_file)`) — a direct violation of
+/// architecture.md's target-isolation invariant ("It sees only its declared
+/// inputs; no ambient filesystem access"). Mirrors
+/// `hbuiltins::pluginfs::normalize_path`'s escape rejection (this crate
+/// cannot depend on `builtins`, and the fs-provider's own protection never
+/// fires here: `def.test_file` is a raw config string consumed directly, not
+/// a `fs:file` dep-group addr the engine resolves through it).
+pub(crate) fn reject_path_escape(field: &str, path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !Path::new(path).is_absolute(),
+        "js_test {field} {path:?} must be a workspace-relative path, not absolute"
+    );
+    anyhow::ensure!(
+        !path.split('/').any(|c| c == ".."),
+        "js_test {field} {path:?} must not contain a `..` path component"
+    );
+    Ok(())
+}
+
+/// A validated `test_file` must additionally live under the addressed
+/// package's own directory — otherwise `//packages/a:js_test@file=<path>`
+/// could address any other real, existing, non-test file anywhere in the
+/// workspace (e.g. a sibling package's source file never surfaced by
+/// `Provider::list`), confined to the workspace but still never a real
+/// `js_test` target. `package` empty means the root package (everything not
+/// already claimed by a nested `package.json` is "under" it).
+fn test_file_under_package(package: &str, test_file: &str) -> bool {
+    if package.is_empty() {
+        return true;
+    }
+    test_file
+        .strip_prefix(package)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Build the `deps` map (`""` = the test file's own runtime-transitive
+/// first-party closure within its owning package —
+/// `importgraph::build_test_closure` over `ImportGraph::runtime_edges`,
+/// always including the test file itself; `"external"` = every file that
+/// closure reaches just outside the package boundary, one-hop only, plus a
+/// lockfile-resolved third-party addr for any closure member's unresolved
+/// bare specifier — the lockfile-driven `deps::resolve_one_dependency`
+/// mechanism, **never** by walking `oxc_resolver` paths against an ambient
+/// `node_modules` on disk: `Provider::get` always runs before `js_install`
+/// ever executes, so a fresh checkout has no `node_modules` at all, and an M3
+/// review caught exactly this mistake in an earlier draft of
+/// `typecheck_deps_config` — see that function's identical on-demand
+/// third-party handling for the precedent this mirrors; `"runner_config"` =
+/// the resolved test-runner config file, if any) plus that config's own
+/// workspace-relative path and raw content, for one `js_test` target.
+///
+/// Deliberately split out from [`Provider::test_config`] so it never touches
+/// the host test-runner toolchain — unit-testable without a real
+/// `vitest`/`jest` binary. This is the task's "single most important test in
+/// this milestone": proving per-test-file, not per-package, Input scoping —
+/// see this module's tests.
+///
+/// `pkg` is the package's workspace-relative path (`""` for the root);
+/// `test_file_rel` is the one test file's workspace-relative path.
+/// `lockfile`/`resolved_graph`/`member_addrs_by_name`/`goos`/`goarch` mirror
+/// `typecheck_deps_config`'s identically-named parameters.
+///
+/// **Known scope trim, disclosed rather than silent — and a real gap, not
+/// merely a narrower one**: the resolved tsconfig (used here only to
+/// configure `Resolvers`' `paths`/`baseUrl`/`extends` support so the import
+/// graph itself is built correctly) is not declared as its own `js_test`
+/// Input, nor hashed, the way `js_typecheck`'s `"tsconfig"`/`tsconfig_content`
+/// pair is. It is tempting to reason that `js_test` runs source directly
+/// (not through `tsc`) so this only affects import *resolution*, not
+/// behavior — but that reasoning is wrong: the recommended default runner,
+/// vitest, transforms TS via Vite's esbuild-based transform, which reads the
+/// nearest `tsconfig.json` itself at transform time for options
+/// (`jsx`/`jsxFactory`/`target`/`useDefineForClassFields`/
+/// `experimentalDecorators`) that change the *emitted, executed* JS — not
+/// just which file a specifier resolves to. Toggling one of those between
+/// two commits, with the resolved import/closure addr set unchanged, is
+/// silently invisible to this target's cache key today (M4 hermeticity
+/// review). Accepted as a known trim for this milestone rather than fixed —
+/// mirroring `js_typecheck`'s `tsconfig_content` fix is the natural
+/// follow-up. TODO M4+.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors typecheck_deps_config's own lockfile/graph/member/platform parameter set, \
+              needed here too for the same on-demand third-party-input resolution, plus \
+              `testrunner` for the jest-package.json-field config fallback"
+)]
+fn test_deps_config(
+    walker: &CachedWalker,
+    workspace_root: &Path,
+    pkg: &str,
+    test_file_rel: &str,
+    lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
+    member_addrs_by_name: &BTreeMap<String, String>,
+    goos: &str,
+    goarch: &str,
+    testrunner: &str,
+    runner_config_candidates: &[&str],
+) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+    let pkg_dir = if pkg.is_empty() {
+        workspace_root.to_path_buf()
+    } else {
+        workspace_root.join(pkg)
+    };
+
+    let manifest = package_json::read_package_manifest(&pkg_dir.join(PACKAGE_JSON))
+        .with_context(|| format!("reading {pkg:?}'s package.json for js_test Input scoping"))?;
+
+    // See `typecheck_deps_config`'s identical canonicalization requirement:
+    // `edge.resolved`/`extends` targets are realpath'd, so every containment
+    // check must compare against a canonicalized `workspace_root`.
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize workspace root {workspace_root:?}"))?;
+
+    // Dedicated filenames first (`vitest.config.*`/`vite.config.*`, or
+    // `jest.config.*`); jest's other documented config location —
+    // `package.json`'s own `"jest"` field — is checked only once none of
+    // those are found on the same ancestor chain, matching jest's own
+    // precedence (hermeticity M4 review: this fallback was previously
+    // entirely missing, so a project configured this way got an unhashed
+    // `runner_config_path == ""` no matter what the real config said).
+    let runner_config = importgraph::find_nearest_test_runner_config(
+        workspace_root,
+        &pkg_dir,
+        runner_config_candidates,
+    )
+    .or_else(|| {
+        if testrunner == toolchain::JEST {
+            importgraph::find_nearest_jest_package_json_config(workspace_root, &pkg_dir)
+        } else {
+            None
+        }
+    });
+    let (runner_config_path_rel, runner_config_content) = match &runner_config {
+        Some(p) => {
+            let rel = p
+                .strip_prefix(workspace_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content = std::fs::read_to_string(p)
+                .with_context(|| format!("reading test-runner config {p:?}"))?;
+            (rel, content)
+        }
+        None => (String::new(), String::new()),
+    };
+
+    // Additional files the resolved config's own content *names* or
+    // *imports* — `setupFiles`/`setupFilesAfterEnv`/`globalSetup`/
+    // `globalTeardown` entries, and a relative `import`/`require` of a
+    // shared base config — recursively, since a base config can itself name
+    // or import more (hermeticity M4 review BLOCKER: previously these were
+    // never discovered, declared, staged, or hashed at all, so e.g. editing
+    // a `setupFiles` target changed real test behavior — mocks, globals —
+    // without busting the cache for any `js_test` target that shared it).
+    // See `resolve_runner_config_referenced_files`'s doc for exactly what is
+    // (and, in the disclosed-trim sense, is not) followed.
+    let mut runner_config_ref_paths_rel: Vec<String> = Vec::new();
+    if let Some(p) = &runner_config {
+        let refs = importgraph::resolve_runner_config_referenced_files(p, &runner_config_content)
+            .with_context(|| {
+            format!("scanning test-runner config {p:?} for referenced files")
+        })?;
+        for f in refs {
+            runner_config_ref_paths_rel.push(
+                f.strip_prefix(workspace_root)
+                    .unwrap_or(&f)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+
+    let tsconfig = importgraph::find_nearest_tsconfig(workspace_root, &pkg_dir);
+    let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
+    let resolve_cache = importgraph::ResolveCache::new();
+    let graph = importgraph::build_package_import_graph(
+        walker,
+        workspace_root,
+        pkg,
+        &import_resolvers,
+        &resolve_cache,
+        tsconfig.as_deref(),
+    )
+    .with_context(|| format!("building import graph for {pkg:?}"))?;
+
+    // Phantom-dependency check: a workspace member requesting only `js_test`
+    // (never `js_package_info`/`js_typecheck`) must not skip it — same
+    // rationale `typecheck_deps_config` documents for its own identical call.
+    let declared_closure = importgraph::declared_closure(&manifest);
+    importgraph::check_phantom_dependencies(workspace_root, pkg, &graph, &declared_closure)
+        .with_context(|| {
+            format!("cross-checking {pkg:?}'s import graph against its declared dependencies")
+        })?;
+
+    let closure = importgraph::build_test_closure(&graph, &canonical_root, pkg, test_file_rel)
+        .with_context(|| {
+            format!("building test closure for {pkg:?}'s test file {test_file_rel:?}")
+        })?;
+
+    let mut deps: HashMap<String, Value> = HashMap::new();
+    deps.insert(
+        String::new(),
+        Value::List(
+            closure
+                .files
+                .iter()
+                .map(|p| Value::String(hbuiltins::pluginfs::file_addr(p).format()))
+                .collect(),
+        ),
+    );
+
+    let mut external_addrs: BTreeSet<String> = BTreeSet::new();
+    for f in &closure.external_files {
+        external_addrs.insert(hbuiltins::pluginfs::file_addr(f).format());
+    }
+    // Mirrors `typecheck_deps_config`'s identical on-demand third-party
+    // handling for an unresolved bare specifier: `check_phantom_dependencies`
+    // above already proved every one of these names is declared; a `None`
+    // here means it's a declared `optionalDependencies` entry that doesn't
+    // apply to this platform/lockfile state.
+    for site in &closure.bare_specifiers {
+        if let Some(addr) = deps::resolve_one_dependency(
+            pkg,
+            &site.package_name,
+            &manifest,
+            lockfile,
+            resolved_graph,
+            member_addrs_by_name,
+            goos,
+            goarch,
+        )
+        .with_context(|| {
+            format!(
+                "resolving {:?}'s unresolved import of `{}` for js_test",
+                site.file, site.package_name
+            )
+        })? {
+            external_addrs.insert(addr);
+        }
+    }
+    if !external_addrs.is_empty() {
+        deps.insert(
+            "external".to_string(),
+            Value::List(external_addrs.into_iter().map(Value::String).collect()),
+        );
+    }
+    if !runner_config_path_rel.is_empty() {
+        let mut runner_config_addrs = vec![Value::String(
+            hbuiltins::pluginfs::file_addr(&runner_config_path_rel).format(),
+        )];
+        for rel in &runner_config_ref_paths_rel {
+            runner_config_addrs.push(Value::String(hbuiltins::pluginfs::file_addr(rel).format()));
+        }
+        deps.insert(
+            "runner_config".to_string(),
+            Value::List(runner_config_addrs),
+        );
+    }
+
+    Ok((deps, runner_config_path_rel, runner_config_content))
+}
+
 /// The default npm registry tarball URL for a `(name, version)` — used when
 /// the lockfile doesn't record one directly (pnpm's common case for a plain
 /// registry dependency; npm's `package-lock.json` always records one, which
@@ -938,7 +1460,38 @@ impl ProviderTrait for Provider {
                 PACKAGE_INFO_TARGET.to_string(),
                 Default::default(),
             );
-            Ok(Box::new(std::iter::once(Ok(ListResponse { addr })))
+            let mut responses: Vec<anyhow::Result<ListResponse>> = vec![Ok(ListResponse { addr })];
+
+            // One `js_test` target per matched test file — the milestone's
+            // stated per-test-file (not per-package) granularity; see
+            // `driver_test.rs` module docs. Test discovery is an optional,
+            // additive listing on top of the always-present
+            // `PACKAGE_INFO_TARGET` entry above: a bad `test_glob` or an
+            // FS-walk error under this one package must not take
+            // `package_info` (and every other target kind that lives in this
+            // package) down with it, so a failure here is surfaced as its
+            // own per-entry error — mirroring `collect_js_packages`'s
+            // identical per-entry error handling — rather than propagated
+            // with `?`.
+            match self.discover_test_files(&req.package).await {
+                Ok(test_files) => {
+                    for file in test_files {
+                        let mut args = BTreeMap::new();
+                        args.insert("file".to_string(), file);
+                        responses.push(Ok(ListResponse {
+                            addr: Addr::new(req.package.clone(), TEST_TARGET.to_string(), args),
+                        }));
+                    }
+                }
+                Err(e) => {
+                    responses.push(Err(e.context(format!(
+                        "discovering js_test files for {}",
+                        req.package.as_str()
+                    ))));
+                }
+            }
+
+            Ok(Box::new(responses.into_iter())
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
                 >)
@@ -1037,6 +1590,69 @@ impl ProviderTrait for Provider {
                     target_spec: TargetSpec {
                         addr: req.addr.clone(),
                         driver: "js_typecheck".to_string(),
+                        config,
+                        labels: vec![],
+                        transitive: Default::default(),
+                        approval: Default::default(),
+                    },
+                });
+            }
+
+            // `js_test` is a third per-package-*file* target kind: one addr
+            // per matched test file, distinguished by the `file` addr arg —
+            // see `driver_test.rs` module docs. Checked before the
+            // `PACKAGE_INFO_TARGET` gate below for the same reason
+            // `TYPECHECK_TARGET` is.
+            if req.addr.name == TEST_TARGET {
+                if self
+                    .skip
+                    .prunes_package(&self.workspace_root, Path::new(req.addr.package.as_str()))
+                {
+                    return Err(GetError::NotFound);
+                }
+                let package_json = self
+                    .workspace_root
+                    .join(req.addr.package.as_str())
+                    .join(PACKAGE_JSON);
+                if !package_json.is_file() {
+                    return Err(GetError::NotFound);
+                }
+                let test_file = req.addr.args.get("file").cloned().ok_or_else(|| {
+                    GetError::Other(anyhow::anyhow!(
+                        "js_test addr {} is missing its required `file` arg",
+                        req.addr.format()
+                    ))
+                })?;
+                // Validated *before* ever touching the filesystem: an
+                // absolute or `..`-escaping `file` arg must never reach
+                // `workspace_root.join(...)` below — see `reject_path_escape`'s
+                // doc for why (a code-quality review BLOCKER — `Path::join`
+                // silently replaces the base for an absolute argument).
+                reject_path_escape("file arg", &test_file).map_err(GetError::Other)?;
+                if !test_file_under_package(req.addr.package.as_str(), &test_file) {
+                    return Err(GetError::Other(anyhow::anyhow!(
+                        "js_test addr {} names file {test_file:?} outside its own package {:?}",
+                        req.addr.format(),
+                        req.addr.package.as_str()
+                    )));
+                }
+                let test_file_abs = self.workspace_root.join(&test_file);
+                let is_file = hcore::blocking::run(enclose!((test_file_abs) move || {
+                    test_file_abs.is_file()
+                }))
+                .await;
+                if !is_file {
+                    return Err(GetError::NotFound);
+                }
+                let config = self
+                    .test_config(&req.addr.package, &test_file)
+                    .await
+                    .with_context(|| format!("resolving js_test config for {}", req.addr.format()))
+                    .map_err(GetError::Other)?;
+                return Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr: req.addr.clone(),
+                        driver: "js_test".to_string(),
                         config,
                         labels: vec![],
                         transitive: Default::default(),
@@ -1698,6 +2314,8 @@ mod tests {
                 walker: Arc::new(CachedWalker::disabled()),
                 allow_scripts: vec!["native-thing".to_string()],
                 tstool: toolchain::HOST.to_string(),
+                testrunner: toolchain::VITEST.to_string(),
+                test_glob: Vec::new(),
             },
         );
 
@@ -2484,5 +3102,749 @@ mod tests {
             .expect("get js_typecheck target_spec");
         assert_eq!(resp.target_spec.driver, "js_typecheck");
         assert!(resp.target_spec.config.contains_key("tsc_version"));
+    }
+
+    // ---- js_test: test_deps_config Input scoping (no real vitest/jest needed) ----
+
+    /// `test_deps_config` with no lockfile/workspace-member context, matching
+    /// vitest's default config filenames — what most of these tests need,
+    /// since they exercise scoping behavior that doesn't touch an unresolved
+    /// third-party/sibling import.
+    fn call_test_deps_config(
+        walker: &CachedWalker,
+        workspace_root: &Path,
+        pkg: &str,
+        test_file_rel: &str,
+    ) -> anyhow::Result<(HashMap<String, Value>, String, String)> {
+        test_deps_config(
+            walker,
+            workspace_root,
+            pkg,
+            test_file_rel,
+            None,
+            None,
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+            toolchain::VITEST,
+            runner_config_candidates(toolchain::VITEST)?,
+        )
+    }
+
+    /// The single most important test in this milestone (per the task): two
+    /// test files in the *same package*, each importing a different sibling
+    /// source file, must get disjoint `""`-group Input sets — proving
+    /// per-test-file, not per-package, granularity. This is exactly what
+    /// Turborepo/Nx cannot do (package granularity only).
+    #[test]
+    fn test_deps_config_scopes_to_one_test_file_not_the_whole_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(dir.path(), "packages/a/src/a.ts", "export const a = 1;\n");
+        write(dir.path(), "packages/a/src/b.ts", "export const b = 2;\n");
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { a } from './a';\ntest('a', () => a);\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/b.test.ts",
+            "import { b } from './b';\ntest('b', () => b);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps_a, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config for a.test.ts");
+        let (deps_b, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/b.test.ts",
+        )
+        .expect("build test deps config for b.test.ts");
+
+        let src_a = dep_addrs(&deps_a, "");
+        let src_b = dep_addrs(&deps_b, "");
+
+        assert!(
+            src_a.iter().any(|a| a.contains("a.test.ts"))
+                && src_a.iter().any(|a| a.contains("src/a.ts")),
+            "{src_a:?}"
+        );
+        assert!(
+            !src_a
+                .iter()
+                .any(|a| a.contains("b.test.ts") || a.contains("src/b.ts")),
+            "a.test.ts's own closure must not include b.test.ts or b.ts: {src_a:?}"
+        );
+
+        assert!(
+            src_b.iter().any(|a| a.contains("b.test.ts"))
+                && src_b.iter().any(|a| a.contains("src/b.ts")),
+            "{src_b:?}"
+        );
+        assert!(
+            !src_b
+                .iter()
+                .any(|a| a.contains("a.test.ts") || a.contains("src/a.ts")),
+            "b.test.ts's own closure must not include a.test.ts or a.ts: {src_b:?}"
+        );
+    }
+
+    /// A file reached transitively (not just directly imported) must still
+    /// be declared — the closure follows the whole chain, not one hop.
+    #[test]
+    fn test_deps_config_includes_transitively_imported_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/deep.ts",
+            "export const deep = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/helper.ts",
+            "export { deep } from './deep';\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import { deep } from './helper';\ntest('a', () => deep);\n",
+        );
+        // An unrelated workspace file elsewhere entirely — must not appear.
+        write(
+            dir.path(),
+            "packages/c/unrelated.ts",
+            "export const z = 1;\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        let src_addrs = dep_addrs(&deps, "");
+        assert!(
+            src_addrs.iter().any(|a| a.contains("helper.ts")),
+            "{src_addrs:?}"
+        );
+        assert!(
+            src_addrs.iter().any(|a| a.contains("deep.ts")),
+            "a transitively-reached file must be declared: {src_addrs:?}"
+        );
+        assert!(
+            !src_addrs.iter().any(|a| a.contains("unrelated")),
+            "an unrelated workspace file must not be a declared input: {src_addrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_deps_config_includes_runner_config_group_and_content_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "export default { test: {} };\n",
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, runner_config_path, runner_config_content) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        assert_eq!(runner_config_path, "vitest.config.ts");
+        assert_eq!(runner_config_content, "export default { test: {} };\n");
+        let runner_config_addrs = dep_addrs(&deps, "runner_config");
+        assert_eq!(runner_config_addrs.len(), 1);
+        assert!(runner_config_addrs[0].contains("vitest.config.ts"));
+    }
+
+    #[test]
+    fn test_deps_config_no_runner_config_group_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, runner_config_path, runner_config_content) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        assert!(runner_config_path.is_empty());
+        assert!(runner_config_content.is_empty());
+        assert!(!deps.contains_key("runner_config"));
+    }
+
+    /// Same lesson as `typecheck_deps_config_declares_thirdparty_type_input_with_no_ambient_node_modules`:
+    /// an unresolved third-party import (no `node_modules` on disk at all)
+    /// must still be resolved to a `js_install` Input via the lockfile —
+    /// never by walking `oxc_resolver` paths against an absent ambient
+    /// `node_modules` (the M3-review lesson this task explicitly calls out).
+    #[test]
+    fn test_deps_config_declares_thirdparty_input_with_no_ambient_node_modules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "devDependencies": {"lodash": "^4.17.21"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "import _ from 'lodash';\ntest('a', () => _.identity(1));\n",
+        );
+        // Deliberately no `node_modules` anywhere in this fixture.
+
+        let lockfile = Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lockfile");
+        let resolved_graph = lockfile.resolved_graph();
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _) = test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+            Some(&lockfile),
+            Some(&resolved_graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+            toolchain::VITEST,
+            runner_config_candidates(toolchain::VITEST).expect("vitest is supported"),
+        )
+        .expect("build test deps config");
+
+        let external_addrs = dep_addrs(&deps, "external");
+        assert!(
+            external_addrs
+                .iter()
+                .any(|a| a.contains("lodash") && a.contains("js_install")),
+            "an unresolved third-party import must still declare a js_install Input even absent \
+             ambient node_modules: {external_addrs:?}"
+        );
+    }
+
+    #[test]
+    fn runner_config_candidates_covers_both_supported_runners() {
+        assert!(
+            runner_config_candidates(toolchain::VITEST)
+                .expect("vitest is supported")
+                .contains(&"vitest.config.ts")
+        );
+        assert!(
+            runner_config_candidates(toolchain::JEST)
+                .expect("jest is supported")
+                .contains(&"jest.config.js")
+        );
+    }
+
+    #[test]
+    fn runner_config_candidates_errors_on_unsupported_testrunner() {
+        runner_config_candidates("mocha").expect_err("mocha must not be supported");
+    }
+
+    // ---- Provider::list / Provider::get: js_test per-test-file target discovery ----
+
+    #[tokio::test]
+    async fn list_discovers_one_js_test_target_per_matched_test_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "export const x = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.test.ts",
+            "test('x', () => 1);\n",
+        );
+        write(
+            dir.path(),
+            "packages/a/src/other.spec.ts",
+            "test('y', () => 1);\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let iter = provider
+            .list(
+                ListRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from("packages/a"),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("list");
+        let addrs: Vec<Addr> = iter.map(|r| r.expect("no per-entry error").addr).collect();
+
+        let test_addrs: Vec<&Addr> = addrs.iter().filter(|a| a.name == TEST_TARGET).collect();
+        assert_eq!(test_addrs.len(), 2, "{addrs:?}");
+        let files: Vec<&String> = test_addrs
+            .iter()
+            .filter_map(|a| a.args.get("file"))
+            .collect();
+        assert!(files.iter().any(|f| f.contains("index.test.ts")));
+        assert!(files.iter().any(|f| f.contains("other.spec.ts")));
+        // The package_info target must still be present too.
+        assert!(addrs.iter().any(|a| a.name == PACKAGE_INFO_TARGET));
+    }
+
+    #[tokio::test]
+    async fn get_js_test_not_found_for_nonexistent_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert(
+            "file".to_string(),
+            "packages/a/src/does-not-exist.test.ts".to_string(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), TEST_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(matches!(result, Err(GetError::NotFound)));
+    }
+
+    // ---- `js_test` addr `file` arg: path-escape / sandbox-isolation
+    // rejection (code-quality review BLOCKER) ----
+
+    #[test]
+    fn reject_path_escape_allows_plain_relative_path() {
+        reject_path_escape("file", "packages/a/src/index.test.ts")
+            .expect("plain workspace-relative path is fine");
+    }
+
+    #[test]
+    fn reject_path_escape_rejects_absolute_path() {
+        reject_path_escape("file", "/etc/passwd").expect_err("absolute path must be rejected");
+    }
+
+    #[test]
+    fn reject_path_escape_rejects_dotdot_escape_anywhere_in_the_path() {
+        reject_path_escape("file", "../../../../etc/passwd")
+            .expect_err("a leading `..` escape must be rejected");
+        reject_path_escape("file", "packages/a/../../../etc/passwd").expect_err(
+            "a `..` component anywhere in the path must be rejected, not just a leading one",
+        );
+    }
+
+    #[test]
+    fn test_file_under_package_confines_to_the_addressed_package() {
+        assert!(test_file_under_package(
+            "packages/a",
+            "packages/a/src/index.test.ts"
+        ));
+        assert!(!test_file_under_package(
+            "packages/a",
+            "packages/b/src/index.ts"
+        ));
+        // A sibling directory that merely shares a prefix with the package
+        // name must not be treated as "under" it.
+        assert!(!test_file_under_package(
+            "packages/a",
+            "packages/a-other/src/index.ts"
+        ));
+        assert!(test_file_under_package("", "packages/a/src/index.test.ts"));
+    }
+
+    #[tokio::test]
+    async fn get_js_test_rejects_absolute_file_arg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert("file".to_string(), "/etc/passwd".to_string());
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), TEST_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::Other(_))),
+            "an absolute `file` arg must be rejected outright, never resolved against the real \
+             host filesystem via `Path::join`'s absolute-replaces-base semantics"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_js_test_rejects_dotdot_escaping_file_arg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert(
+            "file".to_string(),
+            "packages/a/../../../../../../etc/passwd".to_string(),
+        );
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), TEST_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::Other(_))),
+            "a `..`-escaping `file` arg must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_js_test_rejects_file_outside_addressed_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(dir.path(), "packages/b/package.json", r#"{"name": "b"}"#);
+        write(
+            dir.path(),
+            "packages/b/src/index.ts",
+            "export const x = 1;\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert("file".to_string(), "packages/b/src/index.ts".to_string());
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), TEST_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GetError::Other(_))),
+            "a real, existing file belonging to a different package must not be addressable as \
+             packages/a's own js_test target"
+        );
+    }
+
+    // ---- `Provider::from_options`: fail fast on an unsupported `testrunner`
+    // (feature-quality review) ----
+
+    #[test]
+    fn from_options_rejects_unsupported_testrunner() {
+        let mut opts: hplugin::config::Options = BTreeMap::new();
+        opts.insert(
+            "pkgmanager".to_string(),
+            serde_yaml::Value::String("npm".to_string()),
+        );
+        opts.insert(
+            "testrunner".to_string(),
+            serde_yaml::Value::String("mocha".to_string()),
+        );
+        let walker = Arc::new(CachedWalker::disabled());
+        let result =
+            Provider::from_options(PathBuf::from("/does-not-matter"), &[], &[], &opts, walker);
+        match result {
+            Err(err) => assert!(
+                err.to_string().contains("testrunner"),
+                "error should name the rejected option: {err}"
+            ),
+            Ok(_) => panic!(
+                "mocha is not a supported testrunner — Provider::from_options must fail fast at \
+                 construction time, not defer to Provider::get"
+            ),
+        }
+    }
+
+    // ---- hermeticity M4 review: `js_test`'s runner-config resolution/scoping ----
+
+    #[test]
+    fn runner_config_candidates_includes_vite_config_fallback_for_vitest() {
+        let candidates = runner_config_candidates(toolchain::VITEST).expect("vitest is supported");
+        assert!(
+            candidates.contains(&"vite.config.ts"),
+            "vitest's documented `vite.config.ts`-only fallback must be checked too: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_deps_config_falls_back_to_vite_config_when_no_dedicated_vitest_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "vite.config.ts",
+            "export default { test: { environment: 'node' } };\n",
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (_, runner_config_path, runner_config_content) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        assert_eq!(runner_config_path, "vite.config.ts");
+        assert!(runner_config_content.contains("environment"));
+    }
+
+    #[test]
+    fn test_deps_config_falls_back_to_jest_field_in_package_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "jest": {"testEnvironment": "node"}}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, runner_config_path, runner_config_content) = test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+            None,
+            None,
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+            toolchain::JEST,
+            runner_config_candidates(toolchain::JEST).expect("jest is supported"),
+        )
+        .expect("build test deps config");
+
+        assert_eq!(runner_config_path, "package.json");
+        assert!(runner_config_content.contains("testEnvironment"));
+        let runner_config_addrs = dep_addrs(&deps, "runner_config");
+        assert_eq!(runner_config_addrs.len(), 1);
+        assert!(runner_config_addrs[0].contains("package.json"));
+    }
+
+    #[test]
+    fn test_deps_config_declares_setup_files_referenced_by_runner_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "export default { test: { setupFiles: ['./vitest.setup.ts'] } };\n",
+        );
+        write(
+            dir.path(),
+            "vitest.setup.ts",
+            "globalThis.__setup = true;\n",
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        let runner_config_addrs = dep_addrs(&deps, "runner_config");
+        assert_eq!(runner_config_addrs.len(), 2, "{runner_config_addrs:?}");
+        assert!(
+            runner_config_addrs
+                .iter()
+                .any(|a| a.contains("vitest.config.ts"))
+        );
+        assert!(
+            runner_config_addrs
+                .iter()
+                .any(|a| a.contains("vitest.setup.ts")),
+            "a setupFiles-referenced file must be declared as its own Input too, or editing it \
+             would produce a stale cache hit: {runner_config_addrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_deps_config_declares_base_config_reached_via_relative_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "vitest.config.base.ts",
+            "export default { test: { globals: true } };\n",
+        );
+        write(
+            dir.path(),
+            "vitest.config.ts",
+            "import base from './vitest.config.base';\nexport default base;\n",
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/a.test.ts",
+            "test('a', () => 1);\n",
+        );
+
+        let walker = CachedWalker::disabled();
+        let (deps, _, _) = call_test_deps_config(
+            &walker,
+            dir.path(),
+            "packages/a",
+            "packages/a/src/a.test.ts",
+        )
+        .expect("build test deps config");
+
+        let runner_config_addrs = dep_addrs(&deps, "runner_config");
+        assert!(
+            runner_config_addrs
+                .iter()
+                .any(|a| a.contains("vitest.config.base.ts")),
+            "a shared base config reached via a relative import inside the leaf config must be \
+             declared too: {runner_config_addrs:?}"
+        );
+    }
+
+    // ---- `Provider::get` end to end for `js_test` — gated on a real
+    // vitest/jest binary being available in this devenv (querying
+    // `--version` is unavoidably a real subprocess call), unlike the
+    // Input-scoping tests above.
+
+    fn find_real_bin_for_test(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join(name);
+            if std::fs::metadata(&cand)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real `vitest` on PATH — devenv.nix provisions no Node/vitest \
+                toolchain (see toolchain.rs module docs); run explicitly with \
+                `cargo test -- --ignored` on a host with vitest installed"]
+    async fn get_resolves_js_test_target_end_to_end() {
+        find_real_bin_for_test("vitest").expect(
+            "this test is #[ignore]d precisely because vitest isn't guaranteed on PATH — it was \
+             run explicitly, so a missing vitest here is a real failure, not a skip",
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.test.ts",
+            "test('x', () => 1);\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let mut args = BTreeMap::new();
+        args.insert(
+            "file".to_string(),
+            "packages/a/src/index.test.ts".to_string(),
+        );
+        let resp = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(PkgBuf::from("packages/a"), TEST_TARGET.to_string(), args),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("get js_test target_spec");
+        assert_eq!(resp.target_spec.driver, "js_test");
+        assert!(resp.target_spec.config.contains_key("runner_version"));
     }
 }
