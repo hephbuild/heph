@@ -7,7 +7,7 @@
 //! spans, but it does not need the buffer to *evaluate* (it works mid-edit, the
 //! moment a bad key is typed, exactly like the textual completion does).
 //!
-//! Two checks per recognized call:
+//! Three checks per recognized call:
 //! - **Wrong type** — a keyword argument whose value is a literal that doesn't
 //!   match the field's declared [`ParamType`]. Non-literal values (variables,
 //!   concatenations, calls) carry no statically-known type, so they're left alone.
@@ -16,6 +16,12 @@
 //!   resolved from a string-literal `driver=` / `provider=` argument and its schema
 //!   is available. Otherwise the key might legitimately belong to an unresolved
 //!   schema, so we stay silent rather than risk a false positive.
+//! - **Missing required key** — a required field (a base field, or a driver/
+//!   provider-schema field once resolved) with no keyword argument supplying
+//!   it. Anchored on the call's callee token, since there's no key token to
+//!   underline. Suppressed entirely when the call includes a `*args`/`**kwargs`
+//!   splat — it could supply any key at runtime, so a "missing" field isn't
+//!   necessarily missing.
 
 use crate::pluginbuildfile::run_file::target_base_fields;
 use hcore::htvalue::Value;
@@ -42,15 +48,15 @@ pub(crate) fn validate(ast: &AstModule, engine: &dyn LspEngine) -> Vec<Diagnosti
     // (e.g. inside a list or another call) are covered too.
     ast.statement().visit_expr(|top| {
         walk_expr(top, &mut |e| {
-            if let Expr::Call(callee, args) = &e.node
-                && let Expr::Identifier(id) = &callee.node
+            if let Expr::Call(callee_expr, args) = &e.node
+                && let Expr::Identifier(id) = &callee_expr.node
             {
                 let callee = match id.node.ident.as_str() {
                     "target" => Callee::Target,
                     "provider_state" => Callee::ProviderState,
                     _ => return,
                 };
-                check_call(ast, engine, &args.args, callee, &mut out);
+                check_call(ast, engine, callee_expr.span, &args.args, callee, &mut out);
             }
         });
     });
@@ -67,27 +73,49 @@ fn walk_expr<'a>(e: &'a AstExpr, f: &mut impl FnMut(&'a AstExpr)) {
 fn check_call(
     ast: &AstModule,
     engine: &dyn LspEngine,
+    callee_span: Span,
     args: &[AstArgument],
     callee: Callee,
     out: &mut Vec<Diagnostic>,
 ) {
-    // The known fields (name → type) and whether that set is exhaustive.
-    let mut known: Vec<(String, ParamType)> = Vec::new();
+    // The known fields (name, type, required). Base fields (`target`'s
+    // `name`/`driver`/…, or `provider_state`'s `provider`) are always pushed
+    // first; `base_count` marks where they end and driver/provider-schema
+    // fields begin, so a missing-required message can attribute a field to
+    // the right source without formatting/cloning a label for every field up
+    // front — only the (at most one) field that's actually missing needs it.
+    let mut known: Vec<(String, ParamType, bool)> = Vec::new();
+    let base_label: &str;
+    let base_count: usize;
+    let mut schema_label: Option<String> = None;
     let complete;
     let ctx;
     match callee {
         Callee::Target => {
-            known.extend(target_base_fields().into_iter().map(|f| (f.name, f.ty)));
+            base_label = "`target`";
+            known.extend(
+                target_base_fields()
+                    .into_iter()
+                    .map(|f| (f.name, f.ty, f.required)),
+            );
+            base_count = known.len();
             // Driver-specific config fields are only known once the driver is
             // resolved from a string-literal `driver=`. Without it (or with an
-            // unknown driver) any extra key might be a valid driver field.
+            // unknown driver) any extra key might be a valid driver field, and
+            // we can't tell whether the driver's required fields are missing.
             match named_str_literal(args, "driver")
                 .and_then(|d| engine.driver_schema(&d).map(|s| (d, s)))
             {
                 Some((driver, schema)) => {
-                    known.extend(schema.fields.into_iter().map(|f| (f.name, f.ty)));
+                    known.extend(
+                        schema
+                            .fields
+                            .into_iter()
+                            .map(|f| (f.name, f.ty, f.required)),
+                    );
                     complete = true;
                     ctx = format!("`target` or the `{driver}` driver");
+                    schema_label = Some(format!("the `{driver}` driver"));
                 }
                 None => {
                     complete = false;
@@ -96,15 +124,23 @@ fn check_call(
             }
         }
         Callee::ProviderState => {
-            // `provider` is always a valid (string) key.
-            known.push(("provider".to_string(), ParamType::String));
+            base_label = "`provider_state`";
+            // `provider` is always a valid (string) key, and required.
+            known.push(("provider".to_string(), ParamType::String, true));
+            base_count = known.len();
             match named_str_literal(args, "provider")
                 .and_then(|p| engine.provider_state_schema(&p).map(|s| (p, s)))
             {
                 Some((provider, schema)) => {
-                    known.extend(schema.fields.into_iter().map(|f| (f.name, f.ty)));
+                    known.extend(
+                        schema
+                            .fields
+                            .into_iter()
+                            .map(|f| (f.name, f.ty, f.required)),
+                    );
                     complete = true;
                     ctx = format!("the `{provider}` provider");
+                    schema_label = Some(format!("the `{provider}` provider"));
                 }
                 None => {
                     complete = false;
@@ -114,33 +150,69 @@ fn check_call(
         }
     }
 
+    let mut provided: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // A `*args`/`**kwargs` splat could supply any key at runtime, so a missing
+    // key isn't necessarily missing — stay silent rather than risk a false
+    // positive.
+    let mut has_splat = false;
+
     for arg in args {
-        let Argument::Named(name, value) = &arg.node else {
-            continue;
-        };
-        let key = name.node.as_str();
-        match known.iter().find(|(n, _)| n == key) {
-            // A known field: flag a literal value whose type doesn't match.
-            Some((_, ty)) => {
-                if let Some(v) = literal_value(value)
-                    && !value_matches(ty, &v)
-                {
-                    out.push(diag(
-                        ast,
-                        value.span,
-                        format!("`{key}` expects {}, got {}", ty.render(), value_kind(&v)),
-                    ));
+        match &arg.node {
+            Argument::Named(name, value) => {
+                let key = name.node.as_str();
+                provided.insert(key);
+                match known.iter().find(|(n, _, _)| n == key) {
+                    // A known field: flag a literal value whose type doesn't match.
+                    Some((_, ty, _)) => {
+                        if let Some(v) = literal_value(value)
+                            && !value_matches(ty, &v)
+                        {
+                            out.push(diag(
+                                ast,
+                                value.span,
+                                format!("`{key}` expects {}, got {}", ty.render(), value_kind(&v)),
+                            ));
+                        }
+                    }
+                    // An unknown key — only an error when the valid set is exhaustive.
+                    None if complete => {
+                        out.push(diag(
+                            ast,
+                            name.span,
+                            format!("unknown field `{key}` for {ctx}"),
+                        ));
+                    }
+                    None => {}
                 }
             }
-            // An unknown key — only an error when the valid set is exhaustive.
-            None if complete => {
+            Argument::Args(_) | Argument::KwArgs(_) => has_splat = true,
+            Argument::Positional(_) => {}
+        }
+    }
+
+    if !has_splat {
+        // A schema field can share a name with a base field (unusual, but not
+        // forbidden); on collision the base field wins, mirroring the
+        // first-match `.find()` lookup used for type-checking above.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (i, (name, _, required)) in known.iter().enumerate() {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            if *required && !provided.contains(name.as_str()) {
+                let label = if i < base_count {
+                    base_label
+                } else {
+                    schema_label.as_deref().expect(
+                        "schema fields are only appended to `known` once resolved, alongside `schema_label`",
+                    )
+                };
                 out.push(diag(
                     ast,
-                    name.span,
-                    format!("unknown field `{key}` for {ctx}"),
+                    callee_span,
+                    format!("missing required field `{name}` for {label}"),
                 ));
             }
-            None => {}
         }
     }
 }
@@ -279,25 +351,39 @@ mod tests {
             std::sync::Arc::new(hplugin::provider::ProviderFunctionRegistry::default())
         }
         fn driver_schema(&self, name: &str) -> Option<DriverSchema> {
-            (name == "exec").then(|| DriverSchema {
-                fields: vec![
-                    DriverField {
-                        name: "cmd".to_string(),
-                        ty: ParamType::String,
+            match name {
+                "exec" => Some(DriverSchema {
+                    fields: vec![
+                        DriverField {
+                            name: "cmd".to_string(),
+                            ty: ParamType::String,
+                            doc: String::new(),
+                            required: true,
+                        },
+                        DriverField {
+                            name: "verbose".to_string(),
+                            ty: ParamType::Bool,
+                            doc: String::new(),
+                            required: false,
+                        },
+                    ],
+                }),
+                // A required field that collides with a base `target` field
+                // name — exercises the dedup/first-wins path in the
+                // missing-required check.
+                "shadow" => Some(DriverSchema {
+                    fields: vec![DriverField {
+                        name: "name".to_string(),
+                        ty: ParamType::Int,
                         doc: String::new(),
                         required: true,
-                    },
-                    DriverField {
-                        name: "verbose".to_string(),
-                        ty: ParamType::Bool,
-                        doc: String::new(),
-                        required: false,
-                    },
-                ],
-            })
+                    }],
+                }),
+                _ => None,
+            }
         }
         fn driver_names(&self) -> Vec<String> {
-            vec!["exec".to_string()]
+            vec!["exec".to_string(), "shadow".to_string()]
         }
         fn provider_state_schema(&self, name: &str) -> Option<StateSchema> {
             (name == "go").then(|| StateSchema {
@@ -378,7 +464,9 @@ mod tests {
     #[test]
     fn non_literal_value_is_not_type_checked() {
         // A concatenation has no statically-known type → no false positive.
-        let msgs = messages("target(name = PREFIX + \"_t\", driver = \"exec\")\n");
+        // `cmd` is supplied so this doesn't also trip the missing-required check.
+        let msgs =
+            messages("target(name = PREFIX + \"_t\", driver = \"exec\", cmd = \"echo hi\")\n");
         assert!(
             msgs.is_empty(),
             "non-literal value must be skipped, got {msgs:?}"
@@ -413,6 +501,129 @@ mod tests {
     }
 
     #[test]
+    fn missing_required_driver_field_is_flagged() {
+        // `exec` requires `cmd`; the driver is selected but `cmd` is absent.
+        let msgs = messages("target(name = \"t\", driver = \"exec\")\n");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("missing required field `cmd`") && m.contains("`exec` driver")),
+            "expected missing-required error for cmd, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_driver_field_is_silent_when_driver_unresolved() {
+        // No driver selected → the driver's required fields are unknown, so no
+        // missing-required error for them (only the base `name` field is checked).
+        let msgs = messages("target(name = \"t\")\n");
+        assert!(
+            msgs.is_empty(),
+            "must not guess required driver fields without a driver, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_base_field_is_flagged() {
+        // `name` is always required, driver or not.
+        let msgs = messages("target(driver = \"exec\", cmd = \"echo hi\")\n");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("missing required field `name`")),
+            "expected missing-required error for name, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_field_is_silent_with_kwargs_splat() {
+        // A `**kwargs`-style splat could supply `cmd` at runtime — stay silent.
+        let msgs = messages("target(name = \"t\", driver = \"exec\", **extra)\n");
+        assert!(
+            msgs.is_empty(),
+            "a splat argument must suppress the missing-required check, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_field_is_silent_with_args_splat() {
+        // A bare `*args` splat is the same shape as `**kwargs` here.
+        let msgs = messages("target(name = \"t\", driver = \"exec\", *extra)\n");
+        assert!(
+            msgs.is_empty(),
+            "a positional splat must also suppress the missing-required check, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_driver_field_is_silent_for_unknown_driver() {
+        // An unresolvable driver name is just as unknowable as no driver at
+        // all — the unknown-key check already stays silent here (see
+        // `unknown_target_field_is_silent_when_driver_unresolved`); the
+        // missing-required check must too.
+        let msgs = messages("target(name = \"t\", driver = \"nope\")\n");
+        assert!(
+            msgs.is_empty(),
+            "must not guess required fields for an unresolvable driver, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_field_on_shadowed_base_field_reports_once() {
+        // `shadow`'s required `name` field collides with the base `name`
+        // field; omitting `name` entirely must produce exactly one
+        // missing-required diagnostic for it, not one per source.
+        let msgs = messages("target(driver = \"shadow\")\n");
+        let name_msgs: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.contains("missing required field `name`"))
+            .collect();
+        assert_eq!(
+            name_msgs.len(),
+            1,
+            "expected exactly one missing-required diagnostic for the shadowed field, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn missing_required_field_on_multiline_call_anchors_on_callee_token() {
+        // The diagnostic must land on the `target` token (line 0), regardless
+        // of which line the call's arguments span.
+        let content = "target(\n    name = \"t\",\n    driver = \"exec\",\n)\n";
+        let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
+        let diags = validate(&ast, &FakeEngine);
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("missing required field `cmd`"))
+            .expect("missing-cmd diagnostic");
+        assert_eq!(
+            d.range.start.line, 0,
+            "must anchor on the `target` token line"
+        );
+        assert_eq!(d.range.start.character, 0);
+        assert_eq!(d.range.end.character, "target".len() as u32);
+    }
+
+    #[test]
+    fn missing_required_field_fires_inside_list_comprehension() {
+        // The AST walk covers comprehension bodies, not just top-level calls.
+        let msgs = messages("y = [target(name = str(i), driver = \"exec\") for i in [1, 2]]\n");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("missing required field `cmd`")),
+            "expected missing-required to fire inside a list comprehension, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn provider_state_missing_provider_is_flagged() {
+        let msgs = messages("provider_state(bogus = 1)\n");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("missing required field `provider`")),
+            "expected missing-required error for provider, got {msgs:?}"
+        );
+    }
+
+    #[test]
     fn diagnostic_range_targets_the_offending_token() {
         // The unknown-key squiggle must land on the key, not the whole call.
         let content = "target(name = \"t\", driver = \"exec\", bogus = 1)\n";
@@ -432,8 +643,11 @@ mod tests {
     #[test]
     fn list_with_non_literal_element_is_not_type_checked() {
         // labels accepts string | list[string]; a list containing a variable can't
-        // be fully typed, so it must be skipped rather than mis-flagged.
-        let msgs = messages("target(name = \"t\", driver = \"exec\", labels = [\"a\", X])\n");
+        // be fully typed, so it must be skipped rather than mis-flagged. `cmd` is
+        // supplied so this doesn't also trip the missing-required check.
+        let msgs = messages(
+            "target(name = \"t\", driver = \"exec\", cmd = \"echo hi\", labels = [\"a\", X])\n",
+        );
         assert!(
             msgs.is_empty(),
             "partial list must be skipped, got {msgs:?}"
