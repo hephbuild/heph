@@ -940,7 +940,7 @@ mod tests {
     use super::*;
     use crate::engine::Config;
     use crate::engine::local_cache::{
-        Existence, LocalCache, MANIFEST_V1, Manifest, ManifestArtifact,
+        EntryWriter, Existence, LocalCache, MANIFEST_V1, Manifest, ManifestArtifact,
         ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType, PendingWrite,
         SizedReader, TargetStream,
     };
@@ -1052,7 +1052,7 @@ mod tests {
             addr: &Addr,
             hashin: &str,
             name: &str,
-        ) -> anyhow::Result<Box<dyn std::io::Write>> {
+        ) -> anyhow::Result<Box<dyn EntryWriter>> {
             self.inner.writer(addr, hashin, name)
         }
         fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
@@ -1195,7 +1195,7 @@ mod tests {
                 .writer(addr, hashin, name)
                 .expect("writer");
             w.write_all(b"data").expect("write artifact");
-            drop(w);
+            w.commit().expect("commit artifact");
         }
         let manifest = Manifest {
             version: "1.0.0".to_string(),
@@ -1220,7 +1220,7 @@ mod tests {
             .writer(addr, hashin, MANIFEST_V1)
             .expect("manifest writer");
         borsh::to_writer(&mut w, &manifest).expect("write manifest");
-        drop(w);
+        w.commit().expect("commit manifest");
         // Barrier: ensure the write landed before callers enumerate.
         assert!(
             engine
@@ -1875,7 +1875,7 @@ mod tests {
                 .writer(&a, "h1", MANIFEST_V1)
                 .expect("writer");
             w.write_all(b"not a valid borsh manifest").expect("write");
-            drop(w);
+            w.commit().expect("commit");
         }
         write_revision(&engine, &a, "h2", 200, &["o.tar"]);
 
@@ -2168,7 +2168,7 @@ mod tests {
                 .writer(&bad, "h1", MANIFEST_V1)
                 .expect("writer");
             w.write_all(b"not a valid borsh manifest").expect("write");
-            drop(w);
+            w.commit().expect("commit");
             assert!(
                 engine
                     .local_cache
@@ -2207,7 +2207,7 @@ mod tests {
         {
             let mut w = engine.local_cache.writer(&a, "h1", name).expect("writer");
             w.write_all(&big).expect("write blob");
-            drop(w);
+            w.commit().expect("commit blob");
         }
         let manifest = Manifest {
             version: "1.0.0".to_string(),
@@ -2230,7 +2230,7 @@ mod tests {
                 .writer(&a, "h1", MANIFEST_V1)
                 .expect("manifest writer");
             borsh::to_writer(&mut w, &manifest).expect("write manifest");
-            drop(w);
+            w.commit().expect("commit manifest");
         }
         // Barrier + precondition: both the spilled blob and the manifest must
         // have landed before GC. `gc_all` enumerates targets via `list_targets`

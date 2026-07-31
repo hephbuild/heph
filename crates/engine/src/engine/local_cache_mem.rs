@@ -1,4 +1,4 @@
-use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
+use crate::engine::local_cache::{EntryWriter, Existence, LocalCache, SizedReader, TargetStream};
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
@@ -83,11 +83,12 @@ impl LocalCache for LocalCacheMem {
         })
     }
 
-    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
+    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
         let key = Self::key(addr, hashin, name);
-        // Invalidate before forwarding. A reader arriving after this point misses the mem
-        // cache and falls through to the inner backend, which is responsible for its own
-        // read-after-write ordering (e.g. LocalCacheSQLite's PendingTracker).
+        // Invalidate before forwarding, at open rather than at commit. A reader
+        // arriving after this point misses the mem cache and falls through to the
+        // inner backend, which is responsible for its own read-after-write
+        // ordering (e.g. LocalCacheSQLite's PendingTracker).
         self.cache.remove(&key);
         self.inner.writer(addr, hashin, name)
     }
@@ -229,11 +230,12 @@ mod tests {
         }
     }
 
-    impl Drop for VecWriter {
-        fn drop(&mut self) {
+    impl EntryWriter for VecWriter {
+        fn commit(mut self: Box<Self>) -> Result<()> {
             self.store
                 .lock()
                 .insert(self.key.clone(), std::mem::take(&mut self.buf));
+            Ok(())
         }
     }
 
@@ -255,7 +257,7 @@ mod tests {
             }
         }
 
-        fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
+        fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
             self.writer_calls.fetch_add(1, Ordering::Relaxed);
             let key = CountingCache::key(addr, hashin, name);
             Ok(Box::new(VecWriter {
@@ -321,7 +323,7 @@ mod tests {
     fn write_blob(cache: &dyn LocalCache, addr: &Addr, name: &str, data: &[u8]) {
         let mut w = cache.writer(addr, "h1", name).expect("writer");
         w.write_all(data).expect("write");
-        drop(w);
+        w.commit().expect("commit");
     }
 
     /// This tier sits at the top of the cacheable stack, so a method left to the
@@ -465,7 +467,7 @@ mod tests {
                 bytes: Some(self.arc.clone()),
             })
         }
-        fn writer(&self, _: &Addr, _: &str, _: &str) -> Result<Box<dyn io::Write>> {
+        fn writer(&self, _: &Addr, _: &str, _: &str) -> Result<Box<dyn EntryWriter>> {
             unreachable!()
         }
         fn exists(&self, _: &Addr, _: &str, _: &str) -> Result<bool> {

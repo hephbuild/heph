@@ -1834,6 +1834,7 @@ impl Engine {
                 .writer(&addr_owned, &hashin_owned, MANIFEST_V1)
                 .context("open local writer for remote manifest")?;
             w.write_all(&bytes).context("write remote manifest")?;
+            w.commit().context("commit remote manifest")?;
             anyhow::Ok(())
         })
         .await
@@ -1891,9 +1892,9 @@ impl Engine {
     /// The [`TempBlob`] is handed **into** the decode closure rather than held
     /// here. Once [`run_codec`] has queued the job it runs whatever the caller
     /// does, so a guard left on this side would unlink the temp out from under a
-    /// decode that is about to read it — and the local-cache writer publishes
-    /// what it has when dropped, so that loses the race by writing an empty blob
-    /// over a manifest that already claims the artifact is present.
+    /// decode that is about to read it — turning a served blob into a spurious
+    /// decode failure. (The local-cache writer commits only on success, so the
+    /// failed decode at least discards rather than publishing a truncated blob.)
     async fn pull_remote_blob(
         &self,
         ctoken: &dyn Cancellable,
@@ -1940,6 +1941,8 @@ impl Engine {
                 _ => copy_file_to(temp.path(), &mut w)
                     .with_context(|| format!("write downloaded blob {name_owned}"))?,
             }
+            w.commit()
+                .with_context(|| format!("commit downloaded blob {name_owned}"))?;
             Ok(())
         })
         .await

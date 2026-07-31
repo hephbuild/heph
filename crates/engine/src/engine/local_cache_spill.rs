@@ -43,7 +43,7 @@
 //! ephemeral tmp store, not this one.
 
 use crate::engine::local_cache::{
-    Existence, LocalCache, MANIFEST_V1, NotFoundError, SizedReader, TargetStream,
+    EntryWriter, Existence, LocalCache, MANIFEST_V1, NotFoundError, SizedReader, TargetStream,
 };
 use crate::engine::local_cache_fs::LocalCacheFS;
 use anyhow::{Context, Result};
@@ -89,7 +89,7 @@ impl LocalCache for LocalCacheSpill {
         }
     }
 
-    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
+    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
         // The manifest is the GC index — keep it in the primary unconditionally.
         if Self::is_manifest(name) {
             return self.primary.writer(addr, hashin, name);
@@ -242,9 +242,9 @@ struct SpillWriter {
     /// Bytes written so far, used only to detect the threshold crossing.
     size: usize,
     /// Open until the blob spills; `None` afterwards.
-    primary_writer: Option<Box<dyn io::Write>>,
+    primary_writer: Option<Box<dyn EntryWriter>>,
     /// `Some` once spilled; further writes stream directly into it.
-    blob_writer: Option<Box<dyn io::Write>>,
+    blob_writer: Option<Box<dyn EntryWriter>>,
 }
 
 impl SpillWriter {
@@ -252,15 +252,16 @@ impl SpillWriter {
     /// prefix, copy it into a fresh FS writer, drop it from the primary, and
     /// retain the FS writer for the remaining bytes.
     fn spill(&mut self) -> io::Result<()> {
-        // Commit the staged prefix to the primary so it can be read back. The
-        // sqlite writer persists on drop; its PendingTracker makes the following
+        // Commit the staged prefix to the primary so it can be read back — the
+        // one mid-stream commit in the protocol, and it is deleted again below
+        // once copied. The sqlite writer's PendingTracker makes the following
         // reader/delete wait for that write to land.
         let mut pw = self
             .primary_writer
             .take()
             .expect("spill called without an open primary writer");
         pw.flush()?;
-        drop(pw);
+        pw.commit().map_err(io::Error::other)?;
 
         let mut blob_writer = self
             .blobs
@@ -316,17 +317,25 @@ impl io::Write for SpillWriter {
     }
 }
 
-impl Drop for SpillWriter {
-    fn drop(&mut self) {
-        // Whichever backend writer is open owns the bytes; flushing + dropping it
-        // persists the blob (the sqlite writer commits on drop, the FS file is
-        // already on disk). Nothing is staged in `self`, so there is no
-        // finalize-time write that could fail here.
-        if let Some(mut w) = self.blob_writer.take() {
-            drop(w.flush());
-        } else if let Some(mut w) = self.primary_writer.take() {
-            drop(w.flush());
-        }
+impl EntryWriter for SpillWriter {
+    fn commit(mut self: Box<Self>) -> Result<()> {
+        // Whichever backend writer is open owns the bytes; committing it makes
+        // the blob durable in its final home. Nothing is staged in `self`.
+        // Dropped without commit, that same writer discards its staging — an
+        // abandoned blob lands in neither backend.
+        let (w, backend) = match (self.blob_writer.take(), self.primary_writer.take()) {
+            (Some(w), _) => (w, "spilled"),
+            (None, Some(w)) => (w, "primary"),
+            // `spill` always leaves exactly one backend writer open, and commit
+            // consumes `self` — so this is unreachable short of a logic bug.
+            (None, None) => anyhow::bail!(
+                "spill writer for {} {} has no open backend writer to commit",
+                self.addr,
+                self.name
+            ),
+        };
+        w.commit()
+            .with_context(|| format!("commit {backend} blob {} for {}", self.name, self.addr))
     }
 }
 
@@ -371,7 +380,7 @@ mod tests {
     fn write(cache: &dyn LocalCache, a: &Addr, name: &str, data: &[u8]) {
         let mut w = cache.writer(a, "h", name).expect("writer");
         w.write_all(data).expect("write");
-        drop(w);
+        w.commit().expect("commit");
     }
 
     fn read(cache: &dyn LocalCache, a: &Addr, name: &str) -> Vec<u8> {
@@ -531,7 +540,7 @@ mod tests {
         for _ in 0..20 {
             w.write_all(&[7u8; 10]).expect("chunk"); // 200 bytes total
         }
-        drop(w);
+        w.commit().expect("commit");
 
         assert!(
             fs.exists(&a, "h", "blob").expect("ex"),

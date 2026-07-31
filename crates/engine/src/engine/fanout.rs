@@ -66,6 +66,11 @@ where
     }
     if errs.is_empty() {
         Ok(ok)
+    } else if errs.len() == 1 {
+        // A sole failure surfaces directly: wrapping it renders as
+        // "1 errors:\n  [0] …" mid-chain, and every downstream `MultiError`
+        // consumer treats a singleton exactly like the bare error anyway.
+        Err(errs.pop().expect("len checked"))
     } else {
         Err(MultiError(errs).into())
     }
@@ -106,6 +111,17 @@ mod tests {
         let rendered = format!("{multi}");
         assert!(rendered.contains("first"), "got: {rendered}");
         assert!(rendered.contains("second"), "got: {rendered}");
+    }
+
+    /// A sole failure comes back bare — not wrapped in a `MultiError` whose
+    /// Display ("1 errors:") is noise mid-chain for the most common case.
+    #[tokio::test]
+    async fn fail_fast_false_returns_a_sole_error_unwrapped() {
+        let futs: Vec<BoxFuture<'static, anyhow::Result<i32>>> =
+            vec![boxed(Ok(1)), boxed(Err(anyhow::anyhow!("only")))];
+        let err = join_all_failable(futs, false).await.unwrap_err();
+        assert!(err.downcast_ref::<MultiError>().is_none());
+        assert!(err.to_string().contains("only"));
     }
 
     #[tokio::test]

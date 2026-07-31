@@ -1084,7 +1084,7 @@ mod tests {
                 .writer(&a, hashin, crate::engine::local_cache::MANIFEST_V1)
                 .expect("manifest writer");
             std::io::Write::write_all(&mut w, b"x").expect("write");
-            drop(w);
+            w.commit().expect("commit");
             assert!(
                 engine
                     .local_cache

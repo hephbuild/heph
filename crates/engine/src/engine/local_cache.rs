@@ -31,6 +31,12 @@ impl<W: io::Write> CountingWriter<W> {
     fn bytes_written(&self) -> u64 {
         self.count
     }
+
+    /// Hand back the wrapped writer, so a caller that finished a pack can
+    /// [`EntryWriter::commit`] it.
+    fn into_inner(self) -> W {
+        self.inner
+    }
 }
 
 impl<W: io::Write> io::Write for CountingWriter<W> {
@@ -180,9 +186,21 @@ pub enum Existence {
     Queued(PendingWrite),
 }
 
+/// A cache-entry writer. The entry becomes durable only on [`commit`](Self::commit);
+/// dropping without commit discards everything written. This is what keeps a
+/// mid-stream failure or an abandoned attempt from ever surfacing as (or
+/// replacing!) a readable entry: the blocking pool runs jobs to completion even
+/// when their awaiting future is dropped, so "the caller stopped" must never
+/// imply "the bytes landed".
+pub trait EntryWriter: io::Write + Send {
+    /// Make the entry durable. Consumes the writer; errors are the write's.
+    fn commit(self: Box<Self>) -> anyhow::Result<()>;
+}
+
 pub trait LocalCache: Send + Sync {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader>;
-    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Write>>;
+    fn writer(&self, addr: &Addr, hashin: &str, name: &str)
+    -> anyhow::Result<Box<dyn EntryWriter>>;
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool>;
     /// [`exists`](Self::exists), minus the wait on the backend's write-behind
     /// queue — it reports the queue instead of blocking on it, so it is safe to
@@ -383,6 +401,46 @@ fn artifact_is_needed(a: &ManifestArtifact, outputs: &[String], support_needed: 
     }
 }
 
+/// Concurrent local pack jobs (tar/copy of one artifact into the cache).
+///
+/// Same convention as `CODEC_SLOTS` (remote gzip) and `PKG_EVAL_SLOTS`
+/// (Starlark eval): a class of hundreds-of-ms jobs on the shared, arrival-fair
+/// `hcore::blocking` pool caps itself at the core count so it cannot fill every
+/// pool thread and put the sub-millisecond jobs (warm-hit manifest reads) behind
+/// a queue of long ones. Before `cache_locally` fanned artifacts out this class
+/// was implicitly bounded at one job per running target; the fan-out multiplies
+/// that by artifacts-per-target, so the bound has to be explicit. It also caps
+/// concurrent spool memory, which is allocated inside the job.
+static LOCAL_PACK_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(local_pack_slots()));
+
+fn local_pack_slots() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(8)
+}
+
+/// The cache entry name an artifact's blob is stored under. One place, used by
+/// both the write arms and `cache_locally`'s duplicate check, so the two cannot
+/// drift.
+fn cache_entry_name(artifact: &outputartifact::OutputArtifact) -> String {
+    let type_prefix = match artifact.r#type {
+        outputartifact::Type::Output => "out",
+        outputartifact::Type::Log => "log",
+        outputartifact::Type::SupportFile => "support",
+    };
+    match &artifact.content {
+        // Packed on the way in, so the entry carries the container suffix.
+        outputartifact::Content::Raw(_) | outputartifact::Content::File(_) => {
+            format!("{}_{}.tar", type_prefix, artifact.name)
+        }
+        // Already a container on disk; copied verbatim.
+        outputartifact::Content::TarPath(_) | outputartifact::Content::CpioPath(_) => {
+            format!("{}_{}", type_prefix, artifact.name)
+        }
+    }
+}
+
 impl Engine {
     pub async fn cache_artifact_locally(
         &self,
@@ -393,6 +451,14 @@ impl Engine {
         artifact: &outputartifact::OutputArtifact,
     ) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
         let hashin = hashin.to_string();
+        // Waited for in async-land, before queueing — parking a pool thread to
+        // wait for a pool thread is the deadlock. The permit rides *into* the
+        // job (released on the pool thread) so a caller that stops being polled
+        // cannot strand it; same discipline as `PKG_EVAL_SLOTS`.
+        let slot = LOCAL_PACK_SLOTS
+            .acquire()
+            .await
+            .context("acquiring a local pack slot")?;
         // Writing a revision tars and copies every output — the heaviest
         // synchronous work in a build, once per target. It runs on the dedicated
         // blocking pool: not inline (that parks a runtime worker with the runtime
@@ -401,19 +467,15 @@ impl Engine {
         // waker, observed to drop wakeups on macOS under load — see
         // the macOS waker hazard in `hproc::proc_exec`). See `hcore::blocking`.
         hcore::blocking::run(enclose!((cache => local_cache, addr, artifact) move || {
+            let _slot = slot;
             let open_writer =
-                |name: &str| -> anyhow::Result<Box<dyn io::Write>> {
+                |name: &str| -> anyhow::Result<Box<dyn EntryWriter>> {
                     local_cache.writer(&addr, &hashin, name)
                 };
-            let type_prefix = match artifact.r#type {
-                outputartifact::Type::Output => "out",
-                outputartifact::Type::Log => "log",
-                outputartifact::Type::SupportFile => "support",
-            };
+            let name = cache_entry_name(&artifact);
 
-            let (size, content_type, name) = match &artifact.content {
+            let (size, content_type) = match &artifact.content {
                 outputartifact::Content::Raw(raw) => {
-                    let name = format!("{}_{}.tar", type_prefix, artifact.name);
                     let mut cw = CountingWriter::new(
                         open_writer(&name).with_context(|| {
                             format!("open cache writer for {addr} {name}")
@@ -423,10 +485,13 @@ impl Engine {
                     p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
                     p.pack(&mut cw)
                         .with_context(|| format!("pack raw artifact into {addr} {name}"))?;
-                    (cw.bytes_written(), hartifactcontent::Type::Tar, name)
+                    let size = cw.bytes_written();
+                    cw.into_inner().commit().with_context(|| {
+                        format!("commit raw artifact {addr} {name}")
+                    })?;
+                    (size, hartifactcontent::Type::Tar)
                 }
                 outputartifact::Content::File(file) => {
-                    let name = format!("{}_{}.tar", type_prefix, artifact.name);
                     let mut cw = CountingWriter::new(
                         open_writer(&name).with_context(|| {
                             format!("open cache writer for {addr} {name}")
@@ -440,10 +505,13 @@ impl Engine {
                             file.source_path
                         )
                     })?;
-                    (cw.bytes_written(), hartifactcontent::Type::Tar, name)
+                    let size = cw.bytes_written();
+                    cw.into_inner().commit().with_context(|| {
+                        format!("commit file artifact {addr} {name}")
+                    })?;
+                    (size, hartifactcontent::Type::Tar)
                 }
                 outputartifact::Content::TarPath(path) => {
-                    let name = format!("{}_{}", type_prefix, artifact.name);
                     let mut f = File::open(path)
                         .with_context(|| format!("open tar artifact {path}"))?;
                     let size = f
@@ -455,10 +523,12 @@ impl Engine {
                     io::copy(&mut f, &mut w).with_context(|| {
                         format!("copy tar artifact {path} into {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Tar, name)
+                    w.commit().with_context(|| {
+                        format!("commit tar artifact {addr} {name}")
+                    })?;
+                    (size, hartifactcontent::Type::Tar)
                 }
                 outputartifact::Content::CpioPath(path) => {
-                    let name = format!("{}_{}", type_prefix, artifact.name);
                     let mut f = File::open(path)
                         .with_context(|| format!("open cpio artifact {path}"))?;
                     let size = f
@@ -470,7 +540,10 @@ impl Engine {
                     io::copy(&mut f, &mut w).with_context(|| {
                         format!("copy cpio artifact {path} into {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Cpio, name)
+                    w.commit().with_context(|| {
+                        format!("commit cpio artifact {addr} {name}")
+                    })?;
+                    (size, hartifactcontent::Type::Cpio)
                 }
             };
 
@@ -518,8 +591,24 @@ impl Engine {
         artifacts: Vec<outputartifact::OutputArtifact>,
         tmp: bool,
     ) -> anyhow::Result<Vec<CacheArtifact>> {
-        let mut res_artifacts = Vec::with_capacity(artifacts.len());
-        let mut manifest_artifacts = Vec::with_capacity(artifacts.len());
+        // Two artifacts mapping to one cache entry name used to resolve
+        // deterministically (sequential loop — last one won); under the
+        // concurrent fan-out the winner would be pool scheduling, i.e. the
+        // committed bytes would vary run to run under a manifest that lists
+        // both. A colliding name is a driver bug either way — reject it before
+        // writing anything.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(artifacts.len());
+            for artifact in &artifacts {
+                let name = cache_entry_name(artifact);
+                if !seen.insert(name.clone()) {
+                    anyhow::bail!(
+                        "duplicate cache entry name `{name}` among the artifacts of {addr}: \
+                         artifact names must be unique per (type, name) within a target"
+                    );
+                }
+            }
+        }
 
         let key = if tmp {
             let nanos = time::SystemTime::now()
@@ -542,15 +631,36 @@ impl Engine {
             &self.local_cache
         };
 
-        for artifact in artifacts {
-            let artifact_name = artifact.name.clone();
-            let (cached_artifact, manifest_artifact) = self
-                .cache_artifact_locally(ctoken, cache, addr, &key, &artifact)
-                .await
-                .with_context(|| format!("cache artifact {artifact_name} for {addr}"))?;
-            res_artifacts.push(cached_artifact);
-            manifest_artifacts.push(manifest_artifact);
-        }
+        // All artifacts in flight at once, not one at a time: each write is a
+        // whole tar/copy on the blocking pool, so a multi-output target was
+        // paying its writes back to back while the pool sat idle. Order is
+        // preserved (join over an ordered iterator), so the manifest's artifact
+        // list stays equal to the input order regardless of which write finishes
+        // first — the manifest must not become a function of pool scheduling.
+        //
+        // Wait-all, **never fail-fast**: a `hcore::blocking` job runs to
+        // completion even when its awaiting future is dropped, so a fail-fast
+        // join would return an error while sibling tar jobs are still *reading
+        // the sandbox* — racing the sandbox cleanup that execute runs right
+        // after cache_locally errors. Driving every write to completion keeps
+        // "no artifact job outlives this call" for every *polled-to-completion*
+        // call, and reports every failure rather than the first. Dropping this
+        // future mid-join still detaches up to a pack-slot's worth of submitted
+        // jobs — that is inherent to the pool's run-to-completion contract, and
+        // it is safe because an uncommitted `EntryWriter` discards on drop: a
+        // detached straggler can neither surface a partial blob nor replace a
+        // retry's good one.
+        let key_ref = &key;
+        let written = crate::engine::fanout::join_all_failable(
+            artifacts.iter().map(|artifact| async move {
+                self.cache_artifact_locally(ctoken, cache, addr, key_ref, artifact)
+                    .await
+                    .with_context(|| format!("cache artifact {} for {addr}", artifact.name))
+            }),
+            false,
+        )
+        .await?;
+        let (res_artifacts, manifest_artifacts): (Vec<_>, Vec<_>) = written.into_iter().unzip();
 
         let manifest = Manifest {
             version: "1.0.0".to_string(),
@@ -560,11 +670,27 @@ impl Engine {
             artifacts: manifest_artifacts,
         };
 
+        // Manifest strictly last — it is the revision's commit record, so a
+        // reader that finds it finds every artifact it names, or degrades to a
+        // miss (same invariant as the remote cache's manifest-last upload). The
+        // one exemption: the sqlite writer thread batches transactions, and a
+        // failed *earlier* batch completes its slots and moves on — {manifest
+        // committed, blob absent} is reachable there, and is exactly the state a
+        // remote-mirrored revision starts in; the residency probe
+        // (`missing_local_blobs`) covers both by degrading the hit to a miss.
+        // Written only when every artifact write above succeeded, and written
+        // inline: it lands in the sqlite cache's spooled writer (a memcpy plus a
+        // channel send to the writer thread), so queueing it behind the blocking
+        // pool's tar jobs would only delay the moment dependents can read this
+        // result.
         let mut manifest_writer = cache
             .writer(addr, &key, MANIFEST_V1)
             .with_context(|| format!("open manifest writer for {addr}"))?;
         borsh::to_writer(&mut manifest_writer, &manifest)
             .with_context(|| format!("write manifest for {addr}"))?;
+        manifest_writer
+            .commit()
+            .with_context(|| format!("commit manifest for {addr}"))?;
 
         // Remote push happens on a background task driven from the execute path
         // (see `Engine::spawn_remote_upload`), not here — it must not block the
@@ -654,6 +780,9 @@ impl Engine {
             io::copy(&mut reader, &mut writer).with_context(|| {
                 format!("copy blob {} for {addr} into {dst_key}", artifact.name)
             })?;
+            writer.commit().with_context(|| {
+                format!("commit blob {} for {addr} into {dst_key}", artifact.name)
+            })?;
         }
 
         // Stamp the duplicate with a freshly-sampled, strictly-newer timestamp.
@@ -678,6 +807,9 @@ impl Engine {
             .with_context(|| format!("open manifest writer for {addr} {dst_key}"))?;
         borsh::to_writer(&mut manifest_writer, &dup_manifest)
             .with_context(|| format!("write manifest for {addr} {dst_key}"))?;
+        manifest_writer
+            .commit()
+            .with_context(|| format!("commit manifest for {addr} {dst_key}"))?;
 
         Ok(())
     }
@@ -1318,6 +1450,297 @@ mod tests {
         removed
     }
 
+    /// The artifact writes fan out concurrently, so two properties that were
+    /// implicit in the old sequential loop have to be pinned: the manifest's
+    /// artifact list keeps the *input* order (not completion order — the
+    /// manifest must not become a function of pool scheduling), and every
+    /// artifact a manifest names is readable once the manifest is.
+    #[tokio::test]
+    async fn multi_artifact_revision_keeps_input_order() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        // Enough artifacts to actually overlap on the pool, with sizes varied
+        // so completion order differs from input order.
+        let artifacts: Vec<_> = (0..16)
+            .map(|i| {
+                let payload = vec![b'x'; if i % 2 == 0 { 512 * 1024 } else { 8 }];
+                raw_artifact(&format!("a{i:02}"), &payload)
+            })
+            .collect();
+        engine
+            .cache_locally(&ctoken, &addr, "HASHIN_ORDER", artifacts, false)
+            .await
+            .expect("cache_locally");
+
+        let manifest = engine
+            .read_manifest(&addr, "HASHIN_ORDER")
+            .expect("read manifest")
+            .expect("manifest present");
+        let names: Vec<_> = manifest.artifacts.iter().map(|a| a.name.as_str()).collect();
+        let expected: Vec<_> = (0..16).map(|i| format!("out_a{i:02}.tar")).collect();
+        assert_eq!(
+            names,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    /// Manifest-last, the strong form: the manifest writer must not even be
+    /// *opened* until every artifact's writer has been dropped (write complete).
+    /// This is the test that reddens if the manifest write is ever folded into
+    /// the artifact fan-out.
+    #[tokio::test]
+    async fn manifest_opens_only_after_every_artifact_write_completes() {
+        let (mut engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        #[derive(Default)]
+        struct Log {
+            events: std::sync::Mutex<Vec<(String, &'static str)>>,
+        }
+        let log = Arc::new(Log::default());
+        engine.local_cache = Arc::new(
+            crate::engine::local_cache_test_double::ForwardingCache::new(Arc::clone(
+                &engine.local_cache,
+            ))
+            .on_writer(enclose!((log) move |_, _, name| {
+                log.events.lock().unwrap().push((name.to_string(), "open"));
+            }))
+            .on_writer_done(enclose!((log) move |_, _, name| {
+                log.events.lock().unwrap().push((name.to_string(), "done"));
+            })),
+        );
+
+        let artifacts: Vec<_> = (0..8)
+            .map(|i| raw_artifact(&format!("a{i}"), &vec![b'x'; 256 * 1024]))
+            .collect();
+        engine
+            .cache_locally(&ctoken, &addr, "HASHIN_LAST", artifacts, false)
+            .await
+            .expect("cache_locally");
+
+        let events = log.events.lock().unwrap();
+        let manifest_open = events
+            .iter()
+            .position(|(name, ev)| name == MANIFEST_V1 && *ev == "open")
+            .expect("manifest opened");
+        let artifact_dones = events
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, ev))| name != MANIFEST_V1 && *ev == "done")
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(artifact_dones.len(), 8, "events: {events:?}");
+        assert!(
+            artifact_dones.iter().all(|&i| i < manifest_open),
+            "manifest opened before an artifact write finished: {events:?}"
+        );
+    }
+
+    /// Wait-all fan-out: when several artifact writes fail, every failure is
+    /// reported — not just the first. The behavior change from the old
+    /// stop-at-first loop is deliberate and user-visible, so freeze it.
+    #[tokio::test]
+    async fn all_failing_artifacts_are_reported() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let missing = |name: &str| outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: name.to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::TarPath(format!("/nonexistent/heph-{name}")),
+            hashout: format!("hashout-{name}"),
+        };
+        let Err(err) = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN_MULTIFAIL",
+                vec![
+                    missing("first"),
+                    raw_artifact("ok", b"fine"),
+                    missing("second"),
+                ],
+                false,
+            )
+            .await
+        else {
+            panic!("missing tar paths must fail the write");
+        };
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("first"), "got: {rendered}");
+        assert!(rendered.contains("second"), "got: {rendered}");
+    }
+
+    /// The pack cap gates the path to the blocking pool: with every slot held,
+    /// an artifact write must not reach the cache writer; releasing the slots
+    /// lets it through. (Borrows a process-wide semaphore, so it briefly delays
+    /// any concurrently-running test that writes to a cache.)
+    #[tokio::test]
+    async fn artifact_write_waits_for_a_pack_slot() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        // The full capacity, not `available_permits()`: a snapshot of what is
+        // free right now races other tests' in-flight writes — one of them
+        // returning its permit after the snapshot hands this test's gated write
+        // a free slot and flakes the assertion. `acquire_many(capacity)` instead
+        // waits for every straggler and then genuinely holds the whole class.
+        let held = LOCAL_PACK_SLOTS
+            .acquire_many(u32::try_from(local_pack_slots()).unwrap())
+            .await
+            .expect("hold every pack slot");
+
+        let write = engine.cache_locally(
+            &ctoken,
+            &addr,
+            "HASHIN_SLOT",
+            vec![raw_artifact("gated", b"payload")],
+            false,
+        );
+        tokio::pin!(write);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut write)
+                .await
+                .is_err(),
+            "a write must not reach the pool while every pack slot is held",
+        );
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(30), write)
+            .await
+            .expect("releasing the slots must let the write through")
+            .expect("cache_locally");
+    }
+
+    /// Two artifacts that map to the same cache entry name must be rejected up
+    /// front: under the concurrent fan-out the committed bytes would otherwise
+    /// depend on pool scheduling.
+    #[tokio::test]
+    async fn duplicate_entry_names_are_rejected_before_any_write() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let Err(err) = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN_DUP",
+                vec![raw_artifact("same", b"a"), raw_artifact("same", b"b")],
+                false,
+            )
+            .await
+        else {
+            panic!("duplicate entry names must fail");
+        };
+        assert!(format!("{err:#}").contains("same"), "got: {err:#}");
+        assert!(
+            engine
+                .read_manifest(&addr, "HASHIN_DUP")
+                .expect("read manifest")
+                .is_none(),
+            "nothing may be committed for a rejected revision"
+        );
+    }
+
+    /// An empty artifact set still commits a manifest (an empty revision is a
+    /// valid, readable result), unchanged by the fan-out.
+    #[tokio::test]
+    async fn empty_artifact_set_still_commits_a_manifest() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        engine
+            .cache_locally(&ctoken, &addr, "HASHIN_EMPTY", vec![], false)
+            .await
+            .expect("cache_locally");
+        let manifest = engine
+            .read_manifest(&addr, "HASHIN_EMPTY")
+            .expect("read manifest")
+            .expect("manifest present");
+        assert!(manifest.artifacts.is_empty());
+    }
+
+    /// Dropping `cache_locally` mid-fan-out must not wedge anything: already
+    /// submitted pool jobs finish on their own, and a subsequent write of the
+    /// same revision succeeds.
+    #[tokio::test]
+    async fn dropping_cache_locally_mid_write_leaves_the_engine_usable() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let artifacts: Vec<_> = (0..8)
+            .map(|i| raw_artifact(&format!("a{i}"), &vec![b'x'; 512 * 1024]))
+            .collect();
+        {
+            let write =
+                engine.cache_locally(&ctoken, &addr, "HASHIN_DROP", artifacts.clone(), false);
+            tokio::pin!(write);
+            // Poll it exactly once to start the fan-out, then drop it.
+            let _ = futures::poll!(&mut write);
+        }
+
+        engine
+            .cache_locally(&ctoken, &addr, "HASHIN_DROP", artifacts, false)
+            .await
+            .expect("a fresh write after an abandoned one must succeed");
+        assert!(
+            engine
+                .read_manifest(&addr, "HASHIN_DROP")
+                .expect("read manifest")
+                .is_some()
+        );
+    }
+
+    /// Manifest-last: a failed artifact write must error out of `cache_locally`
+    /// with *no* manifest committed — a reader that finds a manifest must find
+    /// every artifact it names, so an incomplete revision has to stay invisible.
+    #[tokio::test]
+    async fn failed_artifact_write_commits_no_manifest() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let missing = outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: "gone".to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::TarPath("/nonexistent/heph-test-tar".to_string()),
+            hashout: "hashout-gone".to_string(),
+        };
+        let Err(err) = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN_FAIL",
+                vec![raw_artifact("ok", b"fine"), missing],
+                false,
+            )
+            .await
+        else {
+            panic!("missing tar path must fail the write");
+        };
+        assert!(
+            format!("{err:#}").contains("gone"),
+            "error names the artifact: {err:#}"
+        );
+
+        assert!(
+            engine
+                .read_manifest(&addr, "HASHIN_FAIL")
+                .expect("read manifest")
+                .is_none(),
+            "a failed revision must not commit a manifest"
+        );
+    }
+
     fn test_addr() -> Addr {
         Addr::new(PkgBuf::from("pkg"), "tgt".to_string(), BTreeMap::new())
     }
@@ -1455,7 +1878,7 @@ mod tests {
         fn reader(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<SizedReader> {
             Err(anyhow::anyhow!(NotFoundError))
         }
-        fn writer(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<Box<dyn io::Write>> {
+        fn writer(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<Box<dyn EntryWriter>> {
             unreachable!("the probe path never writes")
         }
         fn exists(&self, _: &Addr, _: &str, _: &str) -> anyhow::Result<bool> {
