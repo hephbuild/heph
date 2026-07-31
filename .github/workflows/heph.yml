@@ -366,13 +366,18 @@ jobs:
           ./$BIN_NAME version
           ./$BENCH_BIN_NAME --help
           # Both flavours launch, and each reports the flavour patch-flavour.sh
-          # actually stamped — not just that the binary runs at all.
+          # actually stamped — not just that the binary runs at all. The
+          # baked-in version already carries its own build metadata (a commit
+          # hash), so check for the debug flavour marker specifically, not
+          # "any build metadata at all" (`hcore::version::reported` joins the
+          # flavour onto the existing metadata with a `.`, or a bare `+` if
+          # there wasn't any — either way it ends in `.debug` or `+debug`).
           std_version="$(./$BIN_NAME version)"
           debug_version="$(./$DEBUG_BIN_NAME version)"
           echo "std: $std_version"
           echo "debug: $debug_version"
-          case "$std_version" in *+*) echo "std flavour must not report build metadata: $std_version" >&2; exit 1 ;; esac
-          case "$debug_version" in *+debug) ;; *) echo "debug flavour did not report +debug: $debug_version" >&2; exit 1 ;; esac
+          case "$std_version" in *+debug|*.debug) echo "std flavour must not report the debug flavour: $std_version" >&2; exit 1 ;; esac
+          case "$debug_version" in *+debug|*.debug) ;; *) echo "debug flavour did not report itself: $debug_version" >&2; exit 1 ;; esac
         env:
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
           BENCH_BIN_NAME: "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"

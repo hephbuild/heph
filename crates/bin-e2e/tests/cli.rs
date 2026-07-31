@@ -47,10 +47,14 @@ fn shipped_binary_launches_outside_a_workspace() {
     // empty by `scripts/patch-flavour.sh`, not left as "debug" or the
     // unpatched marker — a compile-only (in-process) test can't catch this,
     // since it never runs the patch/strip pipeline the shipped binary went
-    // through.
+    // through. The baked-in version already carries its own build metadata (a
+    // commit hash), so check for the debug flavour marker specifically —
+    // `hcore::version::reported` would join it onto the existing metadata
+    // with a `.`, or add a bare `+` if there wasn't any.
+    let trimmed = stdout.trim();
     assert!(
-        !stdout.contains('+'),
-        "std flavour must not report build metadata: {}",
+        !trimmed.ends_with("+debug") && !trimmed.ends_with(".debug"),
+        "std flavour must not report the debug flavour: {}",
         describe(&out)
     );
 }

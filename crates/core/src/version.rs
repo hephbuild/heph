@@ -81,16 +81,32 @@ pub fn flavour() -> String {
     parse_flavour_slot(&slot).to_string()
 }
 
-/// [`VERSION`] with the release flavour appended as semver build metadata
-/// (`v1.2.3+debug`) when this binary was stamped with one — what `heph
-/// version` and diagnostic banners should show a human. [`VERSION`] itself
-/// stays plain: other consumers (self-upgrade's version-pin compare, the
-/// default govet target address, telemetry) need the bare tag, not a value
-/// that varies by flavour.
+/// [`VERSION`] with the release flavour folded into semver build metadata
+/// when this binary was stamped with one — what `heph version` and
+/// diagnostic banners should show a human. [`VERSION`] itself stays plain:
+/// other consumers (self-upgrade's version-pin compare, the default govet
+/// target address, telemetry) need the bare tag, not a value that varies by
+/// flavour.
+///
+/// CI's actual `HEPH_BUILD_VERSION` already carries build metadata (a commit
+/// hash, e.g. `v1.2.3+gcf0045d9`) — semver allows only one `+`, so the
+/// flavour joins the existing metadata with a `.` (`v1.2.3+gcf0045d9.debug`)
+/// rather than appending a second `+` (`v1.2.3+gcf0045d9+debug`, which isn't
+/// valid build metadata syntax).
 pub fn reported() -> String {
-    match flavour().as_str() {
-        "" => VERSION.to_string(),
-        f => format!("{VERSION}+{f}"),
+    fold_flavour_into_version(VERSION, &flavour())
+}
+
+/// The string-manipulation half of [`reported`], split out so it's testable
+/// against an arbitrary `version` — [`VERSION`] itself is fixed at compile
+/// time, so a test can't make it carry build metadata to exercise the merge.
+fn fold_flavour_into_version(version: &str, flavour: &str) -> String {
+    if flavour.is_empty() {
+        return version.to_string();
+    }
+    match version.split_once('+') {
+        Some((core, build)) => format!("{core}+{build}.{flavour}"),
+        None => format!("{version}+{flavour}"),
     }
 }
 
@@ -216,6 +232,32 @@ mod tests {
         // Test binaries are never touched by `scripts/patch-flavour.sh`.
         assert_eq!(flavour(), "");
         assert_eq!(reported(), VERSION);
+    }
+
+    #[test]
+    fn fold_flavour_into_version_appends_bare_when_no_build_metadata() {
+        assert_eq!(fold_flavour_into_version("v1.2.3", "debug"), "v1.2.3+debug");
+    }
+
+    #[test]
+    fn fold_flavour_into_version_joins_existing_build_metadata_with_a_dot() {
+        // The real bug this pins: CI's actual HEPH_BUILD_VERSION already
+        // carries a commit-hash build metadata segment. Appending a second
+        // bare `+debug` produced `v1.2.3+gcf0045d9+debug` — not valid build
+        // metadata syntax — instead of joining onto the existing segment.
+        assert_eq!(
+            fold_flavour_into_version("v1.2.3+gcf0045d9", "debug"),
+            "v1.2.3+gcf0045d9.debug"
+        );
+    }
+
+    #[test]
+    fn fold_flavour_into_version_is_a_no_op_for_the_std_flavour() {
+        assert_eq!(
+            fold_flavour_into_version("v1.2.3+gcf0045d9", ""),
+            "v1.2.3+gcf0045d9"
+        );
+        assert_eq!(fold_flavour_into_version("v1.2.3", ""), "v1.2.3");
     }
 
     #[test]

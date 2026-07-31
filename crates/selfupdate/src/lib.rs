@@ -23,11 +23,10 @@
 //!   bounding the chain to a single hop even if a download reports a stale version.
 //!
 //! A version-number match alone isn't "nothing to do": `.hephconfig` can pin a
-//! `versionFlavour` without bumping `version`, and [`decide`] only compares
-//! version numbers. `hcore::version::flavour()` — a post-build patch, not a
-//! compile-time constant, since both flavours of a release share one compile —
-//! is what lets the running binary answer "which flavour am I" directly, so
-//! [`decide_pin`] can catch a flavour-only change too.
+//! `versionFlavour` without bumping `version`. `hcore::version::flavour()` —
+//! a post-build patch, not a compile-time constant, since both flavours of a
+//! release share one compile — is what lets the running binary answer "which
+//! flavour am I" directly, so [`decide`] can catch a flavour-only change too.
 
 // Test code uses panicking helpers and fixture asserts; exempt the test cfg from
 // the workspace restriction lints rather than rewriting each test. `allow` (not
@@ -90,19 +89,6 @@ enum Decision {
     Unsupported { reason: String },
 }
 
-/// [`decide`], but also treats a flavour mismatch as reason to upgrade even
-/// when the version tag alone matches — `decide` only compares parsed version
-/// numbers, so a workspace that pins the same `version` but changes
-/// `versionFlavour` would otherwise read as up to date.
-fn decide_pin(current: &str, current_flavour: &str, pin: &str, desired_flavour: &str) -> Decision {
-    match decide(current, pin) {
-        Decision::UpToDate if current_flavour != desired_flavour => Decision::Upgrade {
-            target: pin.trim().to_string(),
-        },
-        other => other,
-    }
-}
-
 /// Read the workspace pin and, when it calls for a different exact version or
 /// flavour, download it and re-exec into it. Returns `Ok(())` when nothing needs
 /// to happen (no workspace, no pin, already current, dev build, or opted out).
@@ -123,16 +109,16 @@ pub fn maybe_self_upgrade() -> Result<(), SelfUpgradeError> {
     // a distinct error so the caller can tolerate it for `heph version`.
     let root = hconfig::get_root().map_err(|_e| SelfUpgradeError::NoConfig)?;
     let cfg = hconfig::load_from_root(&root)?;
-    let Some(pin) = cfg.version.as_deref() else {
+    let Some(desired_version) = cfg.version.as_deref() else {
         return Ok(());
     };
     let flavour = cfg.version_flavour.as_deref().unwrap_or("");
     let current_flavour = version::flavour();
 
-    match decide_pin(current, &current_flavour, pin, flavour) {
+    match decide(current, &current_flavour, desired_version, flavour) {
         Decision::UpToDate => Ok(()),
         Decision::Unsupported { reason } => {
-            tracing::warn!(pin, current, %reason, "ignoring .hephconfig version pin");
+            tracing::warn!(desired_version, current, %reason, "ignoring .hephconfig version pin");
             Ok(())
         }
         Decision::Upgrade { target } => {
@@ -163,20 +149,28 @@ fn env_opts_out() -> bool {
     version::VERSION == DEV_VERSION
 }
 
-/// Decide what to do given the running version and the configured pin.
-fn decide(current: &str, pin: &str) -> Decision {
-    let pin = pin.trim();
-    if pin.is_empty() {
+/// Decide what to do given the running version+flavour and the configured
+/// pin. A flavour mismatch forces an upgrade even when the version tag alone
+/// matches — a workspace can pin the same `version` but change
+/// `versionFlavour`.
+fn decide(
+    current: &str,
+    current_flavour: &str,
+    desired_version: &str,
+    desired_flavour: &str,
+) -> Decision {
+    let desired_version = desired_version.trim();
+    if desired_version.is_empty() {
         return Decision::UpToDate;
     }
-    if is_constraint(pin) {
+    if is_constraint(desired_version) {
         return Decision::Unsupported {
             reason: "version constraints are not yet supported; pin an exact version".to_string(),
         };
     }
-    let Some(target) = version::parse(pin) else {
+    let Some(target) = version::parse(desired_version) else {
         return Decision::Unsupported {
-            reason: format!("`{pin}` is not a valid version"),
+            reason: format!("`{desired_version}` is not a valid version"),
         };
     };
     let Some(running) = version::parse(current) else {
@@ -186,15 +180,16 @@ fn decide(current: &str, pin: &str) -> Decision {
     };
     // Build metadata is ignored when comparing (it is not part of version
     // identity); the core triple + pre-release decides equality.
-    if running.major == target.major
+    let version_matches = running.major == target.major
         && running.minor == target.minor
         && running.patch == target.patch
-        && running.pre_release == target.pre_release
-    {
+        && running.pre_release == target.pre_release;
+
+    if version_matches && current_flavour == desired_flavour {
         Decision::UpToDate
     } else {
         Decision::Upgrade {
-            target: pin.to_string(),
+            target: desired_version.to_string(),
         }
     }
 }
@@ -556,31 +551,40 @@ mod imp {
 mod tests {
     use super::*;
 
-    #[test]
-    fn up_to_date_when_versions_match() {
-        assert_eq!(decide("v1.2.3", "v1.2.3"), Decision::UpToDate);
-        // Leading `v` is optional and build metadata is ignored.
-        assert_eq!(decide("1.2.3", "v1.2.3"), Decision::UpToDate);
-        assert_eq!(decide("v1.2.3+build.9", "v1.2.3"), Decision::UpToDate);
+    /// `decide` with flavour held constant (both empty) — for tests that only
+    /// care about version-number comparison; flavour comparison is covered
+    /// separately below.
+    fn decide_version_only(current: &str, desired_version: &str) -> Decision {
+        decide(current, "", desired_version, "")
     }
 
-    // `decide_pin` is what makes a flavour-only edit (`.hephconfig` gains/changes
-    // `versionFlavour` without bumping `version`) actually trigger a re-fetch:
-    // `decide` alone would see the same version tag and call it `UpToDate`,
-    // missing the flavour change entirely.
+    #[test]
+    fn up_to_date_when_versions_match() {
+        assert_eq!(decide_version_only("v1.2.3", "v1.2.3"), Decision::UpToDate);
+        // Leading `v` is optional and build metadata is ignored.
+        assert_eq!(decide_version_only("1.2.3", "v1.2.3"), Decision::UpToDate);
+        assert_eq!(
+            decide_version_only("v1.2.3+build.9", "v1.2.3"),
+            Decision::UpToDate
+        );
+    }
+
+    // A flavour-only edit (`.hephconfig` gains/changes `versionFlavour` without
+    // bumping `version`) must still trigger a re-fetch — a version match alone
+    // isn't "nothing to do".
 
     #[test]
-    fn decide_pin_upgrades_on_flavour_mismatch_even_when_version_matches() {
+    fn upgrades_on_flavour_mismatch_even_when_version_matches() {
         // Running the std ("") flavour; `.hephconfig` now asks for `debug` with
         // the *same* version pin — must not be a no-op.
         assert_eq!(
-            decide_pin("v1.2.3", "", "v1.2.3", "debug"),
+            decide("v1.2.3", "", "v1.2.3", "debug"),
             Decision::Upgrade {
                 target: "v1.2.3".to_string()
             }
         );
         assert_eq!(
-            decide_pin("v1.2.3", "debug", "v1.2.3", ""),
+            decide("v1.2.3", "debug", "v1.2.3", ""),
             Decision::Upgrade {
                 target: "v1.2.3".to_string()
             }
@@ -588,30 +592,18 @@ mod tests {
     }
 
     #[test]
-    fn decide_pin_up_to_date_when_version_and_flavour_both_match() {
+    fn up_to_date_when_version_and_flavour_both_match() {
         assert_eq!(
-            decide_pin("v1.2.3", "debug", "v1.2.3", "debug"),
+            decide("v1.2.3", "debug", "v1.2.3", "debug"),
             Decision::UpToDate
         );
-        assert_eq!(decide_pin("v1.2.3", "", "v1.2.3", ""), Decision::UpToDate);
+        assert_eq!(decide("v1.2.3", "", "v1.2.3", ""), Decision::UpToDate);
     }
 
     #[test]
-    fn decide_pin_defers_to_decide_when_version_differs() {
-        // A version mismatch already triggers an upgrade regardless of flavour —
-        // `decide_pin` shouldn't change that outcome or its target.
-        assert_eq!(
-            decide_pin("v1.2.3", "debug", "v1.3.0", "debug"),
-            Decision::Upgrade {
-                target: "v1.3.0".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn decide_pin_leaves_unsupported_alone() {
+    fn unsupported_pin_ignored_regardless_of_flavour() {
         assert!(matches!(
-            decide_pin("v1.0.0", "", ">=1.2", "debug"),
+            decide("v1.0.0", "", ">=1.2", "debug"),
             Decision::Unsupported { .. }
         ));
     }
@@ -619,14 +611,14 @@ mod tests {
     #[test]
     fn upgrade_when_versions_differ() {
         assert_eq!(
-            decide("v1.2.3", "v1.3.0"),
+            decide_version_only("v1.2.3", "v1.3.0"),
             Decision::Upgrade {
                 target: "v1.3.0".to_string()
             }
         );
         // Pre-release is part of identity: a release differs from its rc.
         assert_eq!(
-            decide("v1.2.3-rc.1", "v1.2.3"),
+            decide_version_only("v1.2.3-rc.1", "v1.2.3"),
             Decision::Upgrade {
                 target: "v1.2.3".to_string()
             }
@@ -638,7 +630,7 @@ mod tests {
         // The target carries the pin verbatim (trimmed) so the download tag
         // matches the release tag the user wrote.
         assert_eq!(
-            decide("v1.0.0", "  v2.0.0  "),
+            decide_version_only("v1.0.0", "  v2.0.0  "),
             Decision::Upgrade {
                 target: "v2.0.0".to_string()
             }
@@ -649,7 +641,10 @@ mod tests {
     fn constraints_are_unsupported() {
         for pin in [">=1.2", "^1.0.0", "~1.2.3", "1.2.* ", "1.0, 2.0", ">1 <2"] {
             assert!(
-                matches!(decide("v1.0.0", pin), Decision::Unsupported { .. }),
+                matches!(
+                    decide_version_only("v1.0.0", pin),
+                    Decision::Unsupported { .. }
+                ),
                 "expected {pin:?} to be unsupported"
             );
         }
@@ -658,14 +653,14 @@ mod tests {
     #[test]
     fn unparseable_pin_is_unsupported() {
         assert!(matches!(
-            decide("v1.0.0", "banana"),
+            decide_version_only("v1.0.0", "banana"),
             Decision::Unsupported { .. }
         ));
     }
 
     #[test]
     fn empty_pin_is_noop() {
-        assert_eq!(decide("v1.0.0", "   "), Decision::UpToDate);
+        assert_eq!(decide_version_only("v1.0.0", "   "), Decision::UpToDate);
     }
 
     #[test]
