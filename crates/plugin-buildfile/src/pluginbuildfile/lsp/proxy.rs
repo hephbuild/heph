@@ -3,10 +3,16 @@
 //! untouched except `textDocument/hover` and `textDocument/completion`: those are
 //! forwarded too, but their responses are enriched on the way back with heph
 //! specifics the stock server can't know about —
-//! - hover gains a "Targets" block (the addresses produced by the
-//!   symbol under the cursor), and
-//! - completion gains the config fields of the target's `driver` (from the
-//!   driver's [`schema`](hplugin::driver::Driver::schema)).
+//! - hover gains a "Targets" block (the addresses produced by the symbol
+//!   under the cursor), plus, once a `target(...)` call's driver is resolved,
+//!   a section documenting that driver's config fields;
+//! - completion, at an exact syntactic position (a `heph.` namespace member, a
+//!   `driver = "…"` value, or a keyword-argument *key* inside
+//!   `target(...)`/`provider_state(...)`), replaces the stock server's
+//!   proposals with heph's own — exhaustive there, so the stock server's
+//!   generic globals/keywords would otherwise just be noise. On the *value*
+//!   side of a keyword argument (e.g. `cmd = SOME_VAR`), heph adds nothing and
+//!   the stock server's completions (locals, globals) pass through untouched.
 
 use super::index::SharedState;
 use crate::pluginbuildfile::run_file::resolve_load_target;
@@ -420,6 +426,28 @@ fn enrich_hover(
         md.push_str("```\n");
     }
 
+    // Once the target has been provided (its addresses resolved above) and the
+    // call site names a driver, append that driver's config-field docs — the
+    // same detail/doc a completion item for these keys would show. Without
+    // this, hovering a target only ever explained the base `target(...)`
+    // signature, never the driver-specific keys actually in play.
+    if !targets.is_empty()
+        && let Some(driver) = target_driver_at(&index.source, byte_offset(&index.source, line, col))
+            .filter(|d| !d.is_empty())
+        && let Some(schema) = shared.engine.driver_schema(&driver)
+        && !schema.fields.is_empty()
+    {
+        md.push_str(&format!("\n\n---\n\n**`{driver}` driver**\n\n"));
+        for f in &schema.fields {
+            let req = if f.required { " (required)" } else { "" };
+            md.push_str(&format!("- `{}`: {}{req}", f.name, f.ty.render()));
+            if !f.doc.is_empty() {
+                md.push_str(&format!(" — {}", f.doc));
+            }
+            md.push('\n');
+        }
+    }
+
     let hover = Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -761,6 +789,55 @@ fn in_driver_value(prefix: &str) -> bool {
         .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
 }
 
+/// Whether byte `offset` — inside the call whose argument list opens at `open`
+/// (the byte index of its `(`) — sits on the *value* side of a `key = value`
+/// pair (a bare `=` already typed since the nearest depth-0 comma), as opposed
+/// to the key-name side, where only a keyword-argument identifier is valid.
+/// Depth-aware: an `=` inside a nested call/list/dict/string (e.g. a default
+/// argument to a nested function, or a `{"a": "b"}` value) doesn't count.
+/// Schema-field key completion must not fire on the value side — that slot is
+/// already filled, and whatever the cursor is completing there (a local
+/// variable, a call) is the stock server's job, not ours.
+fn in_value_position(source: &str, open: usize, offset: usize) -> bool {
+    let b = source.as_bytes();
+    let offset = offset.min(b.len());
+    let mut i = open + 1;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut seg_has_eq = false;
+    while i < offset {
+        let Some(&c) = b.get(i) else { break };
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 => seg_has_eq = false,
+                // A bare `=`, not part of `==`. `i` starts at `open + 1 >= 1`,
+                // so `i - 1` is always in bounds.
+                b'=' if depth == 0
+                    && b.get(i + 1) != Some(&b'=')
+                    && b.get(i - 1) != Some(&b'=') =>
+                {
+                    seg_has_eq = true;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    seg_has_eq
+}
+
 /// Byte offset into `source` for a 0-based `(line, col)`, clamped to bounds. The
 /// column is treated as a byte column — BUILD structure (identifiers, `=`, parens)
 /// is ASCII, so this is exact at the positions we resolve.
@@ -1057,7 +1134,10 @@ fn enrich_completion(
             .collect()
     } else if in_string(prefix) {
         vec![]
-    } else if let Some(driver) = target_driver_at(&index.source, offset) {
+    } else if let Some(open) = innermost_call_open("target", &index.source, offset)
+        && !in_value_position(&index.source, open, offset)
+        && let Some(driver) = target_driver_at(&index.source, offset)
+    {
         let mut items: Vec<CompletionItem> = crate::pluginbuildfile::run_file::target_base_fields()
             .into_iter()
             .map(|f| field_item(&f.name, &f.ty.render(), f.doc, "target", f.required))
@@ -1073,8 +1153,9 @@ fn enrich_completion(
             );
         }
         items
-    } else if let Some(provider) =
-        provider_state_at(&index.source, offset).filter(|p| !p.is_empty())
+    } else if let Some(open) = innermost_call_open("provider_state", &index.source, offset)
+        && !in_value_position(&index.source, open, offset)
+        && let Some(provider) = provider_state_at(&index.source, offset).filter(|p| !p.is_empty())
     {
         shared
             .engine
@@ -1093,18 +1174,15 @@ fn enrich_completion(
         return;
     }
 
-    let mut items: Vec<CompletionItem> = match resp.result.take() {
-        Some(v) => match serde_json::from_value::<CompletionResponse>(v) {
-            Ok(CompletionResponse::Array(a)) => a,
-            Ok(CompletionResponse::List(l)) => l.items,
-            Err(_) => vec![],
-        },
-        None => vec![],
-    };
-    // Driver fields first, then whatever the stock server proposed.
-    let mut merged = extra;
-    merged.append(&mut items);
-    resp.result = Some(serde_json::to_value(CompletionResponse::Array(merged)).expect("serialize"));
+    // Every branch above is exhaustive for its syntactic position — a `heph.`
+    // member, a `driver = "…"` value, or a keyword-argument *key* inside
+    // `target(...)`/`provider_state(...)` (the `in_value_position` guard keeps
+    // this branch from firing on the *value* side, e.g. `cmd = M`, where a
+    // local variable is exactly what the stock server should offer) — so the
+    // stock server's proposals (its global/keyword completions, meaningless
+    // at a key position) are replaced rather than merged in. Merging used to
+    // bury the handful of valid keys under a pile of unrelated globals.
+    resp.result = Some(serde_json::to_value(CompletionResponse::Array(extra)).expect("serialize"));
     resp.error = None;
 }
 
@@ -1130,20 +1208,23 @@ mod tests {
         fn driver_schema(&self, name: &str) -> Option<hplugin::driver::DriverSchema> {
             use hcore::htvalue::signature::ParamType;
             use hplugin::driver::{DriverField, DriverSchema};
-            if name != "exec" {
-                return None;
+            match name {
+                "exec" => Some(DriverSchema {
+                    fields: vec![DriverField {
+                        name: "cmd".to_string(),
+                        ty: ParamType::String,
+                        doc: "Command line to run.".to_string(),
+                        required: true,
+                    }],
+                }),
+                // A driver with no config at all — `DriverSchema::default()`,
+                // the shape several real drivers use.
+                "bare" => Some(DriverSchema::default()),
+                _ => None,
             }
-            Some(DriverSchema {
-                fields: vec![DriverField {
-                    name: "cmd".to_string(),
-                    ty: ParamType::String,
-                    doc: "Command line to run.".to_string(),
-                    required: true,
-                }],
-            })
         }
         fn driver_names(&self) -> Vec<String> {
-            vec!["exec".to_string()]
+            vec!["exec".to_string(), "bare".to_string()]
         }
         fn provider_state_schema(&self, name: &str) -> Option<hplugin::provider::StateSchema> {
             use hcore::htvalue::signature::ParamType;
@@ -1300,6 +1381,59 @@ mod tests {
     }
 
     #[test]
+    fn completion_at_value_position_does_not_offer_schema_fields() {
+        // Cursor on a bare-identifier VALUE (`cmd = M`), not a key name —
+        // that slot is already filled, so schema-field completions must not
+        // apply here. Whatever the cursor is actually completing (a local
+        // variable, a call) is the stock server's job, not ours — offering
+        // our (exhaustive, stock-replacing) field list here would silently
+        // hide it.
+        let content = "target(name = \"t\", driver = \"exec\", cmd = M)\n";
+        let (shared, uri) = shared_with_index(content);
+        let col = content.find('M').unwrap() as u32 + 1;
+        let labels = completion_labels(&shared, &uri, 0, col);
+        assert!(
+            !labels.iter().any(|l| l == "cmd" || l == "name"),
+            "must not offer schema-field keys at a value position, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_leaves_stock_items_untouched_when_nothing_heph_specific() {
+        // At a position where heph has nothing to add (a bare top-level spot),
+        // any stock completions already in the response must survive
+        // unmodified — the replace-instead-of-merge change must only kick in
+        // when `extra` is actually non-empty.
+        let content = "x = 1\n";
+        let (shared, uri) = shared_with_index(content);
+        let mut resp = lsp_server::Response {
+            id: 1.into(),
+            result: Some(
+                serde_json::to_value(lsp_types::CompletionResponse::Array(vec![
+                    lsp_types::CompletionItem {
+                        label: "stock_item".to_string(),
+                        ..Default::default()
+                    },
+                ]))
+                .unwrap(),
+            ),
+            error: None,
+        };
+        super::enrich_completion(&mut resp, &uri, 0, 0, &shared);
+        let value = resp.result.expect("result preserved");
+        let labels: Vec<String> =
+            match serde_json::from_value::<lsp_types::CompletionResponse>(value).unwrap() {
+                lsp_types::CompletionResponse::Array(items) => {
+                    items.into_iter().map(|i| i.label).collect()
+                }
+                lsp_types::CompletionResponse::List(l) => {
+                    l.items.into_iter().map(|i| i.label).collect()
+                }
+            };
+        assert_eq!(labels, vec!["stock_item".to_string()]);
+    }
+
+    #[test]
     fn completion_inside_provider_state_offers_state_fields() {
         // Cursor inside a fully-valid call, after the provider arg.
         let content = "provider_state(provider = \"go\", )\n";
@@ -1358,6 +1492,38 @@ mod tests {
         assert!(md.contains("name"), "names base arg: {md}");
         assert!(md.contains("**config"), "shows config kwargs: {md}");
         assert!(!md.contains("**kwargs"), "not the raw prototype: {md}");
+    }
+
+    #[test]
+    fn hover_on_target_shows_driver_field_docs_once_resolved() {
+        // Once the target has been provided (its address resolved) and its
+        // driver is known, hover should also explain the driver's config keys.
+        let content = "target(name = \"t\", driver = \"exec\")\n";
+        let (shared, uri) = shared_with_index(content);
+        let col = content.find(')').unwrap() as u32;
+        let md = hover_value(&shared, &uri, 0, col).expect("hover");
+        assert!(md.contains("`exec` driver"), "names the driver: {md}");
+        assert!(md.contains("cmd"), "shows the driver field: {md}");
+        assert!(
+            md.contains("Command line to run."),
+            "shows the field doc: {md}"
+        );
+    }
+
+    #[test]
+    fn hover_on_target_omits_driver_section_when_schema_has_no_fields() {
+        // A driver with no config at all (`DriverSchema::default()`, the
+        // shape several real drivers use) must not render an empty
+        // `**`bare` driver**` header with nothing under it.
+        let content = "target(name = \"t\", driver = \"bare\")\n";
+        let (shared, uri) = shared_with_index(content);
+        let col = content.find(')').unwrap() as u32;
+        let md = hover_value(&shared, &uri, 0, col);
+        let md = md.unwrap_or_default();
+        assert!(
+            !md.contains("driver**"),
+            "must not render a driver section for a schema with no fields: {md}"
+        );
     }
 
     #[test]
