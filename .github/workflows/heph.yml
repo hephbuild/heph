@@ -801,8 +801,8 @@ jobs:
       # Only this platform's artifacts: the std-flavour `heph_<os>_<arch>` (what
       # the `e2e` script stages as `dist/heph`), the debug-flavour
       # `heph_debug_<os>_<arch>` (downloaded too since it matches the glob, but
-      # unused — the `e2e` script only picks up the exact std name), and the two
-      # `heph-*-plugin_<os>_<arch>.{so,dylib}`. `heph-govet` carries no os/arch
+      # unused — the `e2e` script only picks up the exact std name), and the
+      # `heph-*-plugin_<os>_<arch>.{so,dylib}` cdylibs. `heph-govet` carries no os/arch
       # suffix, so the pattern leaves it out.
       - name: Download artifacts under test
         uses: actions/download-artifact@v7
