@@ -69,6 +69,13 @@ impl StdCancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Token identity: `true` iff `other` is a clone of `self` (they share the
+    /// same underlying state). Lets a registry keyed by a reusable id confirm an
+    /// entry is *this* token before acting on it.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 /// Future returned by [`StdCancellationToken::cancelled`]. Resolves once the

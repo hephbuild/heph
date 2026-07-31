@@ -185,27 +185,148 @@ fn err_body(message: String) -> Body {
     })
 }
 
+/// The host-side mirror of the guest's spawn-at-the-seam shape.
+///
+/// A `DynFuture` a host callback returns is polled by a *guest* runtime worker
+/// (the plugin body that awaits it runs on the plugin's own runtime). Running
+/// the callback body inline in that poll would execute engine futures — which
+/// touch the host reactor and timer wheel — on a thread with no host runtime
+/// context, which panics ("there is no reactor running") and then aborts at the
+/// extern seam. So the body is spawned onto the host runtime captured at
+/// `wrap()` time, and the returned future only awaits the `JoinHandle`
+/// (runtime-free to poll). Symmetric with `plugin-sdk::serve`.
+///
+/// `handle` is `None` when `wrap()` ran outside any tokio runtime — an
+/// in-process context (unit tests, `futures::executor`-driven harnesses) where
+/// host and caller share one image and the caller drives the future itself; the
+/// body then runs inline exactly as before. Every production wrap site (`get`/
+/// `list` bodies, provider-function wiring) runs on the engine runtime.
+struct SeamSpawn {
+    handle: Option<tokio::runtime::Handle>,
+    /// Request span captured at `wrap()` time, re-entered by the spawned body so
+    /// engine logs from plugin callbacks keep the request's tracing context.
+    span: tracing::Span,
+}
+
+impl SeamSpawn {
+    fn capture() -> Self {
+        Self {
+            handle: tokio::runtime::Handle::try_current().ok(),
+            span: tracing::Span::current(),
+        }
+    }
+}
+
+/// Abort-on-drop await of a host-side callback task: dropping the wrapper
+/// (the guest abandoned the call — e.g. its own seam task was aborted) stops
+/// the spawned body instead of leaking it. No backstop here: the guest-side
+/// seam wrapper arms one for the whole call (see `plugin-sdk::serve`).
+struct HostTask<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> std::future::Future for HostTask<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().handle).poll(cx)
+    }
+}
+
+impl<T> Drop for HostTask<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Best-effort text of a panic payload.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = p.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
+}
+
+impl SeamSpawn {
+    /// Run `fut` (a host callback body) to a future safe to hand across the
+    /// seam: spawned on the captured host runtime when there is one, inline
+    /// otherwise. A panicking body maps to `mk_err` (host-side bug, surfaced to
+    /// the guest as an error) — never an unwind out of the wrapper's poll,
+    /// which runs inside the extern shim.
+    async fn run<T, F>(
+        &self,
+        method: &'static str,
+        key: String,
+        fut: F,
+        mk_err: fn(String) -> T,
+    ) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        use tracing::Instrument;
+        let Some(handle) = &self.handle else {
+            return fut.instrument(self.span.clone()).await;
+        };
+        let task = HostTask {
+            handle: hcore::hmemoizer::spawn_on_with_cycle_ctx(
+                handle,
+                fut.instrument(self.span.clone()),
+            ),
+        };
+        match task.await {
+            Ok(v) => v,
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                mk_err(format!(
+                    "host callback {method}({key}) panicked: {}",
+                    panic_text(payload.as_ref())
+                ))
+            }
+            Err(_) => mk_err(format!(
+                "host callback {method}({key}) aborted: host runtime shut down"
+            )),
+        }
+    }
+}
+
 /// Wraps the host's aggregate function registry; handed to a plugin as a
 /// [`DynFunctionRegistry`] so it can invoke any registered function.
 pub struct HostFunctionRegistry {
     inner: Arc<ProviderFunctionRegistry>,
+    seam: SeamSpawn,
 }
 
 impl HostFunctionRegistry {
     /// Wrap the aggregate registry as an ABI-stable [`DynFunctionRegistry`].
+    /// Captures the current runtime handle and span — see [`SeamSpawn`].
     pub fn wrap(inner: Arc<ProviderFunctionRegistry>) -> DynFunctionRegistry {
-        dynify(stabby::boxed::Box::new(HostFunctionRegistry { inner }))
+        dynify(stabby::boxed::Box::new(HostFunctionRegistry {
+            inner,
+            seam: SeamSpawn::capture(),
+        }))
     }
 }
 
 impl StableFunctionRegistry for HostFunctionRegistry {
     extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        dynify(stabby::boxed::Box::new(async move {
-            let req = match pb::CallRegisteredRequest::decode(&req[..]) {
-                Ok(r) => r,
-                Err(e) => return unary(err_body(format!("call_registered decode: {e}"))),
-            };
-            let Some(rf) = self.inner.get(&req.provider, &req.name) else {
+        let req = match pb::CallRegisteredRequest::decode(&req[..]) {
+            Ok(r) => r,
+            Err(e) => {
+                let body = unary(err_body(format!("call_registered decode: {e}")));
+                return dynify(stabby::boxed::Box::new(async move { body }));
+            }
+        };
+        let key = format!("{}.{}", req.provider, req.name);
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
+            let Some(rf) = inner.get(&req.provider, &req.name) else {
                 return unary(err_body(format!(
                     "unknown registered function `{}.{}`",
                     req.provider, req.name
@@ -234,19 +355,31 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                 })),
                 Err(e) => unary(err_body(format!("{e:#}"))),
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "call_registered",
+            key,
+            fut,
+            |m| unary(err_body(m)),
+        )))
     }
 }
 
 /// Wraps the per-request engine executor; handed to the plugin as a [`DynExecutor`].
 pub struct HostExecutor {
     inner: Arc<dyn ProviderExecutor>,
+    seam: SeamSpawn,
 }
 
 impl HostExecutor {
     /// Wrap a per-request engine executor as an ABI-stable [`DynExecutor`].
+    /// Captures the current runtime handle and span so callback bodies run on
+    /// the host runtime, not on the guest worker polling them — see [`SeamSpawn`].
     pub fn wrap(inner: Arc<dyn ProviderExecutor>) -> DynExecutor {
-        dynify(stabby::boxed::Box::new(HostExecutor { inner }))
+        dynify(stabby::boxed::Box::new(HostExecutor {
+            inner,
+            seam: SeamSpawn::capture(),
+        }))
     }
 }
 
@@ -288,9 +421,11 @@ impl StableExecutor for HostExecutor {
     }
 
     extern "C" fn result<'a>(&'a self, addr: StableAddr) -> DynFuture<'a, ResultOutcome> {
-        dynify(stabby::boxed::Box::new(async move {
-            let parsed = addr_from_stable(&addr);
-            match self.inner.result(&parsed).await {
+        let parsed = addr_from_stable(&addr);
+        let key = parsed.to_string();
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
+            match inner.result(&parsed).await {
                 Ok(eres) => {
                     // Hand each artifact across as a lazy streaming handle — the
                     // Arc<dyn Content> moves into the handle (keeping its cache
@@ -320,7 +455,19 @@ impl StableExecutor for HostExecutor {
                     artifacts: SVec::new(),
                 },
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "result",
+            key,
+            fut,
+            |m| ResultOutcome {
+                ok: false,
+                cycle: false,
+                cancelled: false,
+                message: m.into(),
+                artifacts: SVec::new(),
+            },
+        )))
     }
 
     extern "C" fn query<'a>(
@@ -328,7 +475,8 @@ impl StableExecutor for HostExecutor {
         matcher_pb: SVec<u8>,
         extra_skip: SVec<SString>,
     ) -> DynFuture<'a, QueryOutcome> {
-        dynify(stabby::boxed::Box::new(async move {
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
             let matcher = match plugin_abi::pb::Matcher::decode(&matcher_pb[..]) {
                 Ok(m) => plugin_abi::convert::matcher_from_pb(m),
                 Err(e) => {
@@ -340,7 +488,7 @@ impl StableExecutor for HostExecutor {
                 }
             };
             let skip: Vec<String> = extra_skip.iter().map(|s| s.to_string()).collect();
-            match self.inner.query(&matcher, &skip).await {
+            match inner.query(&matcher, &skip).await {
                 Ok(addrs) => QueryOutcome {
                     ok: true,
                     message: SString::new(),
@@ -352,13 +500,25 @@ impl StableExecutor for HostExecutor {
                     addrs: SVec::new(),
                 },
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "query",
+            String::new(),
+            fut,
+            |m| QueryOutcome {
+                ok: false,
+                message: m.into(),
+                addrs: SVec::new(),
+            },
+        )))
     }
 
     extern "C" fn states_under<'a>(&'a self, prefix: SString) -> DynFuture<'a, StatesOutcome> {
-        dynify(stabby::boxed::Box::new(async move {
-            let prefix = PkgBuf::from(prefix.to_string());
-            match self.inner.states_under(&prefix).await {
+        let prefix = PkgBuf::from(prefix.to_string());
+        let key = prefix.as_str().to_string();
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
+            match inner.states_under(&prefix).await {
                 Ok(states) => StatesOutcome {
                     ok: true,
                     message: SString::new(),
@@ -373,7 +533,17 @@ impl StableExecutor for HostExecutor {
                     states: SVec::new(),
                 },
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "states_under",
+            key,
+            fut,
+            |m| StatesOutcome {
+                ok: false,
+                message: m.into(),
+                states: SVec::new(),
+            },
+        )))
     }
 }
 

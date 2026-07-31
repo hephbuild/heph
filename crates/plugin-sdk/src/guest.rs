@@ -389,4 +389,47 @@ mod tests {
         seek.read_to_end(&mut buf2).expect("read seekable");
         assert_eq!(buf2, big_payload());
     }
+
+    // The host-side mirror of the guest's panic containment: a panicking
+    // executor callback body (an engine bug) is spawned on the host runtime,
+    // caught by tokio's task harness, and surfaces to the plugin as an error —
+    // never an unwind through the extern shim (which would abort).
+    #[test]
+    fn host_callback_panic_surfaces_as_error_not_abort() {
+        struct PanicExec;
+        impl ProviderExecutor for PanicExec {
+            fn result<'a>(&'a self, _addr: &'a Addr) -> BoxFuture<'a, Result<Arc<EResult>>> {
+                Box::pin(async { panic!("engine exploded") })
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, Result<Vec<Addr>>> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+        }
+
+        // A real runtime so wrap() captures a handle and takes the spawn path.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let dynexec = HostExecutor::wrap(Arc::new(PanicExec) as Arc<dyn ProviderExecutor>);
+            let guest = GuestExecutor::new(dynexec);
+            let addr = parse_addr("//pkg/a:b").expect("parse addr");
+            let msg = match guest.result(&addr).await {
+                Ok(_) => panic!("panic must surface as an error"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(msg.contains("result"), "names the callback: {msg}");
+            assert!(msg.contains("panicked"), "states it panicked: {msg}");
+            assert!(
+                msg.contains("engine exploded"),
+                "carries the payload: {msg}"
+            );
+        });
+    }
 }

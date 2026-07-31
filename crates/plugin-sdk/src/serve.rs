@@ -37,6 +37,7 @@ use prost::Message;
 use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::vec::Vec as SVec;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,10 +58,125 @@ fn cdylib_runtime() -> &'static tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
             .max_blocking_threads(8 * n + 64)
+            .thread_name("heph-plugin-worker")
             .enable_all()
             .build()
             .expect("build cdylib plugin runtime")
     })
+}
+
+/// Awaits a seam task's `JoinHandle` from the wrapper future the host polls.
+///
+/// - **Abort-on-drop**: the host dropping the wrapper (rather than cancelling
+///   cooperatively) is the only stop signal for entry points with no
+///   `CancelRegistry` wiring (`list`, `list_packages`, `call_function`), so the
+///   spawned body is aborted when the wrapper goes away. The cooperative path
+///   (`await_with_cancel` host-side) cancels then keeps polling — it never
+///   drops, so it is unaffected.
+/// - **Backstop**: the completion wake crosses from a plugin-runtime worker to
+///   the host's waker through the stabby seam. That hazard has not been
+///   reproduced in isolation (docs/CONCURRENCY_MEASUREMENTS.md §2); arming
+///   `hcore::blocking::Backstop` on every pending poll is defense-in-depth,
+///   the same treatment `hcore::blocking::run` gives its oneshot wait.
+///
+/// `JoinHandle::poll` is runtime-free, so polling this from a host worker (or
+/// a plain `futures::executor::block_on`) is sound — `hook_on_events` is the
+/// in-tree precedent of a guest `JoinHandle` awaited across the seam.
+struct SeamTask<T> {
+    handle: tokio::task::JoinHandle<T>,
+    backstop: hcore::blocking::Backstop,
+}
+
+impl<T> std::future::Future for SeamTask<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.handle).poll(cx) {
+            std::task::Poll::Ready(out) => std::task::Poll::Ready(out),
+            std::task::Poll::Pending => {
+                this.backstop.arm(cx.waker());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Drop for SeamTask<T> {
+    fn drop(&mut self) {
+        // No-op on a finished task; stops an abandoned body otherwise.
+        self.handle.abort();
+    }
+}
+
+/// Best-effort text of a panic payload (`panic!` string/`String`, else a stub).
+fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = p.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
+}
+
+/// Spawn an ABI entry point's body onto the plugin runtime and return the
+/// wrapper future handed back across the seam.
+///
+/// **Seam invariant — eager start**: the body starts running the moment the
+/// `extern "C"` entry point is called, *before* the host first polls the
+/// returned future. Request decode, `CancelRegistry::enter`, `note_dep`
+/// inserts — any prefix of the body — may already have happened by first poll.
+/// `enter` stays INSIDE the spawned body so a cancel racing ahead of the spawn
+/// is parked in `precancelled` and applied when the body enters, never lost.
+///
+/// A panicking body surfaces as `JoinError::is_panic` (tokio's task harness is
+/// the `catch_unwind`) and is mapped to an error payload via `mk_err` — never
+/// `resume_unwind`, since this wrapper's poll runs inside the host's
+/// `extern "C"` shim where an unwind would abort the process. A
+/// runtime-shutdown `JoinError` maps to an error the same way.
+fn spawn_seam<T, F>(
+    plugin: &Arc<str>,
+    method: &'static str,
+    key: String,
+    fut: F,
+    mk_err: fn(String) -> T,
+) -> impl Future<Output = T> + Send + 'static
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = SeamTask {
+        handle: hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), fut),
+        backstop: hcore::blocking::Backstop::new(),
+    };
+    let plugin = Arc::clone(plugin);
+    async move {
+        match task.await {
+            Ok(v) => v,
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                mk_err(format!(
+                    "plugin {plugin}: {method}({key}) panicked: {}",
+                    panic_text(payload.as_ref())
+                ))
+            }
+            Err(_) => mk_err(format!(
+                "plugin {plugin}: {method}({key}) aborted: plugin runtime shut down"
+            )),
+        }
+    }
+}
+
+/// Render a pb addr for seam diagnostics (no full `Addr` reconstruction).
+fn pb_addr_key(a: Option<&pb::Addr>) -> String {
+    match a {
+        Some(a) => format!("//{}:{}", a.package, a.name),
+        None => String::new(),
+    }
 }
 
 fn unary(body: Body) -> SVec<u8> {
@@ -185,8 +301,17 @@ fn get_error_kind(e: &anyhow::Error) -> pb::get_error::Kind {
 /// Wrap a real provider as an ABI-stable [`hplugin_stabby::abi::DynProvider`] handle
 /// (in-process; the cdylib entry produces the same handle across the boundary).
 pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::DynProvider {
+    // Captured once for seam diagnostics (panic messages) — `config` is static
+    // metadata; calling it lazily on the error path would run author code
+    // inside the extern shim's poll.
+    let name: Arc<str> = provider
+        .config(ConfigRequest {})
+        .map(|r| r.name)
+        .unwrap_or_default()
+        .into();
     dynify(stabby::boxed::Box::new(StableProviderImpl {
         provider,
+        name,
         cancels: Arc::new(CancelRegistry::default()),
     }))
 }
@@ -195,8 +320,14 @@ pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::Dy
 pub fn make_dyn_managed_driver(
     driver: Arc<dyn ManagedDriver>,
 ) -> hplugin_stabby::abi::DynManagedDriver {
+    let name: Arc<str> = driver
+        .config(DriverConfigRequest {})
+        .map(|r| r.name)
+        .unwrap_or_default()
+        .into();
     dynify(stabby::boxed::Box::new(StableManagedDriverImpl {
         driver,
+        name,
         cancels: Arc::new(CancelRegistry::default()),
     }))
 }
@@ -214,9 +345,22 @@ struct CancelRegistry {
 impl CancelRegistry {
     /// Register a fresh token for `id` and return a guard that deregisters on drop.
     /// An empty id (no cancellation wired for this call) is a no-op passthrough.
+    ///
+    /// Ordering pairs with [`cancel`](Self::cancel): each side *publishes* (the
+    /// token into `inflight` / the id into `precancelled`) before it *checks*
+    /// the other's map, so whichever side loses the race, at least one of the
+    /// two checks observes the other's write — a cancel is applied by one of
+    /// them (possibly both; `cancel()` on a token is idempotent), never
+    /// dropped. Checking before publishing (the old order) had a window where
+    /// `enter` saw no parked cancel and `cancel` saw no in-flight token, losing
+    /// the cancel — the eager seam spawn makes that window hittable.
     fn enter(self: &Arc<Self>, id: &str) -> CancelGuard {
         let token = StdCancellationToken::new();
         if !id.is_empty() {
+            self.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string(), token.clone());
             if self
                 .precancelled
                 .lock()
@@ -225,10 +369,6 @@ impl CancelRegistry {
             {
                 token.cancel();
             }
-            self.inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(id.to_string(), token.clone());
         }
         CancelGuard {
             reg: Arc::clone(self),
@@ -237,19 +377,21 @@ impl CancelRegistry {
         }
     }
 
+    /// See [`enter`](Self::enter) for the publish-then-check pairing. A parked
+    /// id not consumed here is consumed (and applied) by the next `enter` under
+    /// the same id — ids name an engine request, and a cancelled request stays
+    /// cancelled, so applying it to that later call is correct.
     fn cancel(&self, id: &str) {
         if id.is_empty() {
             return;
         }
+        self.precancelled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
         let map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = map.get(id) {
             t.cancel();
-        } else {
-            drop(map);
-            self.precancelled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(id.to_string());
         }
     }
 }
@@ -270,11 +412,13 @@ impl CancelGuard {
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         if !self.id.is_empty() {
-            self.reg
-                .inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.id);
+            let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            // Identity-checked: a request id names an engine request, not a
+            // single call, so a later call under the same id may have replaced
+            // this entry — a stale guard's late drop must not deregister it.
+            if map.get(&self.id).is_some_and(|t| t.ptr_eq(&self.token)) {
+                map.remove(&self.id);
+            }
         }
     }
 }
@@ -282,6 +426,8 @@ impl Drop for CancelGuard {
 /// Wraps an author `Provider` as a [`StableProvider`].
 pub struct StableProviderImpl {
     pub provider: Arc<dyn Provider>,
+    /// Provider name, for seam diagnostics (panic/abort error messages).
+    name: Arc<str>,
     cancels: Arc<CancelRegistry>,
 }
 
@@ -302,17 +448,18 @@ fn unimplemented(method: u32) -> SVec<u8> {
 }
 
 // ---- Provider RPC bodies (moved verbatim out of the old per-method vtable slots
-// into helpers; the dispatch impls below route method ids to them) ----
+// into helpers; the dispatch impls below route method ids to them). Each takes
+// its already-decoded request: the dispatch decodes eagerly (to derive the seam
+// diagnostic key) before spawning the body onto the plugin runtime. ----
 
 // Server-streaming: the provider's iterator is pulled lazily across the seam (one
 // item per `StableItemStream::next`), never materialized into one blob.
 
 async fn provider_list_stream(
     provider: Arc<dyn Provider>,
-    req: SVec<u8>,
+    req: pb::ListRequest,
     exec: DynExecutor,
 ) -> DynItemStream {
-    let req = pb::ListRequest::decode(&req[..]).unwrap_or_default();
     let tok = StdCancellationToken::new();
     let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
     let lreq = ListRequest {
@@ -334,9 +481,8 @@ async fn provider_list_stream(
 
 async fn provider_list_packages_stream(
     provider: Arc<dyn Provider>,
-    req: SVec<u8>,
+    req: pb::ListPackagesRequest,
 ) -> DynItemStream {
-    let req = pb::ListPackagesRequest::decode(&req[..]).unwrap_or_default();
     let tok = StdCancellationToken::new();
     let lreq = ListPackagesRequest {
         prefix: PkgBuf::from(req.prefix),
@@ -354,11 +500,10 @@ async fn provider_list_packages_stream(
 
 async fn provider_get(
     provider: Arc<dyn Provider>,
-    req: SVec<u8>,
+    req: pb::GetRequest,
     exec: DynExecutor,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
-    let req = pb::GetRequest::decode(&req[..]).unwrap_or_default();
     let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
     let guard = cancels.enter(&req.request_id);
     let greq = GetRequest {
@@ -385,10 +530,9 @@ async fn provider_get(
 
 async fn provider_probe(
     provider: Arc<dyn Provider>,
-    req: SVec<u8>,
+    req: pb::ProbeRequest,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
-    let req = pb::ProbeRequest::decode(&req[..]).unwrap_or_default();
     let guard = cancels.enter(&req.request_id);
     let preq = ProbeRequest {
         request_id: req.request_id,
@@ -403,8 +547,10 @@ async fn provider_probe(
     unary(body)
 }
 
-async fn provider_call_function(provider: Arc<dyn Provider>, req: SVec<u8>) -> SVec<u8> {
-    let req = pb::CallFunctionRequest::decode(&req[..]).unwrap_or_default();
+async fn provider_call_function(
+    provider: Arc<dyn Provider>,
+    req: pb::CallFunctionRequest,
+) -> SVec<u8> {
     // Re-derive the def each call (cheap; provider functions are static
     // metadata). The handler is not transmissible, so it must be invoked
     // here on the guest side.
@@ -527,17 +673,43 @@ impl StableMeta for StableProviderImpl {
     }
 }
 
+// Entry-point dispatch. Every implemented method body is spawned onto the
+// plugin's own runtime via [`spawn_seam`] — the returned future only awaits the
+// `JoinHandle`, so the host worker polling it never executes plugin code (whose
+// reactor/timer use would panic outside the plugin runtime), and a panicking
+// body surfaces as an error instead of unwinding through the extern shim.
+// Seam invariant (eager start): the body starts at `invoke*()` call time, before
+// the host's first poll — see [`spawn_seam`].
 impl StableProvider for StableProviderImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
-        let cancels = Arc::clone(&self.cancels);
-        dynify(stabby::boxed::Box::new(async move {
-            match pb::ProviderMethod::try_from(method as i32) {
-                Ok(pb::ProviderMethod::Probe) => provider_probe(provider, req, cancels).await,
-                Ok(pb::ProviderMethod::CallFunction) => provider_call_function(provider, req).await,
-                _ => unimplemented(method),
+        match pb::ProviderMethod::try_from(method as i32) {
+            Ok(pb::ProviderMethod::Probe) => {
+                let req = pb::ProbeRequest::decode(&req[..]).unwrap_or_default();
+                let key = req.package.clone();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "probe",
+                    key,
+                    provider_probe(provider, req, Arc::clone(&self.cancels)),
+                    |m| unary(err_body(m)),
+                )))
             }
-        }))
+            Ok(pb::ProviderMethod::CallFunction) => {
+                let req = pb::CallFunctionRequest::decode(&req[..]).unwrap_or_default();
+                let key = req.name.clone();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "call_function",
+                    key,
+                    provider_call_function(provider, req),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            _ => dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            )),
+        }
     }
 
     extern "C" fn invoke_server_stream<'a>(
@@ -546,15 +718,23 @@ impl StableProvider for StableProviderImpl {
         req: SVec<u8>,
     ) -> DynFuture<'a, DynItemStream> {
         let provider = Arc::clone(&self.provider);
-        dynify(stabby::boxed::Box::new(async move {
-            match pb::ProviderMethod::try_from(method as i32) {
-                // `List` rides `invoke_exec_server_stream` (it needs an executor).
-                Ok(pb::ProviderMethod::ListPackages) => {
-                    provider_list_packages_stream(provider, req).await
-                }
-                _ => unimplemented_item_stream(method),
+        match pb::ProviderMethod::try_from(method as i32) {
+            // `List` rides `invoke_exec_server_stream` (it needs an executor).
+            Ok(pb::ProviderMethod::ListPackages) => {
+                let req = pb::ListPackagesRequest::decode(&req[..]).unwrap_or_default();
+                let key = req.prefix.clone();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "list_packages",
+                    key,
+                    provider_list_packages_stream(provider, req),
+                    error_item_stream,
+                )))
             }
-        }))
+            _ => dynify(stabby::boxed::Box::new(async move {
+                unimplemented_item_stream(method)
+            })),
+        }
     }
 
     extern "C" fn invoke_exec_server_stream<'a>(
@@ -564,12 +744,22 @@ impl StableProvider for StableProviderImpl {
         exec: DynExecutor,
     ) -> DynFuture<'a, DynItemStream> {
         let provider = Arc::clone(&self.provider);
-        dynify(stabby::boxed::Box::new(async move {
-            match pb::ProviderMethod::try_from(method as i32) {
-                Ok(pb::ProviderMethod::List) => provider_list_stream(provider, req, exec).await,
-                _ => unimplemented_item_stream(method),
+        match pb::ProviderMethod::try_from(method as i32) {
+            Ok(pb::ProviderMethod::List) => {
+                let req = pb::ListRequest::decode(&req[..]).unwrap_or_default();
+                let key = req.package.clone();
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "list",
+                    key,
+                    provider_list_stream(provider, req, exec),
+                    error_item_stream,
+                )))
             }
-        }))
+            _ => dynify(stabby::boxed::Box::new(async move {
+                unimplemented_item_stream(method)
+            })),
+        }
     }
 
     extern "C" fn invoke_client_stream<'a>(
@@ -600,13 +790,29 @@ impl StableProvider for StableProviderImpl {
         exec: DynExecutor,
     ) -> DynFuture<'a, SVec<u8>> {
         let provider = Arc::clone(&self.provider);
-        let cancels = Arc::clone(&self.cancels);
-        dynify(stabby::boxed::Box::new(async move {
-            match pb::ProviderMethod::try_from(method as i32) {
-                Ok(pb::ProviderMethod::Get) => provider_get(provider, req, exec, cancels).await,
-                _ => unimplemented(method),
+        match pb::ProviderMethod::try_from(method as i32) {
+            Ok(pb::ProviderMethod::Get) => {
+                let req = pb::GetRequest::decode(&req[..]).unwrap_or_default();
+                let key = pb_addr_key(req.addr.as_ref());
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "get",
+                    key,
+                    provider_get(provider, req, exec, Arc::clone(&self.cancels)),
+                    // A panic/abort is a GetErr (not a bare Error) so the host's
+                    // `get` decode surfaces the message as-is.
+                    |m| {
+                        unary(Body::GetErr(pb::GetError {
+                            kind: pb::get_error::Kind::Other as i32,
+                            message: m,
+                        }))
+                    },
+                )))
             }
-        }))
+            _ => dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            )),
+        }
     }
 
     extern "C" fn invoke_registry(&self, method: u32, req: SVec<u8>, reg: DynFunctionRegistry) {
@@ -670,6 +876,8 @@ fn stream_err(message: String) -> Body {
 /// Wraps an author `ManagedDriver` as a [`StableManagedDriver`].
 pub struct StableManagedDriverImpl {
     pub driver: Arc<dyn ManagedDriver>,
+    /// Driver name, for seam diagnostics (panic/abort error messages).
+    name: Arc<str>,
     cancels: Arc<CancelRegistry>,
 }
 
@@ -697,10 +905,9 @@ fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
 
 async fn driver_parse(
     driver: Arc<dyn ManagedDriver>,
-    req: SVec<u8>,
+    req: pb::ParseRequest,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
-    let req = pb::ParseRequest::decode(&req[..]).unwrap_or_default();
     let guard = cancels.enter(&req.request_id);
     let preq = ParseRequest {
         request_id: req.request_id,
@@ -722,10 +929,9 @@ async fn driver_parse(
 
 async fn driver_apply_transitive(
     driver: Arc<dyn ManagedDriver>,
-    req: SVec<u8>,
+    req: pb::ApplyTransitiveRequest,
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
-    let req = pb::ApplyTransitiveRequest::decode(&req[..]).unwrap_or_default();
     let guard = cancels.enter(&req.request_id);
     let target_def = match convert::target_def_from_pb(req.target_def.unwrap_or_default()) {
         Ok(td) => td,
@@ -758,19 +964,39 @@ impl StableMeta for StableManagedDriverImpl {
     }
 }
 
+// Same seam shape as [`StableProvider`]: bodies spawn onto the plugin runtime,
+// the host polls only a `JoinHandle` await, panics become errors (never an
+// unwind through the extern shim), and bodies start eagerly at call time.
 impl StableManagedDriver for StableManagedDriverImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
-        let cancels = Arc::clone(&self.cancels);
-        dynify(stabby::boxed::Box::new(async move {
-            match pb::DriverMethod::try_from(method as i32) {
-                Ok(pb::DriverMethod::Parse) => driver_parse(driver, req, cancels).await,
-                Ok(pb::DriverMethod::ApplyTransitive) => {
-                    driver_apply_transitive(driver, req, cancels).await
-                }
-                _ => unimplemented(method),
+        match pb::DriverMethod::try_from(method as i32) {
+            Ok(pb::DriverMethod::Parse) => {
+                let req = pb::ParseRequest::decode(&req[..]).unwrap_or_default();
+                let key = pb_addr_key(req.target_spec.as_ref().and_then(|t| t.addr.as_ref()));
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "parse",
+                    key,
+                    driver_parse(driver, req, Arc::clone(&self.cancels)),
+                    |m| unary(err_body(m)),
+                )))
             }
-        }))
+            Ok(pb::DriverMethod::ApplyTransitive) => {
+                let req = pb::ApplyTransitiveRequest::decode(&req[..]).unwrap_or_default();
+                let key = pb_addr_key(req.target_def.as_ref().and_then(|t| t.addr.as_ref()));
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "apply_transitive",
+                    key,
+                    driver_apply_transitive(driver, req, Arc::clone(&self.cancels)),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            _ => dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            )),
+        }
     }
 
     // No unary->stream or stream->unary driver RPC yet; provisioned, Unimplemented.
@@ -869,8 +1095,10 @@ async fn run_bidi(
     // The run shells out via the reactor — execute on the cdylib's own runtime,
     // feeding RunOutFrames into a channel the host drains. (Live stdin/stdout will
     // ride `req` / the channel later; today only the terminal result is sent.)
+    // `spawn_on_with_cycle_ctx` (not a bare `spawn`) so the run task inherits the
+    // caller's memoizer frame chain for cycle detection.
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-    cdylib_runtime().spawn(async move {
+    hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), async move {
         let guard = cancels.enter(&start.request_id);
         let out = run_once(driver, start, guard.token()).await;
         // Host gone => receiver dropped; ignore send failure.
@@ -2305,5 +2533,353 @@ mod tests {
             !host.supports_shell(),
             "remote proxy must defer --shell to the host pluginexec fallback"
         );
+    }
+
+    /// Base provider for the seam tests below: every method is a benign stub;
+    /// individual tests override the one they exercise.
+    macro_rules! stub_provider_boilerplate {
+        ($name:literal) => {
+            fn config(&self, _r: ConfigRequest) -> Result<ConfigResponse> {
+                Ok(ConfigResponse { name: $name.into() })
+            }
+            fn list<'a>(
+                &'a self,
+                _r: ListRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _r: ListPackagesRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+            > {
+                Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+            }
+        };
+    }
+
+    // A panicking provider body must surface as an actionable seam error —
+    // plugin name, method, key, payload — never unwind through the extern shim
+    // (which would abort the process). Tokio's task harness is the catch_unwind;
+    // the wrapper maps JoinError::is_panic to the error body.
+    #[test]
+    fn panicking_provider_body_is_contained_as_error() {
+        use hplugin_stabby::load_stable::StableRemoteProvider;
+
+        struct Boomer;
+        impl Provider for Boomer {
+            stub_provider_boilerplate!("boomer");
+            fn get<'a>(
+                &'a self,
+                _r: GetRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
+            {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _r: ProbeRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+                Box::pin(async { panic!("probe exploded") })
+            }
+        }
+
+        let host = StableRemoteProvider::new(make_dyn_provider(Arc::new(Boomer)), "boomer");
+        let ct = StdCancellationToken::new();
+        let msg = match futures::executor::block_on(host.probe(
+            ProbeRequest {
+                request_id: String::new(),
+                package: PkgBuf::from("p"),
+            },
+            &ct,
+        )) {
+            Ok(_) => panic!("panic must surface as an error, not success"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("plugin boomer"), "names the plugin: {msg}");
+        assert!(msg.contains("probe(p)"), "names method + key: {msg}");
+        assert!(msg.contains("panicked"), "states it panicked: {msg}");
+        assert!(msg.contains("probe exploded"), "carries the payload: {msg}");
+    }
+
+    // Abort-on-drop: dropping the seam wrapper without a cooperative cancel is
+    // the only stop signal for entry points with no CancelRegistry wiring — the
+    // spawned guest body must provably stop, not leak on the plugin runtime.
+    #[test]
+    fn dropped_seam_future_aborts_the_spawned_body() {
+        use hplugin_stabby::abi::StableProviderDyn;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct Hanger {
+            started: Arc<AtomicBool>,
+            stopped: Arc<AtomicBool>,
+        }
+        impl Provider for Hanger {
+            stub_provider_boilerplate!("hanger");
+            fn get<'a>(
+                &'a self,
+                _r: GetRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
+            {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _r: ProbeRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+                let started = Arc::clone(&self.started);
+                let stopped = Arc::clone(&self.stopped);
+                Box::pin(async move {
+                    // Dropped only when this future is dropped — i.e. when the
+                    // spawned task is aborted (it never completes on its own).
+                    let _guard = SetOnDrop(stopped);
+                    started.store(true, Ordering::SeqCst);
+                    futures::future::pending::<()>().await;
+                    Ok(ProbeResponse { states: vec![] })
+                })
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let dynp = make_dyn_provider(Arc::new(Hanger {
+            started: Arc::clone(&started),
+            stopped: Arc::clone(&stopped),
+        }) as Arc<dyn Provider>);
+
+        let req = pb::ProbeRequest {
+            request_id: String::new(),
+            package: "p".into(),
+        }
+        .encode_to_vec();
+        let fut = dynp.invoke(pb::ProviderMethod::Probe as u32, SVec::from(req.as_slice()));
+
+        // Eager start: the body begins without the wrapper ever being polled.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "spawned body never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Host abandons the call: drop without polling to completion.
+        drop(fut);
+
+        while !stopped.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "spawned body still running after the wrapper was dropped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // Pre-cancel race loop: a cancel issued through the extern cancel path may
+    // arrive before the (eagerly spawned) body reaches CancelRegistry::enter.
+    // The registry parks it in `precancelled` and applies it at enter — the
+    // cancel must never be lost, whichever side wins the race.
+    #[test]
+    fn precancel_racing_the_spawn_is_never_lost() {
+        use hplugin_stabby::abi::{StableCancelDyn, StableProviderDyn};
+        use std::time::Duration;
+
+        struct CancelWait;
+        impl Provider for CancelWait {
+            stub_provider_boilerplate!("cancelwait");
+            fn get<'a>(
+                &'a self,
+                _r: GetRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
+            {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            // Returns only once the token this call was handed trips.
+            fn probe<'a>(
+                &'a self,
+                _r: ProbeRequest,
+                ct: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+                Box::pin(async move {
+                    ct.cancelled().await;
+                    Ok(ProbeResponse { states: vec![] })
+                })
+            }
+        }
+
+        let dynp = make_dyn_provider(Arc::new(CancelWait) as Arc<dyn Provider>);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        for i in 0..100 {
+            let id = format!("rq-{i}");
+            let req = pb::ProbeRequest {
+                request_id: id.clone(),
+                package: "p".into(),
+            }
+            .encode_to_vec();
+            // Spawn (eager) ...
+            let fut = dynp.invoke(pb::ProviderMethod::Probe as u32, SVec::from(req.as_slice()));
+            // ... and race the cancel against the body reaching `enter`.
+            dynp.cancel(id.into());
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), fut)
+                    .await
+                    .unwrap_or_else(|_| panic!("cancel lost on iteration {i}: probe never woke"));
+            });
+        }
+    }
+
+    // Reentrancy through the seam: a provider `get` whose body calls the host
+    // executor's `result`, whose resolution issues a SECOND provider `get` —
+    // a second spawn into the same plugin runtime while the first body is
+    // parked on the callback. Must complete, not deadlock. (Also exercises the
+    // host-side mirror: the executor body is spawned onto the host runtime
+    // captured at wrap() time, not run inline on a guest worker.)
+    #[test]
+    fn nested_seam_get_completes_without_deadlock() {
+        use hmodel::htaddr::Addr;
+        use hplugin::provider::{NoopExecutor, ProviderExecutor};
+        use hplugin_stabby::load_stable::StableRemoteProvider;
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        struct Nester;
+        impl Provider for Nester {
+            stub_provider_boilerplate!("nester");
+            fn probe<'a>(
+                &'a self,
+                _r: ProbeRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+            fn get<'a>(
+                &'a self,
+                req: GetRequest,
+                _c: &'a (dyn Cancellable + Send + Sync),
+            ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>>
+            {
+                Box::pin(async move {
+                    if req.addr.name != "top" {
+                        return Err(GetError::NotFound);
+                    }
+                    let dep = Addr::new(PkgBuf::from("p"), "dep".into(), Default::default());
+                    match req.executor.result(&dep).await {
+                        // The nested chain completed; surface a recognizable
+                        // marker instead of fabricating a TargetSpec.
+                        Ok(_) => Err(GetError::Other(anyhow::anyhow!("nested-complete"))),
+                        Err(e) => Err(GetError::Other(e.context("nested result failed"))),
+                    }
+                })
+            }
+        }
+
+        /// Host-side executor whose `result` resolves by issuing a second `get`
+        /// through the real seam.
+        struct NestedExec {
+            host: OnceLock<StableRemoteProvider>,
+        }
+        impl ProviderExecutor for NestedExec {
+            fn result<'a>(
+                &'a self,
+                addr: &'a Addr,
+            ) -> futures::future::BoxFuture<'a, Result<Arc<hplugin::eresult::EResult>>>
+            {
+                Box::pin(async move {
+                    let host = self.host.get().expect("host handle wired");
+                    let ct = StdCancellationToken::new();
+                    let req = GetRequest {
+                        request_id: String::new(),
+                        addr: addr.clone(),
+                        states: vec![],
+                        executor: Arc::new(NoopExecutor),
+                    };
+                    match host.get(req, &ct).await {
+                        Err(GetError::NotFound) => Ok(Arc::new(hplugin::eresult::EResult {
+                            artifacts: vec![],
+                            support_artifacts: vec![],
+                            artifacts_meta: vec![],
+                        })),
+                        Ok(_) => anyhow::bail!("dep get unexpectedly found a spec"),
+                        Err(GetError::Other(e)) => Err(e.context("nested dep get")),
+                    }
+                })
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> futures::future::BoxFuture<'a, Result<Vec<Addr>>> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+        }
+
+        let host = StableRemoteProvider::new(
+            make_dyn_provider(Arc::new(Nester) as Arc<dyn Provider>),
+            "nester",
+        );
+        let exec = Arc::new(NestedExec {
+            host: OnceLock::new(),
+        });
+        exec.host
+            .set(host.clone())
+            .unwrap_or_else(|_| panic!("set host"));
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+        let out = rt
+            .block_on(async {
+                let ct = StdCancellationToken::new();
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    host.get(
+                        GetRequest {
+                            request_id: "rq-top".into(),
+                            addr: Addr::new(PkgBuf::from("p"), "top".into(), Default::default()),
+                            states: vec![],
+                            executor: exec.clone() as Arc<dyn ProviderExecutor>,
+                        },
+                        &ct,
+                    ),
+                )
+                .await
+            })
+            .expect("deadlock: nested seam get did not complete");
+        match out {
+            Err(GetError::Other(e)) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("nested-complete"),
+                    "nested chain must have completed: {msg}"
+                );
+            }
+            Err(GetError::NotFound) => panic!("top get must run the nested body"),
+            Ok(_) => panic!("top get returns the marker error"),
+        }
     }
 }
