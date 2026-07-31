@@ -1446,6 +1446,7 @@ name = "e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core",
  "heph",
  "plugin-oci",
  "tar",
