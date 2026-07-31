@@ -12,6 +12,8 @@ hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }
 hplugin = { package = "plugin", path = "../plugin" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
+hbuiltins = { package = "builtins", path = "../builtins" }
+hproc = { package = "proc", path = "../proc" }
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
@@ -19,7 +21,7 @@ serde_yaml = "0.9"
 async-trait = "0.1.89"
 futures = "0.3.32"
 enclose = "1"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 wax = "0.7"
 tracing = "0.1"

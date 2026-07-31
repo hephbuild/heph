@@ -142,6 +142,7 @@ use hwalk::{CachedWalker, EntryKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use wax::{Glob, Program as _};
 
 /// First-party source extensions this walk parses for outgoing edges — see
 /// module docs' "Deliberate scope trims".
@@ -349,20 +350,25 @@ fn tsconfig_pattern_matches(pattern: &str, specifier: &str) -> bool {
     }
 }
 
+/// Read and parse a tsconfig file as JSONC (comments, trailing commas —
+/// conventional for real-world `tsconfig.json` files; a plain `serde_json`
+/// parse would otherwise choke and force callers into an overly conservative
+/// fallback far more often than necessary). Shared by [`bare_specifier_guard`],
+/// [`read_tsconfig_fields`], and [`resolve_tsconfig_extends_chain`] so all
+/// three agree on exactly what counts as "this tsconfig's own JSON".
+fn read_tsconfig_jsonc(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let mut text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading tsconfig {}", path.display()))?;
+    json_strip_comments::strip(&mut text)
+        .map_err(|e| anyhow::anyhow!("stripping comments from {}: {e}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing tsconfig {}", path.display()))
+}
+
 fn bare_specifier_guard(tsconfig: Option<&Path>) -> BareSpecifierGuard {
     let Some(tsconfig) = tsconfig else {
         return BareSpecifierGuard::Unrestricted;
     };
-    let Ok(mut text) = std::fs::read_to_string(tsconfig) else {
-        return BareSpecifierGuard::Disabled;
-    };
-    // tsconfig.json is conventionally JSONC (comments, trailing commas); a
-    // plain `serde_json` parse would otherwise choke on a real-world file
-    // and force `Disabled` far more often than necessary.
-    if json_strip_comments::strip(&mut text).is_err() {
-        return BareSpecifierGuard::Disabled;
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+    let Ok(value) = read_tsconfig_jsonc(tsconfig) else {
         return BareSpecifierGuard::Disabled;
     };
     let compiler_options = value.get("compilerOptions");
@@ -407,6 +413,342 @@ pub fn find_nearest_tsconfig(workspace_root: &Path, pkg_dir: &Path) -> Option<Pa
     }
 }
 
+/// A tsconfig's own `include`/`exclude`/`files` fields (leaf-level only —
+/// **not** merged across an `extends` chain; see
+/// [`resolve_tsconfig_extends_chain`] for the sibling gap this leaves and why
+/// it's an accepted trim, not a silent one). Used both to bound
+/// `js_typecheck`'s declared first-party Input set to what `tsc` actually
+/// reads (see `provider.rs`'s `typecheck_deps_config`) and, via
+/// [`check_tsconfig_scope`], to verify a *shared* tsconfig actually scopes to
+/// one package before trusting a per-package Input set built from it at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TsconfigFields {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub files: Vec<String>,
+}
+
+pub fn read_tsconfig_fields(path: &Path) -> anyhow::Result<TsconfigFields> {
+    let value = read_tsconfig_jsonc(path)?;
+    let strings = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(TsconfigFields {
+        include: strings("include"),
+        exclude: strings("exclude"),
+        files: strings("files"),
+    })
+}
+
+/// Whether `tsconfig_path`'s own effective scope (its `include`/`files`
+/// fields — see [`TsconfigFields`]'s doc for the extends-merge trim) can be
+/// trusted to reach only files under `pkg_dir`.
+///
+/// A package's **own** tsconfig (found directly in `pkg_dir` by
+/// [`find_nearest_tsconfig`]) is always trusted: even with no
+/// `include`/`files` at all, `tsc`'s own default scope — every source file
+/// under the config's directory — is bounded by `pkg_dir` itself, so it can
+/// never reach outside it.
+///
+/// A **shared/ancestor** tsconfig (found by walking up past `pkg_dir`,
+/// meaning the package has no tsconfig of its own) is different: `tsc`'s
+/// default scope is bounded by the *ancestor's* directory, which may
+/// legitimately contain other, unrelated packages — the classic
+/// single-shared-root-tsconfig monorepo shape. A per-package `js_typecheck`
+/// Input set built only from this package's own files would be unsound
+/// there — see `ai-docs/js-plugin-plan.md`'s "Correctness safety valve". So a
+/// shared tsconfig is only trusted when it declares its own `include`/
+/// `files`, **and** every entry's literal (non-wildcard) prefix is confined
+/// to `pkg_dir` or a subdirectory of it (checked textually — proving a
+/// pattern *can't* reach outside the package without needing a full
+/// workspace walk here). Anything else (no `include`/`files` at all, or an
+/// entry reaching outside `pkg_dir`) is rejected with an actionable error
+/// rather than silently assumed safe.
+pub fn check_tsconfig_scope(
+    tsconfig_path: &Path,
+    tsconfig_dir: &Path,
+    pkg_dir: &Path,
+    fields: &TsconfigFields,
+) -> anyhow::Result<()> {
+    if tsconfig_dir == pkg_dir {
+        return Ok(());
+    }
+    let pkg_rel = pkg_dir
+        .strip_prefix(tsconfig_dir)
+        .unwrap_or(pkg_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let entries: Vec<&String> = fields.include.iter().chain(fields.files.iter()).collect();
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "js_typecheck: {pkg_dir:?} has no tsconfig.json of its own, and the nearest ancestor \
+         one ({tsconfig_path:?}) declares no `include`/`files` — its default scope is every \
+         source file under {tsconfig_dir:?}, which may reach other packages heph cannot safely \
+         attribute to just {pkg_dir:?}. Add an `include`/`files` field to {tsconfig_path:?} \
+         scoping it to {pkg_rel:?}, or give {pkg_dir:?} its own tsconfig.json.",
+    );
+    for entry in entries {
+        anyhow::ensure!(
+            pattern_confined_to_pkg(entry, &pkg_rel),
+            "js_typecheck: {tsconfig_path:?}'s `include`/`files` entry {entry:?} is not confined \
+             to {pkg_rel:?} — this shared tsconfig may cover more than one package, which \
+             `js_typecheck`'s per-package Input scoping cannot safely represent. Scope \
+             {tsconfig_path:?}'s `include`/`files` to {pkg_rel:?} only, or give {pkg_dir:?} its \
+             own tsconfig.json.",
+        );
+    }
+    Ok(())
+}
+
+/// Whether `pattern` (an `include`/`files` entry, relative to the tsconfig's
+/// own directory) is textually confined to `pkg_rel` (the package's relative
+/// path from that same directory) or a subdirectory of it. A conservative,
+/// glob-*prefix* check rather than full glob evaluation — see
+/// [`check_tsconfig_scope`]'s doc for why that's the right trade-off here.
+fn pattern_confined_to_pkg(pattern: &str, pkg_rel: &str) -> bool {
+    let pkg_rel = pkg_rel.trim_end_matches('/');
+    if pkg_rel.is_empty() {
+        // The package *is* the tsconfig's own directory (the root package)
+        // — nothing can be "outside" it.
+        return true;
+    }
+    let literal_prefix = pattern
+        .split(['*', '?'])
+        .next()
+        .unwrap_or(pattern)
+        .trim_end_matches('/');
+    literal_prefix == pkg_rel || literal_prefix.starts_with(&format!("{pkg_rel}/"))
+}
+
+/// Filter `files` (absolute paths) down to the ones matching `fields`'
+/// `include`/`files`/`exclude`, interpreted relative to `tsconfig_dir` the
+/// same way `tsc` itself resolves them. `include` and `files` both empty
+/// means "no restriction" (`tsc`'s own default: every file under the
+/// tsconfig's directory, modulo `exclude`) — `files` is always included
+/// verbatim (an explicit file list is never subject to `exclude`, matching
+/// `tsc`'s own semantics).
+pub fn filter_by_tsconfig_fields(
+    files: Vec<PathBuf>,
+    tsconfig_dir: &Path,
+    fields: &TsconfigFields,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if fields.include.is_empty() && fields.files.is_empty() && fields.exclude.is_empty() {
+        return Ok(files);
+    }
+    let include_globs: Vec<Glob<'_>> = fields
+        .include
+        .iter()
+        .map(|p| Glob::new(p).with_context(|| format!("invalid tsconfig include glob {p:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let exclude_globs: Vec<Glob<'_>> = fields
+        .exclude
+        .iter()
+        .map(|p| Glob::new(p).with_context(|| format!("invalid tsconfig exclude glob {p:?}")))
+        .collect::<anyhow::Result<_>>()?;
+    let explicit_files: HashSet<PathBuf> =
+        fields.files.iter().map(|f| tsconfig_dir.join(f)).collect();
+    // No `include`/`files` at all: `tsc`'s own default is "every file under
+    // the tsconfig's directory" — i.e. unrestricted here too, modulo
+    // `exclude` below.
+    let unrestricted_include = fields.include.is_empty() && fields.files.is_empty();
+    Ok(files
+        .into_iter()
+        .filter(|f| {
+            if explicit_files.contains(f) {
+                return true;
+            }
+            let rel = f.strip_prefix(tsconfig_dir).unwrap_or(f);
+            (unrestricted_include || include_globs.iter().any(|g| g.is_match(rel)))
+                && !exclude_globs.iter().any(|g| g.is_match(rel))
+        })
+        .collect())
+}
+
+/// Resolve `leaf`'s `extends` chain (JSONC-aware; each ancestor's own
+/// `extends` is followed too, cycle-guarded), returning every ancestor
+/// config file the chain reaches — nearest first, **excluding** `leaf`
+/// itself. Declared as additional `"tsconfig"` `js_typecheck` Inputs and
+/// folded into its content hash (see `provider.rs`'s `typecheck_deps_config`):
+/// `tsc --project` merges every ancestor's `compilerOptions` into the
+/// effective program, so a change to any of them must bust the cache the
+/// same way a change to the leaf itself does.
+///
+/// A relative `extends` entry (`"./foo"`, `"../bar.json"`) is resolved
+/// against the referencing config's own directory, same as `tsc` itself
+/// (trying the path as given, then with a `.json` extension appended). A
+/// bare package-name entry (TypeScript's shareable-config convention, e.g.
+/// `"@org/tsconfig-base"`) is resolved by walking up `node_modules`
+/// directories from the referencing config towards `workspace_root`,
+/// matching Node's own package-resolution walk — this reintroduces the same
+/// ambient-`node_modules` dependency `typecheck_deps_config`'s third-party
+/// handling already has for package imports (see that function's doc), not a
+/// new one.
+///
+/// An entry that cannot be resolved at all fails the whole call rather than
+/// being silently skipped: `tsc` cannot run at all without it, so pretending
+/// the Input set is complete while omitting a real config file `tsc` needs
+/// would be the exact silent-cache-poisoning failure mode this milestone is
+/// scoped to avoid.
+///
+/// TS 5.0's `extends` array (multiple base configs layered in order) is
+/// followed for declaring/hashing purposes (every entry is resolved and
+/// included), but only the *first* entry is recursed into for its own
+/// further `extends` — see the inline comment at that branch for why.
+pub fn resolve_tsconfig_extends_chain(
+    workspace_root: &Path,
+    leaf: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize workspace root {}", workspace_root.display()))?;
+    let mut chain = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    if let Ok(c) = leaf.canonicalize() {
+        seen.insert(c);
+    }
+    let mut current = leaf.to_path_buf();
+    loop {
+        let value = read_tsconfig_jsonc(&current)?;
+        let Some(extends) = value.get("extends") else {
+            break;
+        };
+        let dir = current.parent().unwrap_or(&current).to_path_buf();
+        let next = match extends {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(items) => {
+                // Every entry is a real config file `tsc` merges in, so every
+                // one is declared/hashed — but only the first is walked
+                // further up for its *own* `extends` (matching the single
+                // chain a single-string `extends` would produce; fully
+                // replicating TS's multi-extends *merge order* is scoped out
+                // — see this function's doc).
+                for item in items.iter().skip(1) {
+                    if let Some(s) = item.as_str() {
+                        let resolved = resolve_extends_specifier(&canonical_root, &dir, s)?;
+                        if seen.insert(resolved.clone()) {
+                            chain.push(resolved);
+                        }
+                    }
+                }
+                items.first().and_then(|v| v.as_str()).map(str::to_string)
+            }
+            _ => None,
+        };
+        let Some(specifier) = next else { break };
+        let resolved = resolve_extends_specifier(&canonical_root, &dir, &specifier)?;
+        anyhow::ensure!(
+            seen.insert(resolved.clone()),
+            "tsconfig extends cycle detected while resolving {}",
+            leaf.display()
+        );
+        chain.push(resolved.clone());
+        current = resolved;
+    }
+    Ok(chain)
+}
+
+fn resolve_extends_specifier(
+    canonical_workspace_root: &Path,
+    from_dir: &Path,
+    specifier: &str,
+) -> anyhow::Result<PathBuf> {
+    if specifier.starts_with('.') || Path::new(specifier).is_absolute() {
+        let candidate = from_dir.join(specifier);
+        let candidate = if candidate.extension().is_some() {
+            candidate
+        } else {
+            candidate.with_extension("json")
+        };
+        anyhow::ensure!(
+            candidate.is_file(),
+            "tsconfig `extends: {specifier:?}` (from {}) not found at {}",
+            from_dir.display(),
+            candidate.display()
+        );
+        return canonicalize_within(canonical_workspace_root, &candidate);
+    }
+    // Bare package-name `extends` — resolved via `node_modules`, walking up
+    // from `from_dir` towards the workspace root. See this function's doc
+    // for why an unresolved entry is a hard error, not a silent skip.
+    let mut dir = from_dir;
+    loop {
+        let base = dir.join("node_modules").join(specifier);
+        for candidate in [
+            base.clone(),
+            base.with_extension("json"),
+            base.join("tsconfig.json"),
+        ] {
+            if candidate.is_file() {
+                return canonicalize_within(canonical_workspace_root, &candidate);
+            }
+        }
+        if dir == canonical_workspace_root {
+            break;
+        }
+        match dir.parent() {
+            Some(parent)
+                if parent.starts_with(canonical_workspace_root)
+                    || parent == canonical_workspace_root =>
+            {
+                dir = parent;
+            }
+            _ => break,
+        }
+    }
+    anyhow::bail!(
+        "tsconfig `extends: {specifier:?}` (from {}) could not be resolved — no matching file \
+         found under any ancestor `node_modules` up to the workspace root ({}); is \
+         `node_modules` installed?",
+        from_dir.display(),
+        canonical_workspace_root.display()
+    )
+}
+
+fn canonicalize_within(canonical_workspace_root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let c = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))?;
+    anyhow::ensure!(
+        c.starts_with(canonical_workspace_root),
+        "tsconfig extends resolved to {} which is outside the workspace root ({}) — cannot \
+         express it as a declared js_typecheck input",
+        c.display(),
+        canonical_workspace_root.display()
+    );
+    Ok(c)
+}
+
+/// Every first-party source file (`SOURCE_EXTENSIONS`) directly owned by
+/// workspace-root-relative package `pkg`, bounded by nested `package.json`
+/// boundaries — the same walk [`build_package_import_graph`] performs
+/// internally to seed its own edge walk. Exposed separately so a caller that
+/// needs the file *list* itself (e.g. `js_typecheck`'s Input declaration —
+/// see `provider.rs`'s `typecheck_deps_config`) doesn't have to re-implement
+/// the walk or re-derive it from `ImportGraph`'s edges (which record only
+/// files that *contain* an import, not every source file in the package).
+pub fn package_source_files(
+    walker: &CachedWalker,
+    workspace_root: &Path,
+    pkg: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let pkg_dir = if pkg.is_empty() {
+        workspace_root.to_path_buf()
+    } else {
+        workspace_root.join(pkg)
+    };
+    let mut files = Vec::new();
+    collect_source_files(walker, &pkg_dir, true, &mut files)?;
+    Ok(files)
+}
+
 /// Build the import graph for every first-party source file directly owned
 /// by `pkg_dir` (workspace-root-relative path `pkg`), bounded by nested
 /// `package.json` boundaries (a subdirectory with its own `package.json` is a
@@ -424,14 +766,7 @@ pub fn build_package_import_graph(
     cache: &ResolveCache,
     tsconfig: Option<&Path>,
 ) -> anyhow::Result<ImportGraph> {
-    let pkg_dir = if pkg.is_empty() {
-        workspace_root.to_path_buf()
-    } else {
-        workspace_root.join(pkg)
-    };
-
-    let mut files = Vec::new();
-    collect_source_files(walker, &pkg_dir, true, &mut files)?;
+    let files = package_source_files(walker, workspace_root, pkg)?;
 
     let guard = bare_specifier_guard(tsconfig);
     let mut graph = ImportGraph::default();
@@ -573,7 +908,7 @@ fn collect_source_files(
 /// found from the *last* `node_modules/` path segment, so a package's own
 /// private nested dependency (`node_modules/a/node_modules/b`) is correctly
 /// attributed to `b`, not `a`.
-fn thirdparty_pkg_name_from_path(resolved: &Path) -> Option<String> {
+pub(crate) fn thirdparty_pkg_name_from_path(resolved: &Path) -> Option<String> {
     let s = resolved.to_str()?;
     let (_, rest) = s.rsplit_once("node_modules/")?;
     let mut parts = rest.splitn(3, '/');
