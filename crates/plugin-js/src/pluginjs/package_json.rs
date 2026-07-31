@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The slice of a `package.json` that dependency wiring needs: its own name
-/// plus its three dependency fields (declared semver ranges, not resolved
+/// plus its dependency fields (declared semver ranges, not resolved
 /// versions — resolution goes through the lockfile).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackageManifest {
@@ -18,6 +18,16 @@ pub struct PackageManifest {
     pub dependencies: BTreeMap<String, String>,
     pub dev_dependencies: BTreeMap<String, String>,
     pub optional_dependencies: BTreeMap<String, String>,
+    /// `peerDependencies` — deliberately **not** folded into `dependencies`
+    /// (unlike `optionalDependencies`): a peer dependency is not this
+    /// package's own install/build dependency to wire a target-dep edge for
+    /// (`deps::resolve_package_deps` never reads this field), it's a
+    /// contract the *consumer* is expected to satisfy. It is still a
+    /// perfectly legitimate thing for this package's own source to `import`,
+    /// though (the single most common real npm pattern for
+    /// component/plugin libraries), so `importgraph::declared_closure` folds
+    /// it in for phantom-dependency-check purposes — see that module.
+    pub peer_dependencies: BTreeMap<String, String>,
 }
 
 impl PackageManifest {
@@ -48,6 +58,8 @@ struct RawManifest {
     dev_dependencies: BTreeMap<String, String>,
     #[serde(default)]
     optional_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_dependencies: BTreeMap<String, String>,
 }
 
 /// Read and parse a package's `package.json`. A missing `"name"` is a hard
@@ -73,6 +85,7 @@ pub fn read_package_manifest(package_json: &Path) -> anyhow::Result<PackageManif
         dependencies,
         dev_dependencies: parsed.dev_dependencies,
         optional_dependencies: parsed.optional_dependencies,
+        peer_dependencies: parsed.peer_dependencies,
     })
 }
 
@@ -123,6 +136,28 @@ mod tests {
         let manifest = read_package_manifest(&path).expect("parse manifest");
         assert!(manifest.is_optional("fsevents"));
         assert!(manifest.dependencies.contains_key("fsevents"));
+    }
+
+    /// `peerDependencies` are parsed into their own field, and — unlike
+    /// `optionalDependencies` — are deliberately *not* folded into
+    /// `dependencies` (they're not a target-dep-wiring input; see the field's
+    /// doc comment and `importgraph::declared_closure`).
+    #[test]
+    fn peer_dependencies_are_parsed_and_not_folded_into_dependencies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write(
+            dir.path(),
+            r#"{
+                "name": "a",
+                "peerDependencies": { "react": "^18.0.0" }
+            }"#,
+        );
+        let manifest = read_package_manifest(&path).expect("parse manifest");
+        assert_eq!(
+            manifest.peer_dependencies.get("react").map(String::as_str),
+            Some("^18.0.0")
+        );
+        assert!(!manifest.dependencies.contains_key("react"));
     }
 
     #[test]

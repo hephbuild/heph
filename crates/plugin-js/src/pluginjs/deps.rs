@@ -12,9 +12,9 @@
 //! only resolves *names* through the lockfile's resolved graph — no
 //! import-statement parsing (oxc) yet; that's M2.
 
-use crate::pluginjs::lockfile::{DepResolution, Lockfile};
+use crate::pluginjs::lockfile::{DepResolution, Lockfile, ResolvedGraph};
 use crate::pluginjs::package_json::PackageManifest;
-use crate::pluginjs::thirdparty;
+use crate::pluginjs::{platform, thirdparty};
 use anyhow::Context;
 use std::collections::BTreeMap;
 
@@ -44,10 +44,28 @@ pub struct ResolvedDep {
 /// `optionalDependencies` entry with no resolution is expected (a
 /// platform-mismatched optional dependency the manager never installs) and
 /// is silently omitted — never a hard error.
+///
+/// Real npm/pnpm semantics extend one step further than "no resolution at
+/// all": an `optionalDependencies` entry can be resolved in the lockfile
+/// (recorded there because it applies on *some* platform) while still not
+/// applying to the platform actually building right now — the flagship case
+/// being one npm package per platform under `optionalDependencies` (e.g.
+/// `@esbuild/darwin-arm64`). `resolved_graph` (the same lockfile's
+/// [`ResolvedGraph`], carrying each resolved package's `os`/`cpu`
+/// restriction) lets this be checked at wiring time, so a platform mismatch
+/// on an optional dependency is skipped here — no `js_install` target-dep
+/// edge is ever wired for it — rather than reaching `Provider::get` for that
+/// addr and hard-failing there (see `platform::matches_platform` and
+/// `Provider::thirdparty_install_spec`, which performs the equivalent check
+/// at resolution time for an addr that does get wired). A required
+/// dependency that resolves to a platform-restricted package which does not
+/// match the current platform stays a hard error — an unresolvable required
+/// dependency is a real, actionable problem, not a case for silent omission.
 pub fn resolve_package_deps(
     pkg: &str,
     manifest: &PackageManifest,
     lockfile: Option<&Lockfile>,
+    resolved_graph: Option<&ResolvedGraph>,
     member_addrs_by_name: &BTreeMap<String, String>,
     goos: &str,
     goarch: &str,
@@ -83,6 +101,20 @@ pub fn resolve_package_deps(
                     );
                 }
                 Some(DepResolution::ThirdParty { name, version }) => {
+                    if let Some(resolved) = resolved_graph.and_then(|g| g.get(&name, &version))
+                        && !platform::matches_platform(&resolved.os, &resolved.cpu, goos, goarch)
+                    {
+                        if manifest.is_optional(&name) {
+                            continue;
+                        }
+                        anyhow::bail!(
+                            "{pkg:?}: `{name}` resolves to {name}@{version}, which is \
+                             restricted to os={:?} cpu={:?} — that does not include the \
+                             current platform {goos}/{goarch}",
+                            resolved.os,
+                            resolved.cpu
+                        );
+                    }
                     let addr = thirdparty::thirdparty_addr(&name, &version, goos, goarch);
                     out.push(ResolvedDep {
                         group,
@@ -134,6 +166,7 @@ mod tests {
             dependencies,
             dev_dependencies: to_map(dev),
             optional_dependencies,
+            peer_dependencies: BTreeMap::new(),
         }
     }
 
@@ -159,8 +192,16 @@ mod tests {
         let manifest = manifest(&[("b", "workspace:*")], &[], &[]);
         let mut members = BTreeMap::new();
         members.insert("b".to_string(), "//packages/b:package_info".to_string());
-        let deps = resolve_package_deps("packages/a", &manifest, None, &members, "linux", "amd64")
-            .unwrap();
+        let deps = resolve_package_deps(
+            "packages/a",
+            &manifest,
+            None,
+            None,
+            &members,
+            "linux",
+            "amd64",
+        )
+        .unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].addr, "//packages/b:package_info");
         assert_eq!(deps[0].group, "dependencies");
@@ -170,10 +211,12 @@ mod tests {
     fn third_party_dep_becomes_js_install_addr() {
         let manifest = manifest(&[("lodash", "^4.17.21")], &[], &[]);
         let lock = npm_lockfile();
+        let graph = lock.resolved_graph();
         let deps = resolve_package_deps(
             "packages/a",
             &manifest,
             Some(&lock),
+            Some(&graph),
             &BTreeMap::new(),
             "linux",
             "amd64",
@@ -192,10 +235,12 @@ mod tests {
     fn missing_required_dep_resolution_is_a_hard_error() {
         let manifest = manifest(&[("not-in-lockfile", "^1.0.0")], &[], &[]);
         let lock = npm_lockfile();
+        let graph = lock.resolved_graph();
         let err = resolve_package_deps(
             "packages/a",
             &manifest,
             Some(&lock),
+            Some(&graph),
             &BTreeMap::new(),
             "linux",
             "amd64",
@@ -208,10 +253,12 @@ mod tests {
     fn missing_optional_dep_resolution_is_silently_skipped() {
         let manifest = manifest(&[], &[], &[("fsevents", "^2.3.0")]);
         let lock = npm_lockfile();
+        let graph = lock.resolved_graph();
         let deps = resolve_package_deps(
             "packages/a",
             &manifest,
             Some(&lock),
+            Some(&graph),
             &BTreeMap::new(),
             "linux",
             "amd64",
@@ -227,10 +274,83 @@ mod tests {
             "packages/a",
             &manifest,
             None,
+            None,
             &BTreeMap::new(),
             "linux",
             "amd64",
         )
         .unwrap_err();
+    }
+
+    /// A lockfile entry for `name` *is* resolved (recorded because it applies
+    /// on some platform), but its `os`/`cpu` restriction excludes the
+    /// current build platform — the flagship `optionalDependencies` use case
+    /// (one npm package per platform, e.g. `@esbuild/darwin-arm64`). This
+    /// must be silently skipped, exactly like an unresolved optional dep,
+    /// never wired as a `js_install` dep and never a hard error.
+    fn npm_lockfile_with_platform_restricted_pkg() -> Lockfile {
+        Lockfile::parse(
+            PkgManager::Npm,
+            r#"{
+                "packages": {
+                    "": {},
+                    "packages/a": { "name": "a" },
+                    "node_modules/native-thing": {
+                        "version": "1.0.0",
+                        "integrity": "sha512-xyz",
+                        "os": ["darwin"],
+                        "cpu": ["arm64"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn platform_mismatched_optional_dep_is_silently_skipped_even_when_lockfile_resolved() {
+        let manifest = manifest(&[], &[], &[("native-thing", "^1.0.0")]);
+        let lock = npm_lockfile_with_platform_restricted_pkg();
+        let graph = lock.resolved_graph();
+        // The declaring workspace runs on linux/amd64; the lockfile-resolved
+        // native-thing@1.0.0 is restricted to darwin/arm64 — a mismatch.
+        let deps = resolve_package_deps(
+            "packages/a",
+            &manifest,
+            Some(&lock),
+            Some(&graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .unwrap();
+        assert!(
+            deps.is_empty(),
+            "platform-mismatched optional dep must not be wired at all: {deps:?}"
+        );
+    }
+
+    #[test]
+    fn platform_mismatched_required_dep_is_a_hard_error() {
+        // Same lockfile-resolved, platform-restricted package as above, but
+        // declared as a required (non-optional) dependency this time — a
+        // required dep that cannot be installed on this platform is a real,
+        // actionable problem and must still hard-fail.
+        let manifest = manifest(&[("native-thing", "^1.0.0")], &[], &[]);
+        let lock = npm_lockfile_with_platform_restricted_pkg();
+        let graph = lock.resolved_graph();
+        let err = resolve_package_deps(
+            "packages/a",
+            &manifest,
+            Some(&lock),
+            Some(&graph),
+            &BTreeMap::new(),
+            "linux",
+            "amd64",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("native-thing"), "{msg}");
+        assert!(msg.contains("darwin"), "{msg}");
     }
 }

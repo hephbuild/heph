@@ -1,8 +1,8 @@
 use crate::pluginjs::lockfile::{self, Lockfile, ResolvedGraph};
 use crate::pluginjs::workspace::{self, PkgManager, WorkspaceMember};
 use crate::pluginjs::{
-    PACKAGE_INFO_TARGET, PACKAGE_JSON, deps, is_skipped_dir_name, package_json, platform,
-    thirdparty,
+    PACKAGE_INFO_TARGET, PACKAGE_JSON, deps, importgraph, is_skipped_dir_name, package_json,
+    platform, resolvers, thirdparty,
 };
 use anyhow::Context;
 use enclose::enclose;
@@ -229,8 +229,21 @@ impl Provider {
     /// into target-dep addrs (see `deps::resolve_package_deps`), returned as
     /// a `{group: [addr, …]}` config value ready to attach to a
     /// `js_package_info` `TargetSpec`'s `deps` field.
+    ///
+    /// **M2**: before returning, this also builds the package's real
+    /// import graph (`importgraph::build_package_import_graph`, oxc-based —
+    /// see that module and `resolvers.rs`) and cross-checks every resolved
+    /// edge against the package's declared-dependency closure
+    /// (`importgraph::declared_closure`). M1's `package.json`-declaration
+    /// path above is still what maps a specifier to an addr; this is the
+    /// correctness check on top of it — a resolved-but-undeclared import is
+    /// a hermeticity violation and fails `Provider::get` loudly, per
+    /// `ai-docs/js-plugin-plan.md`'s Hermeticity section. See
+    /// `importgraph.rs` module docs for why an *unresolvable* specifier is
+    /// deliberately not treated the same way.
     async fn deps_config(&self, pkg: &PkgBuf) -> anyhow::Result<Value> {
         let lockfile = self.lockfile().await?;
+        let resolved_graph = self.resolved_graph().await?;
         let workspace_root = self.workspace_root.clone();
         let walker = Arc::clone(&self.walker);
         let skip = Arc::clone(&self.skip);
@@ -275,10 +288,40 @@ impl Provider {
                 &pkg_str,
                 &manifest,
                 lockfile.as_deref(),
+                resolved_graph.as_deref(),
                 &member_addrs_by_name,
                 &goos,
                 &goarch,
             )?;
+
+            // M2: cross-validate the declared-dependency wiring above against
+            // the package's real import graph — see this method's doc
+            // comment and `importgraph.rs` module docs.
+            let tsconfig =
+                importgraph::find_nearest_tsconfig(&workspace_root, &workspace_root.join(&pkg_str));
+            let import_resolvers = resolvers::Resolvers::new(tsconfig.as_deref());
+            let resolve_cache = importgraph::ResolveCache::new();
+            let graph = importgraph::build_package_import_graph(
+                &walker,
+                &workspace_root,
+                &pkg_str,
+                &import_resolvers,
+                &resolve_cache,
+                tsconfig.as_deref(),
+            )
+            .with_context(|| format!("building import graph for {pkg_str:?}"))?;
+            let declared_closure = importgraph::declared_closure(&manifest);
+            importgraph::check_phantom_dependencies(
+                &workspace_root,
+                &pkg_str,
+                &graph,
+                &declared_closure,
+            )
+            .with_context(|| {
+                format!(
+                    "cross-checking {pkg_str:?}'s import graph against its declared dependencies"
+                )
+            })?;
 
             let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
             for dep in resolved {
@@ -1260,5 +1303,249 @@ mod tests {
             )
             .await
             .expect("allow-listed install script must parse successfully");
+    }
+
+    /// An npm workspace where `packages/a` declares a dependency on
+    /// `native-thing`, resolved in the lockfile to a package restricted to
+    /// `os=["win32"] cpu=["ia32"]` — a platform combination none of heph's
+    /// three supported targets (`x86_64`/`aarch64`-linux-gnu,
+    /// `aarch64-apple-darwin`) ever match, so this fixture exercises the
+    /// mismatch deterministically regardless of which of them runs the test.
+    /// `optional` toggles whether the dependency is declared in
+    /// `optionalDependencies` (must be silently skipped) or `dependencies`
+    /// (must hard-fail) — see `deps::resolve_package_deps`'s doc comment.
+    fn npm_platform_restricted_fixture(optional: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+        );
+        let dep_field = if optional {
+            "optionalDependencies"
+        } else {
+            "dependencies"
+        };
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            &format!(r#"{{"name": "a", "{dep_field}": {{"native-thing": "^1.0.0"}}}}"#),
+        );
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "workspaces": ["packages/*"] },
+                    "packages/a": { "name": "a" },
+                    "node_modules/native-thing": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/native-thing/-/native-thing-1.0.0.tgz",
+                        "integrity": "sha512-xyz",
+                        "os": ["win32"],
+                        "cpu": ["ia32"]
+                    }
+                }
+            }"#,
+        );
+        dir
+    }
+
+    /// The bug this fixes: a platform-restricted `optionalDependencies` entry
+    /// that IS resolved in the lockfile for a platform other than the one
+    /// running the build (the flagship `optionalDependencies` use case — one
+    /// npm package per platform, e.g. `@esbuild/darwin-arm64`) must be
+    /// silently omitted from the package's deps, never wired as a
+    /// `js_install` target-dep edge and never a hard `Provider::get` error.
+    #[tokio::test]
+    async fn npm_e2e_platform_mismatched_optional_dep_is_silently_omitted() {
+        let dir = npm_platform_restricted_fixture(true);
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let addrs = get_deps_addrs(&provider, "packages/a").await;
+        assert!(
+            addrs.is_empty(),
+            "a platform-mismatched optional dep must not be wired as a js_install dep: {addrs:?}"
+        );
+    }
+
+    /// The same dependency, restriction, and platform mismatch as above, but
+    /// declared as a required (non-optional) dependency this time — a
+    /// required dependency that cannot be installed on this platform is a
+    /// real, actionable problem and `Provider::get` must still hard-fail for
+    /// it, naming the package.
+    #[tokio::test]
+    async fn npm_e2e_platform_mismatched_required_dep_is_a_hard_error() {
+        let dir = npm_platform_restricted_fixture(false);
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(
+                        PkgBuf::from("packages/a"),
+                        PACKAGE_INFO_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        match result {
+            Err(GetError::Other(e)) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("native-thing"), "must name the package: {msg}");
+            }
+            Ok(_) => panic!(
+                "a platform-restricted required dep must fail Provider::get, not succeed silently"
+            ),
+            Err(GetError::NotFound) => {
+                panic!("expected GetError::Other (a resolution failure), got NotFound")
+            }
+        }
+    }
+
+    // ---- M2: import-graph cross-validation wired into `Provider::get` ----
+    //
+    // `deps_config` now also builds the package's real import graph and
+    // cross-checks it against its declared dependencies (see
+    // `importgraph.rs`). These drive that end to end through the actual
+    // `Provider::get` pipeline, not just `importgraph`'s own unit tests.
+
+    /// A first-party source file imports a package present in `node_modules`
+    /// (as an npm hoist would leave it) but never declared in the package's
+    /// own `package.json` — `Provider::get` must fail loudly, naming the
+    /// file, specifier, and package, rather than silently trusting M1's
+    /// package.json-only wiring.
+    #[tokio::test]
+    async fn get_hard_fails_on_phantom_thirdparty_import_from_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+        );
+        write(dir.path(), "packages/a/package.json", r#"{"name": "a"}"#);
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "import _ from 'lodash';\n",
+        );
+        // Present on disk (as a hoisted install would leave it), but
+        // `packages/a`'s package.json never declares it.
+        write(
+            dir.path(),
+            "node_modules/lodash/package.json",
+            r#"{"name": "lodash", "main": "index.js"}"#,
+        );
+        write(
+            dir.path(),
+            "node_modules/lodash/index.js",
+            "module.exports = {};\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        let result = provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(
+                        PkgBuf::from("packages/a"),
+                        PACKAGE_INFO_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await;
+        match result {
+            Err(GetError::Other(e)) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("packages/a/src/index.ts"), "{msg}");
+                assert!(msg.contains("lodash"), "{msg}");
+            }
+            Ok(_) => {
+                panic!("a phantom third-party import must fail Provider::get, not succeed silently")
+            }
+            Err(GetError::NotFound) => {
+                panic!("expected GetError::Other (a resolution failure), got NotFound")
+            }
+        }
+    }
+
+    /// The same import, but `lodash` is properly declared this time —
+    /// `Provider::get` must succeed.
+    #[tokio::test]
+    async fn get_succeeds_when_source_import_matches_a_declared_dependency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/package.json",
+            r#"{"name": "a", "dependencies": {"lodash": "^4.17.21"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/a/src/index.ts",
+            "import _ from 'lodash';\n",
+        );
+        write(
+            dir.path(),
+            "package-lock.json",
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "workspaces": ["packages/*"] },
+                    "packages/a": { "name": "a", "dependencies": { "lodash": "^4.17.21" } },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                        "integrity": "sha512-abc"
+                    }
+                }
+            }"#,
+        );
+        write(
+            dir.path(),
+            "node_modules/lodash/package.json",
+            r#"{"name": "lodash", "main": "index.js"}"#,
+        );
+        write(
+            dir.path(),
+            "node_modules/lodash/index.js",
+            "module.exports = {};\n",
+        );
+
+        let provider = Provider::new(dir.path().to_path_buf(), PkgManager::Npm);
+        let ct = ctoken();
+        let executor = Arc::new(NoopExecutor);
+        provider
+            .get(
+                GetRequest {
+                    request_id: "test".to_string(),
+                    addr: Addr::new(
+                        PkgBuf::from("packages/a"),
+                        PACKAGE_INFO_TARGET.to_string(),
+                        Default::default(),
+                    ),
+                    states: vec![],
+                    executor,
+                },
+                &ct,
+            )
+            .await
+            .expect("a properly declared import must not fail Provider::get");
     }
 }
