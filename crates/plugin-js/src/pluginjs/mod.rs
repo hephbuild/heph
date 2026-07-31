@@ -1,10 +1,15 @@
+#[cfg(test)]
+mod conformance;
 mod deps;
 mod driver_install;
 mod driver_package_info;
+mod importgraph;
+mod importparse;
 mod lockfile;
 mod package_json;
 mod platform;
 mod provider;
+mod resolvers;
 mod thirdparty;
 mod workspace;
 
