@@ -96,3 +96,7 @@ humantime = "2.3.0"
 hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile" }
 serde-jsonlines = "0.7.0"
 tempfile = "3"
+# Test-only: lets a test assert on a diagnostic that is *delivered* by `tracing`
+# rather than returned, which a warning necessarily is. Already the workspace's
+# subscriber implementation (the binary uses it), so this is not a second copy.
+tracing-subscriber = "0.3"

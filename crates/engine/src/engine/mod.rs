@@ -53,6 +53,7 @@ pub use remote_cache::{RemoteCacheDef, RemoteCacheSet};
 mod deppath;
 mod query;
 pub mod request_state;
+pub use request_state::ShellTarget;
 mod revdeps;
 pub mod spec;
 pub use result::ArtifactMeta;

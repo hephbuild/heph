@@ -71,13 +71,26 @@ pub struct RunArgs {
     pub force: bool,
     /// Drop into an interactive shell in the target's sandbox instead of running it
     ///
-    /// The terminal goes to the single target you name, never to its
-    /// dependencies. A group of exactly one member *is* that member, so it can
-    /// be shelled into; a group of two or more inlines its members as
-    /// dependencies of the run, and dependencies are not interactive. Shell
-    /// into the member you want instead. Likewise for a multi-target selection,
-    /// which names no single target at all.
-    #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
+    ///   heph run --shell //pkg:app             enter //pkg:app
+    ///
+    ///   heph run --shell=//pkg:lib //pkg:app   build //pkg:app, enter its dependency //pkg:lib
+    ///
+    ///   heph run --shell=//pkg:lib             same as `--shell //pkg:lib`
+    ///
+    /// Bare `--shell` enters the single target the run names. A group of exactly
+    /// one member *is* that member, so it can be shelled into; a group of two or
+    /// more, or a multi-target selection, names no single target, and the run is
+    /// refused rather than guessing which one you meant.
+    ///
+    /// `--shell=ADDRESS` says which one. ADDRESS may be any address this run
+    /// resolves — a selected target, a member a group inlines, or a dependency of
+    /// either; that is how you shell into a dependency without building it on its
+    /// own. Every other target in the run builds with no terminal. An address the
+    /// run never resolves is an error, not a silently ignored flag.
+    ///
+    /// The target you enter always executes (never a cache hit) and its outputs
+    /// are not cached. Requires a terminal.
+    #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ADDRESS",)]
     pub shell: Option<String>,
     /// Print output artifacts to stdout
     #[arg(long = "cat-out", conflicts_with = "list_out")]
@@ -102,10 +115,42 @@ pub struct RunArgs {
     pub log_lines: usize,
 }
 
+/// What `--shell` asked for. The flag has three states and no two of them mean
+/// the same thing to the engine, so they get three variants rather than a
+/// `bool` plus an `Option` the reader has to recombine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellFlag {
+    /// No `--shell`.
+    Absent,
+    /// Bare `--shell` (`default_missing_value = ""`): the run infers its single
+    /// target, and the engine refuses the request when there isn't one.
+    Infer,
+    /// `--shell=ADDRESS`.
+    Target(crate::htaddr::Addr),
+}
+
+/// Parse the `--shell` flag. The address uses the same dialect as the positional
+/// target, so `:name` and `./sub:name` mean the same thing in both places.
+fn resolve_shell_target(
+    shell: Option<&str>,
+    base_pkg: &crate::htpkg::PkgBuf,
+) -> anyhow::Result<ShellFlag> {
+    let Some(value) = shell else {
+        return Ok(ShellFlag::Absent);
+    };
+    if value.is_empty() {
+        return Ok(ShellFlag::Infer);
+    }
+    let addr = crate::htaddr::parse_addr_with_base(value, base_pkg)
+        .with_context(|| format!("parse --shell={value}"))?;
+    Ok(ShellFlag::Target(addr))
+}
+
 struct RunApp {
     args: RunArgs,
     engine: Arc<Engine>,
     matcher: Matcher,
+    shell: ShellFlag,
     fail_fast: bool,
     auto_approve: bool,
     /// Shared approval queue: attached to the TUI view (so prompts render) and to
@@ -168,9 +213,27 @@ impl App for RunApp {
             None
         };
 
+        // `--shell=ADDRESS` names its target on the *request* instead of in
+        // `ResultOptions` (see `ShellTarget`), because `ResultOptions` does not
+        // reach a target resolved as a dependency — and because the engine's
+        // bare-`--shell` gates exist precisely to refuse the ambiguity that an
+        // address resolves. So the wrapper moves out of `opts` entirely: with a
+        // shell target named, every frame that is not it resolves with no
+        // terminal, and leaving a wrapper in `opts` would only tell
+        // `classify_failure` those targets had streamed their output — which
+        // suppresses the process-log tail of a failing one, the exact regression
+        // #225 fixed for group members.
+        let shell_target = match &self.shell {
+            ShellFlag::Target(addr) => Some(addr.clone()),
+            ShellFlag::Absent | ShellFlag::Infer => None,
+        };
+        let (shell_terminal, interactive) = match &shell_target {
+            Some(_) => (interactive, None),
+            None => (None, interactive),
+        };
         let opts = ResultOptions {
             force: self.args.force,
-            shell: self.args.shell.is_some(),
+            shell: self.shell == ShellFlag::Infer,
             interactive,
             frozen: self.args.frozen,
         };
@@ -194,6 +257,12 @@ impl App for RunApp {
             self.args.log_lines,
             Some(approval),
         );
+        if let Some(addr) = shell_target {
+            rs.set_shell_target(crate::engine::ShellTarget {
+                addr,
+                terminal: shell_terminal,
+            });
+        }
 
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
         // `finalize!` paved road handles rendering and exit uniformly. The engine
@@ -277,12 +346,21 @@ pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow:
 
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
-    let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
+    let shell = resolve_shell_target(args.shell.as_deref(), &base_pkg)?;
+    // `heph run --shell=//pkg:a` on its own is a complete request: it names the
+    // target to enter, so there is nothing left to ask for. Falling through to
+    // `resolve_matcher` would answer "missing TARGET_ADDRESS/LABEL" to a command
+    // line that named one.
+    let m = match (&shell, &args.expr, &args.arg1) {
+        (ShellFlag::Target(addr), None, None) => Matcher::Addr(addr.clone()),
+        _ => resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?,
+    };
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
         args,
         engine: std::sync::Arc::clone(&engine),
         matcher: m,
+        shell,
         fail_fast: global.fail_fast,
         auto_approve: global.auto_approve,
         approval: tui::ApprovalCenter::new(),
@@ -356,4 +434,95 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     // exit never races it.
     engine.await_hooks().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::htpkg::PkgBuf;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: TestCmd,
+    }
+
+    #[derive(clap::Subcommand)]
+    enum TestCmd {
+        Run(RunArgs),
+    }
+
+    fn parse(args: &[&str]) -> Result<RunArgs, clap::Error> {
+        TestCli::try_parse_from(args).map(|c| match c.cmd {
+            TestCmd::Run(a) => a,
+        })
+    }
+
+    /// `--shell=TARGET` must reach the command as a value. The whole feature
+    /// rests on clap keeping it: strip `num_args`/`require_equals` and this
+    /// invocation stops parsing altogether.
+    #[test]
+    fn shell_captures_its_value() {
+        let args = parse(&["heph", "run", "--shell=//pkg:a", "//pkg:g"]).expect("parse");
+        assert_eq!(args.shell.as_deref(), Some("//pkg:a"));
+        assert_eq!(args.arg1.as_deref(), Some("//pkg:g"));
+    }
+
+    /// Bare `--shell` stays a mode: present, naming no target. `require_equals`
+    /// is what keeps the following word a positional rather than the value.
+    #[test]
+    fn bare_shell_names_no_target() {
+        let args = parse(&["heph", "run", "--shell", "//pkg:a"]).expect("parse");
+        assert_eq!(args.shell.as_deref(), Some(""));
+        assert_eq!(args.arg1.as_deref(), Some("//pkg:a"));
+        assert!(
+            parse(&["heph", "run", "//pkg:a"])
+                .expect("parse")
+                .shell
+                .is_none(),
+            "no --shell at all is distinct from the bare flag",
+        );
+    }
+
+    /// The three states are distinct, and only the addressed one names a target
+    /// on the request. Collapsing `Absent` and `Infer` would make a plain
+    /// `heph run` try to open a shell; collapsing `Infer` and `Target` would put
+    /// the run back to discarding the value.
+    #[test]
+    fn resolve_shell_target_distinguishes_the_three_forms() -> anyhow::Result<()> {
+        let pkg = PkgBuf::from("cmd/server");
+        assert_eq!(resolve_shell_target(None, &pkg)?, ShellFlag::Absent);
+        assert_eq!(resolve_shell_target(Some(""), &pkg)?, ShellFlag::Infer);
+        assert_eq!(
+            resolve_shell_target(Some("//lib:core"), &pkg)?,
+            ShellFlag::Target(crate::htaddr::parse_addr("//lib:core")?),
+        );
+        Ok(())
+    }
+
+    /// The value is an address in the same dialect as the positional target, so
+    /// `:name` means the same thing in both places.
+    #[test]
+    fn shell_target_resolves_relative_to_the_current_package() -> anyhow::Result<()> {
+        let pkg = PkgBuf::from("cmd/server");
+        assert_eq!(
+            resolve_shell_target(Some(":bin"), &pkg)?,
+            ShellFlag::Target(crate::htaddr::parse_addr("//cmd/server:bin")?),
+        );
+        Ok(())
+    }
+
+    /// An unparseable value fails, with the value in the message — never a
+    /// silently ignored flag, which is the defect this feature fixes.
+    #[test]
+    fn unparseable_shell_target_is_rejected() {
+        let err = resolve_shell_target(Some("not an address"), &PkgBuf::from(""))
+            .err()
+            .expect("must reject");
+        assert!(
+            format!("{err:#}").contains("parse --shell=not an address"),
+            "{err:#}",
+        );
+    }
 }

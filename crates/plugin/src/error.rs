@@ -68,10 +68,11 @@ impl std::error::Error for HashUnknownError {}
 /// How many group members the `--shell` diagnostic lists before eliding.
 const SHELL_MEMBERS_SHOWN: usize = 5;
 
-/// `--shell` was refused: either the request does not resolve to a single
-/// executing target (a multi-target selection, or a transparent group that is
-/// not an alias for one target), or it does, but there is no terminal to hand
-/// it to.
+/// `--shell` was refused: the request does not resolve to a single executing
+/// target (a multi-target selection, or a transparent group that is not an
+/// alias for one target — including a group named directly by
+/// `--shell=ADDR`, which never executes and so has no sandbox to enter), or
+/// it does, but there is no terminal to hand it to.
 ///
 /// A property of the *request*, not a failure of any target: nothing ran, and
 /// nothing was going to. So `classify_failure` propagates it unchanged rather
@@ -81,7 +82,10 @@ const SHELL_MEMBERS_SHOWN: usize = 5;
 ///
 /// The fields stay structured so a caller can render or serialize them; the
 /// `Display` is the human-facing form and always names the next command to run,
-/// so the message is recoverable on its own by a human or an agent.
+/// so the message is recoverable on its own by a human or an agent. The action
+/// it names is `--shell=<addr>`, which is the form that actually resolves the
+/// ambiguity being reported: it keeps the run the user asked for and only says
+/// which of its targets gets the terminal.
 #[derive(Debug, Clone)]
 pub enum ShellNeedsSingleTarget {
     /// A query or label/package matcher that selects more than one target.
@@ -89,7 +93,8 @@ pub enum ShellNeedsSingleTarget {
         /// The selection as the user wrote it.
         query: String,
     },
-    /// A transparent group whose inputs are not exactly one distinct member.
+    /// A transparent group whose inputs are not exactly one distinct member, or
+    /// any group named directly by `--shell=ADDR`.
     Group {
         addr: Addr,
         /// The group's distinct members, in declaration order.
@@ -106,20 +111,27 @@ impl fmt::Display for ShellNeedsSingleTarget {
         match self {
             Self::Selection { query } => write!(
                 f,
-                "--shell needs exactly one target; {query} selects many\n  \
-                 try: heph run --shell //pkg:name with one address"
+                "--shell needs exactly one target; {query} selects many\
+                 \n  name the one to shell into: heph run --shell=<address> {query}\
+                 \n  try: heph query {query}"
             ),
             Self::Group { addr, members } => {
+                let n = members.len();
                 write!(
                     f,
-                    "--shell needs exactly one target; {} is a group with {} members",
+                    "--shell needs exactly one target; {} is a group with {n} member{}",
                     addr.format(),
-                    members.len()
+                    if n == 1 { "" } else { "s" }
                 )?;
                 let Some(first) = members.first() else {
-                    return f.write_str(
+                    // No member to name, so the action has to be discovery. Every
+                    // `try:` line in this error is runnable verbatim — a template
+                    // there is a command an agent will execute for real.
+                    return write!(
+                        f,
                         "\n  the group is empty — there is nothing to shell into\
-                         \n  try: heph run --shell //pkg:name with a target address",
+                         \n  try: heph query //{}",
+                        addr.package
                     );
                 };
                 f.write_str("\n  members: ")?;
@@ -129,11 +141,17 @@ impl fmt::Display for ShellNeedsSingleTarget {
                     }
                     f.write_str(&member.format())?;
                 }
-                let rest = members.len().saturating_sub(SHELL_MEMBERS_SHOWN);
+                let rest = n.saturating_sub(SHELL_MEMBERS_SHOWN);
                 if rest > 0 {
                     write!(f, " … and {rest} more")?;
                 }
-                write!(f, "\n  try: heph run --shell {}", first.format())
+                write!(
+                    f,
+                    "\n  name the member to shell into — {1} still builds as asked\
+                     \n  try: heph run --shell={0} {1}",
+                    first.format(),
+                    addr.format()
+                )
             }
             Self::NotInteractive { addr } => write!(
                 f,
