@@ -1,28 +1,57 @@
 name: Perf
 
-# Reusable workflow, not runnable on its own — `heph.yml`'s `perfbench` job
-# calls it (`uses: ./.github/workflows/perf.yml`) only when needed
-# (`pull_request`, or `push` to `master`), after `build` has already
-# published this run's `heph`/`heph-bench`/go-plugin artifacts. Split out of
-# `heph.yml` because this check's cost (real runners, a generated corpus,
-# real timing) and its own release-fetching/issue-filing logic are large
-# enough to read on their own, separate from the compile/lint/test jobs that
-# make up the rest of CI.
+# Two ways in:
+#   - Reusable workflow: `heph.yml`'s `perfbench` job calls it
+#     (`uses: ./.github/workflows/perf.yml`) only when needed
+#     (`pull_request`, or `push` to `master`), after `build` has already
+#     published this run's `heph`/`heph-bench`/go-plugin artifacts. Split out
+#     of `heph.yml` because this check's cost (real runners, a generated
+#     corpus, real timing) and its own release-fetching/issue-filing logic
+#     are large enough to read on their own, separate from the
+#     compile/lint/test jobs that make up the rest of CI.
+#   - `workflow_dispatch`: a manual run against an explicit (or
+#     auto-resolved) baseline release. Nothing is built here either — the
+#     candidate is the release the dispatched commit's own CI run already
+#     published, so dispatching on a commit whose CI hasn't published yet
+#     fails with a clear message rather than silently building something.
+#     Master commits only: PR runs publish tags derived from the ephemeral
+#     merge commit (`gen` describes the refs/pull/N/merge checkout), which
+#     cannot be re-derived from the branch head the runs API exposes — for a
+#     PR, use the `perf-test` label instead.
 on:
   workflow_call:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: >-
+          Baseline: a commit SHA (its CI run's published release is used), or
+          an exact release tag in hephbuild/heph-artifacts-v1 (e.g.
+          v0.0.0-build.12.345+gabc1234). Empty = latest published release
+          from master.
+        required: false
+        default: ""
 
 jobs:
   # Perf-regression check: generates one synthetic corpus, times a fixed
-  # scenario set against N and N-1, and reports a regression verdict. Two
-  # triggers, two roles:
-  #   - `pull_request`: N is this PR's head, N-1 its merge-base with the
-  #     target branch. This is the GATE — a real regression fails the check
-  #     for real (see "Enforced for real" below).
+  # scenario set against N and N-1, and reports a regression verdict. Three
+  # triggers, three roles:
+  #   - `pull_request`: N is this PR's head, N-1 the latest published master
+  #     release at or before the merge-base with the target branch (usually
+  #     the merge-base itself). This is the GATE — a real regression fails
+  #     the check for real (see "Enforced for real" below).
   #   - `push` to `master`: N is the commit that just landed, N-1 is the
-  #     commit immediately before it (`github.event.before`). Nothing is
-  #     blocked at this point (the merge already happened) — this is
-  #     continuous monitoring, so a regression instead files a GitHub issue
-  #     (see "File regression issue").
+  #     latest published master release before it — NOT blindly the previous
+  #     commit: master pushes build concurrently (per-sha groups in
+  #     `heph.yml`), so the immediately-previous commit's release may not
+  #     exist yet (or ever, if its build broke); the resolver walks back to
+  #     the newest master release that does. Nothing is blocked at this
+  #     point (the merge already happened) — this is continuous monitoring,
+  #     so a regression instead files a GitHub issue (see "File regression
+  #     issue").
+  #   - `workflow_dispatch`: N is the dispatched commit's own published
+  #     release; N-1 is the `baseline` input if given (an exact release tag,
+  #     failing hard if it doesn't exist), else the latest published master
+  #     release before N — a manual re-run/backfill knob, no gating role.
   #
   # Nothing in this job is built. `heph`, the go plugin cdylib, and
   # `heph-bench` itself are all release assets (the `build` job publishes
@@ -51,15 +80,15 @@ jobs:
   # N-1 is fetched, never built: every push to `master` already publishes a
   # prerelease to hephbuild/heph-artifacts-v1 (the `upload_artifacts` job).
   # The release tag isn't the commit SHA — it's `git describe` plus the CI
-  # run_number that built it — so "resolve baseline release" re-derives that
-  # exact tag by finding the `master`-push CI run for the baseline SHA via
-  # the GitHub API and feeding its run_number through the same `version.sh`
-  # logic that originally produced it. If no such run is found (history
-  # pruned, baseline predates this job, API hiccup, or — on `push` — this is
-  # the first commit on the ref), the job is skipped for that leg with a
-  # note — there is deliberately no "build it instead" fallback, since a slow
-  # silent fallback is exactly what turns into "why is this job suddenly
-  # slow" months from now.
+  # run_number that built it — so "Resolve baseline" re-derives tags by
+  # listing `master`-push CI runs via the GitHub API and feeding each run's
+  # run_number + head_sha through the same `version.sh` logic that
+  # originally produced them, walking newest-first until a tag that actually
+  # exists as a release is found. If nothing is found (history pruned,
+  # baseline predates this job, API hiccup, first commit on the ref), the
+  # job fails for that leg with a note — there is deliberately no "build it
+  # instead" fallback, since a slow silent fallback is exactly what turns
+  # into "why is this job suddenly slow" months from now.
   #
   # Enforced for real: the "Compare and report" step exits non-zero when any
   # scenario regresses past its threshold, on both triggers. On a PR that
@@ -83,9 +112,11 @@ jobs:
     # so consecutive master commits queue on the same runner-flavour lane
     # instead of racing each other for timing noise — cancel-in-progress
     # stays false there so a queued commit's regression check still runs
-    # rather than getting starved forever by the next push.
+    # rather than getting starved forever by the next push. `dispatch`: its
+    # own per-ref lane (falls into the `github.ref` arm), so a manual run
+    # doesn't queue behind the master monitoring lane.
     concurrency:
-      group: perfbench-${{ matrix.os }}-${{ matrix.arch }}-${{ github.event_name == 'pull_request' && github.ref || 'master' }}
+      group: perfbench-${{ matrix.os }}-${{ matrix.arch }}-${{ github.event_name == 'push' && 'master' || github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     # Specifying `permissions:` at all makes it exhaustive — everything not
     # listed drops to `none`. `contents: read` for the checkout, `actions:
@@ -151,59 +182,161 @@ jobs:
           go-version: "1.25"
           cache: false
 
-      # PR: the merge-base with the target branch. Push (to master): the
-      # commit immediately before this one — `github.event.before`, the
-      # correct source for "previous commit on this ref" (robust to force-
-      # pushes in a way `HEAD~1` is not). `before` is all-zeros on the very
-      # first push to a ref; treated the same as "no baseline found" below.
-      - name: Resolve baseline SHA
-        id: base
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin "${{ github.base_ref }}"
-            echo "sha=$(git merge-base "origin/${{ github.base_ref }}" HEAD)" >> "$GITHUB_OUTPUT"
-          else
-            sha="${{ github.event.before }}"
-            if [ -z "$sha" ] || [ "$sha" = "0000000000000000000000000000000000000000" ]; then
-              echo "no previous commit on this ref (first push) — nothing to compare against"
-              echo "sha=" >> "$GITHUB_OUTPUT"
-            else
-              echo "sha=$sha" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-
-      # Re-derives the exact version tag `master`'s own CI run published the
-      # baseline commit's release under — see the job comment. Only needs
-      # `gh api` (against this repo, default token) and `git describe`
-      # against a commit already present from the full-history checkout
-      # above; no build, no checkout of that commit.
+      # Resolves the baseline RELEASE (tag in hephbuild/heph-artifacts-v1) +
+      # the SHA it was built from. Only needs `gh api` (run listing against
+      # this repo, default token), `gh release view` (existence check against
+      # the artifacts repo, PAT) and `git describe` against commits already
+      # present from the full-history checkout above; no build, no checkout
+      # of any other commit.
       #
-      # Deliberately does NOT filter by the run's overall conclusion: whether
-      # a release was actually published is what "Fetch baseline" below
-      # checks (best-effort `gh release download`), not whether every other
-      # job in that run happened to pass. A run's Perf legs or an unrelated
-      # job (Binary E2E, say) can fail while `upload_artifacts` still
-      # published fine — gating on run-level success here made a single
-      # flake unrecoverable: the next commit's baseline lookup would find no
-      # "successful" run, fail its own Perf job for missing baseline, and the
-      # failure would propagate to every commit after it forever.
-      - name: Resolve baseline release
-        if: steps.base.outputs.sha != ''
+      #   - dispatch with an explicit `baseline` input: a commit SHA (the
+      #     release its own CI run published) or an exact release tag —
+      #     either way verified to exist, and a missing one fails the job,
+      #     it was asked for by name. For a tag, the SHA is recovered
+      #     best-effort from its `+g<hash>` suffix.
+      #   - everything else: the latest published master release at/before
+      #     the baseline point — merge-base (inclusive) on `pull_request`,
+      #     this commit (exclusive: never compare a commit to itself) on
+      #     `push`/dispatch. PRs try the exact merge-base run first (a
+      #     head_sha-filtered lookup still works when the merge-base is
+      #     older than the walk window below), then fall back to the walk:
+      #     newest-first over recent master-push CI runs, keeping the first
+      #     ancestor-of-the-baseline-point whose re-derived tag exists as a
+      #     release.
+      #
+      # Deliberately does NOT filter by any run's overall conclusion: whether
+      # a release was actually published is checked directly (`gh release
+      # view`), not inferred from whether every other job in that run
+      # happened to pass. A run's Perf legs or an unrelated job (Binary E2E,
+      # say) can fail while `upload_artifacts` still published fine — gating
+      # on run-level success here made a single flake unrecoverable: the
+      # next commit's baseline lookup would find no "successful" run, fail
+      # its own Perf job for missing baseline, and the failure would
+      # propagate to every commit after it forever.
+      - name: Resolve baseline
         id: baseline_release
         env:
           GH_TOKEN: ${{ github.token }}
+          ARTIFACTS_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          EVENT: ${{ github.event_name }}
+          INPUT_BASELINE: ${{ inputs.baseline }}
         run: |
-          RUN_NUMBER=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ steps.base.outputs.sha }}" \
-            --jq '[.workflow_runs[] | select(.name=="CI" and .event=="push")] | first | .run_number // empty')
-          if [ -z "$RUN_NUMBER" ]; then
-            echo "no master push run found for baseline ${{ steps.base.outputs.sha }}"
-            echo "found=false" >> "$GITHUB_OUTPUT"
+          # A 404 is "release doesn't exist"; anything else (401/403 on a
+          # bad/expired PAT, API outage) fails the step loudly — otherwise an
+          # auth failure walks all 50 runs and reports "no published master
+          # release found", a confident diagnosis of the wrong system.
+          release_exists() {
+            local err
+            if err=$(GH_TOKEN="$ARTIFACTS_TOKEN" gh api \
+                "repos/hephbuild/heph-artifacts-v1/releases/tags/$1" 2>&1 >/dev/null); then
+              return 0
+            fi
+            if printf '%s' "$err" | grep -q "HTTP 404"; then
+              return 1
+            fi
+            echo "artifacts-repo API error while checking release '$1': $err" >&2
+            exit 1
+          }
+          # Echoes the version tag the master-push CI run for sha $1
+          # published under; fails if no such run is found. Push runs only:
+          # a PR run's tag derives from its ephemeral merge commit, not the
+          # head_sha the runs API exposes, so it cannot be re-derived here.
+          # The workflow-scoped endpoint (heph.yml) avoids both the
+          # `.name=="CI"` string coupling and sharing the result window with
+          # other push-triggered workflows.
+          version_for_sha() {
+            local rn
+            rn=$(gh api "repos/${{ github.repository }}/actions/workflows/heph.yml/runs?head_sha=$1&event=push" \
+              --jq '.workflow_runs | first | .run_number // empty')
+            [ -n "$rn" ] || return 1
+            .github/workflows/version.sh "$rn" "$1"
+          }
+          emit() { # $1=version $2=sha $3=mode $4=how
+            echo "resolved baseline release: $1 ($4)"
+            {
+              echo "found=true"
+              echo "version=$1"
+              echo "sha=$2"
+              echo "mode=$3"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$INPUT_BASELINE" ]; then
+            if echo "$INPUT_BASELINE" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
+              # A commit SHA: use the release its own CI run published.
+              sha=$(git rev-parse --verify --quiet "$INPUT_BASELINE^{commit}") || {
+                echo "baseline '$INPUT_BASELINE' looks like a commit SHA but is not a known commit" >&2
+                exit 1
+              }
+              # No run is normal, not just "wrong branch": CI runs once per
+              # push, on that push's head commit, so every other commit in a
+              # batched push has no run and no release of its own.
+              version=$(version_for_sha "$sha") || {
+                echo "no master-push CI run found for baseline commit $sha — it is either not on master, or landed in a batched push whose CI ran on a later commit; pick a commit that has a CI run, or pass an exact release tag" >&2
+                exit 1
+              }
+              if ! release_exists "$version"; then
+                echo "baseline commit $sha's CI run never published release '$version'" >&2
+                exit 1
+              fi
+              emit "$version" "$sha" "explicit" "explicit input, commit $sha"
+              exit 0
+            fi
+            if ! release_exists "$INPUT_BASELINE"; then
+              echo "requested baseline release '$INPUT_BASELINE' not found in hephbuild/heph-artifacts-v1" >&2
+              exit 1
+            fi
+            short="${INPUT_BASELINE##*+g}"
+            sha=""
+            if [ "$short" != "$INPUT_BASELINE" ]; then
+              sha=$(git rev-parse --verify --quiet "$short^{commit}" || true)
+            fi
+            emit "$INPUT_BASELINE" "$sha" "explicit" "explicit input"
             exit 0
           fi
-          VERSION=$(.github/workflows/version.sh "$RUN_NUMBER" "${{ steps.base.outputs.sha }}")
-          echo "resolved baseline release: $VERSION (run #$RUN_NUMBER)"
-          echo "found=true" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}"
+            upper=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+            self=""
+            if version=$(version_for_sha "$upper") && release_exists "$version"; then
+              emit "$version" "$upper" "merge-base" "exact merge-base"
+              exit 0
+            fi
+            echo "merge-base $upper has no published release — walking back on master"
+          else
+            upper="${{ github.sha }}"
+            self="${{ github.sha }}"
+          fi
+
+          # Captured, not process-substituted: a failed `gh api` must get
+          # its own message, not silently read as "zero runs" and fall
+          # through to the no-baseline diagnosis below.
+          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/heph.yml/runs?branch=master&event=push&per_page=50" \
+            --jq '.workflow_runs[] | [.run_number, .head_sha] | @tsv') || {
+            echo "failed to list master-push CI runs — cannot resolve a baseline" >&2
+            exit 1
+          }
+          while IFS=$'\t' read -r run_number head_sha; do
+            [ -n "$run_number" ] || continue
+            [ "$head_sha" = "$self" ] && continue
+            git cat-file -e "$head_sha^{commit}" 2>/dev/null || continue
+            git merge-base --is-ancestor "$head_sha" "$upper" || continue
+            version=$(.github/workflows/version.sh "$run_number" "$head_sha")
+            if release_exists "$version"; then
+              emit "$version" "$head_sha" "walk" "run #$run_number, $head_sha"
+              exit 0
+            fi
+            echo "skipping $head_sha (run #$run_number): no published release $version"
+          done <<< "$runs"
+
+          echo "no published master release found in the last 50 master-push CI runs at/before $upper"
+          {
+            echo "found=false"
+            echo "version="
+            echo "sha="
+            echo "mode="
+          } >> "$GITHUB_OUTPUT"
 
       # `heph-bench` may 404 (bootstrap note above) — fetched best-effort,
       # separately from `heph` + the go plugin, so an old baseline still
@@ -216,11 +349,18 @@ jobs:
         run: |
           ext=so; [ "${{ matrix.os }}" = "darwin" ] && ext=dylib
           mkdir -p baseline-dist-raw baseline-dist
-          if gh release download "${{ steps.baseline_release.outputs.version }}" \
-              --repo hephbuild/heph-artifacts-v1 \
-              --dir baseline-dist-raw \
-              --pattern "heph_${{ matrix.os }}_${{ matrix.arch }}" \
-              --pattern "heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"; then
+          # Both downloads are best-effort (`|| true`) and judged by which
+          # files actually landed: `gh release download` exits 0 when only
+          # SOME of its patterns matched, so a partially-published release
+          # would otherwise reach the `cp` and hard-fail the step under
+          # `set -e` instead of degrading to ok=false / bench_ok=false.
+          gh release download "${{ steps.baseline_release.outputs.version }}" \
+            --repo hephbuild/heph-artifacts-v1 \
+            --dir baseline-dist-raw \
+            --pattern "heph_${{ matrix.os }}_${{ matrix.arch }}" \
+            --pattern "heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" || true
+          if [ -f "baseline-dist-raw/heph_${{ matrix.os }}_${{ matrix.arch }}" ] \
+             && [ -f "baseline-dist-raw/heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" ]; then
             cp "baseline-dist-raw/heph_${{ matrix.os }}_${{ matrix.arch }}" baseline-dist/heph
             cp "baseline-dist-raw/heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" "baseline-dist/heph-go-plugin.$ext"
             chmod +x baseline-dist/heph
@@ -229,10 +369,11 @@ jobs:
             echo "release ${{ steps.baseline_release.outputs.version }} found but missing heph/go-plugin for this leg"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
-          if gh release download "${{ steps.baseline_release.outputs.version }}" \
-              --repo hephbuild/heph-artifacts-v1 \
-              --dir baseline-dist-raw \
-              --pattern "heph-bench_${{ matrix.os }}_${{ matrix.arch }}"; then
+          gh release download "${{ steps.baseline_release.outputs.version }}" \
+            --repo hephbuild/heph-artifacts-v1 \
+            --dir baseline-dist-raw \
+            --pattern "heph-bench_${{ matrix.os }}_${{ matrix.arch }}" || true
+          if [ -f "baseline-dist-raw/heph-bench_${{ matrix.os }}_${{ matrix.arch }}" ]; then
             cp "baseline-dist-raw/heph-bench_${{ matrix.os }}_${{ matrix.arch }}" baseline-dist/heph-bench
             chmod +x baseline-dist/heph-bench
             echo "bench_ok=true" >> "$GITHUB_OUTPUT"
@@ -241,12 +382,68 @@ jobs:
             echo "bench_ok=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # workflow_call runs get the candidate from this same run's `build`
+      # artifacts; a dispatch run has no `build` job, so the candidate is the
+      # release the dispatched commit's own master-push CI run published
+      # (master commits only — see the trigger comment at the top). Missing
+      # run or missing assets fail hard: the candidate is mandatory, and
+      # "wait for CI to publish first" is the actionable message.
       - name: Download candidate (N) artifacts
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/download-artifact@v7
         with:
           pattern: heph*_${{ matrix.os }}_${{ matrix.arch }}*
           path: candidate-dist-raw
           merge-multiple: true
+
+      - name: Fetch candidate (N) release artifacts (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACTS_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+        run: |
+          RUN_INFO=$(gh api "repos/${{ github.repository }}/actions/workflows/heph.yml/runs?head_sha=${{ github.sha }}&event=push" \
+            --jq '.workflow_runs | first | [.run_number, .status, .conclusion // "-"] | @tsv')
+          if [ -z "$RUN_INFO" ]; then
+            echo "no master-push CI run found for ${{ github.sha }} — dispatch on a master commit that has its own CI run (CI runs once per push, so a batched push leaves its earlier commits without one); a PR's tag derives from its ephemeral merge commit and cannot be re-derived, so use the \`perf-test\` label for a PR" >&2
+            exit 1
+          fi
+          IFS=$'\t' read -r RUN_NUMBER RUN_STATUS RUN_CONCLUSION <<< "$RUN_INFO"
+          VERSION=$(.github/workflows/version.sh "$RUN_NUMBER" "${{ github.sha }}")
+          # The run existing is not enough — it publishes the release in its
+          # `upload_artifacts` job. Check the release directly and report
+          # still-running vs failed, the two states a dispatcher actually
+          # needs to tell apart.
+          if ! GH_TOKEN="$ARTIFACTS_TOKEN" gh api "repos/hephbuild/heph-artifacts-v1/releases/tags/$VERSION" >/dev/null 2>&1; then
+            if [ "$RUN_STATUS" != "completed" ]; then
+              echo "CI run #$RUN_NUMBER for ${{ github.sha }} is still $RUN_STATUS — wait for its Pre-release job to publish $VERSION, then re-dispatch" >&2
+            else
+              echo "CI run #$RUN_NUMBER completed ($RUN_CONCLUSION) but never published release $VERSION — this commit has no candidate build to test" >&2
+            fi
+            exit 1
+          fi
+          echo "candidate release: $VERSION (run #$RUN_NUMBER)"
+          ext=so; [ "${{ matrix.os }}" = "darwin" ] && ext=dylib
+          mkdir -p candidate-dist-raw
+          GH_TOKEN="$ARTIFACTS_TOKEN" gh release download "$VERSION" \
+            --repo hephbuild/heph-artifacts-v1 \
+            --dir candidate-dist-raw \
+            --pattern "heph_${{ matrix.os }}_${{ matrix.arch }}" \
+            --pattern "heph-bench_${{ matrix.os }}_${{ matrix.arch }}" \
+            --pattern "heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext" || true
+          # `gh release download` exits 0 when only SOME patterns matched, so
+          # the assets are checked by name — otherwise a partially-published
+          # release dies on a bare `cp: cannot stat` in the next step.
+          missing=()
+          for asset in "heph_${{ matrix.os }}_${{ matrix.arch }}" \
+                       "heph-bench_${{ matrix.os }}_${{ matrix.arch }}" \
+                       "heph-go-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"; do
+            [ -f "candidate-dist-raw/$asset" ] || missing+=("$asset")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "release $VERSION is missing candidate asset(s) for this leg: ${missing[*]}" >&2
+            exit 1
+          fi
 
       - name: Normalize candidate dist layout
         run: |
@@ -279,8 +476,11 @@ jobs:
       # absorb it as "no results" for that leg, same as any other run
       # failure. That's a one-time gap that resolves itself once this PR
       # merges; no fallback branching to maintain for it.
+      # Also gated on `ok`: "Compare and report" hard-fails when the Tier B
+      # assets are missing, so timing Tier A first would burn its minutes
+      # for a report that fails anyway.
       - name: Time Tier A (inprocess) scenarios
-        if: steps.baseline_fetch.outputs.bench_ok == 'true'
+        if: steps.baseline_fetch.outputs.ok == 'true' && steps.baseline_fetch.outputs.bench_ok == 'true'
         continue-on-error: true
         run: |
           for scenario in cold full-hit incremental; do
@@ -324,12 +524,20 @@ jobs:
           BENCH=./candidate-dist/heph-bench
           any_regression=false
           mkdir -p verdicts
+          BASE_SHA="${{ steps.baseline_release.outputs.sha }}"
+          [ -n "$BASE_SHA" ] || BASE_SHA="sha unknown"
           report=$(
             echo "# Perf: ${{ matrix.os }}/${{ matrix.arch }}"
             if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
               echo ""
-              echo "_FAILED: no published release found for baseline \`${{ steps.base.outputs.sha }}\`_"
+              echo "_FAILED: no usable baseline release (resolved: \`${{ steps.baseline_release.outputs.version || 'none' }}\`)_"
             else
+              echo ""
+              echo "_baseline: \`${{ steps.baseline_release.outputs.version }}\` (\`$BASE_SHA\`; via ${{ steps.baseline_release.outputs.mode }})_"
+              if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ steps.baseline_release.outputs.mode }}" = "walk" ]; then
+                echo ""
+                echo "_note: baseline is older than this PR's merge-base — a regression here may originate in master commits between them, not in this PR_"
+              fi
               for tier in inproc dist; do
                 echo ""
                 echo "## Tier: $tier"
@@ -372,7 +580,7 @@ jobs:
           # detected regressions and would mislabel this.
           if [ "${{ steps.baseline_fetch.outputs.ok }}" != "true" ]; then
             echo "regressed=false" >> "$GITHUB_OUTPUT"
-            echo "no baseline artifacts found for ${{ steps.base.outputs.sha }} — failing rather than reporting a silent pass" >&2
+            echo "no usable baseline release found — failing rather than reporting a silent pass" >&2
             exit 1
           fi
 
@@ -384,6 +592,20 @@ jobs:
             echo "regression detected — see the job summary for the table" >&2
             exit 1
           fi
+
+      # The structured verdicts otherwise only go to PostHog — publishing
+      # them as a run artifact gives a dispatcher (human or agent) a stable
+      # JSON result via `gh run download`, not just a markdown summary and
+      # an exit code.
+      - name: Upload verdicts artifact
+        if: always() && steps.baseline_fetch.outputs.ok == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: perf-verdicts_${{ matrix.os }}_${{ matrix.arch }}
+          path: |
+            verdicts/
+            perf-report.md
+          if-no-files-found: ignore
 
       # `always()`: the step above now genuinely exits non-zero on a real
       # regression, and the numbers are worth having in PostHog regardless of
@@ -405,7 +627,8 @@ jobs:
             tier=$(basename "$f" .json)
             batch=$(jq --arg tier "$tier" \
               --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" \
-              --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.base.outputs.sha }}" \
+              --arg sha "${{ github.sha }}" --arg base_sha "${{ steps.baseline_release.outputs.sha }}" \
+              --arg baseline_version "${{ steps.baseline_release.outputs.version }}" \
               --arg event_type "${{ github.event_name }}" \
               --arg branch "${{ github.head_ref || github.ref_name }}" \
               --arg run_id "${{ github.run_id }}" \
@@ -415,7 +638,8 @@ jobs:
                 distinct_id: "perfbench",
                 properties: (. + {
                   tier: $tier, os: $os, arch: $arch,
-                  sha: $sha, base_sha: $base_sha, event_type: $event_type,
+                  sha: $sha, base_sha: $base_sha, baseline_version: $baseline_version,
+                  event_type: $event_type,
                   branch: $branch, run_id: $run_id, run_url: $run_url
                 })
               }]' "$f")
@@ -456,8 +680,9 @@ jobs:
           LINKS=$(printf 'Job summary: %s/%s/actions/runs/%s\nCommit: %s/%s/commit/%s\n' \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.sha }}")
-          BODY=$(printf 'Perf regression on `master` for **%s/%s**, vs the previous commit `%s`:\n\n%s\n%s' \
-            "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.base.outputs.sha }}" \
+          BODY=$(printf 'Perf regression on `master` for **%s/%s**, vs baseline release `%s` (`%s`):\n\n%s\n%s' \
+            "${{ matrix.os }}" "${{ matrix.arch }}" \
+            "${{ steps.baseline_release.outputs.version }}" "${{ steps.baseline_release.outputs.sha }}" \
             "$(cat perf-report.md)" "$LINKS")
           gh issue create --repo "${{ github.repository }}" \
             --title "$TITLE" \
