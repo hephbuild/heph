@@ -1417,8 +1417,10 @@ pub trait ProgressHeader: Send {
     /// The bottom-border label.
     fn label(&self) -> String;
     /// Final summary segment printed after the run (after the elapsed clock).
-    /// Empty ⇒ nothing is printed.
-    fn last_render(&self, core: &BuildState) -> String;
+    /// Empty ⇒ nothing is printed. `scope` is the count scope the view was left
+    /// on (the `a` toggle), so the printed summary matches the header the user
+    /// was reading; state-private headers ignore it.
+    fn last_render(&self, core: &BuildState, scope: CountScope) -> String;
 }
 
 /// Build/query/inspect header: the elapsed-clock counts segment plus worker
@@ -1479,12 +1481,19 @@ impl ProgressHeader for BuildHeader {
         self.label.clone()
     }
 
-    fn last_render(&self, core: &BuildState) -> String {
-        if core.has_activity() {
-            // The final summary always reports the matched set, the canonical view.
-            core.counts_segment(CountScope::Matched)
-        } else {
-            String::new()
+    fn last_render(&self, core: &BuildState, scope: CountScope) -> String {
+        if !core.has_activity() {
+            return String::new();
+        }
+        // Report the scope the view was left on: switching to `All` mid-run
+        // carries through to the printed exit summary.
+        match scope {
+            CountScope::Matched => core.counts_segment(scope),
+            // The printed line outlives the header (scrollback, copy-paste),
+            // where nothing else says which population the counts cover — so
+            // the non-default scope labels itself. Matched output stays
+            // byte-identical to what it always was.
+            CountScope::All => format!("{} · all targets", core.counts_segment(scope)),
         }
     }
 }
@@ -1538,7 +1547,7 @@ impl ProgressHeader for GcHeader {
         self.label.clone()
     }
 
-    fn last_render(&self, _core: &BuildState) -> String {
+    fn last_render(&self, _core: &BuildState, _scope: CountScope) -> String {
         if self.targets > 0 {
             self.segment()
         } else {
@@ -1606,6 +1615,14 @@ impl TuiProgressView {
             search_query: RefCell::new(String::new()),
             approval: None,
         }
+    }
+
+    /// The final summary segment, scoped to whatever the `a` toggle was left on
+    /// — a user who switched the header to `All` reads the same scope after
+    /// teardown. Split out from [`TUIAppView::last_render`], which writes it
+    /// straight to stderr and so cannot be asserted on.
+    fn final_summary_segment(&self) -> String {
+        self.model.last_render(&self.state, self.scope.get())
     }
 
     /// Attach the shared approval queue so this view renders pending prompts and
@@ -2157,7 +2174,7 @@ impl TUIAppView for TuiProgressView {
     /// when there was nothing to report (e.g. inspect/query, or a no-op gc), in
     /// which case nothing is printed.
     fn last_render(&self) {
-        let segment = self.model.last_render(&self.state);
+        let segment = self.final_summary_segment();
         if segment.is_empty() {
             return;
         }
@@ -2905,7 +2922,7 @@ mod tests {
         assert!(seg.contains("2 targets"), "{seg}");
         assert!(seg.contains("1.0 KiB"), "{seg}");
         assert_eq!(h.label(), "GC");
-        assert!(!h.last_render(&core).is_empty());
+        assert!(!h.last_render(&core, CountScope::Matched).is_empty());
     }
 
     #[test]
@@ -2940,6 +2957,37 @@ mod tests {
             addrs: addrs.iter().map(|s| (*s).to_string()).collect(),
             complete,
         }
+    }
+
+    /// The exit summary follows the `a` scope toggle: a user who switched the
+    /// header to `All` reads the all-targets counts after teardown, not a
+    /// hardcoded matched-scope line that disagrees with the header they were
+    /// just looking at.
+    #[test]
+    fn final_summary_follows_scope_toggle() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//a:b"], true)));
+        v.apply(&ev(1, result_start("//a:b")));
+        v.apply(&ev(2, result_end("//a:b", None)));
+        // A transitive dep: outside the matched set, counted only under `All`.
+        v.apply(&ev(3, result_start("//dep:x")));
+        v.apply(&ev(4, result_end("//dep:x", None)));
+
+        // The production seam itself — `last_render` prints exactly this.
+        let segment = |v: &TuiProgressView| v.final_summary_segment();
+        assert!(segment(&v).contains("1 / 1 done"), "{}", segment(&v));
+        assert!(
+            !segment(&v).contains("all targets"),
+            "matched scope must not be labeled: {}",
+            segment(&v)
+        );
+        v.toggle_scope();
+        assert!(segment(&v).contains("2 / 2 done"), "{}", segment(&v));
+        // The line outlives the header, so the non-default scope names itself.
+        assert!(segment(&v).ends_with("· all targets"), "{}", segment(&v));
+        // Toggling back restores the matched-scope summary.
+        v.toggle_scope();
+        assert!(segment(&v).contains("1 / 1 done"), "{}", segment(&v));
     }
 
     #[test]
