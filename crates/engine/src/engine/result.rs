@@ -2432,13 +2432,16 @@ impl Engine {
             let _w = if skip_lock {
                 None
             } else {
-                // A hash-only request must not take the write lock — its own
-                // caller is holding guards it will not release until we return.
-                // Reading the tree is what these requests are for, and that is
-                // exactly the `skip_lock` branch above; anything else is a build.
-                if rs.hash_only() {
-                    return Err(HashUnknownError { addr: addr.clone() }.into());
-                }
+                // Hash-only requests may take THIS write lock, unlike the
+                // cacheable paths below. The self-deadlock they guard against
+                // needs the outer request to be riding a read guard on the
+                // addr, and uncacheable resolutions hand out no guard at all
+                // (`guard: None` below) — by the time a nested recompute runs,
+                // the outer request holds nothing here. Blanket-refusing made
+                // the in_place write-back guard structurally unable to verify
+                // any target whose meta chain crosses a cache-off dep (e.g. a
+                // toolchain reached through `//@heph/bin:*` — hostbin is
+                // cache-off), failing `r lint //...` on already-linted trees.
                 Some(
                     self.acquire_with_notice(&rs, addr, self.result_lock().write(addr, ctoken))
                         .await?,
@@ -9340,6 +9343,64 @@ mod tests {
         );
         // The tree is unchanged by the no-op second run.
         assert_eq!(std::fs::read(pkg_dir.join("in.txt"))?, b"HELLO\n");
+        Ok(())
+    }
+
+    /// The in_place write-back guard must survive an uncacheable (non-fs)
+    /// dependency in the target's meta chain.
+    ///
+    /// The guard re-hashes the target on a fresh hash-only request. #193
+    /// forbade hash-only requests from taking the result lock and answered
+    /// `HashUnknownError` for EVERY non-fs target that would need it — but
+    /// the self-deadlock it closed requires the outer request to be riding a
+    /// read guard on the addr, and uncacheable resolutions hand out no guard
+    /// at all (`LockedResolution { guard: None }`). The blanket raise made
+    /// the guard structurally unable to verify any in_place target whose
+    /// meta chain crosses a cache-off dep — `heph r lint //...` over
+    /// toolchains reached through `//@heph/bin:*` (hostbin is cache-off)
+    /// failed on every already-linted target.
+    #[tokio::test]
+    async fn in_place_write_back_survives_an_uncacheable_dep() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![
+            // A cache-off, non-fs dependency — the hostbin shape.
+            pluginstatictarget::Target {
+                addr: "//pkg:tool".to_string(),
+                driver: "bash".to_string(),
+                run: Some("true".to_string()),
+                out: HashMap::new(),
+                codegen: None,
+                deps: HashMap::new(),
+                labels: vec![],
+                cache: Some(hcore::htvalue::Value::Bool(false)),
+                ..Default::default()
+            },
+            codegen_run_target_with_deps(
+                "//pkg:fmt",
+                "in_place",
+                &["in.txt"],
+                "printf '%s\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+                &["//pkg:tool"],
+            ),
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+
+        let fmt = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (res, _ev) = resolve_collecting_events(&engine, &fmt).await;
+        res.with_context(
+            || "the write-back guard must be able to re-hash across an uncacheable dep",
+        )?;
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"HELLO\n",
+            "the in_place transform must have been written back"
+        );
+
+        // Second run: already-transformed tree — the cached-hit path runs the
+        // same guard (this is the `r lint //...` on an already-linted repo).
+        let (res, _ev) = resolve_collecting_events(&engine, &fmt).await;
+        res.with_context(|| "the guard must also pass on the cached re-run")?;
         Ok(())
     }
 
