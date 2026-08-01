@@ -3,4 +3,20 @@
 # cross-task wait-for cycle detection (see `src/hmemoizer/mod.rs`). Other
 # `tokio_unstable` APIs (Builder::name, runtime metrics, …) are not used by
 # this crate but become available when the flag is set.
-rustflags = ["--cfg", "tokio_unstable"]
+#
+# `-Cforce-frame-pointers=yes` keeps a frame record in every function so a stack
+# can be walked without the unwinder. Two things depend on it:
+#
+#   - `--pprof-cpu` walks the frame chain from its `SIGPROF` handler
+#     (`src/pprof_dump.rs`). The DWARF unwinder is not async-signal-safe and
+#     segfaulted the process it was profiling; a frame walk is the fix, and it
+#     produces garbage without frame pointers.
+#   - `samply` (the `perf-test` skill) unwinds by frame pointer first and only
+#     falls back to DWARF, which is slower and drops frames under a deep async
+#     stack.
+#
+# rustc omits frame pointers on both Linux targets at `opt-level > 0`;
+# aarch64-apple-darwin already forces them (the platform ABI requires it), so
+# this only changes the Linux builds. It costs one register and a
+# push/pop per call — the profilers stop lying in exchange.
+rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]

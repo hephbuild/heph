@@ -2,8 +2,9 @@
 //!
 //! When a run hangs in a locked-down CI container, every external tool is blocked:
 //! ptrace is denied (no gdb/perf/`gcore`), the root fs is read-only (kernel core
-//! dumps are dropped), and pprof's sampler can segfault on a static binary. The
-//! one channel left is the process dumping its own stacks. A `SIGUSR1` handler
+//! dumps are dropped), and `--pprof-cpu` only samples a run it was passed on —
+//! which is never the run that turns out to hang. The one channel left is the
+//! process dumping its own stacks. A `SIGUSR1` handler
 //! appends the *signalled* thread's backtrace to a file, so signalling the busy
 //! thread reveals the loop — and a file beats stderr when hundreds of threads
 //! dump at once.

@@ -7,6 +7,10 @@
 //! accumulated so far on `SIGUSR2`, so `kill -USR2 <pid>` snapshots a stuck
 //! process in place (to a writable tmpfs path). The filtered final report is
 //! still written at shutdown.
+//!
+//! Sampling happens in a `SIGPROF` handler, so how the stack is walked is a
+//! correctness question, not a quality one — [`start`] documents why this build
+//! walks frame pointers rather than calling the DWARF unwinder.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -22,33 +26,27 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Sampling frequency, Hz.
 ///
-/// Every sample is a signal delivered to a running thread, and each one is a
-/// chance to interrupt somewhere the unwinder cannot walk (see
-/// [`UNWIND_BLOCKLIST`]). 1000 Hz across every thread of a wide build multiplied
-/// that exposure for resolution this diagnostic never needed: it exists to show
-/// *which loop* is burning a pegged worker, and a hang that has lasted minutes
-/// is not a signal 199 Hz can miss.
+/// Every sample is a signal delivered to a running thread, and the handler runs
+/// at whatever instruction it interrupted. 1000 Hz across every thread of a wide
+/// build bought resolution this diagnostic never needed: it exists to show *which
+/// loop* is burning a pegged worker, and a hang that has lasted minutes is not a
+/// signal 199 Hz can miss. The stack walk is signal-safe either way (see
+/// [`start`]) — this is about the per-sample cost heph pays while profiled, on
+/// every worker, not about containing a crash.
 const SAMPLE_HZ: libc::c_int = 199;
 
-/// Libraries the sampler must not unwind out of.
+/// Libraries the sampler must not walk into.
 ///
-/// `pprof` unwinds from inside its `SIGPROF` handler via the `backtrace` crate,
-/// i.e. `_Unwind_Backtrace`, which takes a global lock and is not
-/// async-signal-safe. Interrupt a thread that is already inside `libc`, the
-/// dynamic loader, or the unwinder itself, and walking that frame faults — which
-/// is how `--pprof-cpu` segfaulted the process it was meant to diagnose, within
-/// seconds of startup on a wide run.
+/// `pprof` resolves these names against the loaded shared objects, checks the
+/// interrupted PC *before* walking anything, and — because this build enables
+/// the `frame-pointer` tracer (see [`start`]) — checks every frame it reaches
+/// afterwards. A sample whose leaf lands in one of them is dropped whole; a walk
+/// that climbs into one stops there. That costs only frames attributable to the C
+/// library, which carry no information about heph's own hot loops.
 ///
-/// `pprof` resolves these names against the loaded shared objects and checks the
-/// interrupted PC *before* attempting any unwind, so a sample landing in one of
-/// them is dropped whole rather than walked. That costs only samples attributable
-/// to libc frames, which carry no information about heph's own hot loops.
-///
-/// Only the **leaf** PC is checked: the per-frame variant of this test is
-/// `#[cfg(feature = "frame-pointer")]` in pprof, and this build uses the
-/// `backtrace`/`_Unwind_Backtrace` tracer instead. So a sample that *starts* in
-/// heph code and walks up into libc is still unwound in full. This removes the
-/// dominant crash class, not the class — see the module TODO for the durable fix.
+/// This used to be the *entire* defence, back when the tracer was
+/// `_Unwind_Backtrace` and only the leaf PC could be tested — see [`start`] for
+/// why that was never sound and what replaced it.
 ///
 /// Matched as substrings against shared-object paths, and `str::contains` is
 /// **case-sensitive**: macOS ships `/usr/lib/libSystem.B.dylib`, which lowercase
@@ -95,9 +93,68 @@ impl Watcher {
     }
 }
 
+/// Whether this build keeps a frame record in every function, which is what the
+/// sampler's stack walk follows (see [`start`]). Set by `build.rs::frame_pointers`
+/// from the rustflags this build was compiled with.
+fn have_frame_pointers() -> bool {
+    cfg!(heph_frame_pointers)
+}
+
 /// Start CPU sampling plus the `SIGUSR2`-driven dump watcher, writing profiles to
 /// `path`. Call [`Watcher::shutdown`] at exit for the final report.
+///
+/// # How the stack is walked, and why it is not the unwinder
+///
+/// Every sample runs inside a `SIGPROF` handler, on whichever thread the kernel
+/// picked, at whatever instruction it happened to interrupt. The only code that
+/// may run there is async-signal-safe code — and `_Unwind_Backtrace`, which
+/// `pprof` uses by default (via the `backtrace` crate), is not. It takes
+/// libgcc's global `object_mutex`, re-enters `dl_iterate_phdr`, and reads
+/// loader state that the interrupted thread may have been halfway through
+/// mutating. Interrupt the wrong instruction and walking that stack faults —
+/// which is how `--pprof-cpu` segfaulted the very process it was asked to
+/// diagnose, within seconds of startup on a wide build.
+///
+/// [`UNWIND_BLOCKLIST`] was the first attempt at containing that: drop a sample
+/// whose *interrupted PC* is inside libc, the loader, or the unwinder. It is a
+/// heuristic on one address, and it left the class open — a sample that starts
+/// in heph code and climbs into libc was still handed to the unwinder in full,
+/// and heph is always in libc somewhere on some thread.
+///
+/// So the tracer itself is replaced: the `frame-pointer` feature makes `pprof`
+/// walk the frame-pointer chain instead. That walk cannot fault, by
+/// construction rather than by heuristic —
+///
+///   - it takes no lock and calls nothing in libc or the loader,
+///   - every candidate frame address is probed with a `write(2)` to a pipe
+///     (`EFAULT` ⇒ unreadable) *before* it is dereferenced, so a garbage frame
+///     pointer truncates the stack instead of segfaulting,
+///   - the chain must climb (a frame pointer below its predecessor ends the
+///     walk), so a corrupt chain cannot loop,
+///   - and [`UNWIND_BLOCKLIST`] is applied to every frame, not just the leaf.
+///
+/// It needs frame pointers to be there: `-Cforce-frame-pointers=yes` in
+/// `.cargo/config.toml` is what puts them there, and
+/// [`tests::this_build_has_frame_pointers`] fails if that flag is ever dropped —
+/// without it the walk does not crash, it silently reports garbage, which for a
+/// profiler is the worse outcome.
+///
+/// The cost is one frame of resolution: the walk starts at the return address in
+/// the innermost frame record, so the interrupted function is attributed to its
+/// caller. For "which loop is burning a pegged worker" — the question this flag
+/// exists to answer — the caller chain is what identifies the loop.
 pub fn start(path: PathBuf) -> anyhow::Result<Watcher> {
+    // A build without frame pointers cannot be sampled honestly: the walk reads
+    // whatever the register held and reports a stack that looks real. Refuse,
+    // rather than hand back fiction nobody can recognise as fiction.
+    if !have_frame_pointers() {
+        anyhow::bail!(
+            "this heph was built without frame pointers, so CPU profiles would report \
+             fabricated stacks; rebuild with `-Cforce-frame-pointers=yes` (the workspace \
+             `.cargo/config.toml` sets it — an explicit RUSTFLAGS replaces it)"
+        );
+    }
+
     // Fail here, where `main` already surfaces the error, rather than at dump
     // time where an unwritable path is a `warn!` the user may never see — by
     // which point they have re-run a multi-minute hang to get nothing. Probed by
@@ -317,15 +374,19 @@ mod tests {
     /// Both halves are load-bearing, and for opposite assertions:
     ///
     /// - The libc churn is the half that puts the sampler in front of the frames
-    ///   the blocklist exists for. The unwinder faults when it interrupts a thread
-    ///   already inside `malloc`, the dynamic loader or a syscall stub, so a pure
-    ///   integer loop — shallow stack, leaf PC in this binary — exercises
-    ///   precisely the case that never crashed. Note what this does *not* claim:
-    ///   the original segfault has not been shown to reproduce here on any
-    ///   supported target (blocklist off, it does not fire on darwin/arm64), so
+    ///   the blocklist exists for, and in front of the states the old unwinder-based
+    ///   tracer faulted in: a thread already inside `malloc`, the dynamic loader,
+    ///   or a syscall stub. A pure integer loop — shallow stack, leaf PC in this
+    ///   binary — exercises precisely the case that never crashed. Note what this
+    ///   does *not* claim: the original segfault has not been shown to reproduce
+    ///   here on any supported target (it fires on neither darwin/arm64 nor
+    ///   linux/arm64, blocklist off, under a 32-thread 20s hammer of concurrent
+    ///   `Backtrace::force_capture` + `dlopen`/`dlclose` + allocator churn), so
     ///   the first half of this test is "the process survives being profiled",
     ///   not a reproduction of the fault. That is why the churn is kept large
-    ///   rather than trimmed to whatever the second assertion needs.
+    ///   rather than trimmed to whatever the second assertion needs — and why the
+    ///   real fix was to stop calling the unwinder at all ([`start`]) rather than
+    ///   to keep widening a blocklist against a fault no test here can summon.
     /// - [`cpu_only`] is what the *profile has heph frames in it* assertion needs,
     ///   and it is not decoration. `pprof` drops a sample whose leaf PC is
     ///   blocklisted **by design**, so a workload built only from the first half
@@ -441,22 +502,54 @@ mod tests {
         UNWIND_BLOCKLIST.iter().any(|b| path.contains(b))
     }
 
+    /// This build must carry frame pointers, and heph must know that it does.
+    ///
+    /// The whole stack walk rests on it (see [`start`]), and both halves of the
+    /// wiring fail silently on their own. Drop `-Cforce-frame-pointers=yes` from
+    /// `.cargo/config.toml` and the frame chain becomes whatever the register
+    /// held; break `build.rs::frame_pointers` and the cfg goes missing while the
+    /// flag is still passed, which turns `--pprof-cpu` into a hard error on a
+    /// build that would have profiled perfectly well.
+    ///
+    /// Asserting the cfg rather than the codegen is deliberate: the test binary
+    /// is built at `opt-level = 0`, where rustc keeps frame pointers anyway, so a
+    /// test that walked its own frame chain would pass with the flag removed —
+    /// it could not fail. The cfg is the thing that actually tracks the flag.
+    ///
+    /// It is the **Linux** runs of this test that carry it. On
+    /// aarch64-apple-darwin the platform ABI reserves x29 for the frame record,
+    /// so `build.rs` sets the cfg unconditionally and this cannot go red — which
+    /// is why it must keep running on all three supported targets and not be
+    /// judged by a green macOS run.
+    #[test]
+    fn this_build_has_frame_pointers() {
+        assert!(
+            have_frame_pointers(),
+            "cfg(heph_frame_pointers) is unset: either `.cargo/config.toml` no longer \
+             passes -Cforce-frame-pointers=yes (CPU profiles would be fabricated), or \
+             build.rs stopped recognising the flag (--pprof-cpu now refuses to start)"
+        );
+    }
+
     /// The blocklist has to name the C library this process actually loaded, and
     /// must not name the main binary.
     ///
     /// Both halves are silent failures otherwise, which is what makes this the
     /// load-bearing test. `pprof` resolves these substrings against loaded shared
     /// objects **once**, at `start()`, and stores address ranges: match nothing
-    /// and `blocklist_segments` is empty, so the fix is a no-op and the sampler
-    /// goes back to faulting. Match the main binary and every heph frame is
-    /// dropped, so `--pprof-cpu` writes empty profiles forever — crashing
-    /// nothing, telling no one. `str::contains` is case-sensitive, which is how
+    /// and `blocklist_segments` is empty, so every profile fills up with C library
+    /// frames that say nothing about heph's own loops. Match the main binary and
+    /// every heph frame is dropped instead, so `--pprof-cpu` writes empty profiles
+    /// forever — telling no one. `str::contains` is case-sensitive, which is how
     /// `libSystem.B.dylib` slips past a lowercase entry.
     ///
+    /// Since the walk moved off the unwinder ([`start`]) an empty blocklist is no
+    /// longer a crash, only a worthless profile — which is why this stayed a test
+    /// of the *names* and did not become a test of survival.
+    ///
     /// A static build resolves `malloc` to the executable itself and fails here.
-    /// That is correct: the blocklist genuinely cannot work in that build, and
-    /// `src/diag.rs` already records that the sampler segfaults on static
-    /// binaries.
+    /// That is correct: the blocklist genuinely cannot distinguish the two in that
+    /// build.
     #[test]
     fn blocklist_covers_the_c_library_but_not_the_main_binary() {
         let libc_obj = owning_object(libc::malloc as *const std::ffi::c_void)
@@ -543,14 +636,16 @@ mod tests {
     ///
     /// Regression: `--pprof-cpu` segfaulted the process it was meant to diagnose,
     /// within seconds of startup on a wide run, because the `SIGPROF` handler
-    /// unwound through libc frames. A crash takes this whole test binary down —
+    /// called the DWARF unwinder. A crash takes this whole test binary down —
     /// that is the first half of the assertion, and it cannot be written any
     /// other way.
     ///
-    /// The second half guards the fix rather than the bug: an over-broad
-    /// [`UNWIND_BLOCKLIST`] (one matching the main binary) would drop every sample
-    /// and leave `--pprof-cpu` writing empty profiles forever, crashing nothing
-    /// and telling no one.
+    /// The second half guards the fix rather than the bug, and guards it against
+    /// two different silent failures now: an over-broad [`UNWIND_BLOCKLIST`] (one
+    /// matching the main binary) would drop every sample, and a frame-pointer walk
+    /// on a build without frame pointers would report stacks that never name this
+    /// binary's own functions. Either leaves `--pprof-cpu` producing nothing worth
+    /// reading while crashing nothing and telling no one.
     ///
     /// It asserts on [`cpu_only`] by name, not on "the profile is non-empty".
     /// Non-empty was the weaker *and* the flakier statement: with the whole burn
