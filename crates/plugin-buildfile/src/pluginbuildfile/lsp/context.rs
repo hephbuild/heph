@@ -159,6 +159,13 @@ impl HephLspContext {
             },
             &ctoken,
         );
+        // Entered, not spawned: this runs on the LSP server's sync request
+        // thread, which has no runtime context of its own, and the provider's
+        // walk calls `hcore::blocking::run` — which requires one
+        // (`spawn_blocking` under the hood). Entering the captured server
+        // runtime satisfies it; the block_on itself parks only this thread.
+        // `listing_works_from_a_thread_with_no_ambient_runtime` pins it.
+        let _rt = self.runtime.enter();
         match futures::executor::block_on(fut) {
             Ok(iter) => iter
                 .filter_map(Result::ok)
@@ -188,6 +195,9 @@ impl HephLspContext {
             },
             &ctoken,
         );
+        // Same contract as `list_packages`: the provider may reach
+        // `hcore::blocking::run`, which needs a runtime context.
+        let _rt = self.runtime.enter();
         match futures::executor::block_on(fut) {
             Ok(iter) => iter
                 .filter_map(Result::ok)
@@ -443,7 +453,82 @@ impl LspContext for HephLspContext {
 
 #[cfg(test)]
 mod tests {
-    use super::first_build_file;
+    use super::{HephLspContext, first_build_file};
+    use hplugin::config::Options;
+    use hplugin::driver::DriverSchema;
+    use hplugin::lsp::LspEngine;
+    use hplugin::provider::{ProviderFunctionRegistry, StateSchema};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// Minimal `LspEngine` over a workspace root: enough for the listing
+    /// provider, which is all the walk path needs.
+    struct FakeEngine {
+        root: PathBuf,
+    }
+
+    impl LspEngine for FakeEngine {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+        fn provider_function_registry(&self) -> Arc<ProviderFunctionRegistry> {
+            Arc::default()
+        }
+        fn driver_schema(&self, _name: &str) -> Option<DriverSchema> {
+            None
+        }
+        fn driver_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn provider_state_schema(&self, _name: &str) -> Option<StateSchema> {
+            None
+        }
+        fn provider_options(&self, _name: &str) -> Options {
+            Options::default()
+        }
+    }
+
+    /// The LSP's listing calls must work from its own request thread, which has
+    /// no ambient tokio runtime.
+    ///
+    /// This is the one production caller of `hcore::blocking::run` that is not
+    /// already polled with a runtime context: `starlark_lsp` dispatches
+    /// completion on a plain `std::thread`, and the package walk underneath
+    /// reaches `blocking::run`, which needs a runtime to `spawn_blocking` on.
+    /// `HephLspContext` captures the server's `Handle` at construction and
+    /// enters it around each `block_on` for exactly this reason.
+    ///
+    /// Driven from a thread spawned outside the runtime, so the context's
+    /// captured handle is the *only* runtime in reach. Remove either `enter()`
+    /// and this panics with "there is no reactor running" (mutation-verified).
+    #[test]
+    fn listing_works_from_a_thread_with_no_ambient_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir_all(&pkg).expect("mkdir pkg");
+        std::fs::write(pkg.join("BUILD"), "").expect("write BUILD");
+
+        // Built inside a runtime (as the real server does — it captures
+        // `Handle::current()`), then used from outside one.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let ctx = rt.block_on(async {
+            HephLspContext::new(Arc::new(FakeEngine {
+                root: dir.path().to_path_buf(),
+            }))
+        });
+
+        let packages = std::thread::spawn(move || ctx.list_packages(""))
+            .join()
+            .expect("the listing thread must not panic for want of a runtime");
+        assert!(
+            packages.iter().any(|p| p == "mypkg"),
+            "the package walk must reach the LSP caller: {packages:?}"
+        );
+    }
 
     #[test]
     fn first_build_file_matches_literal_and_glob_patterns() {

@@ -339,12 +339,15 @@ mod tests {
     use hplugin::driver::inputartifact::{InputArtifact, Type};
     use std::collections::BTreeMap;
 
-    /// A tar-backed input whose `seekable_reader` records the thread it was
-    /// opened on. Both the reader open and the `TarIndex` build happen inside
-    /// `try_register_slot`'s `par_iter`, so this witnesses the whole fan-out.
+    /// A tar-backed input whose `seekable_reader` records whether it was
+    /// opened inside a `blocking::run` job. Both the reader open and the
+    /// `TarIndex` build happen inside `try_register_slot`'s `par_iter`, so
+    /// this witnesses the whole fan-out. (A single-input `par_iter` runs on
+    /// the calling thread — the job's — which is also what kept the old
+    /// thread-name witness deterministic here.)
     struct ThreadRecordingTar {
         bytes: Vec<u8>,
-        thread: Arc<std::sync::Mutex<Option<String>>>,
+        in_job: Arc<std::sync::Mutex<Option<bool>>>,
     }
 
     impl Content for ThreadRecordingTar {
@@ -362,10 +365,8 @@ mod tests {
         fn seekable_reader(&self) -> anyhow::Result<Option<Box<dyn ReadSeek + Send>>> {
             // Not an `expect`: this returns a `Result`, and a poisoned slot would
             // only hide the assertion rather than signal anything.
-            let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
-            *slot = std::thread::current()
-                .name()
-                .map(std::borrow::ToOwned::to_owned);
+            let mut slot = self.in_job.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(hcore::blocking::in_blocking_job());
             drop(slot);
             Ok(Some(Box::new(std::io::Cursor::new(self.bytes.clone()))))
         }
@@ -394,7 +395,7 @@ mod tests {
         packer.create_raw(b"payload".to_vec(), "pkg/x.txt", false);
         let mut bytes = Vec::new();
         packer.pack(&mut bytes).expect("pack");
-        let thread = Arc::new(std::sync::Mutex::new(None));
+        let in_job = Arc::new(std::sync::Mutex::new(None));
 
         let input = RunInput {
             artifact: InputArtifact {
@@ -402,7 +403,7 @@ mod tests {
                 origin_id: "dep|a|0".to_string(),
                 content: Arc::new(ThreadRecordingTar {
                     bytes,
-                    thread: Arc::clone(&thread),
+                    in_job: Arc::clone(&in_job),
                 }),
             },
             origin_id: "dep|a|0".to_string(),
@@ -419,12 +420,11 @@ mod tests {
 
         assert!(slot.is_some(), "a seekable input must register a slot");
         assert_eq!(group.len(), 1, "the group must come back to the caller");
-        let ran_on = thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        assert!(
-            ran_on
-                .as_deref()
-                .is_some_and(|n| n.starts_with("heph-blocking")),
-            "slot registration must run on the blocking pool, ran on {ran_on:?}"
+        let recorded = *in_job.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            recorded,
+            Some(true),
+            "slot registration must run inside a blocking::run job (None = never opened)"
         );
     }
 }

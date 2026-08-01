@@ -1374,8 +1374,8 @@ mod tests {
     /// `waker_ref(cell)`, and every clone of that waker is a strong clone of
     /// `Arc<Cell>`. Real leaves store the waker they are polled with — a
     /// `tokio::sync::oneshot` keeps it in the channel, `Semaphore::acquire`
-    /// parks it in the wait list, and `hcore::blocking::run` clones it into the
-    /// global `PENDING` backstop list on every pending poll. Each of those is a
+    /// parks it in the wait list, and `hcore::blocking::run` parks it in its
+    /// blocking task's join slot for the whole wait. Each of those is a
     /// phantom "joiner" to `Arc::strong_count > 2`, so the guard bails and the
     /// abandoned future — and the worker permit it holds — is retained forever.
     /// `futures::future::pending()` is the one pending future that never stores
@@ -1497,7 +1497,7 @@ mod tests {
     /// `locked_result` cell, which computes by awaiting an `execute_cache`
     /// cell, whose computation takes a real semaphore permit and then parks on
     /// a leaf that **stores the waker it is polled with** — what
-    /// `hcore::blocking::run`'s oneshot does. That stored waker is a strong
+    /// `hcore::blocking::run`'s `JoinHandle` await does. That stored waker is a strong
     /// clone of the `execute_cache` cell, which is what made any
     /// `Arc::strong_count` gate a false pass; `futures::future::pending()`
     /// stores nothing and is forbidden here, and the stash assertion below
@@ -1528,7 +1528,7 @@ mod tests {
         ));
 
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
-        // Held by the test past the drop, like the oneshot channel inside
+        // Held by the test past the drop, like the join slot inside
         // `blocking::run`: the leaf's stored waker must survive the abandonment
         // so the job-finished-late wake can be delivered into the torn-down
         // chain, exactly as the idle-pool-jobs-finished dumps describe.

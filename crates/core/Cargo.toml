@@ -8,7 +8,6 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
-crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 tar = "0.4"
 futures = "0.3.32"

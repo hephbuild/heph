@@ -1048,38 +1048,43 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
 
 /// Concurrent whole-package Starlark evaluations.
 ///
-/// [`hcore::blocking`] is `2 * cores` threads behind one unbounded FIFO, shared
-/// by four classes of work with no reserve between them: sub-millisecond
-/// manifest reads, tar-and-copy into the cache, gzip (already self-capped at the
-/// core count by the remote cache's `CODEC_SLOTS`) — and this, the single
-/// heaviest synchronous unit in a build, at hundreds of milliseconds per
-/// package.
+/// [`hcore::blocking`] is `2 * cores` run slots behind one FIFO semaphore,
+/// shared by four classes of work with no reserve between them:
+/// sub-millisecond manifest reads, tar-and-copy into the cache, gzip (already
+/// self-capped at the core count by the remote cache's `CODEC_SLOTS`) — and
+/// this, the single heaviest synchronous unit in a build, at hundreds of
+/// milliseconds per package.
 ///
-/// The pool is arrival-fair and work-conserving, so an unbounded fan-out of
+/// The slots are arrival-fair and work-conserving, so an unbounded fan-out of
 /// package evaluations does not *starve* the short jobs, it puts them behind a
-/// queue of long ones. `run_pkg` is the only class that can occupy every thread
+/// queue of long ones. `run_pkg` is the only class that can occupy every slot
 /// for that long, and it was the only one not bounded.
 ///
 /// The core count, for the same reason `CODEC_SLOTS` uses it: the work is
 /// CPU-bound, so more concurrent evaluations than cores buys nothing, and half
-/// the pool stays free for the short jobs that were queueing behind them. It is
+/// the slots stay free for the short jobs that were queueing behind them. It is
 /// a cap on this class, not a reserve for the others — with gzip also at its own
-/// core-count cap, a build that peaks on both at once can still fill the pool.
-/// Guaranteeing a reserve is a change to the pool itself.
+/// core-count cap, a build that peaks on both at once can still fill the slots.
+/// Guaranteeing a reserve is a change to `hcore::blocking` itself.
 static PKG_EVAL_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| {
         let slots = pkg_eval_slots();
-        // `LoadRegistry`'s cross-chain claim parks a pool thread on a condvar while
-        // the claim's holder evaluates on another pool thread. That is deadlock-free
-        // only while every holder can actually be running — i.e. while the number of
-        // concurrent evaluations stays strictly below the pool size. The two
-        // constants live in different crates and nothing ties their formulas
-        // together, so enforce the invariant where the slots are minted.
+        // `LoadRegistry`'s cross-chain claim parks its blocking job on a condvar
+        // while the claim's holder evaluates inside a blocking job of its own.
+        // That is deadlock-free only while every holder can actually be running —
+        // i.e. while the number of concurrent evaluations stays strictly below
+        // `hcore::blocking`'s concurrency limit, so a claim holder can always
+        // take a run slot. (Thread supply is not the binding resource anymore —
+        // tokio's blocking pool is capped at `8 * cores + 64` — the run slots
+        // are.) The two constants live in different crates and nothing ties
+        // their formulas together, so enforce the invariant where the slots are
+        // minted.
         assert!(
-            slots < hcore::blocking::pool_size(),
-            "PKG_EVAL_SLOTS ({slots}) must stay strictly below hcore::blocking::pool_size() \
-         ({}): a LoadRegistry claim waiter parks a pool thread while its holder needs one",
-            hcore::blocking::pool_size()
+            slots < hcore::blocking::concurrency_limit(),
+            "PKG_EVAL_SLOTS ({slots}) must stay strictly below \
+         hcore::blocking::concurrency_limit() ({}): a LoadRegistry claim waiter \
+         parks its run slot while its holder needs one",
+            hcore::blocking::concurrency_limit()
         );
         tokio::sync::Semaphore::new(slots)
     });
@@ -1108,8 +1113,8 @@ impl Provider {
                 enclose!((key) move || async move {
                     // Bound the fan-out before queueing: see `PKG_EVAL_SLOTS`.
                     // Waited for here rather than inside the closure so the wait
-                    // happens in async-land, not on a pool thread — parking a
-                    // pool thread to wait for a pool thread is the deadlock.
+                    // happens in async-land, not inside a blocking job — parking
+                    // a run slot to wait for a run slot is the deadlock.
                     let slot = PKG_EVAL_SLOTS
                         .acquire()
                         .await
@@ -1124,21 +1129,19 @@ impl Provider {
                         // guard is already `'static`, and this costs nothing.
                         //
                         // It matters because a permit held across an await is
-                        // released only by a poll of this future — and callers
-                        // exist that stop polling. The discovery fan-out in
-                        // `Engine::query` buffers K of these and its consumer
-                        // parks in the `MatchShrug` arm awaiting a *different*
-                        // package's spec, which needs a permit of its own: the
-                        // holders go unpollable exactly when the consumer needs
-                        // what they hold, and the semaphore is FIFO. That walk
-                        // spawns each package as a task so the runtime keeps
-                        // polling them, which breaks the cycle — but that is the
-                        // caller's discipline, and `list` here is reachable from
-                        // arbitrary provider code. Submitted jobs run to
-                        // completion even when the receiver is gone
-                        // (`hcore::blocking::run`), so releasing on the pool
-                        // thread makes the class impossible rather than merely
-                        // unreached.
+                        // released only by a poll of this future — and plain
+                        // futures can stop being polled without being dropped
+                        // (a `buffered(K)` walk whose consumer parks, the shape
+                        // `Engine::query` used to have). Moved into the job's
+                        // closure, the permit has exactly two fates, neither of
+                        // which needs the caller polled: the job runs to
+                        // completion even when its awaiter is gone (detached,
+                        // `hcore::blocking::run`) and releases at job end, or
+                        // the closure is dropped un-run with the future and
+                        // releases then. This body is also a memoized *task*
+                        // (`pkg_cache` spawns it), so it is either polled by the
+                        // runtime or aborted-and-dropped — never parked forever
+                        // mid-await holding the permit.
                         let _slot = slot;
                         let loader =
                             BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages, loads);
@@ -2371,7 +2374,7 @@ target(
             tokio::time::timeout(std::time::Duration::from_millis(250), &mut eval)
                 .await
                 .is_err(),
-            "an evaluation must not reach the blocking pool while every slot is held",
+            "an evaluation must not reach a blocking job while every slot is held",
         );
 
         drop(held);
@@ -2382,20 +2385,21 @@ target(
         assert_eq!(result.targets.len(), 1);
     }
 
-    /// `LoadRegistry::claim` parks a pool thread on a condvar until the claim's
-    /// holder — another evaluation, on another pool thread — finishes the file.
-    /// Every holder must therefore be able to run, which requires strictly
-    /// fewer concurrent evaluations than pool threads. The formulas live in
-    /// different crates (`pkg_eval_slots` here, `pool_size` in `hcore`), so pin
-    /// the inequality; the `PKG_EVAL_SLOTS` initializer asserts it at runtime
-    /// for non-test binaries.
+    /// `LoadRegistry::claim` parks its blocking job on a condvar until the
+    /// claim's holder — another evaluation, in another blocking job — finishes
+    /// the file. Every holder must therefore be able to run, which requires
+    /// strictly fewer concurrent evaluations than `hcore::blocking` run slots.
+    /// The formulas live in different crates (`pkg_eval_slots` here,
+    /// `concurrency_limit` in `hcore`), so pin the inequality; the
+    /// `PKG_EVAL_SLOTS` initializer asserts it at runtime for non-test
+    /// binaries.
     #[test]
-    fn eval_slots_stay_strictly_below_the_blocking_pool() {
+    fn eval_slots_stay_strictly_below_the_blocking_limit() {
         assert!(
-            pkg_eval_slots() < hcore::blocking::pool_size(),
-            "pkg_eval_slots ({}) must stay strictly below hcore::blocking::pool_size ({})",
+            pkg_eval_slots() < hcore::blocking::concurrency_limit(),
+            "pkg_eval_slots ({}) must stay strictly below hcore::blocking::concurrency_limit ({})",
             pkg_eval_slots(),
-            hcore::blocking::pool_size()
+            hcore::blocking::concurrency_limit()
         );
     }
 

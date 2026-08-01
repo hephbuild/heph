@@ -1374,16 +1374,16 @@ mod tests {
     /// that key. It also runs under the stage `FLock`, so a parked worker holds
     /// the lock every other consumer of that artifact is waiting on.
     ///
-    /// The content records the thread it was walked on;
-    /// `hcore::blocking`'s pool threads are the only ones named
-    /// `heph-blocking-*`. Asserted positively — `!= "tokio-runtime-worker"`
-    /// would pass vacuously, since `#[tokio::test]` runs the body on the test
-    /// thread.
+    /// The content records whether it was walked inside a `blocking::run` job
+    /// (`hcore::blocking::in_blocking_job` is the witness — tokio's blocking
+    /// threads carry no distinguishing name). Asserted positively — "not on a
+    /// worker" would pass vacuously, since `#[tokio::test]` runs the body on
+    /// the test thread.
     #[tokio::test]
     async fn stage_materialization_runs_off_the_runtime_workers() {
         struct ThreadRecordingTar {
             inner: TarBytes,
-            thread: Arc<std::sync::Mutex<Option<String>>>,
+            in_job: Arc<std::sync::Mutex<Option<bool>>>,
         }
 
         impl Content for ThreadRecordingTar {
@@ -1394,7 +1394,7 @@ mod tests {
                 &self,
             ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
             {
-                record_current_thread(&self.thread);
+                record_in_blocking_job(&self.in_job);
                 self.inner.walk()
             }
             fn hashout(&self) -> anyhow::Result<String> {
@@ -1402,24 +1402,22 @@ mod tests {
             }
         }
 
-        /// Record the name of the thread this runs on into `slot`.
+        /// Record whether this runs inside a `blocking::run` job into `slot`.
         ///
         /// A free function returning `()` rather than a lock inside `walk`:
         /// `walk` returns a `Result`, and `clippy::unwrap_in_result` (denied in
         /// this crate) rejects an `expect` there. Poisoning is ignored — the
         /// `Option` is still consistent, and a poisoned slot would only hide the
         /// assertion.
-        fn record_current_thread(slot: &std::sync::Mutex<Option<String>>) {
+        fn record_in_blocking_job(slot: &std::sync::Mutex<Option<bool>>) {
             let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
-            *g = std::thread::current()
-                .name()
-                .map(std::borrow::ToOwned::to_owned);
+            *g = Some(hcore::blocking::in_blocking_job());
         }
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
-        let thread = Arc::new(std::sync::Mutex::new(None));
+        let in_job = Arc::new(std::sync::Mutex::new(None));
         // A real hashout, so this takes the staged path and not the
         // `unpack_blocking` fallback `no_content_hash_falls_back_to_copy` covers.
         let inner = content("stagethread", &[("pkg/x.txt", "hello", false)]);
@@ -1428,7 +1426,7 @@ mod tests {
                 bytes: drain_tar(&inner),
                 hash: "stagethread".to_string(),
             },
-            thread: Arc::clone(&thread),
+            in_job: Arc::clone(&in_job),
         });
 
         stage_and_link(&c, &stage, "k", &link, None, &[], false, &ct())
@@ -1440,12 +1438,11 @@ mod tests {
             "hello",
             "the tree must still be staged and linked"
         );
-        let ran_on = thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        assert!(
-            ran_on
-                .as_deref()
-                .is_some_and(|n| n.starts_with("heph-blocking")),
-            "stage materialization must run on the blocking pool, ran on {ran_on:?}"
+        let recorded = *in_job.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            recorded,
+            Some(true),
+            "stage materialization must run inside a blocking::run job (None = never walked)"
         );
     }
 

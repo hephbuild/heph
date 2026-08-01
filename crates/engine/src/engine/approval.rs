@@ -308,15 +308,16 @@ mod tests {
     /// every matched artifact and reads its bytes out of the cache, and that read
     /// parks the calling thread on any queued sqlite write to those keys.
     ///
-    /// The content records the thread it was walked on; `hcore::blocking`'s pool
-    /// threads are the only ones named `heph-blocking-*`. Asserted positively —
-    /// `!= "tokio-runtime-worker"` would pass vacuously, since `#[tokio::test]`
-    /// runs the body on the test thread.
+    /// The content records whether it was walked inside a `blocking::run` job
+    /// (`hcore::blocking::in_blocking_job` is the witness — tokio's blocking
+    /// threads carry no distinguishing name). Asserted positively — "not on a
+    /// worker" would pass vacuously, since `#[tokio::test]` runs the body on
+    /// the test thread.
     #[tokio::test]
     async fn notice_rendering_runs_off_the_runtime_workers() {
         struct ThreadRecordingTar {
             inner: TarBytes,
-            thread: Arc<std::sync::Mutex<Option<String>>>,
+            in_job: Arc<std::sync::Mutex<Option<bool>>>,
         }
 
         impl Content for ThreadRecordingTar {
@@ -327,10 +328,8 @@ mod tests {
                 &self,
             ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
             {
-                let mut slot = self.thread.lock().unwrap_or_else(|e| e.into_inner());
-                *slot = std::thread::current()
-                    .name()
-                    .map(std::borrow::ToOwned::to_owned);
+                let mut slot = self.in_job.lock().unwrap_or_else(|e| e.into_inner());
+                *slot = Some(hcore::blocking::in_blocking_job());
                 drop(slot);
                 self.inner.walk()
             }
@@ -343,21 +342,20 @@ mod tests {
         packer.create_raw(b"notice body\n".to_vec(), "NOTICE.txt", false);
         let mut bytes = Vec::new();
         packer.pack(&mut bytes).expect("pack");
-        let thread = Arc::new(std::sync::Mutex::new(None));
+        let in_job = Arc::new(std::sync::Mutex::new(None));
         let artifacts: Vec<Arc<dyn Content>> = vec![Arc::new(ThreadRecordingTar {
             inner: TarBytes(bytes),
-            thread: Arc::clone(&thread),
+            in_job: Arc::clone(&in_job),
         })];
 
         let out = read_notice_text_blocking(artifacts).await.expect("render");
 
         assert_eq!(out, "notice body\n", "the notice must still be rendered");
-        let ran_on = thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        assert!(
-            ran_on
-                .as_deref()
-                .is_some_and(|n| n.starts_with("heph-blocking")),
-            "notice rendering must run on the blocking pool, ran on {ran_on:?}"
+        let recorded = *in_job.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            recorded,
+            Some(true),
+            "notice rendering must run inside a blocking::run job (None = never walked)"
         );
     }
 

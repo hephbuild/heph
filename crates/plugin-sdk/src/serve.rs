@@ -77,25 +77,24 @@ pub fn cdylib_runtime_handle() -> tokio::runtime::Handle {
 
 /// Awaits a seam task's `JoinHandle` from the wrapper future the host polls.
 ///
-/// - **Abort-on-drop**: the host dropping the wrapper (rather than cancelling
-///   cooperatively) is the only stop signal for entry points with no
-///   `CancelRegistry` wiring (`list`, `list_packages`, `call_function`), so the
-///   spawned body is aborted when the wrapper goes away. The cooperative path
-///   (`await_with_cancel` host-side) cancels then keeps polling — it never
-///   drops, so it is unaffected.
-/// - **Backstop**: the completion wake crosses from a plugin-runtime worker to
-///   the host's waker through the stabby seam. That hazard has not been
-///   reproduced in isolation (docs/CONCURRENCY_MEASUREMENTS.md §2, lands with
-///   #298 below this PR in the stack); arming `hcore::blocking::Backstop` on
-///   every pending poll is defense-in-depth, the same treatment
-///   `hcore::blocking::run` gives its oneshot wait.
+/// **Abort-on-drop**: the host dropping the wrapper (rather than cancelling
+/// cooperatively) is the only stop signal for entry points with no
+/// `CancelRegistry` wiring (`list`, `list_packages`, `call_function`), so the
+/// spawned body is aborted when the wrapper goes away. The cooperative path
+/// (`await_with_cancel` host-side) cancels then keeps polling — it never
+/// drops, so it is unaffected.
+///
+/// The completion wake crosses from a plugin-runtime worker to the host's
+/// waker through the stabby seam — plain waker forwarding, which is trusted:
+/// the dropped-wake hazard this wrapper used to insure with
+/// `hcore::blocking::Backstop` failed to reproduce across ~40M wakes
+/// (docs/CONCURRENCY_MEASUREMENTS.md §2), and that registry no longer exists.
 ///
 /// `JoinHandle::poll` is runtime-free, so polling this from a host worker (or
 /// a plain `futures::executor::block_on`) is sound — `hook_on_events` is the
 /// in-tree precedent of a guest `JoinHandle` awaited across the seam.
 struct SeamTask<T> {
     handle: tokio::task::JoinHandle<T>,
-    backstop: hcore::blocking::Backstop,
 }
 
 impl<T> std::future::Future for SeamTask<T> {
@@ -105,14 +104,7 @@ impl<T> std::future::Future for SeamTask<T> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let this = self.get_mut();
-        match std::pin::Pin::new(&mut this.handle).poll(cx) {
-            std::task::Poll::Ready(out) => std::task::Poll::Ready(out),
-            std::task::Poll::Pending => {
-                this.backstop.arm(cx.waker());
-                std::task::Poll::Pending
-            }
-        }
+        std::pin::Pin::new(&mut self.get_mut().handle).poll(cx)
     }
 }
 
@@ -151,7 +143,6 @@ where
 {
     let task = SeamTask {
         handle: hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), fut),
-        backstop: hcore::blocking::Backstop::new(),
     };
     let plugin = Arc::clone(plugin);
     async move {

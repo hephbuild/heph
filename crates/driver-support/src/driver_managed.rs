@@ -233,8 +233,8 @@ async fn run_shell_fallback<'a, 'io>(
     shell_fallback.driver.run_shell(new_mreq, ctoken).await
 }
 
-/// Tar, hash and stage every collectable output of a finished run, on the
-/// blocking pool.
+/// Tar, hash and stage every collectable output of a finished run, through
+/// `hcore::blocking::run`.
 ///
 /// This reads, tars and xxh3-hashes **every output byte** the target produced.
 /// Run inline in an `async fn` it holds a tokio worker for that whole time, and
@@ -262,7 +262,7 @@ pub async fn collect_outputs(
 }
 
 /// The synchronous body of [`collect_outputs`], split out so it can be handed to
-/// the blocking pool whole.
+/// `hcore::blocking::run` whole.
 fn collect_outputs_inner(
     target_outputs: &[hplugin::driver::targetdef::Output],
     support_files: &[hplugin::driver::targetdef::path::Path],
@@ -369,7 +369,7 @@ pub(crate) fn build_source_map(
 /// least one input opted in. With no opted-in inputs the map is empty and the
 /// file is skipped entirely — consumers (e.g. golist) treat a missing file as
 /// an empty map.
-/// [`write_source_map`] on the blocking pool, taking and returning the inputs so
+/// [`write_source_map`] through `hcore::blocking::run`, taking and returning the inputs so
 /// the job can own them.
 ///
 /// Cheap when nothing opts in — but an input that does costs an `entry_paths()`
@@ -499,7 +499,7 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
     Ok(())
 }
 
-/// [`hartifactcontent::unpack::unpack`] on the blocking pool.
+/// [`hartifactcontent::unpack::unpack`] through `hcore::blocking::run`.
 ///
 /// Unpacking reads every byte of the artifact out of the cache and writes the
 /// whole tree to disk. Inline in an `async fn` it holds a runtime worker for the
@@ -531,7 +531,7 @@ pub async fn unpack_blocking(
     .await
 }
 
-/// [`detect_output_collisions`] on the blocking pool, taking and returning the
+/// [`detect_output_collisions`] through `hcore::blocking::run`, taking and returning the
 /// groups so the job can own them.
 ///
 /// The check is not the cheap map walk it looks like: `entry_paths()` on a
@@ -539,7 +539,7 @@ pub async fn unpack_blocking(
 /// `LocalCacheSQLite::seekable_reader`, which parks the calling thread until any
 /// queued write to that key has been committed by the single writer thread.
 /// Inline in an `async fn` that is exactly the runtime-worker stall
-/// `hcore::blocking` exists to remove; on a pool thread the park is the
+/// `hcore::blocking` exists to remove; inside a blocking job the park is the
 /// backend's documented contract.
 pub async fn detect_output_collisions_blocking(
     groups: BTreeMap<PathBuf, Vec<RunInput>>,
@@ -999,14 +999,15 @@ mod source_map_tests {
         detect_output_collisions(&groups).expect("filtered-out path must not collide");
     }
 
-    /// Records the thread its bytes were read on, then behaves like `TarBytes`.
+    /// Records whether its bytes were read inside a `blocking::run` job, then
+    /// behaves like `TarBytes`.
     ///
     /// The witness for every "runs off the runtime workers" test in this module:
     /// `entry_paths` (the default) and `unpack` both go through `walk`, so one
     /// recorder covers path enumeration and full materialization alike.
     struct ThreadRecordingTar {
         inner: TarBytes,
-        thread: Arc<std::sync::Mutex<Option<String>>>,
+        in_job: Arc<std::sync::Mutex<Option<bool>>>,
     }
 
     impl Content for ThreadRecordingTar {
@@ -1014,7 +1015,7 @@ mod source_map_tests {
             self.inner.reader()
         }
         fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
-            record_current_thread(&self.thread);
+            record_in_blocking_job(&self.in_job);
             self.inner.walk()
         }
         fn hashout(&self) -> anyhow::Result<String> {
@@ -1022,45 +1023,44 @@ mod source_map_tests {
         }
     }
 
-    /// Record the name of the thread this runs on into `slot`.
+    /// Record whether this runs inside a `blocking::run` job into `slot`.
     ///
     /// A free function returning `()` rather than a lock inside `walk`: `walk`
     /// returns a `Result`, and `clippy::unwrap_in_result` (denied in this crate)
     /// rejects an `expect` there. Poisoning is ignored — the `Option` is still
     /// consistent, and a poisoned slot would only hide the assertion.
-    fn record_current_thread(slot: &std::sync::Mutex<Option<String>>) {
+    fn record_in_blocking_job(slot: &std::sync::Mutex<Option<bool>>) {
         let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
-        *g = std::thread::current()
-            .name()
-            .map(std::borrow::ToOwned::to_owned);
+        *g = Some(hcore::blocking::in_blocking_job());
     }
 
     /// A `ThreadRecordingTar` over `files`, plus the slot it reports into.
     fn recording_content(
         files: &[(&str, &str)],
-    ) -> (Arc<dyn Content>, Arc<std::sync::Mutex<Option<String>>>) {
-        let thread = Arc::new(std::sync::Mutex::new(None));
+    ) -> (Arc<dyn Content>, Arc<std::sync::Mutex<Option<bool>>>) {
+        let in_job = Arc::new(std::sync::Mutex::new(None));
         let content = Arc::new(ThreadRecordingTar {
             inner: TarBytes(pack_files(files)),
-            thread: Arc::clone(&thread),
+            in_job: Arc::clone(&in_job),
         });
-        (content, thread)
+        (content, in_job)
     }
 
-    /// The witness itself: `hcore::blocking`'s pool threads are the only ones
-    /// named `heph-blocking-*`, so the name separates them from a runtime worker
-    /// (`tokio-runtime-worker`) and from the test thread.
+    /// The witness itself: `hcore::blocking::in_blocking_job` is true only
+    /// while a `blocking::run` job runs on the calling thread — a runtime
+    /// worker, the test thread, and even a bare `spawn_blocking` all read
+    /// false. (The old pool's `heph-blocking-*` thread names used to be the
+    /// witness; tokio's blocking threads carry no distinguishing name.)
     ///
-    /// Positive rather than negative on purpose — asserting `!= "tokio-runtime-
-    /// worker"` passes vacuously under `#[tokio::test]`, whose current-thread
-    /// flavor runs the body on the test thread.
-    fn assert_ran_on_blocking_pool(thread: &Arc<std::sync::Mutex<Option<String>>>, what: &str) {
-        let ran_on = thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        assert!(
-            ran_on
-                .as_deref()
-                .is_some_and(|n| n.starts_with("heph-blocking")),
-            "{what} must run on the blocking pool, ran on {ran_on:?}"
+    /// Positive rather than negative on purpose — asserting "not on a worker"
+    /// passes vacuously under `#[tokio::test]`, whose current-thread flavor
+    /// runs the body on the test thread.
+    fn assert_ran_on_blocking_pool(in_job: &Arc<std::sync::Mutex<Option<bool>>>, what: &str) {
+        let recorded = *in_job.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            recorded,
+            Some(true),
+            "{what} must run inside a blocking::run job (None = never walked)"
         );
     }
 
@@ -1071,9 +1071,9 @@ mod source_map_tests {
     /// `async fn` that holds a worker; with `2 * ncpu` execute permits against
     /// `ncpu` workers, enough targets in this window park the whole runtime.
     ///
-    /// Asserted where the work is actually observable: the content itself records
-    /// the thread it was enumerated on. `hcore::blocking`'s pool threads are the
-    /// only ones named `heph-blocking-*`, so the name is the witness.
+    /// Asserted where the work is actually observable: the content itself
+    /// records whether it was enumerated inside a `blocking::run` job
+    /// (`hcore::blocking::in_blocking_job` is the witness).
     #[tokio::test]
     async fn source_map_generation_runs_off_the_runtime_workers() {
         let dir = tempfile::tempdir().expect("tempdir");

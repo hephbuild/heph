@@ -45,8 +45,8 @@ fn stall_backstop(waker: Waker) {
                     }
                 }
             })
-            // Same stance as `hcore::blocking`: a process that cannot spawn its
-            // diagnostic thread has nothing to fall back to.
+            // Same stance as the sandbox cleaner: a process that cannot spawn
+            // its diagnostic thread has nothing to fall back to.
             .expect("spawn heph memoizer stall thread");
     });
     stall_pending().push(waker);
