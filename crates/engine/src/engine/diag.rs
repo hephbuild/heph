@@ -123,12 +123,11 @@ const SLOTS: usize = 512;
 /// Sentinel for a free slot: no span can legitimately hash to it.
 const FREE: u64 = 0;
 
-/// At or below this many open `Execute` spans and nothing else, silence is
-/// treated as "subprocesses are working" rather than a stall — until
-/// [`QUIET_EXEC_FACTOR`] times the threshold has passed.
-const QUIET_EXEC_MAX: u64 = 4;
-
-/// How much longer a silent-subprocess build is given before it is reported.
+/// How much longer a build whose only open work is subprocesses is given
+/// before it is reported. Silence there is "subprocesses are working", not a
+/// stall — heph cannot see inside one — so the ordinary threshold does not
+/// apply; a genuinely stuck one is still reported once this many thresholds
+/// have passed.
 const QUIET_EXEC_FACTOR: u64 = 10;
 
 /// Rolling window over which bytes-moved is reported.
@@ -626,20 +625,33 @@ impl DiagState {
             .collect();
         open.sort_by_key(|(_, n, _)| std::cmp::Reverse(*n));
 
-        // A handful of `Execute` spans and nothing else is a normal build running
-        // normal subprocesses. heph cannot see inside one: a compiler thinking
-        // quietly for ten minutes emits exactly what a wedged one emits, which is
-        // nothing. Reporting that at the ordinary threshold would fire on every
-        // narrow invocation — `heph r //some:slow_target` — and a notice that
+        // Open `Execute` spans and nothing else is a normal build running normal
+        // subprocesses. heph cannot see inside one: a compiler thinking quietly
+        // for ten minutes emits exactly what a wedged one emits, which is
+        // nothing — and the count does not change that, eight parallel link
+        // steps are as opaque as one. Reporting that at the ordinary threshold
+        // would fire on every invocation with a slow target, and a notice that
         // cries wolf is worse than none, because people stop reading it.
         //
         // So hold silent subprocesses to a much longer clock. A genuinely stuck
         // one is still reported, just late, and `dominant` refuses to volunteer a
         // theory about it (see `StallReport::dominant`).
-        let only_subprocesses = !open.is_empty()
+        //
+        // `Result` spans are neutral here, exactly as in
+        // [`StallReport::no_work_in_flight`]: every ancestor holds one open
+        // while awaiting its children, so an execute is *always* wrapped in
+        // open result spans. Requiring "`Execute` and nothing else" literally
+        // made this exception unreachable in a real run.
+        //
+        // A blocked result lock disqualifies it, also as in `no_work_in_flight`:
+        // unlike a subprocess, heph sees a lock wait completely — it names
+        // another process (the holder pid) that nothing else could surface —
+        // so its report must not wait on the subprocess clock.
+        let only_subprocesses = self.lock_waits(now_ms).is_none()
+            && open.iter().any(|(op, _, _)| matches!(op, Op::Execute))
             && open
                 .iter()
-                .all(|(op, n, _)| matches!(op, Op::Execute) && *n <= QUIET_EXEC_MAX);
+                .all(|(op, _, _)| matches!(op, Op::Execute | Op::Result));
         if only_subprocesses && quiet < threshold_ms.saturating_mul(QUIET_EXEC_FACTOR) {
             return None;
         }
@@ -1393,6 +1405,77 @@ mod tests {
         }
     }
 
+    /// The shape a real run actually has: the engine holds a `Result` span open
+    /// for the target and every ancestor while the driver runs the subprocess,
+    /// so an `Execute` span is never open on its own. Requiring "`Execute` and
+    /// nothing else" made the quiet-subprocess exception unreachable outside
+    /// tests, and every long driver `run` got a stall paragraph at the ordinary
+    /// threshold.
+    #[test]
+    fn a_quiet_subprocess_wrapped_in_result_spans_is_not_a_stall() {
+        let s = state();
+        for i in 0..5 {
+            s.op_start(Op::Result, &format!("//dep:{i}"), 0);
+        }
+        s.op_start(Op::Execute, "//a:b", 0);
+        assert!(
+            s.evaluate(61_000, T).is_none(),
+            "fired at the ordinary threshold while a driver run was in flight"
+        );
+        assert!(
+            s.evaluate(T.as_millis() as u64 * QUIET_EXEC_FACTOR, T)
+                .is_some(),
+            "still reported at exactly the longer clock"
+        );
+    }
+
+    /// A blocked result lock disqualifies the quiet-subprocess clock: unlike a
+    /// subprocess, heph sees a lock wait completely — it names another process
+    /// (the holder pid) that nothing else could ever surface — so deferring it
+    /// to the longer clock would delay the one line that points at the culprit.
+    #[test]
+    fn a_blocked_lock_alongside_a_quiet_exec_still_fires() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        s.op_start(Op::Execute, "//a:b", 0);
+        s.lock_wait_start("//c:d", Some(77), 0);
+        let r = s
+            .evaluate(61_000, T)
+            .expect("a visible lock wait must be reported at the ordinary threshold");
+        assert!(r.lock_waits.is_some());
+    }
+
+    /// A wedged cache write alongside a quiet exec fires at the ordinary
+    /// threshold: the write ops are real, visible operations — not
+    /// bookkeeping — and must never drift into the neutral set.
+    #[test]
+    fn an_open_cache_write_alongside_a_quiet_exec_still_fires() {
+        let s = state();
+        s.op_start(Op::Result, "//a:b", 0);
+        s.op_start(Op::Execute, "//a:b", 0);
+        s.op_start(Op::LocalCacheWrite, "//c:d", 0);
+        assert!(
+            s.evaluate(61_000, T).is_some(),
+            "an open cache write is heph's own work and must be reported at 1x"
+        );
+    }
+
+    /// Result-only spans never get the subprocess clock: a process idle with
+    /// work outstanding — a lost wake-up — shows exactly this shape, and
+    /// delaying that report tenfold would hide the class of hang this module
+    /// exists for.
+    #[test]
+    fn result_only_spans_are_not_given_the_subprocess_clock() {
+        let s = state();
+        for i in 0..578 {
+            s.op_start(Op::Result, &format!("//pkg:{i}"), 0);
+        }
+        assert!(
+            s.evaluate(61_000, T).is_some(),
+            "with no execute open there is no subprocess to blame the silence on"
+        );
+    }
+
     /// It is held to a longer clock, not exempted: a genuinely stuck subprocess
     /// is still reported, just late.
     #[test]
@@ -1934,15 +2017,25 @@ mod tests {
         assert!(s.evaluate(61_000, T).is_some());
     }
 
-    /// A wide fan-out of subprocesses is a real signal — that is the worker pool
-    /// wedged, not one slow compile — so the suppression must not swallow it.
+    /// A wide fan-out of quiet subprocesses is as opaque as one: eight parallel
+    /// link steps emit exactly what eight wedged ones emit, which is nothing.
+    /// The count does not change what heph can see, so the whole fan-out is held
+    /// to the same longer clock — reported late, never silently exempted.
     #[test]
-    fn many_open_subprocesses_still_fire() {
+    fn a_wide_exec_fanout_is_held_to_the_longer_clock() {
         let s = state();
-        for i in 0..(QUIET_EXEC_MAX + 1) {
+        for i in 0..16 {
             s.op_start(Op::Execute, &format!("//e:{i}"), 0);
         }
-        assert!(s.evaluate(61_000, T).is_some());
+        assert!(
+            s.evaluate(61_000, T).is_none(),
+            "fired at the ordinary threshold on a healthy wide parallel build"
+        );
+        assert!(
+            s.evaluate(T.as_millis() as u64 * QUIET_EXEC_FACTOR, T)
+                .is_some(),
+            "a genuinely wedged fan-out is still reported on the longer clock"
+        );
     }
 
     /// Work that keeps closing spans never trips the threshold, however long any
