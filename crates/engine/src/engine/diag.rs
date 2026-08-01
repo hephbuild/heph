@@ -1346,7 +1346,6 @@ mod tests {
                     restarts: 0,
                     age: None,
                 }],
-                0,
                 String::new(),
                 String::new(),
             )

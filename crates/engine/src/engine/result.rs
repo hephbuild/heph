@@ -20,7 +20,6 @@ use hmodel::htmatcher::MatchResult;
 use hmodel::htpkg::PkgBuf;
 
 use crate::engine::driver::sandbox::Sandbox;
-use crate::engine::grow_stack::{GrowStack, grow_stack};
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::{BlobResidency, CacheArtifact, Manifest, ManifestArtifactType};
 use crate::engine::remote_cache::RemoteRevision;
@@ -39,8 +38,7 @@ use tokio::task::JoinSet;
 /// purely informational; the wait itself continues until acquired or cancelled.
 const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The boxed future produced by `#[async_recursion]` for `result_addr_impl`,
-/// wrapped per-poll by [`GrowStack`] in [`Engine::result_addr`].
+/// The boxed future produced by `#[async_recursion]` for `result_addr_impl`.
 type BoxedResultFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<Arc<EResult>>> + Send + 'a>>;
 
@@ -1208,22 +1206,22 @@ fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Err
 }
 
 impl Engine {
-    /// Resolve a target's result. Thin wrapper over [`Self::result_addr_impl`]
-    /// that grows the physical stack on demand.
+    /// Resolve a target's result.
     ///
-    /// Every dependency-graph edge recurses through here, and a cache-warm
-    /// descent polls the whole subtree synchronously in one go (~100 KiB of
-    /// stack per level). Wrapping each level's poll in [`grow_stack`] keeps that
-    /// cascade from overflowing the 2 MiB tokio worker stack on deep graphs.
-    /// See `engine::grow_stack` for the full rationale.
+    /// Every dependency-graph edge recurses through here. With task-backed
+    /// request memoizers each level is its own spawned task, so per-poll
+    /// stack depth is O(1) in graph depth (the two deep-chain tests pin this
+    /// on an explicit 2 MiB stack); the only remaining inline recursion is
+    /// the transparent-group re-inline, whose boxed frames are small (its
+    /// own pinned test covers 300 levels).
     pub fn result_addr<'a>(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &'a Addr,
         outputs: OutputMatcher,
         opts: &'a ResultOptions,
-    ) -> GrowStack<BoxedResultFuture<'a>> {
-        grow_stack(self.result_addr_impl(rs, addr, outputs, opts))
+    ) -> BoxedResultFuture<'a> {
+        self.result_addr_impl(rs, addr, outputs, opts)
     }
 
     #[async_recursion]
@@ -1362,9 +1360,15 @@ impl Engine {
                 .map(|input| {
                     let dep_addr = input.r#ref.r#ref.clone();
                     enclose!((self => engine, rs, opts) async move {
-                        engine
-                            .result_addr(rs, &dep_addr, OutputMatcher::All, &opts)
-                            .await
+                        // The one surviving GrowStack site: group inlining
+                        // recurses without a task hop (deliberately — nothing
+                        // to memoize), so a deep group chain nests one boxed
+                        // poll frame per level. See the pinned 2 MiB
+                        // deep_transparent_group test.
+                        crate::engine::grow_stack::grow_stack(
+                            engine.result_addr(rs, &dep_addr, OutputMatcher::All, &opts),
+                        )
+                        .await
                     })
                 })
                 .collect();
@@ -7502,6 +7506,57 @@ mod tests {
         // The boundary surfaces a rich diagnostic to the direct caller.
         assert!(downcast_chain_ref::<TargetFailure>(&err).is_some());
         Ok(())
+    }
+
+    /// Deeply nested transparent groups complete on a 2 MiB stack.
+    ///
+    /// Transparent targets are inlined BEFORE the memoizer (`result_addr`'s
+    /// group path recurses via `#[async_recursion]` without a task hop), so
+    /// their descent is the one place a poll still nests one frame per level
+    /// after the task-cell flip. Group frames are boxed and small (~KBs, not
+    /// the ~100KiB memoized frames), but "small enough" is measured here, on
+    /// a pinned 2 MiB thread — this is the gate that lets `GrowStack` go.
+    #[test]
+    fn deep_transparent_group_chain_completes_on_a_2mib_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async {
+                    const N: usize = 300;
+                    // g0 → g1 → … → g299 → leaf, every gN a transparent group
+                    // of one member (a *name*, inlined without a task hop).
+                    let mut targets = Vec::with_capacity(N + 1);
+                    for i in 0..N {
+                        targets.push(pluginstatictarget::Target {
+                            addr: format!("//chain:g{i}"),
+                            driver: "group".to_string(),
+                            raw_config: HashMap::from([(
+                                "deps".to_string(),
+                                hcore::htvalue::Value::List(vec![hcore::htvalue::Value::String(
+                                    format!("//chain:g{}", i + 1),
+                                )]),
+                            )]),
+                            ..Default::default()
+                        });
+                    }
+                    targets.push(run_target(&format!("//chain:g{N}"), &[], "true"));
+                    let (engine, _home) = engine_with_home(targets).expect("engine");
+                    let head = hmodel::htaddr::parse_addr("//chain:g0").expect("addr");
+                    let rs = engine.new_state();
+                    engine
+                        .clone()
+                        .result_addr(rs, &head, OutputMatcher::All, &ResultOptions::default())
+                        .await
+                        .expect("group chain resolves");
+                });
+            })
+            .expect("spawn group-chain thread")
+            .join()
+            .expect("group-chain thread panicked");
     }
 
     /// A deep, fully-warm descent completes on a 2 MiB stack.

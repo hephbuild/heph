@@ -11,6 +11,7 @@ use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
 };
 use hcore::hasync::StdCancellationToken;
+use hcore::hmemoizer::Memoizer;
 use hmodel::htpkg::PkgBuf;
 use hplugin::lsp::LspEngine;
 use hplugin::provider::{
@@ -48,6 +49,10 @@ pub(crate) struct HephLspContext {
     /// Buildfile provider used only for package/target listing during completion,
     /// with its build timestamp. Rebuilt after [`LISTING_TTL`] (see [`Self::provider`]).
     provider: Mutex<(Instant, Arc<Provider>)>,
+    /// The runtime the listing provider's memoizer spawns on — captured at
+    /// construction (the LSP context is built on the server's runtime), so
+    /// TTL rebuilds from sync callers don't have to discover one.
+    runtime: tokio::runtime::Handle,
     pub(crate) shared: Arc<SharedState>,
 }
 
@@ -59,7 +64,8 @@ impl HephLspContext {
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
         let builtin_hovers = crate::pluginbuildfile::run_file::builtin_call_hovers(&doc_globals);
         let patterns = buildfile_patterns(&*engine);
-        let provider = build_listing_provider(&root, &patterns, &registry);
+        let runtime = tokio::runtime::Handle::current();
+        let provider = build_listing_provider(&root, &patterns, &registry, runtime.clone());
         let shared = SharedState::new(
             engine,
             root.clone(),
@@ -74,6 +80,7 @@ impl HephLspContext {
             globals: Arc::new(OnceLock::new()),
             patterns,
             provider: Mutex::new((Instant::now(), provider)),
+            runtime,
             shared,
         }
     }
@@ -87,7 +94,12 @@ impl HephLspContext {
         if cell.0.elapsed() >= LISTING_TTL {
             *cell = (
                 Instant::now(),
-                build_listing_provider(&self.root, &self.patterns, &self.registry),
+                build_listing_provider(
+                    &self.root,
+                    &self.patterns,
+                    &self.registry,
+                    self.runtime.clone(),
+                ),
             );
         }
         Arc::clone(&cell.1)
@@ -208,11 +220,12 @@ fn build_listing_provider(
     root: &Path,
     patterns: &[glob::Pattern],
     registry: &Arc<ProviderFunctionRegistry>,
+    runtime: tokio::runtime::Handle,
 ) -> Arc<Provider> {
     let provider = Provider {
         root: root.to_path_buf(),
         build_file_patterns: patterns.to_vec(),
-        ..Provider::default()
+        ..Provider::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
     };
     provider.set_function_registry(Arc::clone(registry));
     Arc::new(provider)

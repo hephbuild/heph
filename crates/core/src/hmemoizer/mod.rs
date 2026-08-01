@@ -1,8 +1,7 @@
-mod cell;
+mod stall;
 mod task_cell;
 
 use futures::FutureExt;
-use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -518,44 +517,6 @@ trait CellSource: Send + Sync {
     fn collect(&self, out: &mut Vec<StuckCell>) -> bool;
 }
 
-struct Source<K, V> {
-    tag: &'static str,
-    cache: std::sync::Weak<Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>>,
-}
-
-impl<K, V> CellSource for Source<K, V>
-where
-    K: fmt::Debug + Send + Sync + 'static,
-    V: Send + Sync + 'static,
-{
-    fn collect(&self, out: &mut Vec<StuckCell>) -> bool {
-        let Some(cache) = self.cache.upgrade() else {
-            return false;
-        };
-        // `try_lock` for the same reason as `Cell::waiters`: never block a dump
-        // on the process being dumped.
-        let map = match cache.try_lock() {
-            Ok(m) => m,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return true,
-        };
-        for (key, cell) in map.iter() {
-            if cell.is_done() {
-                continue;
-            }
-            out.push(StuckCell {
-                tag: self.tag,
-                key: format!("{key:?}"),
-                waiters: cell.waiters(),
-                has_driver: cell.has_driver(),
-                restarts: 0,
-                age: None,
-            });
-        }
-        true
-    }
-}
-
 static SOURCES: Mutex<Vec<Box<dyn CellSource>>> = Mutex::new(Vec::new());
 
 /// Registry length at which the next prune of dead entries happens. Doubles
@@ -672,8 +633,8 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
 
 /// One sampling of everything [`render_report`] prints.
 ///
-/// Rendering reads four independent process-wide sources ([`inventory`],
-/// [`void_wakes`], [`dump_wait_graph`], [`dump_phases`]), each of which moves
+/// Rendering reads three independent process-wide sources ([`inventory`],
+/// [`dump_wait_graph`], [`dump_phases`]), each of which moves
 /// while a build runs. Sampling is split from formatting for the same reason
 /// [`inventory`] is split from [`render_inventory`] one screen up: so a value
 /// can be rendered more than once — by two writers being held against each
@@ -687,7 +648,6 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
 #[derive(Debug)]
 pub struct ReportSnapshot {
     cells: Vec<StuckCell>,
-    void_wakes: u64,
     wait_graph: String,
     phases: String,
 }
@@ -701,15 +661,9 @@ impl ReportSnapshot {
     /// `contains` and leaves the branches that matter during an incident — an
     /// empty inventory, an abandoned cell — uncovered. [`capture_report`] is the
     /// live path.
-    pub fn from_parts(
-        cells: Vec<StuckCell>,
-        void_wakes: u64,
-        wait_graph: String,
-        phases: String,
-    ) -> Self {
+    pub fn from_parts(cells: Vec<StuckCell>, wait_graph: String, phases: String) -> Self {
         Self {
             cells,
-            void_wakes,
             wait_graph,
             phases,
         }
@@ -727,7 +681,6 @@ impl ReportSnapshot {
 pub fn capture_report() -> ReportSnapshot {
     ReportSnapshot {
         cells: inventory(),
-        void_wakes: void_wakes(),
         wait_graph: dump_wait_graph(),
         phases: dump_phases(),
     }
@@ -747,226 +700,18 @@ pub fn capture_report() -> ReportSnapshot {
 /// a missing section reads as "nothing to report" when it means "not recorded".
 pub fn render_report(snapshot: &ReportSnapshot) -> String {
     format!(
-        "=== in-flight inventory ({} incomplete cells) ===\n{}  \
-         void wakes   {} (wakes that reached an incomplete cell and found nobody; \
-         a count still climbing while nothing progresses is a lost-wake regression)\n\
+        "=== in-flight inventory ({} incomplete cells) ===\n{}\
          === memoizer wait-for graph ===\n{}\n\
          === memoizer phases (invocation -> next await) ===\n{}\n",
         snapshot.cells.len(),
         render_inventory(&snapshot.cells, usize::MAX),
-        snapshot.void_wakes,
         snapshot.wait_graph,
         snapshot.phases,
     )
 }
 
-/// Monotone process-wide count of wakes that reached an incomplete cell and
-/// found neither a driver nor a single registered waker. See
-/// `cell::VOID_WAKES` for what is (and deliberately is not) counted.
-pub fn void_wakes() -> u64 {
-    cell::void_wakes()
-}
-
-/// Cancels a computation when its last awaiter goes away.
-///
-/// A cell deliberately keeps its in-flight future while awaiters come and go, so
-/// one dropped between polls can be replaced by another. When the *last* one
-/// goes there is no successor: the future is parked for good, and it keeps
-/// everything it captured — including a worker permit it will never release.
-/// Twelve such futures held every permit in the pool while the build sat idle,
-/// each being re-woken every 250ms into a graph with nobody left to receive it.
-/// It is also a leak with no other exit: the parked future holds an
-/// `Arc<RequestState>`, which owns the memoizer, which owns the cell, which owns
-/// the future — a reference cycle that pins the whole request's state for the
-/// life of the process (the production dumps show several wedged requests'
-/// memoizers still alive at once). Cancelling on abandonment is what breaks it.
-///
-/// This is the drop semantics `futures::Shared` has natively — its last handle
-/// dropping drops the inner future — recovered for a cell that additionally
-/// lives in a map. The map's reference must not count as a "handle" (it exists
-/// precisely so the future survives between awaiters), so wanting is tracked
-/// explicitly: [`cell::Cell::acquire_interest`] per `process` frame, released by
-/// this guard after that frame's `Await` is gone. `Arc::strong_count` cannot
-/// stand in for it — the cell is its own waker, so every parked leaf (a
-/// `oneshot`, a semaphore queue slot, the blocking pool's backstop list, every
-/// child cell's waker slab) holds a strong clone.
-///
-/// One guard per `process` frame, created before the `Await` and therefore
-/// dropped after it (locals drop in reverse declaration order). That ordering is
-/// an invariant: when the guard runs, this frame's `Await` has already
-/// deregistered its waker slot and abdicated drivership, so `interest == 0`
-/// really does mean "no live `Await` exists for this cell".
-struct AbandonGuard<'a, K, V>
-where
-    K: std::hash::Hash + Eq,
-{
-    cache: &'a Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>,
-    key: &'a K,
-    cell: Arc<cell::Cell<V>>,
-    /// Cleared once the value is in hand — a completed cell must be kept.
-    armed: bool,
-}
-
-impl<K, V> Drop for AbandonGuard<'_, K, V>
-where
-    K: std::hash::Hash + Eq,
-{
-    fn drop(&mut self) {
-        // Unconditional: this guard's interest ends here whether the value
-        // arrived or the caller walked away.
-        //
-        // Exactly one guard can observe `remaining == 0` for a given zero
-        // crossing: `fetch_sub` is atomic, so of N racing guards exactly one
-        // sees the count hit zero. (The count can be *re-raised* by a joiner and
-        // cross zero again later — that re-crossing is handed to the joiner's
-        // own guard, and `cancel_abandoned` below is idempotent either way.)
-        let remaining = self.cell.release_interest();
-        if !self.armed || remaining != 0 || self.cell.is_done() {
-            // `is_done` here is exact, not advisory: if the frame that completed
-            // the cell released before us, our decrement synchronizes with its
-            // release (see `release_interest`) and completion is visible; if it
-            // has not released yet, `remaining != 0` already stopped us.
-            return;
-        }
-        cancel_abandoned(self.cache, self.key, &self.cell);
-    }
-}
-
-/// Tear down `cell`'s in-flight computation, unless somebody wants it after all.
-///
-/// Split from [`AbandonGuard::drop`] so each decision can be unit-tested
-/// directly — the windows between the guard's unlocked pre-checks and this
-/// function's locked re-checks cannot be hit deterministically from outside.
-///
-/// Interleavings, proven under the cache lock:
-///
-/// * **Joiner in the window.** A caller can join a cell only by cloning it out
-///   of the map under this same lock, and it registers its interest while still
-///   holding the lock (`process`'s occupied arm). So a joiner that arrived after
-///   the guard's decrement is visible to the `interest() != 0` re-check here,
-///   and the cancellation stands down; one that arrives after we evict finds a
-///   vacant entry and starts a fresh computation.
-/// * **Joiner completed in the window.** The joiner may have joined, driven the
-///   computation to a value, and released again — interest is back to zero but
-///   the cell is *done*. Holding the lock freezes both facts (completion
-///   requires a poll, a poll requires a live `Await`, a live `Await` requires
-///   interest, and interest can only be raised under this lock): re-checking
-///   `is_done()` here is therefore exact. Without it a completed, memoized
-///   value would be evicted and a later caller would recompute — for an
-///   `execute` cell that is a double build, the one thing the memoizer exists
-///   to prevent.
-/// * **Two cancellations.** A second zero-crossing (join-then-abandon during
-///   this one) runs this function again. The eviction is `ptr_eq`-guarded, so a
-///   fresh cell a later caller re-created under the same key is never evicted
-///   by a stale cancellation; `take_future` is a `take` on an `Option`, so the
-///   loser gets `None` and drops nothing.
-/// * **Nobody can be mid-poll.** `interest == 0` under the lock means no live
-///   `Await` (every `Await`'s lifetime is enclosed by its frame's interest), so
-///   no poll of this cell can be in flight and none can start (the cell is
-///   unreachable once evicted; pre-existing wakers only wake, they never poll).
-///   `take_future`'s `try_lock` therefore cannot find the slot held — and if a
-///   driver once *unwound* out of a poll, the poisoned lock is claimed and the
-///   future still comes out.
-///
-/// Lock ordering: `take_future` (the `slot` lock) is taken strictly *after* the
-/// cache lock is released. A driving poll holds `slot` and can re-enter this
-/// memoizer's cache from inside the computation (a nested `process` on the same
-/// memoizer is ordinary), so `slot → cache` is an existing order; taking `slot`
-/// while holding `cache` would complete the inversion. Never holding both also
-/// keeps the cascade itself safe: dropping the taken future drops nested
-/// `AbandonGuard`s, which re-enter this function for *other* cells' caches with
-/// a clean lock slate at every level.
-fn cancel_abandoned<K, V>(
-    cache: &Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>,
-    key: &K,
-    cell: &Arc<cell::Cell<V>>,
-) where
-    K: std::hash::Hash + Eq,
-{
-    {
-        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cell.interest() != 0 || cell.is_done() {
-            return;
-        }
-        // Evict before cancelling, so a later caller for this key builds a
-        // fresh cell rather than joining one whose future has been taken —
-        // that cell can never complete and would park its awaiters forever.
-        if cache.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
-            cache.remove(key);
-        }
-    }
-
-    // Unlocked from here on (see the ordering note above). Safe: the eviction
-    // left this cancellation as the only path to the cell, so nothing can join
-    // it any more; a later caller for the same key builds a fresh cell.
-    let Some(taken) = cell.take_future() else {
-        return;
-    };
-
-    // Dropped last, with nothing held: the drop cascades through the retained
-    // chain and runs arbitrary destructors — releasing the worker permit,
-    // leaving the semaphore queue, disarming backstop registrations. (One
-    // exception at the plugin ABI seam: a seam wrapper's drop only *requests*
-    // its spawned body stop via JoinHandle::abort — the body ends on a plugin
-    // worker after this cascade returns, not synchronously within it.)
-    //
-    // The cascade is *recursive*: this future's state machine holds the
-    // `AbandonGuard` + `Await` for the next cell down, whose guard re-enters
-    // `cancel_abandoned`, takes that cell's future, drops it, and so on — one
-    // stack of drop-glue frames per level of the memoized chain. The chain is
-    // as deep as the dependency graph (`result → locked_result → execute` per
-    // level, dozens to hundreds of levels on a monorepo), and unlike the poll
-    // path there is no `GrowStack` wrapper out here to save it. Same remedy:
-    // grow the physical stack on demand at each level. The check is a couple of
-    // instructions and this path is cold (cancellation only).
-    stacker::maybe_grow(DROP_RED_ZONE, DROP_STACK_PER_GROW, move || drop(taken));
-}
-
-/// If less than this much stack remains when a level of the cancellation
-/// cascade drops, grow first. Drop-glue frames are far smaller than the ~100KiB
-/// poll frames `engine`'s `grow_stack` budgets for, but several call frames per
-/// level (`Drop` impls, `take_future`, the boxed state machine's `drop_in_place`)
-/// add up across an unbounded chain.
-const DROP_RED_ZONE: usize = 256 * 1024;
-
-/// Fresh segment size for the cancellation cascade — hosts thousands of levels
-/// per growth.
-const DROP_STACK_PER_GROW: usize = 4 * 1024 * 1024;
-
 pub struct Memoizer<K, V> {
-    inner: Inner<K, V>,
-}
-
-/// The two cell implementations behind [`Memoizer`]'s one API.
-///
-/// `Poll` is the shipped cooperative-polling cell (driver election, waker
-/// slab). `Task` spawns each cold computation as a tokio task on a runtime
-/// handle captured at construction — see `task_cell`'s module docs. The
-/// engine still constructs `Poll` everywhere; flipping construction sites to
-/// [`Memoizer::with_tag_task`] is a deliberate, benched change (one small
-/// commit to revert), not a side effect of this enum existing.
-enum Inner<K, V> {
-    Poll(PollInner<K, V>),
-    Task(task_cell::TaskInner<K, V>),
-}
-
-struct PollInner<K, V> {
-    /// Behind an `Arc` so the inventory can hold a `Weak` to it: a `Memoizer`
-    /// lives in a `RequestState` field, not an `Arc`, so there is nothing else
-    /// for the registry to keep a non-owning handle on.
-    cache: Arc<Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>>,
-    /// Tag used in stall warnings to identify which memoizer is stuck.
-    tag: &'static str,
-}
-
-impl<K, V> Default for Memoizer<K, V>
-where
-    K: std::hash::Hash + Eq + Send + Sync + 'static + fmt::Debug + Clone,
-    V: Clone + Send + Sync + 'static,
-{
-    fn default() -> Self {
-        Self::new()
-    }
+    inner: task_cell::TaskInner<K, V>,
 }
 
 /// If a memoizer await takes longer than this, we panic with the key info to
@@ -996,51 +741,17 @@ where
     K: std::hash::Hash + Eq + Send + Sync + 'static + fmt::Debug + Clone,
     V: Clone + Send + Sync + 'static,
 {
-    pub fn new() -> Self {
-        Self::with_tag("memoizer")
-    }
-
-    pub fn with_tag(tag: &'static str) -> Self {
-        let cache = Arc::new(Mutex::new(FxHashMap::default()));
-        register_source(Box::new(Source {
-            tag,
-            cache: Arc::downgrade(&cache),
-        }));
-        Self {
-            inner: Inner::Poll(PollInner { cache, tag }),
-        }
-    }
-
-    /// Task-backed variant: every cold computation is spawned as a task on
-    /// `handle` (captured here, never discovered at spawn time). See
-    /// `task_cell`'s module docs for the state machine and its guarantees.
-    /// The engine's construction sites stay on [`with_tag`](Self::with_tag)
-    /// until the flip PR switches them, measured.
+    /// Every cold computation is spawned as a task on `handle` — captured
+    /// here, never discovered at spawn time. See `task_cell`'s module docs
+    /// for the state machine and its guarantees.
     pub fn with_tag_task(tag: &'static str, handle: tokio::runtime::Handle) -> Self {
         Self {
-            inner: Inner::Task(task_cell::TaskInner::new(tag, handle)),
+            inner: task_cell::TaskInner::new(tag, handle),
         }
     }
 
     fn tag(&self) -> &'static str {
-        match &self.inner {
-            Inner::Poll(p) => p.tag,
-            Inner::Task(t) => t.tag(),
-        }
-    }
-
-    /// Test-only reach into the poll cell map, for the interleaving proofs
-    /// that drive `cancel_abandoned` by hand.
-    #[cfg(test)]
-    #[expect(
-        clippy::type_complexity,
-        reason = "the full map type is the point — the tests hand it to cancel_abandoned"
-    )]
-    fn poll_cache(&self) -> &Arc<Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>> {
-        match &self.inner {
-            Inner::Poll(p) => &p.cache,
-            Inner::Task(_) => panic!("poll_cache on a task-backed memoizer"),
-        }
+        self.inner.tag()
     }
 
     /// Non-inserting peek: returns the memoized value only if it is already
@@ -1048,13 +759,7 @@ where
     /// on a cache hit (e.g. registering a dep edge with `note_dep` instead of a
     /// full `result`) without disturbing the cache or deduping with in-flight work.
     pub fn peek(&self, key: &K) -> Option<V> {
-        match &self.inner {
-            Inner::Poll(p) => {
-                let cache = p.cache.lock().expect("memoizer lock poisoned");
-                cache.get(key).and_then(|cell| cell.peek().cloned())
-            }
-            Inner::Task(t) => t.peek(key),
-        }
+        self.inner.peek(key)
     }
 
     pub async fn process<F, Fut>(&self, key: K, f: F) -> V
@@ -1062,73 +767,7 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = V> + Send + 'static,
     {
-        match &self.inner {
-            Inner::Poll(p) => p.process(key, f).await,
-            Inner::Task(t) => t.process(key, f).await,
-        }
-    }
-}
-
-impl<K, V> PollInner<K, V>
-where
-    K: std::hash::Hash + Eq + Send + Sync + 'static + fmt::Debug + Clone,
-    V: Clone + Send + Sync + 'static,
-{
-    async fn process<F, Fut>(&self, key: K, f: F) -> V
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = V> + Send + 'static,
-    {
-        // One lock acquisition, and no handle clone on the warm hit: the
-        // completed value is read through the guard we already hold. Cloning the
-        // cell's `Arc` only to `peek` and drop it costs two atomic RMWs on the
-        // hottest path the engine has — `spec`, `def`, `meta` and `result` all
-        // land here for every target of every build.
-        let cell = {
-            let mut cache = self.cache.lock().expect("memoizer lock poisoned");
-            match cache.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    if let Some(v) = e.get().peek() {
-                        return v.clone();
-                    }
-                    // Registered here, under the lock, so a cancellation racing
-                    // us either sees this interest and stands down, or has
-                    // already evicted the entry and we never find it.
-                    e.get().acquire_interest();
-                    Arc::clone(e.get())
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    // `f()` only builds the async block's state machine — async
-                    // blocks are lazy, so no user code runs and nothing can
-                    // await — which makes it safe to construct under the lock.
-                    // Constructing it *outside* meant every loser of an insert
-                    // race boxed a large future just to discard it, and on a
-                    // cell with hundreds of concurrent callers that is hundreds
-                    // of wasted allocations.
-                    let cell = cell::Cell::new(f().boxed());
-                    cell.acquire_interest();
-                    e.insert(Arc::clone(&cell));
-                    cell
-                }
-            }
-        };
-
-        // Cancel the computation if we turn out to be its last awaiter.
-        //
-        // Declared before the await so it drops *after* the `Await` inside it:
-        // by the time this runs, our handle is gone and the cell's remaining
-        // holders are final.
-        let mut abandon = AbandonGuard {
-            cache: &self.cache,
-            key: &key,
-            cell: Arc::clone(&cell),
-            armed: true,
-        };
-        let out = await_with_stall_check(cell::Await::new(cell), &key, self.tag).await;
-        // Completed: there is nothing to cancel, and the cell stays in the map
-        // as the memoized answer.
-        abandon.armed = false;
-        out
+        self.inner.process(key, f).await
     }
 }
 
@@ -1174,7 +813,7 @@ where
     };
     // `timeout_without_reactor` needs `Unpin`; a pinned `&mut` reference is.
     let waiter = std::pin::pin!(waiter);
-    match cell::timeout_without_reactor(threshold, waiter).await {
+    match stall::timeout_without_reactor(threshold, waiter).await {
         Ok(v) => v,
         Err(()) => {
             // Debug-only: opt-in via HEPH_MEMOIZER_STALL_SECS. Panic surfaces a
@@ -1470,10 +1109,7 @@ where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, Arc<anyhow::Error>>> + Send + 'static,
     {
-        match &self.inner {
-            Inner::Poll(_) => self.process(key, f).await,
-            Inner::Task(_) => task_cell::catch_poison(self.process(key, f)).await,
-        }
+        task_cell::catch_poison(self.process(key, f)).await
     }
 
     /// Evict `key` iff its cell completed with a cycle error.
@@ -1493,18 +1129,7 @@ where
             Err(e) => downcast_chain_ref::<MemoizerCycleError>(e).is_some(),
             Ok(_) => false,
         };
-        match &self.inner {
-            Inner::Poll(p) => {
-                let mut cache = p.cache.lock().expect("memoizer lock poisoned");
-                if cache
-                    .get(key)
-                    .is_some_and(|cell| cell.peek().is_some_and(holds_cycle_error))
-                {
-                    cache.remove(key);
-                }
-            }
-            Inner::Task(t) => t.evict_if(key, holds_cycle_error),
-        }
+        self.inner.evict_if(key, holds_cycle_error);
     }
 }
 
@@ -1575,6 +1200,39 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Shared runtime for memoizer construction in tests — sync and async
+    /// alike use one static handle (cross-runtime joins are a supported,
+    /// tested shape).
+    fn test_handle() -> tokio::runtime::Handle {
+        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                // Enough workers that one test's parked or slow body cannot
+                // starve every other test's abort processing — the suite runs
+                // in parallel against this one shared runtime.
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("test runtime")
+        })
+        .handle()
+        .clone()
+    }
+
+    /// Bounded wait for an eventual condition — task-cell teardown is
+    /// asynchronous: aborts and their destructor cascades land when the
+    /// runtime processes them, not on the awaiter's drop.
+    async fn eventually(what: &str, mut pred: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pred() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     use super::*;
     use enclose::enclose;
     use std::sync::Arc;
@@ -1601,29 +1259,42 @@ mod tests {
     /// the wake.
     #[tokio::test]
     async fn dropping_the_last_awaiter_cancels_the_computation() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("abandon-cancel-test");
+        let m: Memoizer<String, u32> =
+            Memoizer::with_tag_task("abandon-cancel-test", test_handle());
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut only = Box::pin(m.process("k".to_string(), {
             let dropped = std::sync::Arc::clone(&dropped);
+            let entered = std::sync::Arc::clone(&entered);
             move || async move {
                 // Stands in for the worker permit: held across the await, so it
                 // is released only if the future itself is dropped.
                 let _held = DropFlag(dropped);
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
                 futures::future::pending::<u32>().await
             }
         }));
         assert!(futures::poll!(&mut only).is_pending());
+        // The body is a spawned task: wait until it has provably started (and
+        // holds the stand-in permit) — an abort landing before the first poll
+        // is a *correct* cancellation of never-started work, but it is not
+        // what this test exists to prove.
+        eventually("the body takes the stand-in permit", || {
+            entered.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
         assert!(
             !dropped.load(std::sync::atomic::Ordering::SeqCst),
             "still awaited, so still wanted"
         );
 
         drop(only);
-        assert!(
-            dropped.load(std::sync::atomic::Ordering::SeqCst),
-            "an abandoned computation must be dropped, releasing what it held"
-        );
+        eventually(
+            "an abandoned computation is dropped, releasing what it held",
+            || dropped.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
     }
 
     /// Cancelling evicts the key, so the next caller builds a fresh cell.
@@ -1633,7 +1304,8 @@ mod tests {
     /// cancellation into a different hang.
     #[tokio::test]
     async fn a_cancelled_key_is_recomputed_by_the_next_caller() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("abandon-recompute-test");
+        let m: Memoizer<String, u32> =
+            Memoizer::with_tag_task("abandon-recompute-test", test_handle());
 
         let mut abandoned = Box::pin(m.process("k".to_string(), || async {
             futures::future::pending::<u32>().await
@@ -1655,7 +1327,8 @@ mod tests {
     /// still receive its value.
     #[tokio::test]
     async fn a_remaining_awaiter_keeps_the_computation_alive() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("abandon-joiner-test");
+        let m: Memoizer<String, u32> =
+            Memoizer::with_tag_task("abandon-joiner-test", test_handle());
         let gate = std::sync::Arc::new(tokio::sync::Notify::new());
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1675,12 +1348,18 @@ mod tests {
         assert!(futures::poll!(&mut stays).is_pending());
 
         drop(leaves);
+        // Let any (wrong) cancellation land before asserting it didn't.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
         assert!(
             !dropped.load(std::sync::atomic::Ordering::SeqCst),
             "a computation someone is still awaiting must not be cancelled"
         );
 
-        gate.notify_waiters();
+        // `notify_one` (stores a permit): the body runs in a spawned task and
+        // may not have registered yet — `notify_waiters` would be lost.
+        gate.notify_one();
         let v = tokio::time::timeout(Duration::from_secs(5), &mut stays)
             .await
             .expect("the surviving awaiter must still be served");
@@ -1709,7 +1388,7 @@ mod tests {
     /// its waker, which is why the test above goes green.
     #[tokio::test]
     async fn cancellation_survives_a_leaf_that_stores_its_waker() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("abandon-waker-test");
+        let m: Memoizer<String, u32> = Memoizer::with_tag_task("abandon-waker-test", test_handle());
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Stands in for the oneshot / semaphore / PENDING slot that holds the
         // waker outside the future itself.
@@ -1730,13 +1409,18 @@ mod tests {
             }
         }));
         assert!(futures::poll!(&mut only).is_pending());
+        // The body is a spawned task: the stored waker doubles as the proof
+        // it actually started before the abandonment.
+        eventually("the leaf stores its waker", || {
+            stash.lock().expect("stash").is_some()
+        })
+        .await;
 
         drop(only);
-        assert!(
-            dropped.load(std::sync::atomic::Ordering::SeqCst),
-            "a stored waker (oneshot / semaphore / blocking backstop) is a clone \
-             of Arc<Cell> and must not read as a joiner that blocks cancellation"
-        );
+        eventually("a leaf-stored waker does not block cancellation", || {
+            dropped.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
     }
 
     /// The production chain from the wedge, in miniature.
@@ -1757,10 +1441,12 @@ mod tests {
     /// the permit never starts.
     #[tokio::test]
     async fn abandoning_the_outer_cell_cascades_to_the_inner_computation() {
-        let outer: std::sync::Arc<Memoizer<String, u32>> =
-            std::sync::Arc::new(Memoizer::with_tag("abandon-chain-outer"));
-        let inner: std::sync::Arc<Memoizer<String, u32>> =
-            std::sync::Arc::new(Memoizer::with_tag("abandon-chain-inner"));
+        let outer: std::sync::Arc<Memoizer<String, u32>> = std::sync::Arc::new(
+            Memoizer::with_tag_task("abandon-chain-outer", test_handle()),
+        );
+        let inner: std::sync::Arc<Memoizer<String, u32>> = std::sync::Arc::new(
+            Memoizer::with_tag_task("abandon-chain-inner", test_handle()),
+        );
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Held by the test past the drop, like a oneshot sender or a semaphore
         // wait list. Its content is a clone of the inner cell's own waker — the
@@ -1791,21 +1477,22 @@ mod tests {
             }
         }));
         assert!(futures::poll!(&mut only).is_pending());
+        // The bodies run in spawned tasks: wait for the leaf to actually park.
+        eventually("the leaf stores its waker", || {
+            stash.lock().expect("stash").is_some()
+        })
+        .await;
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(
-            stash.lock().expect("stash").is_some(),
-            "leaf must have stored a waker, or this test cannot catch a \
-             strong-count-style gate"
-        );
 
         // The outer cell's last awaiter goes away — the abandoned `result`
-        // cell from the dump. The permit must come back.
+        // cell from the dump. The permit must come back (eventually: the
+        // abort cascade is processed by the runtime).
         drop(only);
-        assert!(
-            dropped.load(std::sync::atomic::Ordering::SeqCst),
-            "dropping the last awaiter of the outer cell must cascade through \
-             the retained chain and release what the inner computation holds"
-        );
+        eventually(
+            "the cascade releases what the inner computation holds",
+            || dropped.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
     }
 
     /// The production wedge (pids 2082719 and 2055961), end to end.
@@ -1835,11 +1522,16 @@ mod tests {
     /// pre-fix tree at (a) with `available_permits` stuck at 0.
     #[tokio::test]
     async fn abandoned_chain_returns_the_worker_permit_to_the_semaphore() {
-        let mem_result: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag("repro-result"));
-        let mem_locked: Arc<Memoizer<String, u32>> =
-            Arc::new(Memoizer::with_tag("repro-locked_result"));
-        let mem_execute: Arc<Memoizer<String, u32>> =
-            Arc::new(Memoizer::with_tag("repro-execute_cache"));
+        let mem_result: Arc<Memoizer<String, u32>> =
+            Arc::new(Memoizer::with_tag_task("repro-result", test_handle()));
+        let mem_locked: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
+            "repro-locked_result",
+            test_handle(),
+        ));
+        let mem_execute: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
+            "repro-execute_cache",
+            test_handle(),
+        ));
 
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
         // Held by the test past the drop, like the oneshot channel inside
@@ -1875,17 +1567,17 @@ mod tests {
         }));
 
         // Exactly one awaiter of the outermost cell, polled exactly once.
+        // The chain's bodies run in spawned tasks: wait for the leaf to take
+        // the permit and park.
         assert!(futures::poll!(&mut outer).is_pending());
-        assert_eq!(
-            permits.available_permits(),
-            0,
-            "the parked execute computation must be holding the permit"
-        );
-        assert!(
-            stash.lock().expect("stash").is_some(),
-            "leaf must have stored a waker — a leaf that stores none cannot \
-             catch a strong-count-style gate and this test proves nothing"
-        );
+        eventually("the parked execute computation holds the permit", || {
+            permits.available_permits() == 0
+        })
+        .await;
+        eventually("the leaf stores its waker", || {
+            stash.lock().expect("stash").is_some()
+        })
+        .await;
         let in_flight = |tag: &str| inventory().into_iter().filter(|c| c.tag == tag).count();
         for tag in ["repro-result", "repro-locked_result", "repro-execute_cache"] {
             assert_eq!(
@@ -1898,12 +1590,13 @@ mod tests {
         // Fail-fast drops the only awaiter of the result cell.
         drop(outer);
 
-        // (a) The permit came back: the inversion of the wedge itself.
-        assert_eq!(
-            permits.available_permits(),
-            1,
-            "the worker permit must return to the semaphore when the chain is abandoned"
-        );
+        // (a) The permit came back (eventually — the abort cascade is
+        // processed by the runtime): the inversion of the wedge itself.
+        eventually(
+            "the worker permit returns when the chain is abandoned",
+            || permits.available_permits() == 1,
+        )
+        .await;
 
         // The blocking job finishes *after* the abandonment, exactly as in the
         // dumps (pool idle, jobs long since done, results never read): its wake
@@ -1943,169 +1636,6 @@ mod tests {
         .await
         .expect("a later caller for the abandoned key must not park");
         assert_eq!(v, 42, "the key must be recomputable after the cancellation");
-    }
-
-    /// A cancellation that raced a completing joiner must not evict the value.
-    ///
-    /// The window: our guard decrements interest to zero; before it re-checks
-    /// under the cache lock, a joiner arrives, drives the computation to a
-    /// value, and releases — interest is zero again but the cell is *done*.
-    /// This calls [`cancel_abandoned`] directly at exactly that point, which is
-    /// the only deterministic way in: the window sits inside `Drop`. Evicting
-    /// here would throw away a memoized value and a later caller would
-    /// recompute — for an `execute` cell, a double build.
-    #[tokio::test]
-    async fn a_cancellation_that_lost_to_a_completing_joiner_keeps_the_value() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("abandon-late-cancel-test");
-        let runs = Arc::new(AtomicUsize::new(0));
-
-        let v = m
-            .process("k".to_string(), {
-                enclose!((runs) move || async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    5
-                })
-            })
-            .await;
-        assert_eq!(v, 5);
-
-        // The completed cell stays in the map with interest back at zero — the
-        // state a stale cancellation finds after losing the race.
-        let cell = m
-            .poll_cache()
-            .lock()
-            .expect("memoizer lock poisoned")
-            .get("k")
-            .cloned()
-            .expect("a completed cell is retained as the memoized answer");
-        assert_eq!(cell.interest(), 0);
-        cancel_abandoned(m.poll_cache(), &"k".to_string(), &cell);
-
-        let v = m
-            .process("k".to_string(), {
-                enclose!((runs) move || async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    7
-                })
-            })
-            .await;
-        assert_eq!(v, 5, "the memoized value must survive a stale cancellation");
-        assert_eq!(
-            runs.load(Ordering::SeqCst),
-            1,
-            "a stale cancellation must never force a recompute"
-        );
-    }
-
-    /// A stale cancellation must be a no-op against a recreated cell, and
-    /// running it twice must be harmless.
-    ///
-    /// After a cancellation evicts a key, a later caller builds a fresh cell
-    /// under it. A second zero-crossing of the *old* cell's interest (join,
-    /// then abandon, during the first cancellation) re-enters
-    /// [`cancel_abandoned`] with a handle to the old cell: the `ptr_eq` guard
-    /// must leave the fresh cell in the map, and the old cell's already-taken
-    /// slot must yield `None` rather than a second drop.
-    #[tokio::test]
-    async fn a_stale_cancellation_never_evicts_a_recreated_cell() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("abandon-recreate-test");
-
-        let mut first = Box::pin(m.process("k".to_string(), || async {
-            futures::future::pending::<u32>().await
-        }));
-        assert!(futures::poll!(&mut first).is_pending());
-        let old_cell = m
-            .poll_cache()
-            .lock()
-            .expect("memoizer lock poisoned")
-            .get("k")
-            .cloned()
-            .expect("in-flight cell is in the map");
-        drop(first); // cancels and evicts
-
-        // Idempotence against the (now evicted, future-less) old cell.
-        cancel_abandoned(m.poll_cache(), &"k".to_string(), &old_cell);
-
-        // A fresh computation under the same key, still in flight.
-        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
-        let mut second = Box::pin(m.process("k".to_string(), {
-            let gate = std::sync::Arc::clone(&gate);
-            move || async move {
-                gate.notified().await;
-                3
-            }
-        }));
-        assert!(futures::poll!(&mut second).is_pending());
-
-        // The stale cancellation arrives now. It must not touch the fresh cell.
-        cancel_abandoned(m.poll_cache(), &"k".to_string(), &old_cell);
-
-        gate.notify_waiters();
-        let v = tokio::time::timeout(Duration::from_secs(5), &mut second)
-            .await
-            .expect("the fresh computation must survive a stale cancellation");
-        assert_eq!(v, 3);
-    }
-
-    /// The cycle-error eviction hits only cells that hold a cycle error.
-    ///
-    /// Every waiter that received a cycle error evicts on its way out, and
-    /// with cancel-on-abandonment a key can be legitimately re-created while
-    /// stale waiters are still unwinding. A blind remove-by-key from the
-    /// second waiter onward would evict the innocent successor — in flight
-    /// (losing single-flight: a duplicate compute) or completed (losing the
-    /// memoized value).
-    #[tokio::test]
-    async fn cycle_error_eviction_spares_an_innocent_recreated_cell() {
-        type V = Result<Arc<u32>, Arc<anyhow::Error>>;
-        let m: Memoizer<String, V> = Memoizer::with_tag("cycle-evict-test");
-        let key = "k".to_string();
-
-        // A cell that completed with a cycle error IS evicted.
-        let v = m
-            .process(key.clone(), || async move {
-                Err(Arc::new(anyhow::Error::new(MemoizerCycleError {
-                    tag: "cycle-evict-test",
-                    key: "k".to_string(),
-                    kind: CycleKind::SelfRecursion,
-                    stack: vec![],
-                }))) as V
-            })
-            .await;
-        assert!(v.is_err());
-        m.evict_cached_cycle_error(&key);
-        assert!(
-            !m.poll_cache().lock().expect("lock").contains_key(&key),
-            "a cached cycle error must be evicted — it is only valid for the \
-             chain that produced it"
-        );
-
-        // A re-created cell still in flight is spared.
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let mut inflight = Box::pin(m.process(key.clone(), {
-            enclose!((gate) move || async move {
-                gate.notified().await;
-                Ok(Arc::new(5u32)) as V
-            })
-        }));
-        assert!(futures::poll!(&mut inflight).is_pending());
-        m.evict_cached_cycle_error(&key);
-        assert!(
-            m.poll_cache().lock().expect("lock").contains_key(&key),
-            "an in-flight successor must be spared by a stale cycle eviction"
-        );
-        gate.notify_waiters();
-        let v = tokio::time::timeout(Duration::from_secs(5), &mut inflight)
-            .await
-            .expect("the spared cell must still complete");
-        assert_eq!(**v.as_ref().expect("ok"), 5);
-
-        // A cell completed with a real value is spared too.
-        m.evict_cached_cycle_error(&key);
-        assert!(
-            m.poll_cache().lock().expect("lock").contains_key(&key),
-            "a real memoized value must survive a stale cycle eviction"
-        );
     }
 
     /// Task-mode `once`: values memoize, and a panicking body memoizes as an
@@ -2279,30 +1809,26 @@ mod tests {
         );
     }
 
-    /// An awaiter that *unwinds* out of `process` still cancels and evicts.
-    ///
-    /// Raw `process` has no panic guard (`once` adds one), so a computation
-    /// that panics mid-poll unwinds through the awaiting frame with the cell's
-    /// `slot` mutex poisoned and no value published. Pre-cancellation, that
-    /// cell was a zombie: still in the map, future retained behind a poisoned
-    /// lock, and every later caller parked on it forever. The abandon guard
-    /// runs during the unwind (it is a `Drop`), claims the poisoned lock, and
-    /// evicts — so the next caller recomputes instead of hanging. This is also
-    /// the path the `HEPH_MEMOIZER_STALL_SECS` debug panic takes.
-    #[tokio::test]
+    /// A body that panics in raw `process` (no `once` guard) fails its
+    /// joiner loudly — the poisoned cell's typed panic — and the unwinding
+    /// joiner still cancels and evicts: the next caller recomputes instead of
+    /// parking on the remains. (The poll cell's version of this proved the
+    /// unwind path through a poisoned slot mutex; the task cell has no slot
+    /// to poison, but the evict-on-unwind property is the same contract.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unwinding_awaiter_still_cancels_and_evicts() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("abandon-unwind-test");
+        let m: Memoizer<String, u32> =
+            Memoizer::with_tag_task("abandon-unwind-test", test_handle());
 
-        let mut only = Box::pin(m.process("k".to_string(), || async {
+        let joined = std::panic::AssertUnwindSafe(m.process("k".to_string(), || async {
             panic!("compute exploded");
-        }));
-        let waker = futures::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = only.as_mut().poll(&mut cx);
-        }));
-        assert!(unwound.is_err(), "the compute panic must reach the awaiter");
-        drop(only);
+        }))
+        .catch_unwind()
+        .await;
+        assert!(
+            joined.is_err(),
+            "the poisoned cell must fail the joiner loudly"
+        );
 
         let v = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2321,34 +1847,36 @@ mod tests {
     /// explores interleavings probabilistically rather than proving one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_joiners_and_abandoners_never_strand_a_survivor() {
-        let m: Arc<Memoizer<u64, u64>> = Arc::new(Memoizer::with_tag("abandon-stress-test"));
+        let m: Arc<Memoizer<u64, u64>> = Arc::new(Memoizer::with_tag_task(
+            "abandon-stress-test",
+            test_handle(),
+        ));
 
         for round in 0u64..200 {
-            let gate = Arc::new(tokio::sync::Notify::new());
+            // A latched flag, not a Notify: the bodies run in spawned tasks
+            // that may not have registered anything when the release happens —
+            // a notification would be lost, a latch cannot be.
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let body = move |gate: Arc<std::sync::atomic::AtomicBool>| async move {
+                while !gate.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                round
+            };
 
             // The abandoner: polls once, then is dropped.
-            let mut doomed = Box::pin(m.process(round, {
-                enclose!((gate) move || async move {
-                    gate.notified().await;
-                    round
-                })
-            }));
+            let mut doomed = Box::pin(m.process(round, enclose!((gate) move || body(gate))));
             let _ = futures::poll!(&mut doomed);
 
             // The survivor joins (or recreates) concurrently with the drop.
             let survivor = tokio::spawn({
                 enclose!((m, gate) async move {
-                    let fut = m.process(round, {
-                        enclose!((gate) move || async move {
-                            gate.notified().await;
-                            round
-                        })
-                    });
-                    // Open the gate only once the survivor is parked, so every
+                    let fut = m.process(round, enclose!((gate) move || body(gate)));
+                    // Open the gate only once the survivor is in, so every
                     // round exercises an in-flight cell rather than a warm hit.
                     tokio::pin!(fut);
                     let first = futures::poll!(&mut fut);
-                    gate.notify_waiters();
+                    gate.store(true, std::sync::atomic::Ordering::SeqCst);
                     match first {
                         std::task::Poll::Ready(v) => v,
                         std::task::Poll::Pending => fut.await,
@@ -2356,10 +1884,7 @@ mod tests {
                 })
             });
             drop(doomed);
-            // Late notifies cover the orderings where the survivor parked
-            // before the drop landed (its own notify can be consumed by the
-            // doomed computation's first poll).
-            gate.notify_waiters();
+            gate.store(true, std::sync::atomic::Ordering::SeqCst);
 
             let got = tokio::time::timeout(Duration::from_secs(10), survivor)
                 .await
@@ -2369,80 +1894,12 @@ mod tests {
         }
     }
 
-    /// Cancelling a deep chain must not overflow the stack.
-    ///
-    /// The cascade drops one level's guard, takes the next level's future, and
-    /// drops it — recursive drop glue, one frame set per level of the memoized
-    /// chain, with depth bounded only by the dependency graph. `Ctrl-C` always
-    /// did this in one giant drop; cancel-on-abandonment makes it routine.
-    /// [`cancel_abandoned`] grows the stack on demand (`stacker::maybe_grow`,
-    /// the same remedy `engine`'s `grow_stack` applies to the poll descent), so
-    /// a chain thousands of levels deep unwinds on a 256KiB thread.
-    #[test]
-    fn cancelling_a_deep_chain_does_not_overflow_the_stack() {
-        const DEPTH: usize = 4096;
-
-        fn level(
-            m: Arc<Memoizer<usize, u32>>,
-            depth: usize,
-            bottom_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        ) -> futures::future::BoxFuture<'static, u32> {
-            Box::pin(async move {
-                if depth == 0 {
-                    let _held = DropFlag(bottom_dropped);
-                    return futures::future::pending::<u32>().await;
-                }
-                let inner = Arc::clone(&m);
-                m.process(depth, move || level(inner, depth - 1, bottom_dropped))
-                    .await
-            })
-        }
-
-        let bottom_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Build the chain on a roomy thread — the *poll* descent is one
-        // synchronous recursion of DEPTH levels, and sizing it explicitly keeps
-        // the test about the drop path.
-        let (root, m) = std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn({
-                let bottom_dropped = std::sync::Arc::clone(&bottom_dropped);
-                move || {
-                    let m: Arc<Memoizer<usize, u32>> =
-                        Arc::new(Memoizer::with_tag("abandon-deep-test"));
-                    let mut root = Box::pin(level(Arc::clone(&m), DEPTH, bottom_dropped));
-                    let waker = futures::task::noop_waker();
-                    let mut cx = std::task::Context::from_waker(&waker);
-                    assert!(root.as_mut().poll(&mut cx).is_pending());
-                    (root, m)
-                }
-            })
-            .expect("spawn build thread")
-            .join()
-            .expect("build thread must not overflow");
-
-        // Drop on a deliberately tiny thread: without the on-demand growth in
-        // `cancel_abandoned`, the cascade overflows here and aborts the process.
-        std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(move || drop(root))
-            .expect("spawn drop thread")
-            .join()
-            .expect("the cascade must not overflow a small stack");
-
-        assert!(
-            bottom_dropped.load(std::sync::atomic::Ordering::SeqCst),
-            "the cascade must reach and drop the innermost computation"
-        );
-        drop(m);
-    }
-
     /// Only cells that are still computing. A completed cell is not stuck, and
     /// a report that listed every warm hit on a 27k-target build would bury the
     /// handful that matter.
     #[tokio::test]
     async fn inventory_lists_incomplete_cells_and_drops_completed_ones() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("inv-complete-test");
+        let m: Memoizer<String, u32> = Memoizer::with_tag_task("inv-complete-test", test_handle());
         let gate = Arc::new(tokio::sync::Notify::new());
 
         let held = m.process("stuck".to_string(), {
@@ -2471,59 +1928,14 @@ mod tests {
             listed[0].key
         );
 
-        gate.notify_waiters();
+        // `notify_one` (stores a permit): the body is a spawned task and may
+        // not have registered yet.
+        gate.notify_one();
         assert_eq!(held.await, 1);
         assert!(
             ours("inv-complete-test").is_empty(),
             "a completed cell is not stuck"
         );
-    }
-
-    /// Waiters with no driver is the signature the stall paragraph headlines.
-    #[tokio::test]
-    async fn a_cell_with_waiters_and_no_driver_is_stranded() {
-        let m: Memoizer<String, u32> = Memoizer::with_tag("inv-stranded-test");
-        let gate = Arc::new(tokio::sync::Notify::new());
-
-        // Two awaiters on one cell: the second to poll is the driver.
-        let mut parked = Box::pin(m.process("wedged".to_string(), {
-            let gate = Arc::clone(&gate);
-            move || async move {
-                gate.notified().await;
-                1
-            }
-        }));
-        assert!(futures::poll!(&mut parked).is_pending());
-        let mut driver = Box::pin(m.process("wedged".to_string(), || async { 0 }));
-        assert!(futures::poll!(&mut driver).is_pending());
-
-        let ours = || -> Vec<StuckCell> {
-            inventory()
-                .into_iter()
-                .filter(|c| c.tag == "inv-stranded-test")
-                .collect()
-        };
-
-        let listed = ours();
-        assert_eq!(listed.len(), 1, "one cell, two awaiters");
-        assert!(
-            !listed[0].is_stranded(),
-            "a driven cell is not stranded: {listed:?}"
-        );
-
-        // The driver goes away without the cell completing — a fail-fast sibling
-        // drop, or Ctrl-C. If the abdication wake fails to land, what is left is
-        // a task parked on a cell nobody will poll: the wedge, exactly.
-        drop(driver);
-        let listed = ours();
-        assert_eq!(listed.len(), 1, "the cell is still incomplete");
-        assert_eq!(
-            listed[0].waiters,
-            Some(1),
-            "the parked awaiter is still attached"
-        );
-        assert!(!listed[0].has_driver, "nobody is elected to poll it");
-        assert!(listed[0].is_stranded(), "{listed:?}");
     }
 
     /// The registry holds `Weak`s: a request's memoizers must not keep reporting
@@ -2532,7 +1944,8 @@ mod tests {
     #[tokio::test]
     async fn inventory_drops_memoizers_that_are_gone() {
         {
-            let m: Memoizer<String, u32> = Memoizer::with_tag("inv-dropped-test");
+            let m: Memoizer<String, u32> =
+                Memoizer::with_tag_task("inv-dropped-test", test_handle());
             let mut held = Box::pin(m.process("x".to_string(), || async {
                 futures::future::pending::<u32>().await
             }));
@@ -2646,7 +2059,6 @@ mod tests {
 
         let text = render_report(&ReportSnapshot::from_parts(
             cells,
-            7,
             "  GRAPH-SECTION".to_string(),
             "  PHASES-SECTION".to_string(),
         ));
@@ -2672,7 +2084,6 @@ mod tests {
             text.contains("//p:39"),
             "the last cell is listed too: {text}"
         );
-        assert!(text.contains("void wakes   7 "), "{text}");
         // The gated sections are pass-through: this renderer must not restate
         // them, or "not recorded" turns into "nothing to report".
         assert!(text.contains("  GRAPH-SECTION"), "{text}");
@@ -2685,7 +2096,6 @@ mod tests {
     fn render_report_says_nothing_is_in_flight_rather_than_showing_nothing() {
         let text = render_report(&ReportSnapshot::from_parts(
             Vec::new(),
-            0,
             "  (empty)".to_string(),
             "  (none)".to_string(),
         ));
@@ -2783,7 +2193,7 @@ mod tests {
 
     #[tokio::test]
     async fn panic_in_a_memoized_task_fails_every_waiter() {
-        let memo: FallibleMemo = Arc::new(Memoizer::new());
+        let memo: FallibleMemo = Arc::new(Memoizer::with_tag_task("memoizer", test_handle()));
         let key = "boom".to_string();
 
         // The first caller panics; three more join the same in-flight cell.
@@ -2818,7 +2228,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_memoizer() {
-        let memo: Memoizer<String, Result<Arc<i32>, Arc<anyhow::Error>>> = Memoizer::new();
+        let memo: Memoizer<String, Result<Arc<i32>, Arc<anyhow::Error>>> =
+            Memoizer::with_tag_task("memoizer", test_handle());
         let counter = Arc::new(AtomicUsize::new(0));
 
         let key = "test".to_string();
