@@ -22,6 +22,13 @@
 //!   underline. Suppressed entirely when the call includes a `*args`/`**kwargs`
 //!   splat — it could supply any key at runtime, so a "missing" field isn't
 //!   necessarily missing.
+//!
+//! All three apply only to heph's *builtins*. A buffer that binds `target` or
+//! `provider_state` itself — a `def`, an assignment, a `load(...)` import — is
+//! calling its own function, whose signature is nothing the engine knows: a
+//! `def target(name, **kwargs)` macro legitimately takes any key. Checking such
+//! a call against the builtin's schema would underline valid code, so a
+//! shadowed name is skipped entirely.
 
 use crate::pluginbuildfile::run_file::target_base_fields;
 use hcore::htvalue::Value;
@@ -30,8 +37,10 @@ use hplugin::lsp::LspEngine;
 use lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use starlark::codemap::Span;
 use starlark::syntax::AstModule;
-use starlark::syntax::ast::{Argument, AstArgument, AstExpr, AstLiteral, Expr};
-use std::collections::HashMap;
+use starlark::syntax::ast::{
+    Argument, AssignTarget, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstStmt, Expr, Stmt,
+};
+use std::collections::{HashMap, HashSet};
 
 /// Which recognized builtin a call site is.
 enum Callee {
@@ -43,6 +52,7 @@ enum Callee {
 /// diagnostic per invalid keyword argument (unknown key or type mismatch).
 pub(crate) fn validate(ast: &AstModule, engine: &dyn LspEngine) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    let shadowed = bound_names(ast);
     // `Stmt::visit_expr` yields each top-level expression across all nested
     // statements; `walk_expr` then descends into sub-expressions, so nested calls
     // (e.g. inside a list or another call) are covered too.
@@ -51,7 +61,13 @@ pub(crate) fn validate(ast: &AstModule, engine: &dyn LspEngine) -> Vec<Diagnosti
             if let Expr::Call(callee_expr, args) = &e.node
                 && let Expr::Identifier(id) = &callee_expr.node
             {
-                let callee = match id.node.ident.as_str() {
+                let name = id.node.ident.as_str();
+                // The buffer's own `target`/`provider_state`, not heph's — its
+                // signature is unknown here, so there is nothing to check against.
+                if shadowed.contains(name) {
+                    return;
+                }
+                let callee = match name {
                     "target" => Callee::Target,
                     "provider_state" => Callee::ProviderState,
                     _ => return,
@@ -68,6 +84,61 @@ fn walk_expr<'a>(e: &'a AstExpr, f: &mut impl FnMut(&'a AstExpr)) {
     f(e);
     // `Expr::visit_expr` is one level deep; recurse to reach the whole subtree.
     e.visit_expr(|child| walk_expr(child, f));
+}
+
+/// Visit `s` and every statement nested within it.
+fn walk_stmt<'a>(s: &'a AstStmt, f: &mut impl FnMut(&'a AstStmt)) {
+    f(s);
+    // `Stmt::visit_stmt` is one level deep; recurse to reach the whole subtree.
+    s.visit_stmt(|child| walk_stmt(child, f));
+}
+
+/// Every name the module binds: `def`s and their parameters, assignment and loop
+/// targets, and `load(...)` imports.
+///
+/// Deliberately flat — a name bound anywhere counts as bound everywhere, with no
+/// scope tracking. Over-approximating errs toward silence, which is this
+/// module's rule for anything it cannot resolve exactly, and the alternative
+/// (a real scope analysis) would buy nothing: a buffer that defines its own
+/// `target` almost certainly means it at every call site.
+fn bound_names(ast: &AstModule) -> HashSet<&str> {
+    let mut names = HashSet::new();
+    walk_stmt(ast.statement(), &mut |s| match &s.node {
+        Stmt::Def(def) => {
+            names.insert(def.name.node.ident.as_str());
+            names.extend(
+                def.params
+                    .iter()
+                    .filter_map(|p| p.ident())
+                    .map(|i| i.node.ident.as_str()),
+            );
+        }
+        Stmt::Load(load) => {
+            names.extend(load.args.iter().map(|a| a.local.node.ident.as_str()));
+        }
+        Stmt::Assign(assign) => collect_assign_target(&assign.lhs, &mut names),
+        Stmt::AssignModify(target, _, _) => collect_assign_target(target, &mut names),
+        Stmt::For(for_stmt) => collect_assign_target(&for_stmt.var, &mut names),
+        _ => {}
+    });
+    names
+}
+
+/// Add the identifiers an assignment or loop target binds (`a`, `a, b`, `[a, b]`).
+/// Index and attribute targets (`a[0] = …`, `a.b = …`) mutate an existing
+/// binding rather than introducing one, so they bind nothing.
+fn collect_assign_target<'a>(target: &'a AstAssignTarget, names: &mut HashSet<&'a str>) {
+    match &target.node {
+        AssignTarget::Identifier(id) => {
+            names.insert(id.node.ident.as_str());
+        }
+        AssignTarget::Tuple(items) => {
+            for item in items {
+                collect_assign_target(item, names);
+            }
+        }
+        AssignTarget::Index(_) | AssignTarget::Dot(_, _) => {}
+    }
 }
 
 fn check_call(
@@ -150,7 +221,7 @@ fn check_call(
         }
     }
 
-    let mut provided: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut provided: HashSet<&str> = HashSet::new();
     // A `*args`/`**kwargs` splat could supply any key at runtime, so a missing
     // key isn't necessarily missing — stay silent rather than risk a false
     // positive.
@@ -194,7 +265,7 @@ fn check_call(
         // A schema field can share a name with a base field (unusual, but not
         // forbidden); on collision the base field wins, mirroring the
         // first-match `.find()` lookup used for type-checking above.
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         for (i, (name, _, required)) in known.iter().enumerate() {
             if !seen.insert(name.as_str()) {
                 continue;
@@ -662,5 +733,116 @@ mod tests {
             msgs.iter().any(|m| m.contains("`labels` expects")),
             "expected labels type mismatch, got {msgs:?}"
         );
+    }
+
+    /// A call that the builtin checks would flag twice — `bogus` is no field of
+    /// `target` or the `exec` driver, and the driver's required `cmd` is absent.
+    /// Shared by the shadowing tests so each one is provably non-vacuous: with
+    /// no shadowing binding it produces both diagnostics
+    /// (`an_unrelated_binding_does_not_suppress_validation`).
+    const FLAGGED_TARGET_CALL: &str = "target(name = \"t\", driver = \"exec\", bogus = 1)\n";
+
+    #[test]
+    fn locally_defined_target_macro_is_not_validated() {
+        // The buffer defines its own `target`, taking `**kwargs`: `bogus` is a
+        // legitimate key there and `cmd` is no requirement of it. Checking the
+        // call against the builtin's schema would underline working code.
+        let msgs = messages(&format!(
+            "def target(name, **kwargs):\n    pass\n\n{FLAGGED_TARGET_CALL}"
+        ));
+        assert!(
+            msgs.is_empty(),
+            "a locally-defined `target` is not the builtin, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn loaded_target_macro_is_not_validated() {
+        // Same, via `load(...)` — including the aliased form, where the local
+        // name is what the call site uses.
+        let msgs = messages(&format!(
+            "load(\"//lib\", \"target\")\n\n{FLAGGED_TARGET_CALL}"
+        ));
+        assert!(
+            msgs.is_empty(),
+            "a loaded `target` is not the builtin, got {msgs:?}"
+        );
+
+        let msgs = messages(&format!(
+            "load(\"//lib\", target = \"my_target\")\n\n{FLAGGED_TARGET_CALL}"
+        ));
+        assert!(
+            msgs.is_empty(),
+            "an aliased loaded `target` is not the builtin, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn assigned_provider_state_is_not_validated() {
+        // A plain rebinding shadows the builtin just as a `def` does. Without
+        // the binding this reports the builtin's missing required `provider`
+        // (`provider_state_missing_provider_is_flagged`).
+        let msgs = messages("provider_state = my_fn\n\nprovider_state(bogus = 1)\n");
+        assert!(
+            msgs.is_empty(),
+            "a rebound `provider_state` is not the builtin, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_binding_does_not_suppress_validation() {
+        // Shadowing is per-name: binding `foo` must not silence `target`. Also
+        // pins that the shadowing tests above are not vacuous — the very same
+        // call is flagged here.
+        let msgs = messages(&format!(
+            "def foo(a, **kwargs):\n    pass\n\n{FLAGGED_TARGET_CALL}"
+        ));
+        assert!(
+            msgs.iter().any(|m| m.contains("unknown field `bogus`")),
+            "unrelated bindings must not disable the unknown-key check, got {msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("missing required field `cmd`")),
+            "unrelated bindings must not disable the missing-required check, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn bound_names_collects_every_binding_form() {
+        let content = "\
+load(\"//lib\", \"imported\", alias = \"exported\")
+assigned = 1
+tuple_a, tuple_b = 1, 2
+augmented = 0
+augmented += 1
+for loop_var in [1]:
+    pass
+
+def fn_name(param, *args_param, **kwargs_param):
+    pass
+";
+        let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
+        let names = super::bound_names(&ast);
+        for expected in [
+            "imported",
+            "alias",
+            "assigned",
+            "tuple_a",
+            "tuple_b",
+            "augmented",
+            "loop_var",
+            "fn_name",
+            "param",
+            "args_param",
+            "kwargs_param",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing binding {expected}: {names:?}"
+            );
+        }
+        // `exported` is the name in the *other* module, not a local binding.
+        assert!(!names.contains("exported"), "load alias source: {names:?}");
     }
 }

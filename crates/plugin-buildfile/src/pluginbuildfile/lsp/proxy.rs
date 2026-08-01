@@ -1275,11 +1275,11 @@ mod tests {
             )),
             Arc::default(),
         );
-        // Mirror context.rs: a buffer that fails to eval falls back to a
-        // source-only index (the realistic mid-edit case).
+        // Mirror context.rs: a buffer that fails to eval falls back to an
+        // unevaluated index (the realistic mid-edit case).
         let index = match eval_source("BUILD", content.to_string(), "pkg", &loader) {
             Ok(result) => super::super::index::DocIndex::build(&result, "pkg", content.to_string()),
-            Err(_) => super::super::index::DocIndex::source_only(content.to_string()),
+            Err(_) => super::super::index::DocIndex::unevaluated(content.to_string()),
         };
         let doc_globals =
             crate::pluginbuildfile::run_file::build_globals(&registry).documentation();
