@@ -186,6 +186,41 @@ pub fn is_cancelled(e: &anyhow::Error) -> bool {
 ///
 /// The `$val => $body` clause is optional: omit it for commands that print
 /// incrementally and need no end-of-run output (the success value is discarded).
+/// Fold a keep-going batch into the single `res` that [`finalize!`] expects.
+///
+/// `Engine::result` reports keep-going failures INSIDE its `Ok`
+/// (`BatchResult::errors`); they are normally duplicated into the failure
+/// registry, which `finalize!` renders. This fold must still exist: an error
+/// class the registry declines to record (a request-property marker leaking
+/// out of a conversion boundary) would otherwise be dropped on the floor —
+/// the run prints its "err N" summary, then exits 0 in silence, which a
+/// 308-failure lint run did. The registry branch still wins the rendering
+/// whenever it has entries; this is the belt for when it does not.
+///
+/// Cancellation collapses to [`CancelledError`] only when nothing else
+/// failed — a genuine failure must never be masked by the cancellations it
+/// caused.
+pub fn fold_batch(
+    batch: crate::engine::BatchResult,
+) -> anyhow::Result<Vec<Arc<crate::engine::EResult>>> {
+    if batch.errors.is_empty() {
+        return Ok(batch.ok);
+    }
+    let (cancelled, genuine): (Vec<_>, Vec<_>) =
+        batch.errors.into_iter().partition(|(_, e)| is_cancelled(e));
+    if genuine.is_empty() {
+        drop(cancelled);
+        return Err(CancelledError.into());
+    }
+    Err(crate::engine::error::MultiError(
+        genuine
+            .into_iter()
+            .map(|(addr, e)| e.context(addr.format()))
+            .collect(),
+    )
+    .into())
+}
+
 macro_rules! finalize {
     ($ctx:expr, $rs:expr, $res:expr $(,)?) => {
         $crate::commands::errors::finalize!($ctx, $rs, $res, _ => { Ok(()) })
@@ -548,6 +583,60 @@ mod tests {
             self.pauses.set(self.pauses.get() + 1);
             FakeGuard
         }
+    }
+
+    fn addr(s: &str) -> crate::htaddr::Addr {
+        hmodel::htaddr::parse_addr(s).expect("addr")
+    }
+
+    /// Keep-going failures inside an `Ok` batch must fold into `res` — the
+    /// registry normally duplicates them, but an unrecorded class (the
+    /// silent-exit-0 lint incident) must still fail the run.
+    #[test]
+    fn fold_batch_surfaces_keep_going_errors() {
+        let batch = crate::engine::BatchResult {
+            ok: vec![],
+            errors: vec![(addr("//pkg:a"), anyhow::anyhow!("boom"))],
+        };
+        let err = fold_batch(batch).err().expect("errors must fold into Err");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("//pkg:a"), "{rendered}");
+        assert!(rendered.contains("boom"), "{rendered}");
+    }
+
+    #[test]
+    fn fold_batch_passes_a_clean_batch_through() {
+        let batch = crate::engine::BatchResult {
+            ok: vec![],
+            errors: vec![],
+        };
+        assert!(fold_batch(batch).is_ok());
+    }
+
+    /// All-cancelled collapses to the cancellation `finalize!` recognises…
+    #[test]
+    fn fold_batch_collapses_pure_cancellation() {
+        let batch = crate::engine::BatchResult {
+            ok: vec![],
+            errors: vec![(addr("//pkg:a"), CancelledError.into())],
+        };
+        let err = fold_batch(batch).err().expect("cancelled folds to Err");
+        assert!(is_cancelled(&err), "{err:#}");
+    }
+
+    /// …but a genuine failure is never masked by the cancellations it caused.
+    #[test]
+    fn fold_batch_prefers_genuine_failures_over_cancellation() {
+        let batch = crate::engine::BatchResult {
+            ok: vec![],
+            errors: vec![
+                (addr("//pkg:a"), CancelledError.into()),
+                (addr("//pkg:b"), anyhow::anyhow!("boom")),
+            ],
+        };
+        let err = fold_batch(batch).err().expect("must fail");
+        assert!(!is_cancelled(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("//pkg:b"));
     }
 
     struct FakeRs(std::cell::RefCell<Vec<Arc<TargetFailure>>>);

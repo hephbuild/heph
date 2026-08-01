@@ -217,7 +217,10 @@ impl App for RunApp {
                 .clone()
                 .result(rs.clone(), &m, outputs, &opts)
                 .await
-                .map(|batch| batch.ok),
+                // NOT `.map(|batch| batch.ok)`: keep-going failures ride
+                // inside the Ok and must fold into `res`, or an error the
+                // registry didn't record exits 0 in silence. See `fold_batch`.
+                .and_then(crate::commands::errors::fold_batch),
         };
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
