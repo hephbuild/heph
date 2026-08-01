@@ -4,8 +4,9 @@ use std::future::Future;
 /// In-flight cap for the discovery walks (`Engine::query`,
 /// `EngineProviderExecutor::query`, `states_under`).
 ///
-/// Sized to [`hcore::blocking`]'s pool (`2 * cores`), because that pool is what
-/// the discovery work actually lands on: a package's `list` is a whole-package
+/// Sized to [`hcore::blocking`]'s concurrency limit (`2 * cores`), because
+/// those run slots are what the discovery work actually lands on: a package's
+/// `list` is a whole-package
 /// Starlark evaluation submitted there. This is an *orchestration* bound — the
 /// real admission control lives further down (`PKG_EVAL_SLOTS` caps concurrent
 /// package evaluations at the core count, in async-land, before queueing) — so

@@ -1,375 +1,271 @@
-//! Fixed pool of long-lived OS threads for synchronous blocking work that must
-//! not run on a tokio runtime worker.
+//! Bounded [`tokio::task::spawn_blocking`] for synchronous work that must not
+//! run on a tokio runtime worker (tar/copy into the cache, gzip, borsh, sqlite
+//! spool reads, Starlark evaluation, package walks).
 //!
-//! Every other way of running blocking work is unusable here for a different
-//! reason:
+//! Running that work inline on a worker parks the worker with the runtime
+//! unaware — it neither hands the worker's queue off nor spawns a replacement,
+//! so enough concurrent jobs stop the reactor and the timer wheel and the
+//! build looks hung while nothing is deadlocked (the failure #180 fixed).
+//! [`run`] moves the job to tokio's blocking pool and awaits its
+//! `JoinHandle`, bounded by a semaphore.
 //!
-//! - **Inline on the worker** — what `hproc::process_supervisor::block_or_inline`
-//!   does on Linux. The runtime is never told, so it neither hands the worker's
-//!   queue off nor spawns a replacement: that thread simply stops polling. With
-//!   `worker_threads = ncpu` (2–4 on a CI runner) a handful of concurrent cache
-//!   writes park *every* worker, and then the reactor and the timer wheel stop
-//!   running too — in-flight HTTP transfers make no progress, their deadlines
-//!   never fire, the TUI freezes. Nothing is deadlocked and the build looks hung.
-//!   This is the failure this module exists to remove.
-//! - **`tokio::task::block_in_place`** — correct in principle (the runtime hands
-//!   off), but every call burns a worker handoff and pulls a fresh thread out of
-//!   the blocking pool, and it needs a runtime context this module cannot assume
-//!   (see below). A 0.94 → 0.74 concurrency regression was measured against it
-//!   in the #180 era; a 2026-07-31 re-test found parity within noise on macOS
-//!   Tier A (`docs/CONCURRENCY_MEASUREMENTS.md`) — treat the number as
-//!   historical, not as the reason this pool exists.
-//! - **`tokio::task::spawn_blocking`** — its `JoinHandle` wake-up rides tokio's
-//!   cross-thread waker, observed to drop wake-ups on macOS under heavy load (see
-//!   `docs/RCA_MACOS_WAKER.md` and the hazard note in `hproc::proc_exec`), which
-//!   strands the awaiting task.
+//! ## History
 //!
-//! So: a fixed set of named threads, a `crossbeam_channel` queue, and a
-//! `oneshot` for the result. The threads are created once and live for the
-//! process, so a job costs a channel send rather than a thread spawn.
+//! This module used to be a hand-rolled fixed pool of OS threads with a
+//! `crossbeam_channel` queue, plus a process-wide waker registry re-woken by a
+//! 250ms ticker thread ("the backstop"). Both existed because tokio's own
+//! path was unusable or distrusted:
 //!
-//! **Dropped-wake-up backstop.** The result still crosses threads, so [`run`]
-//! does not simply `await` the `oneshot` — a pending waiter is re-woken on a timer
-//! ([`WAKE_BACKSTOP`]). A lost wake-up then costs latency instead of stranding
-//! the caller forever. This is the same defence the macOS child watcher uses for
-//! its own dropped kernel events (`kqueue_macos.rs`).
+//! - **No runtime context.** A cdylib plugin's futures used to be polled by
+//!   host workers, where the plugin's statically-linked tokio saw no runtime
+//!   at all — `spawn_blocking` there panics, and the panic aborts crossing
+//!   the `extern "C"` seam. Since the spawn-at-the-seam change, every ABI
+//!   entry point's body runs as a task on the cdylib's own runtime and every
+//!   host callback body runs as a task on the host runtime, so every caller
+//!   of [`run`] is polled with a runtime context, on both sides of the seam.
+//! - **Distrusted wake-ups.** Tokio's cross-thread wake was believed to drop
+//!   wake-ups on macOS under load (`docs/RCA_MACOS_WAKER.md`), so the result
+//!   wait was insured by the ticker. A 2026-07-31 re-measurement could not
+//!   reproduce the loss across ~40M wakes on the pinned tokio, and the
+//!   `block_in_place` concurrency regression cited alongside it re-measured
+//!   at parity within noise (`docs/CONCURRENCY_MEASUREMENTS.md`). The
+//!   task-backed memoizer already trusts tokio's waker path for every build;
+//!   so does this module.
 //!
-//! The backstop is a plain thread, *not* `tokio::time::timeout`, because [`run`]
-//! is also awaited inside a loaded cdylib plugin: the plugin's statically-linked
-//! tokio is a separate instance from the host's, and the future is polled by a
-//! host worker, so the plugin's tokio sees no runtime context at all. A tokio
-//! timer there panics with "there is no reactor running", and that panic crosses
-//! the plugin's `extern "C"` ABI seam, where it aborts the process. Nothing in
-//! this module may touch the reactor; a `oneshot` is plain waker traffic and is
-//! fine.
+//! The registry's release coupling — GC flushing registered wakers because a
+//! parked waker's `Arc` chain could pin a cache read guard — dissolved with
+//! it: a `JoinHandle` await parks its waker in the task's join slot for
+//! exactly the wait's lifetime, and an abandoned waiter is torn down by the
+//! task-backed memoizer's abort cascade, which drops the chain and everything
+//! it pins. See `Engine::run_trim_batch_with_delay` (`engine/gc.rs`) for the
+//! consumer-side argument.
 //!
-//! Jobs must be `'static`: a caller's future can be dropped (cancellation) while
-//! its job is still running, so the job cannot borrow from the caller's frame.
-//! Clone or `Arc` what it needs.
+//! ## Contract
+//!
+//! - **[`run`] requires a tokio runtime context** (it calls `spawn_blocking`).
+//!   Every production caller has one post-seam; a sync caller that drives the
+//!   future itself must enter a handle first (the buildfile LSP does).
+//! - **Bounded.** Concurrency is capped at [`concurrency_limit`] (the old
+//!   pool's size, `2 * cores`), not tokio's own `8 * cores + 64` blocking
+//!   cap: an unbounded fan-out of gzip/Starlark jobs would thrash the CPU.
+//!   The permit is acquired in async land — so a waiter dropped while
+//!   queueing leaves cleanly, having spawned nothing — and then rides *into*
+//!   the job, so a job whose caller was dropped still counts against the
+//!   bound until it finishes. Right-sizing the bound against tokio's pool is
+//!   a later, measured change.
+//! - **Panics are transparent.** A panicking job resurfaces on the caller's
+//!   task, exactly as the old pool's `catch_unwind` + `resume_unwind` did
+//!   (tokio's task harness is the `catch_unwind` now).
+//! - **Dropping the future detaches the job.** A `spawn_blocking` job cannot
+//!   be aborted mid-run; dropping the `JoinHandle` lets it run to completion
+//!   with the answer discarded — the same run-to-completion semantics the old
+//!   pool had, and callers rely on it (a permit moved into a job is released
+//!   even when nobody is left to await the answer).
+//!
+//! Jobs must be `'static`: a caller's future can be dropped (cancellation)
+//! while its job is still running, so the job cannot borrow from the caller's
+//! frame. Clone or `Arc` what it needs.
 
-use crossbeam_channel::{Sender, unbounded};
-use std::any::Any;
-use std::future::{Future, poll_fn};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::Pin;
-use std::sync::{Mutex, Once, OnceLock};
-use std::task::{Poll, Waker};
-use std::thread;
-use std::time::Duration;
+use std::cell::Cell;
+use std::sync::LazyLock;
+use tokio::sync::Semaphore;
 
-/// One unit of blocking work. Erased to `()` because the result travels back
-/// over a `oneshot` the closure already owns.
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-/// A panicking job's payload, forwarded so it resurfaces on the caller's task
-/// rather than silently killing a pool thread.
-type Panic = Box<dyn Any + Send + 'static>;
-
-/// How often a pending [`run`] waiter is re-woken.
+/// Concurrency limit for [`run`] jobs.
 ///
-/// Purely a backstop against a dropped cross-thread wake-up: on a healthy wake-up
-/// the result arrives immediately and the tick is never reached. Short enough
-/// that a lost wake-up is a hiccup, long enough that a pool of thousands of
-/// queued jobs isn't paying for a busy poll.
-const WAKE_BACKSTOP: Duration = Duration::from_millis(250);
-
-/// Waiters to re-wake on every tick, keyed by registration.
+/// The work is a mix of filesystem I/O (tar/copy into the cache, `stat`,
+/// rmdir) and CPU (gzip, borsh, starlark evaluation), so it wants more slots
+/// than cores — an I/O-bound job should not hold a slot a CPU-bound one could
+/// use — but not so many that thousands of concurrent targets thrash the
+/// disk. Callers that need a *tighter* bound impose their own (e.g. the
+/// remote cache's `CODEC_SLOTS` caps concurrent gzip at the core count); this
+/// is the ceiling underneath them. The value is the old dedicated pool's
+/// thread count, preserved verbatim across the switch to `spawn_blocking`.
 ///
-/// **Retained**, not drained. The list used to be emptied by each tick, on the
-/// reasoning that waking a waiter provokes a poll and the poll re-registers it.
-/// That holds only if the wake actually reaches the future — and nothing an
-/// arbitrary `Waker` promises guarantees that. When this was written,
-/// `hmemoizer::Cell::wake_by_ref` deliberately dropped a wake when the cell
-/// already had a driver that owed it a re-poll; one swallowed wake meant the
-/// waiter was never polled, never re-registered, and never woken again — with
-/// the blocking pool sitting idle on an empty queue because its job had long
-/// since finished. That stranded twelve targets inside `execute`'s sandbox
-/// cleanup while they held every worker permit, with ninety more queued behind
-/// them on the semaphore and the whole build wedged.
-///
-/// The cell no longer swallows (#236 routes every inner wake to the driver, or
-/// broadcasts), but retention stays because it defends the class, not that
-/// instance: any waker on the chain may coalesce or drop a wake — tokio's own
-/// cross-thread wake has been observed to go missing on macOS under load
-/// (`docs/RCA_MACOS_WAKER.md`), and the next `hmemoizer`-shaped waker is one
-/// refactor away. `a_swallowed_wake_does_not_disarm_the_backstop` pins the
-/// contract with a synthetic swallowing waker. Retaining the registration until
-/// the waiter is done makes the backstop's guarantee hold no matter what the
-/// waker does with a wake.
-static PENDING: Mutex<Vec<(u64, Waker)>> = Mutex::new(Vec::new());
-
-static NEXT_REGISTRATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-static BACKSTOP_THREAD: Once = Once::new();
-
-/// One pass of the backstop: wake every live registration, keeping them armed.
-///
-/// Split out of the thread's loop so the retention contract can be asserted by
-/// calling this directly. Timing a real tick means sleeping for a multiple of
-/// [`WAKE_BACKSTOP`] and counting wakes, which on a loaded CI runner measures the
-/// scheduler rather than the invariant.
-///
-/// Returns how many registrations were woken.
-fn tick() -> usize {
-    // Cloned under the lock and woken outside it: a waker may re-enter this
-    // module from inside `wake`.
-    let due: Vec<Waker> = lock_pending().iter().map(|(_, w)| w.clone()).collect();
-    let n = due.len();
-    for waker in due {
-        waker.wake();
-    }
-    n
-}
-
-fn start_backstop_thread() {
-    BACKSTOP_THREAD.call_once(|| {
-        thread::Builder::new()
-            .name("heph-blocking-wake".to_string())
-            .spawn(|| {
-                loop {
-                    thread::sleep(WAKE_BACKSTOP);
-                    tick();
-                }
-            })
-            // Same stance as the pool itself: no fallback worth having.
-            .expect("spawn heph blocking-wake thread");
-    });
-}
-
-/// A live backstop registration. The waker stays armed until this is dropped.
-///
-/// Held by the awaiting future, so the registration's lifetime is exactly the
-/// wait's: it goes away when the result arrives *or* when the future is
-/// cancelled, and never outlives either. That is what lets the tick retain
-/// entries instead of draining them.
-pub struct Backstop {
-    id: u64,
-}
-
-impl Backstop {
-    /// Reserve a registration, starting the backstop thread on first use (a
-    /// process that never blocks never pays for it). Nothing is armed until
-    /// [`arm`](Self::arm) is called with a waker.
-    pub fn new() -> Self {
-        start_backstop_thread();
-        Self {
-            id: NEXT_REGISTRATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-
-    /// Arm (or refresh) this registration with the polling task's waker. Call
-    /// from every pending poll; re-arming with the same waker is free.
-    pub fn arm(&self, waker: &Waker) {
-        let mut pending = lock_pending();
-        match pending.iter_mut().find(|(id, _)| *id == self.id) {
-            Some((_, armed)) => {
-                if !armed.will_wake(waker) {
-                    *armed = waker.clone();
-                }
-            }
-            None => pending.push((self.id, waker.clone())),
-        }
-    }
-}
-
-impl Default for Backstop {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for Backstop {
-    fn drop(&mut self) {
-        let mut pending = lock_pending();
-        if let Some(i) = pending.iter().position(|(id, _)| *id == self.id) {
-            pending.swap_remove(i);
-        }
-    }
-}
-
-/// Wake every registered backstop waiter now rather than on the next tick, and
-/// hand back the `Waker`s it was holding.
-///
-/// Waking early is always sound: a spurious wake costs one poll, and a waiter
-/// that is genuinely still pending re-arms from the poll that wake provokes.
-///
-/// **Releasing is half the point, and it is not only about *finished* waits.** A
-/// `Waker` owns whatever it can reach — here an `Arc<hmemoizer::Cell>`, whose
-/// memoized value for `mem_locked_result` is the addr's riding cache read. The
-/// post-run cache trim has to take a write lock, so every one of those reads must
-/// be gone before it runs, or the trim finds its target contended and silently
-/// skips.
-///
-/// [`Backstop`] fixes the *finished* half at the source: a registration is
-/// dropped when its wait ends, so a completed waiter no longer pins anything
-/// until a tick sweeps it. But a request can be torn down while background work
-/// is still in flight, and those registrations are live, not stale — the guard
-/// will not release them because the wait genuinely has not ended. Taking them
-/// here is what unpins the read guards, and the still-pending waiter re-arms on
-/// its next poll.
-///
-/// (That re-arm is the same assumption the tick deliberately no longer makes: see
-/// [`PENDING`]. It is sound here because this is a teardown path — the wedge the
-/// tick's retention guards against happens mid-run, under a memoizer cell that
-/// swallows a wake it thinks is redundant.)
-///
-/// Returns how many registrations were taken, so a caller can tell its own flush
-/// from a tick that happened to land first.
-pub fn flush_backstop() -> usize {
-    // Taken, not cloned: releasing the `Waker`s is half the point (see above).
-    // Taken before waking, and the lock released first, so a waker that re-arms
-    // from inside `wake` cannot deadlock against us — its `arm` simply pushes a
-    // fresh entry under the same id.
-    let due: Vec<Waker> = std::mem::take(&mut *lock_pending())
-        .into_iter()
-        .map(|(_, w)| w)
-        .collect();
-    let n = due.len();
-    for waker in due {
-        // Callers reach this from `Drop` on a teardown path. A panicking waker
-        // there would unwind out of a destructor — and abort outright if that
-        // drop is itself already unwinding — so one bad waker is contained
-        // rather than allowed to take the process with it. The panic is still
-        // reported by the default hook before this returns, and this crate has
-        // no `tracing` (it is linked into cdylib plugins, where no subscriber is
-        // ever installed), so there is nothing further to say about it here.
-        // `lock_pending` already contemplates this case for the tick thread.
-        drop(catch_unwind(AssertUnwindSafe(|| waker.wake())));
-    }
-    n
-}
-
-/// A waker panicking mid-`wake` would poison the list and strand every later
-/// waiter, so poisoning is ignored — the `Vec` is still consistent.
-fn lock_pending() -> std::sync::MutexGuard<'static, Vec<(u64, Waker)>> {
-    PENDING.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Pool size.
-///
-/// The work is a mix of filesystem I/O (tar/copy into the cache, `stat`, rmdir)
-/// and CPU (gzip, borsh, starlark evaluation), so it wants more threads than
-/// cores — an I/O-bound job should not hold a slot a CPU-bound one could use —
-/// but not so many that thousands of concurrent targets thrash the disk. Callers
-/// that need a *tighter* bound impose their own (e.g. the remote cache's
-/// `CODEC_SLOTS` caps concurrent gzip at the core count); this is the ceiling
-/// underneath them.
-/// Public so callers that park a pool thread to wait on *another* pool thread
-/// can assert their bound stays strictly below it (e.g. `pluginbuildfile`'s
+/// Public so callers that park inside a job to wait on *another* job can
+/// assert their bound stays strictly below it (e.g. `pluginbuildfile`'s
 /// `PKG_EVAL_SLOTS`, whose `LoadRegistry` condvar wait is deadlock-free only
-/// while every claim holder can be running on some thread of this pool).
-pub fn pool_size() -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(8);
-    (cores * 2).max(4)
+/// while every claim holder can hold a slot of its own).
+pub fn concurrency_limit() -> usize {
+    /// Snapshotted once, not recomputed per call: [`SLOTS`] is sized from it
+    /// at first touch, and `pluginbuildfile`'s `PKG_EVAL_SLOTS` asserts
+    /// against it at its own first touch. Were `available_parallelism` ever to
+    /// change under us (a cgroup resize), a recomputing function would let the
+    /// reported limit, the asserted invariant, and the actual semaphore size
+    /// disagree.
+    static LIMIT: LazyLock<usize> = LazyLock::new(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(8);
+        (cores * 2).max(4)
+    });
+    *LIMIT
 }
 
-static POOL: OnceLock<Sender<Job>> = OnceLock::new();
+/// The bound. A static per linkage unit, not per runtime: the host binary and
+/// each plugin cdylib statically link their own copy of this crate, each with
+/// its own runtime and its own limit — exactly as each used to have its own
+/// pool.
+static SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(concurrency_limit()));
 
-fn sender() -> &'static Sender<Job> {
-    POOL.get_or_init(|| {
-        let (tx, rx) = unbounded::<Job>();
-        for i in 0..pool_size() {
-            let rx = rx.clone();
-            thread::Builder::new()
-                .name(format!("heph-blocking-{i}"))
-                .spawn(move || {
-                    // Ends only when every sender is dropped, which for a
-                    // process-lifetime static means at exit.
-                    for job in rx.iter() {
-                        job();
-                    }
-                })
-                // Same stance as the sandbox cleaner: a process that cannot spawn
-                // its worker threads at startup has nothing to fall back to.
-                .expect("spawn heph blocking-io thread");
-        }
-        tx
-    })
+thread_local! {
+    /// True while this thread is executing a [`run`] job.
+    static IN_JOB: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Fail a [`run`] the same way a panicking job does, for the two states that
-/// cannot happen unless the pool itself is broken (its queue closed, or a thread
-/// dropping a job without answering — `catch_unwind` means even a panic answers).
-/// Raised as a panic rather than folded into the return type so [`run`] stays a
-/// drop-in for the synchronous call it replaced.
-fn pool_broken(what: &'static str) -> ! {
-    std::panic::resume_unwind(Box::new(format!("heph blocking pool {what}")))
-}
-
-/// Run `f` on the blocking pool and await its result.
+/// True while the calling thread is running a [`run`] job.
 ///
-/// Panics are transparent: a panicking job resurfaces on the caller's task
-/// instead of taking down a pool thread and stranding every later job.
+/// The witness for "this leaf was routed through [`run`]": tokio's blocking
+/// threads carry no distinguishing name (a runtime names all its threads
+/// alike), so tests that used to assert on the old pool's `heph-blocking-*`
+/// thread names record this instead. Deliberately scoped to [`run`] jobs — a
+/// bare `spawn_blocking` or `tokio::fs` op on the same pool reads `false`.
+pub fn in_blocking_job() -> bool {
+    IN_JOB.with(Cell::get)
+}
+
+/// Marks the job's thread for [`in_blocking_job`], reset on drop so a
+/// panicking job cannot leave the flag set on a pool thread tokio will reuse.
+struct JobMarker;
+
+impl JobMarker {
+    fn set() -> Self {
+        IN_JOB.with(|c| c.set(true));
+        Self
+    }
+}
+
+impl Drop for JobMarker {
+    fn drop(&mut self) {
+        IN_JOB.with(|c| c.set(false));
+    }
+}
+
+/// Run `f` on tokio's blocking pool, bounded by [`concurrency_limit`], and
+/// await its result.
+///
+/// Requires a tokio runtime context — see the module docs for the full
+/// contract, including panic transparency and drop-detaches semantics.
 pub async fn run<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<R, Panic>>();
-    let job: Job = Box::new(move || {
-        let out = catch_unwind(AssertUnwindSafe(f));
-        // The receiver is gone when the caller's future was dropped — the job
-        // still had to run to completion, but nobody wants the answer.
-        drop(tx.send(out));
+    // Queue in async land: a waiter dropped here (cancellation) leaves the
+    // semaphore's queue cleanly, having spawned nothing — and the closure,
+    // with whatever it owns (a caller's permit riding into the job), is
+    // dropped on the cancelling thread.
+    let permit = SLOTS
+        .acquire()
+        .await
+        .expect("heph blocking slots semaphore is never closed");
+    let handle = tokio::task::spawn_blocking(move || {
+        // The permit rides into the job: once spawned, the job occupies a
+        // slot until it *finishes*, even when the caller's future is dropped
+        // mid-run — the same occupancy the old pool's threads enforced. Kept
+        // in the caller's future instead, every detached job would run
+        // outside the bound.
+        let _permit = permit;
+        let _marker = JobMarker::set();
+        f()
     });
-    if sender().send(job).is_err() {
-        pool_broken("queue closed");
-    }
-
-    // Arm the backstop on every pending poll rather than trusting a single
-    // wake-up: see the dropped-wake-up note in the module docs. The registration
-    // is held for the whole wait and released here on the way out — including on
-    // cancellation, when this future is dropped mid-`await`.
-    let armed = Backstop::new();
-    let received = poll_fn(|cx| match Pin::new(&mut rx).poll(cx) {
-        Poll::Ready(out) => Poll::Ready(out),
-        Poll::Pending => {
-            armed.arm(cx.waker());
-            Poll::Pending
-        }
-    })
-    .await;
-    drop(armed);
-
-    match received {
-        Ok(Ok(value)) => value,
-        Ok(Err(panic)) => std::panic::resume_unwind(panic),
-        Err(_closed) => pool_broken("dropped a job unanswered"),
+    match handle.await {
+        Ok(value) => value,
+        // Transparent panic propagation: resurface the job's panic on the
+        // caller's task rather than wrapping it in a `JoinError`.
+        Err(e) => match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // Not a panic, and `run` never aborts the handle — so this is the
+            // runtime refusing the job outright, i.e. submitting to a runtime
+            // that is already gone (the LSP shape: an external thread holding
+            // an entered handle whose server runtime shut down). A job merely
+            // *queued* when a shutdown starts is not this case: tokio drains
+            // its blocking queue on the way down and runs it (measured, see
+            // `a_job_the_runtime_will_never_run_surfaces_as_a_panic`).
+            //
+            // Raised as a panic (via `resume_unwind`, the same shape a
+            // panicking job produces) rather than folded into the return type
+            // so `run` stays a drop-in for the synchronous call it replaced.
+            Err(e) => std::panic::resume_unwind(Box::new(format!("heph blocking job lost: {e}"))),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
-    /// [`PENDING`] is process-wide, and `flush_backstop` takes *everything* in
-    /// it. Cargo runs these tests in threads of one process, so a test that
-    /// flushes will happily disarm a registration another test is still watching.
-    /// Every test that touches the shared list holds this first.
-    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+    /// [`SLOTS`] is process-wide and cargo runs these tests concurrently in
+    /// one process, so a test that reasons about permit counts (holding them
+    /// all, or parking jobs on a gate for its whole body) must not overlap
+    /// another doing the same. Async-aware so holding it across `await` is
+    /// sound.
+    static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// Poisoning is ignored: the guard protects no invariant of its own, and a
-    /// failing test must not cascade into every later one.
-    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+    /// Take every run slot, without ever parking in the semaphore's queue.
+    ///
+    /// A fair semaphore serves waiters in order, so a parked bulk acquire
+    /// blocks every later acquire behind it — deadlocking against any job that
+    /// holds a permit and needs another. Callers hold `EXCLUSIVE`.
+    async fn drain_all_slots() -> tokio::sync::SemaphorePermit<'static> {
+        let want = u32::try_from(concurrency_limit()).expect("limit fits u32");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(all) = SLOTS.try_acquire_many(want) {
+                return all;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "every run slot must come free"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A gate jobs park on, so a test controls exactly when its jobs finish.
+    struct Gate {
+        open: Mutex<bool>,
+        cond: Condvar,
+    }
+
+    impl Gate {
+        fn closed() -> Arc<Self> {
+            Arc::new(Self {
+                open: Mutex::new(false),
+                cond: Condvar::new(),
+            })
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().expect("gate lock");
+            while !*open {
+                open = self.cond.wait(open).expect("gate wait");
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().expect("gate lock") = true;
+            self.cond.notify_all();
+        }
     }
 
     #[tokio::test]
     async fn runs_off_the_calling_thread_and_returns_the_value() {
         let here = thread::current().id();
-        let (value, ran_on) = run(move || (41 + 1, thread::current().id())).await;
+        let (value, ran_on, marked) =
+            run(move || (41 + 1, thread::current().id(), in_blocking_job())).await;
         assert_eq!(value, 42);
         assert_ne!(ran_on, here, "job must not run on the caller's thread");
+        assert!(marked, "a job must observe in_blocking_job()");
     }
 
-    /// The whole point: a job that blocks its thread outright must not stop the
-    /// runtime from making progress. If the work ran inline on the worker (what
-    /// `block_or_inline` does on Linux) a single-worker runtime would never poll
-    /// the timer, and this test would hang.
+    /// The whole point: a job that blocks its thread outright must not stop
+    /// the runtime from making progress. If the work ran inline on the worker
+    /// a single-worker runtime would never poll the timer, and this test
+    /// would hang.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_work_does_not_stall_the_runtime() {
         let ticks = Arc::new(AtomicUsize::new(0));
@@ -386,261 +282,151 @@ mod tests {
         run(|| thread::sleep(Duration::from_millis(120))).await;
         assert!(
             ticks.load(Ordering::SeqCst) > 0,
-            "the runtime must keep polling while a pool job blocks",
+            "the runtime must keep polling while a blocking job runs",
         );
         ticker.await.expect("ticker");
     }
 
-    /// A panicking job must not kill its pool thread — that would silently strand
-    /// every job scheduled onto it for the rest of the process.
+    /// A panicking job resurfaces on the caller's task, and later jobs are
+    /// unaffected — under the old pool a leaked panic would have killed a
+    /// pool thread and stranded every job scheduled onto it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn panic_surfaces_on_the_caller_and_the_pool_survives() {
+    async fn panic_surfaces_on_the_caller_and_later_jobs_still_run() {
         let panicked = tokio::spawn(run(|| panic!("boom"))).await;
         assert!(panicked.is_err(), "panic must propagate to the caller");
-        assert_eq!(run(|| 7).await, 7, "the pool must still serve jobs");
+        assert_eq!(run(|| 7).await, 7, "later jobs must still be served");
     }
 
-    /// Inside a loaded cdylib plugin the plugin's own tokio has no runtime
-    /// context — the host worker polls the plugin's future through the stable ABI
-    /// seam. Anything here that touched the reactor panicked there, and that panic
-    /// aborts the process on its way back across the `extern "C"` boundary.
-    /// `block_on` with no runtime installed reproduces exactly that context.
-    #[test]
-    fn works_with_no_tokio_runtime_installed() {
-        assert_eq!(futures::executor::block_on(run(|| 7)), 7);
+    /// The witness is scoped to [`run`] jobs: a bare `spawn_blocking` on the
+    /// same tokio pool must read `false`, or every test using the witness
+    /// would pass for work that dodged this module (and its bound) entirely.
+    #[tokio::test]
+    async fn the_marker_identifies_run_jobs_not_the_shared_pool() {
+        assert!(!in_blocking_job(), "an async caller is not a job");
+        assert!(run(in_blocking_job).await, "inside a job it is set");
+        let bare = tokio::task::spawn_blocking(in_blocking_job)
+            .await
+            .expect("bare spawn_blocking");
+        assert!(!bare, "a bare spawn_blocking job is not a run job");
     }
 
-    /// Same, for a job slow enough that the waiter actually parks and arms the
-    /// backstop — the reactor-free path has to carry the pending case too.
-    #[test]
-    fn pending_job_completes_with_no_tokio_runtime_installed() {
-        let out = futures::executor::block_on(run(|| {
-            thread::sleep(WAKE_BACKSTOP * 2);
-            "done"
-        }));
-        assert_eq!(out, "done");
-    }
+    /// The bound: with every job parked on a gate, at most
+    /// [`concurrency_limit`] of them may be running at once no matter how
+    /// many are submitted. Mutation-verified: lifting the semaphore lets
+    /// every submitted job start and `peak` overshoots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrency_is_bounded_at_the_limit() {
+        let _exclusive = EXCLUSIVE.lock().await;
+        let limit = concurrency_limit();
+        let n = limit + 4;
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Gate::closed();
 
-    /// A registration owns its waker, and a waker owns its task — so anything a
-    /// finished task still holds would stay reachable from `PENDING` for as long
-    /// as the registration does. It must therefore end with the wait, not with a
-    /// tick or a flush, which is what the post-run cache trim depends on.
-    #[test]
-    fn a_registration_is_released_when_its_wait_ends() {
-        let _exclusive = exclusive();
-        struct Owning(#[expect(dead_code, reason = "held to observe the refcount")] Arc<()>);
-        impl futures::task::ArcWake for Owning {
-            fn wake_by_ref(_: &Arc<Self>) {}
-        }
+        let jobs: Vec<_> = (0..n)
+            .map(|_| {
+                let running = Arc::clone(&running);
+                let peak = Arc::clone(&peak);
+                let gate = Arc::clone(&gate);
+                tokio::spawn(run(move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    gate.wait();
+                    running.fetch_sub(1, Ordering::SeqCst);
+                }))
+            })
+            .collect();
 
-        let owned = Arc::new(());
-        let armed = Backstop::new();
-
-        // Cloning a `Waker` clones the `Arc<Owning>`, so every clone shares the
-        // one inner `Arc<()>`: the count moves only when the last `Waker` goes.
-        // Drop the local one here so what remains is the registration's alone.
-        {
-            let waker = futures::task::waker(Arc::new(Owning(Arc::clone(&owned))));
-            armed.arm(&waker);
-        }
-        assert_eq!(
-            Arc::strong_count(&owned),
-            2,
-            "armed: the registration is the only thing still holding the waker"
-        );
-
-        drop(armed);
-        assert_eq!(
-            Arc::strong_count(&owned),
-            1,
-            "ending the wait must release the waker the registration held"
-        );
-    }
-
-    /// A flush must hand back the wakers of waits that are *still pending*, not
-    /// only of finished ones.
-    ///
-    /// A `Waker` owns whatever it can reach — an `Arc<hmemoizer::Cell>`, whose
-    /// memoized `mem_locked_result` value is the addr's riding cache read. A
-    /// request can be torn down while background uploads are still in flight, and
-    /// those registrations are live rather than stale, so [`Backstop`]'s
-    /// end-of-wait release does not cover them. Leaving them armed pins the read
-    /// guards, and the post-run cache-history trim then finds every target
-    /// contended and silently skips
-    /// (`e2e::cache_history_is_enforced_by_the_end_of_the_run`).
-    #[test]
-    fn a_flush_releases_a_still_pending_registration() {
-        let _exclusive = exclusive();
-        struct Owning(#[expect(dead_code, reason = "held to observe the refcount")] Arc<()>);
-        impl futures::task::ArcWake for Owning {
-            fn wake_by_ref(_: &Arc<Self>) {}
-        }
-
-        let owned = Arc::new(());
-        // Deliberately kept alive for the whole test: this stands for a wait that
-        // has not ended, so nothing but the flush can release its waker.
-        let armed = Backstop::new();
-        {
-            let waker = futures::task::waker(Arc::new(Owning(Arc::clone(&owned))));
-            armed.arm(&waker);
-        }
-        assert_eq!(Arc::strong_count(&owned), 2, "armed");
-
-        assert!(
-            flush_backstop() >= 1,
-            "the flush must take our registration"
-        );
-        assert_eq!(
-            Arc::strong_count(&owned),
-            1,
-            "a flush must release the waker even though the wait is still live"
-        );
-
-        drop(armed);
-    }
-
-    /// The bug this module's retention exists to prevent.
-    ///
-    /// The list used to be drained by each tick, on the reasoning that waking a
-    /// waiter provokes a poll that re-registers it. A waker that swallows the
-    /// wake — `hmemoizer`'s cell does, when it already has a driver owing it a
-    /// re-poll — broke that: one dropped wake and the waiter was never polled,
-    /// never re-registered, and never woken again. That stranded twelve targets
-    /// in `execute`'s sandbox cleanup holding every worker permit, with the
-    /// blocking pool idle because their jobs had already finished.
-    #[test]
-    fn a_swallowed_wake_does_not_disarm_the_backstop() {
-        let _exclusive = exclusive();
-        /// Counts wakes and drops every one, like a cell that already has a
-        /// driver on the hook.
-        struct Swallowing(Arc<AtomicUsize>);
-        impl futures::task::ArcWake for Swallowing {
-            fn wake_by_ref(me: &Arc<Self>) {
-                me.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let wakes = Arc::new(AtomicUsize::new(0));
-        let waker = futures::task::waker(Arc::new(Swallowing(Arc::clone(&wakes))));
-
-        let armed = Backstop::new();
-        armed.arm(&waker);
-
-        // Driven, not timed. Under the old drain-once list the first tick would
-        // consume the registration and the second would find nothing, because a
-        // swallowed wake never produces the re-registering poll. Calling `tick`
-        // directly asserts exactly that and nothing about the scheduler.
-        for round in 1..=3 {
-            tick();
-            assert_eq!(
-                wakes.load(Ordering::SeqCst),
-                round,
-                "a waiter whose wakes are swallowed must be re-woken on every tick"
+        // Eventual, bounded: the limit's worth of slots fill while the excess
+        // queues on the semaphore.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while running.load(Ordering::SeqCst) < limit {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the limit's worth of jobs must start"
             );
+            tokio::task::yield_now().await;
         }
 
-        drop(armed);
-        let before = wakes.load(Ordering::SeqCst);
-        tick();
+        gate.open();
+        for job in jobs {
+            job.await.expect("job");
+        }
         assert_eq!(
-            wakes.load(Ordering::SeqCst),
-            before,
-            "and must stop being woken once its wait has ended"
+            peak.load(Ordering::SeqCst),
+            limit,
+            "no more than the limit may ever run at once, and the limit must be reachable",
         );
     }
 
-    /// A waiter that is genuinely still pending must survive a flush: it is
-    /// woken, re-polls, finds its job unfinished and re-registers. This is the
-    /// invariant that makes `flush_backstop` safe to call from anywhere.
-    #[test]
-    fn flush_backstop_does_not_strand_a_still_pending_waiter() {
-        let _exclusive = exclusive();
-        let out = futures::executor::block_on(async {
-            let job = run(|| {
-                thread::sleep(WAKE_BACKSTOP / 2);
-                "done"
-            });
-            futures::pin_mut!(job);
-            // Flush repeatedly while the job is still running; each one takes the
-            // waiter's registration out from under it.
-            loop {
-                let mut flushed = 0;
-                let polled = futures::poll!(&mut job);
-                if let Poll::Ready(v) = polled {
-                    break v;
-                }
-                while flushed < 3 {
-                    flush_backstop();
-                    flushed += 1;
-                    thread::sleep(Duration::from_millis(20));
-                }
+    /// Dropping the awaiting future mid-job detaches the job: it still runs
+    /// to completion (its side effect lands) and hands its slot back when it
+    /// finishes. Callers rely on run-to-completion — a permit moved into a
+    /// job must be released even when nobody is left to await the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_caller_detaches_the_job_which_still_completes() {
+        let _exclusive = EXCLUSIVE.lock().await;
+        let gate = Gate::closed();
+        let done = Arc::new(AtomicUsize::new(0));
+
+        let mut fut = Box::pin(run({
+            let gate = Arc::clone(&gate);
+            let done = Arc::clone(&done);
+            move || {
+                gate.wait();
+                done.fetch_add(1, Ordering::SeqCst);
             }
-        });
-        assert_eq!(
-            out, "done",
-            "a flushed-but-pending waiter must still finish"
-        );
-    }
-
-    /// A waiter must be re-woken while its job is still running — that spare
-    /// wake-up is the whole defence against a dropped one. Counted with a waker
-    /// nothing else can wake: the job is still asleep, so any wake seen here came
-    /// from the backstop and not from the job answering.
-    #[test]
-    fn backstop_re_wakes_a_waiter_while_its_job_is_still_running() {
-        let _exclusive = exclusive();
-        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
-
-        static WAKES: AtomicUsize = AtomicUsize::new(0);
-        unsafe fn clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
-        }
-        unsafe fn wake(_: *const ()) {
-            WAKES.fetch_add(1, Ordering::SeqCst);
-        }
-        unsafe fn noop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, noop);
-        let counting = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-
-        let mut fut = Box::pin(run(|| {
-            thread::sleep(WAKE_BACKSTOP * 4);
-            11
         }));
+        // One poll acquires the (uncontended) permit and spawns the job.
         assert!(
-            fut.as_mut()
-                .poll(&mut Context::from_waker(&counting))
-                .is_pending(),
-            "a job that sleeps cannot answer before its first poll returns",
+            futures::poll!(&mut fut).is_pending(),
+            "a gated job cannot answer before its first poll returns"
         );
+        drop(fut);
 
-        thread::sleep(WAKE_BACKSTOP * 2);
-        assert!(
-            WAKES.load(Ordering::SeqCst) > 0,
-            "the backstop must re-wake a waiter whose job is still running",
-        );
-
-        assert_eq!(futures::executor::block_on(fut), 11);
+        gate.open();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while done.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a detached job must still run to completion"
+            );
+            tokio::task::yield_now().await;
+        }
+        // And its slot comes back once the job finishes (eventual: the permit
+        // is dropped inside the job as it returns). Under EXCLUSIVE, the only
+        // other holders are the transient quick-job tests, so the full limit
+        // becoming acquirable is exactly the detached slot's return.
+        let want = u32::try_from(concurrency_limit()).expect("limit fits u32");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(all) = SLOTS.try_acquire_many(want) {
+                drop(all);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a detached job must release its slot when it finishes"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     /// The production wedge's leaf, driven through the real machinery: a
-    /// memoized chain whose innermost computation holds a semaphore permit and
-    /// parks inside [`run`], with a live backstop registration — then the
-    /// chain's only awaiter is dropped, as fail-fast does.
+    /// memoized chain whose innermost computation holds a semaphore permit
+    /// and parks inside [`run`] — then the chain's only awaiter is dropped,
+    /// as fail-fast does. Everything the parked leaf holds must come back via
+    /// the task-backed memoizer's abort cascade: the permit returns to the
+    /// semaphore even though the blocking job is still running, detached.
     ///
-    /// Everything the parked leaf holds must come back: the permit returns to
-    /// the semaphore, and the backstop registration is disarmed (a `tick()`
-    /// wakes nobody). Pre-fix, the memoizer cell retained the whole chain, the
-    /// permit stayed captured, and the backstop re-woke the abandoned cell
-    /// every 250ms forever — the dumps show ~1000 such ticks over 269s.
+    /// (This is the release edge that replaced the old backstop registry's
+    /// `flush_backstop`: nothing retains the abandoned chain, so nothing
+    /// needs a flush to let go of it.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "`exclusive()` serializes whole tests against each other, so its guard is meant to outlive every await below"
-    )]
-    async fn an_abandoned_memoized_wait_releases_its_permit_and_its_backstop() {
+    async fn an_abandoned_memoized_wait_releases_its_permit() {
         use crate::hmemoizer::Memoizer;
 
-        let _exclusive = exclusive();
+        let _exclusive = EXCLUSIVE.lock().await;
 
         let mem_result: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
             "bk-result",
@@ -652,13 +438,14 @@ mod tests {
         ));
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
 
-        // The job blocks until released, so the wait is genuinely pending (and
-        // the backstop genuinely armed) when the abandonment happens.
-        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+        // The job parks until released, so the wait is genuinely pending when
+        // the abandonment happens.
+        let gate = Gate::closed();
 
         let mut outer = Box::pin(mem_result.process("//pkg:tgt".to_string(), {
             let mem_execute = Arc::clone(&mem_execute);
             let permits = Arc::clone(&permits);
+            let gate = Arc::clone(&gate);
             move || async move {
                 mem_execute
                     .process("//pkg:tgt".to_string(), move || async move {
@@ -667,9 +454,7 @@ mod tests {
                             .await
                             .expect("semaphore is never closed");
                         run(move || {
-                            // Park until the test releases us (or drops the
-                            // sender); either outcome means "carry on".
-                            let _released = release_rx.recv();
+                            gate.wait();
                             7
                         })
                         .await
@@ -692,11 +477,12 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // Fail-fast: the only awaiter goes away while the job is still running.
+        // Fail-fast: the only awaiter goes away while the job is still
+        // running.
         drop(outer);
 
-        // Task-cell teardown is asynchronous: the abort cascade lands when the
-        // runtime processes it. Eventual, bounded.
+        // Task-cell teardown is asynchronous: the abort cascade lands when
+        // the runtime processes it. Eventual, bounded.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while permits.available_permits() != 1 {
             assert!(
@@ -705,20 +491,181 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        // The permit coming back proves the innermost future was dropped, and
-        // dropping it drops its `Backstop` — whose registration removal is
-        // proven deterministically by `a_registration_is_released_when_its_wait_ends`.
-        // Asserting `tick() == 0` here instead would race the non-exclusive
-        // tests in this module, which arm registrations of their own.
 
-        // Let the job finish; its answer goes nowhere, and that is fine.
-        release_tx.send(()).expect("job is waiting on this");
+        // Let the detached job finish; its answer goes nowhere, and that is
+        // fine.
+        gate.open();
     }
 
-    /// Many jobs at once all complete, exercising the queue past the pool size.
+    /// A job the runtime will never run surfaces on the caller as a panic —
+    /// not as a hang, and not as a bogus value.
+    ///
+    /// The one non-panic `JoinError` [`run`] can see. Provoked by submitting
+    /// to an already-shut-down runtime, which is deterministic; racing a
+    /// shutdown against a *queued* job is not, because tokio drains its
+    /// blocking queue on the way down (a queued job runs rather than being
+    /// dropped — measured, not assumed).
+    ///
+    /// The reachable production shape is the LSP's: an external thread
+    /// awaiting through an entered handle whose server runtime has gone away.
+    #[test]
+    fn a_job_the_runtime_will_never_run_surfaces_as_a_panic() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = rt.handle().clone();
+        rt.shutdown_background();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_job = Arc::clone(&ran);
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _entered = handle.enter();
+            futures::executor::block_on(run(move || {
+                ran_in_job.fetch_add(1, Ordering::SeqCst);
+                42
+            }))
+        }));
+
+        let payload = out.expect_err("a job that cannot run must not yield a value");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map_or("<not a string payload>", String::as_str);
+        assert!(
+            msg.contains("heph blocking job lost"),
+            "a lost job must say so; got {msg:?}"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the job must not have run at all"
+        );
+    }
+
+    /// A job may itself call [`run`] and drive it to completion.
+    ///
+    /// Load-bearing, not hypothetical: a Starlark handler `block_on`s a
+    /// provider function from inside a package-evaluation job, and anything
+    /// below that may reach [`run`] again. The old pool needed no runtime
+    /// context for this; `spawn_blocking` does, and it works only because
+    /// tokio propagates the runtime context into a blocking closure. It is
+    /// also the premise of `PKG_EVAL_SLOTS < concurrency_limit`: a claim
+    /// holder inside a job must be able to take a slot of its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queues_beyond_the_pool_size() {
-        let n = pool_size() * 4;
+    async fn a_job_can_run_a_nested_job() {
+        // Serialized: this is the one test that holds a slot while acquiring a
+        // second, so letting it interleave with the tests that park jobs on a
+        // gate to fill every slot would deadlock both until their deadline.
+        let _exclusive = EXCLUSIVE.lock().await;
+        // Two permits, deadlock-free against the min-4 limit.
+        let out = run(|| futures::executor::block_on(run(|| 7))).await;
+        assert_eq!(out, 7);
+    }
+
+    /// A panicking job releases its slot — the permit rides into the closure,
+    /// so the release is on the unwind path. Leaking one per panic would wedge
+    /// the process after `limit` of them, which the panic-propagation test
+    /// cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_job_releases_its_slot() {
+        let _exclusive = EXCLUSIVE.lock().await;
+        let panicked = tokio::spawn(run(|| panic!("boom"))).await;
+        assert!(panicked.is_err(), "the job must have panicked");
+
+        let want = u32::try_from(concurrency_limit()).expect("limit fits u32");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(all) = SLOTS.try_acquire_many(want) {
+                drop(all);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a panicking job must hand its slot back"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A panicking job must not leave [`IN_JOB`] set on the thread tokio will
+    /// reuse — every `in_blocking_job` witness in the tree would then pass for
+    /// work that never went through [`run`]. Pinned deterministically with a
+    /// one-thread blocking pool, so the bare probe *must* land on the thread
+    /// the panicking job used.
+    #[test]
+    fn a_panicking_job_clears_the_marker_for_the_next_user_of_its_thread() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let panicked = tokio::spawn(run(|| panic!("boom"))).await;
+            assert!(panicked.is_err(), "the job must have panicked");
+            let reused = tokio::task::spawn_blocking(in_blocking_job)
+                .await
+                .expect("probe");
+            assert!(
+                !reused,
+                "a panicked job left the marker set on a reused blocking thread"
+            );
+        });
+    }
+
+    /// A waiter dropped *while still queued* spawns nothing and drops the
+    /// closure — which is what releases anything the caller moved into it (a
+    /// `PKG_EVAL_SLOTS` permit, in production).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_dropped_while_queued_spawns_nothing_and_drops_the_closure() {
+        let _exclusive = EXCLUSIVE.lock().await;
+        // Drained with try + yield rather than `acquire_many().await`: the
+        // semaphore is fair, so a parked bulk acquire sits at the queue head
+        // and blocks every later single acquire behind it — including one a
+        // permit-holder is waiting on. `EXCLUSIVE` already excludes the tests
+        // that could form that cycle; not parking means this cannot form one
+        // with anything else either.
+        let all = drain_all_slots().await;
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        /// Stands in for a permit moved into the job.
+        struct DropFlag(Arc<AtomicUsize>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut fut = Box::pin(run({
+            let ran = Arc::clone(&ran);
+            let carried = DropFlag(Arc::clone(&dropped));
+            move || {
+                let _carried = carried;
+                ran.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        // Every slot is held, so this parks on the semaphore having spawned
+        // nothing.
+        assert!(futures::poll!(&mut fut).is_pending(), "must queue");
+        drop(fut);
+        drop(all);
+
+        // Nothing to wait for: the drop is synchronous with the future's.
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "a queued job must not run");
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "dropping a queued caller must drop the job closure, releasing what it carried"
+        );
+    }
+
+    /// Many jobs at once all complete, exercising queueing past the limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queues_beyond_the_concurrency_limit() {
+        let _exclusive = EXCLUSIVE.lock().await;
+        let n = concurrency_limit() * 4;
         let jobs = (0..n).map(|i| run(move || i * 2));
         let out = futures::future::join_all(jobs).await;
         assert_eq!(out, (0..n).map(|i| i * 2).collect::<Vec<_>>());

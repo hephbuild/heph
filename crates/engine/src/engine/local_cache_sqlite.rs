@@ -46,7 +46,7 @@ const READ_POOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// capacity and the copy gets to run.
 ///
 /// **A budget, not a proof.** The demand it covers is real threads — tokio
-/// workers, the `hcore::blocking` pool, rayon, and on Linux one FUSE session
+/// workers, `hcore::blocking` jobs, rayon, and on Linux one FUSE session
 /// thread per core, each of which takes an unpermitted connection per `read` and
 /// per `copy_up` — and under simultaneous peak load from all of them the pool can
 /// still be exhausted. Two of the callers are not brief either: `list_targets`'
@@ -94,7 +94,7 @@ impl PipeSemaphore {
     /// Blocks the calling thread until a permit is available.
     ///
     /// **Contract:** callers must be on a thread that may block — a dedicated OS
-    /// thread (the sqlite writer thread, the `hcore::blocking` pool, a rayon
+    /// thread (the sqlite writer thread, a `hcore::blocking` job, a rayon
     /// worker) or a tokio worker that has handed off its core via
     /// `tokio::task::block_in_place`. Calling this directly from a tokio task
     /// parks the worker and can starve the runtime; so does
@@ -157,11 +157,10 @@ struct SlotState {
     done: bool,
     /// Tasks awaiting this slot.
     ///
-    /// Raw wakers rather than a `tokio::sync::Notify`/`oneshot` so the slot needs
-    /// no runtime to exist: a cdylib plugin's futures are polled by host workers
-    /// with no reactor of the plugin's own, and any tokio timer/IO type there
-    /// panics across the `extern "C"` seam, which aborts. Plain waker traffic is
-    /// safe (same stance as `hcore::blocking`).
+    /// Raw wakers rather than a `tokio::sync::Notify`/`oneshot` so the slot
+    /// needs no runtime to exist: plain waker traffic works from any polling
+    /// context, costs nothing extra, and keeps this type free of assumptions
+    /// about who drives it.
     wakers: Vec<Waker>,
 }
 
@@ -187,11 +186,14 @@ impl PendingSlot {
 
     /// Suspend the calling *task* until the command lands, leaving its worker
     /// free to poll everything else.
+    ///
+    /// The wake-up is issued by the sqlite writer thread, off-runtime — plain
+    /// cross-thread waker traffic, which is trusted: the dropped-wake hazard
+    /// this wait used to insure with `hcore::blocking`'s backstop failed to
+    /// reproduce across ~40M wakes (`docs/CONCURRENCY_MEASUREMENTS.md` §2),
+    /// and the registry it armed no longer exists.
     fn wait_async(self: &Arc<Self>) -> impl Future<Output = ()> + Send + 'static {
         let slot = self.clone();
-        // Held for the whole wait and dropped with the future, so the
-        // registration never outlives what it is waking. See `hcore::blocking`.
-        let armed = hcore::blocking::Backstop::new();
         poll_fn(move |cx| {
             let mut state = slot.state.lock().expect("pending slot mutex poisoned");
             if state.done {
@@ -201,11 +203,6 @@ impl PendingSlot {
                 state.wakers.push(cx.waker().clone());
             }
             drop(state);
-            // The wake-up is issued by the sqlite writer thread, off-runtime —
-            // the same dropped-cross-thread-wake-up exposure `hcore::blocking`
-            // documents, so the same backstop. A lost wake costs latency instead
-            // of stranding the task.
-            armed.arm(cx.waker());
             Poll::Pending
         })
     }

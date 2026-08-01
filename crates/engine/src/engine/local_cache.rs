@@ -189,7 +189,7 @@ pub enum Existence {
 /// A cache-entry writer. The entry becomes durable only on [`commit`](Self::commit);
 /// dropping without commit discards everything written. This is what keeps a
 /// mid-stream failure or an abandoned attempt from ever surfacing as (or
-/// replacing!) a readable entry: the blocking pool runs jobs to completion even
+/// replacing!) a readable entry: `hcore::blocking` jobs run to completion even
 /// when their awaiting future is dropped, so "the caller stopped" must never
 /// imply "the bytes landed".
 pub trait EntryWriter: io::Write + Send {
@@ -405,8 +405,8 @@ fn artifact_is_needed(a: &ManifestArtifact, outputs: &[String], support_needed: 
 ///
 /// Same convention as `CODEC_SLOTS` (remote gzip) and `PKG_EVAL_SLOTS`
 /// (Starlark eval): a class of hundreds-of-ms jobs on the shared, arrival-fair
-/// `hcore::blocking` pool caps itself at the core count so it cannot fill every
-/// pool thread and put the sub-millisecond jobs (warm-hit manifest reads) behind
+/// `hcore::blocking` run slots caps itself at the core count so it cannot fill
+/// every slot and put the sub-millisecond jobs (warm-hit manifest reads) behind
 /// a queue of long ones. Before `cache_locally` fanned artifacts out this class
 /// was implicitly bounded at one job per running target; the fan-out multiplies
 /// that by artifacts-per-target, so the bound has to be explicit. It also caps
@@ -451,21 +451,19 @@ impl Engine {
         artifact: &outputartifact::OutputArtifact,
     ) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
         let hashin = hashin.to_string();
-        // Waited for in async-land, before queueing — parking a pool thread to
-        // wait for a pool thread is the deadlock. The permit rides *into* the
-        // job (released on the pool thread) so a caller that stops being polled
+        // Waited for in async-land, before queueing — parking a run slot to
+        // wait for a run slot is the deadlock. The permit rides *into* the
+        // job (released as the job ends) so a caller that stops being polled
         // cannot strand it; same discipline as `PKG_EVAL_SLOTS`.
         let slot = LOCAL_PACK_SLOTS
             .acquire()
             .await
             .context("acquiring a local pack slot")?;
         // Writing a revision tars and copies every output — the heaviest
-        // synchronous work in a build, once per target. It runs on the dedicated
-        // blocking pool: not inline (that parks a runtime worker with the runtime
-        // unaware, and enough concurrent writes stop the reactor entirely) and not
-        // `spawn_blocking` (whose JoinHandle wake-up rides tokio's cross-thread
-        // waker, observed to drop wakeups on macOS under load — see
-        // the macOS waker hazard in `hproc::proc_exec`). See `hcore::blocking`.
+        // synchronous work in a build, once per target. It goes through
+        // `hcore::blocking::run`, never inline: inline parks a runtime worker
+        // with the runtime unaware, and enough concurrent writes stop the
+        // reactor entirely.
         hcore::blocking::run(enclose!((cache => local_cache, addr, artifact) move || {
             let _slot = slot;
             let open_writer =
@@ -632,8 +630,8 @@ impl Engine {
         };
 
         // All artifacts in flight at once, not one at a time: each write is a
-        // whole tar/copy on the blocking pool, so a multi-output target was
-        // paying its writes back to back while the pool sat idle. Order is
+        // whole tar/copy in a blocking job, so a multi-output target was
+        // paying its writes back to back while its run slots sat idle. Order is
         // preserved (join over an ordered iterator), so the manifest's artifact
         // list stays equal to the input order regardless of which write finishes
         // first — the manifest must not become a function of pool scheduling.
@@ -708,8 +706,8 @@ impl Engine {
     }
 
     /// [`read_manifest`](Self::read_manifest) against a cache handle rather than
-    /// `&self`, so it can be moved onto the blocking pool (which needs a `'static`
-    /// job — see [`read_manifest_blocking`](Self::read_manifest_blocking)).
+    /// `&self`, so it can be moved into a blocking job (which must be `'static`
+    /// — see [`read_manifest_blocking`](Self::read_manifest_blocking)).
     pub(crate) fn read_manifest_from(
         cache: &Arc<dyn LocalCache>,
         addr: &Addr,
@@ -819,10 +817,9 @@ impl Engine {
     /// half of a cache lookup, so its result is stashed and reused across the
     /// presence-probe and the per-caller output read (see `LockedResolution::manifest`).
     ///
-    /// On the dedicated blocking pool (see `hcore::blocking`, and
-    /// `cache_artifact_locally` for why neither inline nor `spawn_blocking` works):
-    /// this runs once per target on the hot path, and a backend read plus a borsh
-    /// parse is more than a runtime worker should disappear into.
+    /// Through `hcore::blocking::run` (see `hcore::blocking` for why not
+    /// inline): this runs once per target on the hot path, and a backend read
+    /// plus a borsh parse is more than a runtime worker should disappear into.
     pub(crate) async fn read_manifest_blocking(
         &self,
         _ctoken: &dyn Cancellable,
@@ -1576,7 +1573,7 @@ mod tests {
         assert!(rendered.contains("second"), "got: {rendered}");
     }
 
-    /// The pack cap gates the path to the blocking pool: with every slot held,
+    /// The pack cap gates the path to the blocking job: with every slot held,
     /// an artifact write must not reach the cache writer; releasing the slots
     /// lets it through. (Borrows a process-wide semaphore, so it briefly delays
     /// any concurrently-running test that writes to a cache.)

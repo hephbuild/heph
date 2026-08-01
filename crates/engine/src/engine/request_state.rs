@@ -421,17 +421,16 @@ impl Drop for DeferredTrims {
             );
             return;
         };
-        // Hand back the blocking pool's backstop registrations first. Each is a
-        // `Waker` that owns whatever its task holds, and one of those tasks is
-        // this request's `mem_locked_result` cell — whose memoized value *is* the
-        // addr's riding cache read. `flush_backstop` releases them, not just
-        // wakes them, which is what unpins the guard the trims below need. See
-        // `hcore::blocking::flush_backstop`.
-        //
-        // This one is on the dropping thread, so it covers what is armed *now*;
-        // the batch flushes again on the cleaner thread, where it can also see
-        // whatever armed in between.
-        hcore::blocking::flush_backstop();
+        // The read guards the batch's trims contend with are unpinned by this
+        // request's own teardown: `deferred_trims` is the last field of
+        // `RequestStateData`, so by the time this drop runs, the request's
+        // memoizers are gone and their abort cascades are in flight — each
+        // tears down a chain whose `mem_locked_result` value *is* an addr's
+        // riding cache read. The cascade lands when the runtime processes it,
+        // which is why the batch below probes, re-probes, and retries once
+        // rather than expecting the guards to be gone already. (The blocking
+        // pool's backstop registry, which used to be flushed here because it
+        // could retain those guards past their wait's end, no longer exists.)
 
         // One job for the batch: `try_trim_after_write` is non-blocking and
         // short, and a job per target would allocate a boxed closure per
@@ -476,7 +475,6 @@ impl Drop for DeferredTrims {
                     failed = report.failed,
                     removed = report.removed,
                     bytes = report.bytes,
-                    flushed = report.flushed,
                     "deferred cache-history trims drained",
                 );
                 // Losing *every* target is not ordinary contention, it is the
@@ -488,7 +486,6 @@ impl Drop for DeferredTrims {
                 if report.batch > 0 && report.still_contended == report.batch {
                     tracing::warn!(
                         batch = report.batch,
-                        flushed = report.flushed,
                         "every deferred cache-history trim lost its lock; \
                          cache.history was not enforced by this run",
                     );
@@ -1059,12 +1056,7 @@ mod tests {
     /// The delay is widened well past the production 25ms first, so the margin is
     /// not something a loaded runner can close by accident.
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "`backstop_exclusive()` serializes whole tests against each other, so its guard is meant to outlive the awaits below. No deadlock: nothing on the awaited path takes this mutex — `wait_drained` polls an `AtomicUsize` and sleeps, and neither the cleaner thread nor `flush_backstop` touches it; the only other holders are the three plain `#[test]` fns in `gc.rs`. And `#[tokio::test]` drives this body via `block_on` on the calling thread, so the `!Send` guard cannot migrate"
-    )]
     async fn the_exit_gate_is_held_across_the_trim_retry() -> anyhow::Result<()> {
-        let _exclusive = crate::engine::gc::backstop_exclusive();
         let (_dir, engine) = test_engine()?;
         let (bg, rs) = bg_state(&engine);
         let a = addr("t");

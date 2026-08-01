@@ -10846,18 +10846,20 @@ mod tests {
     /// has been committed — and the artifacts it walks come straight from
     /// `cache_locally`, which queues them.
     ///
-    /// The content records the thread it was walked on. `hcore::blocking`'s pool
-    /// threads are the only ones named `heph-blocking-*`, so the name is the
-    /// witness. Asserted positively: `!= "tokio-runtime-worker"` would pass
-    /// vacuously, since `#[tokio::test]` runs the body on the test thread.
+    /// The content records whether it was walked inside a `blocking::run` job
+    /// (`hcore::blocking::in_blocking_job` is the witness — tokio's blocking
+    /// threads carry no distinguishing name). Asserted positively: "not on a
+    /// worker" would pass vacuously, since `#[tokio::test]` runs the body on
+    /// the test thread.
     #[tokio::test]
     async fn codegen_write_back_runs_off_the_runtime_workers() -> anyhow::Result<()> {
         use crate::engine::driver::targetdef::path;
 
-        /// A one-file tar that records the thread its walk ran on.
+        /// A one-file tar that records whether its walk ran inside a
+        /// `blocking::run` job.
         struct ThreadRecordingTar {
             bytes: Vec<u8>,
-            thread: Arc<std::sync::Mutex<Option<String>>>,
+            in_job: Arc<std::sync::Mutex<Option<bool>>>,
         }
 
         impl Content for ThreadRecordingTar {
@@ -10868,9 +10870,8 @@ mod tests {
                 &self,
             ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
             {
-                *self.thread.lock().expect("thread slot") = std::thread::current()
-                    .name()
-                    .map(std::borrow::ToOwned::to_owned);
+                *self.in_job.lock().expect("witness slot") =
+                    Some(hcore::blocking::in_blocking_job());
                 Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
                     std::io::Cursor::new(self.bytes.clone()),
                 )?))
@@ -10892,7 +10893,7 @@ mod tests {
         packer.create_raw(b"generated\n".to_vec(), "gen.txt", false);
         let mut bytes = Vec::new();
         packer.pack(&mut bytes)?;
-        let thread = Arc::new(std::sync::Mutex::new(None));
+        let in_job = Arc::new(std::sync::Mutex::new(None));
 
         let def = LinkedTargetDef {
             target: Arc::new(TargetDef {
@@ -10919,7 +10920,7 @@ mod tests {
         let cached = vec![ResultArtifact {
             content: Arc::new(ThreadRecordingTar {
                 bytes,
-                thread: Arc::clone(&thread),
+                in_job: Arc::clone(&in_job),
             }),
             group: "out".to_string(),
             r#type: ManifestArtifactType::Output,
@@ -10934,12 +10935,11 @@ mod tests {
             std::fs::read_to_string(root.path().join("gen.txt"))?,
             "generated\n",
         );
-        let ran_on = thread.lock().expect("thread slot").clone();
-        assert!(
-            ran_on
-                .as_deref()
-                .is_some_and(|n| n.starts_with("heph-blocking")),
-            "the codegen write-back must run on the blocking pool, ran on {ran_on:?}"
+        let recorded = *in_job.lock().expect("witness slot");
+        assert_eq!(
+            recorded,
+            Some(true),
+            "the codegen write-back must run inside a blocking::run job (None = never walked)"
         );
         Ok(())
     }

@@ -270,11 +270,11 @@ impl Engine {
     }
 }
 
-/// Run a synchronous `std::fs` operation on the dedicated blocking pool.
+/// Run a synchronous `std::fs` operation through `hcore::blocking::run`.
 ///
-/// Not `tokio::fs::*` (which routes through `spawn_blocking`, observed to lose
-/// wake-ups on macOS under heavy load) and not inline on the worker (which parks
-/// it without telling the runtime). See `hcore::blocking`.
+/// Not `tokio::fs::*` — that routes through `spawn_blocking` too, but outside
+/// `hcore::blocking`'s concurrency bound — and not inline on the worker (which
+/// parks it without telling the runtime). See `hcore::blocking`.
 async fn sync_fs_op_on_thread<F, T>(f: F) -> std::io::Result<T>
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,

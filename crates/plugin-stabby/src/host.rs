@@ -229,17 +229,14 @@ impl SeamSpawn {
 /// (the guest abandoned the call — e.g. its own seam task was aborted) stops
 /// the spawned body instead of leaking it.
 ///
-/// The backstop is armed on every pending poll, same as the guest's
-/// `SeamTask`: this future is polled by a *guest* worker, so the completion
-/// wake (host task → guest worker) crosses the stabby waker seam. A lost wake
-/// here parks the plugin task on this JoinHandle forever — the guest-side
-/// backstop can't help, since re-polling the guest wrapper only re-polls a
-/// never-woken `JoinHandle` if the wake that was lost is this one. Same
-/// defense-in-depth as `hcore::blocking::run` (docs/CONCURRENCY_MEASUREMENTS.md
-/// §2, lands with #298 below this PR in the stack).
+/// This future is polled by a *guest* worker, so the completion wake (host
+/// task → guest worker) crosses the stabby waker seam — plain waker
+/// forwarding, which is trusted: the dropped-wake hazard this wrapper used to
+/// insure with `hcore::blocking::Backstop` failed to reproduce across ~40M
+/// wakes (docs/CONCURRENCY_MEASUREMENTS.md §2), and that registry no longer
+/// exists.
 struct HostTask<T> {
     handle: tokio::task::JoinHandle<T>,
-    backstop: hcore::blocking::Backstop,
 }
 
 impl<T> std::future::Future for HostTask<T> {
@@ -249,14 +246,7 @@ impl<T> std::future::Future for HostTask<T> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let this = self.get_mut();
-        match std::pin::Pin::new(&mut this.handle).poll(cx) {
-            std::task::Poll::Ready(out) => std::task::Poll::Ready(out),
-            std::task::Poll::Pending => {
-                this.backstop.arm(cx.waker());
-                std::task::Poll::Pending
-            }
-        }
+        std::pin::Pin::new(&mut self.get_mut().handle).poll(cx)
     }
 }
 
@@ -292,7 +282,6 @@ impl SeamSpawn {
                 handle,
                 fut.instrument(self.span.clone()),
             ),
-            backstop: hcore::blocking::Backstop::new(),
         };
         match task.await {
             Ok(v) => v,

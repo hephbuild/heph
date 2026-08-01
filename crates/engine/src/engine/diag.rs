@@ -1186,13 +1186,12 @@ impl StallLog {
 /// Poll [`DiagState::evaluate`] and emit a report when it detects a stall.
 ///
 /// Runs on a plain OS thread, never a tokio timer: the whole point is to keep
-/// working when the runtime is saturated or the reactor is not turning, which is
-/// the condition being diagnosed. It is deliberately *not* merged into
-/// `hcore::blocking`'s backstop thread — that one is a correctness mechanism for
-/// dropped wake-ups, and this one ends in blocking I/O. In CI stderr is a pipe;
-/// a stalled consumer would fill the 64 KiB buffer and block forever, freezing
-/// waker delivery for the entire blocking pool. The watchdog would then hang the
-/// process it exists to diagnose.
+/// working when the runtime is saturated or the reactor is not turning, which
+/// is the condition being diagnosed. It must also never share a thread with
+/// anything correctness-bearing, because it ends in blocking I/O: in CI stderr
+/// is a pipe, and a stalled consumer would fill the 64 KiB buffer and park
+/// this thread forever. On a thread of its own that only silences the
+/// watchdog, not the process it exists to diagnose.
 ///
 /// `emit` takes the report, not the rendered text: the caller decides what goes
 /// to the file and what goes to the terminal, and rendering inside the watchdog
