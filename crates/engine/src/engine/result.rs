@@ -44,11 +44,36 @@ const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5
 type BoxedResultFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<Arc<EResult>>> + Send + 'a>>;
 
-tokio::task_local! {
-    /// Set for the duration of a `Provider::list` call dispatched by a
-    /// discovery walk's per-package fan-out — both `Engine::query`'s (in
-    /// `query.rs`) and `EngineProviderExecutor::query`'s own nested one (below)
-    /// scope this around their `.list(...)` call.
+/// rs carries the parent addr (set by result_addr via with_parent) so the executor
+/// does not need to store it separately.
+pub(crate) struct EngineProviderExecutor {
+    engine: Weak<Engine>,
+    rs: Arc<RequestState>,
+    /// True for an executor constructed via [`Self::for_list`] — i.e. one handed
+    /// to `Provider::list` by a discovery walk's per-package fan-out. Only
+    /// `query()` checks it; `result`/`note_dep`/`states_under` work regardless.
+    ///
+    /// Carried on the instance rather than in a tokio task-local deliberately:
+    /// a task-local is scoped to one poll chain, so a provider that moves the
+    /// executor into a `tokio::spawn`ed task (or calls back across the plugin
+    /// ABI seam, where the guest cannot see host task-locals at all) would
+    /// silently escape the guard. The instance flag survives any spawn.
+    for_provider_list: bool,
+}
+
+impl EngineProviderExecutor {
+    pub(crate) fn new(engine: Weak<Engine>, rs: Arc<RequestState>) -> Self {
+        Self {
+            engine,
+            rs,
+            for_provider_list: false,
+        }
+    }
+
+    /// The executor to hand to a `Provider::list` call dispatched by a discovery
+    /// walk's per-package fan-out — both `Engine::query`'s (in `query.rs`) and
+    /// `EngineProviderExecutor::query`'s own nested one (below) use this for
+    /// their `.list(...)` call.
     ///
     /// `ListRequest::executor` hands `list()` implementations the same `query()`
     /// capability `get()` gets (see the ABI note at the `query()` call site). A
@@ -57,21 +82,14 @@ tokio::task_local! {
     /// pinned memory and scheduler pressure rather than a hard deadlock (nesting
     /// doesn't manufacture extra `PKG_EVAL_SLOTS` permits, see the long comment at
     /// the fan-out), but with no in-tree caller and no diagnostic if a third-party
-    /// or out-of-process plugin ever does it by accident. `query()` checks this
-    /// flag first and fails loudly instead of silently nesting.
-    pub(crate) static IN_PROVIDER_LIST: ();
-}
-
-/// rs carries the parent addr (set by result_addr via with_parent) so the executor
-/// does not need to store it separately.
-pub(crate) struct EngineProviderExecutor {
-    engine: Weak<Engine>,
-    rs: Arc<RequestState>,
-}
-
-impl EngineProviderExecutor {
-    pub(crate) fn new(engine: Weak<Engine>, rs: Arc<RequestState>) -> Self {
-        Self { engine, rs }
+    /// or out-of-process plugin ever does it by accident. `query()` checks
+    /// `for_provider_list` first and fails loudly instead of silently nesting.
+    pub(crate) fn for_list(engine: Weak<Engine>, rs: Arc<RequestState>) -> Self {
+        Self {
+            engine,
+            rs,
+            for_provider_list: true,
+        }
     }
 }
 
@@ -252,10 +270,11 @@ impl ProviderExecutor for EngineProviderExecutor {
         extra_skip: &'a [String],
     ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
         Box::pin(async move {
-            // See `IN_PROVIDER_LIST`: a provider calling back into `query()` from
-            // its own `list()` would nest a K-wide walk under an already-running
-            // one. Fail loudly here rather than let it silently nest.
-            if IN_PROVIDER_LIST.try_with(|()| ()).is_ok() {
+            // See `EngineProviderExecutor::for_list`: a provider calling back into
+            // `query()` from its own `list()` would nest a K-wide walk under an
+            // already-running one. Fail loudly here rather than let it silently
+            // nest.
+            if self.for_provider_list {
                 anyhow::bail!(
                     "ListRequest::executor.query() was called from inside Provider::list() \
                      — this would nest a K-wide package walk under an already-running one; \
@@ -274,8 +293,9 @@ impl ProviderExecutor for EngineProviderExecutor {
 
             // One `list` callback surface for the whole walk, not one per
             // (package, provider) pair — it is stateless apart from the engine
-            // handle and the request.
-            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::new(
+            // handle and the request. `for_list`, so a reentrant `query()` on it
+            // is caught — see its doc comment.
+            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::for_list(
                 Arc::downgrade(&engine),
                 rs.clone(),
             ));
@@ -306,7 +326,8 @@ impl ProviderExecutor for EngineProviderExecutor {
             // `list` gets K nested walks. No in-tree provider does (plugin-go's
             // `list` calls only `states_under`), but it is a constraint on the
             // plugin surface, not an accident of the current callers — and it is
-            // enforced below (`IN_PROVIDER_LIST`), not just documented here.
+            // enforced (the executor above is `for_list`, so its `query()`
+            // refuses), not just documented here.
             let per_pkg = futures::stream::iter(pkgs.into_iter()
                 // Ends the source when abandoning, so the drain joins only the
                 // <=K tasks already spawned instead of spawning one per remaining
@@ -346,24 +367,20 @@ impl ProviderExecutor for EngineProviderExecutor {
                                 continue;
                             }
                             // Collect list results eagerly (non-Send iterator dropped before next await).
-                            // Scoped under `IN_PROVIDER_LIST` so a reentrant `executor.query()`
-                            // called from inside this `list()` is caught — see its doc comment.
-                            let list_iter = IN_PROVIDER_LIST
-                                .scope(
-                                    (),
-                                    provider.provider.list(
-                                        ListRequest {
-                                            request_id: rs.request_id().to_string(),
-                                            package: pkg.clone(),
-                                            states: states
-                                                .iter()
-                                                .filter(|s| s.provider == provider.name)
-                                                .cloned()
-                                                .collect(),
-                                            executor: Arc::clone(&executor),
-                                        },
-                                        rs.ctoken(),
-                                    ),
+                            let list_iter = provider
+                                .provider
+                                .list(
+                                    ListRequest {
+                                        request_id: rs.request_id().to_string(),
+                                        package: pkg.clone(),
+                                        states: states
+                                            .iter()
+                                            .filter(|s| s.provider == provider.name)
+                                            .cloned()
+                                            .collect(),
+                                        executor: Arc::clone(&executor),
+                                    },
+                                    rs.ctoken(),
                                 )
                                 .await?;
                             let raw: Vec<_> = list_iter.collect::<anyhow::Result<Vec<_>>>()?;
@@ -3627,10 +3644,10 @@ impl Engine {
         let mut pending_cycle: Option<anyhow::Error> = None;
         for provider in self.providers.iter() {
             let provider_rs = rs.with_skip_provider(&provider.name);
-            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
-                engine: Arc::downgrade(&self),
-                rs: provider_rs,
-            });
+            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::new(
+                Arc::downgrade(&self),
+                provider_rs,
+            ));
 
             let spec = match provider
                 .provider
@@ -4683,10 +4700,7 @@ mod tests {
         let rs = engine.new_state();
         let skipped_rs = rs.with_skip_provider("test_provider");
 
-        let executor = EngineProviderExecutor {
-            engine: SArc::downgrade(&engine),
-            rs: skipped_rs,
-        };
+        let executor = EngineProviderExecutor::new(SArc::downgrade(&engine), skipped_rs);
 
         let _addrs = executor
             .query(&Matcher::Package(PkgBuf::from("any")), &[])
@@ -6980,11 +6994,11 @@ mod tests {
     }
 
     /// A `list()` implementation that calls back into `req.executor.query()` —
-    /// exactly the reentrant call `IN_PROVIDER_LIST` exists to catch (see its doc
-    /// comment). No in-tree provider does this, but nothing stopped a third-party
-    /// or out-of-process one from nesting a second K-wide walk under the one
-    /// already dispatching this `list()` call, silently, with no diagnostic.
-    /// Must fail loudly instead.
+    /// exactly the reentrant call the `for_list` executor flag exists to catch
+    /// (see `EngineProviderExecutor::for_list`). No in-tree provider does this,
+    /// but nothing stopped a third-party or out-of-process one from nesting a
+    /// second K-wide walk under the one already dispatching this `list()` call,
+    /// silently, with no diagnostic. Must fail loudly instead.
     #[tokio::test]
     async fn list_calling_back_into_query_is_rejected() -> anyhow::Result<()> {
         struct ReentrantQueryProvider {
@@ -7071,6 +7085,115 @@ mod tests {
             .await
             .expect_err(
                 "a list() that calls back into query() must be rejected, not silently nested",
+            );
+        assert!(
+            format!("{err:#}").contains("Provider::list"),
+            "expected the reentrancy error, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// The same reentrant `query()`, but issued from a `tokio::spawn`ed task
+    /// inside `list()` — the shape a plugin-side runtime gives every provider
+    /// body once `list` futures are spawned rather than polled inline.
+    ///
+    /// This is the case the instance-carried flag exists for: the previous
+    /// task-local guard was scoped to the poll chain awaiting `list()`, so a
+    /// spawn severed it and the nested walk went undetected. The flag rides on
+    /// the executor the provider was handed, so it survives any spawn —
+    /// including across the plugin ABI seam, where the guest cannot see host
+    /// task-locals even in principle.
+    #[tokio::test]
+    async fn list_calling_back_into_query_from_spawned_task_is_rejected() -> anyhow::Result<()> {
+        struct SpawnedReentrantQueryProvider {
+            pkg: String,
+        }
+
+        impl crate::engine::provider::Provider for SpawnedReentrantQueryProvider {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "spawned-reentrant".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
+                Box::pin(async move {
+                    // Incorrect provider behaviour, from a task the host did not
+                    // poll into: the guard must still trip.
+                    let executor = SArc::clone(&req.executor);
+                    tokio::spawn(async move {
+                        executor
+                            .query(&Matcher::PackagePrefix(PkgBuf::from("")), &[])
+                            .await
+                    })
+                    .await??;
+                    Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
+            > {
+                let pkg = self.pkg.clone();
+                Box::pin(async move {
+                    let items: Vec<anyhow::Result<ListPackageResponse>> =
+                        vec![Ok(ListPackageResponse {
+                            pkg: PkgBuf::from(pkg.as_str()),
+                        })];
+                    Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+                })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                _req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+            }
+        }
+
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(|_| {
+            Box::new(SpawnedReentrantQueryProvider {
+                pkg: "p".to_string(),
+            })
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let matcher = Matcher::PackagePrefix(PkgBuf::from(""));
+        let err = SArc::clone(&engine)
+            .query(rs, &matcher)
+            .try_collect::<Vec<Addr>>()
+            .await
+            .expect_err(
+                "a spawned task calling back into query() from list() must be \
+                 rejected, not silently nested",
             );
         assert!(
             format!("{err:#}").contains("Provider::list"),

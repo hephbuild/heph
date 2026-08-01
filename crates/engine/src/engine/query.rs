@@ -31,9 +31,11 @@ impl Engine {
             let mut seen: FxHashSet<Addr> = FxHashSet::default();
             // Callback surface handed to each `list` so a provider can gather
             // config beyond the package ancestry (e.g. the go module variant
-            // universe via `states_under`).
+            // universe via `states_under`). `for_list`, so a reentrant
+            // `executor.query()` called from inside a `list()` is caught rather
+            // than silently nested — see its doc comment in `result.rs`.
             let executor: Arc<dyn hplugin::provider::ProviderExecutor> = Arc::new(
-                crate::engine::result::EngineProviderExecutor::new(Arc::downgrade(&self), rs.clone()),
+                crate::engine::result::EngineProviderExecutor::for_list(Arc::downgrade(&self), rs.clone()),
             );
             let pkgs: Vec<String> = self.packages(m, &rs).await?.collect::<anyhow::Result<_>>()?;
 
@@ -151,11 +153,7 @@ impl Engine {
                     let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
 
                     for provider in &engine.providers {
-                        // Scoped under `IN_PROVIDER_LIST` so a reentrant
-                        // `executor.query()` called from inside this `list()` is
-                        // caught rather than silently nested — see its doc
-                        // comment in `result.rs`.
-                        let it = crate::engine::result::IN_PROVIDER_LIST.scope((), provider.provider.list(ListRequest {
+                        let it = provider.provider.list(ListRequest {
                             request_id: rs.request_id().to_string(),
                             package: pkg.clone(),
                             states: states
@@ -164,7 +162,7 @@ impl Engine {
                                 .cloned()
                                 .collect(),
                             executor: Arc::clone(&executor),
-                        }, rs.ctoken())).await?;
+                        }, rs.ctoken()).await?;
                         // The iterator is not `Send`; drain it before the next await.
                         let raw: Vec<_> = it.collect::<anyhow::Result<Vec<_>>>()?;
 
