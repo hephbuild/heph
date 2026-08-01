@@ -2508,6 +2508,15 @@ impl Engine {
             // caller needs them.
             Some(manifest) => (None, Some(manifest), RemoteCell::new()),
             None => {
+                // The settled local miss: both probes came back empty under the
+                // write lock, so this fires exactly once per cold target — the
+                // probe itself stays silent on a miss (see
+                // `probe_cache_manifest`). Uncacheable targets never reach this
+                // path (early return above), so the hit/miss stats cover only
+                // targets that could have hit.
+                rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
+                    addr: addr.format(),
+                });
                 // Local miss under the write lock: ask the remote caches whether
                 // this revision exists. Manifest only — no output blob is
                 // downloaded here, and none may be: a dependent that just needs
@@ -3287,10 +3296,27 @@ impl Engine {
     }
 
     /// Probe the **local** manifest for `(addr, hashin)` and decide whether it is
-    /// a usable hit, emitting the hit/miss event. Returns the parsed manifest so
-    /// the per-caller output read in
+    /// a usable hit, emitting `LocalCacheHit` on a hit. Returns the parsed
+    /// manifest so the per-caller output read in
     /// [`execute_and_cache`](Self::execute_and_cache) reuses it instead of
     /// re-reading + re-deserializing it from the cache backend.
+    ///
+    /// A miss emits **nothing** here: this runs twice per cold target (the
+    /// optimistic probe under the read lock, then the re-check under the write
+    /// lock), so emitting the miss inside the probe double-counted every cold
+    /// target in the hit/miss stats. The caller emits `LocalCacheMiss` exactly
+    /// once, at the settled miss under the write lock — see
+    /// [`resolve_locked_inner`](Self::resolve_locked_inner). Only one probe can
+    /// hit (a hit returns before the second probe runs), so the hit emission
+    /// stays here.
+    ///
+    /// Neither event is emitted for a hash-only request. Those are nested
+    /// recomputes — the in_place write-back guard re-deriving a dep's `hashout`
+    /// (see [`Self::meta`]) — not resolutions a user asked for, and the same
+    /// addr is probed again by the real request that wraps them. They carry no
+    /// event sender, so the TUI and CI summaries never saw them either way, but
+    /// hooks (telemetry, the GHA summary) are dispatched regardless of the
+    /// sender and were counting each nested probe as another hit.
     ///
     /// A local manifest is not proof of residency: a revision whose manifest was
     /// mirrored from a remote (see
@@ -3330,15 +3356,11 @@ impl Engine {
             .read_manifest_blocking(rs.ctoken(), addr, hashin)
             .await?
             .map(Arc::new);
-        rs.emit(if hit.is_some() {
-            crate::engine::event::BuildEventKind::LocalCacheHit {
+        if hit.is_some() && !rs.hash_only() {
+            rs.emit(crate::engine::event::BuildEventKind::LocalCacheHit {
                 addr: addr.format(),
-            }
-        } else {
-            crate::engine::event::BuildEventKind::LocalCacheMiss {
-                addr: addr.format(),
-            }
-        });
+            });
+        }
         Ok(hit)
     }
 
@@ -5604,11 +5626,23 @@ mod tests {
             engine_with_remote(vec![static_target("//pkg:t", &[], &[])], &remote_uri)?;
         let (res, events) = resolve_collecting_events(&miss_engine, &addr).await;
         res.expect("target must resolve on a remote miss");
-        assert!(
-            events.iter().any(
-                |e| matches!(&e.kind, BuildEventKind::RemoteCacheMiss { addr } if addr == "//pkg:t")
+        assert_eq!(
+            count_kind(
+                &events,
+                |e| matches!(e, BuildEventKind::RemoteCacheMiss { addr } if addr == "//pkg:t")
             ),
-            "empty remote must emit RemoteCacheMiss: {events:?}"
+            1,
+            "empty remote must emit exactly one RemoteCacheMiss: {events:?}"
+        );
+        // The remote lookup only runs after the local miss settles under the
+        // write lock, and that miss is emitted once — not once per probe.
+        assert_eq!(
+            count_kind(
+                &events,
+                |e| matches!(e, BuildEventKind::LocalCacheMiss { addr } if addr == "//pkg:t")
+            ),
+            1,
+            "expected exactly one LocalCacheMiss: {events:?}"
         );
         assert!(
             !events.iter().any(
@@ -5643,11 +5677,23 @@ mod tests {
             engine_with_remote(vec![static_target("//pkg:t", &[], &[])], &remote_uri)?;
         let (res, events) = resolve_collecting_events(&hit_engine, &addr).await;
         res.expect("target must resolve on a remote hit");
-        assert!(
-            events.iter().any(
-                |e| matches!(&e.kind, BuildEventKind::RemoteCacheHit { addr } if addr == "//pkg:t")
+        assert_eq!(
+            count_kind(
+                &events,
+                |e| matches!(e, BuildEventKind::RemoteCacheHit { addr } if addr == "//pkg:t")
             ),
-            "a remote pull must emit RemoteCacheHit: {events:?}"
+            1,
+            "a remote pull must emit exactly one RemoteCacheHit: {events:?}"
+        );
+        // A remote-served target is a local miss exactly once — the shape the
+        // TUI/telemetry summaries render on a remote-backed cold run.
+        assert_eq!(
+            count_kind(
+                &events,
+                |e| matches!(e, BuildEventKind::LocalCacheMiss { addr } if addr == "//pkg:t")
+            ),
+            1,
+            "expected exactly one LocalCacheMiss: {events:?}"
         );
         assert!(
             !events.iter().any(
@@ -7888,6 +7934,13 @@ mod tests {
         Ok((Arc::new(engine), root))
     }
 
+    /// How many collected events match `pred`. Cache hit/miss assertions want a
+    /// *count*, not an `any` — the bug these tests pin was one event emitted
+    /// twice for one target, which every `any` in the suite happily accepted.
+    fn count_kind(events: &[BuildEvent], pred: impl Fn(&BuildEventKind) -> bool) -> usize {
+        events.iter().filter(|e| pred(&e.kind)).count()
+    }
+
     /// Resolve `addr` with a fresh event-collecting `RequestState`, then drop the
     /// state (closing the sender) and drain every emitted event.
     async fn resolve_collecting_events(
@@ -7935,11 +7988,16 @@ mod tests {
             )),
             "expected ExecuteStart{{driver:exec, cache:true}}, got {events:?}"
         );
-        assert!(
-            events.iter().any(
-                |e| matches!(&e.kind, BuildEventKind::LocalCacheMiss { addr } if addr == "//pkg:a")
+        // Exactly one: the optimistic probe under the read lock stays silent on a
+        // miss, and only the settled re-check under the write lock emits — a cold
+        // target must not count as two misses in the hit/miss stats.
+        assert_eq!(
+            count_kind(
+                &events,
+                |e| matches!(e, BuildEventKind::LocalCacheMiss { addr } if addr == "//pkg:a")
             ),
-            "expected LocalCacheMiss, got {events:?}"
+            1,
+            "expected exactly one LocalCacheMiss, got {events:?}"
         );
         assert!(
             events.iter().any(|e| matches!(
@@ -8003,11 +8061,21 @@ mod tests {
         let (second, events) = resolve_collecting_events(&engine, &addr).await;
         second.expect("second resolve must succeed");
 
-        assert!(
-            events.iter().any(
-                |e| matches!(&e.kind, BuildEventKind::LocalCacheHit { addr } if addr == "//pkg:a")
+        // Exactly one: a hit returns from the first probe, so the second probe
+        // never runs — and a warm target must not also count a miss.
+        assert_eq!(
+            count_kind(
+                &events,
+                |e| matches!(e, BuildEventKind::LocalCacheHit { addr } if addr == "//pkg:a")
             ),
-            "warm resolve must emit LocalCacheHit, got {events:?}"
+            1,
+            "warm resolve must emit exactly one LocalCacheHit, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, BuildEventKind::LocalCacheMiss { .. })),
+            "warm resolve must not emit LocalCacheMiss, got {events:?}"
         );
         assert!(
             !events
@@ -8020,6 +8088,131 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.kind, BuildEventKind::ExecuteEnd { .. })),
             "warm resolve must not re-execute (no ExecuteEnd), got {events:?}"
+        );
+        Ok(())
+    }
+
+    /// Two requests racing one cold addr produce **one** miss and **one** hit
+    /// between them — never a target counted as both.
+    ///
+    /// This is the other half of the double-count bug. Both requests probe under
+    /// the read lock and both miss; one wins the write lock, executes and
+    /// caches, and the loser's re-probe under that same lock hits. When the probe
+    /// itself emitted the miss, the loser reported `Miss` *and* `Hit` for one
+    /// target — inflating the miss count and letting `built + cached` exceed the
+    /// target count. Only the winner's settled miss may be emitted.
+    ///
+    /// The winner is nondeterministic, but the totals across both streams are
+    /// not: whatever the interleaving (including the degenerate sequential one),
+    /// exactly one execute happens and exactly one of each event.
+    #[tokio::test]
+    async fn concurrent_cold_resolves_emit_one_miss_and_one_hit() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        // Separate `RequestState`s: the per-request memoizer dedups within a
+        // request, so only distinct requests can reach the lock protocol at all.
+        let (a, b) = tokio::join!(
+            resolve_collecting_events(&engine, &addr),
+            resolve_collecting_events(&engine, &addr),
+        );
+        a.0.expect("first concurrent resolve must succeed");
+        b.0.expect("second concurrent resolve must succeed");
+
+        let events: Vec<BuildEvent> = a.1.into_iter().chain(b.1).collect();
+        let count = |pred: fn(&BuildEventKind) -> bool| count_kind(&events, pred);
+        assert_eq!(
+            count(|e| matches!(e, BuildEventKind::LocalCacheMiss { addr } if addr == "//pkg:a")),
+            1,
+            "expected exactly one LocalCacheMiss across both requests, got {events:?}"
+        );
+        assert_eq!(
+            count(|e| matches!(e, BuildEventKind::LocalCacheHit { addr } if addr == "//pkg:a")),
+            1,
+            "the loser's re-probe is the only hit, got {events:?}"
+        );
+        assert_eq!(
+            count(|e| matches!(e, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:a")),
+            1,
+            "the write lock must let exactly one request execute, got {events:?}"
+        );
+        Ok(())
+    }
+
+    /// A `cache = False` target can never hit, so it must not show up in the
+    /// hit/miss stats at all — every consumer (TUI, CI summary, GHA, telemetry)
+    /// folds these events, and counting a target that *cannot* be cached as a
+    /// "miss" misreports cache effectiveness on every run.
+    #[tokio::test]
+    async fn uncacheable_target_emits_no_cache_hit_or_miss_events() -> anyhow::Result<()> {
+        let target = pluginstatictarget::Target {
+            cache: Some(hcore::htvalue::Value::Bool(false)),
+            ..static_target_run("//pkg:nocache", "true")
+        };
+        let (engine, _home) = engine_with_home(vec![target])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:nocache")?;
+
+        // Resolve twice: neither the cold nor the repeat run may emit any
+        // cache hit/miss event for an uncacheable target.
+        for pass in ["cold", "repeat"] {
+            let (res, events) = resolve_collecting_events(&engine, &addr).await;
+            res.unwrap_or_else(|e| panic!("{pass} resolve must succeed: {e:#}"));
+            assert!(
+                !events.iter().any(|e| matches!(
+                    &e.kind,
+                    BuildEventKind::LocalCacheHit { .. }
+                        | BuildEventKind::LocalCacheMiss { .. }
+                        | BuildEventKind::RemoteCacheHit { .. }
+                        | BuildEventKind::RemoteCacheMiss { .. }
+                )),
+                "{pass}: uncacheable target must emit no cache events, got {events:?}"
+            );
+            // It executes every time, announced with `cache: false` so views can
+            // tell an uncacheable execute from a cache-miss execute.
+            assert!(
+                events.iter().any(|e| matches!(
+                    &e.kind,
+                    BuildEventKind::ExecuteStart { addr, cache: false, .. } if addr == "//pkg:nocache"
+                )),
+                "{pass}: expected ExecuteStart{{cache:false}}, got {events:?}"
+            );
+        }
+
+        // `--force` is the other way a resolution becomes uncacheable, and it
+        // shares the same early return today. Pin it separately so splitting
+        // that branch (e.g. teaching force to probe the cache in order to
+        // invalidate it) cannot silently put forced targets back in the stats.
+        let (forced_engine, _forced_home) =
+            engine_with_home(vec![static_target_run("//pkg:forced", "true")])?;
+        let forced_addr = hmodel::htaddr::parse_addr("//pkg:forced")?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = forced_engine.new_state_with_events(true, Some(tx));
+        Arc::clone(&forced_engine)
+            .result_addr(
+                rs.clone(),
+                &forced_addr,
+                OutputMatcher::All,
+                &ResultOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("forced resolve must succeed");
+        drop(rs);
+        let mut forced_events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            forced_events.push(ev);
+        }
+        assert!(
+            !forced_events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::LocalCacheHit { .. }
+                    | BuildEventKind::LocalCacheMiss { .. }
+                    | BuildEventKind::RemoteCacheHit { .. }
+                    | BuildEventKind::RemoteCacheMiss { .. }
+            )),
+            "a forced resolve must emit no cache events, got {forced_events:?}"
         );
         Ok(())
     }
@@ -9163,6 +9356,98 @@ mod tests {
             .meta(engine.new_hash_only_state(addr.clone()), &addr)
             .await
             .expect("a cached target is answerable without building");
+        Ok(())
+    }
+
+    /// A hash-only probe that hits the cache must not report that hit.
+    ///
+    /// These are nested recomputes (the in_place write-back guard and fixpoint
+    /// re-deriving a `hashin`), not resolutions anyone asked for, and the real
+    /// request wrapping them probes the same addrs itself. They carry no event
+    /// sender, so the TUI and the CI summary never saw them — but hooks are
+    /// dispatched regardless of the sender, so telemetry and the GHA summary
+    /// counted each nested probe as another cache hit.
+    #[tokio::test]
+    async fn hash_only_probes_do_not_report_cache_hits_to_hooks() -> anyhow::Result<()> {
+        use crate::engine::hook::Hook;
+
+        #[derive(Default)]
+        struct HitCounter(std::sync::atomic::AtomicUsize);
+        impl Hook for HitCounter {
+            fn name(&self) -> String {
+                "hit-counter".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                if matches!(ev.kind, BuildEventKind::LocalCacheHit { .. }) {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            fn on_close(&self) {}
+        }
+
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        // A dep is what makes the probe run at all: `meta` hashes a target from
+        // its inputs, so it resolves `//pkg:dep` for its `hashout` — and that
+        // resolution is what probes the cache under the hash-only request.
+        let provider = pluginstatictarget::Provider::new(vec![
+            static_target("//pkg:dep", &[], &[]),
+            static_target("//pkg:top", &[], &["//pkg:dep"]),
+        ])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        let counter = Arc::new(HitCounter::default());
+        engine.register_hook(Arc::clone(&counter) as Arc<dyn Hook>)?;
+        let engine = Arc::new(engine);
+        let addr = hmodel::htaddr::parse_addr("//pkg:top")?;
+
+        // Warm the cache; the cold run reports no hit.
+        let rs = engine.new_state();
+        Arc::clone(&engine)
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("cold resolve");
+        drop(rs);
+        let hits = || counter.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(hits(), 0, "a cold resolve reports no cache hit");
+
+        // Hash-only probes hit the cache — and stay silent about it.
+        for _ in 0..3 {
+            Arc::clone(&engine)
+                .meta(engine.new_hash_only_state(addr.clone()), &addr)
+                .await
+                .expect("cached target answerable without building");
+        }
+        assert_eq!(hits(), 0, "hash-only probes must not report cache hits");
+
+        // A real warm resolve still does — one per cached target it resolves.
+        let rs = engine.new_state();
+        Arc::clone(&engine)
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .expect("warm resolve");
+        drop(rs);
+        assert_eq!(
+            hits(),
+            2,
+            "a real warm resolve reports one hit per cached target (top + dep)"
+        );
         Ok(())
     }
 
