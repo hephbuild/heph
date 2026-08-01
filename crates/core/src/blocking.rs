@@ -642,9 +642,14 @@ mod tests {
 
         let _exclusive = exclusive();
 
-        let mem_result: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag("bk-result"));
-        let mem_execute: Arc<Memoizer<String, u32>> =
-            Arc::new(Memoizer::with_tag("bk-execute_cache"));
+        let mem_result: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
+            "bk-result",
+            tokio::runtime::Handle::current(),
+        ));
+        let mem_execute: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
+            "bk-execute_cache",
+            tokio::runtime::Handle::current(),
+        ));
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
 
         // The job blocks until released, so the wait is genuinely pending (and
@@ -676,20 +681,30 @@ mod tests {
             futures::poll!(&mut outer).is_pending(),
             "the chain must park inside blocking::run"
         );
-        assert_eq!(
-            permits.available_permits(),
-            0,
-            "permit captured by the wait"
-        );
+        // The chain's bodies run in spawned tasks: wait (bounded) for the
+        // leaf to actually take the permit and park in the blocking wait.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while permits.available_permits() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wait never captured the permit"
+            );
+            tokio::task::yield_now().await;
+        }
 
         // Fail-fast: the only awaiter goes away while the job is still running.
         drop(outer);
 
-        assert_eq!(
-            permits.available_permits(),
-            1,
-            "abandoning the chain must release the permit held across the blocking wait"
-        );
+        // Task-cell teardown is asynchronous: the abort cascade lands when the
+        // runtime processes it. Eventual, bounded.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while permits.available_permits() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoning the chain must release the permit held across the blocking wait"
+            );
+            tokio::task::yield_now().await;
+        }
         // The permit coming back proves the innermost future was dropped, and
         // dropping it drops its `Backstop` — whose registration removal is
         // proven deterministically by `a_registration_is_released_when_its_wait_ends`.

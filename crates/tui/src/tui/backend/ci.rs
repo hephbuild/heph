@@ -31,19 +31,12 @@ pub async fn run<A: App + 'static>(
     // happens to yield. Spawning lets the fold loop be re-polled on another worker.
     //
     // This also moves the app off the 8 MiB main-thread stack `bootstrap::block_on`
-    // runs on and onto a 2 MiB tokio worker stack. That matters: `heph run` on a
-    // single address awaits `Engine::result_addr` directly on this future
-    // (`commands/run.rs`), and a cache-warm descent resolves the whole dependency
-    // subtree inside one `poll`, ~100 KiB of stack per level.
-    //
-    // What makes the descent safe is `GrowStack`: `Engine::result_addr` returns one,
-    // and it is the only way into `result_addr_impl`, so every level of the result
-    // spine — the outermost included — polls under `stacker::maybe_grow` and takes a
-    // fresh segment when headroom runs low. The spine therefore cannot overflow.
-    // Recursion nested *inside* one level (`plugingo::import_closure`,
-    // `expand_inputs`, `collect_transitive_deps`) is not wrapped and is bounded only
-    // by `RED_ZONE`, exactly as it already is on the batch path — `Engine::result`
-    // spawns each target — and on the interactive backend. See `engine::grow_stack`.
+    // runs on and onto a 2 MiB tokio worker stack. That is safe: with
+    // task-backed request memoizers, every level of the result spine is its
+    // own spawned task, so per-poll stack depth is O(1) in graph depth (the
+    // engine's `deep_warm_chain_completes_on_a_2mib_stack` test pins exactly
+    // this). The one remaining inline recursion — the transparent-group
+    // re-inline — polls under `GrowStack` and has its own pinned deep test.
     //
     // `Engine::drop` (FUSE unmount, SQLite flush, sandbox rmdir) now runs on the
     // worker that polled the app to completion rather than on the main thread; it

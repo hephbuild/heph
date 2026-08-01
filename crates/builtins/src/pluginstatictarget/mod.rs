@@ -30,6 +30,11 @@ pub struct Target {
     /// Sandbox this target contributes to whoever depends on it — the deps/tools
     /// the engine folds into a dependent's def when transitives are applied.
     pub transitive: Sandbox,
+    /// Extra config entries merged verbatim after the derived ones — for
+    /// drivers whose schema the fields above don't model (e.g. `group`, whose
+    /// `deps` is a flat list where this provider's `deps` field derives a
+    /// per-group map).
+    pub raw_config: HashMap<String, Value>,
 }
 
 pub struct Provider {
@@ -74,6 +79,7 @@ impl Provider {
                         .collect();
                     config.insert("deps".to_string(), Value::Map(map));
                 }
+                config.extend(t.raw_config);
                 Ok(TargetSpec {
                     addr: parse_addr(&t.addr)?,
                     driver: t.driver,

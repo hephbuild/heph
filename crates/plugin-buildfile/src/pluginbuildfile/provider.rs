@@ -186,15 +186,19 @@ pub struct Provider {
     pub(crate) walker: Arc<CachedWalker>,
 }
 
-impl Default for Provider {
-    fn default() -> Self {
+impl Provider {
+    /// Field defaults shared by the real constructors (which inject the
+    /// memoizer's runtime) and the test-only `Default`.
+    pub(crate) fn base(
+        pkg_cache: Memoizer<String, Result<Arc<RunResult>, Arc<anyhow::Error>>>,
+    ) -> Self {
         Self {
             root: std::path::PathBuf::from("/"),
             build_file_patterns: default_build_file_patterns(),
             skip: Arc::new(Ignore::default()),
             default_driver: None,
             requests: Mutex::new(HashMap::new()),
-            pkg_cache: Memoizer::with_tag("buildfile_pkg"),
+            pkg_cache,
             packages: OnceLock::new(),
             file_cache: Arc::new(Mutex::new(HashMap::new())),
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -206,12 +210,33 @@ impl Default for Provider {
     }
 }
 
+/// Test-only: the memoizer needs a runtime handle, and struct-update tests
+/// (`..Provider::default()`) have no natural place to inject one — a shared
+/// static test runtime serves them. Production constructors take the handle
+/// explicitly.
+#[cfg(test)]
+impl Default for Provider {
+    fn default() -> Self {
+        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let handle = RT
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+            })
+            .handle()
+            .clone();
+        Self::base(Memoizer::with_tag_task("buildfile_pkg", handle))
+    }
+}
+
 impl Provider {
     pub fn new(root: std::path::PathBuf, runtime: tokio::runtime::Handle) -> Self {
         Self {
             root,
-            pkg_cache: Memoizer::with_tag_task("buildfile_pkg", runtime),
-            ..Self::default()
+            ..Self::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
         }
     }
 
@@ -268,8 +293,7 @@ impl Provider {
             build_file_patterns: compiled,
             skip: Arc::new(skip),
             default_driver,
-            pkg_cache: Memoizer::with_tag_task("buildfile_pkg", runtime),
-            ..Self::default()
+            ..Self::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
         })
     }
 }

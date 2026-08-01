@@ -1,7 +1,7 @@
 //! Task-backed memoizer cell: the computation is a spawned tokio task, not a
 //! future cooperatively polled by its awaiters.
 //!
-//! The poll-based cell (`cell.rs`) exists for two constraints that no longer
+//! The poll-based cell it replaced existed for two constraints that no longer
 //! hold: plugin-linked code had no runtime context (fixed by spawn-at-the-seam
 //! — every ABI entry point body now runs on its side's runtime), and
 //! cancellation-by-abandonment (a future nobody polls) broke `futures::Shared`

@@ -55,8 +55,9 @@ impl Engine {
         // has no open `execute` span and shows only as an open `result`.
         let d = crate::engine::diag::global();
         d.limiter("workers").observe(pool.available(), d.now_ms());
-        // Parks holding nothing until a permit is genuinely free — see
-        // `worker_pool`. A caller abandoned mid-wait strands no permit.
+        // Fair queue — see `worker_pool`'s module docs for the contract: a
+        // waiter dropped mid-wait leaves the queue, and a permit assigned to
+        // a since-aborted waiter returns on its `Acquire` drop.
         let _permit = pool.acquire().await.context("worker pool closed")?;
         // Counted once the permit is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();

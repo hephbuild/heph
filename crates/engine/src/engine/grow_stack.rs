@@ -1,27 +1,30 @@
-//! On-demand stack growth for the recursive result/meta traversal.
+//! On-demand stack growth for the transparent-group re-inline — the one
+//! recursion in `result_addr` that still nests poll frames.
 //!
-//! `Engine::result_addr` resolves a target by recursively resolving its inputs'
-//! results (to hash them) — one `#[async_recursion]` level per dependency-graph
-//! edge. Because intermediate `result`/`meta`/`spec` lookups hit the memoizer
-//! cache and resolve *synchronously* (no `Pending`, no yield), a single `poll`
-//! can descend the whole dep graph in one go, building ~30 stack frames (~100 KiB)
-//! per level. On a deep go monorepo this overflows the 2 MiB tokio worker stack
-//! ("thread 'tokio-rt-worker' has overflowed its stack").
+//! With task-backed request memoizers, the memoized result/meta descent is a
+//! chain of tasks: per-poll stack depth is O(1) in graph depth, and this
+//! wrapper is not involved (the `deep_warm_chain_completes_on_a_2mib_stack`
+//! test pins that without it). Transparent groups are different by design:
+//! they are inlined *before* the memoizer — nothing to deduplicate — so a
+//! group whose member is another group recurses through `result_addr` in the
+//! caller's own poll, one boxed `#[async_recursion]` frame per nesting level.
+//! Deep enough group chains overflow a 2 MiB worker stack (the
+//! `deep_transparent_group_chain_completes_on_a_2mib_stack` test goes red
+//! without this wrapper at 300 levels on a debug build).
 //!
-//! Yielding doesn't help: the cached path never returns `Pending`, and re-polling
-//! a suspended future re-descends the same nested boxed futures, rebuilding the
-//! same depth. The fix is to grow the *physical* stack on demand — the same
-//! approach rustc uses for deeply recursive ASTs. [`GrowStack`] wraps a future so
-//! every `poll` runs under [`stacker::maybe_grow`]: a couple-instruction check on
-//! the hot path, allocating a fresh stack segment only when headroom runs low.
+//! So the group branch wraps its recursive calls in [`GrowStack`]: every
+//! `poll` runs under [`stacker::maybe_grow`] — a couple-instruction check on
+//! the hot path, allocating a fresh stack segment only when headroom runs
+//! low. The same approach rustc uses for deeply recursive ASTs.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// If less than this much stack remains when a wrapped future is polled, grow.
-/// Sized well above the worst-case ~100 KiB a single dep-graph level consumes
-/// between consecutive [`GrowStack`] poll points, so we never run out mid-level.
+/// Inherited from the wrapper's memoized-descent era (sized for ~100 KiB
+/// levels); generous for the group re-inline's ~KB frames, and the check is
+/// cheap enough that right-sizing it buys nothing.
 const RED_ZONE: usize = 512 * 1024;
 
 /// Size of each freshly allocated stack segment. Large enough to host many

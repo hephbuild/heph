@@ -874,7 +874,6 @@ dependencies = [
  "libc",
  "rustc-hash",
  "serde",
- "stacker",
  "tar",
  "tempfile",
  "tokio",
