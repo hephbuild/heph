@@ -394,13 +394,11 @@ fn enrich_hover(
         // the stock server has no docs for these dynamic kwargs, so render the
         // schema field's type + doc ourselves.
         md = field_md;
-    } else if let Some(builtin_md) =
-        builtin_call_name_at(&index.source, byte_offset(&index.source, line, col))
-            .and_then(|name| shared.builtin_hovers.get(name))
-    {
+    } else if let Some(builtin_md) = builtin_call_hover(&index.source, line, col, shared) {
         // The `target` / `provider_state` callee name: both take a raw `*args,
-        // **kwargs`, so the stock hover is meaningless — render the real signature.
-        md = builtin_md.clone();
+        // **kwargs`, so the stock hover is meaningless — render the real
+        // signature, narrowed to the driver/provider this call selects.
+        md = builtin_md;
     } else if md.is_empty()
         && let Some(doc) = index.def_hover_at(line + 1, col + 1)
     {
@@ -411,9 +409,6 @@ fn enrich_hover(
 
     // Append the targets this call site produced, if any.
     let targets = index.targets_at(line + 1, col + 1).unwrap_or(&[]);
-    if md.is_empty() && targets.is_empty() {
-        return;
-    }
     if !targets.is_empty() {
         if !md.is_empty() {
             md.push_str("\n\n---\n\n");
@@ -426,14 +421,18 @@ fn enrich_hover(
         md.push_str("```\n");
     }
 
-    // Once the target has been provided (its addresses resolved above) and the
-    // call site names a driver, append that driver's config-field docs — the
-    // same detail/doc a completion item for these keys would show. Without
-    // this, hovering a target only ever explained the base `target(...)`
-    // signature, never the driver-specific keys actually in play.
-    if !targets.is_empty()
-        && let Some(driver) = target_driver_at(&index.source, byte_offset(&index.source, line, col))
-            .filter(|d| !d.is_empty())
+    // Hovering *inside* a `target(...)` whose driver resolves: append that
+    // driver's config-field docs — the same detail/doc a completion item for
+    // these keys would show. Hovering the callee token instead gets the whole
+    // signature narrowed to the driver (see `builtin_call_hover`), which is
+    // strictly better; this covers every other position in the call.
+    //
+    // The driver is resolved textually, like the matching completion, so this
+    // holds on a buffer that doesn't evaluate. Gating it on the call having
+    // produced targets would have meant the keys disappear the moment a typo
+    // breaks the file — exactly when they're being looked up.
+    if let Some(driver) = target_driver_at(&index.source, byte_offset(&index.source, line, col))
+        .filter(|d| !d.is_empty())
         && let Some(schema) = shared.engine.driver_schema(&driver)
         && !schema.fields.is_empty()
     {
@@ -448,6 +447,12 @@ fn enrich_hover(
         }
     }
 
+    // Nothing to say — leave the stock response alone rather than replacing it
+    // with an empty hover.
+    if md.is_empty() {
+        return;
+    }
+
     let hover = Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -457,6 +462,46 @@ fn enrich_hover(
     };
     resp.result = Some(serde_json::to_value(hover).expect("serialize hover"));
     resp.error = None;
+}
+
+/// Hover markdown for the `target` / `provider_state` callee token under the
+/// cursor, or `None` when the cursor isn't on one.
+///
+/// The signature is narrowed to the call's own `driver = "…"` / `provider = "…"`
+/// whenever that name resolves to a schema, so the hover documents the keys this
+/// target actually accepts instead of a `**config` catch-all. The lookup is
+/// textual, like the matching completion and diagnostics, so it holds up on a
+/// buffer that doesn't evaluate.
+fn builtin_call_hover(source: &str, line: u32, col: u32, shared: &SharedState) -> Option<String> {
+    let offset = byte_offset(source, line, col);
+    let (name, open) = builtin_call_open_at(source, offset)?;
+    // The call's own argument list, not an enclosing one: the cursor is on the
+    // callee token, which sits *before* this call's `(`.
+    let args = call_args_from_open(source, open);
+    let selected = |key: &str| {
+        args.and_then(|a| kwarg_string(a, key))
+            .filter(|v| !v.is_empty())
+    };
+    Some(match name {
+        "provider_state" => {
+            let provider = selected("provider");
+            let schema = provider
+                .as_deref()
+                .and_then(|p| shared.engine.provider_state_schema(p).map(|s| (p, s)));
+            shared
+                .builtin_hovers
+                .provider_state(schema.as_ref().map(|(p, s)| (*p, s)))
+        }
+        _ => {
+            let driver = selected("driver");
+            let schema = driver
+                .as_deref()
+                .and_then(|d| shared.engine.driver_schema(d).map(|s| (d, s)));
+            shared
+                .builtin_hovers
+                .target(schema.as_ref().map(|(d, s)| (*d, s)))
+        }
+    })
 }
 
 /// Hover markdown for a provider-function reference under the cursor, or `None`
@@ -880,7 +925,14 @@ fn target_driver_at(source: &str, offset: usize) -> Option<String> {
 /// and nested calls are skipped so parens/quotes inside them don't confuse the
 /// scan.
 fn enclosing_call_args<'a>(name: &str, source: &'a str, offset: usize) -> Option<&'a str> {
-    let open = innermost_call_open(name, source, offset)?;
+    call_args_from_open(source, innermost_call_open(name, source, offset)?)
+}
+
+/// The argument list of the call whose `(` is at byte `open` — the text up to its
+/// matching `)`, or to the end of the source when that `)` hasn't been typed yet.
+/// String literals and nested calls are skipped so parens and quotes inside them
+/// don't confuse the scan.
+fn call_args_from_open(source: &str, open: usize) -> Option<&str> {
     let region_start = open + 1;
     let b = source.as_bytes();
     let mut depth = 0i32;
@@ -1033,10 +1085,13 @@ fn word_at_offset(source: &str, offset: usize) -> Option<&str> {
 }
 
 /// If the identifier covering `offset` is the callee name of a recognized builtin
-/// call — `target(` or `provider_state(` — return that name; `None` otherwise. The
-/// identifier must be immediately followed (modulo whitespace) by `(`, so a bare
-/// `target` used as a value isn't mistaken for the call. Purely textual.
-fn builtin_call_name_at(source: &str, offset: usize) -> Option<&str> {
+/// call — `target(` or `provider_state(` — return that name and the byte offset of
+/// the `(` that opens the call, so the caller can read the call's own arguments
+/// (which lie *after* the callee token the cursor is on). `None` otherwise.
+///
+/// The identifier must be immediately followed (modulo whitespace) by `(`, so a
+/// bare `target` used as a value isn't mistaken for the call. Purely textual.
+fn builtin_call_open_at(source: &str, offset: usize) -> Option<(&str, usize)> {
     let b = source.as_bytes();
     let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let offset = offset.min(b.len());
@@ -1061,7 +1116,7 @@ fn builtin_call_name_at(source: &str, offset: usize) -> Option<&str> {
     while b.get(k).copied().is_some_and(|c| c.is_ascii_whitespace()) {
         k += 1;
     }
-    (b.get(k) == Some(&b'(')).then_some(word)
+    (b.get(k) == Some(&b'(')).then_some((word, k))
 }
 
 fn field_item(name: &str, ty: &str, doc: String, ctx: &str, required: bool) -> CompletionItem {
@@ -1188,7 +1243,7 @@ fn enrich_completion(
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_call_name_at, find_symbol_def, pkg_of, result_points_to_other_file};
+    use super::{builtin_call_open_at, find_symbol_def, pkg_of, result_points_to_other_file};
     use std::path::Path;
 
     struct FakeEngine {
@@ -1283,7 +1338,7 @@ mod tests {
         };
         let doc_globals =
             crate::pluginbuildfile::run_file::build_globals(&registry).documentation();
-        let builtin_hovers = crate::pluginbuildfile::run_file::builtin_call_hovers(&doc_globals);
+        let builtin_hovers = crate::pluginbuildfile::run_file::BuiltinHovers::new(&doc_globals);
         let engine = Arc::new(FakeEngine {
             root: tmp.path().to_path_buf(),
             registry,
@@ -1473,8 +1528,9 @@ mod tests {
     #[test]
     fn hover_on_provider_state_callee_renders_signature() {
         // Hovering the `provider_state` name (not a field) shows the real
-        // signature, not the stock `def provider_state(*args, **kwargs)`.
-        let content = "provider_state(provider = \"go\")\n";
+        // signature, not the stock `def provider_state(*args, **kwargs)`. The
+        // provider doesn't resolve here, so the `**state` catch-all stands.
+        let content = "provider_state(provider = \"nope\")\n";
         let (shared, uri) = shared_with_index(content);
         // Cursor on the `provider_state` callee (0-based col 3).
         let md = hover_value(&shared, &uri, 0, 3).expect("hover");
@@ -1484,14 +1540,69 @@ mod tests {
     }
 
     #[test]
+    fn hover_on_provider_state_callee_narrows_to_the_selected_provider() {
+        let content = "provider_state(provider = \"go\")\n";
+        let (shared, uri) = shared_with_index(content);
+        let md = hover_value(&shared, &uri, 0, 3).expect("hover");
+        assert!(!md.contains("**state"), "catch-all replaced: {md}");
+        assert!(md.contains("go_codegen_root"), "names the field: {md}");
+        assert!(
+            md.contains("Mark this package as a Go codegen root."),
+            "shows the field doc: {md}"
+        );
+        assert!(md.contains("`go` provider"), "attributes the fields: {md}");
+    }
+
+    #[test]
     fn hover_on_target_callee_renders_signature() {
-        let content = "target(name = \"t\", driver = \"exec\")\n";
+        // No driver named, so nothing can narrow the config keys: the catch-all
+        // stands and the base args are all the hover can promise.
+        let content = "target(name = \"t\")\n";
         let (shared, uri) = shared_with_index(content);
         // Cursor on the `target` callee (0-based col 2).
         let md = hover_value(&shared, &uri, 0, 2).expect("hover");
         assert!(md.contains("name"), "names base arg: {md}");
         assert!(md.contains("**config"), "shows config kwargs: {md}");
         assert!(!md.contains("**kwargs"), "not the raw prototype: {md}");
+    }
+
+    #[test]
+    fn hover_on_target_callee_narrows_to_the_selected_driver() {
+        // The whole point: with `driver = "exec"` on the call, hovering `target`
+        // documents `exec`'s keys instead of an opaque `**config`.
+        let content = "target(name = \"t\", driver = \"exec\")\n";
+        let (shared, uri) = shared_with_index(content);
+        let md = hover_value(&shared, &uri, 0, 2).expect("hover");
+        assert!(!md.contains("**config"), "catch-all replaced: {md}");
+        assert!(md.contains("cmd"), "names the driver field: {md}");
+        assert!(
+            md.contains("Command line to run."),
+            "shows the field doc: {md}"
+        );
+        assert!(md.contains("`exec` driver"), "attributes the fields: {md}");
+        assert!(md.contains("name"), "keeps the base args: {md}");
+    }
+
+    #[test]
+    fn hover_on_target_callee_narrows_on_a_buffer_that_does_not_evaluate() {
+        // The driver is read textually, so the narrowed hover survives a buffer
+        // the engine would reject — which is when the reader needs it most.
+        let content = "target(name = \"t\", driver = \"exec\", bogus = undefined_symbol)\n";
+        let (shared, uri) = shared_with_index(content);
+        let md = hover_value(&shared, &uri, 0, 2).expect("hover");
+        assert!(md.contains("cmd"), "names the driver field: {md}");
+        assert!(md.contains("`exec` driver"), "attributes the fields: {md}");
+    }
+
+    #[test]
+    fn hover_on_target_callee_of_an_unknown_driver_keeps_the_catch_all() {
+        // An unresolvable driver is as unknowable as none at all: the hover must
+        // not claim a narrowed key set it can't back up.
+        let content = "target(name = \"t\", driver = \"nope\")\n";
+        let (shared, uri) = shared_with_index(content);
+        let md = hover_value(&shared, &uri, 0, 2).expect("hover");
+        assert!(md.contains("**config"), "catch-all stands: {md}");
+        assert!(!md.contains("driver's."), "no attribution line: {md}");
     }
 
     #[test]
@@ -1504,6 +1615,30 @@ mod tests {
         let md = hover_value(&shared, &uri, 0, col).expect("hover");
         assert!(md.contains("`exec` driver"), "names the driver: {md}");
         assert!(md.contains("cmd"), "shows the driver field: {md}");
+        assert!(
+            md.contains("Command line to run."),
+            "shows the field doc: {md}"
+        );
+    }
+
+    #[test]
+    fn hover_inside_target_shows_driver_fields_on_a_buffer_that_does_not_evaluate() {
+        // The driver reads textually, so the field docs must survive a buffer
+        // the engine rejects — the earlier gate on the call having produced
+        // targets took them away exactly when the keys were being looked up.
+        let content = "target(name = \"t\", driver = \"exec\", cmd = undefined_symbol)\n";
+        let (shared, uri) = shared_with_index(content);
+        assert!(
+            shared
+                .index(&uri)
+                .expect("index")
+                .targets_at(1, 1)
+                .is_none(),
+            "the buffer must not evaluate, or this proves nothing"
+        );
+        let col = content.find(')').unwrap() as u32;
+        let md = hover_value(&shared, &uri, 0, col).expect("hover");
+        assert!(md.contains("`exec` driver"), "names the driver: {md}");
         assert!(
             md.contains("Command line to run."),
             "shows the field doc: {md}"
@@ -1528,23 +1663,31 @@ mod tests {
 
     #[test]
     fn builtin_call_name_at_detects_callee_only() {
+        let name_at = |s, off| builtin_call_open_at(s, off).map(|(name, _)| name);
         // On the callee name immediately before `(`.
+        assert_eq!(name_at("target(name = \"t\")", 2), Some("target"));
         assert_eq!(
-            builtin_call_name_at("target(name = \"t\")", 2),
-            Some("target")
-        );
-        assert_eq!(
-            builtin_call_name_at("provider_state(provider = \"go\")", 3),
+            name_at("provider_state(provider = \"go\")", 3),
             Some("provider_state")
         );
         // Whitespace between name and `(` is tolerated.
-        assert_eq!(builtin_call_name_at("target  (x)", 2), Some("target"));
+        assert_eq!(name_at("target  (x)", 2), Some("target"));
         // A bare `target` not used as a call → None.
-        assert_eq!(builtin_call_name_at("x = target", 8), None);
+        assert_eq!(name_at("x = target", 8), None);
         // An unrelated identifier → None.
-        assert_eq!(builtin_call_name_at("glob(\"x\")", 1), None);
+        assert_eq!(name_at("glob(\"x\")", 1), None);
         // Inside the args, not on the callee → None.
-        assert_eq!(builtin_call_name_at("target(name = \"t\")", 9), None);
+        assert_eq!(name_at("target(name = \"t\")", 9), None);
+    }
+
+    #[test]
+    fn builtin_call_open_at_points_past_the_callee_token() {
+        // The reported offset is the call's own `(` — the args the hover reads
+        // start there, not at an enclosing call's.
+        let src = "target  (name = \"t\")";
+        let (_, open) = builtin_call_open_at(src, 2).expect("callee");
+        assert_eq!(open, src.find('(').unwrap());
+        assert_eq!(super::call_args_from_open(src, open), Some("name = \"t\""));
     }
 
     #[test]
