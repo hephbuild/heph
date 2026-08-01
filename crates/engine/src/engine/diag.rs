@@ -1343,6 +1343,8 @@ mod tests {
                     key: format!("//call:{}", calls.get()),
                     waiters: Some(1),
                     has_driver: false,
+                    restarts: 0,
+                    age: None,
                 }],
                 0,
                 String::new(),
@@ -1564,6 +1566,8 @@ mod tests {
             key: "//a:b".to_string(),
             waiters: Some(4),
             has_driver: false,
+            restarts: 0,
+            age: None,
         }];
         let text = render_stall(&r);
         assert!(text.contains("The process is"), "{text}");
@@ -1600,6 +1604,8 @@ mod tests {
                 key: format!("@heph/fs:file {i}"),
                 waiters: Some(1),
                 has_driver: true,
+                restarts: 0,
+                age: None,
             })
             .collect();
 
@@ -1642,6 +1648,8 @@ mod tests {
             key: "//a:b".to_string(),
             waiters: Some(1),
             has_driver: true,
+            restarts: 0,
+            age: None,
         }];
         assert!(!r.no_work_in_flight(), "an execute span is real work");
         let text = render_stall(&r);
@@ -1671,6 +1679,8 @@ mod tests {
             key: "//a:b".to_string(),
             waiters: Some(1),
             has_driver: true,
+            restarts: 0,
+            age: None,
         }];
         assert!(!r.no_work_in_flight());
         let text = render_stall(&r);
@@ -1723,6 +1733,8 @@ mod tests {
             key: "//a:b".to_string(),
             waiters: Some(1),
             has_driver: true,
+            restarts: 0,
+            age: None,
         }];
         let text = render_stall(&r);
         assert!(

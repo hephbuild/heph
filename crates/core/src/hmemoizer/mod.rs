@@ -1,4 +1,5 @@
 mod cell;
+mod task_cell;
 
 use futures::FutureExt;
 use rustc_hash::FxHashMap;
@@ -474,7 +475,16 @@ pub struct StuckCell {
     pub waiters: Option<usize>,
     /// Whether an awaiter is elected to re-poll the inner future. See
     /// [`cell::Cell::has_driver`] for why `false` here is the interesting case.
+    /// For a task-backed cell this is "the spawned task is still live" — same
+    /// meaning (somebody is on the hook to finish this cell), same rendering.
     pub has_driver: bool,
+    /// How many aborted predecessors this cell's key has had (task-backed
+    /// cells only; always 0 for poll cells). A climbing count is abort/rejoin
+    /// thrash — work being redone, not work being slow.
+    pub restarts: u32,
+    /// How long the computation has been in flight (task-backed cells only —
+    /// the poll cell records no spawn instant).
+    pub age: Option<Duration>,
 }
 
 impl StuckCell {
@@ -538,6 +548,8 @@ where
                 key: format!("{key:?}"),
                 waiters: cell.waiters(),
                 has_driver: cell.has_driver(),
+                restarts: 0,
+                age: None,
             });
         }
         true
@@ -638,8 +650,17 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
         } else {
             ""
         };
+        let age = match cell.age {
+            Some(a) => format!(" age={:.1}s", a.as_secs_f64()),
+            None => String::new(),
+        };
+        let restarts = if cell.restarts > 0 {
+            format!(" restarts={}", cell.restarts)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "    [{}] {} waiters={waiters} driver={}{mark}\n",
+            "    [{}] {} waiters={waiters} driver={}{age}{restarts}{mark}\n",
             cell.tag, cell.key, cell.has_driver
         ));
     }
@@ -913,6 +934,23 @@ const DROP_RED_ZONE: usize = 256 * 1024;
 const DROP_STACK_PER_GROW: usize = 4 * 1024 * 1024;
 
 pub struct Memoizer<K, V> {
+    inner: Inner<K, V>,
+}
+
+/// The two cell implementations behind [`Memoizer`]'s one API.
+///
+/// `Poll` is the shipped cooperative-polling cell (driver election, waker
+/// slab). `Task` spawns each cold computation as a tokio task on a runtime
+/// handle captured at construction — see `task_cell`'s module docs. The
+/// engine still constructs `Poll` everywhere; flipping construction sites to
+/// [`Memoizer::with_tag_task`] is a deliberate, benched change (one small
+/// commit to revert), not a side effect of this enum existing.
+enum Inner<K, V> {
+    Poll(PollInner<K, V>),
+    Task(task_cell::TaskInner<K, V>),
+}
+
+struct PollInner<K, V> {
     /// Behind an `Arc` so the inventory can hold a `Weak` to it: a `Memoizer`
     /// lives in a `RequestState` field, not an `Arc`, so there is nothing else
     /// for the registry to keep a non-owning handle on.
@@ -968,7 +1006,41 @@ where
             tag,
             cache: Arc::downgrade(&cache),
         }));
-        Self { cache, tag }
+        Self {
+            inner: Inner::Poll(PollInner { cache, tag }),
+        }
+    }
+
+    /// Task-backed variant: every cold computation is spawned as a task on
+    /// `handle` (captured here, never discovered at spawn time). See
+    /// `task_cell`'s module docs for the state machine and its guarantees.
+    /// The engine's construction sites stay on [`with_tag`](Self::with_tag)
+    /// until the flip PR switches them, measured.
+    pub fn with_tag_task(tag: &'static str, handle: tokio::runtime::Handle) -> Self {
+        Self {
+            inner: Inner::Task(task_cell::TaskInner::new(tag, handle)),
+        }
+    }
+
+    fn tag(&self) -> &'static str {
+        match &self.inner {
+            Inner::Poll(p) => p.tag,
+            Inner::Task(t) => t.tag(),
+        }
+    }
+
+    /// Test-only reach into the poll cell map, for the interleaving proofs
+    /// that drive `cancel_abandoned` by hand.
+    #[cfg(test)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the full map type is the point — the tests hand it to cancel_abandoned"
+    )]
+    fn poll_cache(&self) -> &Arc<Mutex<FxHashMap<K, Arc<cell::Cell<V>>>>> {
+        match &self.inner {
+            Inner::Poll(p) => &p.cache,
+            Inner::Task(_) => panic!("poll_cache on a task-backed memoizer"),
+        }
     }
 
     /// Non-inserting peek: returns the memoized value only if it is already
@@ -976,11 +1048,33 @@ where
     /// on a cache hit (e.g. registering a dep edge with `note_dep` instead of a
     /// full `result`) without disturbing the cache or deduping with in-flight work.
     pub fn peek(&self, key: &K) -> Option<V> {
-        let cache = self.cache.lock().expect("memoizer lock poisoned");
-        cache.get(key).and_then(|cell| cell.peek().cloned())
+        match &self.inner {
+            Inner::Poll(p) => {
+                let cache = p.cache.lock().expect("memoizer lock poisoned");
+                cache.get(key).and_then(|cell| cell.peek().cloned())
+            }
+            Inner::Task(t) => t.peek(key),
+        }
     }
 
     pub async fn process<F, Fut>(&self, key: K, f: F) -> V
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = V> + Send + 'static,
+    {
+        match &self.inner {
+            Inner::Poll(p) => p.process(key, f).await,
+            Inner::Task(t) => t.process(key, f).await,
+        }
+    }
+}
+
+impl<K, V> PollInner<K, V>
+where
+    K: std::hash::Hash + Eq + Send + Sync + 'static + fmt::Debug + Clone,
+    V: Clone + Send + Sync + 'static,
+{
+    async fn process<F, Fut>(&self, key: K, f: F) -> V
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = V> + Send + 'static,
@@ -1070,14 +1164,16 @@ where
     }
 }
 
-async fn await_with_stall_check<V, K>(waiter: cell::Await<V>, key: &K, tag: &'static str) -> V
+async fn await_with_stall_check<V, K, Fut>(waiter: Fut, key: &K, tag: &'static str) -> V
 where
-    V: Clone + Send + Sync + 'static,
+    Fut: Future<Output = V>,
     K: fmt::Debug,
 {
     let Some(threshold) = stall_threshold() else {
         return waiter.await;
     };
+    // `timeout_without_reactor` needs `Unpin`; a pinned `&mut` reference is.
+    let waiter = std::pin::pin!(waiter);
     match cell::timeout_without_reactor(threshold, waiter).await {
         Ok(v) => v,
         Err(()) => {
@@ -1214,7 +1310,7 @@ where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
     {
-        let tag = self.tag;
+        let tag = self.tag();
 
         // Fast path: cycle detection disabled. Skip key hashing, the frame
         // push, the task_local::scope wrap, AND the wait-for graph bookkeeping
@@ -1222,7 +1318,7 @@ where
         // deadlocking the runtime, and most runs don't have cycles. Opt back in
         // with `HEPH_DEBUG_MEMOIZER_CYCLE=1`.
         if !cycle_detection_enabled() {
-            return self.process(key, || guard_panics(f())).await;
+            return self.process_result(key, || guard_panics(f())).await;
         }
 
         let key_hash = compute_key_hash(&key);
@@ -1323,7 +1419,7 @@ where
         let result = IN_FLIGHT
             .scope(
                 frame,
-                self.process(key, move || {
+                self.process_result(key, move || {
                     IN_FLIGHT.scope(creator_frame, guard_panics(f()))
                 }),
             )
@@ -1361,6 +1457,25 @@ where
         result
     }
 
+    /// `process` with the task-mode poison contract applied: a poisoned
+    /// task cell panics its joiners (`task_cell::wait_done`), and for this
+    /// `Result`-typed surface that panic is caught and memoized-shaped as an
+    /// `Err` — a shut-down runtime or an unguarded body panic degrades to a
+    /// failed target instead of unwinding into a cdylib seam, where an unwind
+    /// is an abort. Poll mode is untouched: no wrapper, identical behavior to
+    /// before the enum existed. Any non-poison panic is resumed, so the
+    /// debug-only stall panic stays loud in both modes.
+    async fn process_result<F, Fut>(&self, key: K, f: F) -> Result<T, Arc<anyhow::Error>>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, Arc<anyhow::Error>>> + Send + 'static,
+    {
+        match &self.inner {
+            Inner::Poll(_) => self.process(key, f).await,
+            Inner::Task(_) => task_cell::catch_poison(self.process(key, f)).await,
+        }
+    }
+
     /// Evict `key` iff its cell completed with a cycle error.
     ///
     /// Cycle errors are context-dependent — valid only for the call chain that
@@ -1374,15 +1489,21 @@ where
     /// exactly the cells it exists for; an in-flight cell (`peek() == None`)
     /// is never touched.
     fn evict_cached_cycle_error(&self, key: &K) {
-        let mut cache = self.cache.lock().expect("memoizer lock poisoned");
-        let holds_cycle_error = cache.get(key).is_some_and(|cell| {
-            cell.peek().is_some_and(|v| match v {
-                Err(e) => downcast_chain_ref::<MemoizerCycleError>(e).is_some(),
-                Ok(_) => false,
-            })
-        });
-        if holds_cycle_error {
-            cache.remove(key);
+        let holds_cycle_error = |v: &Result<T, Arc<anyhow::Error>>| match v {
+            Err(e) => downcast_chain_ref::<MemoizerCycleError>(e).is_some(),
+            Ok(_) => false,
+        };
+        match &self.inner {
+            Inner::Poll(p) => {
+                let mut cache = p.cache.lock().expect("memoizer lock poisoned");
+                if cache
+                    .get(key)
+                    .is_some_and(|cell| cell.peek().is_some_and(holds_cycle_error))
+                {
+                    cache.remove(key);
+                }
+            }
+            Inner::Task(t) => t.evict_if(key, holds_cycle_error),
         }
     }
 }
@@ -1851,14 +1972,14 @@ mod tests {
         // The completed cell stays in the map with interest back at zero — the
         // state a stale cancellation finds after losing the race.
         let cell = m
-            .cache
+            .poll_cache()
             .lock()
             .expect("memoizer lock poisoned")
             .get("k")
             .cloned()
             .expect("a completed cell is retained as the memoized answer");
         assert_eq!(cell.interest(), 0);
-        cancel_abandoned(&m.cache, &"k".to_string(), &cell);
+        cancel_abandoned(m.poll_cache(), &"k".to_string(), &cell);
 
         let v = m
             .process("k".to_string(), {
@@ -1894,7 +2015,7 @@ mod tests {
         }));
         assert!(futures::poll!(&mut first).is_pending());
         let old_cell = m
-            .cache
+            .poll_cache()
             .lock()
             .expect("memoizer lock poisoned")
             .get("k")
@@ -1903,7 +2024,7 @@ mod tests {
         drop(first); // cancels and evicts
 
         // Idempotence against the (now evicted, future-less) old cell.
-        cancel_abandoned(&m.cache, &"k".to_string(), &old_cell);
+        cancel_abandoned(m.poll_cache(), &"k".to_string(), &old_cell);
 
         // A fresh computation under the same key, still in flight.
         let gate = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -1917,7 +2038,7 @@ mod tests {
         assert!(futures::poll!(&mut second).is_pending());
 
         // The stale cancellation arrives now. It must not touch the fresh cell.
-        cancel_abandoned(&m.cache, &"k".to_string(), &old_cell);
+        cancel_abandoned(m.poll_cache(), &"k".to_string(), &old_cell);
 
         gate.notify_waiters();
         let v = tokio::time::timeout(Duration::from_secs(5), &mut second)
@@ -1954,7 +2075,7 @@ mod tests {
         assert!(v.is_err());
         m.evict_cached_cycle_error(&key);
         assert!(
-            !m.cache.lock().expect("lock").contains_key(&key),
+            !m.poll_cache().lock().expect("lock").contains_key(&key),
             "a cached cycle error must be evicted — it is only valid for the \
              chain that produced it"
         );
@@ -1970,7 +2091,7 @@ mod tests {
         assert!(futures::poll!(&mut inflight).is_pending());
         m.evict_cached_cycle_error(&key);
         assert!(
-            m.cache.lock().expect("lock").contains_key(&key),
+            m.poll_cache().lock().expect("lock").contains_key(&key),
             "an in-flight successor must be spared by a stale cycle eviction"
         );
         gate.notify_waiters();
@@ -1982,8 +2103,179 @@ mod tests {
         // A cell completed with a real value is spared too.
         m.evict_cached_cycle_error(&key);
         assert!(
-            m.cache.lock().expect("lock").contains_key(&key),
+            m.poll_cache().lock().expect("lock").contains_key(&key),
             "a real memoized value must survive a stale cycle eviction"
+        );
+    }
+
+    /// Task-mode `once`: values memoize, and a panicking body memoizes as an
+    /// `Err` (the panic guard runs *inside* the spawned task) — the full
+    /// `once` surface works unchanged over the task cell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_mode_once_memoizes_values_and_guards_panics() {
+        type V = Result<Arc<u32>, Arc<anyhow::Error>>;
+        let m: Memoizer<String, V> =
+            Memoizer::with_tag_task("task-once-test", tokio::runtime::Handle::current());
+
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        for _ in 0..2 {
+            let v = m
+                .once("k".to_string(), {
+                    enclose!((runs) move || async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(Arc::new(5u32))
+                    })
+                })
+                .await;
+            assert_eq!(**v.as_ref().expect("ok"), 5);
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "second call is a warm hit");
+
+        let v = m
+            .once("p".to_string(), || async { panic!("task body panic") })
+            .await;
+        let err = v.expect_err("a panicking body memoizes as Err");
+        assert!(
+            err.to_string().contains("panicked"),
+            "the Err carries the panic provenance: {err}"
+        );
+    }
+
+    /// Task-mode `once` against a shut-down runtime: the spawn failure
+    /// surfaces as a memoized `Err`, never a hang and never an unwind out of
+    /// `once` (inside a cdylib that unwind would be an abort).
+    #[tokio::test]
+    async fn task_mode_once_on_a_dead_runtime_returns_err() {
+        type V = Result<Arc<u32>, Arc<anyhow::Error>>;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let m: Memoizer<String, V> =
+            Memoizer::with_tag_task("dead-rt-once-test", rt.handle().clone());
+        // A runtime cannot be dropped from async context.
+        tokio::task::spawn_blocking(move || drop(rt))
+            .await
+            .expect("shut down the runtime");
+
+        let v = tokio::time::timeout(
+            Duration::from_secs(5),
+            m.once("k".to_string(), || async { Ok(Arc::new(1u32)) }),
+        )
+        .await
+        .expect("a dead runtime must fail fast, not hang");
+        let err = v.expect_err("spawn on a dead runtime memoizes as Err");
+        assert!(
+            err.to_string().contains("runtime shut down"),
+            "the Err names the cause: {err}"
+        );
+    }
+
+    /// Task-mode twin of `cycle_error_eviction_spares_an_innocent_recreated_cell`:
+    /// the eviction is value-keyed through `TaskInner::evict_if` — a cached
+    /// cycle error is evicted, an in-flight successor and a real value are
+    /// spared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_mode_cycle_error_eviction_spares_an_innocent_recreated_cell() {
+        type V = Result<Arc<u32>, Arc<anyhow::Error>>;
+        let m: Memoizer<String, V> =
+            Memoizer::with_tag_task("task-cycle-evict-test", tokio::runtime::Handle::current());
+        let key = "k".to_string();
+
+        let v = m
+            .process(key.clone(), || async move {
+                Err(Arc::new(anyhow::Error::new(MemoizerCycleError {
+                    tag: "task-cycle-evict-test",
+                    key: "k".to_string(),
+                    kind: CycleKind::SelfRecursion,
+                    stack: vec![],
+                }))) as V
+            })
+            .await;
+        assert!(v.is_err());
+        m.evict_cached_cycle_error(&key);
+        assert!(
+            m.peek(&key).is_none(),
+            "a cached cycle error must be evicted from the task cell map"
+        );
+
+        // A completed innocent value is spared.
+        let v = m
+            .process(key.clone(), || async move { Ok(Arc::new(5u32)) as V })
+            .await;
+        assert_eq!(**v.as_ref().expect("ok"), 5);
+        m.evict_cached_cycle_error(&key);
+        assert!(
+            m.peek(&key).is_some(),
+            "a real memoized value must survive a stale cycle eviction"
+        );
+    }
+
+    /// Task-mode cycle detection, end to end. The detection flag is
+    /// process-latched (`OnceLock` over the env), so the actual assertion runs
+    /// in a subprocess of this test binary with the env set at startup; this
+    /// driver only checks the subprocess verdict.
+    #[test]
+    fn task_mode_cycle_detection_is_intact() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "hmemoizer::tests::task_mode_self_cycle_errors_helper",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("HEPH_DEBUG_MEMOIZER_CYCLE", "1")
+            .output()
+            .expect("spawn helper subprocess");
+        assert!(
+            out.status.success(),
+            "task-mode cycle detection helper failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// Body of [`task_mode_cycle_detection_is_intact`] — a same-task re-entry
+    /// through a spawned task-cell body must produce `MemoizerCycleError`, not
+    /// an eternal park. Proves `IN_FLIGHT` scoping survives the spawn (the
+    /// creator-frame wrap travels with the body future into the task).
+    #[tokio::test]
+    #[ignore = "driven by task_mode_cycle_detection_is_intact — needs HEPH_DEBUG_MEMOIZER_CYCLE=1 latched at process start"]
+    async fn task_mode_self_cycle_errors_helper() {
+        assert!(
+            cycle_detection_enabled(),
+            "helper requires the cycle-detection flag latched on at process start"
+        );
+        type V = Result<Arc<u32>, Arc<anyhow::Error>>;
+        let m: Arc<Memoizer<String, V>> = Arc::new(Memoizer::with_tag_task(
+            "task-cycle-detect-test",
+            tokio::runtime::Handle::current(),
+        ));
+        let v = tokio::time::timeout(Duration::from_secs(5), {
+            let m2 = Arc::clone(&m);
+            m.once("A".to_string(), move || async move {
+                // Re-enter our own in-flight key from inside the spawned body.
+                // Without detection this deadlocks (the timeout above catches
+                // it); with it, the inner call must return the typed error.
+                let inner = m2
+                    .once("A".to_string(), || async { Ok(Arc::new(1u32)) })
+                    .await;
+                let err = inner.expect_err("self-recursion must error, not recurse");
+                assert!(
+                    downcast_chain_ref::<MemoizerCycleError>(&err).is_some(),
+                    "the inner error must be the typed cycle error: {err}"
+                );
+                Ok(Arc::new(99u32))
+            })
+        })
+        .await
+        .expect("a self-cycle must error, not hang");
+        assert_eq!(
+            **v.as_ref().expect("outer body completes"),
+            99,
+            "the outer computation proceeds once the inner cycle errored"
         );
     }
 
@@ -2290,12 +2582,16 @@ mod tests {
                 key: "//a:b".to_string(),
                 waiters: Some(3),
                 has_driver: false,
+                restarts: 0,
+                age: None,
             },
             StuckCell {
                 tag: "spec",
                 key: "//c:d".to_string(),
                 waiters: Some(1),
                 has_driver: true,
+                restarts: 0,
+                age: None,
             },
         ];
         let text = render_inventory(&cells, 10);
@@ -2326,12 +2622,16 @@ mod tests {
                 key: "//a:stranded".to_string(),
                 waiters: Some(2),
                 has_driver: false,
+                restarts: 0,
+                age: None,
             },
             StuckCell {
                 tag: "result",
                 key: "//a:abandoned".to_string(),
                 waiters: Some(0),
                 has_driver: false,
+                restarts: 0,
+                age: None,
             },
         ];
         // Enough to trip any cap a future edit might reintroduce.
@@ -2340,6 +2640,8 @@ mod tests {
             key: format!("//p:{i}"),
             waiters: Some(1),
             has_driver: true,
+            restarts: 0,
+            age: None,
         }));
 
         let text = render_report(&ReportSnapshot::from_parts(
@@ -2462,6 +2764,8 @@ mod tests {
                 key: format!("//p:{i}"),
                 waiters: Some(1),
                 has_driver: true,
+                restarts: 0,
+                age: None,
             })
             .collect();
         let text = render_inventory(&cells, 2);

@@ -504,6 +504,43 @@ mod tests {
         assert!(dir.path().join("go/go.mod").is_file());
     }
 
+    /// The deep-graph shape the memoizer redesign's bench gate runs against:
+    /// one target per layer, exactly one dep each — a 200-deep linear chain.
+    /// Depth is the point (the stack-overflow and depth-serialization
+    /// pathologies scale with it), so the chain being unbroken is asserted,
+    /// not assumed: with `fan_out = 1` every non-root layer picks exactly one
+    /// dep from the layer below.
+    #[test]
+    fn generate_supports_a_deep_thin_chain_corpus() {
+        let params = CorpusParams {
+            seed: 5,
+            target_count: 200,
+            packages: 4,
+            layers: 200,
+            fan_out: 1,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = generate(&params, dir.path()).expect("generate deep corpus");
+        assert_eq!(manifest.bash_addrs.len(), 200);
+
+        // 200 targets over 200 layers = 1 per layer; every target except the
+        // single layer-0 root must carry a deps list.
+        let mut with_deps = 0usize;
+        for pkg in &manifest.bash_packages {
+            let src =
+                std::fs::read_to_string(dir.path().join(pkg).join("BUILD")).expect("read BUILD");
+            with_deps += src
+                .lines()
+                .filter(|l| l.trim_start().starts_with("deps"))
+                .count();
+        }
+        assert_eq!(
+            with_deps, 199,
+            "a fan_out=1, one-target-per-layer corpus must be an unbroken chain"
+        );
+    }
+
     #[test]
     fn incrementalize_touches_requested_fraction() {
         let params = CorpusParams {

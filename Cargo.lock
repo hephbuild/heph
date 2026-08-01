@@ -878,6 +878,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tracing",
  "xxhash-rust",
 ]
 
