@@ -1579,8 +1579,17 @@ mod tests {
             md.contains("Command line to run."),
             "shows the field doc: {md}"
         );
-        assert!(md.contains("`exec` driver"), "attributes the fields: {md}");
+        // A blend, not a swap: `target`'s own spec-level fields stay, with their
+        // docs, and the closing line says which half is which.
         assert!(md.contains("name"), "keeps the base args: {md}");
+        assert!(
+            md.contains("Target name (required)."),
+            "keeps the base docs: {md}"
+        );
+        assert!(
+            md.contains("`target`'s own, then the `exec` driver's config"),
+            "attributes each half of the blend: {md}"
+        );
     }
 
     #[test]
@@ -1602,7 +1611,10 @@ mod tests {
         let (shared, uri) = shared_with_index(content);
         let md = hover_value(&shared, &uri, 0, 2).expect("hover");
         assert!(md.contains("**config"), "catch-all stands: {md}");
-        assert!(!md.contains("driver's."), "no attribution line: {md}");
+        assert!(
+            !md.contains("The fields above are"),
+            "no attribution line: {md}"
+        );
     }
 
     #[test]

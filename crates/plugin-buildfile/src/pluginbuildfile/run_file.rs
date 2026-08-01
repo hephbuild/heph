@@ -270,15 +270,19 @@ fn render_builtin_hover(
     }));
     let mut md = render_doc_item_no_link(name, &item);
 
+    // Say which half is which. The list above blends two sources — the
+    // builtin's own spec-level fields, then the selected schema's — and a
+    // reader who can't tell them apart can't tell what changes if they swap the
+    // driver.
     if let Some((schema_name, fields, kind, field_kind)) = schema {
         md.push_str("\n\n");
         if fields.is_empty() {
             md.push_str(&format!(
-                "*The `{schema_name}` {kind} takes no {field_kind} fields.*"
+                "*The fields above are `{name}`'s own; the `{schema_name}` {kind} takes no {field_kind}.*"
             ));
         } else {
             md.push_str(&format!(
-                "*The {field_kind} fields above are the `{schema_name}` {kind}'s.*"
+                "*The fields above are `{name}`'s own, then the `{schema_name}` {kind}'s {field_kind}.*"
             ));
         }
     }
@@ -1859,20 +1863,34 @@ mod tests {
         assert!(md.contains("Command line to run."), "field doc: {md}");
         assert!(md.contains("Echo the command."), "optional field doc: {md}");
         assert!(md.contains("verbose"), "optional field: {md}");
-        // The base args are still there — a driver narrows, it doesn't replace.
-        assert!(md.contains("name"), "keeps base args: {md}");
-        // And the reader can tell where `cmd` came from.
-        assert!(md.contains("`exec` driver"), "attributes the fields: {md}");
+        // A driver narrows the config keys; it never displaces `target`'s own
+        // spec-level fields. Every one of them is still there, documented.
+        for base in target_base_fields() {
+            assert!(
+                md.contains(&base.name),
+                "keeps base arg {}: {md}",
+                base.name
+            );
+            assert!(md.contains(&base.doc), "keeps base doc {}: {md}", base.name);
+        }
+        // Which half is which: the reader must be able to tell `name` (always
+        // there) from `cmd` (there because this target picked `exec`).
+        assert!(
+            md.contains("*The fields above are `target`'s own, then the `exec` driver's config.*"),
+            "attributes each half of the blend: {md}"
+        );
     }
 
     #[test]
     fn builtin_call_hovers_say_so_when_a_driver_takes_no_config() {
         // A config-less driver (`DriverSchema::default()`, what several real
-        // drivers return) must read as "no keys", not as a hover that broke.
+        // drivers return) must read as "no keys", not as a hover that broke —
+        // and must still show `target`'s own fields.
         let md = hovers().target(Some(("bare", &DriverSchema::default())));
         assert!(!md.contains("**config"), "catch-all replaced: {md}");
+        assert!(md.contains("name"), "keeps base args: {md}");
         assert!(
-            md.contains("`bare` driver takes no config fields"),
+            md.contains("`bare` driver takes no config"),
             "says the driver takes nothing: {md}"
         );
     }
@@ -1894,7 +1912,13 @@ mod tests {
             md.contains("Treat this package as a codegen root."),
             "field doc: {md}"
         );
-        assert!(md.contains("`go` provider"), "attributes the fields: {md}");
+        assert!(md.contains("provider"), "keeps the base arg: {md}");
+        assert!(
+            md.contains(
+                "*The fields above are `provider_state`'s own, then the `go` provider's state.*"
+            ),
+            "attributes each half of the blend: {md}"
+        );
     }
 
     #[test]
