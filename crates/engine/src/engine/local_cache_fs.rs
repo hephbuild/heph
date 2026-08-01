@@ -1,5 +1,6 @@
 use crate::engine::local_cache::{
-    Existence, LocalCache, MANIFEST_V1, Manifest, NotFoundError, SizedReader, TargetStream,
+    EntryWriter, Existence, LocalCache, MANIFEST_V1, Manifest, NotFoundError, SizedReader,
+    TargetStream,
 };
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
@@ -39,15 +40,16 @@ impl LocalCacheFS {
 }
 
 /// Staging writer behind [`LocalCacheFS::writer`]: bytes land in a temp file that
-/// is renamed over the final path when the writer is dropped, so the blob appears
-/// atomically. A write error (or a failed final flush) drops the temp instead,
-/// leaving whatever was already at the destination untouched rather than
-/// replacing it with a truncated blob.
+/// is renamed over the final path on [`EntryWriter::commit`], so the blob appears
+/// atomically. Dropping without commit — a write error, an abandoned attempt —
+/// deletes the temp instead, leaving whatever was already at the destination
+/// untouched rather than replacing it with a truncated blob.
 struct AtomicFileWriter {
     file: Option<fs::File>,
     temp: PathBuf,
     dest: PathBuf,
     failed: bool,
+    committed: bool,
 }
 
 impl io::Write for AtomicFileWriter {
@@ -74,15 +76,37 @@ impl io::Write for AtomicFileWriter {
     }
 }
 
+impl EntryWriter for AtomicFileWriter {
+    fn commit(mut self: Box<Self>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.failed,
+            "cannot commit cache file {:?}: an earlier write failed",
+            self.dest
+        );
+        let mut file = self
+            .file
+            .take()
+            .with_context(|| format!("cache writer for {:?} already finalized", self.dest))?;
+        file.flush()
+            .with_context(|| format!("flush cache file {:?}", self.temp))?;
+        drop(file);
+        fs::rename(&self.temp, &self.dest)
+            .with_context(|| format!("rename cache file {:?} into place", self.dest))?;
+        // The temp no longer exists; tell Drop there is nothing to discard.
+        self.committed = true;
+        Ok(())
+    }
+}
+
 impl Drop for AtomicFileWriter {
     fn drop(&mut self) {
-        let flushed = match self.file.take() {
-            Some(mut file) => file.flush().is_ok(),
-            None => false,
-        };
-        if self.failed || !flushed || fs::rename(&self.temp, &self.dest).is_err() {
-            drop(fs::remove_file(&self.temp));
+        if self.committed {
+            return;
         }
+        // Dropped without commit (or commit failed part-way): discard the temp.
+        // The destination keeps whatever complete blob it already had.
+        drop(self.file.take());
+        drop(fs::remove_file(&self.temp));
     }
 }
 
@@ -108,8 +132,7 @@ impl LocalCache for LocalCacheFS {
         })
     }
 
-    /// Write to a sibling temp file and rename it into place once the writer is
-    /// dropped.
+    /// Write to a sibling temp file and rename it into place on commit.
     ///
     /// The rename makes a blob appear atomically: a concurrent reader either sees
     /// the previous complete file or the new one, never a truncated write in
@@ -118,7 +141,7 @@ impl LocalCache for LocalCacheFS {
     /// materializes into an entry other callers are already reading. Both writers
     /// store the same content-addressed bytes, so whichever rename lands last is
     /// equally correct.
-    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
+    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
         let path = self.get_path(addr, hashin, name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -136,6 +159,7 @@ impl LocalCache for LocalCacheFS {
             temp,
             dest: path,
             failed: false,
+            committed: false,
         }))
     }
 
@@ -334,7 +358,7 @@ mod tests {
         // Test writer
         let mut writer = cache.writer(&addr, hashin, name)?;
         writer.write_all(b"hello cache")?;
-        drop(writer);
+        writer.commit()?;
 
         // Test existence
         assert!(cache.exists(&addr, hashin, name)?);
@@ -378,7 +402,7 @@ mod tests {
 
         let mut w = cache.writer(&addr, "h", "out.tar")?;
         w.write_all(b"bytes")?;
-        drop(w);
+        w.commit()?;
 
         let path = cache
             .file_path(&addr, "h", "out.tar")
@@ -413,7 +437,7 @@ mod tests {
             };
             let mut w = cache.writer(&addr, h, MANIFEST_V1)?;
             borsh::to_writer(&mut w, &manifest)?;
-            drop(w);
+            w.commit()?;
         }
 
         // One distinct target, recovered from the manifest's `target` field.
@@ -439,7 +463,7 @@ mod tests {
         );
         let mut w = cache.writer(&addr, "h", "blob")?;
         w.write_all(b"0123456789abcdef")?;
-        drop(w);
+        w.commit()?;
 
         let mut r = cache
             .seekable_reader(&addr, "h", "blob")?

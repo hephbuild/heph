@@ -20,8 +20,8 @@
 //! run, so it grows by at most one entry per uncacheable target (within the
 //! capacity budget) and is reclaimed when the process exits.
 
-use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
-use anyhow::Result;
+use crate::engine::local_cache::{EntryWriter, Existence, LocalCache, SizedReader, TargetStream};
+use anyhow::{Context, Result};
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
 use parking_lot::RwLock;
@@ -107,7 +107,7 @@ impl LocalCache for LocalCacheTmp {
         self.durable.reader(addr, hashin, name)
     }
 
-    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
+    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
         let key = Self::key(addr, hashin, name);
         // Drop any stale value before the write lands (tmp keys are unique, so
         // this is belt-and-suspenders for repeated writes of the same key).
@@ -215,23 +215,25 @@ impl LocalCache for LocalCacheTmp {
     }
 }
 
-/// Writer that buffers in memory and publishes on drop. It spills to the durable
-/// cache when the stream exceeds the per-entry cap, or (on drop) when admitting
-/// the buffered entry would exceed the capacity budget.
+/// Writer that buffers in memory and publishes on commit. It spills to the
+/// durable cache when the stream exceeds the per-entry cap, or (on commit) when
+/// admitting the buffered entry would exceed the capacity budget. Dropped
+/// without commit, the buffer is discarded — and a spilled stream's durable
+/// writer discards with it, so an abandoned write never lands anywhere.
 struct TmpWriter {
     key: Key,
     addr: Addr,
     hashin: String,
     name: String,
     buf: Vec<u8>,
-    spilled: Option<Box<dyn io::Write>>,
+    spilled: Option<Box<dyn EntryWriter>>,
     durable: Arc<dyn LocalCache>,
     store: Arc<Store>,
 }
 
 impl TmpWriter {
     /// Open the durable writer and flush the buffered bytes into it.
-    fn begin_spill(&mut self) -> io::Result<&mut Box<dyn io::Write>> {
+    fn begin_spill(&mut self) -> io::Result<&mut Box<dyn EntryWriter>> {
         let mut w = self
             .durable
             .writer(&self.addr, &self.hashin, &self.name)
@@ -265,25 +267,35 @@ impl io::Write for TmpWriter {
     }
 }
 
-impl Drop for TmpWriter {
-    fn drop(&mut self) {
-        // Spilled entries are finalized by the durable writer's own Drop.
-        if self.spilled.is_some() {
-            return;
+impl EntryWriter for TmpWriter {
+    fn commit(mut self: Box<Self>) -> Result<()> {
+        // A spilled stream's bytes live in the durable writer; committing it is
+        // committing the entry.
+        if let Some(w) = self.spilled.take() {
+            return w
+                .commit()
+                .with_context(|| format!("commit spilled tmp cache entry {}", self.name));
         }
         let len = self.buf.len() as u64;
         if self.store.try_reserve(len) {
             let arc: Arc<[u8]> = Arc::from(std::mem::take(&mut self.buf));
             self.store.map.write().insert(self.key.clone(), arc);
-        } else if let Ok(mut w) = self.durable.writer(&self.addr, &self.hashin, &self.name) {
-            // Over the capacity budget: spill to durable instead of mem. Nothing
-            // actionable on a write error inside Drop; surface it and move on.
-            if let Err(e) = w.write_all(&self.buf) {
-                tracing::error!(error = %e, "tmp cache spill-on-drop write failed");
-            }
+            return Ok(());
         }
+        // Over the capacity budget: spill to durable instead of mem.
+        let mut w = self
+            .durable
+            .writer(&self.addr, &self.hashin, &self.name)
+            .with_context(|| format!("open durable writer for tmp cache entry {}", self.name))?;
+        w.write_all(&self.buf)
+            .with_context(|| format!("spill tmp cache entry {} to durable", self.name))?;
+        w.commit()
+            .with_context(|| format!("commit spilled tmp cache entry {}", self.name))
     }
 }
+
+// No Drop impl: dropped without commit, the buffer is simply discarded, and a
+// spilled stream's durable writer discards its own staging on drop too.
 
 #[cfg(test)]
 mod tests {
@@ -315,11 +327,12 @@ mod tests {
             Ok(())
         }
     }
-    impl Drop for RecordingWriter {
-        fn drop(&mut self) {
+    impl EntryWriter for RecordingWriter {
+        fn commit(mut self: Box<Self>) -> Result<()> {
             self.store
                 .write()
                 .insert(self.key.clone(), Arc::from(std::mem::take(&mut self.buf)));
+            Ok(())
         }
     }
 
@@ -335,7 +348,7 @@ mod tests {
                 None => Err(anyhow::anyhow!(NotFoundError)),
             }
         }
-        fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
+        fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
             Ok(Box::new(RecordingWriter {
                 key: (addr.format(), hashin.to_string(), name.to_string()),
                 buf: Vec::new(),
@@ -377,7 +390,7 @@ mod tests {
     fn write_all(cache: &dyn LocalCache, a: &Addr, h: &str, n: &str, bytes: &[u8]) {
         let mut w = cache.writer(a, h, n).expect("writer");
         w.write_all(bytes).expect("write");
-        drop(w);
+        w.commit().expect("commit");
     }
 
     fn read_all(cache: &dyn LocalCache, a: &Addr, h: &str, n: &str) -> Vec<u8> {

@@ -14,7 +14,7 @@
 //! Add another `on_*` hook here, not another struct, if a test needs to watch
 //! a different call.
 
-use crate::engine::local_cache::{Existence, LocalCache, SizedReader, TargetStream};
+use crate::engine::local_cache::{EntryWriter, Existence, LocalCache, SizedReader, TargetStream};
 use hmodel::htaddr::Addr;
 use std::io;
 use std::path::PathBuf;
@@ -23,12 +23,15 @@ use std::sync::Arc;
 type ReaderHook = Box<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 type ExistsHook = Box<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 type ListTargetEntriesHook = Box<dyn Fn(&Addr) + Send + Sync>;
+type WriterHook = Arc<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 
 pub(crate) struct ForwardingCache {
     inner: Arc<dyn LocalCache>,
     on_reader: ReaderHook,
     on_exists: ExistsHook,
     on_list_target_entries: ListTargetEntriesHook,
+    on_writer: WriterHook,
+    on_writer_done: Option<WriterHook>,
 }
 
 impl ForwardingCache {
@@ -38,6 +41,8 @@ impl ForwardingCache {
             on_reader: Box::new(|_, _, _| {}),
             on_exists: Box::new(|_, _, _| {}),
             on_list_target_entries: Box::new(|_| {}),
+            on_writer: Arc::new(|_, _, _| {}),
+            on_writer_done: None,
         }
     }
 
@@ -70,6 +75,76 @@ impl ForwardingCache {
         self.on_list_target_entries = Box::new(f);
         self
     }
+
+    /// Run `f` when a `writer` is opened, then forward regardless of what it
+    /// does.
+    pub(crate) fn on_writer(
+        mut self,
+        f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_writer = Arc::new(f);
+        self
+    }
+
+    /// Run `f` when a writer handed out by `writer` is finished with — committed,
+    /// or dropped uncommitted — i.e. when that write has *completed*, not merely
+    /// started. Lets ordering tests assert "B opened only after A finished"
+    /// rather than the weaker "after A opened". The hook also fires when a write
+    /// is abandoned on an error path, after the inner writer has discarded it.
+    pub(crate) fn on_writer_done(
+        mut self,
+        f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_writer_done = Some(Arc::new(f));
+        self
+    }
+}
+
+/// Forwards writes; fires the `on_writer_done` hook exactly once, when the write
+/// finishes — on commit, or on drop for an abandoned write. Either way the inner
+/// writer is finalized (committed or discarded) *before* the hook runs, so a
+/// hook that probes the cache observes the write's final state.
+struct DoneWriter {
+    inner: Option<Box<dyn EntryWriter>>,
+    done: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl io::Write for DoneWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.as_mut() {
+            Some(w) => w.write(buf),
+            None => Err(io::Error::other("writer already finalized")),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.as_mut() {
+            Some(w) => w.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl EntryWriter for DoneWriter {
+    fn commit(mut self: Box<Self>) -> anyhow::Result<()> {
+        let res = match self.inner.take() {
+            Some(w) => w.commit(),
+            None => Ok(()),
+        };
+        if let Some(done) = self.done.take() {
+            done();
+        }
+        res
+    }
+}
+
+impl Drop for DoneWriter {
+    fn drop(&mut self) {
+        // Discard the inner writer before signaling done — see the type doc.
+        drop(self.inner.take());
+        if let Some(done) = self.done.take() {
+            done();
+        }
+    }
 }
 
 impl LocalCache for ForwardingCache {
@@ -78,8 +153,25 @@ impl LocalCache for ForwardingCache {
         self.inner.reader(addr, hashin, name)
     }
 
-    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Write>> {
-        self.inner.writer(addr, hashin, name)
+    fn writer(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+    ) -> anyhow::Result<Box<dyn EntryWriter>> {
+        (self.on_writer)(addr, hashin, name);
+        let inner = self.inner.writer(addr, hashin, name)?;
+        Ok(match &self.on_writer_done {
+            Some(done) => {
+                let done = Arc::clone(done);
+                let (addr, hashin, name) = (addr.clone(), hashin.to_string(), name.to_string());
+                Box::new(DoneWriter {
+                    inner: Some(inner),
+                    done: Some(Box::new(move || done(&addr, &hashin, &name))),
+                })
+            }
+            None => inner,
+        })
     }
 
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
@@ -176,7 +268,7 @@ mod tests {
 
         let mut w = cache.writer(&a, "h", "out").expect("writer");
         w.write_all(b"data").expect("write");
-        drop(w);
+        w.commit().expect("commit");
 
         assert_eq!(
             reader_calls.load(Ordering::SeqCst),

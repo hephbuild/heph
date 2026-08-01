@@ -1,5 +1,5 @@
 use crate::engine::local_cache::{
-    Existence, LocalCache, NotFoundError, PendingWrite, SizedReader, TargetStream,
+    EntryWriter, Existence, LocalCache, NotFoundError, PendingWrite, SizedReader, TargetStream,
 };
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
@@ -794,11 +794,13 @@ impl LocalCache for LocalCacheSQLite {
         })
     }
 
-    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
+    fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
         // No pending registration here: the key becomes pending when the finished
-        // spool is *queued*, in `SqliteCacheWriter::drop`. Registering at open
+        // spool is *queued*, in `SqliteCacheWriter::commit`. Registering at open
         // would make every reader of the key wait out the caller's whole
-        // streaming write — see `PendingTracker::register_and_send`.
+        // streaming write — see `PendingTracker::register_and_send`. A writer
+        // dropped without commit therefore strands no waiter: nothing was ever
+        // registered for it.
         Ok(Box::new(SqliteCacheWriter {
             writer_tx: self.writer_tx()?.clone(),
             pending: self.pending.clone(),
@@ -1028,27 +1030,25 @@ impl io::Write for SqliteCacheWriter {
     }
 }
 
-impl Drop for SqliteCacheWriter {
-    fn drop(&mut self) {
+impl EntryWriter for SqliteCacheWriter {
+    fn commit(mut self: Box<Self>) -> Result<()> {
         let (Some(key), Some(buf)) = (self.key.take(), self.buf.take()) else {
-            return;
+            // `commit` consumes the writer, so the fields can only be gone if a
+            // previous commit already took them.
+            anyhow::bail!("sqlite cache writer already committed");
         };
 
-        let Ok(size) = i64::try_from(self.size) else {
-            // Pathological size. Nothing was ever registered for this key — that
-            // now happens at enqueue — so dropping the write strands no waiter.
-            tracing::error!(
-                addr = key.0,
-                hashin = key.1,
-                name = key.2,
-                size = self.size,
-                "sqlite cache write is too large to address; dropping it"
-            );
-            return;
-        };
+        let size = i64::try_from(self.size).with_context(|| {
+            format!(
+                "sqlite cache write of {}/{}/{} is too large to address ({} bytes)",
+                key.0, key.1, key.2, self.size
+            )
+        })?;
 
-        if self
-            .pending
+        // The key becomes pending here, at enqueue — see `writer` for why not at
+        // open. From this point `exists`/`reader` wait for the writer thread's
+        // batch commit rather than answering from stale committed state.
+        self.pending
             .register_and_send(&self.writer_tx, key, move |key, slot| {
                 WriterCmd::Write(WriteJob {
                     key,
@@ -1057,13 +1057,29 @@ impl Drop for SqliteCacheWriter {
                     slot,
                 })
             })
-            .is_none()
-        {
-            // Writer thread is gone; the registration was rolled back inside
-            // `register_and_send`, so readers fall through to the DB and observe
-            // NotFound rather than waiting for a commit that will never come.
-            tracing::error!("sqlite cache writer thread is gone; write dropped");
-        }
+            // The registration was rolled back inside `register_and_send`, so
+            // readers fall through to the DB and observe NotFound rather than
+            // waiting for a commit that will never come.
+            .context("queueing a cache write: sqlite writer thread is gone")?;
+        Ok(())
+    }
+}
+
+impl Drop for SqliteCacheWriter {
+    fn drop(&mut self) {
+        // Dropped without commit: discard the spool. Nothing was registered for
+        // this key (that happens at enqueue, in `commit`), so no waiter is
+        // stranded — the entry simply never existed.
+        let (Some(key), Some(buf)) = (self.key.take(), self.buf.take()) else {
+            return;
+        };
+        drop(buf);
+        tracing::debug!(
+            addr = key.0,
+            hashin = key.1,
+            name = key.2,
+            "uncommitted sqlite cache write discarded"
+        );
     }
 }
 
@@ -1182,7 +1198,7 @@ mod tests {
         for i in 0..HELD_PIPES {
             let mut w = cache.writer(addr, "h", &format!("blob{i}"))?;
             w.write_all(&payload)?;
-            drop(w);
+            w.commit()?;
         }
         (0..HELD_PIPES)
             .map(|i| cache.reader(addr, "h", &format!("blob{i}")))
@@ -1283,7 +1299,7 @@ mod tests {
         let addr = make_addr("pkg", "t");
         let mut w = cache.writer(&addr, "h", "blob")?;
         w.write_all(&vec![7u8; 4 * 1024 * 1024])?;
-        drop(w);
+        w.commit()?;
         let _held = cache.reader(&addr, "h", "blob")?;
 
         let err = cache
@@ -1315,7 +1331,7 @@ mod tests {
 
         let mut writer = cache.writer(&addr, hashin, name)?;
         writer.write_all(b"hello sqlite cache")?;
-        drop(writer);
+        writer.commit()?;
 
         assert!(cache.exists(&addr, hashin, name)?);
 
@@ -1370,8 +1386,8 @@ mod tests {
             "an unfinished write has no committed bytes, so the key is absent"
         );
 
-        // And once queued, the wait is back on: the committed value is visible.
-        drop(writer);
+        // And once committed (queued), the wait is back on: the value is visible.
+        writer.commit()?;
         assert!(cache.exists(&addr, "h", "blob")?);
         Ok(())
     }
@@ -1553,7 +1569,7 @@ mod tests {
     fn queued_write(cache: &LocalCacheSQLite, addr: &Addr, name: &str, bytes: &[u8]) {
         let mut w = cache.writer(addr, "h", name).expect("writer");
         w.write_all(bytes).expect("write");
-        drop(w);
+        w.commit().expect("commit");
     }
 
     fn committed(e: Existence) -> bool {
@@ -1909,9 +1925,9 @@ mod tests {
         let mut second = cache.writer(&addr, "h", "blob")?;
         second.write_all(b"second")?;
 
-        // Reverse of the open order, so last-opened != last-enqueued.
-        drop(second);
-        drop(first);
+        // Committed in reverse of the open order, so last-opened != last-enqueued.
+        second.commit()?;
+        first.commit()?;
         cache.gate.open();
 
         let mut got = String::new();
@@ -1995,7 +2011,7 @@ mod tests {
         let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
         let mut w = cache.writer(&addr, "h", "blob")?;
         w.write_all(&payload)?;
-        drop(w);
+        w.commit()?;
 
         let mut r = cache
             .seekable_reader(&addr, "h", "blob")?
@@ -2046,7 +2062,7 @@ mod tests {
 
         let mut writer = cache.writer(&addr, hashin, name)?;
         writer.write_all(b"concurrent read data")?;
-        drop(writer);
+        writer.commit()?;
 
         let handles: Vec<_> = (0..4)
             .map(|_| {
@@ -2081,7 +2097,7 @@ mod tests {
         for (addr, h) in [(&a, "h1"), (&a, "h2"), (&b, "h9")] {
             let mut w = cache.writer(addr, h, "out.tar")?;
             w.write_all(b"x")?;
-            drop(w);
+            w.commit()?;
             assert!(cache.exists(addr, h, "out.tar")?); // barrier
         }
 
@@ -2100,8 +2116,8 @@ mod tests {
     fn test_local_cache_sqlite_read_after_pending_write() -> Result<()> {
         use std::sync::Arc;
 
-        // Reader started before the writer Drop returns from enqueue must still observe
-        // the write once it lands. This exercises the PendingTracker wait path.
+        // Reader started before the writer's commit returns from enqueue must still
+        // observe the write once it lands. This exercises the PendingTracker wait path.
         let dir = tempdir()?;
         let cache = Arc::new(LocalCacheSQLite::with_pipe_limit(
             dir.path().join("cache.db"),
@@ -2115,9 +2131,9 @@ mod tests {
         for i in 0..16 {
             let mut writer = cache.writer(&addr, hashin, name)?;
             writer.write_all(format!("iter-{i}").as_bytes())?;
-            drop(writer);
+            writer.commit()?;
 
-            // Right after drop, the write is enqueued but may not be persisted yet.
+            // Right after commit, the write is enqueued but may not be persisted yet.
             // exists() must wait until the bg thread completes the slot.
             assert!(cache.exists(&addr, hashin, name)?);
 
@@ -2127,6 +2143,84 @@ mod tests {
             assert_eq!(got, format!("iter-{i}"));
         }
 
+        Ok(())
+    }
+
+    /// The commit-on-success contract at the backend that had the hole: a writer
+    /// dropped without commit leaves no trace — not a readable entry, not a
+    /// queued write — and does not poison the key for a later attempt.
+    #[test]
+    fn dropped_writer_commits_nothing() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "abandoned");
+
+        let mut w = cache.writer(&addr, "h", "blob")?;
+        w.write_all(b"partial bytes")?;
+        drop(w);
+
+        assert!(
+            !cache.exists(&addr, "h", "blob")?,
+            "an uncommitted write must not surface as a readable entry"
+        );
+        let err = match cache.reader(&addr, "h", "blob") {
+            Ok(_) => panic!("reader must not find an uncommitted write"),
+            Err(e) => e,
+        };
+        assert!(err.is::<NotFoundError>(), "{err:#}");
+
+        // A fresh writer for the same key, committed this time, is readable with
+        // the new bytes only.
+        let mut w = cache.writer(&addr, "h", "blob")?;
+        w.write_all(b"committed bytes")?;
+        w.commit()?;
+        let mut got = String::new();
+        cache
+            .reader(&addr, "h", "blob")?
+            .reader
+            .read_to_string(&mut got)?;
+        assert_eq!(got, "committed bytes");
+        Ok(())
+    }
+
+    /// The poisoning schedule that motivated commit-on-success: a
+    /// `hcore::blocking` pack job runs to completion even when its awaiting
+    /// future is dropped, so a job that errors mid-tar abandons its writer with
+    /// a partial spool. Under commit-on-drop that partial spool was enqueued and
+    /// *replaced* the good entry under the same key; it must be discarded.
+    #[test]
+    fn mid_stream_failure_cannot_replace_a_good_entry() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "poisoned");
+
+        let mut w = cache.writer(&addr, "h", "blob")?;
+        w.write_all(b"good bytes")?;
+        w.commit()?;
+        assert!(cache.exists(&addr, "h", "blob")?); // barrier
+
+        // A rewrite of the same key fails mid-stream and is abandoned.
+        let mut second = cache.writer(&addr, "h", "blob")?;
+        second.write_all(b"par")?;
+        drop(second);
+
+        let mut got = String::new();
+        cache
+            .reader(&addr, "h", "blob")?
+            .reader
+            .read_to_string(&mut got)?;
+        assert_eq!(
+            got, "good bytes",
+            "an abandoned rewrite must not replace the committed entry"
+        );
         Ok(())
     }
 }
