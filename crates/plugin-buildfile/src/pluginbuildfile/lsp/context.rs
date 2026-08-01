@@ -264,9 +264,10 @@ impl LspContext for HephLspContext {
             Ok(ast) => ast,
             Err(e) => {
                 // Keep the (unparseable) buffer source so prefix-based completion
-                // and hover still work while the user is typing (`heph.` etc.).
+                // and hover still work while the user is typing (`heph.` etc.),
+                // and its `load(...)` imports so goto-definition still resolves.
                 self.shared
-                    .set_index(uri.clone(), DocIndex::source_only(content));
+                    .set_index(uri.clone(), DocIndex::unevaluated(content));
                 return LspEvalResult {
                     diagnostics: vec![eval_message_to_lsp_diagnostic(EvalMessage::from_error(
                         &path, &e,
@@ -282,9 +283,11 @@ impl LspContext for HephLspContext {
         let diagnostics = super::diagnostics::validate(&ast, &*self.shared.engine);
 
         // Best-effort evaluation to populate the provenance / driver index. A
-        // half-typed buffer that fails to evaluate simply yields no provenance —
-        // but we keep the source for prefix-based completion/hover. We do not
-        // surface eval errors as diagnostics (they would be noisy while typing).
+        // half-typed buffer (or one the engine rejects — an unknown key on a
+        // macro call fails the whole evaluation) simply yields no provenance;
+        // the source and its `load(...)` imports survive, so completion, hover
+        // and goto-definition keep working. We do not surface eval errors as
+        // diagnostics (they would be noisy while typing).
         let pkg = self.path_to_pkg(&path);
         let source = content.clone();
         if let Ok(result) = eval_source(&filename, content, &pkg, &self.loader()) {
@@ -292,7 +295,7 @@ impl LspContext for HephLspContext {
                 .set_index(uri.clone(), DocIndex::build(&result, &pkg, source));
         } else {
             self.shared
-                .set_index(uri.clone(), DocIndex::source_only(source));
+                .set_index(uri.clone(), DocIndex::unevaluated(source));
         }
 
         LspEvalResult {
@@ -453,7 +456,7 @@ impl LspContext for HephLspContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{HephLspContext, first_build_file};
+    use super::{HephLspContext, LspContext as _, first_build_file};
     use hplugin::config::Options;
     use hplugin::driver::DriverSchema;
     use hplugin::lsp::LspEngine;
@@ -527,6 +530,50 @@ mod tests {
         assert!(
             packages.iter().any(|p| p == "mypkg"),
             "the package walk must reach the LSP caller: {packages:?}"
+        );
+    }
+
+    /// Goto-definition must survive a buffer the engine refuses to evaluate.
+    ///
+    /// An unknown key on a macro call is an eval error, and the index built from
+    /// a failed eval carries no provenance — but the `load(...)` imports that
+    /// drive cross-file goto-definition are read from the source text, so they
+    /// must still be there. Losing the jump exactly while the user is fixing the
+    /// error is the worst moment to lose it.
+    #[test]
+    fn loaded_symbols_survive_a_buffer_that_fails_to_evaluate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let ctx = rt.block_on(async {
+            HephLspContext::new(Arc::new(FakeEngine {
+                root: dir.path().to_path_buf(),
+            }))
+        });
+
+        // `//lib` does not exist, so the load fails and the whole evaluation
+        // with it — the same shape as any other error in the file.
+        let content = "load(\"//lib\", \"make_name\")\n\ntarget(name = make_name(\"t\"))\n";
+        let uri = super::LspUri::File(dir.path().join("BUILD"));
+        let result = ctx.parse_file_with_contents(&uri, content.to_string());
+        assert!(
+            result.ast.is_some(),
+            "the buffer parses; only evaluation fails"
+        );
+
+        let index = ctx.shared.index(&uri).expect("index");
+        assert!(
+            index.call_targets.is_empty(),
+            "a failed eval yields no provenance"
+        );
+        // Line 1, over the `make_name` inside the load statement.
+        assert_eq!(
+            index.loaded_symbol_at(1, 18),
+            Some(("//lib", "make_name")),
+            "the loaded symbol must still resolve for goto-definition"
         );
     }
 

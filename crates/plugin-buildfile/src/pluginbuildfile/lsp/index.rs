@@ -69,11 +69,19 @@ pub(crate) struct DocIndex {
 }
 
 impl DocIndex {
-    /// An index carrying only the buffer text, no provenance. Used when the
-    /// buffer doesn't parse/evaluate (the user is mid-edit, e.g. just typed
-    /// `heph.`) so prefix-based completion/hover still has the current source.
-    pub(crate) fn source_only(source: String) -> DocIndex {
+    /// An index for a buffer that didn't parse or evaluate — the user is
+    /// mid-edit, or the file has an error the engine rejects. Carries the
+    /// buffer text (so prefix-based completion/hover still see the current
+    /// source) and the `load(...)` imports, which are read textually and so
+    /// cost nothing an evaluation would have paid for.
+    ///
+    /// Keeping `loaded` here is what makes cross-file goto-definition survive a
+    /// broken buffer: an unknown key on a macro call fails the whole
+    /// evaluation, and a jump-to-definition that stops working exactly when the
+    /// user is trying to fix the file is the worst moment to lose it.
+    pub(crate) fn unevaluated(source: String) -> DocIndex {
         DocIndex {
+            loaded: parse_load_symbols(&source),
             source,
             ..DocIndex::default()
         }
@@ -393,6 +401,19 @@ load("//other", "x")
             Some(&("//lib".to_string(), "GREETING".to_string()))
         );
         assert_eq!(m.get("x"), Some(&("//other".to_string(), "x".to_string())));
+    }
+
+    #[test]
+    fn unevaluated_index_still_resolves_loaded_symbols() {
+        // No evaluation happened, so there is no provenance — but the load
+        // imports are textual, and goto-definition depends on them.
+        let index = DocIndex::unevaluated(
+            "load(\"//lib\", \"make_name\")\ntarget(name = make_name(\"t\"))\n".to_string(),
+        );
+        assert!(index.call_targets.is_empty());
+        assert_eq!(index.loaded_symbol_at(1, 18), Some(("//lib", "make_name")));
+        // The usage on line 2 resolves to the same import.
+        assert_eq!(index.loaded_symbol_at(2, 16), Some(("//lib", "make_name")));
     }
 
     #[test]
