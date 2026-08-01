@@ -4567,6 +4567,7 @@ mod tests {
     #[test]
     fn provider_functions_lists_exposed_functions() {
         let root = tempdir().unwrap();
+        let _rt = crate::engine::test_rt_enter();
         // `fs` is auto-registered by `Engine::new`.
         let engine = Engine::new(Config {
             root: root.path().to_path_buf(),

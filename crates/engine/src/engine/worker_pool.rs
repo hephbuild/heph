@@ -260,8 +260,10 @@ mod tests {
             "wp-task-repro-locked_result",
             handle.clone(),
         ));
-        let mem_execute: Arc<Memoizer<String, u32>> =
-            Arc::new(Memoizer::with_tag_task("wp-task-repro-execute_cache", handle));
+        let mem_execute: Arc<Memoizer<String, u32>> = Arc::new(Memoizer::with_tag_task(
+            "wp-task-repro-execute_cache",
+            handle,
+        ));
 
         let mut outer = Box::pin(mem_result.process("//pkg:tgt".to_string(), {
             let (mem_locked, mem_execute) = (Arc::clone(&mem_locked), Arc::clone(&mem_execute));

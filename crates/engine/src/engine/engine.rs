@@ -424,8 +424,9 @@ impl Engine {
         // Fails loudly here rather than at first request: every request's
         // memoizers spawn on this handle, and an engine constructed off-runtime
         // could only defer that failure to a stranger place.
-        let runtime = tokio::runtime::Handle::try_current()
-            .context("Engine::new must run inside a tokio runtime (request memoizers spawn on it)")?;
+        let runtime = tokio::runtime::Handle::try_current().context(
+            "Engine::new must run inside a tokio runtime (request memoizers spawn on it)",
+        )?;
 
         let mut engine = Engine {
             cfg: cfg.clone(),

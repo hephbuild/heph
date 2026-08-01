@@ -86,3 +86,20 @@ mod meta;
 pub mod sandbox_cleaner;
 pub mod validate;
 pub mod worker_pool;
+
+/// Shared runtime for sync tests that construct an [`Engine`]: `Engine::new`
+/// captures the ambient tokio runtime for its request memoizers, so a plain
+/// `#[test]` must enter one first. Static, so handles captured from it stay
+/// valid for the life of the test process.
+#[cfg(test)]
+pub(crate) fn test_rt_enter() -> tokio::runtime::EnterGuard<'static> {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    })
+    .enter()
+}

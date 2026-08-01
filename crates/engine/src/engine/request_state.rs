@@ -976,6 +976,7 @@ mod tests {
     /// The returned `TempDir` must be held alive for the test's duration.
     fn test_engine() -> anyhow::Result<(tempfile::TempDir, Arc<Engine>)> {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let engine = Arc::new(Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: PathBuf::new(),
@@ -1502,6 +1503,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let mut e = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: PathBuf::new(),
@@ -1558,6 +1560,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let mut e = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: PathBuf::new(),
