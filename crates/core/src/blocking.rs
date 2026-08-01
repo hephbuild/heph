@@ -13,13 +13,16 @@
 //!   never fire, the TUI freezes. Nothing is deadlocked and the build looks hung.
 //!   This is the failure this module exists to remove.
 //! - **`tokio::task::block_in_place`** — correct in principle (the runtime hands
-//!   off), but measured a concurrency regression on this workload (0.94 → 0.74,
-//!   see `PERFORMANCE.md`), because every call burns a worker handoff and pulls a
-//!   fresh thread out of the blocking pool.
+//!   off), but every call burns a worker handoff and pulls a fresh thread out of
+//!   the blocking pool, and it needs a runtime context this module cannot assume
+//!   (see below). A 0.94 → 0.74 concurrency regression was measured against it
+//!   in the #180 era; a 2026-07-31 re-test found parity within noise on macOS
+//!   Tier A (`docs/CONCURRENCY_MEASUREMENTS.md`) — treat the number as
+//!   historical, not as the reason this pool exists.
 //! - **`tokio::task::spawn_blocking`** — its `JoinHandle` wake-up rides tokio's
 //!   cross-thread waker, observed to drop wake-ups on macOS under heavy load (see
-//!   the macOS waker hazard documented in `hproc::proc_exec`), which strands the
-//!   awaiting task.
+//!   `docs/RCA_MACOS_WAKER.md` and the hazard note in `hproc::proc_exec`), which
+//!   strands the awaiting task.
 //!
 //! So: a fixed set of named threads, a `crossbeam_channel` queue, and a
 //! `oneshot` for the result. The threads are created once and live for the
@@ -74,19 +77,25 @@ const WAKE_BACKSTOP: Duration = Duration::from_millis(250);
 ///
 /// **Retained**, not drained. The list used to be emptied by each tick, on the
 /// reasoning that waking a waiter provokes a poll and the poll re-registers it.
-/// That holds only if the wake actually reaches the future — and in this engine
-/// it need not. `run` is awaited inside a `hmemoizer` cell, so the waker handed
-/// to it is the *cell's* waker, and `Cell::wake_by_ref` deliberately drops a wake
-/// when the cell already has a driver that owes it a re-poll. One swallowed wake
-/// then meant the waiter was never polled, never re-registered, and never woken
-/// again — with the blocking pool sitting idle on an empty queue because its job
-/// had long since finished.
+/// That holds only if the wake actually reaches the future — and nothing an
+/// arbitrary `Waker` promises guarantees that. When this was written,
+/// `hmemoizer::Cell::wake_by_ref` deliberately dropped a wake when the cell
+/// already had a driver that owed it a re-poll; one swallowed wake meant the
+/// waiter was never polled, never re-registered, and never woken again — with
+/// the blocking pool sitting idle on an empty queue because its job had long
+/// since finished. That stranded twelve targets inside `execute`'s sandbox
+/// cleanup while they held every worker permit, with ninety more queued behind
+/// them on the semaphore and the whole build wedged.
 ///
-/// That stranded twelve targets inside `execute`'s sandbox cleanup while they
-/// held every worker permit, with ninety more queued behind them on the
-/// semaphore and the whole build wedged. Retaining the registration until the
-/// waiter is done makes the backstop's guarantee hold no matter what the waker
-/// does with a wake.
+/// The cell no longer swallows (#236 routes every inner wake to the driver, or
+/// broadcasts), but retention stays because it defends the class, not that
+/// instance: any waker on the chain may coalesce or drop a wake — tokio's own
+/// cross-thread wake has been observed to go missing on macOS under load
+/// (`docs/RCA_MACOS_WAKER.md`), and the next `hmemoizer`-shaped waker is one
+/// refactor away. `a_swallowed_wake_does_not_disarm_the_backstop` pins the
+/// contract with a synthetic swallowing waker. Retaining the registration until
+/// the waiter is done makes the backstop's guarantee hold no matter what the
+/// waker does with a wake.
 static PENDING: Mutex<Vec<(u64, Waker)>> = Mutex::new(Vec::new());
 
 static NEXT_REGISTRATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -245,7 +254,11 @@ fn lock_pending() -> std::sync::MutexGuard<'static, Vec<(u64, Waker)>> {
 /// that need a *tighter* bound impose their own (e.g. the remote cache's
 /// `CODEC_SLOTS` caps concurrent gzip at the core count); this is the ceiling
 /// underneath them.
-fn pool_size() -> usize {
+/// Public so callers that park a pool thread to wait on *another* pool thread
+/// can assert their bound stays strictly below it (e.g. `pluginbuildfile`'s
+/// `PKG_EVAL_SLOTS`, whose `LoadRegistry` condvar wait is deadlock-free only
+/// while every claim holder can be running on some thread of this pool).
+pub fn pool_size() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(8);
