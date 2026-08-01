@@ -336,8 +336,11 @@ pub struct WorkerPermits {
 }
 
 impl WorkerPermits {
-    /// Permits the pool considers taken that no running target holds — granted
-    /// to a waiter that is not being polled, and therefore never coming back.
+    /// Permits the pool considers taken that no running target holds. In
+    /// transit, not leaked: a released permit is assigned to the queue head
+    /// before its `RunningPermit` exists, and abort-cascade teardown widens
+    /// the window — transient nonzero is routine. *Persistently* nonzero is
+    /// the anomaly worth chasing.
     pub fn unaccounted(&self) -> u64 {
         self.capacity
             .saturating_sub(self.free)

@@ -17,7 +17,7 @@
 //!
 //! `available()` stays as the diag gauge (`engine.rs` registers it).
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -55,7 +55,7 @@ impl WorkerPool {
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
-            .expect("the worker pool semaphore is never closed");
+            .context("worker pool semaphore closed")?;
         Ok(WorkerPermit { _permit: permit })
     }
 }
@@ -78,8 +78,8 @@ mod tests {
         let b = pool.acquire().await.expect("second");
         assert_eq!(pool.available(), 0);
 
-        // A third caller must wait, and must not be holding anything while it
-        // does — the whole point of the type.
+        // A third caller must wait; before any release lands it holds
+        // nothing (an assigned permit only exists after a release).
         let mut third = Box::pin(pool.acquire());
         assert!(futures::poll!(&mut third).is_pending());
         assert_eq!(pool.available(), 0, "a waiter must hold no permit");

@@ -470,19 +470,19 @@ pub struct StuckCell {
     pub tag: &'static str,
     /// `format!("{:?}")` of the cell key — for `mem_result` this is the addr.
     pub key: String,
-    /// Registered awaiters, or `None` if the waker set was locked when sampled.
+    /// Joiners currently interested in the cell. `Option` for a source that
+    /// cannot sample it without blocking (none today — the task cell always
+    /// reports `Some`; kept optional so a future source may decline).
     pub waiters: Option<usize>,
-    /// Whether an awaiter is elected to re-poll the inner future. See
-    /// [`cell::Cell::has_driver`] for why `false` here is the interesting case.
-    /// For a task-backed cell this is "the spawned task is still live" — same
-    /// meaning (somebody is on the hook to finish this cell), same rendering.
+    /// Whether the spawned task is still live — somebody is on the hook to
+    /// finish this cell. `false` on an incomplete cell is the stranded
+    /// signal: the task died without publishing.
     pub has_driver: bool,
-    /// How many aborted predecessors this cell's key has had (task-backed
-    /// cells only; always 0 for poll cells). A climbing count is abort/rejoin
-    /// thrash — work being redone, not work being slow.
+    /// How many aborted predecessors this cell's key has had. A climbing
+    /// count is abort/rejoin thrash — work being redone, not work being slow.
     pub restarts: u32,
-    /// How long the computation has been in flight (task-backed cells only —
-    /// the poll cell records no spawn instant).
+    /// How long the computation has been in flight. Same `Option` stance as
+    /// `waiters` — the task cell always reports `Some`.
     pub age: Option<Duration>,
 }
 
@@ -492,19 +492,14 @@ impl StuckCell {
         !self.has_driver && self.waiters.is_some_and(|n| n > 0)
     }
 
-    /// Nobody is awaiting this cell at all, and it never finished.
+    /// Nobody is awaiting this cell, and it never finished.
     ///
-    /// The cell still *holds* its in-flight future — that is deliberate, so an
-    /// awaiter dropped between polls can be replaced by another. But when the
-    /// last awaiter goes for good (fail-fast drops every sibling on the first
-    /// error; Ctrl-C drops them wholesale) there is no replacement coming, and
-    /// nothing will ever poll that future again.
-    ///
-    /// It is not inert while it sits there. A parked future keeps whatever it
-    /// was holding, and keeps its place in whatever queue it was waiting on — so
-    /// an abandoned computation can still be handed a worker permit it will
-    /// never use and never give back. Counting these is how that becomes
-    /// visible instead of inferred.
+    /// Under the task cell this is a *transient* state, not a leak: the last
+    /// joiner's departure evicts the cell and aborts its task, so a sampled
+    /// abandoned cell is an abort still in flight (or a dump racing the
+    /// eviction). One in a single snapshot is routine; the same cell
+    /// abandoned across consecutive snapshots means the teardown is not
+    /// progressing — that is the signal worth chasing.
     pub fn is_abandoned(&self) -> bool {
         !self.has_driver && self.waiters == Some(0)
     }
@@ -593,8 +588,8 @@ pub fn render_inventory(cells: &[StuckCell], limit: usize) -> String {
     let abandoned = cells.iter().filter(|c| c.is_abandoned()).count();
     if abandoned > 0 {
         out.push_str(&format!(
-            "  abandoned    {abandoned} cell(s) have no awaiters left — their futures are parked\n  \
-             {} for good, still holding whatever they had\n",
+            "  abandoned    {abandoned} cell(s) have no awaiters left — teardown should be in \n  \
+             {} flight; the same cell abandoned across snapshots is a stall\n",
             " ".repeat(11)
         ));
     }
@@ -1096,14 +1091,13 @@ where
         result
     }
 
-    /// `process` with the task-mode poison contract applied: a poisoned
-    /// task cell panics its joiners (`task_cell::wait_done`), and for this
-    /// `Result`-typed surface that panic is caught and memoized-shaped as an
-    /// `Err` — a shut-down runtime or an unguarded body panic degrades to a
-    /// failed target instead of unwinding into a cdylib seam, where an unwind
-    /// is an abort. Poll mode is untouched: no wrapper, identical behavior to
-    /// before the enum existed. Any non-poison panic is resumed, so the
-    /// debug-only stall panic stays loud in both modes.
+    /// `process` with the poison contract applied: a poisoned cell panics
+    /// its joiners (`task_cell::wait_done`), and for this `Result`-typed
+    /// surface that panic is caught and memoized-shaped as an `Err` — a
+    /// shut-down runtime or an unguarded body panic degrades to a failed
+    /// target instead of unwinding into a cdylib seam, where an unwind is an
+    /// abort. Any non-poison panic is resumed, so the debug-only stall panic
+    /// stays loud.
     async fn process_result<F, Fut>(&self, key: K, f: F) -> Result<T, Arc<anyhow::Error>>
     where
         F: FnOnce() -> Fut + Send + 'static,

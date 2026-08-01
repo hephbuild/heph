@@ -19,6 +19,11 @@ use std::sync::Arc;
 /// Serve the BUILD-file LSP over stdio until the client disconnects. The
 /// `starlark_lsp` server runs on an in-memory connection; a proxy bridges it to
 /// the real stdio and enriches hover/completion.
+///
+/// Must be called with a tokio runtime context entered: the LSP context
+/// captures `Handle::current()` at construction (its listing provider's
+/// memoizer spawns on it). `build_lsp.rs` enters the command runtime before
+/// calling in.
 pub fn serve_stdio(engine: Arc<dyn LspEngine>) -> anyhow::Result<()> {
     let ctx = HephLspContext::new(engine);
     let shared = Arc::clone(&ctx.shared);
