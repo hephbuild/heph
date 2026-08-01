@@ -285,6 +285,7 @@ fn make_workspace_ordered(
                         govet: govet_addr(),
                         ..Default::default()
                     },
+                    init.runtime.clone(),
                 )
                 .expect("plugingo provider"),
             )
@@ -292,7 +293,12 @@ fn make_workspace_ordered(
     }
 
     b = b
-        .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+            ))
+        })
         .with_provider(move |_| {
             Box::new(
                 pluginstatictarget::Provider::new(vec![pluginstatictarget::Target {
@@ -322,6 +328,7 @@ fn make_workspace_ordered(
                         govet: govet_addr(),
                         ..Default::default()
                     },
+                    init.runtime.clone(),
                 )
                 .expect("plugingo provider"),
             )

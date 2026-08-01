@@ -4611,6 +4611,7 @@ mod tests {
         engine.register_provider(|init| {
             Box::new(hplugin_buildfile::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
+                init.runtime.clone(),
             ))
         })?;
         let engine = SArc::new(engine);
@@ -4657,6 +4658,7 @@ mod tests {
         engine.register_provider(|init| {
             Box::new(hplugin_buildfile::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
+                init.runtime.clone(),
             ))
         })?;
         let engine = SArc::new(engine);

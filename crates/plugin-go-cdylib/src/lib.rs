@@ -73,8 +73,14 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     options.remove("walk_db");
 
     let walker = Arc::new(hwalk::CachedWalker::open(&walk_db));
-    let provider: Arc<dyn hplugin::provider::Provider> =
-        Arc::new(Provider::from_options(root, &[], &[], &options, walker)?);
+    let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(Provider::from_options(
+        root,
+        &[],
+        &[],
+        &options,
+        walker,
+        plugin_sdk::stabby::cdylib_runtime_handle(),
+    )?);
 
     let mut drivers = stabby::vec::Vec::new();
     let golist: Arc<dyn ManagedDriver> = Arc::new(GoGolistDriver::new());

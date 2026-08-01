@@ -207,9 +207,10 @@ impl Default for Provider {
 }
 
 impl Provider {
-    pub fn new(root: std::path::PathBuf) -> Self {
+    pub fn new(root: std::path::PathBuf, runtime: tokio::runtime::Handle) -> Self {
         Self {
             root,
+            pkg_cache: Memoizer::with_tag_task("buildfile_pkg", runtime),
             ..Self::default()
         }
     }
@@ -245,6 +246,7 @@ impl Provider {
         skip_dirs: &[std::path::PathBuf],
         skip_globs: &[String],
         opts: &hplugin::config::Options,
+        runtime: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
         hplugin::config::deny_unknown(
             "buildfile provider",
@@ -266,6 +268,7 @@ impl Provider {
             build_file_patterns: compiled,
             skip: Arc::new(skip),
             default_driver,
+            pkg_cache: Memoizer::with_tag_task("buildfile_pkg", runtime),
             ..Self::default()
         })
     }
@@ -634,6 +637,21 @@ impl EProvider for Provider {
 
 #[cfg(test)]
 mod tests {
+    /// Handle for sync tests constructing the provider: one shared runtime,
+    /// built on first use.
+    fn test_runtime() -> tokio::runtime::Handle {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("test runtime")
+        })
+        .handle()
+        .clone()
+    }
+
     use super::*;
     use hcore::hasync::StdCancellationToken;
     use hmodel::htaddr::parse_addr;
@@ -824,8 +842,14 @@ mod tests {
     #[test]
     fn from_options_defaults_to_build() {
         let dir = tempdir().expect("tempdir");
-        let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &Options::new())
-            .expect("from_options");
+        let p = Provider::from_options(
+            dir.path().to_path_buf(),
+            &[],
+            &[],
+            &Options::new(),
+            test_runtime(),
+        )
+        .expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
         assert_eq!(names, vec!["BUILD", "*.BUILD"]);
     }
@@ -838,7 +862,7 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::from_str("[BUILD2, \"*.BUILD2\"]").expect("yaml"),
         );
-        let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts)
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts, test_runtime())
             .expect("from_options");
         let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
         assert_eq!(names, vec!["BUILD2", "*.BUILD2"]);
@@ -852,7 +876,7 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::from_str("[\"[bad\"]").expect("yaml"),
         );
-        let err = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts)
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts, test_runtime())
             .err()
             .expect("must error");
         assert!(err.to_string().contains("[bad"), "{err}");
@@ -863,7 +887,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut opts = Options::new();
         opts.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
-        let err = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts)
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts, test_runtime())
             .err()
             .expect("must error");
         assert!(err.to_string().contains("bogus"), "{err}");
@@ -940,7 +964,7 @@ mod tests {
             "patterns".to_string(),
             serde_yaml::Value::String("not a list".to_string()),
         );
-        let err = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts)
+        let err = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts, test_runtime())
             .err()
             .expect("must error");
         assert!(err.to_string().contains("patterns"), "{err}");
@@ -982,7 +1006,7 @@ mod tests {
             "defaultDriver".to_string(),
             serde_yaml::Value::String("exec".to_string()),
         );
-        let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts)
+        let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts, test_runtime())
             .expect("from_options");
         assert_eq!(p.default_driver.as_deref(), Some("exec"));
     }
@@ -990,8 +1014,14 @@ mod tests {
     #[test]
     fn from_options_default_driver_absent_is_none() {
         let dir = tempdir().expect("tempdir");
-        let p = Provider::from_options(dir.path().to_path_buf(), &[], &[], &Options::new())
-            .expect("from_options");
+        let p = Provider::from_options(
+            dir.path().to_path_buf(),
+            &[],
+            &[],
+            &Options::new(),
+            test_runtime(),
+        )
+        .expect("from_options");
         assert!(p.default_driver.is_none());
     }
 
@@ -1080,8 +1110,14 @@ mod tests {
             "skip".to_string(),
             serde_yaml::from_str("[vendor]").expect("yaml"),
         );
-        let provider = Provider::from_options(root.to_path_buf(), &[heph.clone()], &[], &opts)
-            .expect("provider");
+        let provider = Provider::from_options(
+            root.to_path_buf(),
+            &[heph.clone()],
+            &[],
+            &opts,
+            test_runtime(),
+        )
+        .expect("provider");
 
         let ctoken = StdCancellationToken::new();
         let res = provider
@@ -1119,9 +1155,14 @@ mod tests {
 
         // `vendor` comes in as an engine skip dir (the resolved `fs.skip`), not
         // the provider's own `skip` option — proving the engine threads it in.
-        let provider =
-            Provider::from_options(root.to_path_buf(), &[vendor.clone()], &[], &Options::new())
-                .expect("provider");
+        let provider = Provider::from_options(
+            root.to_path_buf(),
+            &[vendor.clone()],
+            &[],
+            &Options::new(),
+            test_runtime(),
+        )
+        .expect("provider");
 
         let ctoken = StdCancellationToken::new();
         let res = provider
@@ -1161,6 +1202,7 @@ mod tests {
             &[root.join("vendor")],
             &[],
             &Options::new(),
+            test_runtime(),
         )
         .expect("provider");
 
