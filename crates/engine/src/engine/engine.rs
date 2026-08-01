@@ -36,6 +36,11 @@ pub struct PluginInit {
     pub skip_globs: Vec<String>,
     /// Shared cross-run filesystem-walk cache for tree-walking plugins.
     pub walker: Arc<hwalk::CachedWalker>,
+    /// The engine's runtime — what an in-process plugin's memoizers spawn
+    /// their computations on. Handed to the plugin, never discovered by it
+    /// (a cdylib plugin uses its own runtime instead; this field serves the
+    /// in-process construction path).
+    pub runtime: tokio::runtime::Handle,
 }
 
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
@@ -596,6 +601,7 @@ impl Engine {
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 

@@ -140,6 +140,7 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
                 &init.skip_dirs,
                 &init.skip_globs,
                 opts,
+                init.runtime.clone(),
             )?
             .with_walker(init.walker.clone()),
         ))
@@ -300,6 +301,7 @@ mod tests {
                     &init.skip_dirs,
                     &init.skip_globs,
                     opts,
+                    init.runtime.clone(),
                 )?
                 .with_walker(init.walker.clone()),
             ))

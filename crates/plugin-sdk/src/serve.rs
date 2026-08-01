@@ -66,6 +66,15 @@ fn cdylib_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// The cdylib runtime's handle, for the plugin's own construction code: what
+/// a plugin's memoizers spawn on (`Memoizer::with_tag_task`). Handed to
+/// constructors at `create` time — the plugin never discovers a runtime, and
+/// `heph_plugin_create` runs on a host thread where `Handle::current()` would
+/// be wrong or absent.
+pub fn cdylib_runtime_handle() -> tokio::runtime::Handle {
+    cdylib_runtime().handle().clone()
+}
+
 /// Awaits a seam task's `JoinHandle` from the wrapper future the host polls.
 ///
 /// - **Abort-on-drop**: the host dropping the wrapper (rather than cancelling

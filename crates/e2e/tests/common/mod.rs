@@ -55,7 +55,12 @@ impl Workspace {
         let p = parallelism.into();
         let builder = WorkspaceBuilder::new()
             .expect("workspace tempdir")
-            .with_provider(|init| Box::new(pluginbuildfile::Provider::new(init.root.to_path_buf())))
+            .with_provider(|init| {
+                Box::new(pluginbuildfile::Provider::new(
+                    init.root.to_path_buf(),
+                    init.runtime.clone(),
+                ))
+            })
             .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
             .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
             .with_managed_driver(Box::new(pluginhttp::Driver));
@@ -104,7 +109,9 @@ impl Workspace {
         })
         .context("reopen: build engine over the existing workspace root")?;
         engine
-            .register_provider(move |_| Box::new(pluginbuildfile::Provider::new(root)))
+            .register_provider(move |init| {
+                Box::new(pluginbuildfile::Provider::new(root, init.runtime.clone()))
+            })
             .context("reopen: register buildfile provider")?;
         engine
             .register_managed_driver(|_| Box::new(pluginexec::Driver::new_exec()))

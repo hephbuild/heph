@@ -218,8 +218,8 @@ fn compose_closures(
 }
 
 impl Provider {
-    pub fn new(workspace_root: PathBuf) -> anyhow::Result<Self> {
-        Self::with_config(workspace_root, Config::default())
+    pub fn new(workspace_root: PathBuf, runtime: tokio::runtime::Handle) -> anyhow::Result<Self> {
+        Self::with_config(workspace_root, Config::default(), runtime)
     }
 
     pub fn from_options(
@@ -228,6 +228,7 @@ impl Provider {
         skip_globs: &[String],
         opts: &hplugin::config::Options,
         walker: Arc<CachedWalker>,
+        runtime: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
         // `gotool` selects the Go toolchain and is REQUIRED — there is no
         // implicit default. Set it to:
@@ -281,10 +282,15 @@ impl Provider {
                 walker,
                 ..Default::default()
             },
+            runtime,
         )
     }
 
-    pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
+    pub fn with_config(
+        workspace_root: PathBuf,
+        config: Config,
+        runtime: tokio::runtime::Handle,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Arc::new(ProviderInner {
                 workspace_root,
@@ -294,10 +300,10 @@ impl Provider {
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
-                pkg_cache: Memoizer::with_tag("pkg_cache"),
-                pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
-                libs_cache: Memoizer::with_tag("libs_cache"),
-                import_closure_cache: Memoizer::with_tag("import_closure_cache"),
+                pkg_cache: Memoizer::with_tag_task("pkg_cache", runtime.clone()),
+                pkg_addrs_cache: Memoizer::with_tag_task("pkg_addrs_cache", runtime.clone()),
+                libs_cache: Memoizer::with_tag_task("libs_cache", runtime.clone()),
+                import_closure_cache: Memoizer::with_tag_task("import_closure_cache", runtime),
                 go_mod_cache: RwLock::new(HashMap::new()),
             }),
         })
@@ -3505,6 +3511,22 @@ use hplugin::provider::{ProbeRequest, ProbeResponse};
 
 #[cfg(test)]
 mod tests {
+    /// Runtime for provider construction in plain #[test]s (and uniform in
+    /// async ones): with_tag_task spawns on a handle, so give it one that
+    /// outlives the process.
+    fn test_runtime() -> tokio::runtime::Handle {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("test runtime")
+        })
+        .handle()
+        .clone()
+    }
+
     use super::*;
     use crate::plugingo::addr_util::decode_package;
     use crate::plugingo::factors::Factors;
@@ -3889,6 +3911,7 @@ mod tests {
                 govet: addr.to_string(),
                 ..Default::default()
             },
+            test_runtime(),
         )
         .expect("build provider")
     }
@@ -3940,7 +3963,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_govet_dev_default_target_is_a_config_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let p = Provider::new(tmp.path().to_path_buf()).expect("provider");
+        let p = Provider::new(tmp.path().to_path_buf(), test_runtime()).expect("provider");
         let dev = govet::govet_addr(hcore::version::VERSION);
         let err = match provider_get(&p, dev).await {
             Err(GetError::Other(e)) => e,
@@ -3961,7 +3984,7 @@ mod tests {
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
         // Default `govet` — i.e. the dev build's (nonexistent) release target.
-        let p = Provider::new(sandbox.path().to_path_buf()).expect("provider");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).expect("provider");
         // `_lint-analyze` is the per-variant unit; the gate/fixer and the
         // formatters are bare.
         provider_get(&p, make_addr("cmd", "_lint-analyze"))
@@ -3992,7 +4015,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_govet_download_target_is_an_http_fetch() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let p = Provider::new(tmp.path().to_path_buf()).expect("provider");
+        let p = Provider::new(tmp.path().to_path_buf(), test_runtime()).expect("provider");
         let resp = provider_get(&p, govet::govet_addr("v0.1.234"))
             .await
             .expect("govet target resolves");
@@ -4023,6 +4046,7 @@ mod tests {
                 )]),
                 ..Default::default()
             },
+            test_runtime(),
         )
         .expect("provider");
         let resp = provider_get(&p, govet::govet_addr("v0.1.234"))
@@ -4200,7 +4224,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )
         .unwrap();
 
-        let p = Provider::new(dir.path().to_path_buf()).expect("provider");
+        let p = Provider::new(dir.path().to_path_buf(), test_runtime()).expect("provider");
         let data = p.inner.load_go_mod(dir.path()).expect("load_go_mod");
 
         let net = find_module_for_import("golang.org/x/net/context/ctxhttp", &data.requires)
@@ -4228,7 +4252,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_simple_lib_build_lib_driver() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         assert_eq!(resp.target_spec.driver, "go_compile");
     }
@@ -4237,7 +4261,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_simple_lib_build_lib_out_has_a_group() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         let out = resp.target_spec.config.get("out").unwrap();
         assert!(matches!(out, Value::Map(m) if m.contains_key("a")));
@@ -4247,7 +4271,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_simple_lib_no_build_target() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let result = provider_get(&p, make_addr("", "build")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
     }
@@ -4256,7 +4280,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_simple_lib_golist_target() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         // _golist should return a spec without calling executor
         let ctoken = StdCancellationToken::new();
         let req = GetRequest {
@@ -4319,7 +4343,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             result_calls: Arc::clone(&counter),
         });
 
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let golist = make_addr("", "_golist");
 
         p.inner
@@ -4376,7 +4400,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
 
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
-        let p = Provider::new(dir.path().to_path_buf()).unwrap();
+        let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let executor: Arc<dyn ProviderExecutor> = Arc::new(BailExecutor {
@@ -4410,7 +4434,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_dep_lib_build_lib_driver() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("lib", "build_lib"))
             .await
             .unwrap();
@@ -4421,7 +4445,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_dep_cmd_build_lib_has_dep_on_lib() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "build_lib"))
             .await
             .unwrap();
@@ -4544,7 +4568,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         require_go!();
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_bare_addr("cmd", "lint-check"))
             .await
             .unwrap();
@@ -4575,7 +4599,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         require_go!();
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_bare_addr("cmd", "lint"))
             .await
             .unwrap();
@@ -5057,7 +5081,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_dep_constrained_importer_skips_unbuildable_dep() {
         require_go!();
         let sandbox = copy_fixture("dep_constrained");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
 
         // The excluded dep itself is NotFound (no buildable Go files).
         let lib_res = provider_get(&p, make_addr("lib", "build_lib")).await;
@@ -5093,7 +5117,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_dep_cmd_build_is_main() {
         require_go!();
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "build")).await.unwrap();
         assert_eq!(resp.target_spec.driver, "sh");
         let out = match resp.target_spec.config.get("out").unwrap() {
@@ -5113,7 +5137,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_stdlib_build_lib_driver() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("@heph/go/std/fmt", "build_lib"))
             .await
             .unwrap();
@@ -5124,7 +5148,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_stdlib_build_returns_not_found() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let result = provider_get(&p, make_addr("@heph/go/std/fmt", "build")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
     }
@@ -5135,7 +5159,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_test_build_test_exists() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_test"))
             .await
             .unwrap();
@@ -5151,7 +5175,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_test_test_deps_on_build_test() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -5194,7 +5218,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_test_cycle_build_test_uses_test_lib_for_p() {
         require_go!();
         let sandbox = copy_fixture("with_test_cycle");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkgb", "build_test"))
             .await
             .unwrap();
@@ -5227,7 +5251,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_test_cycle_build_xtest_uses_normal_p_and_xtest_lib() {
         require_go!();
         let sandbox = copy_fixture("with_test_cycle");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkgb", "build_xtest"))
             .await
             .unwrap();
@@ -5308,7 +5332,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // embedcfg in-process.
         require_go!();
         let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let result = provider_get(&p, make_addr("server", "embed")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
     }
@@ -5319,7 +5343,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_variant_factors_flow_to_compile_config() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         // A root variant pinning linux/amd64; resolving `build_lib@v=x` must thread
         // those factors into the go_compile config.
         let variant = Value::Map(HashMap::from([
@@ -5357,7 +5381,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_embed_build_lib_exists() {
         require_go!();
         let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("server", "build_lib"))
             .await
             .unwrap();
@@ -5373,7 +5397,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_with_embed_build_lib_resolves_embed_in_driver() {
         require_go!();
         let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("server", "build_lib"))
             .await
             .unwrap();
@@ -5403,7 +5427,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_simple_lib_build_lib_no_embed() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -5425,7 +5449,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_simple_lib_build_lib_default_deps_are_pluginfs_addrs() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         let deps = match resp.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
@@ -5461,7 +5485,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_list_simple_lib_no_go_src_target() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let names = provider_list(&p, "").await;
         assert!(
             !names.iter().any(|n| n == "_go_src"),
@@ -5476,7 +5500,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_non_go_package_returns_not_found() {
         require_go!();
         let sandbox = tempfile::tempdir().unwrap();
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let result = provider_get(&p, make_addr("somepkg", "build_lib")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
     }
@@ -5504,7 +5528,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     #[tokio::test]
     async fn list_library_enumerates_sibling_variant_from_universe() {
         let sandbox = copy_fixture("simple_lib"); // a library package at the module root
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
 
         // `release` declared ONLY at sibling package `other` — not in the root
         // lib's ancestry. `states_under` (the module universe) surfaces it.
@@ -5593,7 +5617,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "module example.com/nested\ngo 1.22\n",
         )
         .unwrap();
-        let p = Provider::new(ws.path().to_path_buf()).unwrap();
+        let p = Provider::new(ws.path().to_path_buf(), test_runtime()).unwrap();
 
         // `release` declared at the root module ("") AND at the nested submodule
         // ("nested"). `states_under("")` returns both by prefix.
@@ -5672,7 +5696,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_list_with_test_includes_build_test() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let names = provider_list(&p, "pkg").await;
         assert!(
             names.iter().any(|n| n == "build_test"),
@@ -5685,7 +5709,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_list_with_test_includes_test() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let names = provider_list(&p, "pkg").await;
         assert!(
             names.iter().any(|n| n == "test"),
@@ -5702,7 +5726,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_simple_lib_no_test_targets_via_get() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         assert!(matches!(
             provider_get(&p, make_addr("", "build_test")).await,
             Err(GetError::NotFound)
@@ -5717,7 +5741,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_list_with_test_includes_build_lib() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let names = provider_list(&p, "pkg").await;
         assert!(
             names.iter().any(|n| n == "build_lib"),
@@ -5730,7 +5754,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_list_test_only_pkg_includes_build_test() {
         require_go!();
         let sandbox = copy_fixture("test_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let names = provider_list(&p, "pkg").await;
         assert!(
             names.iter().any(|n| n == "build_test"),
@@ -5743,7 +5767,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_list_test_only_pkg_includes_test() {
         require_go!();
         let sandbox = copy_fixture("test_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let names = provider_list(&p, "pkg").await;
         assert!(
             names.iter().any(|n| n == "test"),
@@ -5759,7 +5783,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_test_only_pkg_build_lib_not_found_via_get() {
         require_go!();
         let sandbox = copy_fixture("test_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         assert!(matches!(
             provider_get(&p, make_addr("pkg", "build_lib")).await,
             Err(GetError::NotFound)
@@ -5773,7 +5797,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_test_only_build_xtest_exists() {
         require_go!();
         let sandbox = copy_fixture("test_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
             .await
             .unwrap();
@@ -5789,7 +5813,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_test_only_xtest_exists() {
         require_go!();
         let sandbox = copy_fixture("test_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let _resp = provider_get(&p, make_addr("pkg", "xtest")).await.unwrap();
     }
 
@@ -5797,7 +5821,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_test_only_internal_build_test_not_found() {
         require_go!();
         let sandbox = copy_fixture("test_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let result = provider_get(&p, make_addr("pkg", "build_test")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
     }
@@ -5809,7 +5833,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn xtest_only_build_xtest_omits_p_slot() {
         require_go!();
         let sandbox = copy_fixture("test_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
             .await
             .unwrap();
@@ -5835,7 +5859,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_only_internal_build_lib_not_found() {
         require_go!();
         let sandbox = copy_fixture("test_only_internal");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         assert!(matches!(
             provider_get(&p, make_addr("pkg", "build_lib")).await,
             Err(GetError::NotFound)
@@ -5846,7 +5870,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_only_internal_build_test_lib_exists() {
         require_go!();
         let sandbox = copy_fixture("test_only_internal");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_test_lib"))
             .await
             .unwrap();
@@ -5857,7 +5881,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_only_internal_build_test_exists() {
         require_go!();
         let sandbox = copy_fixture("test_only_internal");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_test"))
             .await
             .unwrap();
@@ -5872,7 +5896,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_only_internal_test_exists() {
         require_go!();
         let sandbox = copy_fixture("test_only_internal");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let _ = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
     }
 
@@ -5880,7 +5904,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_only_internal_xtest_variants_not_found() {
         require_go!();
         let sandbox = copy_fixture("test_only_internal");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         for name in [
             "build_xtest",
             "build_xtest_lib",
@@ -5907,7 +5931,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_xtest_only_build_lib_not_found() {
         require_go!();
         let sandbox = copy_fixture("test_xtest_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         assert!(matches!(
             provider_get(&p, make_addr("pkg", "build_lib")).await,
             Err(GetError::NotFound)
@@ -5918,7 +5942,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_xtest_only_build_test_exists() {
         require_go!();
         let sandbox = copy_fixture("test_xtest_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let _ = provider_get(&p, make_addr("pkg", "build_test"))
             .await
             .unwrap();
@@ -5928,7 +5952,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_xtest_only_build_xtest_exists() {
         require_go!();
         let sandbox = copy_fixture("test_xtest_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let _ = provider_get(&p, make_addr("pkg", "build_xtest"))
             .await
             .unwrap();
@@ -5941,7 +5965,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_xtest_only_build_xtest_p_slot_uses_test_lib() {
         require_go!();
         let sandbox = copy_fixture("test_xtest_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
             .await
             .unwrap();
@@ -5975,7 +5999,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_xtest_only_build_xtest_lib_p_in_importcfg_uses_test_lib() {
         require_go!();
         let sandbox = copy_fixture("test_xtest_only");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_xtest_lib"))
             .await
             .unwrap();
@@ -6007,7 +6031,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_mod_asm_build_lib_driver() {
         require_go!();
         let sandbox = copy_fixture("mod-asm");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
         assert_eq!(resp.target_spec.driver, "go_compile");
     }
@@ -6016,7 +6040,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn test_mod_asm_thirdparty_with_sfiles_generates_asm_steps() {
         require_go!();
         let sandbox = copy_fixture("mod-asm");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
 
         // github.com/klauspost/cpuid/v2 has assembly on all architectures
         let addr = make_addr(
@@ -6528,7 +6552,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn list_excludes_test_targets_when_test_skip_set() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
         let req = ListRequest {
             request_id: "test".to_string(),
@@ -6562,7 +6586,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     #[tokio::test]
     async fn list_runnable_test_targets_only_for_host_variant() {
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
 
         // Module root declares two variants: `host` (this machine) and `cross`
         // (host goos, a non-host goarch).
@@ -6673,7 +6697,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn magic_build_returns_group_forwarding_to_host_variant() {
         require_go!();
         let sandbox = copy_fixture("with_dep"); // `cmd` is `package main`
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let addr = Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default());
         let resp = provider_get(&p, addr).await.expect("magic build resolves");
         let spec = resp.target_spec;
@@ -6694,7 +6718,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     #[tokio::test]
     async fn magic_build_not_found_without_host_variant() {
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let cross = State {
             package: PkgBuf::from(""),
             provider: "go".to_string(),
@@ -6732,7 +6756,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn magic_build_not_found_for_non_main_package() {
         require_go!();
         let sandbox = copy_fixture("with_dep"); // `lib` is a library (package lib)
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let addr = Addr::new(PkgBuf::from("lib"), "build".to_string(), Default::default());
         let res = provider_get(&p, addr).await;
         assert!(
@@ -6747,7 +6771,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     #[tokio::test]
     async fn unknown_build_addr_arg_is_rejected() {
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let addr = Addr::new(
             PkgBuf::from("cmd"),
             "build".to_string(),
@@ -6774,7 +6798,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     #[tokio::test]
     async fn unknown_addr_arg_rejected_on_build_lib() {
         let sandbox = copy_fixture("with_dep");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let addr = Addr::new(
             PkgBuf::from("lib"),
             "build_lib".to_string(),
@@ -6800,7 +6824,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn get_returns_not_found_for_test_targets_when_test_skip_set() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
         for name in ["test", "build_test", "xtest", "build_xtest"] {
             let req = GetRequest {
@@ -6824,7 +6848,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn get_build_test_still_works_when_test_skip_false_overrides() {
         require_go!();
         let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
         let req = GetRequest {
             request_id: "test".to_string(),
@@ -6861,7 +6885,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn golist_root_package_keeps_an_exact_go_src_query_scope() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let req = GetRequest {
             request_id: "test".to_string(),
             addr: make_addr("", "_golist"),
@@ -6898,7 +6922,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn golist_codegen_root_widens_go_src_query_and_appends_deps() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let mut state_map = HashMap::new();
         state_map.insert("go_codegen_root".to_string(), Value::Bool(true));
         state_map.insert(
@@ -7086,7 +7110,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn golist_appends_codegen_deps_without_root_marker() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let mut state_map = HashMap::new();
         state_map.insert(
             "go_codegen_deps".to_string(),

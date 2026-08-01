@@ -228,6 +228,7 @@ mod tests {
                 &init.skip_dirs,
                 &init.skip_globs,
                 opts,
+                init.runtime.clone(),
             )?))
         })
         .expect("register buildfile");
