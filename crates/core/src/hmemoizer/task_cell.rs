@@ -62,11 +62,13 @@ use rustc_hash::FxHashMap;
 /// once `done` is set (at which point `task` is empty — a completed cell pins
 /// no dead task harness).
 pub(crate) struct TaskCell<V> {
-    done: OnceLock<V>,
-    /// Terminal failure that is not a value: the task was dropped without
-    /// publishing (a panicking body outside `once()`'s guard, or its runtime
-    /// shut down). Waiters surface it loudly instead of parking forever.
-    poison: OnceLock<&'static str>,
+    /// The terminal state: `Ok` is the published value; `Err` is poison — the
+    /// task was dropped without publishing (a panicking body outside
+    /// `once()`'s guard, or its runtime shut down), and waiters surface it
+    /// loudly instead of parking forever. One `OnceLock`, not two: a cell has
+    /// exactly one terminal state, and the merged slot is a footprint win at
+    /// hundreds of thousands of cells.
+    outcome: OnceLock<Result<V, &'static str>>,
     /// Wakes waiters on publish/poison. Waiters use the register-then-recheck
     /// discipline (see `wait_done`) — `notify_waiters` leaves nothing behind
     /// for a waiter that registers later, so the recheck is what's load-bearing.
@@ -86,11 +88,21 @@ pub(crate) struct TaskCell<V> {
 
 impl<V> TaskCell<V> {
     pub(crate) fn peek(&self) -> Option<&V> {
-        self.done.get()
+        self.outcome.get().and_then(|o| o.as_ref().ok())
     }
 
+    /// A published *value*. Poison is deliberately not "done": a poisoned
+    /// cell may be evicted by its unwinding joiner so the next caller
+    /// recomputes.
     pub(crate) fn is_done(&self) -> bool {
-        self.done.get().is_some()
+        matches!(self.outcome.get(), Some(Ok(_)))
+    }
+
+    fn poison_msg(&self) -> Option<&'static str> {
+        match self.outcome.get() {
+            Some(Err(msg)) => Some(msg),
+            _ => None,
+        }
     }
 
     pub(crate) fn acquire_interest(&self) {
@@ -154,15 +166,23 @@ struct Grave {
     restarts: u32,
 }
 
+/// The memoizer's shared state, behind ONE `Arc`: every spawned body clones a
+/// single pointer instead of two, and the inventory holds a single `Weak`.
+pub(crate) struct Maps<K, V> {
+    /// Live cells. Also the arbiter lock between publish and the cancel
+    /// decision (module docs).
+    cells: Mutex<FxHashMap<K, Arc<TaskCell<V>>>>,
+    /// Aborted-but-possibly-still-dying predecessors, per key. Entries are
+    /// consumed by the next caller for the key; unconsumed entries die with
+    /// the memoizer (bounded by cancelled keys per request).
+    graves: Mutex<FxHashMap<K, Grave>>,
+}
+
 /// Task-backed implementation behind `Memoizer`. Same map + interest protocol
 /// as the poll implementation; the computation lifecycle is the module docs'
 /// state machine.
 pub(crate) struct TaskInner<K, V> {
-    cache: Arc<Mutex<FxHashMap<K, Arc<TaskCell<V>>>>>,
-    /// Aborted-but-possibly-still-dying predecessors, per key. Entries are
-    /// consumed by the next caller for the key; unconsumed entries die with
-    /// the memoizer (bounded by cancelled keys per request).
-    graves: Arc<Mutex<FxHashMap<K, Grave>>>,
+    maps: Arc<Maps<K, V>>,
     tag: &'static str,
     /// Captured at construction — the runtime every cold cell spawns on. Never
     /// discovered via `Handle::current()` at spawn time: whichever runtime the
@@ -177,17 +197,15 @@ where
     V: Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(tag: &'static str, handle: tokio::runtime::Handle) -> Self {
-        let cache = Arc::new(Mutex::new(FxHashMap::default()));
+        let maps = Arc::new(Maps {
+            cells: Mutex::new(FxHashMap::default()),
+            graves: Mutex::new(FxHashMap::default()),
+        });
         super::register_source(Box::new(TaskSource {
             tag,
-            cache: Arc::downgrade(&cache),
+            maps: Arc::downgrade(&maps),
         }));
-        Self {
-            cache,
-            graves: Arc::new(Mutex::new(FxHashMap::default())),
-            tag,
-            handle,
-        }
+        Self { maps, tag, handle }
     }
 
     pub(crate) fn tag(&self) -> &'static str {
@@ -208,7 +226,7 @@ where
     }
 
     fn cache_lock(&self) -> MutexGuard<'_, FxHashMap<K, Arc<TaskCell<V>>>> {
-        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+        self.maps.cells.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn peek(&self, key: &K) -> Option<V> {
@@ -243,14 +261,14 @@ where
                     // predecessor with nothing to serialize on.
                     let fut = f();
                     let grave = self
+                        .maps
                         .graves
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .remove(&key);
                     let restarts = grave.as_ref().map_or(0, |g| g.restarts + 1);
                     let cell = Arc::new(TaskCell {
-                        done: OnceLock::new(),
-                        poison: OnceLock::new(),
+                        outcome: OnceLock::new(),
                         notify: tokio::sync::Notify::new(),
                         interest: AtomicUsize::new(0),
                         task: Mutex::new(None),
@@ -260,8 +278,7 @@ where
                     cell.acquire_interest();
                     let body = BodyTask {
                         cell: Arc::clone(&cell),
-                        cache: Arc::clone(&self.cache),
-                        graves: Arc::clone(&self.graves),
+                        maps: Arc::clone(&self.maps),
                         key: key.clone(),
                         grave,
                     };
@@ -285,8 +302,8 @@ where
                         }
                         Err(_) => {
                             let _already_poisoned = cell
-                                .poison
-                                .set("memoized task could not spawn (runtime shut down)");
+                                .outcome
+                                .set(Err("memoized task could not spawn (runtime shut down)"));
                         }
                     }
                     e.insert(Arc::clone(&cell));
@@ -345,7 +362,8 @@ where
             // may re-park a predecessor under this key — that insert must find
             // ours already present, never overwrite-race it.
             let abort = task.abort_handle();
-            self.graves
+            self.maps
+                .graves
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(
@@ -378,8 +396,7 @@ where
     K: std::hash::Hash + Eq + Clone,
 {
     cell: Arc<TaskCell<V>>,
-    cache: Arc<Mutex<FxHashMap<K, Arc<TaskCell<V>>>>>,
-    graves: Arc<Mutex<FxHashMap<K, Grave>>>,
+    maps: Arc<Maps<K, V>>,
     key: K,
     grave: Option<Grave>,
 }
@@ -415,6 +432,7 @@ where
                 }
                 None => {
                     let next = self
+                        .maps
                         .graves
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -436,12 +454,12 @@ where
         // cell holds no dead task harness. (Dropping one's own JoinHandle is a
         // detach, which is exactly right — the task is finishing.)
         {
-            let _arbiter = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            let _first_publish = self.cell.done.set(v);
+            let _arbiter = self.maps.cells.lock().unwrap_or_else(|p| p.into_inner());
+            let _first_publish = self.cell.outcome.set(Ok(v));
             *self.cell.task_slot() = None;
         }
         self.cell.notify.notify_waiters();
-        // `self` drops disarmed: `done` is set, so `Drop` won't poison.
+        // `self` drops disarmed: the outcome is set, so `Drop` won't poison.
         // The consumed grave (if any) is gone — nothing to re-park.
     }
 }
@@ -464,12 +482,13 @@ where
             // The chain's restart count, not the re-parked handle's own: this
             // generation died too, and the next one's counter must say so.
             g.restarts = self.cell.restarts;
-            self.graves
+            self.maps
+                .graves
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(self.key.clone(), g);
         }
-        if self.cell.done.get().is_some() {
+        if self.cell.outcome.get().is_some() {
             return;
         }
         // Dropped without publishing. For an aborted cell this is ordinary
@@ -477,9 +496,9 @@ where
         // it means the body panicked (only reachable outside `once()`'s
         // guard) or the runtime shut down mid-flight: poison so waiters fail
         // loudly instead of parking forever.
-        let _already_poisoned = self.cell.poison.set(
+        let _already_poisoned = self.cell.outcome.set(Err(
             "memoized task dropped without publishing (body panicked or its runtime shut down)",
-        );
+        ));
         self.cell.notify.notify_waiters();
     }
 }
@@ -504,10 +523,10 @@ async fn wait_done<K: std::fmt::Debug, V: Clone>(
         let notified = cell.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(v) = cell.done.get() {
+        if let Some(v) = cell.peek() {
             return v.clone();
         }
-        if let Some(msg) = cell.poison.get() {
+        if let Some(msg) = cell.poison_msg() {
             // Loud on purpose: a poisoned cell has no value and never will.
             // `once()` catches this and memoizes it as an `Err`; a raw
             // `process()` caller surfaces it as a panic in the joiner. A typed
@@ -588,7 +607,7 @@ where
 /// driver-election bookkeeping now falls out of `JoinHandle::is_finished`.
 struct TaskSource<K, V> {
     tag: &'static str,
-    cache: std::sync::Weak<Mutex<FxHashMap<K, Arc<TaskCell<V>>>>>,
+    maps: std::sync::Weak<Maps<K, V>>,
 }
 
 impl<K, V> super::CellSource for TaskSource<K, V>
@@ -597,11 +616,11 @@ where
     V: Send + Sync + 'static,
 {
     fn collect(&self, out: &mut Vec<super::StuckCell>) -> bool {
-        let Some(cache) = self.cache.upgrade() else {
+        let Some(maps) = self.maps.upgrade() else {
             return false;
         };
         // `try_lock`: never block a diagnostic dump on the process being dumped.
-        let map = match cache.try_lock() {
+        let map = match maps.cells.try_lock() {
             Ok(m) => m,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return true,
@@ -1123,7 +1142,7 @@ mod repro {
             entered.notified().await; // body1 is inside its occupancy section
 
             // Hold the graves lock so the canceller parks between evict and insert.
-            let graves_guard = m.graves.lock().unwrap();
+            let graves_guard = m.maps.graves.lock().unwrap();
 
             // Canceller on its own OS thread: evicts under the cache lock, then
             // blocks on graves.lock() *before* issuing the abort.
@@ -1158,7 +1177,7 @@ mod repro {
                 );
             }
             // Drain the grave (if the canceller won) so rounds stay independent.
-            m.graves.lock().unwrap().remove(&format!("k{round}"));
+            m.maps.graves.lock().unwrap().remove(&format!("k{round}"));
         }
     }
 }
