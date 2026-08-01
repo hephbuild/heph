@@ -244,6 +244,7 @@ fn workspace() -> htestkit::Workspace {
         .with_provider(|init| {
             Box::new(heph::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
+                init.runtime.clone(),
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))

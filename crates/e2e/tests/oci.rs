@@ -93,6 +93,7 @@ fn workspace_with_fake(fake: &Fake) -> htestkit::Workspace {
         .with_provider(|init| {
             Box::new(heph::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
+                init.runtime.clone(),
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
@@ -351,6 +352,7 @@ async fn test_oci_image_build_failure_surfaces_the_builder_error() -> anyhow::Re
         .with_provider(|init| {
             Box::new(heph::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
+                init.runtime.clone(),
             ))
         })
         .with_managed_driver(Box::new(heph::pluginexec::Driver::new_bash()))
