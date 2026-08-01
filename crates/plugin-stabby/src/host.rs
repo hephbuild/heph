@@ -374,8 +374,17 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                     .collect(),
             };
             match rf.func.call(&ctx, args).await {
-                Ok(v) => unary(Body::CallFunctionResp(pb::CallFunctionResponse {
-                    value: Some(convert::value_to_pb(&v)),
+                // The CallFunction wire carries only the return value; a function
+                // that declared targets / provider-state would lose them, so fail
+                // loudly rather than drop silently (the ABI extension that carries
+                // declarations is the follow-up for out-of-process plugins).
+                Ok(o) if !o.is_value_only() => unary(err_body(
+                    "declaring targets/provider_state from an out-of-process plugin \
+                     function is not yet supported over the plugin ABI"
+                        .to_string(),
+                )),
+                Ok(o) => unary(Body::CallFunctionResp(pb::CallFunctionResponse {
+                    value: Some(convert::value_to_pb(&o.value)),
                 })),
                 Err(e) => unary(err_body(format!("{e:#}"))),
             }

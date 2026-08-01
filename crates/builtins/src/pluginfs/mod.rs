@@ -18,9 +18,9 @@ use hplugin::driver::{
 use hplugin::htspec::Spec;
 use hplugin::provider::{
     ConfigRequest as ProviderConfigRequest, ConfigResponse as ProviderConfigResponse, FnArgs,
-    FnCallContext, GetError, GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest,
-    ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, ProviderFn,
-    ProviderFunctionDef, TargetSpec,
+    FnCallContext, FnOutcome, GetError, GetRequest, GetResponse, ListPackageResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
+    Provider as EProvider, ProviderFn, ProviderFunctionDef, TargetSpec,
 };
 use hwalk::{CachedWalker, Ignore};
 use parking_lot::RwLock;
@@ -298,7 +298,7 @@ struct GlobFn {
 
 #[async_trait]
 impl ProviderFn for GlobFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         // Arg shape is enforced by the declared signature before we get here.
         let pattern = str_arg("heph.fs.glob", &args)?;
 
@@ -333,7 +333,7 @@ impl ProviderFn for GlobFn {
         }
 
         paths.sort();
-        Ok(Value::List(paths.into_iter().map(Value::String).collect()))
+        Ok(Value::List(paths.into_iter().map(Value::String).collect()).into())
     }
 }
 
@@ -415,7 +415,7 @@ struct JoinFn;
 
 #[async_trait]
 impl ProviderFn for JoinFn {
-    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         // Signature: `join(*elems: string) -> string`. The variadic shape (each
         // element a string) is enforced by the declared signature before we get
         // here, so every positional is a string.
@@ -426,7 +426,7 @@ impl ProviderFn for JoinFn {
                 other => anyhow::bail!("heph.fs.join: elems must be strings, got {other:?}"),
             }
         }
-        Ok(Value::String(path_join(&elems)))
+        Ok(Value::String(path_join(&elems)).into())
     }
 }
 
@@ -434,8 +434,8 @@ struct DirFn;
 
 #[async_trait]
 impl ProviderFn for DirFn {
-    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        Ok(Value::String(path_dir(str_arg("heph.fs.dir", &args)?)))
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+        Ok(Value::String(path_dir(str_arg("heph.fs.dir", &args)?)).into())
     }
 }
 
@@ -443,8 +443,8 @@ struct BaseFn;
 
 #[async_trait]
 impl ProviderFn for BaseFn {
-    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
-        Ok(Value::String(path_base(str_arg("heph.fs.base", &args)?)))
+    async fn call(&self, _ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+        Ok(Value::String(path_base(str_arg("heph.fs.base", &args)?)).into())
     }
 }
 
@@ -458,7 +458,7 @@ struct ParentFn;
 
 #[async_trait]
 impl ProviderFn for ParentFn {
-    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<Value> {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
         let filename = str_arg("heph.fs.parent", &args)?;
         // A bare name is required — a nested path would make "closest parent"
         // ambiguous and could escape the package with `..`.
@@ -478,12 +478,12 @@ impl ProviderFn for ParentFn {
                 let s = rel.to_str().ok_or_else(|| {
                     anyhow::anyhow!("heph.fs.parent: path is not valid UTF-8: {}", rel.display())
                 })?;
-                return Ok(Value::String(s.to_string()));
+                return Ok(Value::String(s.to_string()).into());
             }
             // `pop` returns false at the root of the relative path — stop there
             // rather than climbing above the workspace root.
             if !dir.pop() {
-                return Ok(Value::Null());
+                return Ok(Value::Null().into());
             }
         }
     }
@@ -1163,7 +1163,8 @@ mod tests {
             }
             .call(&ctx, args),
         )
-        .unwrap();
+        .unwrap()
+        .value;
         match v {
             Value::List(l) => l
                 .into_iter()
@@ -1229,7 +1230,10 @@ mod tests {
                 .collect(),
             named: Default::default(),
         };
-        match futures::executor::block_on(f.call(&ctx, args)).unwrap() {
+        match futures::executor::block_on(f.call(&ctx, args))
+            .unwrap()
+            .value
+        {
             Value::String(s) => s,
             other => panic!("expected string, got {other:?}"),
         }
@@ -1246,7 +1250,10 @@ mod tests {
                 .collect(),
             named: Default::default(),
         };
-        match futures::executor::block_on(JoinFn.call(&ctx, args)).unwrap() {
+        match futures::executor::block_on(JoinFn.call(&ctx, args))
+            .unwrap()
+            .value
+        {
             Value::String(s) => s,
             other => panic!("expected string, got {other:?}"),
         }
@@ -1302,7 +1309,10 @@ mod tests {
             positional: vec![Value::String(filename.to_string())],
             named: Default::default(),
         };
-        match futures::executor::block_on(ParentFn.call(&ctx, args)).unwrap() {
+        match futures::executor::block_on(ParentFn.call(&ctx, args))
+            .unwrap()
+            .value
+        {
             Value::String(s) => Some(s),
             Value::Null() => None,
             other => panic!("expected string or null, got {other:?}"),
