@@ -6,6 +6,7 @@ use crate::abi::{
     NoteDepOutcome, QueryOutcome, ResultOutcome, StableAddr, StableArtifactContent, StableExecutor,
     StableFunctionRegistry, StableLogSink, StableRead, StableSupervisor, StatesOutcome,
 };
+use crate::seam::panic_text;
 use crate::vtable::dynify;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
@@ -185,27 +186,182 @@ fn err_body(message: String) -> Body {
     })
 }
 
+/// The host-side mirror of the guest's spawn-at-the-seam shape.
+///
+/// A `DynFuture` a host callback returns is polled by a *guest* runtime worker
+/// (the plugin body that awaits it runs on the plugin's own runtime). Running
+/// the callback body inline in that poll would execute engine futures — which
+/// touch the host reactor and timer wheel — on a thread with no host runtime
+/// context, which panics ("there is no reactor running") and then aborts at the
+/// extern seam. So the body is spawned onto the host runtime handed in at
+/// `wrap()` time, and the returned future only awaits the `JoinHandle`
+/// (runtime-free to poll). Symmetric with `plugin-sdk::serve`.
+///
+/// The two constructors make the mode an explicit caller decision rather than
+/// a silent runtime probe: [`SeamSpawn::on`] for production (the caller passes
+/// the runtime it is on), [`SeamSpawn::inline`] for runtime-less in-process
+/// harnesses (`futures::executor`-driven tests), where the caller drives the
+/// future itself and there is no host reactor to protect.
+struct SeamSpawn {
+    handle: Option<tokio::runtime::Handle>,
+    /// Span re-entered by the spawned body so engine logs from plugin
+    /// callbacks keep their tracing context.
+    span: tracing::Span,
+}
+
+impl SeamSpawn {
+    /// Spawn callback bodies on `handle`, instrumented with `span`.
+    fn on(handle: tokio::runtime::Handle, span: tracing::Span) -> Self {
+        Self {
+            handle: Some(handle),
+            span,
+        }
+    }
+
+    /// Run callback bodies inline on the polling thread. Only sound where the
+    /// caller drives the future itself (in-process test harnesses).
+    fn inline(span: tracing::Span) -> Self {
+        Self { handle: None, span }
+    }
+}
+
+/// Abort-on-drop await of a host-side callback task: dropping the wrapper
+/// (the guest abandoned the call — e.g. its own seam task was aborted) stops
+/// the spawned body instead of leaking it.
+///
+/// The backstop is armed on every pending poll, same as the guest's
+/// `SeamTask`: this future is polled by a *guest* worker, so the completion
+/// wake (host task → guest worker) crosses the stabby waker seam. A lost wake
+/// here parks the plugin task on this JoinHandle forever — the guest-side
+/// backstop can't help, since re-polling the guest wrapper only re-polls a
+/// never-woken `JoinHandle` if the wake that was lost is this one. Same
+/// defense-in-depth as `hcore::blocking::run` (docs/CONCURRENCY_MEASUREMENTS.md
+/// §2, lands with #298 below this PR in the stack).
+struct HostTask<T> {
+    handle: tokio::task::JoinHandle<T>,
+    backstop: hcore::blocking::Backstop,
+}
+
+impl<T> std::future::Future for HostTask<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.handle).poll(cx) {
+            std::task::Poll::Ready(out) => std::task::Poll::Ready(out),
+            std::task::Poll::Pending => {
+                this.backstop.arm(cx.waker());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Drop for HostTask<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl SeamSpawn {
+    /// Run `fut` (a host callback body) to a future safe to hand across the
+    /// seam: spawned on the runtime this wrapper was constructed with, inline
+    /// otherwise. A panicking body maps to `mk_err` (host-side bug, surfaced to
+    /// the guest as an error) — never an unwind out of the wrapper's poll,
+    /// which runs inside the extern shim.
+    async fn run<T, F>(
+        &self,
+        method: &'static str,
+        key: String,
+        fut: F,
+        mk_err: fn(String) -> T,
+    ) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        use tracing::Instrument;
+        let Some(handle) = &self.handle else {
+            return fut.instrument(self.span.clone()).await;
+        };
+        let task = HostTask {
+            handle: hcore::hmemoizer::spawn_on_with_cycle_ctx(
+                handle,
+                fut.instrument(self.span.clone()),
+            ),
+            backstop: hcore::blocking::Backstop::new(),
+        };
+        match task.await {
+            Ok(v) => v,
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                mk_err(format!(
+                    "host callback {method}({key}) panicked: {}",
+                    panic_text(payload.as_ref())
+                ))
+            }
+            Err(_) => mk_err(format!(
+                "host callback {method}({key}) aborted: host runtime shut down"
+            )),
+        }
+    }
+}
+
 /// Wraps the host's aggregate function registry; handed to a plugin as a
 /// [`DynFunctionRegistry`] so it can invoke any registered function.
 pub struct HostFunctionRegistry {
     inner: Arc<ProviderFunctionRegistry>,
+    seam: SeamSpawn,
 }
 
 impl HostFunctionRegistry {
-    /// Wrap the aggregate registry as an ABI-stable [`DynFunctionRegistry`].
-    pub fn wrap(inner: Arc<ProviderFunctionRegistry>) -> DynFunctionRegistry {
-        dynify(stabby::boxed::Box::new(HostFunctionRegistry { inner }))
+    /// The span callback bodies run under. Purpose-made rather than
+    /// `Span::current()`: the registry is wired once per process, so capturing
+    /// the ambient span would attribute every later call to whichever request
+    /// happened to wire it first — and pin that request's span for the process
+    /// lifetime.
+    fn span() -> tracing::Span {
+        tracing::info_span!("provider_functions")
+    }
+
+    /// Wrap the aggregate registry as an ABI-stable [`DynFunctionRegistry`],
+    /// spawning callback bodies on `handle` — see [`SeamSpawn`].
+    pub fn wrap(
+        inner: Arc<ProviderFunctionRegistry>,
+        handle: tokio::runtime::Handle,
+    ) -> DynFunctionRegistry {
+        dynify(stabby::boxed::Box::new(HostFunctionRegistry {
+            inner,
+            seam: SeamSpawn::on(handle, Self::span()),
+        }))
+    }
+
+    /// Runtime-less variant for in-process test harnesses: callback bodies run
+    /// inline on the polling thread, which is the caller's own driver.
+    pub fn wrap_inline(inner: Arc<ProviderFunctionRegistry>) -> DynFunctionRegistry {
+        dynify(stabby::boxed::Box::new(HostFunctionRegistry {
+            inner,
+            seam: SeamSpawn::inline(Self::span()),
+        }))
     }
 }
 
 impl StableFunctionRegistry for HostFunctionRegistry {
     extern "C" fn call_registered<'a>(&'a self, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
-        dynify(stabby::boxed::Box::new(async move {
-            let req = match pb::CallRegisteredRequest::decode(&req[..]) {
-                Ok(r) => r,
-                Err(e) => return unary(err_body(format!("call_registered decode: {e}"))),
-            };
-            let Some(rf) = self.inner.get(&req.provider, &req.name) else {
+        let req = match pb::CallRegisteredRequest::decode(&req[..]) {
+            Ok(r) => r,
+            Err(e) => {
+                let body = unary(err_body(format!("call_registered decode: {e}")));
+                return dynify(stabby::boxed::Box::new(async move { body }));
+            }
+        };
+        let key = format!("{}.{}", req.provider, req.name);
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
+            let Some(rf) = inner.get(&req.provider, &req.name) else {
                 return unary(err_body(format!(
                     "unknown registered function `{}.{}`",
                     req.provider, req.name
@@ -234,19 +390,41 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                 })),
                 Err(e) => unary(err_body(format!("{e:#}"))),
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "call_registered",
+            key,
+            fut,
+            |m| unary(err_body(m)),
+        )))
     }
 }
 
 /// Wraps the per-request engine executor; handed to the plugin as a [`DynExecutor`].
 pub struct HostExecutor {
     inner: Arc<dyn ProviderExecutor>,
+    seam: SeamSpawn,
 }
 
 impl HostExecutor {
-    /// Wrap a per-request engine executor as an ABI-stable [`DynExecutor`].
-    pub fn wrap(inner: Arc<dyn ProviderExecutor>) -> DynExecutor {
-        dynify(stabby::boxed::Box::new(HostExecutor { inner }))
+    /// Wrap a per-request engine executor as an ABI-stable [`DynExecutor`],
+    /// spawning callback bodies on `handle` (instrumented with the caller's
+    /// current span) so they run on the host runtime, not on the guest worker
+    /// polling them — see [`SeamSpawn`].
+    pub fn wrap(inner: Arc<dyn ProviderExecutor>, handle: tokio::runtime::Handle) -> DynExecutor {
+        dynify(stabby::boxed::Box::new(HostExecutor {
+            inner,
+            seam: SeamSpawn::on(handle, tracing::Span::current()),
+        }))
+    }
+
+    /// Runtime-less variant for in-process test harnesses: callback bodies run
+    /// inline on the polling thread, which is the caller's own driver.
+    pub fn wrap_inline(inner: Arc<dyn ProviderExecutor>) -> DynExecutor {
+        dynify(stabby::boxed::Box::new(HostExecutor {
+            inner,
+            seam: SeamSpawn::inline(tracing::Span::current()),
+        }))
     }
 }
 
@@ -288,9 +466,11 @@ impl StableExecutor for HostExecutor {
     }
 
     extern "C" fn result<'a>(&'a self, addr: StableAddr) -> DynFuture<'a, ResultOutcome> {
-        dynify(stabby::boxed::Box::new(async move {
-            let parsed = addr_from_stable(&addr);
-            match self.inner.result(&parsed).await {
+        let parsed = addr_from_stable(&addr);
+        let key = parsed.to_string();
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
+            match inner.result(&parsed).await {
                 Ok(eres) => {
                     // Hand each artifact across as a lazy streaming handle — the
                     // Arc<dyn Content> moves into the handle (keeping its cache
@@ -320,7 +500,19 @@ impl StableExecutor for HostExecutor {
                     artifacts: SVec::new(),
                 },
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "result",
+            key,
+            fut,
+            |m| ResultOutcome {
+                ok: false,
+                cycle: false,
+                cancelled: false,
+                message: m.into(),
+                artifacts: SVec::new(),
+            },
+        )))
     }
 
     extern "C" fn query<'a>(
@@ -328,7 +520,8 @@ impl StableExecutor for HostExecutor {
         matcher_pb: SVec<u8>,
         extra_skip: SVec<SString>,
     ) -> DynFuture<'a, QueryOutcome> {
-        dynify(stabby::boxed::Box::new(async move {
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
             let matcher = match plugin_abi::pb::Matcher::decode(&matcher_pb[..]) {
                 Ok(m) => plugin_abi::convert::matcher_from_pb(m),
                 Err(e) => {
@@ -340,7 +533,7 @@ impl StableExecutor for HostExecutor {
                 }
             };
             let skip: Vec<String> = extra_skip.iter().map(|s| s.to_string()).collect();
-            match self.inner.query(&matcher, &skip).await {
+            match inner.query(&matcher, &skip).await {
                 Ok(addrs) => QueryOutcome {
                     ok: true,
                     message: SString::new(),
@@ -352,13 +545,25 @@ impl StableExecutor for HostExecutor {
                     addrs: SVec::new(),
                 },
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "query",
+            String::new(),
+            fut,
+            |m| QueryOutcome {
+                ok: false,
+                message: m.into(),
+                addrs: SVec::new(),
+            },
+        )))
     }
 
     extern "C" fn states_under<'a>(&'a self, prefix: SString) -> DynFuture<'a, StatesOutcome> {
-        dynify(stabby::boxed::Box::new(async move {
-            let prefix = PkgBuf::from(prefix.to_string());
-            match self.inner.states_under(&prefix).await {
+        let prefix = PkgBuf::from(prefix.to_string());
+        let key = prefix.as_str().to_string();
+        let inner = Arc::clone(&self.inner);
+        let fut = async move {
+            match inner.states_under(&prefix).await {
                 Ok(states) => StatesOutcome {
                     ok: true,
                     message: SString::new(),
@@ -373,7 +578,17 @@ impl StableExecutor for HostExecutor {
                     states: SVec::new(),
                 },
             }
-        }))
+        };
+        dynify(stabby::boxed::Box::new(self.seam.run(
+            "states_under",
+            key,
+            fut,
+            |m| StatesOutcome {
+                ok: false,
+                message: m.into(),
+                states: SVec::new(),
+            },
+        )))
     }
 }
 
@@ -458,6 +673,103 @@ mod tests {
                 assert_eq!(got.as_slice(), [$n as u8], "vtable dispatched to the wrong impl");
             })*
         };
+    }
+
+    /// Abort-on-drop on the host mirror: the guest abandoning a callback future
+    /// (dropping it — e.g. its own seam task was aborted) must stop the spawned
+    /// host body, not leak it on the engine runtime. Same shape as the guest's
+    /// `dropped_seam_future_aborts_the_spawned_body`: side-effect flag +
+    /// deadline poll. The host spawn is lazy (first poll of the returned
+    /// future), so the future is polled once before the drop.
+    #[test]
+    fn dropped_callback_future_aborts_the_spawned_host_body() {
+        use crate::abi::{StableAddr, StableExecutorDyn};
+        use futures::future::BoxFuture;
+        use hmodel::htaddr::Addr;
+        use hplugin::provider::ProviderExecutor;
+        use std::future::Future as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct Hanger {
+            started: Arc<AtomicBool>,
+            stopped: Arc<AtomicBool>,
+        }
+        impl ProviderExecutor for Hanger {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<hplugin::eresult::EResult>>> {
+                let started = Arc::clone(&self.started);
+                let stopped = Arc::clone(&self.stopped);
+                Box::pin(async move {
+                    // Dropped only when this body's future is dropped — i.e.
+                    // when the spawned host task is aborted.
+                    let _guard = SetOnDrop(stopped);
+                    started.store(true, Ordering::SeqCst);
+                    futures::future::pending::<()>().await;
+                    anyhow::bail!("unreachable: pending never resolves")
+                })
+            }
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _s: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+        let dynexec = super::HostExecutor::wrap(
+            Arc::new(Hanger {
+                started: Arc::clone(&started),
+                stopped: Arc::clone(&stopped),
+            }) as Arc<dyn ProviderExecutor>,
+            rt.handle().clone(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        {
+            let fut = dynexec.result(StableAddr {
+                package: "p".into(),
+                name: "t".into(),
+                args: stabby::vec::Vec::new(),
+            });
+            futures::pin_mut!(fut);
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "callback body must still be running"
+            );
+            while !started.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "spawned host body never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The guest abandons the call: the future drops at end of scope.
+        }
+        while !stopped.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "host body still running after the callback future was dropped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The host's `wrap` constructors run on the plugin-load path, which is driven

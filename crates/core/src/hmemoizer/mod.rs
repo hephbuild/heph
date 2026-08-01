@@ -884,7 +884,10 @@ fn cancel_abandoned<K, V>(
 
     // Dropped last, with nothing held: the drop cascades through the retained
     // chain and runs arbitrary destructors — releasing the worker permit,
-    // leaving the semaphore queue, disarming backstop registrations.
+    // leaving the semaphore queue, disarming backstop registrations. (One
+    // exception at the plugin ABI seam: a seam wrapper's drop only *requests*
+    // its spawned body stop via JoinHandle::abort — the body ends on a plugin
+    // worker after this cascade returns, not synchronously within it.)
     //
     // The cascade is *recursive*: this future's state machine holds the
     // `AbandonGuard` + `Await` for the next cell down, whose guard re-enters
@@ -1408,6 +1411,30 @@ where
     }
     let inherited_frame = current_frame();
     tokio::spawn(async move { IN_FLIGHT.scope(inherited_frame, fut).await })
+}
+
+/// [`spawn_with_cycle_ctx`] variant that spawns onto an explicit runtime
+/// [`Handle`](tokio::runtime::Handle) — for spawns issued from a context with
+/// no ambient runtime, such as a plugin ABI `extern "C"` entry point (where a
+/// bare `tokio::spawn` would panic, or land on whichever runtime happens to be
+/// current rather than the intended one). Same frame inheritance as
+/// [`spawn_with_cycle_ctx`]: the spawned task's first `once()` sees the
+/// caller's invocation as its parent in the wait-for graph, so under
+/// `HEPH_DEBUG_MEMOIZER_CYCLE=1` a cycle through the seam errors instead of
+/// hanging.
+pub fn spawn_on_with_cycle_ctx<F>(
+    handle: &tokio::runtime::Handle,
+    fut: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    if !cycle_detection_enabled() {
+        return handle.spawn(fut);
+    }
+    let inherited_frame = current_frame();
+    handle.spawn(async move { IN_FLIGHT.scope(inherited_frame, fut).await })
 }
 
 /// `JoinSet::spawn` analogue with the same IN_FLIGHT inheritance semantics

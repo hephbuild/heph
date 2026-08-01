@@ -80,6 +80,65 @@ fn shipped_gha_cdylib_loads() {
     );
 }
 
+/// The spawn-at-the-seam host mirror, across a REAL cdylib: the go provider's
+/// `list` calls back into the engine executor (`states_under`, the module
+/// variant universe) from a plugin-runtime worker. In-process tests
+/// structurally cannot cover this — host and plugin share one tokio image
+/// there, so the callback body always finds a runtime to run on. Here the
+/// callback future is built by the host binary and polled by the plugin's own
+/// workers: exactly the asymmetry that panics ("no reactor running") and then
+/// aborts at the extern seam if the host side does not spawn the body onto the
+/// engine runtime.
+///
+/// The fixture mirrors plugingo-e2e's `variant_sibling`: the `release` variant
+/// is declared ONLY at `//cmd`, so it is absent from `//lib`'s ancestry and
+/// `//lib:build_lib@v=release` can be listed only if the module universe came
+/// back through the `states_under` callback — the assertion cannot pass
+/// vacuously. `gotool: host` + query-only keeps the fixture offline: listing
+/// runs no toolchain.
+#[test]
+fn shipped_go_cdylib_list_calls_back_states_under_across_the_seam() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      gotool: \"host\"\n",
+        manifest.display()
+    ))
+    .expect("write config");
+
+    ws.write("go.mod", "module example.com/seam\n\ngo 1.21\n")
+        .expect("write go.mod");
+    ws.write(
+        "lib/lib.go",
+        "package lib\n\nfunc Greet() string { return \"hi\" }\n",
+    )
+    .expect("write lib.go");
+    ws.write("cmd/main.go", "package main\n\nfunc main() {}\n")
+        .expect("write main.go");
+    ws.write(
+        "cmd/BUILD",
+        "provider_state(\n    provider = \"go\",\n    variants = {\"release\": {\"goos\": \"linux\", \"goarch\": \"amd64\"}},\n)\n",
+    )
+    .expect("write BUILD");
+
+    let out = ws.run(&dist, &["query", "-e", "//lib/..."]).expect("run");
+    assert!(out.status.success(), "{}", describe(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("//lib:build_lib@v=release"),
+        "the sibling-declared variant must come back through the plugin's \
+         states_under callback across the seam: {}",
+        describe(&out)
+    );
+}
+
 /// Regression test for the log-sink-before-`create` ordering bug: if the host
 /// installs its log sink *after* calling the plugin's `create`, a
 /// `tracing::error!` logged during construction failure has no subscriber to

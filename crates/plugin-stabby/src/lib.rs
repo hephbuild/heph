@@ -26,6 +26,7 @@
 )]
 
 pub mod abi;
+pub mod seam;
 pub mod vtable;
 
 #[cfg(feature = "host")]
