@@ -255,6 +255,19 @@ mod tests {
     use super::*;
 
     fn build_engine_from_yaml(yaml: &str) -> anyhow::Result<(tempfile::TempDir, engine::Engine)> {
+        // Engine::new captures the ambient runtime for its request memoizers;
+        // these are plain #[test]s, so provide one. Static: handles captured
+        // from it stay valid for the life of the test process.
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let _rt = RT
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+            })
+            .enter();
         let file: config_yaml::ConfigYaml = serde_yaml::from_str(yaml)?;
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();

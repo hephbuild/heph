@@ -130,6 +130,7 @@ mod tests {
 
     fn test_engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),

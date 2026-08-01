@@ -1073,3 +1073,92 @@ mod tests {
         drop(hung);
     }
 }
+
+#[cfg(test)]
+mod repro {
+    use super::*;
+    use std::time::Duration;
+
+    /// SCRATCH REPRO (not for commit): the window between cancel_abandoned's
+    /// eviction (cache lock released) and its graves.insert. A successor whose
+    /// vacant-path graves.remove wins the graves lock in that window spawns
+    /// grave-less while the predecessor has not even been aborted yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repro_evict_to_grave_window_overlaps_bodies() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(TaskInner::new(
+            "repro-window",
+            tokio::runtime::Handle::current(),
+        ));
+        let occupancy = Arc::new(AtomicUsize::new(0));
+
+        for round in 0..40u32 {
+            let key = format!("k{round}");
+            // Gen1: enters occupancy, parks forever.
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let first = {
+                let occ = Arc::clone(&occupancy);
+                let entered = Arc::clone(&entered);
+                let m = Arc::clone(&m);
+                let key = key.clone();
+                let mut fut = Box::pin(async move {
+                    m.process(key, move || async move {
+                        occ.fetch_add(1, Ordering::SeqCst);
+                        entered.notify_one();
+                        // Park forever; occupancy released only via abort+drop.
+                        struct Un(Arc<AtomicUsize>);
+                        impl Drop for Un {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+                        let _un = Un(occ);
+                        futures::future::pending::<()>().await;
+                        0u32
+                    })
+                    .await
+                });
+                assert!(futures::poll!(&mut fut).is_pending());
+                fut
+            };
+            entered.notified().await; // body1 is inside its occupancy section
+
+            // Hold the graves lock so the canceller parks between evict and insert.
+            let graves_guard = m.graves.lock().unwrap();
+
+            // Canceller on its own OS thread: evicts under the cache lock, then
+            // blocks on graves.lock() *before* issuing the abort.
+            let canceller = std::thread::spawn(move || drop(first));
+            std::thread::sleep(Duration::from_millis(30)); // let it reach the block
+
+            // Release, then immediately run the successor inline: its vacant
+            // path barges the graves mutex ahead of the parked canceller's
+            // OS wakeup (std Mutex allows barging on both Linux and macOS).
+            let overlap_seen = Arc::new(AtomicUsize::new(0));
+            drop(graves_guard);
+            let v = {
+                let occ = Arc::clone(&occupancy);
+                let seen = Arc::clone(&overlap_seen);
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    m.process(key.clone(), move || async move {
+                        seen.store(occ.load(Ordering::SeqCst), Ordering::SeqCst);
+                        7u32
+                    }),
+                )
+                .await
+                .expect("successor completes")
+            };
+            assert_eq!(v, 7);
+            canceller.join().expect("canceller thread");
+            if overlap_seen.load(Ordering::SeqCst) != 0 {
+                panic!(
+                    "round {round}: successor body ran while predecessor body \
+                     was still live (occupancy {})",
+                    overlap_seen.load(Ordering::SeqCst)
+                );
+            }
+            // Drain the grave (if the canceller won) so rounds stay independent.
+            m.graves.lock().unwrap().remove(&format!("k{round}"));
+        }
+    }
+}

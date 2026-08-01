@@ -83,6 +83,10 @@ pub struct Engine {
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
     pub home: PathBuf,
+    /// The runtime every request's memoizers spawn their computations on.
+    /// Captured once at construction — the engine is handed its runtime, the
+    /// memoizers never discover one at spawn time.
+    pub(crate) runtime: tokio::runtime::Handle,
     pub(crate) result_permits: Arc<crate::engine::worker_pool::WorkerPool>,
     /// Maximum concurrent executes (the `result_permits` capacity). Cached
     /// here so it can be announced to clients via a `MaxWorkers` build event
@@ -417,9 +421,17 @@ impl Engine {
 
         let max_workers = 2 * parallelism;
 
+        // Fails loudly here rather than at first request: every request's
+        // memoizers spawn on this handle, and an engine constructed off-runtime
+        // could only defer that failure to a stranger place.
+        let runtime = tokio::runtime::Handle::try_current().context(
+            "Engine::new must run inside a tokio runtime (request memoizers spawn on it)",
+        )?;
+
         let mut engine = Engine {
             cfg: cfg.clone(),
             home: home.clone(),
+            runtime,
             local_cache,
             local_cache_tmp,
             walker,

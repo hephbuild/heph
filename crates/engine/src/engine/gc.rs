@@ -953,6 +953,7 @@ mod tests {
 
     fn test_engine() -> (Arc<Engine>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
@@ -968,6 +969,7 @@ mod tests {
     /// without writing megabytes.
     fn test_engine_spill(spill: u64) -> (Arc<Engine>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
@@ -1114,6 +1116,7 @@ mod tests {
     /// `cache.barrier_reads` is the manifest-barrier counter.
     fn test_engine_queued() -> (Arc<Engine>, Arc<QueuedWriteCache>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let mut engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
@@ -1139,6 +1142,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
         let mut engine = Engine::new(Config {
             root: dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),

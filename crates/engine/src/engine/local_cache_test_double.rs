@@ -228,6 +228,7 @@ mod tests {
     }
 
     fn real_cache(dir: &std::path::Path) -> Arc<dyn LocalCache> {
+        let _rt = crate::engine::test_rt_enter();
         let engine = Engine::new(Config {
             root: dir.to_path_buf(),
             home_dir: std::path::PathBuf::new(),
