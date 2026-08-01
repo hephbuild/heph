@@ -33,12 +33,22 @@
 //! and its destructors run on a runtime worker, not on the canceller's stack.
 //! A successor spawned in that window must not overlap the predecessor, so the
 //! canceller parks the aborted `JoinHandle` in a per-key grave and the
-//! successor's task awaits it before running its own body. If the successor is
-//! itself aborted *while still awaiting the grave*, its drop re-parks the
-//! not-yet-dead predecessor handle (`ReGrave`) — it never started its body, so
-//! its own handle is the wrong thing for generation N+2 to wait on. The grave
-//! insert happens *before* the abort is issued so the re-park can never race
-//! the canceller's own insert.
+//! successor's task awaits it before running its own body. Three orderings
+//! make this airtight rather than merely likely:
+//!
+//! * The eviction, the handle-take, and the grave park are **one cache-lock
+//!   critical section** — a caller that finds the map vacant is guaranteed to
+//!   also find the grave (park-after-unlock would let it spawn grave-less).
+//! * A successor aborted *while still awaiting the grave* never started its
+//!   body, so its own handle is the wrong thing for generation N+2 to wait
+//!   on: its drop **re-parks** the not-yet-dead predecessor handle
+//!   (`ReGrave`), with the canceller's own insert ordered before the abort so
+//!   the re-park can never race it.
+//! * The successor **drains the grave in a loop** — a handle it awaited
+//!   resolves only after that task's drop ran, and any re-park that drop
+//!   performed is therefore visible to the re-check. Without the loop,
+//!   generation N+2 could take the dead N+1 handle before N+1's drop re-parks
+//!   the still-live N, and overlap it.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,9 +99,11 @@ impl<V> TaskCell<V> {
         self.interest.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns the remaining count. AcqRel so the "exactly one guard observes
-    /// each zero crossing" property holds; the *decision* still re-reads under
-    /// the cache lock.
+    /// Returns the remaining count. "Exactly one guard observes each zero
+    /// crossing" comes from RMW atomicity (any ordering would do); the AcqRel
+    /// is kept only so the guard's unlocked pre-check is a sensible hint. The
+    /// *decision* is always re-taken under the cache lock — nothing correct
+    /// rests on this atomic's ordering.
     pub(crate) fn release_interest(&self) -> usize {
         let prev = self.interest.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev > 0, "interest release without a matching acquire");
@@ -113,12 +125,17 @@ impl<V> TaskCell<V> {
     /// cancelled away). `false` on an incomplete cell is the stranded signal:
     /// the task died without publishing.
     pub(crate) fn task_live(&self) -> bool {
-        self.task
-            .try_lock()
-            .map(|slot| slot.as_ref().is_some_and(|h| !h.is_finished()))
+        match self.task.try_lock() {
+            Ok(slot) => slot.as_ref().is_some_and(|h| !h.is_finished()),
+            // Same stance as `task_slot` / `TaskSource::collect`: a poisoned
+            // slot is structurally intact — read through it.
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                e.into_inner().as_ref().is_some_and(|h| !h.is_finished())
+            }
             // Slot briefly held (spawn/publish/cancel in progress) — the task
             // is being worked on, which is the opposite of stranded.
-            .unwrap_or(true)
+            Err(std::sync::TryLockError::WouldBlock) => true,
+        }
     }
 
     pub(crate) fn age(&self) -> std::time::Duration {
@@ -217,6 +234,14 @@ where
                     Arc::clone(e.get())
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
+                    // Lazy async blocks: `f()` only builds the state machine,
+                    // so constructing it under the lock is free. Built BEFORE
+                    // the grave is taken out of the map: a caller closure that
+                    // panics here would otherwise unwind with the removed
+                    // grave in hand, losing the predecessor's handle — the
+                    // next caller would then spawn against a still-dying
+                    // predecessor with nothing to serialize on.
+                    let fut = f();
                     let grave = self
                         .graves
                         .lock()
@@ -233,11 +258,6 @@ where
                         restarts,
                     });
                     cell.acquire_interest();
-                    // Lazy async blocks: `f()` only builds the state machine,
-                    // so constructing it under the lock is free (and spares
-                    // insert-race losers a wasted allocation — not that a
-                    // vacant entry has racers under this lock).
-                    let fut = f();
                     let body = BodyTask {
                         cell: Arc::clone(&cell),
                         cache: Arc::clone(&self.cache),
@@ -283,17 +303,24 @@ where
             cell: Arc::clone(&cell),
             armed: true,
         };
-        let out = super::await_with_stall_check(wait_done(&cell, self.tag), &key, self.tag).await;
+        let out =
+            super::await_with_stall_check(wait_done(&cell, self.tag, &key), &key, self.tag).await;
         abandon.armed = false;
         out
     }
 
     /// Evict-and-abort, unless somebody wants the cell after all. The decision
-    /// re-checks under the cache lock (the arbiter — see module docs); the
-    /// abort itself happens with no lock held, matching the poll cell's
-    /// "never hold the cache lock across teardown" discipline.
+    /// re-checks under the cache lock (the arbiter — see module docs), and the
+    /// eviction, handle-take, and grave-park all happen inside that one
+    /// critical section: a successor that finds the map vacant is thereby
+    /// guaranteed to also find the grave — evict-then-unlock-then-park would
+    /// open a window where it spawns grave-less against a still-live
+    /// predecessor. Only the `abort()` itself runs outside the lock (it is a
+    /// request, not teardown — the "never hold the cache lock across
+    /// teardown" discipline is about the destructors, which run on a runtime
+    /// worker here, never on this stack).
     fn cancel_abandoned(&self, key: &K, cell: &Arc<TaskCell<V>>) {
-        {
+        let abort = {
             let mut cache = self.cache_lock();
             if cell.interest() != 0 || cell.is_done() {
                 return;
@@ -305,12 +332,30 @@ where
             if cache.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
                 cache.remove(key);
             }
-        }
 
-        // Idempotent across two zero-crossings on the same cell: the loser
-        // finds the slot empty.
-        let Some(task) = cell.task_slot().take() else {
-            return;
+            // Idempotent across two zero-crossings on the same cell: the loser
+            // finds the slot empty. Lock nesting cache → task-slot and cache →
+            // graves is the established order (publish and the vacant arm use
+            // the same nesting); nothing takes them the other way around.
+            let Some(task) = cell.task_slot().take() else {
+                return;
+            };
+            // Grave park ordered before the abort is issued: once aborted, the
+            // task can be dropped at any instant and `ReGrave` (its drop path)
+            // may re-park a predecessor under this key — that insert must find
+            // ours already present, never overwrite-race it.
+            let abort = task.abort_handle();
+            self.graves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(
+                    key.clone(),
+                    Grave {
+                        handle: task,
+                        restarts: cell.restarts,
+                    },
+                );
+            abort
         };
         tracing::debug!(
             tag = self.tag,
@@ -318,21 +363,6 @@ where
             restarts = cell.restarts,
             "memoized computation abandoned; aborting its task"
         );
-        // Grave BEFORE abort: once the abort is issued the task can be dropped
-        // at any instant, and `ReGrave` (its drop path) may re-park a
-        // predecessor under this key — that insert must find ours already
-        // present, never overwrite-race it.
-        let abort = task.abort_handle();
-        self.graves
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                key.clone(),
-                Grave {
-                    handle: task,
-                    restarts: cell.restarts,
-                },
-            );
         abort.abort();
     }
 }
@@ -360,16 +390,42 @@ where
     V: Clone + Send + Sync + 'static,
 {
     async fn run<Fut: Future<Output = V>>(mut self, fut: Fut) {
-        if let Some(g) = self.grave.as_mut() {
-            // `&mut JoinHandle` is a future (JoinHandle is Unpin), so an abort
-            // landing mid-await leaves the handle in place for `Drop` to
-            // re-park. A JoinError here is the expected `is_cancelled` — the
-            // predecessor was aborted, that's why it's in a grave.
-            let _cancelled = (&mut g.handle).await;
+        // Serialize on every predecessor before touching the body — not just
+        // the spawn-time grave. After each observed death the map is
+        // re-checked: a successor aborted mid-grave-await re-parks *its*
+        // predecessor (`ReGrave` in `Drop`), and that insert runs during the
+        // very drop the JoinHandle await just observed, so the re-check is
+        // guaranteed to see any deeper still-dying handle. Without the loop,
+        // generation N+2 can take the (already dead, body-less) N+1 handle
+        // from the grave before N+1's drop re-parks the still-live N — and
+        // overlap it.
+        //
+        // Whatever is currently being awaited sits in `self.grave`, so this
+        // task's own abort re-parks it for the next generation.
+        loop {
+            match self.grave.as_mut() {
+                Some(g) => {
+                    // `&mut JoinHandle` is a future (JoinHandle is Unpin), so
+                    // an abort landing mid-await leaves the handle in place
+                    // for `Drop` to re-park. A JoinError here is the expected
+                    // `is_cancelled` — the predecessor was aborted, that's
+                    // why it's in a grave.
+                    let _cancelled = (&mut g.handle).await;
+                    self.grave = None;
+                }
+                None => {
+                    let next = self
+                        .graves
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&self.key);
+                    match next {
+                        Some(g) => self.grave = Some(g),
+                        None => break,
+                    }
+                }
+            }
         }
-        // Predecessor observed dead: it can no longer touch anything. Only now
-        // is the body allowed to run.
-        self.grave = None;
         let v = fut.await;
         self.publish(v);
     }
@@ -395,13 +451,19 @@ where
     K: std::hash::Hash + Eq + Clone,
 {
     fn drop(&mut self) {
-        // Aborted while still awaiting the predecessor's grave: this task
-        // never ran its body, so its own handle is the wrong thing for the
-        // next generation to serialize on — re-park the predecessor's.
-        // (The canceller's own grave insert always precedes the abort, so
-        // this overwrite replaces *this* task's handle with the still-dying
-        // predecessor's — the one that might still have body state.)
-        if let Some(g) = self.grave.take() {
+        // Aborted while still awaiting a predecessor's grave: this task never
+        // ran its body, so its own handle is the wrong thing for the next
+        // generation to serialize on — re-park the predecessor's. (The
+        // canceller's own grave insert always precedes the abort, so this
+        // overwrite replaces *this* task's handle with the still-dying
+        // predecessor's — the one that might still have body state. A
+        // successor that took this task's handle *before* this overwrite
+        // re-checks the map after that handle resolves — `run`'s drain loop —
+        // and this insert is ordered before that resolve, so it is seen.)
+        if let Some(mut g) = self.grave.take() {
+            // The chain's restart count, not the re-parked handle's own: this
+            // generation died too, and the next one's counter must say so.
+            g.restarts = self.cell.restarts;
             self.graves
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -433,7 +495,11 @@ where
               (PoisonPanic) so once() converts it to a memoized Err, and a raw \
               process() joiner fails loudly instead of parking forever"
 )]
-async fn wait_done<V: Clone>(cell: &TaskCell<V>, tag: &'static str) -> V {
+async fn wait_done<K: std::fmt::Debug, V: Clone>(
+    cell: &TaskCell<V>,
+    tag: &'static str,
+    key: &K,
+) -> V {
     loop {
         let notified = cell.notify.notified();
         tokio::pin!(notified);
@@ -447,9 +513,11 @@ async fn wait_done<V: Clone>(cell: &TaskCell<V>, tag: &'static str) -> V {
             // `process()` caller surfaces it as a panic in the joiner. A typed
             // payload, so `catch_poison` converts exactly this panic and
             // resumes every other one (the debug stall panic must stay loud).
+            // The key rides along — "which target's cell died" is the first
+            // question the failure raises.
             std::panic::panic_any(PoisonPanic {
                 tag,
-                msg: (*msg).to_string(),
+                msg: format!("{msg} (key={key:?})"),
             });
         }
         notified.await;
@@ -577,65 +645,181 @@ mod tests {
             .expect("test future must complete within the timeout")
     }
 
-    /// The core no-overlap guarantee: an aborted body's destructors complete
-    /// before the successor's body starts. The body holds an RAII occupancy
-    /// guard; the successor asserts the section is empty on entry. Without the
-    /// grave await this fails whenever the runtime processes the abort after
-    /// the successor spawns.
+    /// RAII occupancy guard for the no-overlap tests: `enter` fails the body
+    /// (and thereby the test, via the poison path) if another body for the
+    /// same key is still alive — including still running its destructors.
+    struct Occupancy(Arc<AtomicUsize>);
+    impl Occupancy {
+        fn enter(counter: &Arc<AtomicUsize>) -> Self {
+            let prev = counter.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(prev, 0, "two bodies for one key are executing concurrently");
+            Self(Arc::clone(counter))
+        }
+    }
+    impl Drop for Occupancy {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A body that holds the occupancy guard and busy-spins on `release`
+    /// WITHOUT an await point: the abort issued against it cannot take effect
+    /// until the flag flips (an aborted task dies only at a yield boundary),
+    /// which makes the "predecessor still alive after its abort" window a
+    /// deterministic state instead of a nanosecond race.
+    async fn spinning_body(
+        occupancy: Arc<AtomicUsize>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    ) -> u32 {
+        let _occ = Occupancy::enter(&occupancy);
+        entered.store(true, Ordering::SeqCst);
+        // Time-bounded: if the test panics before flipping `release`, the
+        // spin must still end — a poll that never returns wedges runtime
+        // shutdown and turns a red test into a hung binary.
+        let start = Instant::now();
+        while !release.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        // First yield point after release: a pending abort lands here and
+        // the guard drops with the future.
+        futures::future::pending::<()>().await;
+        0u32
+    }
+
+    /// The core no-overlap guarantee, deterministically: the predecessor is
+    /// kept alive *through* its abort by a spin with no await point, the
+    /// successor is spawned into exactly that window, and only releasing the
+    /// spin may let the successor's body run. Mutation-verified: deleting the
+    /// grave await in `BodyTask::run` turns this red every run (the successor
+    /// enters while the predecessor's guard is live → poison → joiner fails).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn no_two_bodies_for_one_key_ever_overlap() {
-        struct Occupancy(Arc<AtomicUsize>);
-        impl Occupancy {
-            fn enter(counter: &Arc<AtomicUsize>) -> Self {
-                let prev = counter.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(prev, 0, "two bodies for one key are executing concurrently");
-                Self(Arc::clone(counter))
-            }
-        }
-        impl Drop for Occupancy {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-
         let m: Arc<TaskInner<String, u32>> = Arc::new(inner("overlap-test"));
         let occupancy = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        for round in 0..50u32 {
-            // Fresh key per round: a completed successor stays memoized, so
-            // reusing one key would make every later round a warm hit.
-            let key = format!("k{round}");
-            // First joiner: body enters the section and parks forever. Dropping
-            // the joiner is the last-interest abort.
-            let first = {
-                let occupancy = Arc::clone(&occupancy);
-                let m = Arc::clone(&m);
-                let key = key.clone();
-                let mut fut = Box::pin(async move {
-                    m.process(key, move || async move {
-                        let _occ = Occupancy::enter(&occupancy);
-                        futures::future::pending::<()>().await;
-                        0u32
-                    })
-                    .await
-                });
-                // Poll once so the cell exists and the task is spawned.
-                assert!(futures::poll!(&mut fut).is_pending());
-                fut
-            };
-            // Give the spawned body a chance to actually enter the section.
-            tokio::task::yield_now().await;
-            drop(first);
+        let first = {
+            let m = Arc::clone(&m);
+            let body = spinning_body(
+                Arc::clone(&occupancy),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            );
+            let mut fut = Box::pin(async move { m.process("k".to_string(), move || body).await });
+            assert!(futures::poll!(&mut fut).is_pending());
+            fut
+        };
+        // Wait until the predecessor is provably inside the section.
+        within(async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
 
-            // Immediate re-join: the successor body asserts sole occupancy.
-            let occupancy2 = Arc::clone(&occupancy);
-            let v = within(m.process(key, move || async move {
-                let _occ = Occupancy::enter(&occupancy2);
-                round
-            }))
-            .await;
-            assert_eq!(v, round);
-        }
+        // Last-interest abort. The predecessor CANNOT die yet — it is spinning
+        // with no await point — so the no-overlap window is held open.
+        drop(first);
+
+        // Successor into the held-open window. Its body asserts sole
+        // occupancy; without the grave await it runs immediately and trips.
+        let successor = {
+            let (m, occupancy) = (Arc::clone(&m), Arc::clone(&occupancy));
+            tokio::spawn(async move {
+                m.process("k".to_string(), move || async move {
+                    let _occ = Occupancy::enter(&occupancy);
+                    7u32
+                })
+                .await
+            })
+        };
+        // Give a broken implementation ample room to run the successor's body
+        // while the predecessor still holds the guard.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            occupancy.load(Ordering::SeqCst),
+            1,
+            "the successor's body must not have started while the predecessor lives"
+        );
+
+        // Let the predecessor reach an await point and die; the successor may
+        // only now proceed.
+        release.store(true, Ordering::SeqCst);
+        let v = within(successor).await.expect("successor joiner");
+        assert_eq!(v, 7);
+    }
+
+    /// Transitive no-overlap across three generations — the `ReGrave` path.
+    /// Gen 1 is held alive by the spin; gen 2 is aborted while still awaiting
+    /// gen 1's grave (it never runs its body); gen 3 must serialize on gen 1,
+    /// not on gen 2's already-dead handle, and must report the chain's
+    /// restart count. Deterministic by the same no-await-point construction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_regraved_predecessor_still_serializes_generation_three() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(inner("regrave-test"));
+        let occupancy = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Gen 1: spinning in the section.
+        let gen1 = {
+            let m = Arc::clone(&m);
+            let body = spinning_body(
+                Arc::clone(&occupancy),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            );
+            let mut fut = Box::pin(async move { m.process("k".to_string(), move || body).await });
+            assert!(futures::poll!(&mut fut).is_pending());
+            fut
+        };
+        within(async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(gen1); // aborted; cannot die while spinning
+
+        // Gen 2: its task parks awaiting gen 1's grave (gen 1 is alive).
+        let gen2 = {
+            let m = Arc::clone(&m);
+            let mut fut =
+                Box::pin(async move { m.process("k".to_string(), || async { 1u32 }).await });
+            assert!(futures::poll!(&mut fut).is_pending());
+            fut
+        };
+        // Let gen 2's spawned task actually reach the grave await.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Abort gen 2 mid-grave-await: its Drop must re-park gen 1's handle.
+        drop(gen2);
+
+        // Gen 3: must wait for gen 1 (still spinning), and must carry
+        // restarts == 2 (two dead generations before it).
+        let gen3 = {
+            let (m, occupancy) = (Arc::clone(&m), Arc::clone(&occupancy));
+            tokio::spawn(async move {
+                m.process("k".to_string(), move || async move {
+                    let _occ = Occupancy::enter(&occupancy);
+                    3u32
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            occupancy.load(Ordering::SeqCst),
+            1,
+            "gen 3 must not run while gen 1 still lives — it serialized on the wrong grave"
+        );
+        let cell = m.cache_lock().get("k").cloned().expect("gen 3 cell in map");
+        assert_eq!(cell.restarts(), 2, "two generations died before gen 3");
+
+        release.store(true, Ordering::SeqCst);
+        let v = within(gen3).await.expect("gen 3 joiner");
+        assert_eq!(v, 3);
     }
 
     /// A stale cancellation must never evict a completed cell — the value
@@ -730,8 +914,16 @@ mod tests {
         );
     }
 
-    /// Register-then-recheck: a joiner racing the publish must never park
-    /// forever. Loop hard enough that both interleavings actually occur.
+    /// Smoke test: two concurrent joiners per key both complete, 2000 keys.
+    ///
+    /// Honesty note: this does NOT prove the register-then-recheck ordering in
+    /// `wait_done` — the check-then-register bug's window is nanoseconds
+    /// inside one poll, and a black-box test cannot force a publish into it
+    /// (mutation-tested: the inverted ordering still passes here). That
+    /// ordering is proven by review against the documented discipline (see
+    /// `wait_done`'s comment and the `WorkerPool::acquire` pattern it copies);
+    /// what this test freezes is the end-to-end join/publish path staying
+    /// live under churn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joiner_racing_completion_never_parks_forever() {
         let m: Arc<TaskInner<u32, u32>> = Arc::new(inner("race-test"));

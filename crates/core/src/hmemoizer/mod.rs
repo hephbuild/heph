@@ -2172,6 +2172,113 @@ mod tests {
         );
     }
 
+    /// Task-mode twin of `cycle_error_eviction_spares_an_innocent_recreated_cell`:
+    /// the eviction is value-keyed through `TaskInner::evict_if` — a cached
+    /// cycle error is evicted, an in-flight successor and a real value are
+    /// spared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_mode_cycle_error_eviction_spares_an_innocent_recreated_cell() {
+        type V = Result<Arc<u32>, Arc<anyhow::Error>>;
+        let m: Memoizer<String, V> =
+            Memoizer::with_tag_task("task-cycle-evict-test", tokio::runtime::Handle::current());
+        let key = "k".to_string();
+
+        let v = m
+            .process(key.clone(), || async move {
+                Err(Arc::new(anyhow::Error::new(MemoizerCycleError {
+                    tag: "task-cycle-evict-test",
+                    key: "k".to_string(),
+                    kind: CycleKind::SelfRecursion,
+                    stack: vec![],
+                }))) as V
+            })
+            .await;
+        assert!(v.is_err());
+        m.evict_cached_cycle_error(&key);
+        assert!(
+            m.peek(&key).is_none(),
+            "a cached cycle error must be evicted from the task cell map"
+        );
+
+        // A completed innocent value is spared.
+        let v = m
+            .process(key.clone(), || async move { Ok(Arc::new(5u32)) as V })
+            .await;
+        assert_eq!(**v.as_ref().expect("ok"), 5);
+        m.evict_cached_cycle_error(&key);
+        assert!(
+            m.peek(&key).is_some(),
+            "a real memoized value must survive a stale cycle eviction"
+        );
+    }
+
+    /// Task-mode cycle detection, end to end. The detection flag is
+    /// process-latched (`OnceLock` over the env), so the actual assertion runs
+    /// in a subprocess of this test binary with the env set at startup; this
+    /// driver only checks the subprocess verdict.
+    #[test]
+    fn task_mode_cycle_detection_is_intact() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "hmemoizer::tests::task_mode_self_cycle_errors_helper",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("HEPH_DEBUG_MEMOIZER_CYCLE", "1")
+            .output()
+            .expect("spawn helper subprocess");
+        assert!(
+            out.status.success(),
+            "task-mode cycle detection helper failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// Body of [`task_mode_cycle_detection_is_intact`] — a same-task re-entry
+    /// through a spawned task-cell body must produce `MemoizerCycleError`, not
+    /// an eternal park. Proves `IN_FLIGHT` scoping survives the spawn (the
+    /// creator-frame wrap travels with the body future into the task).
+    #[tokio::test]
+    #[ignore = "driven by task_mode_cycle_detection_is_intact — needs HEPH_DEBUG_MEMOIZER_CYCLE=1 latched at process start"]
+    async fn task_mode_self_cycle_errors_helper() {
+        assert!(
+            cycle_detection_enabled(),
+            "helper requires the cycle-detection flag latched on at process start"
+        );
+        type V = Result<Arc<u32>, Arc<anyhow::Error>>;
+        let m: Arc<Memoizer<String, V>> = Arc::new(Memoizer::with_tag_task(
+            "task-cycle-detect-test",
+            tokio::runtime::Handle::current(),
+        ));
+        let v = tokio::time::timeout(Duration::from_secs(5), {
+            let m2 = Arc::clone(&m);
+            m.once("A".to_string(), move || async move {
+                // Re-enter our own in-flight key from inside the spawned body.
+                // Without detection this deadlocks (the timeout above catches
+                // it); with it, the inner call must return the typed error.
+                let inner = m2
+                    .once("A".to_string(), || async { Ok(Arc::new(1u32)) })
+                    .await;
+                let err = inner.expect_err("self-recursion must error, not recurse");
+                assert!(
+                    downcast_chain_ref::<MemoizerCycleError>(&err).is_some(),
+                    "the inner error must be the typed cycle error: {err}"
+                );
+                Ok(Arc::new(99u32))
+            })
+        })
+        .await
+        .expect("a self-cycle must error, not hang");
+        assert_eq!(
+            **v.as_ref().expect("outer body completes"),
+            99,
+            "the outer computation proceeds once the inner cycle errored"
+        );
+    }
+
     /// An awaiter that *unwinds* out of `process` still cancels and evicts.
     ///
     /// Raw `process` has no panic guard (`once` adds one), so a computation
