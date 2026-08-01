@@ -3171,6 +3171,14 @@ impl Engine {
         let current = Arc::clone(&self)
             .meta(self.new_hash_only_state(addr.clone()), addr)
             .await
+            // Seal the chain: it may carry request-property markers
+            // (`HashUnknownError` from the nested hash-only request) that
+            // `classify_failure` deliberately refuses to record — correct for
+            // the marker itself, wrong once this guard turns it into a real
+            // target failure. Left unsealed, the failure shows in the event
+            // stream (the TUI's failed tab) but never lands in the failure
+            // registry, so the run exits non-zero with nothing printed.
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
             .with_context(|| {
                 format!(
                     "re-reading the sources of {addr} to confirm they still match what it \
@@ -9205,6 +9213,86 @@ mod tests {
             std::fs::read(pkg_dir.join("in.txt"))?,
             b"HELLO\n",
             "the in_place write-back must still land",
+        );
+        Ok(())
+    }
+
+    /// A write-back-guard failure must land in the failure registry — not just
+    /// the event stream.
+    ///
+    /// The guard's nested hash-only recompute can fail with
+    /// `HashUnknownError` in its chain (a cacheable dep whose inputs moved
+    /// mid-run misses at its new hash). That marker is deliberately never
+    /// recorded by `classify_failure` — correct while it is a request
+    /// property, wrong once the guard converts it into a real target failure.
+    /// Unsealed, the run showed the failure in the TUI's failed tab (events)
+    /// but exited with an empty registry and nothing printed. The guard now
+    /// seals the chain; this pins both the recording and the refusal to
+    /// write back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_place_guard_failure_is_recorded_not_just_evented() -> anyhow::Result<()> {
+        let escape = tempdir()?;
+        let started = escape.path().join("started");
+        let release = escape.path().join("release");
+        let src = hbuiltins::pluginfs::file_addr("pkg/other.txt").format();
+        let (engine, root) = engine_with_home_fs(vec![
+            // Cacheable dep hashing a file the test mutates mid-run.
+            bash_target("//pkg:probe", &[&src]),
+            codegen_run_target_with_deps(
+                "//pkg:fmt",
+                "in_place",
+                &["in.txt"],
+                &format!(
+                    "touch {started}; until [ -f {release} ]; do sleep 0.05; done; \
+                     printf '%s\n' \"$(tr a-z A-Z < in.txt)\" > in.txt.tmp && mv in.txt.tmp in.txt",
+                    started = started.display(),
+                    release = release.display(),
+                ),
+                &["//pkg:probe"],
+            ),
+        ])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("in.txt"), b"hello")?;
+        std::fs::write(pkg_dir.join("other.txt"), b"v1")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let rs = engine.new_state();
+        let resolve = tokio::spawn(enclose!((engine, rs) async move {
+            engine
+                .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                .await
+        }));
+
+        // The run is provably in flight; move the tree under the dep, then
+        // let the run finish. The guard's fresh recompute now hashes `probe`
+        // at inputs nothing has cached → HashUnknownError inside its chain.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !started.exists() {
+            assert!(std::time::Instant::now() < deadline, "run never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::write(pkg_dir.join("other.txt"), b"v2")?;
+        std::fs::write(&release, b"go")?;
+
+        let res = tokio::time::timeout(Duration::from_secs(60), resolve)
+            .await
+            .expect("run must finish")
+            .expect("join");
+        res.err()
+            .expect("the guard must refuse: it cannot confirm the tree");
+
+        let failures = rs.take_failures();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the guard failure must be recorded so the exit path renders it"
+        );
+        assert_eq!(failures[0].addr.format(), "//pkg:fmt");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("in.txt"))?,
+            b"hello",
+            "an unconfirmed write-back must not touch the tree"
         );
         Ok(())
     }
