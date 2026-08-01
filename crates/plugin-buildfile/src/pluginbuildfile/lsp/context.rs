@@ -62,7 +62,7 @@ impl HephLspContext {
         let registry = engine.provider_function_registry();
         let doc_globals = build_globals(&registry).documentation();
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
-        let builtin_hovers = crate::pluginbuildfile::run_file::builtin_call_hovers(&doc_globals);
+        let builtin_hovers = crate::pluginbuildfile::run_file::BuiltinHovers::new(&doc_globals);
         let patterns = buildfile_patterns(&*engine);
         let runtime = tokio::runtime::Handle::current();
         let provider = build_listing_provider(&root, &patterns, &registry, runtime.clone());

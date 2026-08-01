@@ -6,8 +6,8 @@ use hcore::htvalue::signature::{FnSignature, ParamType};
 use hcore::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use hmodel::htaddr;
 use hmodel::htpkg::PkgBuf;
-use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+use hplugin::driver::{DriverSchema, TargetAddr};
 use hplugin::provider::{
     Approval, FnArgs, FnCallContext, ProvenanceFrame, ProviderFn, ProviderFunctionRegistry,
 };
@@ -85,98 +85,208 @@ pub(crate) fn heph_core_members(globals_doc: &starlark::docs::DocModule) -> Vec<
         .collect()
 }
 
-/// Rendered hover markdown for the `target` and `provider_state` builtins, keyed
-/// by name. Both take a raw `args: &Arguments`, so the stock server can only
-/// render the meaningless `def name(*args, **kwargs)` prototype; we render a
-/// meaningful one — `target`'s recognized base arguments (from
-/// [`target_base_fields`], so the two never drift) plus a `**config` catch-all for
-/// driver fields, and `provider_state`'s `provider` plus a `**state` catch-all —
-/// while keeping each builtin's real docstring. Computed once at startup (the
-/// signatures are static); the proxy serves these when the callee name is hovered.
-pub(crate) fn builtin_call_hovers(
-    globals_doc: &starlark::docs::DocModule,
-) -> std::collections::HashMap<String, String> {
-    use starlark::docs::markdown::render_doc_item_no_link;
-    use starlark::docs::{
-        DocFunction, DocItem, DocMember, DocParam, DocParams, DocReturn, DocString,
-    };
-    use starlark::typing::Ty;
+/// Hover markdown for the `target` and `provider_state` builtins, rendered on
+/// demand so each prototype can be narrowed to what the call site selects.
+///
+/// Both builtins take a raw `args: &Arguments`, so the stock server can only
+/// render the meaningless `def name(*args, **kwargs)` prototype. We render a
+/// meaningful one instead: `target`'s recognized base arguments (from
+/// [`target_base_fields`], so the two never drift) and `provider_state`'s
+/// `provider`, keeping each builtin's real docstring.
+///
+/// The point of rendering per call rather than once at startup is the rest: when
+/// the call names a `driver` (or a `provider`) whose schema resolves, that
+/// schema's fields *replace* the `**config` / `**state` catch-all, each with its
+/// type, its required-ness and its doc. The hover then describes the keys this
+/// particular target accepts and nothing else — the generic prototype could only
+/// say "and some more keyword arguments". Only the docstrings are held here;
+/// rendering is a handful of allocations and runs once per hover.
+pub(crate) struct BuiltinHovers {
+    target_doc: Option<starlark::docs::DocString>,
+    provider_state_doc: Option<starlark::docs::DocString>,
+}
 
-    // The builtin's real docstring, pulled from the globals doc so it never drifts
-    // from the `#[starlark_module]` definition.
-    let docstring = |name: &str| -> Option<DocString> {
-        match globals_doc.members.get(name) {
+/// One schema field as the hover renderer needs it — the shape a driver's
+/// `DriverField` and a provider's `StateField` have in common.
+struct HoverField<'a> {
+    name: &'a str,
+    ty: &'a ParamType,
+    doc: &'a str,
+    required: bool,
+}
+
+impl BuiltinHovers {
+    pub(crate) fn new(globals_doc: &starlark::docs::DocModule) -> BuiltinHovers {
+        use starlark::docs::{DocItem, DocMember};
+        // The builtin's real docstring, pulled from the globals doc so it never
+        // drifts from the `#[starlark_module]` definition.
+        let docstring = |name: &str| match globals_doc.members.get(name) {
             Some(DocItem::Member(DocMember::Function(f))) => f.docs.clone(),
             _ => None,
+        };
+        BuiltinHovers {
+            target_doc: docstring("target"),
+            provider_state_doc: docstring("provider_state"),
         }
-    };
+    }
 
-    // One named parameter; `required` controls whether a `= None` default (the
-    // optional convention) is shown.
-    let param = |name: &str, ty: Ty, required: bool| DocParam {
-        name: name.to_string(),
-        docs: None,
-        typ: ty,
-        default_value: (!required).then(|| "None".to_string()),
-    };
-    // A `**name` catch-all of arbitrary type.
-    let kwargs = |name: &str| DocParam {
-        name: name.to_string(),
-        docs: None,
-        typ: Ty::any(),
-        default_value: None,
-    };
-    let render = |name: &str, params: DocParams, ret: Ty| {
-        let item = DocItem::Member(DocMember::Function(DocFunction {
-            docs: docstring(name),
-            params,
-            ret: DocReturn {
-                docs: None,
-                typ: ret,
-            },
-        }));
-        render_doc_item_no_link(name, &item)
-    };
-
-    let mut out = std::collections::HashMap::new();
-
-    // `target(name, driver, …, **config) -> str`. Base args come from the single
-    // source of truth shared with completion.
-    out.insert(
-        "target".to_string(),
-        render(
+    /// `target(name, driver, …, **config) -> str`, or — with `driver` resolved to
+    /// its schema — that driver's config fields in place of the catch-all.
+    pub(crate) fn target(&self, driver: Option<(&str, &DriverSchema)>) -> String {
+        let fields = driver.map(|(name, schema)| {
+            let fields: Vec<HoverField<'_>> = schema
+                .fields
+                .iter()
+                .map(|f| HoverField {
+                    name: &f.name,
+                    ty: &f.ty,
+                    doc: &f.doc,
+                    required: f.required,
+                })
+                .collect();
+            (name, fields, "driver", "config")
+        });
+        let base = target_base_fields();
+        let base: Vec<HoverField<'_>> = base
+            .iter()
+            .map(|f| HoverField {
+                name: &f.name,
+                ty: &f.ty,
+                doc: &f.doc,
+                required: f.required,
+            })
+            .collect();
+        render_builtin_hover(
             "target",
-            DocParams {
-                pos_only: Vec::new(),
-                pos_or_named: target_base_fields()
-                    .into_iter()
-                    .map(|f| param(&f.name, param_type_to_ty(&f.ty), f.required))
-                    .collect(),
-                args: None,
-                named_only: Vec::new(),
-                kwargs: Some(kwargs("config")),
-            },
-            Ty::string(),
-        ),
-    );
+            &self.target_doc,
+            &base,
+            fields
+                .as_ref()
+                .map(|(n, f, k, c)| (*n, f.as_slice(), *k, *c)),
+            "config",
+            starlark::typing::Ty::string(),
+        )
+    }
 
-    // `provider_state(provider, **state) -> None`.
-    out.insert(
-        "provider_state".to_string(),
-        render(
+    /// `provider_state(provider, **state) -> None`, narrowed the same way once
+    /// the named provider's state schema resolves.
+    pub(crate) fn provider_state(
+        &self,
+        provider: Option<(&str, &hplugin::provider::StateSchema)>,
+    ) -> String {
+        let fields = provider.map(|(name, schema)| {
+            let fields: Vec<HoverField<'_>> = schema
+                .fields
+                .iter()
+                .map(|f| HoverField {
+                    name: &f.name,
+                    ty: &f.ty,
+                    doc: &f.doc,
+                    required: f.required,
+                })
+                .collect();
+            (name, fields, "provider", "state")
+        });
+        let base = [HoverField {
+            name: "provider",
+            ty: &ParamType::String,
+            doc: "Provider whose state this sets.",
+            required: true,
+        }];
+        render_builtin_hover(
             "provider_state",
-            DocParams {
-                pos_only: Vec::new(),
-                pos_or_named: vec![param("provider", Ty::string(), true)],
-                args: None,
-                named_only: Vec::new(),
-                kwargs: Some(kwargs("state")),
-            },
-            Ty::none(),
-        ),
-    );
+            &self.provider_state_doc,
+            &base,
+            fields
+                .as_ref()
+                .map(|(n, f, k, c)| (*n, f.as_slice(), *k, *c)),
+            "state",
+            starlark::typing::Ty::none(),
+        )
+    }
+}
 
-    out
+/// Render one builtin's hover: its prototype, docstring, and a `#### Parameters`
+/// section for every field that documents itself.
+///
+/// `schema` is the resolved driver/provider — `(name, its fields, what it is,
+/// what the fields are called)`. Present, its fields take the place of the
+/// `**{catch_all}` parameter and a closing line attributes them, so a reader who
+/// wonders where `cmd` came from can see it. Absent, the catch-all stands: the
+/// remaining keys exist but nothing here knows them.
+fn render_builtin_hover(
+    name: &str,
+    docs: &Option<starlark::docs::DocString>,
+    base: &[HoverField<'_>],
+    schema: Option<(&str, &[HoverField<'_>], &str, &str)>,
+    catch_all: &str,
+    ret: starlark::typing::Ty,
+) -> String {
+    use starlark::docs::markdown::render_doc_item_no_link;
+    use starlark::docs::{
+        DocFunction, DocItem, DocMember, DocParam, DocParams, DocReturn, DocString, DocStringKind,
+    };
+
+    // `required` controls whether a `= None` default — the optional convention —
+    // is shown; the field's own doc becomes the parameter's, which is what puts
+    // it in the rendered `#### Parameters` list.
+    let param = |f: &HoverField<'_>| DocParam {
+        name: f.name.to_string(),
+        docs: DocString::from_docstring(DocStringKind::Starlark, f.doc),
+        typ: param_type_to_ty(f.ty),
+        default_value: (!f.required).then(|| "None".to_string()),
+    };
+
+    let params = DocParams {
+        pos_only: Vec::new(),
+        pos_or_named: Vec::new(),
+        args: None,
+        // Keyword-only, which is what these builtins actually are — they reject
+        // positional arguments outright. It also keeps the prototype well-formed
+        // once a schema is spliced in: a driver's required `cmd` lands after the
+        // optional base args, which reads as invalid syntax without the `*`.
+        named_only: base
+            .iter()
+            .chain(schema.iter().flat_map(|(_, fields, _, _)| fields.iter()))
+            .map(param)
+            .collect(),
+        // A `**name` catch-all of arbitrary type, only while the schema behind it
+        // is unknown.
+        kwargs: schema.is_none().then(|| DocParam {
+            name: catch_all.to_string(),
+            docs: None,
+            typ: starlark::typing::Ty::any(),
+            default_value: None,
+        }),
+    };
+
+    let item = DocItem::Member(DocMember::Function(DocFunction {
+        docs: docs.clone(),
+        params,
+        ret: DocReturn {
+            docs: None,
+            typ: ret,
+        },
+    }));
+    let mut md = render_doc_item_no_link(name, &item);
+
+    // Say which half is which. The list above blends two sources — the
+    // builtin's own spec-level fields, then the selected schema's — and a
+    // reader who can't tell them apart can't tell what changes if they swap the
+    // driver.
+    if let Some((schema_name, fields, kind, field_kind)) = schema {
+        md.push_str("\n\n");
+        if fields.is_empty() {
+            md.push_str(&format!(
+                "*The fields above are `{name}`'s own; the `{schema_name}` {kind} takes no {field_kind}.*"
+            ));
+        } else {
+            md.push_str(&format!(
+                "*The fields above are `{name}`'s own, then the `{schema_name}` {kind}'s {field_kind}.*"
+            ));
+        }
+    }
+    md
 }
 
 pub(crate) fn build_globals(registry: &ProviderFunctionRegistry) -> Globals {
@@ -1697,28 +1807,117 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn hovers() -> BuiltinHovers {
+        BuiltinHovers::new(&build_globals(&ProviderFunctionRegistry::default()).documentation())
+    }
+
     #[test]
     fn builtin_call_hovers_render_real_signatures() {
-        let doc = build_globals(&ProviderFunctionRegistry::default()).documentation();
-        let hovers = builtin_call_hovers(&doc);
+        let hovers = hovers();
 
-        let target = hovers.get("target").expect("target hover");
-        // Real args, the `**config` catch-all, and the address return — not the
-        // stock `def target(*args, **kwargs) -> None`.
+        // With nothing selected: real args, the `**config` catch-all, and the
+        // address return — not the stock `def target(*args, **kwargs) -> None`.
+        let target = hovers.target(None);
         assert!(target.contains("name"), "names base arg: {target}");
         assert!(target.contains("driver"), "names driver arg: {target}");
         assert!(target.contains("**config"), "shows config kwargs: {target}");
         assert!(!target.contains("**kwargs"), "no raw kwargs: {target}");
         // The real docstring carries through.
         assert!(target.contains("Declare a build target"), "doc: {target}");
+        // Base fields document themselves.
+        assert!(
+            target.contains("Target name (required)."),
+            "base field doc: {target}"
+        );
 
-        let ps = hovers.get("provider_state").expect("provider_state hover");
+        let ps = hovers.provider_state(None);
         assert!(ps.contains("provider"), "names provider arg: {ps}");
         assert!(ps.contains("**state"), "shows state kwargs: {ps}");
         assert!(!ps.contains("**kwargs"), "no raw kwargs: {ps}");
+    }
+
+    #[test]
+    fn builtin_call_hovers_narrow_to_the_selected_driver() {
+        let schema = DriverSchema {
+            fields: vec![
+                hplugin::driver::DriverField {
+                    name: "cmd".to_string(),
+                    ty: ParamType::String,
+                    doc: "Command line to run.".to_string(),
+                    required: true,
+                },
+                hplugin::driver::DriverField {
+                    name: "verbose".to_string(),
+                    ty: ParamType::Bool,
+                    doc: "Echo the command.".to_string(),
+                    required: false,
+                },
+            ],
+        };
+        let md = hovers().target(Some(("exec", &schema)));
+
+        // The driver's fields stand in for the catch-all, in the prototype and
+        // in the parameter docs, with required-ness carried across.
+        assert!(!md.contains("**config"), "catch-all replaced: {md}");
+        assert!(md.contains("cmd"), "prototype names the field: {md}");
+        assert!(md.contains("Command line to run."), "field doc: {md}");
+        assert!(md.contains("Echo the command."), "optional field doc: {md}");
+        assert!(md.contains("verbose"), "optional field: {md}");
+        // A driver narrows the config keys; it never displaces `target`'s own
+        // spec-level fields. Every one of them is still there, documented.
+        for base in target_base_fields() {
+            assert!(
+                md.contains(&base.name),
+                "keeps base arg {}: {md}",
+                base.name
+            );
+            assert!(md.contains(&base.doc), "keeps base doc {}: {md}", base.name);
+        }
+        // Which half is which: the reader must be able to tell `name` (always
+        // there) from `cmd` (there because this target picked `exec`).
         assert!(
-            ps.contains("provider state") || ps.contains("provider"),
-            "doc: {ps}"
+            md.contains("*The fields above are `target`'s own, then the `exec` driver's config.*"),
+            "attributes each half of the blend: {md}"
+        );
+    }
+
+    #[test]
+    fn builtin_call_hovers_say_so_when_a_driver_takes_no_config() {
+        // A config-less driver (`DriverSchema::default()`, what several real
+        // drivers return) must read as "no keys", not as a hover that broke —
+        // and must still show `target`'s own fields.
+        let md = hovers().target(Some(("bare", &DriverSchema::default())));
+        assert!(!md.contains("**config"), "catch-all replaced: {md}");
+        assert!(md.contains("name"), "keeps base args: {md}");
+        assert!(
+            md.contains("`bare` driver takes no config"),
+            "says the driver takes nothing: {md}"
+        );
+    }
+
+    #[test]
+    fn builtin_call_hovers_narrow_to_the_selected_provider() {
+        let schema = hplugin::provider::StateSchema {
+            fields: vec![hplugin::provider::StateField {
+                name: "go_codegen_root".to_string(),
+                ty: ParamType::Bool,
+                doc: "Treat this package as a codegen root.".to_string(),
+                required: false,
+            }],
+        };
+        let md = hovers().provider_state(Some(("go", &schema)));
+        assert!(!md.contains("**state"), "catch-all replaced: {md}");
+        assert!(md.contains("go_codegen_root"), "names the field: {md}");
+        assert!(
+            md.contains("Treat this package as a codegen root."),
+            "field doc: {md}"
+        );
+        assert!(md.contains("provider"), "keeps the base arg: {md}");
+        assert!(
+            md.contains(
+                "*The fields above are `provider_state`'s own, then the `go` provider's state.*"
+            ),
+            "attributes each half of the blend: {md}"
         );
     }
 
