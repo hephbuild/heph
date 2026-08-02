@@ -1710,9 +1710,15 @@ mod tests {
             .await
             .expect("shut down the runtime");
 
+        // Suspends, so finishing it requires a spawn — which is the thing that
+        // fails on a dead runtime. A body that completed inline would need no
+        // runtime and would legitimately succeed (see `task_cell::inline_first`).
         let v = tokio::time::timeout(
             Duration::from_secs(5),
-            m.once("k".to_string(), || async { Ok(Arc::new(1u32)) }),
+            m.once("k".to_string(), || async {
+                tokio::task::yield_now().await;
+                Ok(Arc::new(1u32))
+            }),
         )
         .await
         .expect("a dead runtime must fail fast, not hang");
