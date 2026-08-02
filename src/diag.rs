@@ -154,7 +154,7 @@ fn spawn_sweeper() {
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         if DUMP_REQUESTED.swap(false, Ordering::Relaxed) {
-                            sweep();
+                            sweep(&dump_path());
                         }
                     }
                 }),
@@ -170,8 +170,14 @@ const MAX_THREADS: usize = 256;
 /// Pause between signalling successive threads.
 const THREAD_GAP: std::time::Duration = std::time::Duration::from_millis(2);
 
-fn sweep() {
-    let path = dump_path();
+/// Write a dump to `path`.
+///
+/// The path is a parameter rather than read from [`dump_path`] inside: that
+/// reads a process-global `OnceLock`, so a test wanting its own file had to set
+/// the global and thereby decide where *every other* test in the binary thought
+/// dumps went. That is what it did — silently, ordering-dependent, green
+/// locally and red on CI.
+fn sweep(path: &std::path::Path) {
     if let Some(dir) = path.parent() {
         drop(std::fs::create_dir_all(dir));
     }
@@ -442,16 +448,14 @@ mod tests {
 
         let before = sigusr1_disposition();
 
+        // Its own path, never `set_dump_dir`: that writes a process-global
+        // `OnceLock`, so this test would decide where every *other* test in the
+        // binary thinks dumps go — which is exactly how it broke
+        // `the_dump_path_is_absolute`, ordering-dependent and only on CI.
         let dir = tempfile::tempdir().expect("tempdir");
-        set_dump_dir(dir.path());
-        let path = dump_path();
-        assert!(
-            path.starts_with(dir.path()),
-            "DUMP_DIR is a OnceLock and something set it first, so this test would \
-             write into the working tree instead of {dir:?}: {path:?}"
-        );
+        let path = dir.path().join("dump.txt");
 
-        sweep();
+        sweep(&path);
 
         assert_eq!(
             sigusr1_disposition(),
